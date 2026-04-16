@@ -375,7 +375,7 @@ impl<'a> KeyDestructionOrchestrator<'a> {
     ///
     /// Returns [`ContextError::CryptoFailed`] if MLS group or sender key
     /// destruction fails.
-    pub fn destroy_ephemeral_keys(
+    pub async fn destroy_ephemeral_keys(
         &self,
         context_id: &str,
         relay_urls: &[String],
@@ -389,11 +389,13 @@ impl<'a> KeyDestructionOrchestrator<'a> {
         // application key material).
         self.crypto
             .destroy_mls_group(&context_id_bytes)
+            .await
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         // Step 2: Destroy all sender keys for this context.
         self.crypto
             .destroy_sender_key(&context_id_bytes)
+            .await
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         // Step 3: Issue relay deletion requests for all encrypted event data.
@@ -633,24 +635,37 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl ContextCryptoProvider for MockCryptoProvider {
-        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+        async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
             Ok(())
         }
 
-        fn create_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn create_mls_group(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             Ok(())
         }
 
-        fn generate_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn generate_sender_key(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             Ok(())
         }
 
-        fn init_broadcast_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn init_broadcast_key(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             Ok(())
         }
 
-        fn destroy_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_mls_group(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             if self.fail_mls {
                 return Err(ContextCreationError::CryptoFailed(
                     "MLS destruction failed".to_owned(),
@@ -660,7 +675,10 @@ mod tests {
             Ok(())
         }
 
-        fn destroy_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_sender_key(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             if self.fail_sender {
                 return Err(ContextCreationError::CryptoFailed(
                     "sender key destruction failed".to_owned(),
@@ -670,7 +688,7 @@ mod tests {
             Ok(())
         }
 
-        fn validate_key_package(
+        async fn validate_key_package(
             &self,
             _owner_did: &str,
             _key_package_bytes: Option<&[u8]>,
@@ -678,7 +696,7 @@ mod tests {
             Ok(())
         }
 
-        fn add_member(
+        async fn add_member(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -687,7 +705,7 @@ mod tests {
             Ok(crate::context::builder::AddMemberOutput::default())
         }
 
-        fn remove_member(
+        async fn remove_member(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -695,7 +713,7 @@ mod tests {
             Ok(crate::context::builder::RemoveMemberOutput::default())
         }
 
-        fn distribute_sender_key(
+        async fn distribute_sender_key(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -703,7 +721,7 @@ mod tests {
             Ok(())
         }
 
-        fn remove_member_sender_key(
+        async fn remove_member_sender_key(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -799,26 +817,28 @@ mod tests {
     // KeyDestructionOrchestrator tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn destroy_ephemeral_keys_destroys_mls_and_sender_keys() {
+    #[tokio::test]
+    async fn destroy_ephemeral_keys_destroys_mls_and_sender_keys() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = KeyDestructionOrchestrator::new(&crypto);
 
-        let result = orchestrator.destroy_ephemeral_keys(
-            "ctx-1",
-            &["wss://relay1.example.com".to_owned()],
-            &[[0x01; 32]],
-            KeyDestructionLevel::SoftwareOnly,
-            1_700_000_000,
-        );
+        let result = orchestrator
+            .destroy_ephemeral_keys(
+                "ctx-1",
+                &["wss://relay1.example.com".to_owned()],
+                &[[0x01; 32]],
+                KeyDestructionLevel::SoftwareOnly,
+                1_700_000_000,
+            )
+            .await;
 
         assert!(result.is_ok());
         assert!(crypto.mls_destroyed.load(Ordering::SeqCst));
         assert!(crypto.sender_key_destroyed.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn destroy_ephemeral_keys_issues_relay_deletion_requests() {
+    #[tokio::test]
+    async fn destroy_ephemeral_keys_issues_relay_deletion_requests() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = KeyDestructionOrchestrator::new(&crypto);
 
@@ -836,6 +856,7 @@ mod tests {
                 KeyDestructionLevel::HardwareAttested,
                 1_700_000_000,
             )
+            .await
             .unwrap();
 
         assert_eq!(result.deletion_requests.len(), 2);
@@ -855,8 +876,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn destroy_ephemeral_keys_returns_attestation() {
+    #[tokio::test]
+    async fn destroy_ephemeral_keys_returns_attestation() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = KeyDestructionOrchestrator::new(&crypto);
 
@@ -868,6 +889,7 @@ mod tests {
                 KeyDestructionLevel::HardwareAttested,
                 1_700_000_000,
             )
+            .await
             .unwrap();
 
         assert_eq!(result.attestation.context_id, "ctx-1");
@@ -880,38 +902,42 @@ mod tests {
         assert!(result.attestation.sender_keys_destroyed);
     }
 
-    #[test]
-    fn destroy_ephemeral_keys_records_attestation_level_not_gates() {
+    #[tokio::test]
+    async fn destroy_ephemeral_keys_records_attestation_level_not_gates() {
         // NoAttestation level is recorded as metadata but does not prevent
         // key destruction from succeeding.
         let crypto = MockCryptoProvider::new();
         let orchestrator = KeyDestructionOrchestrator::new(&crypto);
 
-        let result = orchestrator.destroy_ephemeral_keys(
-            "ctx-1",
-            &[],
-            &[],
-            KeyDestructionLevel::NoAttestation,
-            1_700_000_000,
-        );
+        let result = orchestrator
+            .destroy_ephemeral_keys(
+                "ctx-1",
+                &[],
+                &[],
+                KeyDestructionLevel::NoAttestation,
+                1_700_000_000,
+            )
+            .await;
 
         assert!(result.is_ok());
         let result = result.unwrap();
         assert_eq!(result.attestation.level, KeyDestructionLevel::NoAttestation);
     }
 
-    #[test]
-    fn destroy_ephemeral_keys_fails_on_mls_destruction_error() {
+    #[tokio::test]
+    async fn destroy_ephemeral_keys_fails_on_mls_destruction_error() {
         let crypto = MockCryptoProvider::failing_mls();
         let orchestrator = KeyDestructionOrchestrator::new(&crypto);
 
-        let result = orchestrator.destroy_ephemeral_keys(
-            "ctx-1",
-            &[],
-            &[],
-            KeyDestructionLevel::SoftwareOnly,
-            1_700_000_000,
-        );
+        let result = orchestrator
+            .destroy_ephemeral_keys(
+                "ctx-1",
+                &[],
+                &[],
+                KeyDestructionLevel::SoftwareOnly,
+                1_700_000_000,
+            )
+            .await;
 
         assert!(result.is_err());
         match result {
@@ -922,18 +948,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn destroy_ephemeral_keys_fails_on_sender_key_destruction_error() {
+    #[tokio::test]
+    async fn destroy_ephemeral_keys_fails_on_sender_key_destruction_error() {
         let crypto = MockCryptoProvider::failing_sender();
         let orchestrator = KeyDestructionOrchestrator::new(&crypto);
 
-        let result = orchestrator.destroy_ephemeral_keys(
-            "ctx-1",
-            &[],
-            &[],
-            KeyDestructionLevel::SoftwareOnly,
-            1_700_000_000,
-        );
+        let result = orchestrator
+            .destroy_ephemeral_keys(
+                "ctx-1",
+                &[],
+                &[],
+                KeyDestructionLevel::SoftwareOnly,
+                1_700_000_000,
+            )
+            .await;
 
         assert!(result.is_err());
         match result {
@@ -944,8 +972,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn destroy_ephemeral_keys_with_no_relays_returns_empty_requests() {
+    #[tokio::test]
+    async fn destroy_ephemeral_keys_with_no_relays_returns_empty_requests() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = KeyDestructionOrchestrator::new(&crypto);
 
@@ -957,6 +985,7 @@ mod tests {
                 KeyDestructionLevel::SoftwareOnly,
                 1_700_000_000,
             )
+            .await
             .unwrap();
 
         assert!(result.deletion_requests.is_empty());

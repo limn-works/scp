@@ -3309,6 +3309,7 @@ pub async fn context_close(
                     None, // verification_window_secs — use default
                     now,
                 )
+                .await
                 .map_err(|e| ScpError::Context {
                     msg: format!("close orchestration failed: {e}"),
                     code: codes::CTX_2017.to_owned(),
@@ -7927,6 +7928,7 @@ pub async fn restore_context(context_id: String) -> Result<(), ScpError> {
             // subsequent finalize_close.
             let (snapshot, _broadcast) = manager
                 .load_persisted_context_state(&ctx_id)
+                .await
                 .map_err(ScpError::from)?;
 
             let core_handle = scp_core::context::ContextHandle::new(

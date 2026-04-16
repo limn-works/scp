@@ -834,8 +834,9 @@ pub struct VelocityTrackerSnapshot {
 /// (membership, roles, governance, TTL) and the broadcast-specific state
 /// (author keys, subscribers, block lists).
 ///
-/// Implementors must be dyn-compatible (`Send + Sync`, no generics, no
-/// RPITIT). All methods return `Result<_, Box<dyn Error + Send + Sync>>`
+/// Implementors must be dyn-compatible (`Send + Sync`, no generics).
+/// Uses `#[async_trait]` for object-safe async methods.
+/// All methods return `Result<_, Box<dyn Error + Send + Sync>>`
 /// for best-effort semantics: the `ContextManager` logs errors but does
 /// not abort mutations when persistence fails.
 ///
@@ -843,6 +844,7 @@ pub struct VelocityTrackerSnapshot {
 /// wraps `Arc<ProtocolRepository<S>>`.
 ///
 /// See spec section 17.4.
+#[async_trait::async_trait]
 pub trait ContextPersistence: Send + Sync {
     /// Persists the full context snapshot.
     ///
@@ -851,7 +853,7 @@ pub trait ContextPersistence: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the underlying storage write fails.
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
@@ -864,7 +866,7 @@ pub trait ContextPersistence: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the underlying storage read fails.
-    fn load_context(
+    async fn load_context(
         &self,
         context_id: &str,
     ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>>;
@@ -876,7 +878,7 @@ pub trait ContextPersistence: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the underlying storage write fails.
-    fn persist_broadcast(
+    async fn persist_broadcast(
         &self,
         context_id: &str,
         snapshot: &BroadcastContextSnapshot,
@@ -889,7 +891,7 @@ pub trait ContextPersistence: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the underlying storage read fails.
-    fn load_broadcast(
+    async fn load_broadcast(
         &self,
         context_id: &str,
     ) -> Result<Option<BroadcastContextSnapshot>, Box<dyn std::error::Error + Send + Sync>>;
@@ -899,7 +901,7 @@ pub trait ContextPersistence: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the underlying storage delete fails.
-    fn delete_context(
+    async fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -909,7 +911,7 @@ pub trait ContextPersistence: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the underlying storage list fails.
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>;
 }
@@ -2193,14 +2195,14 @@ impl ContextManager {
         crate::metrics::set_buffer_occupancy(total_buffered);
     }
 
-    fn persist_context_snapshot(&self, context_id: &str, mut snapshot: ContextSnapshot) {
+    async fn persist_context_snapshot(&self, context_id: &str, mut snapshot: ContextSnapshot) {
         if let Some(ref persistence) = self.persistence {
             // Export MLS crypto state alongside the context snapshot (#645).
             // Populate `mls_crypto_state` in-place on the owned snapshot (#711).
             // Best-effort: if export fails, persist without crypto state (the
             // context will need reconnection on restore, matching §23.11 fallback).
             let ctx_id_bytes = context_id_to_bytes(context_id);
-            match self.crypto.export_crypto_state(&ctx_id_bytes) {
+            match self.crypto.export_crypto_state(&ctx_id_bytes).await {
                 Ok(state) => snapshot.mls_crypto_state = state,
                 Err(e) => {
                     tracing::warn!(
@@ -2211,7 +2213,7 @@ impl ContextManager {
                     );
                 }
             }
-            if let Err(e) = persistence.persist_context(context_id, &snapshot) {
+            if let Err(e) = persistence.persist_context(context_id, &snapshot).await {
                 // Best-effort persistence: log but don't fail the operation.
                 // In-memory state remains authoritative.
                 crate::metrics::record_persistence_failure();
@@ -2226,9 +2228,13 @@ impl ContextManager {
 
     /// Persists a broadcast context snapshot if a persistence provider is
     /// configured. Best-effort: logs errors but does not propagate.
-    fn persist_broadcast_snapshot(&self, context_id: &str, snapshot: &BroadcastContextSnapshot) {
+    async fn persist_broadcast_snapshot(
+        &self,
+        context_id: &str,
+        snapshot: &BroadcastContextSnapshot,
+    ) {
         if let Some(ref persistence) = self.persistence
-            && let Err(e) = persistence.persist_broadcast(context_id, snapshot)
+            && let Err(e) = persistence.persist_broadcast(context_id, snapshot).await
         {
             tracing::warn!(
                 context_id = %context_id,
@@ -2242,7 +2248,7 @@ impl ContextManager {
     /// (SCP-227). Derives admission policy from `template_id` and registers
     /// the creator as the first author. Persists the initial broadcast state
     /// for crash recovery.
-    fn init_broadcast_context(
+    async fn init_broadcast_context(
         &self,
         context_id: &str,
         params: &ContextParams,
@@ -2265,7 +2271,8 @@ impl ContextManager {
             .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
         // Persist initial broadcast state for crash recovery.
         if self.has_persistence() {
-            self.persist_broadcast_snapshot(context_id, &bc.to_snapshot());
+            self.persist_broadcast_snapshot(context_id, &bc.to_snapshot())
+                .await;
         }
         Ok(Some(bc))
     }
@@ -2282,9 +2289,9 @@ impl ContextManager {
                 .as_ref()
                 .map(BroadcastContext::to_snapshot);
             drop(ctx);
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
             if let Some(ref bcs) = bc_snapshot {
-                self.persist_broadcast_snapshot(context_id, bcs);
+                self.persist_broadcast_snapshot(context_id, bcs).await;
             }
         }
     }

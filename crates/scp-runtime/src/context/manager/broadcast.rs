@@ -87,7 +87,7 @@ impl ContextManager {
 
         // Persist broadcast state for crash recovery.
         if let Some(ref snapshot) = snapshot {
-            self.persist_broadcast_snapshot(context_id, snapshot);
+            self.persist_broadcast_snapshot(context_id, snapshot).await;
         }
 
         // Persist context state after subscribe (best-effort).
@@ -97,7 +97,8 @@ impl ContextManager {
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let ctx_snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(context_id, ctx_snapshot);
+            self.persist_context_snapshot(context_id, ctx_snapshot)
+                .await;
         }
 
         // Append event to persistent event log.
@@ -175,7 +176,7 @@ impl ContextManager {
 
         // Persist broadcast state for crash recovery.
         if let Some(ref snapshot) = snapshot {
-            self.persist_broadcast_snapshot(context_id, snapshot);
+            self.persist_broadcast_snapshot(context_id, snapshot).await;
         }
 
         // Persist context state after unsubscribe (best-effort).
@@ -185,7 +186,8 @@ impl ContextManager {
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let ctx_snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(context_id, ctx_snapshot);
+            self.persist_context_snapshot(context_id, ctx_snapshot)
+                .await;
         }
 
         self.event_log.append_context_event(
@@ -325,7 +327,8 @@ impl ContextManager {
 
         // Send via transport.
         self.transport
-            .send_message(&context_id_bytes, &envelope_bytes)?;
+            .send_message(&context_id_bytes, &envelope_bytes)
+            .await?;
 
         // Append event to persistent event log.
         self.event_log.append_context_event(
@@ -436,7 +439,7 @@ impl ContextManager {
 
         // Persist broadcast state for crash recovery.
         if let Some(ref snapshot) = snapshot {
-            self.persist_broadcast_snapshot(context_id, snapshot);
+            self.persist_broadcast_snapshot(context_id, snapshot).await;
         }
 
         self.event_log.append_context_event(
@@ -514,7 +517,7 @@ impl ContextManager {
 
         // Persist broadcast state for crash recovery.
         if let Some(ref snapshot) = snapshot {
-            self.persist_broadcast_snapshot(context_id, snapshot);
+            self.persist_broadcast_snapshot(context_id, snapshot).await;
         }
 
         self.event_log.append_context_event(

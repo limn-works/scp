@@ -229,13 +229,15 @@ pub fn py_fullstack_join_from_welcome(node: &PyFullStackNode, context_id: String
     // Step 2b: Regenerate the joiner's sender key and distribute it to
     // existing members. The key from create_context was for the throwaway
     // MLS group and is now stale.
-    node.inner
-        .regenerate_and_distribute_sender_key(&ctx_bytes)
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to distribute joiner sender key: {e}"
-            ))
-        })?;
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(node.inner.regenerate_and_distribute_sender_key(&ctx_bytes))
+    })
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to distribute joiner sender key: {e}"
+        ))
+    })?;
 
     // Step 2c: Sync all members' access keys into the ContextManager's
     // PerContextState so that send_message wraps content for all recipients.
@@ -274,24 +276,32 @@ pub fn py_fullstack_sync_sender_keys(
     let did_b = node_b.inner.did.to_string();
 
     // A distributes to B, B distributes to A.
-    node_a
-        .inner
-        .crypto
-        .distribute_sender_key(&ctx_bytes, &did_b)
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to distribute sender key from A to B: {e}"
-            ))
-        })?;
-    node_b
-        .inner
-        .crypto
-        .distribute_sender_key(&ctx_bytes, &did_a)
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to distribute sender key from B to A: {e}"
-            ))
-        })?;
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(
+            node_a
+                .inner
+                .crypto
+                .distribute_sender_key(&ctx_bytes, &did_b),
+        )
+    })
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to distribute sender key from A to B: {e}"
+        ))
+    })?;
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(
+            node_b
+                .inner
+                .crypto
+                .distribute_sender_key(&ctx_bytes, &did_a),
+        )
+    })
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to distribute sender key from B to A: {e}"
+        ))
+    })?;
 
     // Both pick up the other's key.
     node_a.inner.pickup_sender_keys(&ctx_bytes).map_err(|e| {
@@ -361,12 +371,17 @@ pub fn py_fullstack_decrypt_message<'py>(
     sender_did: String,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let ctx_bytes = context_id_bytes(&context_id);
-    let plaintext = node
-        .inner
-        .decrypt_message(&context_id, &ctx_bytes, ciphertext, &sender_did)
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to decrypt message: {e}"))
-        })?;
+    let plaintext = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(node.inner.decrypt_message(
+            &context_id,
+            &ctx_bytes,
+            ciphertext,
+            &sender_did,
+        ))
+    })
+    .map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to decrypt message: {e}"))
+    })?;
 
     Ok(PyBytes::new(py, &plaintext))
 }

@@ -1047,7 +1047,7 @@ impl ContextManager {
         // variant exists yet. Governance actions are free until the economy
         // spec adds a governance cost tier. Tracked by #1537.
 
-        let result = match self.dispatch_governance_action(context_id, proposal).await {
+        let result = match Box::pin(self.dispatch_governance_action(context_id, proposal)).await {
             Ok(r) => r,
             Err(e) => {
                 // Roll back the executed marker on dispatch failure so the
@@ -1272,7 +1272,7 @@ impl ContextManager {
                 // 4. Persist the updated context state (best-effort).
                 if self.has_persistence() {
                     let snapshot = Self::snapshot_context(ctx);
-                    self.persist_context_snapshot(context_id, snapshot);
+                    self.persist_context_snapshot(context_id, snapshot).await;
                 }
             } else {
                 tracing::warn!(
@@ -1345,7 +1345,7 @@ impl ContextManager {
                 };
 
                 if let Some(snapshot) = snapshot {
-                    self.persist_context_snapshot(context_id, snapshot);
+                    self.persist_context_snapshot(context_id, snapshot).await;
                 }
                 let context_id_bytes = context_id_to_bytes(context_id);
                 self.event_log.append_context_event(
@@ -1743,8 +1743,14 @@ impl ContextManager {
         ),
         ContextError,
     > {
-        self.propose_governance_action_inner(context_id, proposer_did, action, signing_key, false)
-            .await
+        Box::pin(self.propose_governance_action_inner(
+            context_id,
+            proposer_did,
+            action,
+            signing_key,
+            false,
+        ))
+        .await
     }
 
     /// Inner implementation of proposal submission with auto-execution.
@@ -1930,10 +1936,7 @@ impl ContextManager {
         // If the proposal was auto-approved (SingleAdmin), execute immediately
         // — unless it was invalidated by conflict or governance is frozen.
         let execution_result = if should_execute && !invalidated_by_conflict && !in_freeze {
-            Some(
-                self.execute_governance_action(context_id, &proposal)
-                    .await?,
-            )
+            Some(Box::pin(self.execute_governance_action(context_id, &proposal)).await?)
         } else {
             None
         };
@@ -1945,7 +1948,7 @@ impl ContextManager {
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
 
         Ok((proposal, events, execution_result))
@@ -1984,14 +1987,14 @@ impl ContextManager {
         approve: bool,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
-        self.vote_on_proposal_inner(
+        Box::pin(self.vote_on_proposal_inner(
             context_id,
             proposal_id,
             voter_did,
             approve,
             signing_key,
             false,
-        )
+        ))
         .await
     }
 
@@ -2143,8 +2146,7 @@ impl ContextManager {
             };
 
             if !in_freeze && !invalidated_by_conflict {
-                self.execute_governance_action(context_id, &proposal)
-                    .await?;
+                Box::pin(self.execute_governance_action(context_id, &proposal)).await?;
             }
         }
 
@@ -2155,7 +2157,7 @@ impl ContextManager {
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
 
         Ok((status, events))
@@ -2249,9 +2251,14 @@ impl ContextManager {
         // under the same lock as the proposal submission. This eliminates
         // the TOCTOU race where a separate check-then-act pattern allowed
         // capability revocation between the check and the propose.
-        let (proposal, _events, execution_result) = self
-            .propose_governance_action_inner(context_id, proposer_did, action, signing_key, true)
-            .await?;
+        let (proposal, _events, execution_result) = Box::pin(self.propose_governance_action_inner(
+            context_id,
+            proposer_did,
+            action,
+            signing_key,
+            true,
+        ))
+        .await?;
 
         let status = proposal.status.clone();
         Ok(ProposalOutcome {
@@ -2284,9 +2291,15 @@ impl ContextManager {
         // Capability check is atomic inside vote_on_proposal_inner (under
         // the same lock as the vote) — eliminates the TOCTOU window from
         // the previous separate lock block.
-        let (status, _events) = self
-            .vote_on_proposal_inner(context_id, proposal_id, voter_did, true, signing_key, true)
-            .await?;
+        let (status, _events) = Box::pin(self.vote_on_proposal_inner(
+            context_id,
+            proposal_id,
+            voter_did,
+            true,
+            signing_key,
+            true,
+        ))
+        .await?;
 
         Ok(status)
     }
@@ -2314,9 +2327,15 @@ impl ContextManager {
         // Capability check is atomic inside vote_on_proposal_inner (under
         // the same lock as the vote) — eliminates the TOCTOU window from
         // the previous separate lock block.
-        let (status, _events) = self
-            .vote_on_proposal_inner(context_id, proposal_id, voter_did, false, signing_key, true)
-            .await?;
+        let (status, _events) = Box::pin(self.vote_on_proposal_inner(
+            context_id,
+            proposal_id,
+            voter_did,
+            false,
+            signing_key,
+            true,
+        ))
+        .await?;
 
         Ok(status)
     }
@@ -2380,7 +2399,7 @@ impl ContextManager {
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
 
         Ok(status)
@@ -2442,7 +2461,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log
             .append_context_event(&context_id_bytes, "MemberSuspended", actor_did)?;
@@ -2580,10 +2599,11 @@ impl ContextManager {
         };
 
         if let Some(ctx_snapshot) = ctx_snapshot {
-            self.persist_context_snapshot(context_id, ctx_snapshot);
+            self.persist_context_snapshot(context_id, ctx_snapshot)
+                .await;
         }
         if let Some(ref bc_snap) = bc_snapshot {
-            self.persist_broadcast_snapshot(context_id, bc_snap);
+            self.persist_broadcast_snapshot(context_id, bc_snap).await;
         }
         self.event_log.append_context_event_with_payload(
             &context_id_bytes,
@@ -2605,14 +2625,17 @@ impl ContextManager {
         // during revoke, so rotation failure does not leave the group in an
         // inconsistent state — warn and continue.
         if needs_sender_key_rotation {
-            if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes) {
+            if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes).await {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
                     "rotate_sender_key failed after access revocation"
                 );
             }
-            if let Err(e) = self.drain_and_deliver_sender_keys(context_id, &context_id_bytes) {
+            if let Err(e) = self
+                .drain_and_deliver_sender_keys(context_id, &context_id_bytes)
+                .await
+            {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
@@ -2728,10 +2751,11 @@ impl ContextManager {
         };
 
         if let Some(ctx_snapshot) = ctx_snapshot {
-            self.persist_context_snapshot(context_id, ctx_snapshot);
+            self.persist_context_snapshot(context_id, ctx_snapshot)
+                .await;
         }
         if let Some(ref bc_snap) = bc_snapshot {
-            self.persist_broadcast_snapshot(context_id, bc_snap);
+            self.persist_broadcast_snapshot(context_id, bc_snap).await;
         }
         self.event_log
             .append_context_event(&context_id_bytes, "AccessRestored", actor_did)?;
@@ -2769,6 +2793,7 @@ impl ContextManager {
             let add_output = self
                 .crypto
                 .add_member(&context_id_bytes, did, None)
+                .await
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Add to role state.
@@ -2819,7 +2844,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log
             .append_context_event(&context_id_bytes, "MemberJoined", actor_did)?;
@@ -2861,6 +2886,7 @@ impl ContextManager {
             let remove_output = self
                 .crypto
                 .remove_member(&context_id_bytes, did)
+                .await
                 .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
             // Sender key cleanup is best-effort: log failures but do not
@@ -2870,6 +2896,7 @@ impl ContextManager {
             if let Err(e) = self
                 .crypto
                 .remove_member_sender_key(&context_id_bytes, did.as_ref())
+                .await
             {
                 tracing::warn!(
                     context_id,
@@ -2888,7 +2915,7 @@ impl ContextManager {
             // If rotation fails after MLS removal succeeded, returning Err
             // would leave the system inconsistent (member removed from MLS
             // but governance action appears to have failed).
-            if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes) {
+            if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes).await {
                 tracing::warn!(
                     context_id,
                     error = %e,
@@ -2936,7 +2963,10 @@ impl ContextManager {
 
         // Drain pending sender key distribution messages queued by
         // rotate_sender_key, MLS-encrypt, and deliver via transport (§9.16.2).
-        if let Err(e) = self.drain_and_deliver_sender_keys(context_id, &context_id_bytes) {
+        if let Err(e) = self
+            .drain_and_deliver_sender_keys(context_id, &context_id_bytes)
+            .await
+        {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -2945,7 +2975,7 @@ impl ContextManager {
         }
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log
             .append_context_event(&context_id_bytes, "MemberLeft", actor_did)?;
@@ -3009,7 +3039,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log
             .append_context_event(&context_id_bytes, "RoleAssigned", actor_did)?;
@@ -3064,7 +3094,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log
             .append_context_event(&context_id_bytes, "ToolRegistered", actor_did)?;
@@ -3106,7 +3136,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log
             .append_context_event(&context_id_bytes, "ToolRemoved", actor_did)?;
@@ -3182,7 +3212,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log.append_context_event(
             &context_id_bytes,
@@ -3246,7 +3276,7 @@ impl ContextManager {
 
         if applied {
             if let Some(snapshot) = snapshot {
-                self.persist_context_snapshot(context_id, snapshot);
+                self.persist_context_snapshot(context_id, snapshot).await;
             }
             self.event_log
                 .append_context_event(&context_id_bytes, "CeilingModified", "")?;
@@ -3318,7 +3348,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log
             .append_context_event(&context_id_bytes, "ContextClosing", actor_did)?;
@@ -3426,7 +3456,7 @@ impl ContextManager {
         }
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
 
         // §5.10.1 step 5: Record TTLExtended event with structured payload
@@ -3519,7 +3549,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log
             .append_context_event(&context_id_bytes, "AdminTransferred", actor_did)?;
@@ -3645,7 +3675,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log.append_context_event(
             &context_id_bytes,
@@ -3732,7 +3762,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log
             .append_context_event(&context_id_bytes, "SignerAdded", actor_did)?;
@@ -3812,7 +3842,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log
             .append_context_event(&context_id_bytes, "SignerRemoved", actor_did)?;
@@ -3859,7 +3889,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log
             .append_context_event(&context_id_bytes, "ThresholdModified", actor_did)?;
@@ -3914,7 +3944,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log.append_context_event(
             &context_id_bytes,
@@ -3957,11 +3987,13 @@ impl ContextManager {
         let remove_output = self
             .crypto
             .remove_member(&context_id_bytes, did)
+            .await
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         // Step 2: Re-add to MLS group with fresh key material.
         let add_output = self
             .crypto
             .add_member(&context_id_bytes, did, None)
+            .await
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
         // Broadcast the MLS Commits so remaining members can process
@@ -3996,6 +4028,7 @@ impl ContextManager {
         if let Err(e) = self
             .crypto
             .remove_member_sender_key(&context_id_bytes, did.as_ref())
+            .await
         {
             tracing::warn!(
                 context_id,
@@ -4005,7 +4038,7 @@ impl ContextManager {
                  sender key layer may retain stale key"
             );
         }
-        if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes) {
+        if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes).await {
             tracing::warn!(
                 context_id,
                 error = %e,
@@ -4015,7 +4048,10 @@ impl ContextManager {
 
         // Drain pending sender key distribution messages, MLS-encrypt,
         // and deliver via transport (same pattern as lifecycle leave).
-        if let Err(e) = self.drain_and_deliver_sender_keys(context_id, &context_id_bytes) {
+        if let Err(e) = self
+            .drain_and_deliver_sender_keys(context_id, &context_id_bytes)
+            .await
+        {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -4156,7 +4192,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log.append_context_event(
             &context_id_bytes,
@@ -4242,7 +4278,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log
             .append_context_event(&context_id_bytes, "ContextPromoted", actor_did)?;
@@ -4303,7 +4339,7 @@ impl ContextManager {
                 (None, snap)
             } else {
                 // Encrypted mode: advance MLS epoch via propose_update (#1548).
-                let epoch_out = self.crypto.advance_epoch(&context_id_bytes)?;
+                let epoch_out = self.crypto.advance_epoch(&context_id_bytes).await?;
 
                 // Encrypted mode: regenerate per-member access keys at a new
                 // epoch (§9.17.2 step 6, ADR-038). MLS key rotation and access
@@ -4361,10 +4397,10 @@ impl ContextManager {
         }
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         if let Some(ref snap) = bc_snapshot {
-            self.persist_broadcast_snapshot(context_id, snap);
+            self.persist_broadcast_snapshot(context_id, snap).await;
         }
 
         self.event_log
@@ -4470,7 +4506,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log.append_context_event(
             &context_id_bytes,
@@ -4567,7 +4603,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log.append_context_event(
             &context_id_bytes,
@@ -4628,7 +4664,7 @@ impl ContextManager {
 
         if applied {
             if let Some(snapshot) = snapshot {
-                self.persist_context_snapshot(context_id, snapshot);
+                self.persist_context_snapshot(context_id, snapshot).await;
             }
             self.event_log
                 .append_context_event(&context_id_bytes, "EconomicPolicyApplied", "")?;
@@ -4691,7 +4727,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         let payload = serde_json::json!({
             "event": "SpendApproved",
@@ -4752,7 +4788,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log.append_context_event(
             &context_id_bytes,
@@ -4841,7 +4877,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log.append_context_event(
             &context_id_bytes,
@@ -5006,7 +5042,7 @@ impl ContextManager {
         }
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log.append_context_event(
             &context_id_bytes,
@@ -5097,7 +5133,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log.append_context_event(
             &context_id_bytes,
@@ -5207,7 +5243,7 @@ impl ContextManager {
         };
 
         if let Some(snapshot) = snapshot {
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         self.event_log.append_context_event(
             &context_id_bytes,
@@ -5846,7 +5882,11 @@ impl ContextManager {
         }
         let routing_id = scp_protocol::context::context_routing_id(context_id);
         // First attempt: try to send immediately.
-        match self.transport.send_message(&routing_id, &commit_bytes) {
+        match self
+            .transport
+            .send_message(&routing_id, &commit_bytes)
+            .await
+        {
             Ok(()) => {
                 let context_id_bytes = context_id_to_bytes(context_id);
                 self.event_log.append_context_event(
@@ -5998,7 +6038,8 @@ impl ContextManager {
         let now = clock.now_secs();
         // Phase A (no lock held): retry each pending entry whose backoff has
         // elapsed and classify the outcome.
-        let outcomes = Self::compute_commit_retry_outcomes(&snapshot, now, transport.as_ref());
+        let outcomes =
+            Self::compute_commit_retry_outcomes(&snapshot, now, transport.as_ref()).await;
         if outcomes.is_empty() {
             return;
         }
@@ -6033,7 +6074,7 @@ impl ContextManager {
     /// pending commit whose backoff has elapsed as `Success`, `Retry`,
     /// or `Failed`. Returns one outcome per processed entry (entries whose
     /// `next_attempt_at` is still in the future are skipped).
-    fn compute_commit_retry_outcomes(
+    async fn compute_commit_retry_outcomes(
         snapshot: &[PendingCommit],
         now: u64,
         transport: &dyn super::ContextTransportProvider,
@@ -6058,7 +6099,10 @@ impl ContextManager {
                 continue;
             }
             // Attempt the send.
-            match transport.send_message(&pending.routing_id, &pending.commit_bytes) {
+            match transport
+                .send_message(&pending.routing_id, &pending.commit_bytes)
+                .await
+            {
                 Ok(()) => {
                     outcomes.push(CommitRetryOutcome {
                         index: idx,

@@ -255,7 +255,7 @@ impl ContextManager {
 
         // 2. Perform the MLS epoch advance (Update + self-Commit).
         //    If this fails the counter is NOT incremented.
-        let epoch_output = self.crypto.advance_epoch(&context_id_bytes)?;
+        let epoch_output = self.crypto.advance_epoch(&context_id_bytes).await?;
 
         // 2b. Broadcast the MLS Commit to all members so they can advance
         //     their group epoch and ratchet key material.
@@ -264,6 +264,7 @@ impl ContextManager {
             if let Err(e) = self
                 .transport
                 .send_message(&routing_id, &epoch_output.commit_bytes)
+                .await
             {
                 tracing::warn!(
                     context_id = %context_id,
@@ -316,7 +317,7 @@ impl ContextManager {
         {
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
 
         Ok(new_epoch)
@@ -384,15 +385,18 @@ impl ContextManager {
         // Use domain-separated routing ID for relay routing, distinct from
         // the raw context_id_bytes used for MLS crypto keying.
         let routing_id = scp_protocol::context::context_routing_id(context_id);
-        let encrypted = self.crypto.seal(
-            &context_id_bytes,
-            &inner,
-            &routing_id,
-            300, // 5 minute blob TTL
-        )?;
+        let encrypted = self
+            .crypto
+            .seal(
+                &context_id_bytes,
+                &inner,
+                &routing_id,
+                300, // 5 minute blob TTL
+            )
+            .await?;
 
         // Send via transport using the domain-separated routing ID.
-        self.transport.send_message(&routing_id, &encrypted)?;
+        self.transport.send_message(&routing_id, &encrypted).await?;
 
         Ok(())
     }

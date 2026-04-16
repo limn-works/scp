@@ -2620,6 +2620,7 @@ fn py_restore_context(context_id: &str) -> PyResult<()> {
         // subsequent finalize_close.
         let (snapshot, _broadcast) = mgr
             .load_persisted_context_state(&context_id_owned)
+            .await
             .map_err(|e| {
                 PyRuntimeError::new_err(format!(
                     "SCP-CTX-2064: failed to load persisted state: {e}"

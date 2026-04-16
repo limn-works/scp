@@ -854,50 +854,51 @@ async fn end_to_end_network_demo() {
 #[derive(Default)]
 struct DemoCrypto;
 
+#[async_trait::async_trait]
 impl scp_core::context::builder::ContextCryptoProvider for DemoCrypto {
-    fn validate_creator_identity(
+    async fn validate_creator_identity(
         &self,
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         Ok(())
     }
-    fn create_mls_group(
-        &self,
-        _: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn generate_sender_key(
+    async fn create_mls_group(
         &self,
         _: &[u8; 32],
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         Ok(())
     }
-    fn init_broadcast_key(
+    async fn generate_sender_key(
         &self,
         _: &[u8; 32],
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         Ok(())
     }
-    fn destroy_mls_group(
+    async fn init_broadcast_key(
         &self,
         _: &[u8; 32],
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         Ok(())
     }
-    fn destroy_sender_key(
+    async fn destroy_mls_group(
         &self,
         _: &[u8; 32],
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         Ok(())
     }
-    fn validate_key_package(
+    async fn destroy_sender_key(
+        &self,
+        _: &[u8; 32],
+    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
+        Ok(())
+    }
+    async fn validate_key_package(
         &self,
         _: &str,
         _: Option<&[u8]>,
     ) -> Result<(), scp_core::context::ContextError> {
         Ok(())
     }
-    fn add_member(
+    async fn add_member(
         &self,
         _: &[u8; 32],
         _: &str,
@@ -905,21 +906,21 @@ impl scp_core::context::builder::ContextCryptoProvider for DemoCrypto {
     ) -> Result<scp_core::context::AddMemberOutput, scp_core::context::ContextError> {
         Ok(scp_core::context::AddMemberOutput::default())
     }
-    fn remove_member(
+    async fn remove_member(
         &self,
         _: &[u8; 32],
         _: &str,
     ) -> Result<scp_core::context::RemoveMemberOutput, scp_core::context::ContextError> {
         Ok(scp_core::context::RemoveMemberOutput::default())
     }
-    fn distribute_sender_key(
+    async fn distribute_sender_key(
         &self,
         _: &[u8; 32],
         _: &str,
     ) -> Result<(), scp_core::context::ContextError> {
         Ok(())
     }
-    fn remove_member_sender_key(
+    async fn remove_member_sender_key(
         &self,
         _: &[u8; 32],
         _: &str,
@@ -927,7 +928,7 @@ impl scp_core::context::builder::ContextCryptoProvider for DemoCrypto {
         Ok(())
     }
 
-    fn seal(
+    async fn seal(
         &self,
         _context_id: &[u8; 32],
         inner: &scp_core::envelope::inner::InnerEnvelope,
@@ -939,7 +940,7 @@ impl scp_core::context::builder::ContextCryptoProvider for DemoCrypto {
             .map_err(|e| scp_core::context::ContextError::CryptoFailed(format!("mock seal: {e}")))
     }
 
-    fn open(
+    async fn open(
         &self,
         _context_id: &[u8; 32],
         outer_bytes: &[u8],
@@ -978,24 +979,25 @@ impl DemoTransport {
     }
 }
 
+#[async_trait::async_trait]
 impl scp_core::context::builder::ContextTransportProvider for DemoTransport {
     fn is_connected(&self) -> bool {
         self.connected.load(std::sync::atomic::Ordering::Relaxed)
     }
-    fn publish_context(
+    async fn publish_context(
         &self,
         _: &[u8; 32],
         _: &scp_core::context::ContextParams,
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         Ok(())
     }
-    fn delete_published(
+    async fn delete_published(
         &self,
         _: &[u8; 32],
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         Ok(())
     }
-    fn send_message(
+    async fn send_message(
         &self,
         _: &[u8; 32],
         payload: &[u8],

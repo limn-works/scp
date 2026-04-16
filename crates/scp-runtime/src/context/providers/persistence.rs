@@ -65,8 +65,9 @@ impl Default for InMemoryPersistence {
     }
 }
 
+#[async_trait::async_trait]
 impl ContextPersistence for InMemoryPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
@@ -78,7 +79,7 @@ impl ContextPersistence for InMemoryPersistence {
         Ok(())
     }
 
-    fn load_context(
+    async fn load_context(
         &self,
         context_id: &str,
     ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
@@ -90,7 +91,7 @@ impl ContextPersistence for InMemoryPersistence {
             .cloned())
     }
 
-    fn persist_broadcast(
+    async fn persist_broadcast(
         &self,
         context_id: &str,
         snapshot: &BroadcastContextSnapshot,
@@ -102,7 +103,7 @@ impl ContextPersistence for InMemoryPersistence {
         Ok(())
     }
 
-    fn load_broadcast(
+    async fn load_broadcast(
         &self,
         context_id: &str,
     ) -> Result<Option<BroadcastContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
@@ -114,7 +115,7 @@ impl ContextPersistence for InMemoryPersistence {
             .cloned())
     }
 
-    fn delete_context(
+    async fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -129,7 +130,7 @@ impl ContextPersistence for InMemoryPersistence {
         Ok(())
     }
 
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self
@@ -214,68 +215,76 @@ mod tests {
         }
     }
 
-    #[test]
-    fn persist_and_load_context_roundtrip() {
+    #[tokio::test]
+    async fn persist_and_load_context_roundtrip() {
         let persistence = InMemoryPersistence::new();
         let snapshot = test_snapshot("ctx-1");
 
-        persistence.persist_context("ctx-1", &snapshot).unwrap();
+        persistence
+            .persist_context("ctx-1", &snapshot)
+            .await
+            .unwrap();
 
-        let loaded = persistence.load_context("ctx-1").unwrap();
+        let loaded = persistence.load_context("ctx-1").await.unwrap();
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
         assert_eq!(loaded.context_id, "ctx-1");
         assert_eq!(loaded.state, ContextState::Active);
     }
 
-    #[test]
-    fn load_missing_context_returns_none() {
+    #[tokio::test]
+    async fn load_missing_context_returns_none() {
         let persistence = InMemoryPersistence::new();
-        let loaded = persistence.load_context("nonexistent").unwrap();
+        let loaded = persistence.load_context("nonexistent").await.unwrap();
         assert!(loaded.is_none());
     }
 
-    #[test]
-    fn delete_context_removes_both_stores() {
+    #[tokio::test]
+    async fn delete_context_removes_both_stores() {
         let persistence = InMemoryPersistence::new();
         let snapshot = test_snapshot("ctx-del");
 
-        persistence.persist_context("ctx-del", &snapshot).unwrap();
+        persistence
+            .persist_context("ctx-del", &snapshot)
+            .await
+            .unwrap();
 
-        persistence.delete_context("ctx-del").unwrap();
+        persistence.delete_context("ctx-del").await.unwrap();
 
-        assert!(persistence.load_context("ctx-del").unwrap().is_none());
+        assert!(persistence.load_context("ctx-del").await.unwrap().is_none());
     }
 
-    #[test]
-    fn list_persisted_contexts() {
+    #[tokio::test]
+    async fn list_persisted_contexts() {
         let persistence = InMemoryPersistence::new();
 
         persistence
             .persist_context("ctx-a", &test_snapshot("ctx-a"))
+            .await
             .unwrap();
         persistence
             .persist_context("ctx-b", &test_snapshot("ctx-b"))
+            .await
             .unwrap();
 
-        let mut list = persistence.list_persisted_contexts().unwrap();
+        let mut list = persistence.list_persisted_contexts().await.unwrap();
         list.sort();
         assert_eq!(list, vec!["ctx-a", "ctx-b"]);
     }
 
-    #[test]
-    fn persist_overwrites_existing() {
+    #[tokio::test]
+    async fn persist_overwrites_existing() {
         let persistence = InMemoryPersistence::new();
 
         let mut snap1 = test_snapshot("ctx-ow");
         snap1.threshold_value = 1;
-        persistence.persist_context("ctx-ow", &snap1).unwrap();
+        persistence.persist_context("ctx-ow", &snap1).await.unwrap();
 
         let mut snap2 = test_snapshot("ctx-ow");
         snap2.threshold_value = 42;
-        persistence.persist_context("ctx-ow", &snap2).unwrap();
+        persistence.persist_context("ctx-ow", &snap2).await.unwrap();
 
-        let loaded = persistence.load_context("ctx-ow").unwrap().unwrap();
+        let loaded = persistence.load_context("ctx-ow").await.unwrap().unwrap();
         assert_eq!(loaded.threshold_value, 42);
     }
 }

@@ -223,7 +223,7 @@ pub fn fullstack_add_member(
 /// with a `ContextHandle`, enabling subsequent `fullstack_send_message` and
 /// `fullstack_remove_member` calls on this node.
 #[napi]
-pub fn fullstack_join_from_welcome(
+pub async fn fullstack_join_from_welcome(
     node: &NapiFullStackNode,
     context_id: String,
 ) -> napi::Result<()> {
@@ -270,6 +270,7 @@ pub fn fullstack_join_from_welcome(
     // MLS group and is now stale.
     node.inner
         .regenerate_and_distribute_sender_key(&ctx_bytes)
+        .await
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
                 message: format!("failed to distribute joiner sender key: {e}"),
@@ -308,7 +309,7 @@ pub fn fullstack_join_from_welcome(
 /// Call this after `fullstack_join_from_welcome` to enable bidirectional
 /// messaging in tests.
 #[napi]
-pub fn fullstack_sync_sender_keys(
+pub async fn fullstack_sync_sender_keys(
     node_a: &NapiFullStackNode,
     node_b: &NapiFullStackNode,
     context_id: String,
@@ -322,6 +323,7 @@ pub fn fullstack_sync_sender_keys(
         .inner
         .crypto
         .distribute_sender_key(&ctx_bytes, &did_b)
+        .await
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
                 message: format!("failed to distribute sender key from A to B: {e}"),
@@ -332,6 +334,7 @@ pub fn fullstack_sync_sender_keys(
         .inner
         .crypto
         .distribute_sender_key(&ctx_bytes, &did_a)
+        .await
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
                 message: format!("failed to distribute sender key from B to A: {e}"),
@@ -417,7 +420,7 @@ pub fn fullstack_send_message(
 /// epoch is current (handles multi-party scenarios where a third member
 /// was added after this node last synced).
 #[napi]
-pub fn fullstack_decrypt_message(
+pub async fn fullstack_decrypt_message(
     node: &NapiFullStackNode,
     context_id: String,
     ciphertext: Buffer,
@@ -427,6 +430,7 @@ pub fn fullstack_decrypt_message(
     let plaintext = node
         .inner
         .decrypt_message(&context_id, &ctx_bytes, &ciphertext, &sender_did)
+        .await
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Crypto {
                 message: format!("failed to decrypt message: {e}"),

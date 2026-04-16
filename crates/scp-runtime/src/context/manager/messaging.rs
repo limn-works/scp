@@ -119,7 +119,7 @@ pub(super) const DEFAULT_BLOB_TTL_SECS: u32 = 300;
 /// Handles: access key wrapping, inner envelope creation (sign + pad),
 /// and sealing (sender key + MLS + outer envelope).
 #[allow(clippy::too_many_arguments)]
-fn build_encrypted_envelope(
+async fn build_encrypted_envelope(
     manager: &ContextManager,
     context_id: &str,
     sender_did: &DID,
@@ -204,12 +204,15 @@ fn build_encrypted_envelope(
     // context_id_bytes, to prevent routing IDs from colliding with other
     // SHA-256(context_id) usages (MLS groups, event logs).
     let routing_id = derive_routing_id(context_id);
-    manager.crypto.seal(
-        &context_id_bytes,
-        &inner,
-        &routing_id,
-        DEFAULT_BLOB_TTL_SECS,
-    )
+    manager
+        .crypto
+        .seal(
+            &context_id_bytes,
+            &inner,
+            &routing_id,
+            DEFAULT_BLOB_TTL_SECS,
+        )
+        .await
 }
 
 /// Verifies signature and unwraps access keys from a received inner envelope.
@@ -490,17 +493,19 @@ impl ContextManager {
         };
 
         // Phase 2: encrypt + send (no lock held).
-        let phase2_result = self.encrypt_and_send(
-            broadcast_envelope,
-            signing_key,
-            &context_id,
-            sender_did,
-            payload,
-            &recipients_data,
-            sequence,
-            source_provenance,
-            &routing_id,
-        );
+        let phase2_result = self
+            .encrypt_and_send(
+                broadcast_envelope,
+                signing_key,
+                &context_id,
+                sender_did,
+                payload,
+                &recipients_data,
+                sequence,
+                source_provenance,
+                &routing_id,
+            )
+            .await;
         if let Err(e) = phase2_result {
             // Void the escrow hold and roll back the full ticket (budget,
             // velocity, hard-rate-limit) on send failure. F4: before this
@@ -548,7 +553,7 @@ impl ContextManager {
     ///
     /// Extracted to keep `send_message` within the clippy `too_many_lines` limit.
     #[allow(clippy::too_many_arguments)]
-    fn encrypt_and_send(
+    async fn encrypt_and_send(
         &self,
         broadcast_envelope: Option<scp_protocol::crypto::sender_keys::broadcast::BroadcastEnvelope>,
         signing_key: Option<&ed25519_dalek::SigningKey>,
@@ -580,11 +585,12 @@ impl ContextManager {
                 recipients_data,
                 sequence,
                 source_provenance,
-            )?;
+            )
+            .await?;
             crate::metrics::record_encrypt_duration(encrypt_start.elapsed());
             result
         };
-        self.transport.send_message(routing_id, &encrypted)?;
+        self.transport.send_message(routing_id, &encrypted).await?;
         crate::metrics::record_message_sent();
         Ok(())
     }
@@ -769,7 +775,7 @@ impl ContextManager {
         {
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
         Ok(())
     }
@@ -779,14 +785,14 @@ impl ContextManager {
     /// Returns `Some(OpenedEnvelope)` for application messages that need further
     /// processing, or `None` for control/management messages that are handled
     /// internally.
-    fn decrypt_and_dispatch(
+    async fn decrypt_and_dispatch(
         &self,
         context_id: &str,
         context_id_bytes: &[u8; 32],
         encrypted_blob: &[u8],
     ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
         let decrypt_start = std::time::Instant::now();
-        let open_result = self.crypto.open(context_id_bytes, encrypted_blob)?;
+        let open_result = self.crypto.open(context_id_bytes, encrypted_blob).await?;
         crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
 
         match open_result {
@@ -798,7 +804,8 @@ impl ContextManager {
             } => {
                 tracing::debug!(sender_did = %sender_did, context_id = %context_id, "received MLS-wrapped management message");
                 self.crypto
-                    .process_incoming_sender_key(context_id_bytes, &sender_did, &payload)?;
+                    .process_incoming_sender_key(context_id_bytes, &sender_did, &payload)
+                    .await?;
                 Ok(None)
             }
         }
@@ -857,8 +864,9 @@ impl ContextManager {
         drop(local_dids);
 
         // Phase 2: open envelope (MLS + sender key + deserialize + integrity).
-        let Some(opened_envelope) =
-            self.decrypt_and_dispatch(context_id, &context_id_bytes, encrypted_blob)?
+        let Some(opened_envelope) = self
+            .decrypt_and_dispatch(context_id, &context_id_bytes, encrypted_blob)
+            .await?
         else {
             return Ok(None);
         };

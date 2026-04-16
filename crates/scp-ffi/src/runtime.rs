@@ -331,33 +331,37 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
 /// `None` key packages which `MlsCryptoProvider` rejects.
 struct NoOpCryptoProvider;
 
+#[async_trait::async_trait]
 impl ContextCryptoProvider for NoOpCryptoProvider {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+    async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn create_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn create_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn generate_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn generate_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn init_broadcast_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_broadcast_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn destroy_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn destroy_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn validate_key_package(
+    async fn validate_key_package(
         &self,
         _owner_did: &str,
         _key_package_bytes: Option<&[u8]>,
     ) -> Result<(), ContextError> {
         Ok(())
     }
-    fn add_member(
+    async fn add_member(
         &self,
         _context_id: &[u8; 32],
         _member_did: &str,
@@ -365,21 +369,21 @@ impl ContextCryptoProvider for NoOpCryptoProvider {
     ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
         Ok(scp_core::context::AddMemberOutput::default())
     }
-    fn remove_member(
+    async fn remove_member(
         &self,
         _context_id: &[u8; 32],
         _member_did: &str,
     ) -> Result<scp_core::context::RemoveMemberOutput, ContextError> {
         Ok(scp_core::context::RemoveMemberOutput::default())
     }
-    fn distribute_sender_key(
+    async fn distribute_sender_key(
         &self,
         _context_id: &[u8; 32],
         _member_did: &str,
     ) -> Result<(), ContextError> {
         Ok(())
     }
-    fn remove_member_sender_key(
+    async fn remove_member_sender_key(
         &self,
         _context_id: &[u8; 32],
         _member_did: &str,

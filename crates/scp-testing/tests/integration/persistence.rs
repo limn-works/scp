@@ -885,8 +885,9 @@ impl InMemoryContextPersistence {
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+#[async_trait::async_trait]
 impl ContextPersistence for InMemoryContextPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
@@ -898,7 +899,7 @@ impl ContextPersistence for InMemoryContextPersistence {
         Ok(())
     }
 
-    fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
+    async fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
         let guard = self
             .contexts
             .lock()
@@ -906,7 +907,7 @@ impl ContextPersistence for InMemoryContextPersistence {
         Ok(guard.get(context_id).cloned())
     }
 
-    fn persist_broadcast(
+    async fn persist_broadcast(
         &self,
         context_id: &str,
         snapshot: &BroadcastContextSnapshot,
@@ -918,7 +919,7 @@ impl ContextPersistence for InMemoryContextPersistence {
         Ok(())
     }
 
-    fn load_broadcast(
+    async fn load_broadcast(
         &self,
         context_id: &str,
     ) -> Result<Option<BroadcastContextSnapshot>, BoxError> {
@@ -929,7 +930,7 @@ impl ContextPersistence for InMemoryContextPersistence {
         Ok(guard.get(context_id).cloned())
     }
 
-    fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
+    async fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
         self.contexts
             .lock()
             .map_err(|e| -> BoxError { Box::new(std::io::Error::other(e.to_string())) })?
@@ -941,7 +942,7 @@ impl ContextPersistence for InMemoryContextPersistence {
         Ok(())
     }
 
-    fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
+    async fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
         let guard = self
             .contexts
             .lock()
@@ -956,40 +957,41 @@ impl ContextPersistence for InMemoryContextPersistence {
 /// rule prevents implementing `ContextPersistence` for `Arc<T>` directly.
 struct SharedPersistence(Arc<InMemoryContextPersistence>);
 
+#[async_trait::async_trait]
 impl ContextPersistence for SharedPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
     ) -> Result<(), BoxError> {
-        self.0.persist_context(context_id, snapshot)
+        self.0.persist_context(context_id, snapshot).await
     }
 
-    fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
-        self.0.load_context(context_id)
+    async fn load_context(&self, context_id: &str) -> Result<Option<ContextSnapshot>, BoxError> {
+        self.0.load_context(context_id).await
     }
 
-    fn persist_broadcast(
+    async fn persist_broadcast(
         &self,
         context_id: &str,
         snapshot: &BroadcastContextSnapshot,
     ) -> Result<(), BoxError> {
-        self.0.persist_broadcast(context_id, snapshot)
+        self.0.persist_broadcast(context_id, snapshot).await
     }
 
-    fn load_broadcast(
+    async fn load_broadcast(
         &self,
         context_id: &str,
     ) -> Result<Option<BroadcastContextSnapshot>, BoxError> {
-        self.0.load_broadcast(context_id)
+        self.0.load_broadcast(context_id).await
     }
 
-    fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
-        self.0.delete_context(context_id)
+    async fn delete_context(&self, context_id: &str) -> Result<(), BoxError> {
+        self.0.delete_context(context_id).await
     }
 
-    fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
-        self.0.list_persisted_contexts()
+    async fn list_persisted_contexts(&self) -> Result<Vec<String>, BoxError> {
+        self.0.list_persisted_contexts().await
     }
 }
 
@@ -1004,33 +1006,37 @@ mod mock_providers {
     use scp_core::context::{ContextError, ContextParams};
 
     pub struct MockCrypto;
+    #[async_trait::async_trait]
     impl ContextCryptoProvider for MockCrypto {
-        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+        async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn create_mls_group(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn create_mls_group(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn generate_sender_key(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn generate_sender_key(
+            &self,
+            _ctx_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn init_broadcast_key(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn init_broadcast_key(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn destroy_mls_group(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_mls_group(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn destroy_sender_key(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_sender_key(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn validate_key_package(
+        async fn validate_key_package(
             &self,
             _owner_did: &str,
             _key_package_bytes: Option<&[u8]>,
         ) -> Result<(), ContextError> {
             Ok(())
         }
-        fn add_member(
+        async fn add_member(
             &self,
             _ctx_id: &[u8; 32],
             _member_did: &str,
@@ -1038,21 +1044,21 @@ mod mock_providers {
         ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
             Ok(scp_core::context::AddMemberOutput::default())
         }
-        fn remove_member(
+        async fn remove_member(
             &self,
             _ctx_id: &[u8; 32],
             _member_did: &str,
         ) -> Result<scp_core::context::RemoveMemberOutput, ContextError> {
             Ok(scp_core::context::RemoveMemberOutput::default())
         }
-        fn distribute_sender_key(
+        async fn distribute_sender_key(
             &self,
             _ctx_id: &[u8; 32],
             _member_did: &str,
         ) -> Result<(), ContextError> {
             Ok(())
         }
-        fn remove_member_sender_key(
+        async fn remove_member_sender_key(
             &self,
             _ctx_id: &[u8; 32],
             _member_did: &str,
@@ -1060,7 +1066,7 @@ mod mock_providers {
             Ok(())
         }
 
-        fn seal(
+        async fn seal(
             &self,
             _context_id: &[u8; 32],
             inner: &scp_core::envelope::inner::InnerEnvelope,
@@ -1072,7 +1078,7 @@ mod mock_providers {
                 .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
         }
 
-        fn open(
+        async fn open(
             &self,
             _context_id: &[u8; 32],
             outer_bytes: &[u8],
@@ -1089,21 +1095,22 @@ mod mock_providers {
     }
 
     pub struct MockTransport;
+    #[async_trait::async_trait]
     impl ContextTransportProvider for MockTransport {
         fn is_connected(&self) -> bool {
             true
         }
-        fn publish_context(
+        async fn publish_context(
             &self,
             _ctx_id: &[u8; 32],
             _params: &ContextParams,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn delete_published(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn delete_published(&self, _ctx_id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn send_message(
+        async fn send_message(
             &self,
             _ctx_id: &[u8; 32],
             _encrypted_payload: &[u8],
@@ -1229,7 +1236,7 @@ async fn context_manager_broadcast_restore_roundtrip() {
 
     // --- Phase 2: Verify persistence contains executed_proposals ---
 
-    let persisted = persistence.load_context(ctx_id).unwrap().unwrap();
+    let persisted = persistence.load_context(ctx_id).await.unwrap().unwrap();
     assert!(
         persisted.executed_proposals.contains(&proposal_id),
         "executed_proposals should be persisted after governance action"

@@ -153,7 +153,7 @@ impl ContextManager {
         {
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(&context_id, snapshot);
+            self.persist_context_snapshot(&context_id, snapshot).await;
         }
 
         Ok(result)
@@ -185,7 +185,7 @@ impl ContextManager {
 
         // Delete persisted state after finalize (best-effort).
         if let Some(ref persistence) = self.persistence {
-            let _ = persistence.delete_context(&context_id);
+            let _ = persistence.delete_context(&context_id).await;
         }
 
         Ok(())
@@ -263,7 +263,7 @@ impl ContextManager {
         {
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(&context_id, snapshot);
+            self.persist_context_snapshot(&context_id, snapshot).await;
         }
 
         if result.has_failures() {
@@ -324,7 +324,8 @@ impl ContextManager {
         // Persist context state after proposal consent (best-effort).
         if self.has_persistence() {
             let ctx_snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(context_id, ctx_snapshot);
+            self.persist_context_snapshot(context_id, ctx_snapshot)
+                .await;
         }
 
         Ok(unanimous)
@@ -360,7 +361,7 @@ impl ContextManager {
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(context_id, snapshot);
+            self.persist_context_snapshot(context_id, snapshot).await;
         }
     }
 

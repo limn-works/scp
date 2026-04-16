@@ -317,7 +317,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::PersistenceFailed`] if no persistence provider
     /// is configured, no snapshot exists, or the load operation fails.
-    pub fn load_persisted_context_state(
+    pub async fn load_persisted_context_state(
         &self,
         context_id: &str,
     ) -> Result<(ContextSnapshot, Option<BroadcastContext>), ContextError> {
@@ -329,6 +329,7 @@ impl ContextManager {
 
         let ctx_snapshot = persistence
             .load_context(context_id)
+            .await
             .map_err(|e| {
                 ContextError::PersistenceFailed(format!(
                     "failed to load context state for {context_id}: {e}"
@@ -342,6 +343,7 @@ impl ContextManager {
 
         let broadcast_ctx = persistence
             .load_broadcast(context_id)
+            .await
             .map_err(|e| {
                 ContextError::PersistenceFailed(format!(
                     "failed to load broadcast state for {context_id}: {e}"
@@ -374,7 +376,8 @@ impl ContextManager {
         context_id: &str,
         handle: &ContextHandle,
     ) -> Result<(), ContextError> {
-        let (mut ctx_snapshot, broadcast_ctx) = self.load_persisted_context_state(context_id)?;
+        let (mut ctx_snapshot, broadcast_ctx) =
+            self.load_persisted_context_state(context_id).await?;
         self.restore_event_log_best_effort(context_id);
         // C3: Validate consequence rules on restore — reject tampered
         // rules. Uses validate_against_config to enforce the opt-in
@@ -415,7 +418,8 @@ impl ContextManager {
         if !ctx_snapshot.mls_crypto_state.is_empty() {
             let ctx_id_bytes = context_id_to_bytes(context_id);
             self.crypto
-                .restore_crypto_state(&ctx_id_bytes, &ctx_snapshot.mls_crypto_state)?;
+                .restore_crypto_state(&ctx_id_bytes, &ctx_snapshot.mls_crypto_state)
+                .await?;
         }
 
         let last_members: HashSet<DID> = ctx_snapshot
@@ -831,14 +835,14 @@ impl ContextManager {
             ));
         };
 
-        let context_ids = persistence.list_persisted_contexts().map_err(|e| {
+        let context_ids = persistence.list_persisted_contexts().await.map_err(|e| {
             ContextError::PersistenceFailed(format!("failed to list persisted contexts: {e}"))
         })?;
 
         let mut restored = Vec::new();
         for ctx_id in &context_ids {
             // Load the snapshot to get params for handle creation.
-            let ctx_snapshot = match persistence.load_context(ctx_id) {
+            let ctx_snapshot = match persistence.load_context(ctx_id).await {
                 Ok(Some(snap)) => snap,
                 Ok(None) => {
                     // No snapshot -- skip silently.
@@ -1018,16 +1022,17 @@ impl ContextManager {
                 // §23.17 Invariant 3: capture per-sender epoch floors BEFORE
                 // destroying crypto state so they can be validated against the
                 // incoming snapshot (replay-based floor regression guard).
-                let local_epoch_floors = self.crypto.export_sender_key_epochs(&ctx_id_bytes);
+                let local_epoch_floors = self.crypto.export_sender_key_epochs(&ctx_id_bytes).await;
 
                 // Clean up old crypto state before reimport.
-                let _ = self.crypto.destroy_mls_group(&ctx_id_bytes);
-                let _ = self.crypto.destroy_sender_key(&ctx_id_bytes);
+                let _ = self.crypto.destroy_mls_group(&ctx_id_bytes).await;
+                let _ = self.crypto.destroy_sender_key(&ctx_id_bytes).await;
 
                 // Restore incoming crypto state (if the export carries any).
                 if !export.mls_state.is_empty() {
                     self.crypto
                         .restore_crypto_state(&ctx_id_bytes, &export.mls_state)
+                        .await
                         .map_err(|e| {
                             ContextError::PersistenceFailed(format!(
                                 "import: crypto state restore failed: {e}"
@@ -1038,15 +1043,19 @@ impl ContextManager {
                 // §23.17 Invariant 3: validate that no per-sender epoch floor
                 // regresses, and merge local floors back (max-merge) to preserve
                 // Invariant 4.  On failure, roll back the restored crypto state.
-                if let Err(e) = self.crypto.validate_and_merge_epoch_floors(
-                    &ctx_id_bytes,
-                    local_epoch_floors,
-                    crate::crypto::mls::provider::MAX_EPOCH_ADVANCE,
-                ) {
+                if let Err(e) = self
+                    .crypto
+                    .validate_and_merge_epoch_floors(
+                        &ctx_id_bytes,
+                        local_epoch_floors,
+                        crate::crypto::mls::provider::MAX_EPOCH_ADVANCE,
+                    )
+                    .await
+                {
                     // Rollback: destroy the just-restored crypto state so the
                     // provider is not left with partially-merged floors.
-                    let _ = self.crypto.destroy_mls_group(&ctx_id_bytes);
-                    let _ = self.crypto.destroy_sender_key(&ctx_id_bytes);
+                    let _ = self.crypto.destroy_mls_group(&ctx_id_bytes).await;
+                    let _ = self.crypto.destroy_sender_key(&ctx_id_bytes).await;
                     return Err(e);
                 }
             } else if !export.mls_state.is_empty() {
@@ -1057,6 +1066,7 @@ impl ContextManager {
                 // and sender keys are available immediately after import.
                 self.crypto
                     .restore_crypto_state(&ctx_id_bytes, &export.mls_state)
+                    .await
                     .map_err(|e| {
                         ContextError::PersistenceFailed(format!(
                             "import: crypto state restore failed: {e}"
@@ -1347,7 +1357,7 @@ impl ContextManager {
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snap = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(&context_id, snap);
+            self.persist_context_snapshot(&context_id, snap).await;
         }
 
         // 9. Re-spawn TTL timer if there was remaining TTL.
@@ -1425,7 +1435,9 @@ impl ContextManager {
             .map(|a| a.tokens.clone())
             .unwrap_or_default();
         membership.add_member(creator_did.clone(), "admin".into(), creator_tokens);
-        let broadcast_context = self.init_broadcast_context(&context_id, &params, &creator_did)?;
+        let broadcast_context = self
+            .init_broadcast_context(&context_id, &params, &creator_did)
+            .await?;
         let (initial_threshold_signers, initial_threshold_value) = match &params.governance {
             GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
             _ => (Vec::new(), 0),
@@ -1663,7 +1675,8 @@ impl ContextManager {
             bc.add_author(&creator_did)
                 .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
             if self.has_persistence() {
-                self.persist_broadcast_snapshot(&context_id, &bc.to_snapshot());
+                self.persist_broadcast_snapshot(&context_id, &bc.to_snapshot())
+                    .await;
             }
             Some(bc)
         } else {
@@ -1880,7 +1893,9 @@ impl ContextManager {
 
         // Validate key package before any mutations (idempotent, no lock needed).
         let kp_bytes = key_package.mls_key_package_bytes.as_deref();
-        self.crypto.validate_key_package(&member_did, kp_bytes)?;
+        self.crypto
+            .validate_key_package(&member_did, kp_bytes)
+            .await?;
 
         // Phase 1: Economy enforcement + sybil check under lock (budget deduction).
         // This happens BEFORE any crypto mutations so that a rejected payment
@@ -1993,6 +2008,7 @@ impl ContextManager {
         let add_output = match self
             .crypto
             .add_member(&context_id_bytes, &member_did, kp_bytes)
+            .await
         {
             Ok(output) => output,
             Err(e) => {
@@ -2007,12 +2023,17 @@ impl ContextManager {
         if let Err(e) = self
             .crypto
             .distribute_sender_key(&context_id_bytes, &member_did)
+            .await
         {
             // Sender key distribution failed after MLS add — rollback MLS state.
-            let _ = self.crypto.remove_member(&context_id_bytes, &member_did);
             let _ = self
                 .crypto
-                .remove_member_sender_key(&context_id_bytes, &member_did);
+                .remove_member(&context_id_bytes, &member_did)
+                .await;
+            let _ = self
+                .crypto
+                .remove_member_sender_key(&context_id_bytes, &member_did)
+                .await;
             if let Some(a) = auth {
                 self.void_paid_action(a, &context_id).await;
             }
@@ -2048,13 +2069,20 @@ impl ContextManager {
         // management message before the Welcome, their `crypto.open()`
         // call fails to decrypt and the `SenderKeyRequest` fallback
         // recovers the key.
-        if let Err(e) = self.drain_and_deliver_sender_keys(&context_id, &context_id_bytes) {
+        if let Err(e) = self
+            .drain_and_deliver_sender_keys(&context_id, &context_id_bytes)
+            .await
+        {
             // Drain failed catastrophically — roll back MLS state, sender
             // key, escrow, and economy ticket so the join is fully aborted.
-            let _ = self.crypto.remove_member(&context_id_bytes, &member_did);
             let _ = self
                 .crypto
-                .remove_member_sender_key(&context_id_bytes, &member_did);
+                .remove_member(&context_id_bytes, &member_did)
+                .await;
+            let _ = self
+                .crypto
+                .remove_member_sender_key(&context_id_bytes, &member_did)
+                .await;
             if let Some(a) = auth {
                 self.void_paid_action(a, &context_id).await;
             }
@@ -2068,10 +2096,14 @@ impl ContextManager {
             .join_context_membership(&context_id, &member_did, add_output)
             .await
         {
-            let _ = self.crypto.remove_member(&context_id_bytes, &member_did);
             let _ = self
                 .crypto
-                .remove_member_sender_key(&context_id_bytes, &member_did);
+                .remove_member(&context_id_bytes, &member_did)
+                .await;
+            let _ = self
+                .crypto
+                .remove_member_sender_key(&context_id_bytes, &member_did)
+                .await;
             if let Some(a) = auth {
                 self.void_paid_action(a, &context_id).await;
             }
@@ -2107,7 +2139,7 @@ impl ContextManager {
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(&context_id, snapshot);
+            self.persist_context_snapshot(&context_id, snapshot).await;
         }
 
         Ok(())
@@ -2284,10 +2316,14 @@ impl ContextManager {
         // key cleanup as best-effort. MLS removal is the cryptographic
         // enforcement; sender key removal is defense-in-depth (§9.16).
         if !is_broadcast {
-            let remove_output = self.crypto.remove_member(&context_id_bytes, member_did)?;
+            let remove_output = self
+                .crypto
+                .remove_member(&context_id_bytes, member_did)
+                .await?;
             if let Err(e) = self
                 .crypto
                 .remove_member_sender_key(&context_id_bytes, member_did)
+                .await
             {
                 tracing::warn!(
                     context_id = %context_id,
@@ -2315,7 +2351,7 @@ impl ContextManager {
             // M23: Non-fatal — MLS removal above is the hard security boundary.
             // If rotation fails, log but continue: returning Err here would leave
             // the system inconsistent (MLS removed, but caller thinks leave failed).
-            if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes) {
+            if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes).await {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
@@ -2323,7 +2359,10 @@ impl ContextManager {
                      remaining members retain old sender key"
                 );
             }
-            if let Err(e) = self.drain_and_deliver_sender_keys(&context_id, &context_id_bytes) {
+            if let Err(e) = self
+                .drain_and_deliver_sender_keys(&context_id, &context_id_bytes)
+                .await
+            {
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
@@ -2400,7 +2439,7 @@ impl ContextManager {
         {
             let ctx = &*guard;
             let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(&context_id, snapshot);
+            self.persist_context_snapshot(&context_id, snapshot).await;
         }
 
         // If member count reaches zero, transition to Closing.
@@ -2414,14 +2453,15 @@ impl ContextManager {
     /// Drains pending sender key distribution messages and delivers them
     /// via transport (§9.16.2). Called after `rotate_sender_key` to send
     /// HPKE-sealed sender key responses to remaining members.
-    pub(super) fn drain_and_deliver_sender_keys(
+    pub(super) async fn drain_and_deliver_sender_keys(
         &self,
         context_id: &str,
         context_id_bytes: &[u8; 32],
     ) -> Result<(), ContextError> {
         let pending = self
             .crypto
-            .drain_pending_sender_key_messages(context_id_bytes)?;
+            .drain_pending_sender_key_messages(context_id_bytes)
+            .await?;
         if !pending.is_empty() {
             let routing_id = scp_protocol::context::context_routing_id(context_id);
             for (target_did, message) in pending {
@@ -2431,14 +2471,18 @@ impl ContextManager {
                     message_len = message.len(),
                     "MLS-encrypting and sending rotated sender key distribution"
                 );
-                match self.crypto.mls_encrypt_management(
-                    context_id_bytes,
-                    &message,
-                    &routing_id,
-                    super::messaging::DEFAULT_BLOB_TTL_SECS,
-                ) {
+                match self
+                    .crypto
+                    .mls_encrypt_management(
+                        context_id_bytes,
+                        &message,
+                        &routing_id,
+                        super::messaging::DEFAULT_BLOB_TTL_SECS,
+                    )
+                    .await
+                {
                     Ok(sealed) => {
-                        if let Err(e) = self.transport.send_message(&routing_id, &sealed) {
+                        if let Err(e) = self.transport.send_message(&routing_id, &sealed).await {
                             tracing::warn!(target_did = %target_did, context_id = %context_id, error = %e, "failed to send rotated sender key");
                         }
                     }

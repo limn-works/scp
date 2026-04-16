@@ -136,6 +136,7 @@ async fn fullstack_alice_to_bob_encrypted_message() {
     // 7. Bob decrypts through the full envelope pipeline.
     let decrypted = bob
         .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(
         decrypted.as_slice(),
@@ -212,6 +213,7 @@ async fn fullstack_three_party_group() {
     // Bob decrypts.
     let bob_decrypted = bob
         .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(bob_decrypted.as_slice(), msg.as_slice());
     println!("  [5] Bob decrypted successfully");
@@ -219,6 +221,7 @@ async fn fullstack_three_party_group() {
     // Carol decrypts.
     let carol_decrypted = carol
         .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(carol_decrypted.as_slice(), msg.as_slice());
     println!("  [6] Carol decrypted successfully");
@@ -253,6 +256,7 @@ async fn fullstack_governance_with_real_crypto() {
     let sent1 = alice.take_sent_ciphertexts();
     let decrypted1 = bob
         .decrypt_message(ctx_id, &ctx_bytes, &sent1[0].1, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(decrypted1.as_slice(), msg1.as_slice());
     println!("  [2] Pre-governance message roundtrip verified");
@@ -279,7 +283,9 @@ async fn fullstack_governance_with_real_crypto() {
 
     // Bob should NOT be able to decrypt this message (MLS group epoch advanced,
     // Bob's group state is stale).
-    let decrypt_result = bob.decrypt_message(ctx_id, &ctx_bytes, &sent2[0].1, ALICE_DID);
+    let decrypt_result = bob
+        .decrypt_message(ctx_id, &ctx_bytes, &sent2[0].1, ALICE_DID)
+        .await;
     assert!(
         decrypt_result.is_err(),
         "Bob must NOT decrypt after removal (MLS forward secrecy)"
@@ -381,6 +387,7 @@ async fn fullstack_multiple_messages_roundtrip() {
 
         let decrypted = bob
             .decrypt_message(ctx_id, &ctx_bytes, &sent[0].1, ALICE_DID)
+            .await
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&decrypted),
@@ -430,9 +437,11 @@ async fn fullstack_ciphertext_is_nondeterministic() {
     // Both must still decrypt to the same plaintext.
     let d1 = bob
         .decrypt_message(ctx_id, &ctx_bytes, &sent1[0].1, ALICE_DID)
+        .await
         .unwrap();
     let d2 = bob
         .decrypt_message(ctx_id, &ctx_bytes, &sent2[0].1, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(d1.as_slice(), msg.as_slice());
     assert_eq!(d2.as_slice(), msg.as_slice());
@@ -619,6 +628,7 @@ async fn full_stack_relay_encrypted_roundtrip() {
     //    The relay roundtrip above verified the encrypted_blob survived intact.
     let decrypted = bob
         .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(
         decrypted.as_slice(),
@@ -727,6 +737,7 @@ async fn full_stack_relay_multiple_messages() {
         );
         let decrypted = bob
             .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+            .await
             .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&decrypted),
@@ -829,6 +840,7 @@ async fn full_stack_relay_three_party() {
     );
     let bob_decrypted = bob
         .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(bob_decrypted.as_slice(), msg.as_slice());
     println!("  [3] Bob decrypted from relay");
@@ -841,6 +853,7 @@ async fn full_stack_relay_three_party() {
     );
     let carol_decrypted = carol
         .decrypt_message(ctx_id, &ctx_bytes, ciphertext, ALICE_DID)
+        .await
         .unwrap();
     assert_eq!(carol_decrypted.as_slice(), msg.as_slice());
     println!("  [4] Carol decrypted from relay");

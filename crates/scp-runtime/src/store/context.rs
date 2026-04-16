@@ -930,92 +930,64 @@ impl<S: Storage> ProtocolRepositoryContextBridge<S> {
     }
 }
 
+#[async_trait::async_trait]
 impl<S: Storage + 'static> crate::context::manager::ContextPersistence
     for ProtocolRepositoryContextBridge<S>
 {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &crate::context::manager::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let snap = snapshot.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.store_full_snapshot(&ctx_id, &snap).await })
-        })?;
+        self.store.store_full_snapshot(context_id, snapshot).await?;
         Ok(())
     }
 
-    fn load_context(
+    async fn load_context(
         &self,
         context_id: &str,
     ) -> Result<
         Option<crate::context::manager::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.load_full_snapshot(&ctx_id).await })
-        })?;
+        let result = self.store.load_full_snapshot(context_id).await?;
         Ok(result)
     }
 
-    fn persist_broadcast(
+    async fn persist_broadcast(
         &self,
         context_id: &str,
         snapshot: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let snap = snapshot.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.store_broadcast_state(&ctx_id, &snap).await })
-        })?;
+        self.store
+            .store_broadcast_state(context_id, snapshot)
+            .await?;
         Ok(())
     }
 
-    fn load_broadcast(
+    async fn load_broadcast(
         &self,
         context_id: &str,
     ) -> Result<
         Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.load_broadcast_state(&ctx_id).await })
-        })?;
+        let result = self.store.load_broadcast_state(context_id).await?;
         Ok(result)
     }
 
-    fn delete_context(
+    async fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let ctx_id = context_id.to_owned();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.delete_context(&ctx_id).await })
-        })?;
+        self.store.delete_context(context_id).await?;
         Ok(())
     }
 
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.clone();
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { store.list_persisted_snapshot_contexts().await })
-        })?;
+        let result = self.store.list_persisted_snapshot_contexts().await?;
         Ok(result)
     }
 }
@@ -1820,9 +1792,12 @@ mod tests {
 
         let snapshot = make_context_snapshot();
 
-        bridge.persist_context("ctx-bridge-1", &snapshot).unwrap();
+        bridge
+            .persist_context("ctx-bridge-1", &snapshot)
+            .await
+            .unwrap();
 
-        let loaded = bridge.load_context("ctx-bridge-1").unwrap();
+        let loaded = bridge.load_context("ctx-bridge-1").await.unwrap();
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
         assert_eq!(loaded.context_id, "ctx-snap-1");
@@ -1841,9 +1816,10 @@ mod tests {
 
         bridge
             .persist_broadcast("ctx-bc-bridge", &snapshot)
+            .await
             .unwrap();
 
-        let loaded = bridge.load_broadcast("ctx-bc-bridge").unwrap();
+        let loaded = bridge.load_broadcast("ctx-bc-bridge").await.unwrap();
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
         assert_eq!(loaded.context_id, "ctx-broadcast-1");
@@ -1874,12 +1850,12 @@ mod tests {
             .await
             .unwrap();
 
-        let listed = bridge.list_persisted_contexts().unwrap();
+        let listed = bridge.list_persisted_contexts().await.unwrap();
         assert_eq!(listed, vec!["ctx-list-1", "ctx-list-2"]);
 
-        bridge.delete_context("ctx-list-1").unwrap();
+        bridge.delete_context("ctx-list-1").await.unwrap();
 
-        let listed = bridge.list_persisted_contexts().unwrap();
+        let listed = bridge.list_persisted_contexts().await.unwrap();
         assert_eq!(listed, vec!["ctx-list-2"]);
     }
 

@@ -271,7 +271,7 @@ impl E2eCryptoProvider {
     ///
     /// Returns `ContextError` if the sender key cannot be generated or
     /// distributed.
-    pub fn regenerate_and_distribute_sender_key(
+    pub async fn regenerate_and_distribute_sender_key(
         &self,
         context_id: &[u8; 32],
     ) -> Result<(), ContextError> {
@@ -300,7 +300,7 @@ impl E2eCryptoProvider {
 
         for member_did in &members {
             if member_did != &self.local_did {
-                self.distribute_sender_key(context_id, member_did)?;
+                self.distribute_sender_key(context_id, member_did).await?;
             }
         }
 
@@ -521,14 +521,15 @@ impl E2eCryptoProvider {
 }
 
 // Nursery lint — false-positives on lock guards across block boundaries.
+#[async_trait::async_trait]
 #[allow(clippy::significant_drop_tightening)]
 impl ContextCryptoProvider for E2eCryptoProvider {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+    async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
         let _ = self.credential()?;
         Ok(())
     }
 
-    fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let credential = self.credential()?;
         let group = create_group(&credential)
             .map_err(|e| ContextCreationError::CryptoFailed(e.to_string()))?;
@@ -553,7 +554,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         Ok(())
     }
 
-    fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let key = generate_sender_key();
         let ctx_hex = Self::context_id_hex(context_id);
 
@@ -578,7 +579,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         Ok(())
     }
 
-    fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let key = generate_sender_key();
         let mut broadcast_keys = self
             .broadcast_keys
@@ -588,7 +589,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         Ok(())
     }
 
-    fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let mut groups = self
             .groups
             .lock()
@@ -599,7 +600,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         Ok(())
     }
 
-    fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let ctx_hex = Self::context_id_hex(context_id);
         let mut store = self
             .sender_keys
@@ -615,7 +616,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         Ok(())
     }
 
-    fn validate_key_package(
+    async fn validate_key_package(
         &self,
         owner_did: &str,
         _key_package_bytes: Option<&[u8]>,
@@ -631,7 +632,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         Ok(())
     }
 
-    fn add_member(
+    async fn add_member(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -721,7 +722,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         })
     }
 
-    fn remove_member(
+    async fn remove_member(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -786,7 +787,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         })
     }
 
-    fn distribute_sender_key(
+    async fn distribute_sender_key(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -821,7 +822,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         Ok(())
     }
 
-    fn remove_member_sender_key(
+    async fn remove_member_sender_key(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -834,7 +835,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         let _ = store.remove(&ctx_hex, member_did);
         Ok(())
     }
-    fn advance_epoch(
+    async fn advance_epoch(
         &self,
         context_id: &[u8; 32],
     ) -> Result<scp_core::context::AdvanceEpochOutput, ContextError> {
@@ -855,7 +856,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         Ok(scp_core::context::AdvanceEpochOutput { commit_bytes })
     }
 
-    fn seal(
+    async fn seal(
         &self,
         context_id: &[u8; 32],
         inner: &scp_core::envelope::inner::InnerEnvelope,
@@ -957,7 +958,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         Ok(result)
     }
 
-    fn open(
+    async fn open(
         &self,
         context_id: &[u8; 32],
         outer_bytes: &[u8],
@@ -1075,7 +1076,7 @@ impl ContextCryptoProvider for E2eCryptoProvider {
         }
     }
 
-    fn mls_encrypt_management(
+    async fn mls_encrypt_management(
         &self,
         context_id: &[u8; 32],
         plaintext: &[u8],

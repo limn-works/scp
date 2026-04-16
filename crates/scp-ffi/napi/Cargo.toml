@@ -17,6 +17,7 @@ allow_in_memory_custody = ["scp-platform/testing", "dep:scp-testing"]
 server = ["scp-ffi-common/server", "dep:scp-node"]
 
 [dependencies]
+async-trait = { workspace = true }
 napi = { version = "3", default-features = false, features = ["napi9", "tokio_rt", "async", "error_anyhow"] }
 napi-derive = "3"
 tokio = { workspace = true }

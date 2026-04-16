@@ -2665,15 +2665,15 @@ pub async fn context_restore(context_id: String) -> napi::Result<()> {
     // Load the persisted snapshot to obtain the correct ContextParams (including
     // memory_scope). Using ContextParams::default() would give Ephemeral scope,
     // which would cause incorrect key destruction on subsequent finalize_close.
-    let (snapshot, _broadcast) =
-        manager
-            .load_persisted_context_state(&context_id)
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("restore_context: failed to load persisted state: {e}"),
-                    code: codes::CTX_2064.to_owned(),
-                })
-            })?;
+    let (snapshot, _broadcast) = manager
+        .load_persisted_context_state(&context_id)
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("restore_context: failed to load persisted state: {e}"),
+                code: codes::CTX_2064.to_owned(),
+            })
+        })?;
 
     let core_handle = ContextHandle::new(context_id.clone(), snapshot.context_params.clone());
     let _ = core_handle.transition_to(&ContextState::Active).await;

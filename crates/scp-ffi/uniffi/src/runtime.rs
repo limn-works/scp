@@ -552,32 +552,36 @@ pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), crate:
 /// performed by the platform-injected `KeyCustodyProvider`.
 struct FfiBridgeCrypto;
 
+#[async_trait::async_trait]
 impl ContextCryptoProvider for FfiBridgeCrypto {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+    async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
         Ok(())
     }
 
-    fn create_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn create_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 
-    fn generate_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn generate_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), ContextCreationError> {
         Ok(())
     }
 
-    fn init_broadcast_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_broadcast_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 
-    fn destroy_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 
-    fn destroy_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 
-    fn validate_key_package(
+    async fn validate_key_package(
         &self,
         _owner_did: &str,
         _key_package_bytes: Option<&[u8]>,
@@ -585,7 +589,7 @@ impl ContextCryptoProvider for FfiBridgeCrypto {
         Ok(())
     }
 
-    fn add_member(
+    async fn add_member(
         &self,
         _context_id: &[u8; 32],
         _member_did: &str,
@@ -594,7 +598,7 @@ impl ContextCryptoProvider for FfiBridgeCrypto {
         Ok(scp_core::context::AddMemberOutput::default())
     }
 
-    fn remove_member(
+    async fn remove_member(
         &self,
         _context_id: &[u8; 32],
         _member_did: &str,
@@ -602,7 +606,7 @@ impl ContextCryptoProvider for FfiBridgeCrypto {
         Ok(scp_core::context::RemoveMemberOutput::default())
     }
 
-    fn distribute_sender_key(
+    async fn distribute_sender_key(
         &self,
         _context_id: &[u8; 32],
         _member_did: &str,
@@ -610,7 +614,7 @@ impl ContextCryptoProvider for FfiBridgeCrypto {
         Ok(())
     }
 
-    fn remove_member_sender_key(
+    async fn remove_member_sender_key(
         &self,
         _context_id: &[u8; 32],
         _member_did: &str,

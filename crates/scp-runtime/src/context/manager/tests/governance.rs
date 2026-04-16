@@ -5150,42 +5150,56 @@ async fn test_remove_member_sender_key_before_mls_removal() {
         inner: MockCrypto,
     }
 
+    #[async_trait::async_trait]
     impl scp_protocol::context::builder::ContextCryptoProvider for OrderTrackingCrypto {
-        fn validate_creator_identity(&self) -> Result<(), super::ContextCreationError> {
-            self.inner.validate_creator_identity()
+        async fn validate_creator_identity(&self) -> Result<(), super::ContextCreationError> {
+            self.inner.validate_creator_identity().await
         }
-        fn create_mls_group(&self, id: &[u8; 32]) -> Result<(), super::ContextCreationError> {
-            self.inner.create_mls_group(id)
+        async fn create_mls_group(&self, id: &[u8; 32]) -> Result<(), super::ContextCreationError> {
+            self.inner.create_mls_group(id).await
         }
-        fn generate_sender_key(&self, id: &[u8; 32]) -> Result<(), super::ContextCreationError> {
-            self.inner.generate_sender_key(id)
+        async fn generate_sender_key(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<(), super::ContextCreationError> {
+            self.inner.generate_sender_key(id).await
         }
-        fn init_broadcast_key(&self, id: &[u8; 32]) -> Result<(), super::ContextCreationError> {
-            self.inner.init_broadcast_key(id)
+        async fn init_broadcast_key(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<(), super::ContextCreationError> {
+            self.inner.init_broadcast_key(id).await
         }
-        fn destroy_mls_group(&self, id: &[u8; 32]) -> Result<(), super::ContextCreationError> {
-            self.inner.destroy_mls_group(id)
+        async fn destroy_mls_group(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<(), super::ContextCreationError> {
+            self.inner.destroy_mls_group(id).await
         }
-        fn destroy_sender_key(&self, id: &[u8; 32]) -> Result<(), super::ContextCreationError> {
-            self.inner.destroy_sender_key(id)
+        async fn destroy_sender_key(
+            &self,
+            id: &[u8; 32],
+        ) -> Result<(), super::ContextCreationError> {
+            self.inner.destroy_sender_key(id).await
         }
-        fn validate_key_package(
+        async fn validate_key_package(
             &self,
             owner_did: &str,
             key_package_bytes: Option<&[u8]>,
         ) -> Result<(), ContextError> {
             self.inner
                 .validate_key_package(owner_did, key_package_bytes)
+                .await
         }
-        fn add_member(
+        async fn add_member(
             &self,
             ctx: &[u8; 32],
             did: &str,
             kp: Option<&[u8]>,
         ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
-            self.inner.add_member(ctx, did, kp)
+            self.inner.add_member(ctx, did, kp).await
         }
-        fn remove_member(
+        async fn remove_member(
             &self,
             ctx: &[u8; 32],
             did: &str,
@@ -5194,39 +5208,47 @@ async fn test_remove_member_sender_key_before_mls_removal() {
                 .lock()
                 .unwrap()
                 .push(format!("remove_member:{did}"));
-            self.inner.remove_member(ctx, did)
+            self.inner.remove_member(ctx, did).await
         }
-        fn distribute_sender_key(&self, ctx: &[u8; 32], did: &str) -> Result<(), ContextError> {
-            self.inner.distribute_sender_key(ctx, did)
+        async fn distribute_sender_key(
+            &self,
+            ctx: &[u8; 32],
+            did: &str,
+        ) -> Result<(), ContextError> {
+            self.inner.distribute_sender_key(ctx, did).await
         }
-        fn remove_member_sender_key(&self, ctx: &[u8; 32], did: &str) -> Result<(), ContextError> {
+        async fn remove_member_sender_key(
+            &self,
+            ctx: &[u8; 32],
+            did: &str,
+        ) -> Result<(), ContextError> {
             self.log
                 .lock()
                 .unwrap()
                 .push(format!("remove_member_sender_key:{did}"));
-            self.inner.remove_member_sender_key(ctx, did)
+            self.inner.remove_member_sender_key(ctx, did).await
         }
-        fn seal(
+        async fn seal(
             &self,
             ctx: &[u8; 32],
             inner: &scp_protocol::envelope::inner::InnerEnvelope,
             routing_id: &[u8],
             ttl: u32,
         ) -> Result<Vec<u8>, ContextError> {
-            self.inner.seal(ctx, inner, routing_id, ttl)
+            self.inner.seal(ctx, inner, routing_id, ttl).await
         }
-        fn open(
+        async fn open(
             &self,
             ctx: &[u8; 32],
             bytes: &[u8],
         ) -> Result<scp_protocol::context::builder::OpenResult, ContextError> {
-            self.inner.open(ctx, bytes)
+            self.inner.open(ctx, bytes).await
         }
-        fn advance_epoch(
+        async fn advance_epoch(
             &self,
             ctx: &[u8; 32],
         ) -> Result<scp_protocol::context::builder::AdvanceEpochOutput, ContextError> {
-            self.inner.advance_epoch(ctx)
+            self.inner.advance_epoch(ctx).await
         }
     }
 
@@ -14213,8 +14235,8 @@ async fn test_velocity_includes_current_message() {
 // This test verifies the trait method compiles with the new parameter.
 // -----------------------------------------------------------------------
 
-#[test]
-fn test_non_member_key_request_rejected() {
+#[tokio::test]
+async fn test_non_member_key_request_rejected() {
     use scp_protocol::context::builder::ContextCryptoProvider;
     use std::collections::HashSet;
 
@@ -14223,7 +14245,9 @@ fn test_non_member_key_request_rejected() {
     // MockCrypto uses the default implementation which returns an error,
     // verifying the signature is correct.
     let blocked = HashSet::new();
-    let result = crypto.handle_sender_key_request(&[0u8; 32], &[], &[], &blocked);
+    let result = crypto
+        .handle_sender_key_request(&[0u8; 32], &[], &[], &blocked)
+        .await;
     assert!(result.is_err(), "mock should return unsupported error");
 }
 
@@ -18032,8 +18056,8 @@ async fn consequence_events_visible_to_subsequent_rule_evaluation() {
 ///     `append_context_event_with_payload` call. Every emission helper
 ///     calls this; the structural test verifies that invariant.
 #[allow(clippy::too_many_lines)]
-#[test]
-fn consequence_event_log_append_ordering() {
+#[tokio::test]
+async fn consequence_event_log_append_ordering() {
     let source = include_str!("../governance.rs");
 
     /// Extracts the body of a top-level function from `source`.

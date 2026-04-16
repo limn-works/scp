@@ -25,6 +25,7 @@ pub use scp_protocol::context::builder::{
 ///
 /// Implementors handle relay connectivity checks and context publication /
 /// deletion.
+#[async_trait::async_trait]
 pub trait ContextTransportProvider: Send + Sync {
     /// Returns `true` if the transport layer is connected and at least one
     /// relay is reachable.
@@ -35,7 +36,7 @@ pub trait ContextTransportProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextCreationError`] if publication fails.
-    fn publish_context(
+    async fn publish_context(
         &self,
         context_id: &[u8; 32],
         params: &ContextParams,
@@ -47,7 +48,7 @@ pub trait ContextTransportProvider: Send + Sync {
     ///
     /// Returns [`ContextCreationError`] if deletion fails. Callers may
     /// ignore this error during rollback (best-effort).
-    fn delete_published(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+    async fn delete_published(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
 
     // -- Messaging operations (SCP-020) ------------------------------------
 
@@ -56,7 +57,7 @@ pub trait ContextTransportProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::TransportFailed`] if sending fails.
-    fn send_message(
+    async fn send_message(
         &self,
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
@@ -71,7 +72,7 @@ pub trait ContextTransportProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::TransportFailed`] if sending fails.
-    fn send_to_routing_id(
+    async fn send_to_routing_id(
         &self,
         _routing_id: &[u8; 32],
         _payload: &[u8],
@@ -295,12 +296,13 @@ pub trait ContextEventLogProvider: Send + Sync {
 /// production builds and carries no failure-injection machinery.
 pub struct LocalTransportProvider;
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for LocalTransportProvider {
     fn is_connected(&self) -> bool {
         true
     }
 
-    fn publish_context(
+    async fn publish_context(
         &self,
         _context_id: &[u8; 32],
         _params: &ContextParams,
@@ -308,11 +310,11 @@ impl ContextTransportProvider for LocalTransportProvider {
         Ok(())
     }
 
-    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 
-    fn send_message(
+    async fn send_message(
         &self,
         _context_id: &[u8; 32],
         _encrypted_payload: &[u8],
@@ -336,12 +338,13 @@ impl ContextTransportProvider for LocalTransportProvider {
 /// successfully when no relay is actually reachable.
 pub struct NotConfiguredTransportProvider;
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for NotConfiguredTransportProvider {
     fn is_connected(&self) -> bool {
         false
     }
 
-    fn publish_context(
+    async fn publish_context(
         &self,
         _context_id: &[u8; 32],
         _params: &ContextParams,
@@ -353,7 +356,7 @@ impl ContextTransportProvider for NotConfiguredTransportProvider {
         ))
     }
 
-    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Err(ContextCreationError::TransportFailed(
             "transport not configured — call transport_connect() to set up a relay \
              before deleting published contexts"
@@ -361,7 +364,7 @@ impl ContextTransportProvider for NotConfiguredTransportProvider {
         ))
     }
 
-    fn send_message(
+    async fn send_message(
         &self,
         _context_id: &[u8; 32],
         _encrypted_payload: &[u8],
@@ -475,7 +478,7 @@ impl CreationReceipt {
     /// Rollback is best-effort: if a destruction step fails, it is ignored
     /// so that subsequent rollback steps still execute. This ensures that a
     /// failure during rollback does not leave additional orphaned state.
-    pub fn rollback(
+    pub async fn rollback(
         &self,
         context_id: &[u8; 32],
         crypto: &dyn ContextCryptoProvider,
@@ -486,16 +489,16 @@ impl CreationReceipt {
         if self.published {
             // Best-effort: relays are untrusted, orphaned blobs are encrypted
             // with destroyed keys.
-            let _ = transport.delete_published(context_id);
+            let _ = transport.delete_published(context_id).await;
         }
         if self.event_log.is_some() {
             let _ = event_log.destroy_event_log(context_id);
         }
         if self.sender_key.is_some() {
-            let _ = crypto.destroy_sender_key(context_id);
+            let _ = crypto.destroy_sender_key(context_id).await;
         }
         if self.mls_group.is_some() {
-            let _ = crypto.destroy_mls_group(context_id);
+            let _ = crypto.destroy_mls_group(context_id).await;
         }
     }
 }
@@ -608,7 +611,7 @@ pub async fn create_context(
     validate_params(&params)?;
 
     // 2. Validate the creator's identity and signing key accessibility.
-    crypto.validate_creator_identity()?;
+    crypto.validate_creator_identity().await?;
 
     // 3. Transport connectivity is NOT checked here. Context creation is a
     //    local operation (MLS group init, sender key generation, event log
@@ -628,15 +631,19 @@ pub async fn create_context(
     // Step 2: Create MLS group (Encrypted) or init broadcast key (Broadcast).
     match params.mode {
         ContextMode::Encrypted => {
-            if let Err(e) = crypto.create_mls_group(&id_bytes) {
-                receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
+            if let Err(e) = crypto.create_mls_group(&id_bytes).await {
+                receipt
+                    .rollback(&id_bytes, crypto, transport, event_log_provider)
+                    .await;
                 return Err(e);
             }
             receipt.mls_group = Some(MlsGroupHandle::new());
         }
         ContextMode::Broadcast => {
-            if let Err(e) = crypto.init_broadcast_key(&id_bytes) {
-                receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
+            if let Err(e) = crypto.init_broadcast_key(&id_bytes).await {
+                receipt
+                    .rollback(&id_bytes, crypto, transport, event_log_provider)
+                    .await;
                 return Err(e);
             }
             // No MLS group for Broadcast mode -- mls_group stays None.
@@ -646,9 +653,11 @@ pub async fn create_context(
     // Step 3: Generate sender key (Encrypted) -- broadcast key already done
     // in step 2 for Broadcast mode.
     if params.mode == ContextMode::Encrypted
-        && let Err(e) = crypto.generate_sender_key(&id_bytes)
+        && let Err(e) = crypto.generate_sender_key(&id_bytes).await
     {
-        receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
+        receipt
+            .rollback(&id_bytes, crypto, transport, event_log_provider)
+            .await;
         return Err(e);
     }
     // Mark sender_key for both modes: Encrypted has an explicit key,
@@ -658,7 +667,9 @@ pub async fn create_context(
 
     // Step 4: Initialise event log.
     if let Err(e) = event_log_provider.init_event_log(&id_bytes) {
-        receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
+        receipt
+            .rollback(&id_bytes, crypto, transport, event_log_provider)
+            .await;
         return Err(e);
     }
     receipt.event_log = Some(EventLogHandle::new());
@@ -671,7 +682,7 @@ pub async fn create_context(
     // warning and continue.  The context won't be discoverable via
     // relay until a subsequent publish or sync, but all local state
     // (MLS group, sender key, event log) remains valid.
-    match transport.publish_context(&id_bytes, &params) {
+    match transport.publish_context(&id_bytes, &params).await {
         Ok(()) => {
             receipt.published = true;
         }
@@ -686,7 +697,9 @@ pub async fn create_context(
 
     // Step 6: Transition state to Active.
     if let Err(e) = handle.transition_to(&ContextState::Active).await {
-        receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
+        receipt
+            .rollback(&id_bytes, crypto, transport, event_log_provider)
+            .await;
         return Err(e.into());
     }
 
@@ -694,7 +707,9 @@ pub async fn create_context(
     if let Err(e) = event_log_provider.append_event(&id_bytes, "ContextCreated", creator_did, None)
     {
         // Even though the handle is Active, we must roll back everything.
-        receipt.rollback(&id_bytes, crypto, transport, event_log_provider);
+        receipt
+            .rollback(&id_bytes, crypto, transport, event_log_provider)
+            .await;
         return Err(e);
     }
 
@@ -738,8 +753,9 @@ mod tests {
         sender_keys_destroyed: Mutex<Vec<[u8; 32]>>,
     }
 
+    #[async_trait::async_trait]
     impl ContextCryptoProvider for MockCryptoProvider {
-        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+        async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
             if self.fail_validate_identity.load(Ordering::Relaxed) {
                 return Err(ContextCreationError::IdentityValidationFailed(
                     "mock identity validation failure".into(),
@@ -748,7 +764,10 @@ mod tests {
             Ok(())
         }
 
-        fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn create_mls_group(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             if self.fail_create_mls.load(Ordering::Relaxed) {
                 return Err(ContextCreationError::CryptoFailed(
                     "mock MLS group creation failure".into(),
@@ -758,7 +777,10 @@ mod tests {
             Ok(())
         }
 
-        fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn generate_sender_key(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             if self.fail_generate_sender_key.load(Ordering::Relaxed) {
                 return Err(ContextCreationError::CryptoFailed(
                     "mock sender key generation failure".into(),
@@ -768,7 +790,10 @@ mod tests {
             Ok(())
         }
 
-        fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn init_broadcast_key(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             if self.fail_init_broadcast_key.load(Ordering::Relaxed) {
                 return Err(ContextCreationError::CryptoFailed(
                     "mock broadcast key init failure".into(),
@@ -781,17 +806,23 @@ mod tests {
             Ok(())
         }
 
-        fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_mls_group(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             self.mls_groups_destroyed.lock().unwrap().push(*context_id);
             Ok(())
         }
 
-        fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_sender_key(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             self.sender_keys_destroyed.lock().unwrap().push(*context_id);
             Ok(())
         }
 
-        fn validate_key_package(
+        async fn validate_key_package(
             &self,
             _owner_did: &str,
             _key_package_bytes: Option<&[u8]>,
@@ -799,7 +830,7 @@ mod tests {
             Ok(())
         }
 
-        fn add_member(
+        async fn add_member(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -808,7 +839,7 @@ mod tests {
             Ok(AddMemberOutput::default())
         }
 
-        fn remove_member(
+        async fn remove_member(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -816,7 +847,7 @@ mod tests {
             Ok(RemoveMemberOutput::default())
         }
 
-        fn distribute_sender_key(
+        async fn distribute_sender_key(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -824,7 +855,7 @@ mod tests {
             Ok(())
         }
 
-        fn remove_member_sender_key(
+        async fn remove_member_sender_key(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -849,12 +880,13 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl ContextTransportProvider for MockTransportProvider {
         fn is_connected(&self) -> bool {
             self.connected.load(Ordering::Relaxed)
         }
 
-        fn publish_context(
+        async fn publish_context(
             &self,
             context_id: &[u8; 32],
             _params: &ContextParams,
@@ -868,12 +900,15 @@ mod tests {
             Ok(())
         }
 
-        fn delete_published(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn delete_published(
+            &self,
+            context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             self.deleted.lock().unwrap().push(*context_id);
             Ok(())
         }
 
-        fn send_message(
+        async fn send_message(
             &self,
             _context_id: &[u8; 32],
             _encrypted_payload: &[u8],
@@ -1274,8 +1309,8 @@ mod tests {
     // Receipt rollback ordering
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn creation_receipt_rollback_only_destroys_completed_steps() {
+    #[tokio::test]
+    async fn creation_receipt_rollback_only_destroys_completed_steps() {
         // Simulate a receipt where only MLS group and sender key were created.
         let receipt = CreationReceipt {
             mls_group: Some(MlsGroupHandle::new()),
@@ -1289,7 +1324,7 @@ mod tests {
         let event_log = MockEventLogProvider::default();
         let id = [0u8; 32];
 
-        receipt.rollback(&id, &crypto, &transport, &event_log);
+        receipt.rollback(&id, &crypto, &transport, &event_log).await;
 
         // Only MLS group and sender key should be destroyed.
         assert_eq!(crypto.mls_groups_destroyed.lock().unwrap().len(), 1);
@@ -1298,8 +1333,8 @@ mod tests {
         assert!(transport.deleted.lock().unwrap().is_empty());
     }
 
-    #[test]
-    fn creation_receipt_default_rollback_destroys_nothing() {
+    #[tokio::test]
+    async fn creation_receipt_default_rollback_destroys_nothing() {
         let receipt = CreationReceipt::default();
 
         let crypto = MockCryptoProvider::default();
@@ -1307,7 +1342,7 @@ mod tests {
         let event_log = MockEventLogProvider::default();
         let id = [0u8; 32];
 
-        receipt.rollback(&id, &crypto, &transport, &event_log);
+        receipt.rollback(&id, &crypto, &transport, &event_log).await;
 
         assert!(crypto.mls_groups_destroyed.lock().unwrap().is_empty());
         assert!(crypto.sender_keys_destroyed.lock().unwrap().is_empty());
@@ -1315,8 +1350,8 @@ mod tests {
         assert!(transport.deleted.lock().unwrap().is_empty());
     }
 
-    #[test]
-    fn creation_receipt_full_rollback_destroys_everything() {
+    #[tokio::test]
+    async fn creation_receipt_full_rollback_destroys_everything() {
         let receipt = CreationReceipt {
             mls_group: Some(MlsGroupHandle::new()),
             sender_key: Some(SenderKeyHandle::new()),
@@ -1329,7 +1364,7 @@ mod tests {
         let event_log = MockEventLogProvider::default();
         let id = [42u8; 32];
 
-        receipt.rollback(&id, &crypto, &transport, &event_log);
+        receipt.rollback(&id, &crypto, &transport, &event_log).await;
 
         assert_eq!(crypto.mls_groups_destroyed.lock().unwrap().len(), 1);
         assert_eq!(crypto.sender_keys_destroyed.lock().unwrap().len(), 1);

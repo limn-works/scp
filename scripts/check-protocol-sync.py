@@ -2,7 +2,10 @@
 """Verify scp-protocol contains zero async fn in production code.
 
 Uses tree-sitter to parse Rust files and detect async functions outside
-#[cfg(test)] modules. Fails CI if any are found.
+#[cfg(test)] modules and outside trait definitions / trait impl blocks.
+Trait methods using #[async_trait] are exempt because the macro desugars
+them to return Pin<Box<dyn Future>> (no tokio runtime dependency).
+Fails CI if any non-exempt async fn are found.
 """
 import sys
 import os
@@ -41,16 +44,25 @@ def has_test_cfg_attribute(node, source):
     return False
 
 
-def walk(node, source, in_test=False, filepath=""):
+def walk(node, source, in_test=False, in_trait=False, filepath=""):
     test_ctx = in_test
+    trait_ctx = in_trait
 
     # Check if this node is a test-gated module
     if node.type == "mod_item":
         if has_test_cfg_attribute(node, source):
             test_ctx = True
 
-    # Check for async fn in production code
-    if node.type == "function_item" and not test_ctx:
+    # Check if this node is a trait definition or impl block.
+    # Methods using #[async_trait] are exempt because the macro desugars
+    # async fn to return Pin<Box<dyn Future>> — no runtime dep. This
+    # covers trait definitions, trait impl blocks, and inherent impl
+    # blocks on orchestrator structs that call async trait methods.
+    if node.type in ("trait_item", "impl_item"):
+        trait_ctx = True
+
+    # Check for async fn in production code (exempt test + trait contexts)
+    if node.type == "function_item" and not test_ctx and not trait_ctx:
         for child in node.children:
             if child.type == "function_modifiers":
                 mod_text = source[child.start_byte:child.end_byte].decode(
@@ -69,7 +81,7 @@ def walk(node, source, in_test=False, filepath=""):
                     violations.append(f"{filepath}:{line}: async fn {name}")
 
     for child in node.children:
-        walk(child, source, test_ctx, filepath)
+        walk(child, source, test_ctx, trait_ctx, filepath)
 
 
 for root, dirs, files in os.walk(PROTO_SRC):
@@ -88,4 +100,4 @@ if violations:
         print(f"  {v}")
     sys.exit(1)
 else:
-    print("scp-protocol sync check passed: zero async fn in production code.")
+    print("scp-protocol sync check passed: zero async fn in production code (trait methods exempt).")

@@ -326,8 +326,9 @@ impl MlsCryptoProvider {
 }
 
 #[allow(clippy::significant_drop_tightening)]
+#[async_trait::async_trait]
 impl ContextCryptoProvider for MlsCryptoProvider {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+    async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
         // Validate that the local DID is a valid did:dht:z... format.
         if !self.local_did.starts_with("did:dht:z") {
             return Err(ContextCreationError::IdentityValidationFailed(
@@ -337,7 +338,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let credential = self.make_credential()?;
         let wrapping_pk = self
             .wrapping_public_key
@@ -369,7 +370,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let mut contexts = self
             .contexts
             .lock()
@@ -384,7 +385,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let key = generate_sender_key();
         let mut broadcast_keys = self
             .broadcast_keys
@@ -394,7 +395,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let mut contexts = self
             .contexts
             .lock()
@@ -405,7 +406,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         // Zeroize the sender key in context state (if present).
         {
             let mut contexts = self
@@ -439,7 +440,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn validate_key_package(
+    async fn validate_key_package(
         &self,
         owner_did: &str,
         key_package_bytes: Option<&[u8]>,
@@ -491,7 +492,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn add_member(
+    async fn add_member(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -558,7 +559,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn remove_member(
+    async fn remove_member(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -638,7 +639,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn distribute_sender_key(
+    async fn distribute_sender_key(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -706,7 +707,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn remove_member_sender_key(
+    async fn remove_member_sender_key(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -739,7 +740,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn rotate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+    async fn rotate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
         let ctx_id_hex = hex::encode(context_id);
         let mut contexts = self
             .contexts
@@ -838,7 +839,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn drain_pending_sender_key_messages(
+    async fn drain_pending_sender_key_messages(
         &self,
         context_id: &[u8; 32],
     ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
@@ -852,7 +853,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(std::mem::take(&mut state.pending_distributions))
     }
 
-    fn process_incoming_sender_key(
+    async fn process_incoming_sender_key(
         &self,
         context_id: &[u8; 32],
         sender_did: &str,
@@ -920,7 +921,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         }
     }
 
-    fn handle_sender_key_request(
+    async fn handle_sender_key_request(
         &self,
         context_id: &[u8; 32],
         request_bytes: &[u8],
@@ -1020,7 +1021,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(Some(message))
     }
 
-    fn seal(
+    async fn seal(
         &self,
         context_id: &[u8; 32],
         inner: &scp_protocol::envelope::inner::InnerEnvelope,
@@ -1086,7 +1087,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn open(
+    async fn open(
         &self,
         context_id: &[u8; 32],
         outer_bytes: &[u8],
@@ -1224,7 +1225,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn mls_encrypt_management(
+    async fn mls_encrypt_management(
         &self,
         context_id: &[u8; 32],
         plaintext: &[u8],
@@ -1262,7 +1263,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn advance_epoch(
+    async fn advance_epoch(
         &self,
         context_id: &[u8; 32],
     ) -> Result<scp_protocol::context::builder::AdvanceEpochOutput, ContextError> {
@@ -1290,7 +1291,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn export_crypto_state(&self, context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
+    async fn export_crypto_state(&self, context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
         let contexts = self
             .contexts
             .lock()
@@ -1408,7 +1409,11 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         result
     }
 
-    fn restore_crypto_state(&self, context_id: &[u8; 32], data: &[u8]) -> Result<(), ContextError> {
+    async fn restore_crypto_state(
+        &self,
+        context_id: &[u8; 32],
+        data: &[u8],
+    ) -> Result<(), ContextError> {
         if data.is_empty() {
             return Ok(());
         }
@@ -1601,7 +1606,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn export_sender_key_epochs(&self, context_id: &[u8; 32]) -> Vec<(String, u64)> {
+    async fn export_sender_key_epochs(&self, context_id: &[u8; 32]) -> Vec<(String, u64)> {
         let Ok(contexts) = self.contexts.lock() else {
             return Vec::new();
         };
@@ -1612,7 +1617,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         state.sender_key_store.epochs_for_context(&ctx_id_hex)
     }
 
-    fn validate_and_merge_epoch_floors(
+    async fn validate_and_merge_epoch_floors(
         &self,
         context_id: &[u8; 32],
         local_floors: Vec<(String, u64)>,
@@ -1675,7 +1680,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
+    async fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
         use tls_codec::Serialize as TlsSerializeTrait;
 
         let credential = self
@@ -1712,7 +1717,7 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(kp_bytes)
     }
 
-    fn join_from_welcome(
+    async fn join_from_welcome(
         &self,
         context_id: &[u8; 32],
         welcome_bytes: &[u8],
@@ -1823,42 +1828,42 @@ mod tests {
         id
     }
 
-    #[test]
-    fn validate_creator_identity_accepts_valid_did() {
+    #[tokio::test]
+    async fn validate_creator_identity_accepts_valid_did() {
         let provider = make_provider();
-        assert!(provider.validate_creator_identity().is_ok());
+        assert!(provider.validate_creator_identity().await.is_ok());
     }
 
-    #[test]
-    fn validate_creator_identity_rejects_invalid_did() {
+    #[tokio::test]
+    async fn validate_creator_identity_rejects_invalid_did() {
         let provider = MlsCryptoProvider::new("did:key:invalid".to_string());
-        assert!(provider.validate_creator_identity().is_err());
+        assert!(provider.validate_creator_identity().await.is_err());
     }
 
-    #[test]
-    fn create_mls_group_and_destroy() {
+    #[tokio::test]
+    async fn create_mls_group_and_destroy() {
         let provider = make_provider();
         let ctx_id = make_context_id();
 
-        assert!(provider.create_mls_group(&ctx_id).is_ok());
+        assert!(provider.create_mls_group(&ctx_id).await.is_ok());
 
         // Verify group exists by attempting to encrypt.
         let encrypted = test_encrypt_message(&provider, &ctx_id, b"hello", 0, 0);
         assert!(encrypted.is_ok());
 
         // Destroy.
-        assert!(provider.destroy_mls_group(&ctx_id).is_ok());
+        assert!(provider.destroy_mls_group(&ctx_id).await.is_ok());
 
         // After destroy, encrypt should fail.
         let encrypted = test_encrypt_message(&provider, &ctx_id, b"hello", 0, 0);
         assert!(encrypted.is_err());
     }
 
-    #[test]
-    fn add_member_with_real_key_package() {
+    #[tokio::test]
+    async fn add_member_with_real_key_package() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
         // Generate a key package for Bob.
         let bob_cred = ScpCredential::new(
@@ -1876,26 +1881,28 @@ mod tests {
             .unwrap();
 
         // Add Bob.
-        let result = provider.add_member(&ctx_id, &bob_cred.did, Some(&kp_bytes));
+        let result = provider
+            .add_member(&ctx_id, &bob_cred.did, Some(&kp_bytes))
+            .await;
         assert!(result.is_ok(), "add_member failed: {result:?}");
     }
 
-    #[test]
-    fn add_member_requires_key_package_bytes() {
+    #[tokio::test]
+    async fn add_member_requires_key_package_bytes() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
         // add_member with None should fail.
-        let result = provider.add_member(&ctx_id, "did:dht:z6MkBob", None);
+        let result = provider.add_member(&ctx_id, "did:dht:z6MkBob", None).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn remove_member_by_did() {
+    #[tokio::test]
+    async fn remove_member_by_did() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
         // Add Bob.
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
@@ -1907,10 +1914,11 @@ mod tests {
             .unwrap();
         provider
             .add_member(&ctx_id, bob_did, Some(&kp_bytes))
+            .await
             .unwrap();
 
         // Remove Bob.
-        let result = provider.remove_member(&ctx_id, bob_did);
+        let result = provider.remove_member(&ctx_id, bob_did).await;
         assert!(result.is_ok(), "remove_member failed: {result:?}");
         let output = result.unwrap();
         assert!(
@@ -1919,16 +1927,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn remove_member_self_returns_empty_commit() {
+    #[tokio::test]
+    async fn remove_member_self_returns_empty_commit() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
         // Self-removal (leave) returns empty commit bytes — the local node
         // does not produce a Commit for its own departure.
         let output = provider
             .remove_member(&ctx_id, &provider.local_did)
+            .await
             .unwrap();
         assert!(
             output.commit_bytes.is_empty(),
@@ -1936,13 +1945,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn advance_epoch_returns_non_empty_commit() {
+    #[tokio::test]
+    async fn advance_epoch_returns_non_empty_commit() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
-        let output = provider.advance_epoch(&ctx_id);
+        let output = provider.advance_epoch(&ctx_id).await;
         assert!(output.is_ok(), "advance_epoch failed: {output:?}");
         let output = output.unwrap();
         assert!(
@@ -1951,11 +1960,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn encrypt_message_produces_ciphertext() {
+    #[tokio::test]
+    async fn encrypt_message_produces_ciphertext() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
         let plaintext = b"test message";
         let ciphertext = test_encrypt_message(&provider, &ctx_id, plaintext, 0, 0).unwrap();
@@ -1965,13 +1974,13 @@ mod tests {
         assert_ne!(&ciphertext, plaintext.as_slice());
     }
 
-    #[test]
-    fn encrypt_decrypt_roundtrip_two_members() {
+    #[tokio::test]
+    async fn encrypt_decrypt_roundtrip_two_members() {
         // Alice creates a group.
         let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
         let alice_provider = MlsCryptoProvider::new(alice_did.to_string());
         let ctx_id = make_context_id();
-        alice_provider.create_mls_group(&ctx_id).unwrap();
+        alice_provider.create_mls_group(&ctx_id).await.unwrap();
 
         // Generate a key package for Bob.
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
@@ -2006,13 +2015,13 @@ mod tests {
         assert_eq!(decrypted, plaintext);
     }
 
-    #[test]
-    fn forward_secrecy_after_epoch_advance() {
+    #[tokio::test]
+    async fn forward_secrecy_after_epoch_advance() {
         // Alice creates a group.
         let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
         let alice_provider = MlsCryptoProvider::new(alice_did.to_string());
         let ctx_id = make_context_id();
-        alice_provider.create_mls_group(&ctx_id).unwrap();
+        alice_provider.create_mls_group(&ctx_id).await.unwrap();
 
         // Add Bob.
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
@@ -2078,11 +2087,11 @@ mod tests {
         assert_ne!(ciphertext_epoch1, ciphertext_epoch2);
     }
 
-    #[test]
-    fn max_past_epochs_allows_grace_window() {
+    #[tokio::test]
+    async fn max_past_epochs_allows_grace_window() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
         let contexts = provider.contexts.lock().unwrap();
         let state = contexts.get(&ctx_id).unwrap();
@@ -2095,12 +2104,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn three_member_group() {
+    #[tokio::test]
+    async fn three_member_group() {
         let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
         let provider = MlsCryptoProvider::new(alice_did.to_string());
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
         // Add Bob.
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
@@ -2149,12 +2158,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn member_removal_advances_epoch() {
+    #[tokio::test]
+    async fn member_removal_advances_epoch() {
         let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
         let provider = MlsCryptoProvider::new(alice_did.to_string());
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
@@ -2165,6 +2174,7 @@ mod tests {
             .unwrap();
         provider
             .add_member(&ctx_id, bob_did, Some(&bob_kp_bytes))
+            .await
             .unwrap();
 
         {
@@ -2173,7 +2183,7 @@ mod tests {
             assert_eq!(state.mls_group.epoch().unwrap(), 1);
         }
 
-        provider.remove_member(&ctx_id, bob_did).unwrap();
+        provider.remove_member(&ctx_id, bob_did).await.unwrap();
 
         {
             let contexts = provider.contexts.lock().unwrap();
@@ -2184,11 +2194,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ciphersuite_is_correct() {
+    #[tokio::test]
+    async fn ciphersuite_is_correct() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
         let contexts = provider.contexts.lock().unwrap();
         let state = contexts.get(&ctx_id).unwrap();
@@ -2200,24 +2210,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn init_and_destroy_broadcast_key() {
+    #[tokio::test]
+    async fn init_and_destroy_broadcast_key() {
         let provider = make_provider();
         let ctx_id = make_context_id();
 
-        assert!(provider.init_broadcast_key(&ctx_id).is_ok());
-        assert!(provider.destroy_sender_key(&ctx_id).is_ok());
+        assert!(provider.init_broadcast_key(&ctx_id).await.is_ok());
+        assert!(provider.destroy_sender_key(&ctx_id).await.is_ok());
     }
 
-    #[test]
-    fn distribute_and_remove_sender_key() {
+    #[tokio::test]
+    async fn distribute_and_remove_sender_key() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
         assert!(
             provider
                 .distribute_sender_key(&ctx_id, "did:dht:z6MkBob")
+                .await
                 .is_ok()
         );
         {
@@ -2227,57 +2238,64 @@ mod tests {
             assert!(state.sender_key_store.get(&ctx_hex, TEST_DID).is_some());
         }
 
-        assert!(provider.remove_member_sender_key(&ctx_id, TEST_DID).is_ok());
+        assert!(
+            provider
+                .remove_member_sender_key(&ctx_id, TEST_DID)
+                .await
+                .is_ok()
+        );
     }
 
-    #[test]
-    fn distribute_sender_key_errors_without_context() {
+    #[tokio::test]
+    async fn distribute_sender_key_errors_without_context() {
         let provider = make_provider();
         let ctx_id = make_context_id();
         assert!(
             provider
                 .distribute_sender_key(&ctx_id, "did:dht:z6MkBob")
+                .await
                 .is_err()
         );
     }
 
-    #[test]
-    fn remove_member_sender_key_errors_without_context() {
+    #[tokio::test]
+    async fn remove_member_sender_key_errors_without_context() {
         let provider = make_provider();
         let ctx_id = make_context_id();
         assert!(
             provider
                 .remove_member_sender_key(&ctx_id, "did:dht:z6MkBob")
+                .await
                 .is_err()
         );
     }
 
-    #[test]
-    fn generate_sender_key_errors_without_context() {
+    #[tokio::test]
+    async fn generate_sender_key_errors_without_context() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        assert!(provider.generate_sender_key(&ctx_id).is_err());
+        assert!(provider.generate_sender_key(&ctx_id).await.is_err());
     }
 
-    #[test]
-    fn self_removal_is_noop() {
+    #[tokio::test]
+    async fn self_removal_is_noop() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
         // Self-removal is a no-op: the leaving member abandons their local
         // MLS group state; the remaining members handle the actual removal
         // via a Commit from the group admin (#1294).
-        let result = provider.remove_member(&ctx_id, TEST_DID);
+        let result = provider.remove_member(&ctx_id, TEST_DID).await;
         assert!(result.is_ok());
     }
 
     // -- New tests for sender key distribution wiring --------------------------
 
-    #[test]
-    fn create_mls_group_includes_wrapping_key() {
+    #[tokio::test]
+    async fn create_mls_group_includes_wrapping_key() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
         let contexts = provider.contexts.lock().unwrap();
         let state = contexts.get(&ctx_id).unwrap();
@@ -2290,13 +2308,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn distribute_sender_key_hpke_seals_when_wrapping_key_available() {
+    #[tokio::test]
+    async fn distribute_sender_key_hpke_seals_when_wrapping_key_available() {
         use super::super::group::generate_key_package_with_wrapping_key;
 
         let alice_provider = make_provider();
         let ctx_id = make_context_id();
-        alice_provider.create_mls_group(&ctx_id).unwrap();
+        alice_provider.create_mls_group(&ctx_id).await.unwrap();
 
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let bob_wrapping = [0xBB_u8; 32];
@@ -2310,6 +2328,7 @@ mod tests {
 
         alice_provider
             .add_member(&ctx_id, bob_did, Some(&kp_bytes))
+            .await
             .unwrap();
 
         {
@@ -2324,10 +2343,12 @@ mod tests {
 
         alice_provider
             .distribute_sender_key(&ctx_id, bob_did)
+            .await
             .unwrap();
 
         let pending = alice_provider
             .drain_pending_sender_key_messages(&ctx_id)
+            .await
             .unwrap();
         assert_eq!(pending.len(), 1, "should have 1 pending distribution");
         assert_eq!(pending[0].0, bob_did, "pending message should target Bob");
@@ -2349,11 +2370,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn distribute_sender_key_no_wrapping_key_still_stores_locally() {
+    #[tokio::test]
+    async fn distribute_sender_key_no_wrapping_key_still_stores_locally() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let bob_cred = ScpCredential::new(bob_did.to_string(), None, SigningKeyId::Active).unwrap();
@@ -2364,9 +2385,13 @@ mod tests {
             .unwrap();
         provider
             .add_member(&ctx_id, bob_did, Some(&kp_bytes))
+            .await
             .unwrap();
 
-        provider.distribute_sender_key(&ctx_id, bob_did).unwrap();
+        provider
+            .distribute_sender_key(&ctx_id, bob_did)
+            .await
+            .unwrap();
 
         {
             let contexts = provider.contexts.lock().unwrap();
@@ -2375,12 +2400,15 @@ mod tests {
             assert!(state.sender_key_store.get(&ctx_hex, TEST_DID).is_some());
         }
 
-        let pending = provider.drain_pending_sender_key_messages(&ctx_id).unwrap();
+        let pending = provider
+            .drain_pending_sender_key_messages(&ctx_id)
+            .await
+            .unwrap();
         assert!(pending.is_empty());
     }
 
-    #[test]
-    fn process_incoming_sender_key_roundtrip() {
+    #[tokio::test]
+    async fn process_incoming_sender_key_roundtrip() {
         use super::super::group::generate_key_package_with_wrapping_key;
 
         let alice_provider = make_provider();
@@ -2388,8 +2416,8 @@ mod tests {
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string(),
         );
         let ctx_id = make_context_id();
-        alice_provider.create_mls_group(&ctx_id).unwrap();
-        bob_provider.create_mls_group(&ctx_id).unwrap();
+        alice_provider.create_mls_group(&ctx_id).await.unwrap();
+        bob_provider.create_mls_group(&ctx_id).await.unwrap();
 
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
 
@@ -2403,18 +2431,22 @@ mod tests {
             .unwrap();
         alice_provider
             .add_member(&ctx_id, bob_did, Some(&kp_bytes))
+            .await
             .unwrap();
 
         alice_provider
             .distribute_sender_key(&ctx_id, bob_did)
+            .await
             .unwrap();
         let pending = alice_provider
             .drain_pending_sender_key_messages(&ctx_id)
+            .await
             .unwrap();
         assert_eq!(pending.len(), 1);
 
         bob_provider
             .process_incoming_sender_key(&ctx_id, TEST_DID, &pending[0].1)
+            .await
             .unwrap();
 
         {
@@ -2437,36 +2469,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn drain_pending_sender_key_messages_clears_queue() {
+    #[tokio::test]
+    async fn drain_pending_sender_key_messages_clears_queue() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
-        let pending = provider.drain_pending_sender_key_messages(&ctx_id).unwrap();
+        let pending = provider
+            .drain_pending_sender_key_messages(&ctx_id)
+            .await
+            .unwrap();
         assert!(pending.is_empty());
 
         provider
             .distribute_sender_key(&ctx_id, "did:dht:z6MkBob")
+            .await
             .unwrap();
-        let pending = provider.drain_pending_sender_key_messages(&ctx_id).unwrap();
+        let pending = provider
+            .drain_pending_sender_key_messages(&ctx_id)
+            .await
+            .unwrap();
         assert!(pending.is_empty());
     }
 
-    #[test]
-    fn drain_pending_sender_key_messages_errors_without_context() {
+    #[tokio::test]
+    async fn drain_pending_sender_key_messages_errors_without_context() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        assert!(provider.drain_pending_sender_key_messages(&ctx_id).is_err());
+        assert!(
+            provider
+                .drain_pending_sender_key_messages(&ctx_id)
+                .await
+                .is_err()
+        );
     }
 
-    #[test]
-    fn process_incoming_sender_key_rejects_wrong_sender() {
+    #[tokio::test]
+    async fn process_incoming_sender_key_rejects_wrong_sender() {
         let bob_provider = MlsCryptoProvider::new(
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string(),
         );
         let ctx_id = make_context_id();
-        bob_provider.create_mls_group(&ctx_id).unwrap();
+        bob_provider.create_mls_group(&ctx_id).await.unwrap();
 
         let ctx_hex = hex::encode(ctx_id);
         let bob_wrapping_pk = *bob_provider.wrapping_public_key.lock().unwrap();
@@ -2491,8 +2535,9 @@ mod tests {
         let msg = SenderKeyDistributionMessage::KeyResponse(response);
         let serialized = msg.to_bytes().unwrap();
 
-        let result =
-            bob_provider.process_incoming_sender_key(&ctx_id, "did:dht:z6MkCharlie", &serialized);
+        let result = bob_provider
+            .process_incoming_sender_key(&ctx_id, "did:dht:z6MkCharlie", &serialized)
+            .await;
         assert!(
             result.is_err(),
             "should reject when sender_did doesn't match transport sender"
@@ -2503,34 +2548,34 @@ mod tests {
     // MLS crypto state persistence tests (#645)
     // -------------------------------------------------------------------
 
-    #[test]
-    fn export_crypto_state_returns_empty_for_unknown_context() {
+    #[tokio::test]
+    async fn export_crypto_state_returns_empty_for_unknown_context() {
         let provider = make_provider();
         let unknown_ctx = [0xFFu8; 32];
-        let exported = provider.export_crypto_state(&unknown_ctx).unwrap();
+        let exported = provider.export_crypto_state(&unknown_ctx).await.unwrap();
         assert!(
             exported.is_empty(),
             "should return empty Vec for unknown context"
         );
     }
 
-    #[test]
-    fn restore_crypto_state_noop_on_empty_data() {
+    #[tokio::test]
+    async fn restore_crypto_state_noop_on_empty_data() {
         let provider = make_provider();
         let ctx_id = make_context_id();
         // restore_crypto_state with empty data should be a no-op.
-        let result = provider.restore_crypto_state(&ctx_id, &[]);
+        let result = provider.restore_crypto_state(&ctx_id, &[]).await;
         assert!(result.is_ok(), "empty data should succeed silently");
     }
 
-    #[test]
-    fn export_restore_crypto_state_roundtrip() {
+    #[tokio::test]
+    async fn export_restore_crypto_state_roundtrip() {
         let provider = make_provider();
         let ctx_id = make_context_id();
 
         // Create a group and generate a sender key.
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
+        provider.generate_sender_key(&ctx_id).await.unwrap();
 
         // Store a sender key for a remote member.
         {
@@ -2574,7 +2619,7 @@ mod tests {
         };
 
         // Export crypto state.
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider.export_crypto_state(&ctx_id).await.unwrap();
         assert!(!exported.is_empty(), "exported state should be non-empty");
 
         // Create a fresh provider and restore the state.
@@ -2585,7 +2630,10 @@ mod tests {
         assert!(encrypted.is_err(), "should fail before restore");
 
         // Restore.
-        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        provider2
+            .restore_crypto_state(&ctx_id, &exported)
+            .await
+            .unwrap();
 
         // Verify the MLS group is functional: encrypt should succeed.
         let encrypted = test_encrypt_message(&provider2, &ctx_id, b"test after restore", 0, 0);
@@ -2642,8 +2690,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn restore_preserves_sender_key_epoch_high_water_mark() {
+    #[tokio::test]
+    async fn restore_preserves_sender_key_epoch_high_water_mark() {
         // Regression for #1608 rollback-protection across restart.
         //
         // Scenario:
@@ -2661,8 +2709,8 @@ mod tests {
         // silently re-opening the rollback window.
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
+        provider.generate_sender_key(&ctx_id).await.unwrap();
 
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let ctx_id_hex = hex::encode(ctx_id);
@@ -2684,12 +2732,15 @@ mod tests {
         }
 
         // Step 2: export snapshot.
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider.export_crypto_state(&ctx_id).await.unwrap();
         assert!(!exported.is_empty());
 
         // Step 3: simulate restart — fresh provider, restore state.
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
-        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        provider2
+            .restore_crypto_state(&ctx_id, &exported)
+            .await
+            .unwrap();
 
         // Verify the restored floor exactly matches the persisted epoch.
         {
@@ -2760,15 +2811,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn restore_preserves_epoch_floor_for_removed_members() {
+    #[tokio::test]
+    async fn restore_preserves_epoch_floor_for_removed_members() {
         // Removed members still have their epoch floor retained (see
         // `SenderKeyStore::remove`) so a rejoining member cannot replay
         // an earlier-epoch key. This invariant must survive a restart.
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
+        provider.generate_sender_key(&ctx_id).await.unwrap();
 
         let carol_did = "did:dht:z6MkCarolCarolCarolCarolCarolCarolCarolCa";
         let ctx_id_hex = hex::encode(ctx_id);
@@ -2795,9 +2846,12 @@ mod tests {
         }
 
         // Snapshot + restart.
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider.export_crypto_state(&ctx_id).await.unwrap();
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
-        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        provider2
+            .restore_crypto_state(&ctx_id, &exported)
+            .await
+            .unwrap();
 
         // Restored store has no key for Carol but still has the floor.
         {
@@ -2826,8 +2880,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn restore_tolerates_legacy_snapshot_with_seeded_floor() {
+    #[tokio::test]
+    async fn restore_tolerates_legacy_snapshot_with_seeded_floor() {
         // Back-compat: a snapshot serialized before `sender_key_epochs`
         // was persisted must still deserialize cleanly AND must close
         // the one-shot rollback window that would otherwise exist at
@@ -2846,8 +2900,8 @@ mod tests {
         // fills in an empty Vec on deserialize).
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
+        provider.generate_sender_key(&ctx_id).await.unwrap();
 
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let ctx_id_hex = hex::encode(ctx_id);
@@ -2863,7 +2917,7 @@ mod tests {
         }
 
         // Export, then hand-edit the msgpack to drop the epoch map.
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider.export_crypto_state(&ctx_id).await.unwrap();
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
@@ -2871,6 +2925,7 @@ mod tests {
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
         provider2
             .restore_crypto_state(&ctx_id, &legacy_bytes)
+            .await
             .expect("legacy snapshot (empty epoch map) must restore cleanly");
 
         // The legacy snapshot had no per-sender epoch map, so the
@@ -2906,8 +2961,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn restore_legacy_snapshot_gap_case_residual_window_documented() {
+    #[tokio::test]
+    async fn restore_legacy_snapshot_gap_case_residual_window_documented() {
         // Pins the residual-window case for legacy snapshots: the
         // floor seed uses the global `sender_key_epoch` counter,
         // which reflects LOCAL rotation count only. A remote peer
@@ -2919,8 +2974,8 @@ mod tests {
         // unambiguous.
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
+        provider.generate_sender_key(&ctx_id).await.unwrap();
 
         let peer_did = "did:dht:z6MkPeerPeerPeerPeerPeerPeerPeerPeerPeerPe";
         let ctx_id_hex = hex::encode(ctx_id);
@@ -2948,7 +3003,7 @@ mod tests {
 
         // Export, then strip the per-sender epoch map to simulate a
         // legacy snapshot.
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider.export_crypto_state(&ctx_id).await.unwrap();
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
@@ -2956,6 +3011,7 @@ mod tests {
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
         provider2
             .restore_crypto_state(&ctx_id, &legacy_bytes)
+            .await
             .expect("legacy restore must succeed");
 
         // OBSERVED BEHAVIOR: the peer's restored floor equals the
@@ -2983,8 +3039,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn restore_legacy_snapshot_with_zero_global_epoch_seeds_floor_to_one() {
+    #[tokio::test]
+    async fn restore_legacy_snapshot_with_zero_global_epoch_seeds_floor_to_one() {
         // Edge case of the legacy-floor seed: if the legacy snapshot's
         // global `sender_key_epoch` is 0 (brand-new context, never
         // rotated), the seed must still be at least 1 so that
@@ -2993,8 +3049,8 @@ mod tests {
         // the floor to be explicit rather than implicit).
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.generate_sender_key(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
+        provider.generate_sender_key(&ctx_id).await.unwrap();
 
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let ctx_id_hex = hex::encode(ctx_id);
@@ -3007,7 +3063,7 @@ mod tests {
                 .set_unchecked(&ctx_id_hex, bob_did, generate_sender_key());
         }
 
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider.export_crypto_state(&ctx_id).await.unwrap();
         let mut snapshot: MlsCryptoSnapshot = rmp_serde::from_slice(&exported).unwrap();
         snapshot.sender_key_epochs.clear();
         let legacy_bytes = rmp_serde::to_vec_named(&snapshot).unwrap();
@@ -3015,6 +3071,7 @@ mod tests {
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
         provider2
             .restore_crypto_state(&ctx_id, &legacy_bytes)
+            .await
             .unwrap();
 
         let contexts = provider2.contexts.lock().unwrap();
@@ -3026,43 +3083,51 @@ mod tests {
         );
     }
 
-    #[test]
-    fn export_fails_on_destroyed_group() {
+    #[tokio::test]
+    async fn export_fails_on_destroyed_group() {
         let provider = make_provider();
         let ctx_id = make_context_id();
 
-        provider.create_mls_group(&ctx_id).unwrap();
-        provider.destroy_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
+        provider.destroy_mls_group(&ctx_id).await.unwrap();
 
         // After destroy, export should return empty (context removed).
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider.export_crypto_state(&ctx_id).await.unwrap();
         assert!(
             exported.is_empty(),
             "destroyed group should export empty state"
         );
     }
 
-    #[test]
-    fn restore_rejects_corrupt_data() {
+    #[tokio::test]
+    async fn restore_rejects_corrupt_data() {
         let provider = make_provider();
         let ctx_id = make_context_id();
 
-        let result = provider.restore_crypto_state(&ctx_id, b"not valid msgpack");
+        let result = provider
+            .restore_crypto_state(&ctx_id, b"not valid msgpack")
+            .await;
         assert!(result.is_err(), "corrupt data should fail");
     }
 
-    #[test]
-    fn restore_idempotent_on_same_context() {
+    #[tokio::test]
+    async fn restore_idempotent_on_same_context() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider.export_crypto_state(&ctx_id).await.unwrap();
 
         // Restore into a fresh provider twice — second should overwrite cleanly.
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
-        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
-        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        provider2
+            .restore_crypto_state(&ctx_id, &exported)
+            .await
+            .unwrap();
+        provider2
+            .restore_crypto_state(&ctx_id, &exported)
+            .await
+            .unwrap();
 
         // Should still be functional.
         let encrypted = test_encrypt_message(&provider2, &ctx_id, b"test", 0, 0);
@@ -3072,11 +3137,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn export_restore_preserves_mls_epoch() {
+    #[tokio::test]
+    async fn export_restore_preserves_mls_epoch() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
         // Get the epoch before export.
         let epoch_before = {
@@ -3085,10 +3150,13 @@ mod tests {
             state.mls_group.epoch().unwrap()
         };
 
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider.export_crypto_state(&ctx_id).await.unwrap();
 
         let provider2 = MlsCryptoProvider::new(TEST_DID.to_string());
-        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        provider2
+            .restore_crypto_state(&ctx_id, &exported)
+            .await
+            .unwrap();
 
         // Verify epoch is preserved.
         let epoch_after = {
@@ -3103,11 +3171,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_wrapping_key_persisted_across_restart() {
+    #[tokio::test]
+    async fn test_wrapping_key_persisted_across_restart() {
         let provider = make_provider();
         let ctx_id = make_context_id();
-        provider.create_mls_group(&ctx_id).unwrap();
+        provider.create_mls_group(&ctx_id).await.unwrap();
 
         // Capture the original wrapping keypair.
         let original_public = *provider.wrapping_public_key.lock().unwrap();
@@ -3124,7 +3192,7 @@ mod tests {
         );
 
         // Export the crypto state.
-        let exported = provider.export_crypto_state(&ctx_id).unwrap();
+        let exported = provider.export_crypto_state(&ctx_id).await.unwrap();
         assert!(!exported.is_empty());
 
         // Create a fresh provider (simulates restart — gets a NEW random keypair).
@@ -3136,7 +3204,10 @@ mod tests {
         );
 
         // Restore the exported state into the fresh provider.
-        provider2.restore_crypto_state(&ctx_id, &exported).unwrap();
+        provider2
+            .restore_crypto_state(&ctx_id, &exported)
+            .await
+            .unwrap();
 
         // After restore, the wrapping keypair must match the ORIGINAL, not the fresh one.
         let restored_public = *provider2.wrapping_public_key.lock().unwrap();
@@ -3160,36 +3231,44 @@ mod tests {
     /// MLS group via the provider-level Welcome flow, exchange Alice's
     /// sender key, and return both providers ready for `seal()` /
     /// `open()`. Used by the H9 ceiling tests.
-    fn setup_alice_bob_two_party() -> (MlsCryptoProvider, MlsCryptoProvider, [u8; 32], String) {
+    async fn setup_alice_bob_two_party() -> (MlsCryptoProvider, MlsCryptoProvider, [u8; 32], String)
+    {
         let alice_did = TEST_DID;
         let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
         let context_id = make_context_id();
 
         let alice = MlsCryptoProvider::new(alice_did.to_string());
-        alice.create_mls_group(&context_id).unwrap();
-        alice.generate_sender_key(&context_id).unwrap();
+        alice.create_mls_group(&context_id).await.unwrap();
+        alice.generate_sender_key(&context_id).await.unwrap();
 
         let bob = MlsCryptoProvider::new(bob_did.to_string());
-        let bob_kp_bytes = bob.prepare_key_package_for_join().unwrap();
+        let bob_kp_bytes = bob.prepare_key_package_for_join().await.unwrap();
 
         let add_output = alice
             .add_member(&context_id, bob_did, Some(&bob_kp_bytes))
+            .await
             .unwrap();
 
         bob.join_from_welcome(&context_id, &add_output.welcome_bytes)
+            .await
             .unwrap();
-        bob.generate_sender_key(&context_id).unwrap();
+        bob.generate_sender_key(&context_id).await.unwrap();
 
         // Distribute Alice's sender key to Bob via the legitimate path.
         // This sets `bob.sender_key_store.epoch(ctx, alice_did) = 1`,
         // which is the H9 high-water mark.
-        alice.distribute_sender_key(&context_id, bob_did).unwrap();
+        alice
+            .distribute_sender_key(&context_id, bob_did)
+            .await
+            .unwrap();
         let pending = alice
             .drain_pending_sender_key_messages(&context_id)
+            .await
             .unwrap();
         assert_eq!(pending.len(), 1);
         for (_target, msg) in pending {
             bob.process_incoming_sender_key(&context_id, alice_did, &msg)
+                .await
                 .unwrap();
         }
 
@@ -3239,24 +3318,25 @@ mod tests {
         context_id.to_vec()
     }
 
-    #[test]
-    fn test_recv_epoch_ceiling_rejects_far_future() {
+    #[tokio::test]
+    async fn test_recv_epoch_ceiling_rejects_far_future() {
         // H9: A crafted sender-layer header with `epoch = u64::MAX` must
         // be rejected before it pollutes `recv_sequence_tracker` and
         // permanently locks Bob out of subsequent legitimate messages
         // from Alice. Bob's stored high-water for Alice is 1 (set by
         // the legitimate distribution in `setup_alice_bob_two_party`),
         // so the ceiling is `1 + MAX_EPOCH_ADVANCE = 1001`.
-        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party().await;
 
         force_alice_sender_key_epoch(&alice, &ctx_id, u64::MAX);
 
         let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
         let routing_id = ctx_routing_id(&ctx_id);
-        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
+        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).await.unwrap();
 
         let err = bob
             .open(&ctx_id, &sealed)
+            .await
             .expect_err("u64::MAX epoch must be rejected by the H9 ceiling");
         match err {
             ContextError::CryptoFailed(msg) => {
@@ -3282,21 +3362,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recv_epoch_ceiling_rejects_unreasonable_advance() {
+    #[tokio::test]
+    async fn test_recv_epoch_ceiling_rejects_unreasonable_advance() {
         // H9 boundary: stored high-water = 1, MAX_EPOCH_ADVANCE = 1000,
         // so ceiling = 1001. An advance of 1001 (epoch = 1002) is one
         // past the boundary and must be rejected.
-        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party().await;
 
         force_alice_sender_key_epoch(&alice, &ctx_id, 1002);
 
         let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
         let routing_id = ctx_routing_id(&ctx_id);
-        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
+        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).await.unwrap();
 
         let err = bob
             .open(&ctx_id, &sealed)
+            .await
             .expect_err("epoch one past the ceiling must be rejected");
         match err {
             ContextError::CryptoFailed(msg) => {
@@ -3309,21 +3390,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_recv_epoch_ceiling_allows_gap_fill() {
+    #[tokio::test]
+    async fn test_recv_epoch_ceiling_allows_gap_fill() {
         // H9 boundary: an advance of exactly MAX_EPOCH_ADVANCE must be
         // accepted. Stored high-water = 1, ceiling = 1001, so an
         // incoming epoch of 1001 sits exactly on the boundary.
-        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party().await;
 
         force_alice_sender_key_epoch(&alice, &ctx_id, 1001);
 
         let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
         let routing_id = ctx_routing_id(&ctx_id);
-        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
+        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).await.unwrap();
 
         let result = bob
             .open(&ctx_id, &sealed)
+            .await
             .expect("epoch == ceiling must be accepted (boundary inclusive)");
         match result {
             scp_protocol::context::builder::OpenResult::Application(env) => {
@@ -3340,12 +3422,12 @@ mod tests {
         assert_eq!(entry, Some((1001, 0)));
     }
 
-    #[test]
-    fn test_recv_epoch_normal_path_unchanged() {
+    #[tokio::test]
+    async fn test_recv_epoch_normal_path_unchanged() {
         // Regression: the H9 ceiling must not break the happy path.
         // A sequential epoch+sequence stream below the ceiling is
         // accepted, and the receive tracker advances monotonically.
-        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party().await;
 
         let routing_id = ctx_routing_id(&ctx_id);
         let inner1 = build_test_inner(&ctx_id, &alice_did, 0, 0);
@@ -3353,11 +3435,21 @@ mod tests {
 
         // Two sequential seals at Alice's natural epoch=1, sequence
         // increments handled by `seal()` itself.
-        let sealed1 = alice.seal(&ctx_id, &inner1, &routing_id, 300).unwrap();
-        let sealed2 = alice.seal(&ctx_id, &inner2, &routing_id, 300).unwrap();
+        let sealed1 = alice
+            .seal(&ctx_id, &inner1, &routing_id, 300)
+            .await
+            .unwrap();
+        let sealed2 = alice
+            .seal(&ctx_id, &inner2, &routing_id, 300)
+            .await
+            .unwrap();
 
-        bob.open(&ctx_id, &sealed1).expect("first seal must open");
-        bob.open(&ctx_id, &sealed2).expect("second seal must open");
+        bob.open(&ctx_id, &sealed1)
+            .await
+            .expect("first seal must open");
+        bob.open(&ctx_id, &sealed2)
+            .await
+            .expect("second seal must open");
 
         let contexts = bob.contexts.lock().unwrap();
         let state = contexts.get(&ctx_id).unwrap();
@@ -3370,13 +3462,13 @@ mod tests {
         assert_eq!(seq, 1, "sequence should advance to the second message");
     }
 
-    #[test]
-    fn test_recv_epoch_reorder_still_rejected() {
+    #[tokio::test]
+    async fn test_recv_epoch_reorder_still_rejected() {
         // Regression: existing replay/reorder rejection must still
         // fire even with the H9 ceiling in place. After a successful
         // open at (epoch=1, seq=1), a replay of the same (epoch, seq)
         // and a lower-sequence message must both be rejected.
-        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party().await;
 
         let routing_id = ctx_routing_id(&ctx_id);
 
@@ -3384,10 +3476,16 @@ mod tests {
         // legitimate messages.
         let inner_a = build_test_inner(&ctx_id, &alice_did, 0, 0);
         let inner_b = build_test_inner(&ctx_id, &alice_did, 0, 1);
-        let sealed_a = alice.seal(&ctx_id, &inner_a, &routing_id, 300).unwrap();
-        let sealed_b = alice.seal(&ctx_id, &inner_b, &routing_id, 300).unwrap();
-        bob.open(&ctx_id, &sealed_a).unwrap();
-        bob.open(&ctx_id, &sealed_b).unwrap();
+        let sealed_a = alice
+            .seal(&ctx_id, &inner_a, &routing_id, 300)
+            .await
+            .unwrap();
+        let sealed_b = alice
+            .seal(&ctx_id, &inner_b, &routing_id, 300)
+            .await
+            .unwrap();
+        bob.open(&ctx_id, &sealed_a).await.unwrap();
+        bob.open(&ctx_id, &sealed_b).await.unwrap();
 
         // Now force Alice's send_sequence backwards and re-seal. The
         // resulting header has (epoch=1, sequence=0) which is below
@@ -3402,8 +3500,9 @@ mod tests {
         let inner_replay = build_test_inner(&ctx_id, &alice_did, 0, 0);
         let sealed_replay = alice
             .seal(&ctx_id, &inner_replay, &routing_id, 300)
+            .await
             .unwrap();
-        let err = bob.open(&ctx_id, &sealed_replay).expect_err(
+        let err = bob.open(&ctx_id, &sealed_replay).await.expect_err(
             "lower-sequence message at the same epoch must still be rejected as replay",
         );
         match err {
@@ -3426,9 +3525,13 @@ mod tests {
             state.send_sequence = 5;
         }
         let inner_lower = build_test_inner(&ctx_id, &alice_did, 0, 0);
-        let sealed_lower = alice.seal(&ctx_id, &inner_lower, &routing_id, 300).unwrap();
+        let sealed_lower = alice
+            .seal(&ctx_id, &inner_lower, &routing_id, 300)
+            .await
+            .unwrap();
         let err = bob
             .open(&ctx_id, &sealed_lower)
+            .await
             .expect_err("lower-epoch message must still be rejected as reorder");
         match err {
             ContextError::CryptoFailed(msg) => {

@@ -297,12 +297,13 @@ pub(super) struct MockCrypto {
     pub(super) pending_restore_epochs: std::sync::Mutex<Option<Vec<(String, u64)>>>,
 }
 
+#[async_trait::async_trait]
 impl ContextCryptoProvider for MockCrypto {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+    async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
         Ok(())
     }
 
-    fn create_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn create_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         if self.fail_create_mls.load(Ordering::Relaxed) {
             return Err(ContextCreationError::CryptoFailed("mock failure".into()));
         }
@@ -310,27 +311,27 @@ impl ContextCryptoProvider for MockCrypto {
         Ok(())
     }
 
-    fn generate_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn generate_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.sender_keys_created.lock().unwrap().push(*id);
         Ok(())
     }
 
-    fn init_broadcast_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_broadcast_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.broadcast_created.lock().unwrap().push(*id);
         Ok(())
     }
 
-    fn destroy_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.mls_destroyed.lock().unwrap().push(*id);
         Ok(())
     }
 
-    fn destroy_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.sender_keys_destroyed.lock().unwrap().push(*id);
         Ok(())
     }
 
-    fn validate_key_package(
+    async fn validate_key_package(
         &self,
         _owner_did: &str,
         _key_package_bytes: Option<&[u8]>,
@@ -341,7 +342,7 @@ impl ContextCryptoProvider for MockCrypto {
         Ok(())
     }
 
-    fn add_member(
+    async fn add_member(
         &self,
         _context_id: &[u8; 32],
         member_did: &str,
@@ -354,7 +355,7 @@ impl ContextCryptoProvider for MockCrypto {
         Ok(scp_protocol::context::builder::AddMemberOutput::default())
     }
 
-    fn remove_member(
+    async fn remove_member(
         &self,
         _context_id: &[u8; 32],
         member_did: &str,
@@ -381,7 +382,7 @@ impl ContextCryptoProvider for MockCrypto {
         })
     }
 
-    fn distribute_sender_key(
+    async fn distribute_sender_key(
         &self,
         _context_id: &[u8; 32],
         member_did: &str,
@@ -393,7 +394,7 @@ impl ContextCryptoProvider for MockCrypto {
         Ok(())
     }
 
-    fn drain_pending_sender_key_messages(
+    async fn drain_pending_sender_key_messages(
         &self,
         _context_id: &[u8; 32],
     ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
@@ -410,7 +411,7 @@ impl ContextCryptoProvider for MockCrypto {
         Ok(Vec::new())
     }
 
-    fn remove_member_sender_key(
+    async fn remove_member_sender_key(
         &self,
         _context_id: &[u8; 32],
         member_did: &str,
@@ -431,7 +432,7 @@ impl ContextCryptoProvider for MockCrypto {
         Ok(())
     }
 
-    fn rotate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+    async fn rotate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
         if self.fail_rotate_sender_key.load(Ordering::Relaxed) {
             return Err(ContextError::CryptoFailed(
                 "mock rotate_sender_key failure".into(),
@@ -445,7 +446,7 @@ impl ContextCryptoProvider for MockCrypto {
         Ok(())
     }
 
-    fn seal(
+    async fn seal(
         &self,
         _context_id: &[u8; 32],
         inner: &scp_protocol::envelope::inner::InnerEnvelope,
@@ -461,7 +462,7 @@ impl ContextCryptoProvider for MockCrypto {
             .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
     }
 
-    fn open(
+    async fn open(
         &self,
         _context_id: &[u8; 32],
         outer_bytes: &[u8],
@@ -476,7 +477,7 @@ impl ContextCryptoProvider for MockCrypto {
         ))
     }
 
-    fn advance_epoch(
+    async fn advance_epoch(
         &self,
         context_id: &[u8; 32],
     ) -> Result<scp_protocol::context::builder::AdvanceEpochOutput, ContextError> {
@@ -497,7 +498,7 @@ impl ContextCryptoProvider for MockCrypto {
         })
     }
 
-    fn export_sender_key_epochs(&self, context_id: &[u8; 32]) -> Vec<(String, u64)> {
+    async fn export_sender_key_epochs(&self, context_id: &[u8; 32]) -> Vec<(String, u64)> {
         let ctx_key = hex::encode(context_id);
         self.epoch_floors
             .lock()
@@ -507,7 +508,7 @@ impl ContextCryptoProvider for MockCrypto {
             .unwrap_or_default()
     }
 
-    fn restore_crypto_state(
+    async fn restore_crypto_state(
         &self,
         context_id: &[u8; 32],
         _data: &[u8],
@@ -523,7 +524,7 @@ impl ContextCryptoProvider for MockCrypto {
         Ok(())
     }
 
-    fn validate_and_merge_epoch_floors(
+    async fn validate_and_merge_epoch_floors(
         &self,
         context_id: &[u8; 32],
         local_floors: Vec<(String, u64)>,
@@ -614,12 +615,13 @@ impl MockTransport {
     }
 }
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for MockTransport {
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
 
-    fn publish_context(
+    async fn publish_context(
         &self,
         id: &[u8; 32],
         _params: &ContextParams,
@@ -628,12 +630,12 @@ impl ContextTransportProvider for MockTransport {
         Ok(())
     }
 
-    fn delete_published(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
         self.deleted.lock().unwrap().push(*id);
         Ok(())
     }
 
-    fn send_message(
+    async fn send_message(
         &self,
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
@@ -1157,12 +1159,13 @@ impl ContextEventLogProvider for ArcFailingAppendEventLog {
 /// when transport fails (#1420).
 pub(super) struct FailingTransport;
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for FailingTransport {
     fn is_connected(&self) -> bool {
         true
     }
 
-    fn publish_context(
+    async fn publish_context(
         &self,
         _id: &[u8; 32],
         _params: &ContextParams,
@@ -1170,11 +1173,11 @@ impl ContextTransportProvider for FailingTransport {
         Ok(())
     }
 
-    fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 
-    fn send_message(
+    async fn send_message(
         &self,
         _context_id: &[u8; 32],
         _encrypted_payload: &[u8],
@@ -1207,12 +1210,13 @@ impl Default for RetriableMockTransport {
     }
 }
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for RetriableMockTransport {
     fn is_connected(&self) -> bool {
         true
     }
 
-    fn publish_context(
+    async fn publish_context(
         &self,
         _id: &[u8; 32],
         _params: &ContextParams,
@@ -1220,11 +1224,11 @@ impl ContextTransportProvider for RetriableMockTransport {
         Ok(())
     }
 
-    fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 
-    fn send_message(
+    async fn send_message(
         &self,
         _context_id: &[u8; 32],
         encrypted_payload: &[u8],
@@ -1249,29 +1253,30 @@ impl ContextTransportProvider for RetriableMockTransport {
 /// reach in and tweak `fail_count` after the manager has been constructed.
 pub(super) struct ArcRetriableTransport(pub(super) std::sync::Arc<RetriableMockTransport>);
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for ArcRetriableTransport {
     fn is_connected(&self) -> bool {
         self.0.is_connected()
     }
 
-    fn publish_context(
+    async fn publish_context(
         &self,
         id: &[u8; 32],
         params: &ContextParams,
     ) -> Result<(), ContextCreationError> {
-        self.0.publish_context(id, params)
+        self.0.publish_context(id, params).await
     }
 
-    fn delete_published(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        self.0.delete_published(id)
+    async fn delete_published(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.delete_published(id).await
     }
 
-    fn send_message(
+    async fn send_message(
         &self,
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
     ) -> Result<(), ContextError> {
-        self.0.send_message(context_id, encrypted_payload)
+        self.0.send_message(context_id, encrypted_payload).await
     }
 }
 

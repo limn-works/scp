@@ -650,12 +650,14 @@ pub async fn finalize_close(
     if memory_scope == MemoryScope::Ephemeral || memory_scope == MemoryScope::Summary {
         crypto
             .destroy_mls_group(&context_id_bytes)
+            .await
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
         crypto
             .destroy_sender_key(&context_id_bytes)
+            .await
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
-        let _ = transport.delete_published(&context_id_bytes);
+        let _ = transport.delete_published(&context_id_bytes).await;
     }
 
     event_log.append_context_event(&context_id_bytes, "ContextClosed", "system:close")?;
@@ -799,7 +801,7 @@ pub async fn try_ttl_expiry_cleanup(
     //    operations that already succeeded on a prior attempt.
     if needs_key_destruction {
         if result.completed_steps & STEP_MLS_DESTROYED == 0 {
-            match crypto.destroy_mls_group(&context_id_bytes) {
+            match crypto.destroy_mls_group(&context_id_bytes).await {
                 Ok(()) => result.set_step(STEP_MLS_DESTROYED),
                 Err(e) => {
                     let msg = format!("failed to destroy MLS group: {e}");
@@ -810,7 +812,7 @@ pub async fn try_ttl_expiry_cleanup(
             }
         }
         if result.completed_steps & STEP_SENDER_KEY_DESTROYED == 0 {
-            match crypto.destroy_sender_key(&context_id_bytes) {
+            match crypto.destroy_sender_key(&context_id_bytes).await {
                 Ok(()) => result.set_step(STEP_SENDER_KEY_DESTROYED),
                 Err(e) => {
                     let msg = format!("failed to destroy sender key: {e}");
@@ -826,7 +828,7 @@ pub async fn try_ttl_expiry_cleanup(
         // keys are destroyed and the data is unreadable. Not tracked in the
         // bitmask since it is best-effort by design.
         if let Some(transport) = transport
-            && let Err(e) = transport.delete_published(&context_id_bytes)
+            && let Err(e) = transport.delete_published(&context_id_bytes).await
         {
             tracing::warn!(context_id = %context_id, error = %e,
                 "best-effort relay deletion failed after TTL expiry");
@@ -1248,35 +1250,36 @@ mod tests {
         sender_keys_destroyed: Mutex<Vec<[u8; 32]>>,
     }
 
+    #[async_trait::async_trait]
     impl ContextCryptoProvider for MockCrypto {
-        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+        async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn destroy_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
             self.mls_destroyed.lock().unwrap().push(*id);
             Ok(())
         }
-        fn destroy_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
             self.sender_keys_destroyed.lock().unwrap().push(*id);
             Ok(())
         }
-        fn validate_key_package(
+        async fn validate_key_package(
             &self,
             _owner_did: &str,
             _key_package_bytes: Option<&[u8]>,
         ) -> Result<(), ContextError> {
             Ok(())
         }
-        fn add_member(
+        async fn add_member(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -1284,21 +1287,21 @@ mod tests {
         ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
             Ok(scp_protocol::context::builder::AddMemberOutput::default())
         }
-        fn remove_member(
+        async fn remove_member(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
         ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
             Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
         }
-        fn distribute_sender_key(
+        async fn distribute_sender_key(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
         ) -> Result<(), ContextError> {
             Ok(())
         }
-        fn remove_member_sender_key(
+        async fn remove_member_sender_key(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -1321,22 +1324,23 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl ContextTransportProvider for MockTransport {
         fn is_connected(&self) -> bool {
             self.connected.load(Ordering::Relaxed)
         }
-        fn publish_context(
+        async fn publish_context(
             &self,
             _id: &[u8; 32],
             _params: &ContextParams,
         ) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn delete_published(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn delete_published(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
             self.deleted.lock().unwrap().push(*id);
             Ok(())
         }
-        fn send_message(
+        async fn send_message(
             &self,
             _context_id: &[u8; 32],
             _encrypted_payload: &[u8],
@@ -2400,36 +2404,37 @@ mod tests {
         sender_keys_destroyed: Mutex<Vec<[u8; 32]>>,
     }
 
+    #[async_trait::async_trait]
     impl ContextCryptoProvider for FailingMlsCrypto {
-        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+        async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn destroy_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Err(ContextCreationError::CryptoFailed(
                 "MLS group destruction failed".into(),
             ))
         }
-        fn destroy_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
             self.sender_keys_destroyed.lock().unwrap().push(*id);
             Ok(())
         }
-        fn validate_key_package(
+        async fn validate_key_package(
             &self,
             _owner_did: &str,
             _key_package_bytes: Option<&[u8]>,
         ) -> Result<(), ContextError> {
             Ok(())
         }
-        fn add_member(
+        async fn add_member(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -2437,21 +2442,21 @@ mod tests {
         ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
             Ok(scp_protocol::context::builder::AddMemberOutput::default())
         }
-        fn remove_member(
+        async fn remove_member(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
         ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
             Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
         }
-        fn distribute_sender_key(
+        async fn distribute_sender_key(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
         ) -> Result<(), ContextError> {
             Ok(())
         }
-        fn remove_member_sender_key(
+        async fn remove_member_sender_key(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -2823,20 +2828,21 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl ContextCryptoProvider for TransientFailCrypto {
-        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+        async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
             Ok(())
         }
-        fn destroy_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
             let mut remaining = self.remaining_failures.lock().unwrap();
             if *remaining > 0 {
                 *remaining -= 1;
@@ -2848,18 +2854,18 @@ mod tests {
                 Ok(())
             }
         }
-        fn destroy_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
             self.sender_keys_destroyed.lock().unwrap().push(*id);
             Ok(())
         }
-        fn validate_key_package(
+        async fn validate_key_package(
             &self,
             _owner_did: &str,
             _key_package_bytes: Option<&[u8]>,
         ) -> Result<(), ContextError> {
             Ok(())
         }
-        fn add_member(
+        async fn add_member(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -2867,21 +2873,21 @@ mod tests {
         ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
             Ok(scp_protocol::context::builder::AddMemberOutput::default())
         }
-        fn remove_member(
+        async fn remove_member(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
         ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
             Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
         }
-        fn distribute_sender_key(
+        async fn distribute_sender_key(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
         ) -> Result<(), ContextError> {
             Ok(())
         }
-        fn remove_member_sender_key(
+        async fn remove_member_sender_key(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,

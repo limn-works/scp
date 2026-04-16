@@ -526,7 +526,7 @@ impl<'a> CloseOrchestrator<'a> {
     /// Returns [`ContextError::CryptoFailed`] if key destruction fails
     /// (Ephemeral scope only).
     #[allow(clippy::too_many_arguments)]
-    pub fn initiate_close(
+    pub async fn initiate_close(
         &self,
         context_id: &str,
         reason: ContextCloseReason,
@@ -540,13 +540,16 @@ impl<'a> CloseOrchestrator<'a> {
     ) -> Result<CloseAction, ContextError> {
         match memory_scope {
             MemoryScope::Ephemeral => {
-                let result = self.key_destruction.destroy_ephemeral_keys(
-                    context_id,
-                    relay_urls,
-                    blob_ids,
-                    attestation_level,
-                    now,
-                )?;
+                let result = self
+                    .key_destruction
+                    .destroy_ephemeral_keys(
+                        context_id,
+                        relay_urls,
+                        blob_ids,
+                        attestation_level,
+                        now,
+                    )
+                    .await?;
 
                 Ok(CloseAction::KeysDestroyed {
                     reason,
@@ -599,7 +602,7 @@ impl<'a> CloseOrchestrator<'a> {
     /// Returns [`ContextError::CryptoFailed`] if key destruction fails.
     /// Returns [`ContextError::ContextNotActive`] if the verification
     /// window has not yet closed.
-    pub fn complete_summary_close(
+    pub async fn complete_summary_close(
         &self,
         window: &SummaryVerificationWindow,
         relay_urls: &[String],
@@ -611,13 +614,15 @@ impl<'a> CloseOrchestrator<'a> {
             return Err(ContextError::ContextNotActive);
         }
 
-        self.key_destruction.destroy_ephemeral_keys(
-            window.context_id(),
-            relay_urls,
-            blob_ids,
-            attestation_level,
-            now,
-        )
+        self.key_destruction
+            .destroy_ephemeral_keys(
+                window.context_id(),
+                relay_urls,
+                blob_ids,
+                attestation_level,
+                now,
+            )
+            .await
     }
 }
 
@@ -709,24 +714,37 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl ContextCryptoProvider for MockCryptoProvider {
-        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+        async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
             Ok(())
         }
 
-        fn create_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn create_mls_group(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             Ok(())
         }
 
-        fn generate_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn generate_sender_key(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             Ok(())
         }
 
-        fn init_broadcast_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn init_broadcast_key(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             Ok(())
         }
 
-        fn destroy_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_mls_group(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             if self.fail_mls {
                 return Err(ContextCreationError::CryptoFailed(
                     "MLS destruction failed".to_owned(),
@@ -736,7 +754,10 @@ mod tests {
             Ok(())
         }
 
-        fn destroy_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        async fn destroy_sender_key(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), ContextCreationError> {
             if self.fail_sender {
                 return Err(ContextCreationError::CryptoFailed(
                     "sender key destruction failed".to_owned(),
@@ -746,7 +767,7 @@ mod tests {
             Ok(())
         }
 
-        fn validate_key_package(
+        async fn validate_key_package(
             &self,
             _owner_did: &str,
             _key_package_bytes: Option<&[u8]>,
@@ -754,7 +775,7 @@ mod tests {
             Ok(())
         }
 
-        fn add_member(
+        async fn add_member(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -763,7 +784,7 @@ mod tests {
             Ok(crate::context::builder::AddMemberOutput::default())
         }
 
-        fn remove_member(
+        async fn remove_member(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -771,7 +792,7 @@ mod tests {
             Ok(crate::context::builder::RemoveMemberOutput::default())
         }
 
-        fn distribute_sender_key(
+        async fn distribute_sender_key(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -779,7 +800,7 @@ mod tests {
             Ok(())
         }
 
-        fn remove_member_sender_key(
+        async fn remove_member_sender_key(
             &self,
             _context_id: &[u8; 32],
             _member_did: &str,
@@ -968,22 +989,24 @@ mod tests {
     // CloseOrchestrator -- Ephemeral close tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn ephemeral_close_ttl_expired_destroys_keys() {
+    #[tokio::test]
+    async fn ephemeral_close_ttl_expired_destroys_keys() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = CloseOrchestrator::new(&crypto);
 
-        let result = orchestrator.initiate_close(
-            "ctx-1",
-            ContextCloseReason::TtlExpired,
-            MemoryScope::Ephemeral,
-            &["wss://relay.example.com".to_owned()],
-            &[[0x01; 32]],
-            KeyDestructionLevel::SoftwareOnly,
-            2,
-            None,
-            1_700_000_000,
-        );
+        let result = orchestrator
+            .initiate_close(
+                "ctx-1",
+                ContextCloseReason::TtlExpired,
+                MemoryScope::Ephemeral,
+                &["wss://relay.example.com".to_owned()],
+                &[[0x01; 32]],
+                KeyDestructionLevel::SoftwareOnly,
+                2,
+                None,
+                1_700_000_000,
+            )
+            .await;
 
         assert!(result.is_ok());
         let action = result.unwrap();
@@ -1014,22 +1037,24 @@ mod tests {
         assert!(crypto.sender_key_destroyed.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn ephemeral_close_governance_closed_destroys_keys() {
+    #[tokio::test]
+    async fn ephemeral_close_governance_closed_destroys_keys() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = CloseOrchestrator::new(&crypto);
 
-        let result = orchestrator.initiate_close(
-            "ctx-2",
-            ContextCloseReason::GovernanceClosed,
-            MemoryScope::Ephemeral,
-            &[],
-            &[],
-            KeyDestructionLevel::HardwareAttested,
-            3,
-            None,
-            1_700_000_000,
-        );
+        let result = orchestrator
+            .initiate_close(
+                "ctx-2",
+                ContextCloseReason::GovernanceClosed,
+                MemoryScope::Ephemeral,
+                &[],
+                &[],
+                KeyDestructionLevel::HardwareAttested,
+                3,
+                None,
+                1_700_000_000,
+            )
+            .await;
 
         assert!(result.is_ok());
         match result.unwrap() {
@@ -1040,22 +1065,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ephemeral_close_all_members_left_destroys_keys() {
+    #[tokio::test]
+    async fn ephemeral_close_all_members_left_destroys_keys() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = CloseOrchestrator::new(&crypto);
 
-        let result = orchestrator.initiate_close(
-            "ctx-3",
-            ContextCloseReason::AllMembersLeft,
-            MemoryScope::Ephemeral,
-            &[],
-            &[],
-            KeyDestructionLevel::NoAttestation,
-            0,
-            None,
-            1_700_000_000,
-        );
+        let result = orchestrator
+            .initiate_close(
+                "ctx-3",
+                ContextCloseReason::AllMembersLeft,
+                MemoryScope::Ephemeral,
+                &[],
+                &[],
+                KeyDestructionLevel::NoAttestation,
+                0,
+                None,
+                1_700_000_000,
+            )
+            .await;
 
         assert!(result.is_ok());
         match result.unwrap() {
@@ -1066,22 +1093,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ephemeral_close_propagates_crypto_failure() {
+    #[tokio::test]
+    async fn ephemeral_close_propagates_crypto_failure() {
         let crypto = MockCryptoProvider::failing_mls();
         let orchestrator = CloseOrchestrator::new(&crypto);
 
-        let result = orchestrator.initiate_close(
-            "ctx-1",
-            ContextCloseReason::TtlExpired,
-            MemoryScope::Ephemeral,
-            &[],
-            &[],
-            KeyDestructionLevel::SoftwareOnly,
-            2,
-            None,
-            1_700_000_000,
-        );
+        let result = orchestrator
+            .initiate_close(
+                "ctx-1",
+                ContextCloseReason::TtlExpired,
+                MemoryScope::Ephemeral,
+                &[],
+                &[],
+                KeyDestructionLevel::SoftwareOnly,
+                2,
+                None,
+                1_700_000_000,
+            )
+            .await;
 
         assert!(result.is_err());
         match result {
@@ -1096,22 +1125,24 @@ mod tests {
     // CloseOrchestrator -- Summary close tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn summary_close_opens_verification_window() {
+    #[tokio::test]
+    async fn summary_close_opens_verification_window() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = CloseOrchestrator::new(&crypto);
 
-        let result = orchestrator.initiate_close(
-            "ctx-1",
-            ContextCloseReason::GovernanceClosed,
-            MemoryScope::Summary,
-            &["wss://relay.example.com".to_owned()],
-            &[[0x01; 32]],
-            KeyDestructionLevel::SoftwareOnly,
-            3,
-            None,
-            1_700_000_000,
-        );
+        let result = orchestrator
+            .initiate_close(
+                "ctx-1",
+                ContextCloseReason::GovernanceClosed,
+                MemoryScope::Summary,
+                &["wss://relay.example.com".to_owned()],
+                &[[0x01; 32]],
+                KeyDestructionLevel::SoftwareOnly,
+                3,
+                None,
+                1_700_000_000,
+            )
+            .await;
 
         assert!(result.is_ok());
         match result.unwrap() {
@@ -1148,22 +1179,24 @@ mod tests {
         assert!(!crypto.sender_key_destroyed.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn summary_close_custom_verification_window() {
+    #[tokio::test]
+    async fn summary_close_custom_verification_window() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = CloseOrchestrator::new(&crypto);
 
-        let result = orchestrator.initiate_close(
-            "ctx-1",
-            ContextCloseReason::TtlExpired,
-            MemoryScope::Summary,
-            &[],
-            &[],
-            KeyDestructionLevel::SoftwareOnly,
-            2,
-            Some(600),
-            1_700_000_000,
-        );
+        let result = orchestrator
+            .initiate_close(
+                "ctx-1",
+                ContextCloseReason::TtlExpired,
+                MemoryScope::Summary,
+                &[],
+                &[],
+                KeyDestructionLevel::SoftwareOnly,
+                2,
+                Some(600),
+                1_700_000_000,
+            )
+            .await;
 
         assert!(result.is_ok());
         match result.unwrap() {
@@ -1174,20 +1207,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn complete_summary_close_destroys_keys_after_window() {
+    #[tokio::test]
+    async fn complete_summary_close_destroys_keys_after_window() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = CloseOrchestrator::new(&crypto);
 
         let window = SummaryVerificationWindow::new("ctx-1".to_owned(), 1000, 300, 2);
 
-        let result = orchestrator.complete_summary_close(
-            &window,
-            &["wss://relay.example.com".to_owned()],
-            &[[0x01; 32]],
-            KeyDestructionLevel::SoftwareOnly,
-            1300,
-        );
+        let result = orchestrator
+            .complete_summary_close(
+                &window,
+                &["wss://relay.example.com".to_owned()],
+                &[[0x01; 32]],
+                KeyDestructionLevel::SoftwareOnly,
+                1300,
+            )
+            .await;
 
         assert!(result.is_ok());
         let destruction_result = result.unwrap();
@@ -1198,20 +1233,16 @@ mod tests {
         assert!(crypto.sender_key_destroyed.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn complete_summary_close_rejects_before_window_closes() {
+    #[tokio::test]
+    async fn complete_summary_close_rejects_before_window_closes() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = CloseOrchestrator::new(&crypto);
 
         let window = SummaryVerificationWindow::new("ctx-1".to_owned(), 1000, 300, 2);
 
-        let result = orchestrator.complete_summary_close(
-            &window,
-            &[],
-            &[],
-            KeyDestructionLevel::SoftwareOnly,
-            1200,
-        );
+        let result = orchestrator
+            .complete_summary_close(&window, &[], &[], KeyDestructionLevel::SoftwareOnly, 1200)
+            .await;
 
         assert!(result.is_err());
         match result {
@@ -1221,20 +1252,16 @@ mod tests {
         assert!(!crypto.mls_destroyed.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn complete_summary_close_propagates_crypto_failure() {
+    #[tokio::test]
+    async fn complete_summary_close_propagates_crypto_failure() {
         let crypto = MockCryptoProvider::failing_mls();
         let orchestrator = CloseOrchestrator::new(&crypto);
 
         let window = SummaryVerificationWindow::new("ctx-1".to_owned(), 1000, 300, 2);
 
-        let result = orchestrator.complete_summary_close(
-            &window,
-            &[],
-            &[],
-            KeyDestructionLevel::SoftwareOnly,
-            1300,
-        );
+        let result = orchestrator
+            .complete_summary_close(&window, &[], &[], KeyDestructionLevel::SoftwareOnly, 1300)
+            .await;
 
         assert!(result.is_err());
         match result {
@@ -1249,22 +1276,24 @@ mod tests {
     // CloseOrchestrator -- Full close tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn full_close_preserves_keys_and_data() {
+    #[tokio::test]
+    async fn full_close_preserves_keys_and_data() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = CloseOrchestrator::new(&crypto);
 
-        let result = orchestrator.initiate_close(
-            "ctx-1",
-            ContextCloseReason::GovernanceClosed,
-            MemoryScope::Full,
-            &["wss://relay.example.com".to_owned()],
-            &[[0x01; 32]],
-            KeyDestructionLevel::SoftwareOnly,
-            3,
-            None,
-            1_700_000_000,
-        );
+        let result = orchestrator
+            .initiate_close(
+                "ctx-1",
+                ContextCloseReason::GovernanceClosed,
+                MemoryScope::Full,
+                &["wss://relay.example.com".to_owned()],
+                &[[0x01; 32]],
+                KeyDestructionLevel::SoftwareOnly,
+                3,
+                None,
+                1_700_000_000,
+            )
+            .await;
 
         assert!(result.is_ok());
         match result.unwrap() {
@@ -1284,22 +1313,24 @@ mod tests {
         assert!(!crypto.sender_key_destroyed.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn full_close_ttl_expired_preserves_data() {
+    #[tokio::test]
+    async fn full_close_ttl_expired_preserves_data() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = CloseOrchestrator::new(&crypto);
 
-        let result = orchestrator.initiate_close(
-            "ctx-1",
-            ContextCloseReason::TtlExpired,
-            MemoryScope::Full,
-            &[],
-            &[],
-            KeyDestructionLevel::SoftwareOnly,
-            1,
-            None,
-            1_700_000_000,
-        );
+        let result = orchestrator
+            .initiate_close(
+                "ctx-1",
+                ContextCloseReason::TtlExpired,
+                MemoryScope::Full,
+                &[],
+                &[],
+                KeyDestructionLevel::SoftwareOnly,
+                1,
+                None,
+                1_700_000_000,
+            )
+            .await;
 
         assert!(result.is_ok());
         match result.unwrap() {
@@ -1310,22 +1341,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn full_close_all_members_left_preserves_data() {
+    #[tokio::test]
+    async fn full_close_all_members_left_preserves_data() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = CloseOrchestrator::new(&crypto);
 
-        let result = orchestrator.initiate_close(
-            "ctx-1",
-            ContextCloseReason::AllMembersLeft,
-            MemoryScope::Full,
-            &[],
-            &[],
-            KeyDestructionLevel::SoftwareOnly,
-            0,
-            None,
-            1_700_000_000,
-        );
+        let result = orchestrator
+            .initiate_close(
+                "ctx-1",
+                ContextCloseReason::AllMembersLeft,
+                MemoryScope::Full,
+                &[],
+                &[],
+                KeyDestructionLevel::SoftwareOnly,
+                0,
+                None,
+                1_700_000_000,
+            )
+            .await;
 
         assert!(result.is_ok());
         match result.unwrap() {
@@ -1340,8 +1373,8 @@ mod tests {
     // Cross-cutting: all close reasons x all memory scopes
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn all_reasons_ephemeral_scope_destroy_keys() {
+    #[tokio::test]
+    async fn all_reasons_ephemeral_scope_destroy_keys() {
         let reasons = [
             ContextCloseReason::TtlExpired,
             ContextCloseReason::GovernanceClosed,
@@ -1362,6 +1395,7 @@ mod tests {
                     None,
                     1_700_000_000,
                 )
+                .await
                 .unwrap();
             assert!(
                 matches!(result, CloseAction::KeysDestroyed { .. }),
@@ -1372,8 +1406,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn all_reasons_summary_scope_open_verification_window() {
+    #[tokio::test]
+    async fn all_reasons_summary_scope_open_verification_window() {
         let reasons = [
             ContextCloseReason::TtlExpired,
             ContextCloseReason::GovernanceClosed,
@@ -1394,6 +1428,7 @@ mod tests {
                     None,
                     1_700_000_000,
                 )
+                .await
                 .unwrap();
             assert!(
                 matches!(result, CloseAction::VerificationWindowOpened { .. }),
@@ -1404,8 +1439,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn all_reasons_full_scope_preserve_data() {
+    #[tokio::test]
+    async fn all_reasons_full_scope_preserve_data() {
         let reasons = [
             ContextCloseReason::TtlExpired,
             ContextCloseReason::GovernanceClosed,
@@ -1426,6 +1461,7 @@ mod tests {
                     None,
                     1_700_000_000,
                 )
+                .await
                 .unwrap();
             assert!(
                 matches!(result, CloseAction::Preserved { .. }),
@@ -1440,8 +1476,8 @@ mod tests {
     // End-to-end: Summary verification then key destruction
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn summary_close_end_to_end_verify_then_destroy() {
+    #[tokio::test]
+    async fn summary_close_end_to_end_verify_then_destroy() {
         let crypto = MockCryptoProvider::new();
         let orchestrator = CloseOrchestrator::new(&crypto);
 
@@ -1458,6 +1494,7 @@ mod tests {
                 Some(300),
                 1000,
             )
+            .await
             .unwrap();
 
         let mut window = match action {
@@ -1471,13 +1508,15 @@ mod tests {
         assert_eq!(window.verification_count(), 2);
 
         // Step 3: Window hasn't closed yet -- complete_summary_close should fail.
-        let early_result = orchestrator.complete_summary_close(
-            &window,
-            &["wss://relay.example.com".to_owned()],
-            &[[0xAB; 32]],
-            KeyDestructionLevel::SoftwareOnly,
-            1200,
-        );
+        let early_result = orchestrator
+            .complete_summary_close(
+                &window,
+                &["wss://relay.example.com".to_owned()],
+                &[[0xAB; 32]],
+                KeyDestructionLevel::SoftwareOnly,
+                1200,
+            )
+            .await;
         assert!(early_result.is_err());
 
         // Step 4: Window closes -- complete_summary_close succeeds.
@@ -1489,6 +1528,7 @@ mod tests {
                 KeyDestructionLevel::SoftwareOnly,
                 1300,
             )
+            .await
             .unwrap();
 
         assert!(result.attestation.mls_group_destroyed);

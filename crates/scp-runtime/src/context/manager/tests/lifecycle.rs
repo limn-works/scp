@@ -568,8 +568,9 @@ struct MockContextPersistence {
     broadcasts: std::sync::Mutex<HashMap<String, BroadcastContextSnapshot>>,
 }
 
+#[async_trait::async_trait]
 impl super::ContextPersistence for MockContextPersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &super::ContextSnapshot,
@@ -581,14 +582,14 @@ impl super::ContextPersistence for MockContextPersistence {
         Ok(())
     }
 
-    fn load_context(
+    async fn load_context(
         &self,
         context_id: &str,
     ) -> Result<Option<super::ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.contexts.lock().unwrap().get(context_id).cloned())
     }
 
-    fn persist_broadcast(
+    async fn persist_broadcast(
         &self,
         context_id: &str,
         snapshot: &BroadcastContextSnapshot,
@@ -600,14 +601,14 @@ impl super::ContextPersistence for MockContextPersistence {
         Ok(())
     }
 
-    fn load_broadcast(
+    async fn load_broadcast(
         &self,
         context_id: &str,
     ) -> Result<Option<BroadcastContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.broadcasts.lock().unwrap().get(context_id).cloned())
     }
 
-    fn delete_context(
+    async fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -616,7 +617,7 @@ impl super::ContextPersistence for MockContextPersistence {
         Ok(())
     }
 
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.contexts.lock().unwrap().keys().cloned().collect())
@@ -782,9 +783,11 @@ async fn persist_drop_restore_roundtrip() {
     // Seed mock persistence directly.
     persistence
         .persist_context("persist-ctx-2", &snapshot)
+        .await
         .unwrap();
     persistence
         .persist_broadcast("persist-ctx-2", &bc_snapshot)
+        .await
         .unwrap();
 
     // Create a new manager with the seeded persistence.
@@ -906,12 +909,14 @@ async fn restore_preserves_executed_proposals() {
 
     persistence
         .persist_context("replay-ctx", &snapshot)
+        .await
         .unwrap();
 
     // Also seed broadcast state (needed for restore).
     let bc_snapshot = test_broadcast_snapshot("replay-ctx");
     persistence
         .persist_broadcast("replay-ctx", &bc_snapshot)
+        .await
         .unwrap();
 
     // Create manager and restore.
@@ -1019,7 +1024,10 @@ async fn restore_respawns_ttl_timer() {
         generation: 0,
     };
 
-    persistence.persist_context("ttl-ctx", &snapshot).unwrap();
+    persistence
+        .persist_context("ttl-ctx", &snapshot)
+        .await
+        .unwrap();
 
     let manager = ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
@@ -1112,7 +1120,10 @@ async fn restore_all_contexts_restores_persisted() {
             checkpoint_last_time_secs: 0,
             generation: 0,
         };
-        persistence.persist_context(ctx_name, &snapshot).unwrap();
+        persistence
+            .persist_context(ctx_name, &snapshot)
+            .await
+            .unwrap();
     }
 
     let manager = ContextManager::with_persistence(
@@ -1206,9 +1217,13 @@ async fn restore_context_rejects_duplicate() {
     };
 
     let bc_snapshot = test_broadcast_snapshot("dup-ctx");
-    persistence.persist_context("dup-ctx", &snapshot).unwrap();
+    persistence
+        .persist_context("dup-ctx", &snapshot)
+        .await
+        .unwrap();
     persistence
         .persist_broadcast("dup-ctx", &bc_snapshot)
+        .await
         .unwrap();
 
     let manager = ContextManager::with_persistence(
@@ -1322,9 +1337,11 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
     let bc_snapshot = test_broadcast_snapshot("grace-incon-ctx");
     persistence
         .persist_context("grace-incon-ctx", &snapshot)
+        .await
         .unwrap();
     persistence
         .persist_broadcast("grace-incon-ctx", &bc_snapshot)
+        .await
         .unwrap();
 
     let manager = ContextManager::with_persistence(
@@ -1443,9 +1460,11 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
     let bc_snapshot = test_broadcast_snapshot("grace-ok-ctx");
     persistence
         .persist_context("grace-ok-ctx", &snapshot)
+        .await
         .unwrap();
     persistence
         .persist_broadcast("grace-ok-ctx", &bc_snapshot)
+        .await
         .unwrap();
 
     let manager = ContextManager::with_persistence(
@@ -1578,6 +1597,7 @@ async fn restore_preserves_spending_nonce_tracker_across_restart() {
 
     persistence
         .persist_context("nonce-persist-ctx", &snapshot)
+        .await
         .unwrap();
 
     // Simulate restart: fresh manager with the pre-populated persistence.
@@ -1721,8 +1741,8 @@ async fn manager_with_reconnect_snapshots(
     let persistence = MockContextPersistence::default();
     for (ctx_id, snap) in snapshots {
         let bc = test_broadcast_snapshot(ctx_id);
-        persistence.persist_context(ctx_id, snap).unwrap();
-        persistence.persist_broadcast(ctx_id, &bc).unwrap();
+        persistence.persist_context(ctx_id, snap).await.unwrap();
+        persistence.persist_broadcast(ctx_id, &bc).await.unwrap();
     }
     let manager = ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
@@ -3495,6 +3515,7 @@ async fn restore_context_preserves_budget_tracker() {
 
     persistence
         .persist_context("c3-restore-budget", &snapshot)
+        .await
         .unwrap();
 
     let manager = ContextManager::with_persistence(
@@ -3581,6 +3602,7 @@ async fn restore_context_validates_consequence_rules() {
 
     persistence
         .persist_context("c3-restore-bad-rules", &snapshot)
+        .await
         .unwrap();
 
     let manager = ContextManager::with_persistence(

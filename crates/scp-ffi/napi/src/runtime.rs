@@ -345,50 +345,51 @@ pub(crate) fn init_context_manager_for_test() {
 struct TestNoOpCryptoProvider;
 
 #[cfg(test)]
+#[async_trait::async_trait]
 impl scp_core::context::builder::ContextCryptoProvider for TestNoOpCryptoProvider {
-    fn validate_creator_identity(
+    async fn validate_creator_identity(
         &self,
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         Ok(())
     }
-    fn create_mls_group(
-        &self,
-        _context_id: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn generate_sender_key(
+    async fn create_mls_group(
         &self,
         _context_id: &[u8; 32],
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         Ok(())
     }
-    fn init_broadcast_key(
+    async fn generate_sender_key(
         &self,
         _context_id: &[u8; 32],
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         Ok(())
     }
-    fn destroy_mls_group(
+    async fn init_broadcast_key(
         &self,
         _context_id: &[u8; 32],
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         Ok(())
     }
-    fn destroy_sender_key(
+    async fn destroy_mls_group(
         &self,
         _context_id: &[u8; 32],
     ) -> Result<(), scp_core::context::builder::ContextCreationError> {
         Ok(())
     }
-    fn validate_key_package(
+    async fn destroy_sender_key(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
+        Ok(())
+    }
+    async fn validate_key_package(
         &self,
         _owner_did: &str,
         _key_package_bytes: Option<&[u8]>,
     ) -> Result<(), scp_core::context::ContextError> {
         Ok(())
     }
-    fn add_member(
+    async fn add_member(
         &self,
         _context_id: &[u8; 32],
         _member_did: &str,
@@ -396,21 +397,21 @@ impl scp_core::context::builder::ContextCryptoProvider for TestNoOpCryptoProvide
     ) -> Result<scp_core::context::AddMemberOutput, scp_core::context::ContextError> {
         Ok(scp_core::context::AddMemberOutput::default())
     }
-    fn remove_member(
+    async fn remove_member(
         &self,
         _context_id: &[u8; 32],
         _member_did: &str,
     ) -> Result<scp_core::context::RemoveMemberOutput, scp_core::context::ContextError> {
         Ok(scp_core::context::RemoveMemberOutput::default())
     }
-    fn distribute_sender_key(
+    async fn distribute_sender_key(
         &self,
         _context_id: &[u8; 32],
         _member_did: &str,
     ) -> Result<(), scp_core::context::ContextError> {
         Ok(())
     }
-    fn remove_member_sender_key(
+    async fn remove_member_sender_key(
         &self,
         _context_id: &[u8; 32],
         _member_did: &str,
@@ -976,8 +977,9 @@ impl NapiBridgePersistence {
     }
 }
 
+#[async_trait::async_trait]
 impl ContextPersistence for NapiBridgePersistence {
-    fn persist_context(
+    async fn persist_context(
         &self,
         context_id: &str,
         snapshot: &ContextSnapshot,
@@ -987,14 +989,14 @@ impl ContextPersistence for NapiBridgePersistence {
         Ok(())
     }
 
-    fn load_context(
+    async fn load_context(
         &self,
         context_id: &str,
     ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.contexts.get(context_id).map(|v| v.value().clone()))
     }
 
-    fn persist_broadcast(
+    async fn persist_broadcast(
         &self,
         context_id: &str,
         snapshot: &scp_core::context::broadcast::BroadcastContextSnapshot,
@@ -1004,7 +1006,7 @@ impl ContextPersistence for NapiBridgePersistence {
         Ok(())
     }
 
-    fn load_broadcast(
+    async fn load_broadcast(
         &self,
         context_id: &str,
     ) -> Result<
@@ -1014,7 +1016,7 @@ impl ContextPersistence for NapiBridgePersistence {
         Ok(self.broadcasts.get(context_id).map(|v| v.value().clone()))
     }
 
-    fn delete_context(
+    async fn delete_context(
         &self,
         context_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1023,7 +1025,7 @@ impl ContextPersistence for NapiBridgePersistence {
         Ok(())
     }
 
-    fn list_persisted_contexts(
+    async fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self

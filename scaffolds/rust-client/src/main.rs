@@ -90,26 +90,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // ── Mock providers (replace with production implementations) ──────
 
 struct MockCrypto;
+#[async_trait::async_trait]
 impl ContextCryptoProvider for MockCrypto {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+    async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn destroy_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn destroy_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn validate_key_package(
+    async fn validate_key_package(
         &self,
         _owner_did: &str,
         _key_package_bytes: Option<&[u8]>,
@@ -126,7 +127,7 @@ impl ContextCryptoProvider for MockCrypto {
     ) -> Result<Vec<u8>, ContextError> {
         Ok(payload.to_vec())
     }
-    fn add_member(
+    async fn add_member(
         &self,
         _id: &[u8; 32],
         _member_did: &str,
@@ -134,17 +135,17 @@ impl ContextCryptoProvider for MockCrypto {
     ) -> Result<AddMemberOutput, ContextError> {
         Ok(AddMemberOutput::default())
     }
-    fn remove_member(
+    async fn remove_member(
         &self,
         _id: &[u8; 32],
         _member_did: &str,
     ) -> Result<RemoveMemberOutput, ContextError> {
         Ok(RemoveMemberOutput::default())
     }
-    fn distribute_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
+    async fn distribute_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
         Ok(())
     }
-    fn remove_member_sender_key(
+    async fn remove_member_sender_key(
         &self,
         _id: &[u8; 32],
         _member_did: &str,
@@ -154,21 +155,22 @@ impl ContextCryptoProvider for MockCrypto {
 }
 
 struct MockTransport;
+#[async_trait::async_trait]
 impl ContextTransportProvider for MockTransport {
     fn is_connected(&self) -> bool {
         true
     }
-    fn publish_context(
+    async fn publish_context(
         &self,
         _id: &[u8; 32],
         _params: &ContextParams,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn send_message(&self, _id: &[u8; 32], _encrypted_payload: &[u8]) -> Result<(), ContextError> {
+    async fn send_message(&self, _id: &[u8; 32], _encrypted_payload: &[u8]) -> Result<(), ContextError> {
         Ok(())
     }
 }

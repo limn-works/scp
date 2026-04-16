@@ -27,33 +27,34 @@ pub fn signing_key_for(did: &DID) -> ed25519_dalek::SigningKey {
 /// Mock crypto provider — all operations succeed with dummy data.
 pub struct MockCrypto;
 
+#[async_trait::async_trait]
 impl ContextCryptoProvider for MockCrypto {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+    async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn destroy_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn destroy_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn destroy_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn validate_key_package(
+    async fn validate_key_package(
         &self,
         _owner_did: &str,
         _key_package_bytes: Option<&[u8]>,
     ) -> Result<(), ContextError> {
         Ok(())
     }
-    fn add_member(
+    async fn add_member(
         &self,
         _id: &[u8; 32],
         _member_did: &str,
@@ -61,17 +62,21 @@ impl ContextCryptoProvider for MockCrypto {
     ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
         Ok(scp_protocol::context::builder::AddMemberOutput::default())
     }
-    fn remove_member(
+    async fn remove_member(
         &self,
         _id: &[u8; 32],
         _member_did: &str,
     ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
         Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
     }
-    fn distribute_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
+    async fn distribute_sender_key(
+        &self,
+        _id: &[u8; 32],
+        _member_did: &str,
+    ) -> Result<(), ContextError> {
         Ok(())
     }
-    fn remove_member_sender_key(
+    async fn remove_member_sender_key(
         &self,
         _id: &[u8; 32],
         _member_did: &str,
@@ -79,7 +84,7 @@ impl ContextCryptoProvider for MockCrypto {
         Ok(())
     }
 
-    fn seal(
+    async fn seal(
         &self,
         _context_id: &[u8; 32],
         inner: &scp_protocol::envelope::inner::InnerEnvelope,
@@ -91,7 +96,7 @@ impl ContextCryptoProvider for MockCrypto {
             .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
     }
 
-    fn open(
+    async fn open(
         &self,
         _context_id: &[u8; 32],
         outer_bytes: &[u8],
@@ -110,21 +115,26 @@ impl ContextCryptoProvider for MockCrypto {
 /// Mock transport provider — reports connected, all sends succeed silently.
 pub struct MockTransport;
 
+#[async_trait::async_trait]
 impl ContextTransportProvider for MockTransport {
     fn is_connected(&self) -> bool {
         true
     }
-    fn publish_context(
+    async fn publish_context(
         &self,
         _id: &[u8; 32],
         _params: &ContextParams,
     ) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
-    fn send_message(&self, _id: &[u8; 32], _encrypted_payload: &[u8]) -> Result<(), ContextError> {
+    async fn send_message(
+        &self,
+        _id: &[u8; 32],
+        _encrypted_payload: &[u8],
+    ) -> Result<(), ContextError> {
         Ok(())
     }
 }

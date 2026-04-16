@@ -1,8 +1,8 @@
 //! Context creation types and the `ContextCryptoProvider` trait.
 //!
-//! Pure sync trait definition and associated error types. The async builder
-//! implementation (`create_context`, `CreateContextPhases`) remains in
-//! `scp-runtime::context::builder`.
+//! Async trait definition (via `#[async_trait]`) and associated error types.
+//! The async builder implementation (`create_context`, `CreateContextPhases`)
+//! remains in `scp-runtime::context::builder`.
 
 use std::collections::HashSet;
 
@@ -266,6 +266,7 @@ pub struct AdvanceEpochOutput {
 }
 
 /// Trait for MLS-backed context crypto operations (create group, add/remove member, encrypt/decrypt).
+#[async_trait::async_trait]
 pub trait ContextCryptoProvider: Send + Sync {
     /// Validates that the creator's identity is valid and the signing key is
     /// accessible.
@@ -277,7 +278,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     ///
     /// Returns [`ContextCreationError::IdentityValidationFailed`] if the
     /// identity is invalid or the signing key cannot be accessed.
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError>;
+    async fn validate_creator_identity(&self) -> Result<(), ContextCreationError>;
 
     /// Creates an MLS group for the given context.
     ///
@@ -287,7 +288,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextCreationError`] if MLS group creation fails.
-    fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+    async fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
 
     /// Generates a sender key for the given context.
     ///
@@ -296,7 +297,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextCreationError`] if sender key generation fails.
-    fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+    async fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
 
     /// Initializes a broadcast key for the given context.
     ///
@@ -306,21 +307,21 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextCreationError`] if broadcast key initialisation fails.
-    fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+    async fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
 
     /// Destroys the MLS group created for the given context (rollback).
     ///
     /// # Errors
     ///
     /// Returns [`ContextCreationError`] if destruction fails.
-    fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+    async fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
 
     /// Destroys the sender key created for the given context (rollback).
     ///
     /// # Errors
     ///
     /// Returns [`ContextCreationError`] if destruction fails.
-    fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
+    async fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError>;
 
     // -- Membership operations (SCP-020) -----------------------------------
 
@@ -335,7 +336,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::InvalidKeyPackage`] if the key package is invalid.
-    fn validate_key_package(
+    async fn validate_key_package(
         &self,
         owner_did: &str,
         key_package_bytes: Option<&[u8]>,
@@ -357,7 +358,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if the MLS operation fails.
-    fn add_member(
+    async fn add_member(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -373,7 +374,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if the MLS operation fails.
-    fn remove_member(
+    async fn remove_member(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -384,7 +385,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if distribution fails.
-    fn distribute_sender_key(
+    async fn distribute_sender_key(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -395,7 +396,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if removal fails.
-    fn remove_member_sender_key(
+    async fn remove_member_sender_key(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -419,7 +420,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     ///
     /// Returns [`ContextError::CryptoFailed`] if key generation, HPKE
     /// sealing, or internal lock acquisition fails.
-    fn rotate_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextError> {
+    async fn rotate_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextError> {
         Ok(())
     }
 
@@ -439,7 +440,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     ///
     /// Returns [`ContextError::CryptoFailed`] if the internal lock is
     /// poisoned.
-    fn drain_pending_sender_key_messages(
+    async fn drain_pending_sender_key_messages(
         &self,
         _context_id: &[u8; 32],
     ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
@@ -460,7 +461,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     ///
     /// Returns [`ContextError::CryptoFailed`] if deserialization, HPKE
     /// decryption, or storage fails.
-    fn process_incoming_sender_key(
+    async fn process_incoming_sender_key(
         &self,
         _context_id: &[u8; 32],
         _sender_did: &str,
@@ -484,7 +485,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     ///
     /// Returns [`ContextError::CryptoFailed`] if signature verification,
     /// HPKE encryption, or serialization fails.
-    fn handle_sender_key_request(
+    async fn handle_sender_key_request(
         &self,
         _context_id: &[u8; 32],
         _request_bytes: &[u8],
@@ -509,7 +510,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if any encryption step fails.
-    fn seal(
+    async fn seal(
         &self,
         _context_id: &[u8; 32],
         _inner: &InnerEnvelope,
@@ -539,7 +540,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     ///
     /// Returns [`ContextError::CryptoFailed`] if MLS decryption, sender key
     /// decryption, deserialization, padding strip, or integrity check fails.
-    fn open(
+    async fn open(
         &self,
         _context_id: &[u8; 32],
         _outer_bytes: &[u8],
@@ -562,7 +563,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     ///
     /// Returns [`ContextError::CryptoFailed`] if MLS encryption or
     /// serialization fails.
-    fn mls_encrypt_management(
+    async fn mls_encrypt_management(
         &self,
         _context_id: &[u8; 32],
         _plaintext: &[u8],
@@ -583,7 +584,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     ///
     /// The default implementation is a no-op. Test providers that need to
     /// share access keys between separate crypto instances should override.
-    fn deposit_access_key(
+    async fn deposit_access_key(
         &self,
         _context_id: &str,
         _member_did: &str,
@@ -609,7 +610,10 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if the MLS update/commit fails.
-    fn advance_epoch(&self, _context_id: &[u8; 32]) -> Result<AdvanceEpochOutput, ContextError> {
+    async fn advance_epoch(
+        &self,
+        _context_id: &[u8; 32],
+    ) -> Result<AdvanceEpochOutput, ContextError> {
         Ok(AdvanceEpochOutput::default())
     }
 
@@ -633,7 +637,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if serialization fails.
-    fn export_crypto_state(&self, _context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
+    async fn export_crypto_state(&self, _context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
         Ok(Vec::new())
     }
 
@@ -651,7 +655,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     ///
     /// Returns [`ContextError::CryptoFailed`] if deserialization fails or
     /// the data is corrupt.
-    fn restore_crypto_state(
+    async fn restore_crypto_state(
         &self,
         _context_id: &[u8; 32],
         _data: &[u8],
@@ -672,7 +676,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     ///
     /// The default implementation returns an empty `Vec`.  Production
     /// providers that maintain a `SenderKeyStore` MUST override this.
-    fn export_sender_key_epochs(&self, _context_id: &[u8; 32]) -> Vec<(String, u64)> {
+    async fn export_sender_key_epochs(&self, _context_id: &[u8; 32]) -> Vec<(String, u64)> {
         Vec::new()
     }
 
@@ -696,7 +700,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     ///
     /// Returns [`ContextError::SnapshotFloorRegression`] on regression or
     /// ceiling violation.
-    fn validate_and_merge_epoch_floors(
+    async fn validate_and_merge_epoch_floors(
         &self,
         _context_id: &[u8; 32],
         _local_floors: Vec<(String, u64)>,
@@ -716,7 +720,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if key package generation fails.
-    fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
+    async fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
         Err(ContextError::CryptoFailed(
             "prepare_key_package_for_join not supported".into(),
         ))
@@ -730,7 +734,7 @@ pub trait ContextCryptoProvider: Send + Sync {
     /// # Errors
     ///
     /// Returns [`ContextError::CryptoFailed`] if Welcome processing fails.
-    fn join_from_welcome(
+    async fn join_from_welcome(
         &self,
         _context_id: &[u8; 32],
         _welcome_bytes: &[u8],

@@ -283,6 +283,7 @@ impl ContextManager {
                     let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
                     self.transport
                         .publish_context(&context_id_bytes, handle.params())
+                        .await
                         .map_err(|e| {
                             ContextError::TransportFailed(format!(
                                 "reconnection failed for context {context_id}: {e}"

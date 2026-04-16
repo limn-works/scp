@@ -26,8 +26,8 @@ use scp_core::crypto::mls::provider::MlsCryptoProvider;
 /// Two separate `MlsCryptoProvider` instances prove that the Welcome message
 /// produced by `add_member` can be consumed by `join_from_welcome` on a
 /// different instance, establishing a shared MLS group.
-#[test]
-fn cross_process_welcome_delivery() {
+#[tokio::test]
+async fn cross_process_welcome_delivery() {
     let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
     let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
     let context_id = [0x42u8; 32];
@@ -37,11 +37,11 @@ fn cross_process_welcome_delivery() {
     let bob_crypto = MlsCryptoProvider::new(bob_did.to_string());
 
     // Alice creates the MLS group and generates her sender key.
-    alice_crypto.create_mls_group(&context_id).unwrap();
-    alice_crypto.generate_sender_key(&context_id).unwrap();
+    alice_crypto.create_mls_group(&context_id).await.unwrap();
+    alice_crypto.generate_sender_key(&context_id).await.unwrap();
 
     // Bob prepares a key package (retains private state internally).
-    let bob_kp_bytes = bob_crypto.prepare_key_package_for_join().unwrap();
+    let bob_kp_bytes = bob_crypto.prepare_key_package_for_join().await.unwrap();
     assert!(
         !bob_kp_bytes.is_empty(),
         "key package bytes must not be empty"
@@ -50,6 +50,7 @@ fn cross_process_welcome_delivery() {
     // Alice adds Bob using his key package.
     let add_output = alice_crypto
         .add_member(&context_id, bob_did, Some(&bob_kp_bytes))
+        .await
         .unwrap();
     assert!(
         !add_output.welcome_bytes.is_empty(),
@@ -63,10 +64,11 @@ fn cross_process_welcome_delivery() {
     // Bob joins the group from the Welcome message.
     bob_crypto
         .join_from_welcome(&context_id, &add_output.welcome_bytes)
+        .await
         .unwrap();
 
     // Bob also needs a sender key for his own context.
-    bob_crypto.generate_sender_key(&context_id).unwrap();
+    bob_crypto.generate_sender_key(&context_id).await.unwrap();
 
     // Distribute Alice's sender key to Bob so he can decrypt.
     // In production this happens via HPKE-sealed SenderKeyDistributionMessage
@@ -74,9 +76,11 @@ fn cross_process_welcome_delivery() {
     // package during add_member).
     alice_crypto
         .distribute_sender_key(&context_id, bob_did)
+        .await
         .unwrap();
     let pending = alice_crypto
         .drain_pending_sender_key_messages(&context_id)
+        .await
         .unwrap();
     assert!(
         !pending.is_empty(),
@@ -85,6 +89,7 @@ fn cross_process_welcome_delivery() {
     for (_target, msg) in pending {
         bob_crypto
             .process_incoming_sender_key(&context_id, alice_did, &msg)
+            .await
             .unwrap();
     }
 
@@ -109,11 +114,12 @@ fn cross_process_welcome_delivery() {
     let routing_id = scp_core::context::context_routing_id(&hex::encode(context_id));
     let sealed = alice_crypto
         .seal(&context_id, &inner, &routing_id, 300)
+        .await
         .unwrap();
 
     // Bob opens Alice's message — proves the full pipeline works:
     // MLS Welcome join + sender key distribution + seal + open.
-    let open_result = bob_crypto.open(&context_id, &sealed).unwrap();
+    let open_result = bob_crypto.open(&context_id, &sealed).await.unwrap();
     let envelope = match open_result {
         scp_core::context::builder::OpenResult::Application(env) => env,
         other => panic!("expected Application, got {other:?}"),
@@ -136,8 +142,8 @@ fn cross_process_welcome_delivery() {
 /// `transport.send_message`, which the receive-side dispatcher attempted
 /// to deserialize as an `OuterEnvelope` and silently dropped on failure.
 /// This test asserts the correct framing end-to-end at the provider level.
-#[test]
-fn join_time_sender_key_distribution_uses_management_channel() {
+#[tokio::test]
+async fn join_time_sender_key_distribution_uses_management_channel() {
     let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
     let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
     let context_id = [0x33u8; 32];
@@ -146,27 +152,31 @@ fn join_time_sender_key_distribution_uses_management_channel() {
     let bob_crypto = MlsCryptoProvider::new(bob_did.to_string());
 
     // Alice creates the group and her sender key.
-    alice_crypto.create_mls_group(&context_id).unwrap();
-    alice_crypto.generate_sender_key(&context_id).unwrap();
+    alice_crypto.create_mls_group(&context_id).await.unwrap();
+    alice_crypto.generate_sender_key(&context_id).await.unwrap();
 
     // Bob prepares his key package, Alice adds Bob, Bob joins via Welcome.
-    let bob_kp_bytes = bob_crypto.prepare_key_package_for_join().unwrap();
+    let bob_kp_bytes = bob_crypto.prepare_key_package_for_join().await.unwrap();
     let add_output = alice_crypto
         .add_member(&context_id, bob_did, Some(&bob_kp_bytes))
+        .await
         .unwrap();
     bob_crypto
         .join_from_welcome(&context_id, &add_output.welcome_bytes)
+        .await
         .unwrap();
-    bob_crypto.generate_sender_key(&context_id).unwrap();
+    bob_crypto.generate_sender_key(&context_id).await.unwrap();
 
     // Alice queues her sender key distribution to Bob (in production this
     // happens automatically inside `add_member` via the `distribute_sender_key`
     // call from `ContextManager::join_context`).
     alice_crypto
         .distribute_sender_key(&context_id, bob_did)
+        .await
         .unwrap();
     let pending = alice_crypto
         .drain_pending_sender_key_messages(&context_id)
+        .await
         .unwrap();
     assert_eq!(
         pending.len(),
@@ -184,7 +194,7 @@ fn join_time_sender_key_distribution_uses_management_channel() {
     // Sanity check the pre-fix shape: the raw distribution bytes are NOT
     // a valid OuterEnvelope. Bob's `open()` would error if we sent them
     // as-is via `transport.send_message`.
-    let bare_open = bob_crypto.open(&context_id, &raw_distribution);
+    let bare_open = bob_crypto.open(&context_id, &raw_distribution).await;
     assert!(
         bare_open.is_err(),
         "raw HPKE distribution bytes must not deserialize as OuterEnvelope — \
@@ -194,11 +204,12 @@ fn join_time_sender_key_distribution_uses_management_channel() {
     // Now MLS-wrap via the management channel — the post-fix path.
     let wrapped = alice_crypto
         .mls_encrypt_management(&context_id, &raw_distribution, &routing_id, 300)
+        .await
         .unwrap();
 
     // Bob's `open()` MUST recognize the wrapped payload as Management,
     // surfacing the inner HPKE bytes for `process_incoming_sender_key`.
-    let open_result = bob_crypto.open(&context_id, &wrapped).unwrap();
+    let open_result = bob_crypto.open(&context_id, &wrapped).await.unwrap();
     let payload = match open_result {
         scp_core::context::builder::OpenResult::Management {
             sender_did,
@@ -227,6 +238,7 @@ fn join_time_sender_key_distribution_uses_management_channel() {
     // application messages from Alice — the join-time happy path.
     bob_crypto
         .process_incoming_sender_key(&context_id, alice_did, &payload)
+        .await
         .unwrap();
 }
 
@@ -234,21 +246,22 @@ fn join_time_sender_key_distribution_uses_management_channel() {
 // 2. welcome_bytes_nonempty — AddMemberOutput contains data
 // ---------------------------------------------------------------------------
 
-#[test]
-fn welcome_bytes_nonempty_with_key_package() {
+#[tokio::test]
+async fn welcome_bytes_nonempty_with_key_package() {
     let alice_did = "did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic";
     let bob_did = "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo";
     let context_id = [0x01u8; 32];
 
     let alice_crypto = MlsCryptoProvider::new(alice_did.to_string());
-    alice_crypto.create_mls_group(&context_id).unwrap();
-    alice_crypto.generate_sender_key(&context_id).unwrap();
+    alice_crypto.create_mls_group(&context_id).await.unwrap();
+    alice_crypto.generate_sender_key(&context_id).await.unwrap();
 
     let bob_crypto = MlsCryptoProvider::new(bob_did.to_string());
-    let bob_kp_bytes = bob_crypto.prepare_key_package_for_join().unwrap();
+    let bob_kp_bytes = bob_crypto.prepare_key_package_for_join().await.unwrap();
 
     let output = alice_crypto
         .add_member(&context_id, bob_did, Some(&bob_kp_bytes))
+        .await
         .unwrap();
 
     assert!(
@@ -267,13 +280,15 @@ fn welcome_bytes_nonempty_with_key_package() {
 // 3. join_from_welcome_without_prepare_fails
 // ---------------------------------------------------------------------------
 
-#[test]
-fn join_from_welcome_without_prepare_fails() {
+#[tokio::test]
+async fn join_from_welcome_without_prepare_fails() {
     let bob_crypto = MlsCryptoProvider::new("did:dht:z6MkBob".to_string());
     let context_id = [0x02u8; 32];
 
     // Attempt to join without ever calling prepare_key_package_for_join.
-    let result = bob_crypto.join_from_welcome(&context_id, b"fake-welcome");
+    let result = bob_crypto
+        .join_from_welcome(&context_id, b"fake-welcome")
+        .await;
     assert!(
         result.is_err(),
         "join_from_welcome must fail without pending key package"
@@ -317,20 +332,20 @@ fn routing_id_determinism() {
 // 5. prepare_replaces_previous_key_package — second prepare supersedes first
 // ---------------------------------------------------------------------------
 
-#[test]
-fn prepare_replaces_previous_key_package() {
+#[tokio::test]
+async fn prepare_replaces_previous_key_package() {
     let bob_crypto =
         MlsCryptoProvider::new("did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_string());
     let alice_crypto =
         MlsCryptoProvider::new("did:dht:z6MkAliceAliceAliceAliceAliceAliceAliceAlic".to_string());
     let context_id = [0xAA; 32];
 
-    alice_crypto.create_mls_group(&context_id).unwrap();
+    alice_crypto.create_mls_group(&context_id).await.unwrap();
 
     // Bob prepares two key packages. The second replaces the first
     // (clear + push), so only kp2's private state is retained.
-    let _kp1 = bob_crypto.prepare_key_package_for_join().unwrap();
-    let kp2 = bob_crypto.prepare_key_package_for_join().unwrap();
+    let _kp1 = bob_crypto.prepare_key_package_for_join().await.unwrap();
+    let kp2 = bob_crypto.prepare_key_package_for_join().await.unwrap();
 
     let add_output = alice_crypto
         .add_member(
@@ -338,11 +353,13 @@ fn prepare_replaces_previous_key_package() {
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
             Some(&kp2),
         )
+        .await
         .unwrap();
 
     // Should succeed because prepare_key_package_for_join replaced the
     // first pending state with the second, so kp2's signer/provider match.
     bob_crypto
         .join_from_welcome(&context_id, &add_output.welcome_bytes)
+        .await
         .unwrap();
 }

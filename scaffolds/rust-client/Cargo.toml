@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+async-trait = "0.1"
 scp-core = { path = "../../crates/scp-core", features = ["testing"] }
 scp-identity = { path = "../../crates/scp-identity" }
 scp-platform = { path = "../../crates/scp-platform", features = ["testing"] }

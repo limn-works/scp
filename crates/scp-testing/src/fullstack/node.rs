@@ -54,13 +54,14 @@ impl CapturingTransport {
     }
 }
 
+#[async_trait::async_trait]
 #[allow(clippy::significant_drop_tightening)]
 impl ContextTransportProvider for CapturingTransport {
     fn is_connected(&self) -> bool {
         true
     }
 
-    fn publish_context(
+    async fn publish_context(
         &self,
         _context_id: &[u8; 32],
         _params: &ContextParams,
@@ -68,11 +69,11 @@ impl ContextTransportProvider for CapturingTransport {
         Ok(())
     }
 
-    fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    async fn delete_published(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         Ok(())
     }
 
-    fn send_message(
+    async fn send_message(
         &self,
         context_id: &[u8; 32],
         encrypted_payload: &[u8],
@@ -329,7 +330,7 @@ impl FullStackNode {
     /// # Errors
     ///
     /// Propagates `ContextError` if any decryption or verification step fails.
-    pub fn decrypt_message(
+    pub async fn decrypt_message(
         &self,
         context_id_str: &str,
         context_id: &[u8; 32],
@@ -343,7 +344,7 @@ impl FullStackNode {
 
         // Open: deserialize outer envelope → MLS decrypt → sender key
         // decrypt → deserialize InnerEnvelope → strip padding → verify hash.
-        let open_result = self.crypto.open(context_id, ciphertext)?;
+        let open_result = self.crypto.open(context_id, ciphertext).await?;
         let opened = match open_result {
             scp_core::context::builder::OpenResult::Application(env) => *env,
             scp_core::context::builder::OpenResult::Control => {
@@ -354,7 +355,8 @@ impl FullStackNode {
                 payload,
             } => {
                 self.crypto
-                    .process_incoming_sender_key(context_id, &sender_did, &payload)?;
+                    .process_incoming_sender_key(context_id, &sender_did, &payload)
+                    .await?;
                 return Err(ContextError::CryptoFailed(
                     "open returned Management".into(),
                 ));
@@ -401,11 +403,13 @@ impl FullStackNode {
     /// # Errors
     ///
     /// Propagates `ContextError` from the crypto provider.
-    pub fn regenerate_and_distribute_sender_key(
+    pub async fn regenerate_and_distribute_sender_key(
         &self,
         context_id: &[u8; 32],
     ) -> Result<(), ContextError> {
-        self.crypto.regenerate_and_distribute_sender_key(context_id)
+        self.crypto
+            .regenerate_and_distribute_sender_key(context_id)
+            .await
     }
 
     /// Picks up any pending sender keys from the shared `KeyExchange`.
@@ -442,93 +446,96 @@ impl FullStackNode {
 /// Newtype wrapping `Arc<E2eCryptoProvider>` to implement `ContextCryptoProvider`.
 struct ArcCryptoProvider(Arc<E2eCryptoProvider>);
 
+#[async_trait::async_trait]
 impl ContextCryptoProvider for ArcCryptoProvider {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-        self.0.validate_creator_identity()
+    async fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+        self.0.validate_creator_identity().await
     }
-    fn create_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        self.0.create_mls_group(id)
+    async fn create_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.create_mls_group(id).await
     }
-    fn generate_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        self.0.generate_sender_key(id)
+    async fn generate_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.generate_sender_key(id).await
     }
-    fn init_broadcast_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        self.0.init_broadcast_key(id)
+    async fn init_broadcast_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.init_broadcast_key(id).await
     }
-    fn destroy_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        self.0.destroy_mls_group(id)
+    async fn destroy_mls_group(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.destroy_mls_group(id).await
     }
-    fn destroy_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        self.0.destroy_sender_key(id)
+    async fn destroy_sender_key(&self, id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        self.0.destroy_sender_key(id).await
     }
-    fn validate_key_package(&self, did: &str, kp: Option<&[u8]>) -> Result<(), ContextError> {
-        self.0.validate_key_package(did, kp)
+    async fn validate_key_package(&self, did: &str, kp: Option<&[u8]>) -> Result<(), ContextError> {
+        self.0.validate_key_package(did, kp).await
     }
-    fn add_member(
+    async fn add_member(
         &self,
         id: &[u8; 32],
         did: &str,
         kp: Option<&[u8]>,
     ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
-        self.0.add_member(id, did, kp)
+        self.0.add_member(id, did, kp).await
     }
-    fn remove_member(
+    async fn remove_member(
         &self,
         id: &[u8; 32],
         did: &str,
     ) -> Result<scp_core::context::RemoveMemberOutput, ContextError> {
-        self.0.remove_member(id, did)
+        self.0.remove_member(id, did).await
     }
-    fn distribute_sender_key(&self, id: &[u8; 32], did: &str) -> Result<(), ContextError> {
-        self.0.distribute_sender_key(id, did)
+    async fn distribute_sender_key(&self, id: &[u8; 32], did: &str) -> Result<(), ContextError> {
+        self.0.distribute_sender_key(id, did).await
     }
-    fn remove_member_sender_key(&self, id: &[u8; 32], did: &str) -> Result<(), ContextError> {
-        self.0.remove_member_sender_key(id, did)
+    async fn remove_member_sender_key(&self, id: &[u8; 32], did: &str) -> Result<(), ContextError> {
+        self.0.remove_member_sender_key(id, did).await
     }
-    fn drain_pending_sender_key_messages(
+    async fn drain_pending_sender_key_messages(
         &self,
         id: &[u8; 32],
     ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
-        self.0.drain_pending_sender_key_messages(id)
+        self.0.drain_pending_sender_key_messages(id).await
     }
-    fn process_incoming_sender_key(
+    async fn process_incoming_sender_key(
         &self,
         id: &[u8; 32],
         did: &str,
         msg: &[u8],
     ) -> Result<(), ContextError> {
-        self.0.process_incoming_sender_key(id, did, msg)
+        self.0.process_incoming_sender_key(id, did, msg).await
     }
-    fn handle_sender_key_request(
+    async fn handle_sender_key_request(
         &self,
         id: &[u8; 32],
         req: &[u8],
         pk: &[u8],
         blocked_dids: &std::collections::HashSet<String>,
     ) -> Result<Option<Vec<u8>>, ContextError> {
-        self.0.handle_sender_key_request(id, req, pk, blocked_dids)
+        self.0
+            .handle_sender_key_request(id, req, pk, blocked_dids)
+            .await
     }
-    fn advance_epoch(
+    async fn advance_epoch(
         &self,
         id: &[u8; 32],
     ) -> Result<scp_core::context::AdvanceEpochOutput, ContextError> {
-        self.0.advance_epoch(id)
+        self.0.advance_epoch(id).await
     }
-    fn seal(
+    async fn seal(
         &self,
         id: &[u8; 32],
         inner: &scp_core::envelope::inner::InnerEnvelope,
         routing_id: &[u8],
         blob_ttl: u32,
     ) -> Result<Vec<u8>, ContextError> {
-        self.0.seal(id, inner, routing_id, blob_ttl)
+        self.0.seal(id, inner, routing_id, blob_ttl).await
     }
-    fn open(
+    async fn open(
         &self,
         id: &[u8; 32],
         outer_bytes: &[u8],
     ) -> Result<scp_core::context::builder::OpenResult, ContextError> {
-        self.0.open(id, outer_bytes)
+        self.0.open(id, outer_bytes).await
     }
 }
 

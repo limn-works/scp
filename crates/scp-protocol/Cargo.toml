@@ -10,6 +10,7 @@ homepage.workspace = true
 [dependencies]
 scp-primitives = { path = "../scp-primitives", version = "=0.1.0-beta.1" }
 scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.1" }
+async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
@@ -52,6 +53,7 @@ uuid = { version = "1", features = ["v4", "js"] }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 proptest = "1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 scp-primitives = { path = "../scp-primitives" }
 scp-event-log = { path = "../scp-event-log", features = ["testing"] }
 
