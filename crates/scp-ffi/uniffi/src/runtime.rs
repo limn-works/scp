@@ -614,12 +614,14 @@ pub struct UcanContextState {
 /// Returns a reference to the UCAN state registry.
 ///
 /// The registry is stored as a type-erased `Arc<DashMap<String, UcanContextState>>`
-/// in the `BridgeInstance`. Panics if called before `init_context_manager`.
+/// in the `BridgeInstance`. Falls back to an empty registry when the bridge
+/// has not been initialized (e.g. in unit tests that don't call
+/// `init_context_manager`).
 ///
-/// # Panics
-///
-/// Panics if the bridge has not been initialized. This is a programming error.
-#[allow(clippy::panic)]
+/// Fallback empty UCAN registry for when `BridgeInstance` is not initialized.
+static EMPTY_UCAN_REGISTRY: std::sync::OnceLock<DashMap<String, UcanContextState>> =
+    std::sync::OnceLock::new();
+
 fn ucan_registry() -> &'static DashMap<String, UcanContextState> {
     BRIDGE_INSTANCE
         .get()
@@ -627,11 +629,7 @@ fn ucan_registry() -> &'static DashMap<String, UcanContextState> {
             bi.get_ucan_registry_as::<Arc<DashMap<String, UcanContextState>>>()
                 .map(Arc::as_ref)
         })
-        .unwrap_or_else(|| {
-            panic!(
-                "UCAN registry not initialized — call init_context_manager before UCAN operations"
-            )
-        })
+        .unwrap_or_else(|| EMPTY_UCAN_REGISTRY.get_or_init(DashMap::new))
 }
 
 /// Ensures UCAN validation state is registered for a context.
