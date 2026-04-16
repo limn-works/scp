@@ -1,0 +1,2 @@
+- [SCP state topology](scp_state_topology.md) — persistence/concurrency/state-ownership map across the whole runtime.
+- [ContextSnapshot drift risk](context_snapshot_drift.md) — why the single-blob ContextSnapshot + separate MLS map + separate event log is fundamentally torn.

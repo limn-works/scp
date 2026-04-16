@@ -265,3 +265,15 @@ class TestNanInfinityGuards:
     def test_parse_finite_int_inf_raises(self) -> None:
         with pytest.raises(ValidationError, match="SCP-VALID-7005"):
             _parse_finite_int(float("inf"), "x")
+
+    def test_parse_finite_int_rejects_string(self) -> None:
+        with pytest.raises(ValidationError, match="SCP-VALID-7005"):
+            _parse_finite_int("1700000000", "verified_at")
+
+    def test_parse_finite_int_rejects_negative(self) -> None:
+        with pytest.raises(ValidationError, match="SCP-VALID-7005"):
+            _parse_finite_int(-1, "verified_at")
+
+    def test_parse_finite_int_rejects_float(self) -> None:
+        with pytest.raises(ValidationError, match="SCP-VALID-7005"):
+            _parse_finite_int(1.5, "verified_at")

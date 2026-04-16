@@ -66,6 +66,14 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - **RED-804 (MEDIUM)**: WASM nonce tracker uses HashMap with f64 timestamps (JS precision). 10K cap with TTL eviction. Reset on context import loses all nonces -- full replay window opens.
 - **RED-805 (MEDIUM)**: `rollback_last` on velocity tracker always pops the LAST timestamp regardless of which message failed. Concurrent senders can roll back the wrong sender's velocity.
 
+## PRs #1629-#1642 Assessment (2026-04-14, error taxonomy + NaN guards)
+- **RED-901 (MEDIUM)**: ATTEST codes 9015-9017 are Swift-unique, 9018 is WASM-unique. Single ScpError with embedded code fingerprints SDK. Any caller receiving ScpError learns bridge family.
+- **RED-902 (LOW)**: Python IdentityAttestation.__post_init__ (identity.py:746-749) does raw int() without _parse_finite_int. _from_dict path is hardened, dataclass-construction path is not.
+- **RED-903 (LOW)**: HandleRegisterStatus serde rename from "lowercase" to "snake_case" in PR #1632 is a breaking wire-format change with no alias. Older persisted forms ("ownershipmismatch") fail to deserialize.
+- **RED-904 (LOW)**: HandleRegistry.next_entry_id is monotonic and never resets. Observers derive registration churn rate. Capacity check ordering is correct (no counter bump on fail).
+- **RED-905 (LOW)**: MissingPassphrase → VALID-7004 (UniFFI only). Combined with pre-existing CustodyError("decryption failed (wrong passphrase?)") vs Io differential, gives 3-way oracle for identity file state.
+- **RED-906 (LOW)**: NaN guard in TS uses Number.isFinite but not Number.isSafeInteger. Unsafe-integer verified_at (>=2^53) silently truncates on re-serialize, causing cross-peer signature consistency failure.
+
 ## Key Attack Patterns for This Codebase
 - **Bridge parity gap**: WASM bridge cannot depend on scp-core (tokio incompatibility), so it re-implements validation partially. ALWAYS check WASM bridge when core validation changes.
 - **Two UcanToken types**: `roles::UcanToken` (stub, no sig/expiry) vs `crypto::ucan::UcanToken` (full, has sig/encoded). Broadcast uses the stub. Any code accepting the stub has no sig verification.

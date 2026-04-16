@@ -228,4 +228,26 @@ describe("IdentityAttestation", () => {
         }),
     ).toThrow(ValidationError);
   });
+
+  it("RevocationStatus.revoked() factory throws for negative revokedAt", () => {
+    expect(() => RevocationStatus.revoked(-1, "reason")).toThrow(ValidationError);
+  });
+
+  it("IdentityAttestation constructor throws for negative verifiedAt", () => {
+    expect(
+      () =>
+        new IdentityAttestation({
+          id: "abc123",
+          platform: "github.com",
+          platformHandle: "alice",
+          verificationMethod: "did:dht:z6Mk...#active",
+          verifiedAt: -1,
+          revocationStatus: RevocationStatus.active(),
+        }),
+    ).toThrow(ValidationError);
+  });
+
+  it("RevocationStatus.revoked() factory throws for non-integer float", () => {
+    expect(() => RevocationStatus.revoked(1.5, "reason")).toThrow(ValidationError);
+  });
 });
