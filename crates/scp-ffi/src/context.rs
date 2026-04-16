@@ -949,14 +949,9 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
         let ctx_id = context_id.clone();
         let creator_did_for_register = scp_identity::DID(identity_did.to_owned());
         rt.block_on(async move {
-            mgr.create_context_with_pseudonym(
-                ctx_id,
-                core_params,
-                creator_did_owned,
-                local_pseudonym,
-            )
-            .await
-            .map_err(|e| scp_core::context::ContextError::CreationFailed(e.to_string()))?;
+            mgr.create_context(ctx_id, core_params, creator_did_owned, local_pseudonym)
+                .await
+                .map_err(|e| scp_core::context::ContextError::CreationFailed(e.to_string()))?;
             // Register the creator's DID as a local DID for defense-in-depth,
             // matching NAPI's behavior.
             mgr.register_local_did(creator_did_for_register).await;
@@ -1136,13 +1131,13 @@ fn py_context_join(
         let core_params = build_core_context_params(&handle.params)?;
         let temp_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
         // Transition the temp handle to Active to match the real state.
-        // §9.10.4: use join_context_with_pseudonym to store the pseudonym
-        // in PerContextState for subsequent send_message fan-out.
+        // §9.10.4: pass the pseudonym to join_context so it is stored in
+        // PerContextState for subsequent send_message fan-out.
         rt.block_on(async {
             let _ = temp_handle
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
-            mgr.join_context_with_pseudonym(
+            mgr.join_context(
                 &temp_handle,
                 key_package,
                 spending_ucan.as_ref(),
@@ -4696,6 +4691,7 @@ mod tests {
             ctx_id.clone(),
             params,
             scp_identity::DID(creator.to_owned()),
+            None,
         ))
         .unwrap();
         let new_did = "did:key:z6MkNewMember1";
@@ -4755,6 +4751,7 @@ mod tests {
             ctx_id.clone(),
             params,
             scp_identity::DID(creator.to_owned()),
+            None,
         ))
         .unwrap();
         let new_did = "did:key:z6MkAdded1";
@@ -4807,6 +4804,7 @@ mod tests {
             ctx_id.clone(),
             params,
             scp_identity::DID(creator.to_owned()),
+            None,
         ))
         .unwrap();
         let add = approved_proposal(

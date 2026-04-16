@@ -1405,34 +1405,13 @@ impl ContextManager {
         context_id: String,
         params: ContextParams,
         creator_did: DID,
-    ) -> Result<ContextHandle, ContextCreationError> {
-        self.create_context_inner(context_id, params, creator_did, None)
-            .await
-    }
-
-    /// Creates a new SCP context with a pre-derived pseudonym routing ID.
-    ///
-    /// The `local_pseudonym` is the 32-byte Ed25519 public key derived via
-    /// `KeyCustody::derive_pseudonym` in the FFI bridge. For encrypted
-    /// contexts, this pseudonym will be used as the member's per-context
-    /// routing ID (§9.10.4) instead of the shared `context_routing_id`.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`create_context`](Self::create_context).
-    pub async fn create_context_with_pseudonym(
-        &self,
-        context_id: String,
-        params: ContextParams,
-        creator_did: DID,
         local_pseudonym: Option<[u8; 32]>,
     ) -> Result<ContextHandle, ContextCreationError> {
         self.create_context_inner(context_id, params, creator_did, local_pseudonym)
             .await
     }
 
-    /// Internal implementation for context creation, shared by both
-    /// `create_context` and `create_context_with_pseudonym`.
+    /// Internal implementation for context creation.
     #[allow(clippy::too_many_lines)] // Context creation initializes many subsystems including pseudonym routing.
     async fn create_context_inner(
         &self,
@@ -1886,7 +1865,7 @@ impl ContextManager {
             merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
             // §9.10.4: pseudonym routing — governance-path creation does not
             // yet support pseudonym injection. The FFI bridge can set this
-            // later via the standard create_context_with_pseudonym path.
+            // later via the standard create_context path.
             local_pseudonym: None,
             pseudonym_registry: HashMap::new(),
         })
@@ -1910,33 +1889,13 @@ impl ContextManager {
         handle: &ContextHandle,
         key_package: KeyPackage,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
-    ) -> Result<(), ContextError> {
-        self.join_context_inner(handle, key_package, spending_ucan, None)
-            .await
-    }
-
-    /// Joins a member to a context with a pre-derived pseudonym routing ID.
-    ///
-    /// The `local_pseudonym` is stored in `PerContextState` and used for
-    /// per-member pseudonym routing (§9.10.4). After a successful join, a
-    /// `PseudonymAnnouncement` MLS message is sent to inform other members.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`join_context`](Self::join_context).
-    pub async fn join_context_with_pseudonym(
-        &self,
-        handle: &ContextHandle,
-        key_package: KeyPackage,
-        spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
         local_pseudonym: Option<[u8; 32]>,
     ) -> Result<(), ContextError> {
         self.join_context_inner(handle, key_package, spending_ucan, local_pseudonym)
             .await
     }
 
-    /// Internal join implementation shared by `join_context` and
-    /// `join_context_with_pseudonym`.
+    /// Internal join implementation.
     #[allow(clippy::too_many_lines)]
     #[instrument(skip_all, fields(context_id = handle.context_id()))]
     async fn join_context_inner(
@@ -2215,8 +2174,8 @@ impl ContextManager {
     /// Sends a `PseudonymAnnouncement` to inform other members of this
     /// member's per-context routing ID (§9.10.4).
     ///
-    /// Called by the FFI bridges after `create_context_with_pseudonym` or
-    /// `join_context_with_pseudonym` succeeds. The signing key is available
+    /// Called by the FFI bridges after `create_context` or `join_context`
+    /// succeeds with a pseudonym. The signing key is available
     /// at the FFI bridge layer but NOT in the runtime lifecycle methods, so
     /// this method is separated from the create/join paths.
     ///
@@ -2525,6 +2484,9 @@ impl ContextManager {
             ctx.access
                 .access_key_store
                 .remove(&context_id, member_did.as_ref());
+
+            // §9.10.4: remove the departing member's pseudonym routing ID.
+            ctx.pseudonym_registry.remove(member_did);
 
             // Emit MemberLeft event to receive buffer.
             ctx.receive_buffer.push(ContextEvent::MemberLeft {

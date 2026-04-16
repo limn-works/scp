@@ -25,7 +25,7 @@ async fn cac009_tier1_encrypted_block_unblock() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context("cac009-enc".into(), params, "did:key:alice".into())
+        .create_context("cac009-enc".into(), params, "did:key:alice".into(), None)
         .await
         .unwrap();
     for did in &["did:key:dave", "did:key:bob"] {
@@ -124,11 +124,21 @@ async fn cac009_tier2_global_block_multiple_contexts() {
         ..ContextParams::default()
     };
     let _h1 = manager
-        .create_context("cac009-g1".into(), make_params(), "did:key:alice".into())
+        .create_context(
+            "cac009-g1".into(),
+            make_params(),
+            "did:key:alice".into(),
+            None,
+        )
         .await
         .unwrap();
     let _h2 = manager
-        .create_context("cac009-g2".into(), make_params(), "did:key:alice".into())
+        .create_context(
+            "cac009-g2".into(),
+            make_params(),
+            "did:key:alice".into(),
+            None,
+        )
         .await
         .unwrap();
     for ctx_id in &["cac009-g1", "cac009-g2"] {
@@ -516,7 +526,7 @@ async fn cac010_threshold_revoke_read_access() {
         signers: vec![creator.clone()],
     };
     let _handle = manager
-        .create_context("cac010-thresh".into(), params, creator.clone())
+        .create_context("cac010-thresh".into(), params, creator.clone(), None)
         .await
         .unwrap();
     {
@@ -786,6 +796,7 @@ async fn test_recovery_advance_epoch_calls_crypto_provider() {
             "recovery-epoch-1".into(),
             ContextParams::default(),
             "did:key:creator".into(),
+            None,
         )
         .await
         .unwrap();
@@ -841,6 +852,7 @@ async fn test_recovery_advance_epoch_rollback_on_crypto_failure() {
             "recovery-fail-1".into(),
             ContextParams::default(),
             "did:key:creator".into(),
+            None,
         )
         .await
         .unwrap();
@@ -882,6 +894,7 @@ async fn test_recovery_advance_epoch_rejects_inactive_context() {
             "recovery-inactive-1".into(),
             ContextParams::default(),
             "did:key:creator".into(),
+            None,
         )
         .await
         .unwrap();

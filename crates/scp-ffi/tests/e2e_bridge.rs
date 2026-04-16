@@ -108,7 +108,7 @@ fn create_test_context(creator_did: &str) -> String {
 
     rt.block_on(async move {
         let params = scp_core::context::ContextParams::default();
-        mgr.create_context(ctx_id.clone(), params, creator.clone())
+        mgr.create_context(ctx_id.clone(), params, creator.clone(), None)
             .await
             .unwrap();
         mgr.register_local_did(creator).await;

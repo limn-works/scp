@@ -525,7 +525,7 @@ pub async fn context_create(
     // Delegate to ContextManager with pseudonym for per-member routing.
     let manager = context_manager()?;
     let core_handle = manager
-        .create_context_with_pseudonym(
+        .create_context(
             context_id.clone(),
             context_params,
             DID(creator_did.clone()),
@@ -628,36 +628,25 @@ pub async fn context_join(
 
     // §9.10.4: Derive pseudonym for the joining member so it can be stored
     // in PerContextState and announced to other members.
+    // Extract custody + identity key from registry (sync), then derive
+    // the pseudonym asynchronously — avoids block_on inside an async fn.
     let context_id = handle.context_id.clone();
     let local_pseudonym: Option<[u8; 32]> = {
         #[cfg(feature = "allow_in_memory_custody")]
         {
-            crate::runtime::with_identity(&identity_did, |entry| {
-                let custody = &entry.custody;
-                let scp_id = &entry.identity;
-                let ctx = context_id.clone();
-                // Block on the async pseudonym derivation.
-                let rt_handle = tokio::runtime::Handle::current();
-                let pseudonym = rt_handle
-                    .block_on(async {
-                        custody
-                            .0
-                            .derive_pseudonym(&scp_id.identity_key, ctx.as_bytes())
-                            .await
-                    })
-                    .map_err(|e| ScpNapiError::Context {
-                        message: format!("pseudonym derivation failed: {e}"),
-                        code: codes::CTX_2014.to_owned(),
-                    })?;
-                let bytes: [u8; 32] = pseudonym.public_key.as_bytes().try_into().map_err(|_| {
-                    ScpNapiError::Context {
-                        message: "pseudonym public key must be 32 bytes".to_owned(),
-                        code: codes::CTX_2014.to_owned(),
-                    }
-                })?;
-                Ok(bytes)
+            let custody_and_key = crate::runtime::with_identity(&identity_did, |entry| {
+                Ok((entry.custody.clone(), entry.identity.identity_key))
             })
-            .ok()
+            .ok();
+            match custody_and_key {
+                Some((custody, identity_key)) => custody
+                    .0
+                    .derive_pseudonym(&identity_key, context_id.as_bytes())
+                    .await
+                    .ok()
+                    .and_then(|p| p.public_key.as_bytes().try_into().ok()),
+                None => None,
+            }
         }
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
@@ -667,7 +656,7 @@ pub async fn context_join(
 
     let manager = context_manager()?;
     manager
-        .join_context_with_pseudonym(
+        .join_context(
             core_handle,
             key_package,
             spending_ucan.as_ref(),
@@ -681,30 +670,23 @@ pub async fn context_join(
     if local_pseudonym.is_some() {
         #[cfg(feature = "allow_in_memory_custody")]
         {
-            let _ = async {
-                let entry = crate::runtime::with_identity(&identity_did, |e| {
-                    let key_handle = e.identity.active_signing_key;
-                    let rt_handle = tokio::runtime::Handle::current();
-                    let sk = rt_handle
-                        .block_on(async {
-                            e.custody.0.export_ed25519_signing_key(&key_handle).await
-                        })
-                        .map_err(|err| ScpNapiError::Context {
-                            message: format!("signing key export failed: {err}"),
-                            code: codes::CTX_2014.to_owned(),
-                        })?;
-                    Ok(sk)
-                });
-                if let Ok(sk) = entry {
-                    let sender_did = DID(identity_did.clone());
-                    let mgr = context_manager().ok()?;
-                    let ann_handle = handle.require_core_handle().ok()?;
+            // Extract custody + key handle from registry (sync), then export
+            // the signing key asynchronously — avoids block_on inside async fn.
+            let custody_and_key = crate::runtime::with_identity(&identity_did, |e| {
+                Ok((e.custody.clone(), e.identity.active_signing_key))
+            })
+            .ok();
+            if let Some((custody, key_handle)) = custody_and_key
+                && let Ok(sk) = custody.0.export_ed25519_signing_key(&key_handle).await
+            {
+                let sender_did = DID(identity_did.clone());
+                if let (Some(mgr), Ok(ann_handle)) =
+                    (context_manager().ok(), handle.require_core_handle())
+                {
                     mgr.send_pseudonym_announcement(ann_handle, &sender_did, &sk)
                         .await;
                 }
-                Some(())
             }
-            .await;
         }
     }
 
@@ -984,6 +966,10 @@ pub fn context_subscribe(
     // §9.10.4: dual subscription — subscribe to both the shared context
     // routing ID (for backward compat and MLS management messages) and the
     // member's pseudonym routing ID (for pseudonym-routed application messages).
+    //
+    // TODO(§9.10.4.A step 4): After all members have exchanged pseudonyms,
+    // unsubscribe from the shared routing ID to achieve full pseudonym privacy.
+    // Currently the shared subscription is permanent (migration never completes).
     let shared_routing_id_bytes = scp_core::context::context_routing_id(&context_id);
     let shared_routing_id = scp_transport::RoutingId::new(shared_routing_id_bytes);
 
@@ -3569,7 +3555,7 @@ mod tests {
         };
 
         let handle = manager
-            .create_context(ctx_id.clone(), params, creator)
+            .create_context(ctx_id.clone(), params, creator, None)
             .await
             .expect("create_context should succeed");
 
@@ -3581,7 +3567,7 @@ mod tests {
 
         let kp = KeyPackage::mock(DID("did:key:z6MkJoiner".to_owned()));
         manager
-            .join_context(&handle, kp, None)
+            .join_context(&handle, kp, None, None)
             .await
             .expect("join_context should succeed");
 
@@ -3643,7 +3629,7 @@ mod tests {
             ..ContextParams::default()
         };
         manager
-            .create_context(ctx_id.clone(), params, DID(creator.to_owned()))
+            .create_context(ctx_id.clone(), params, DID(creator.to_owned()), None)
             .await
             .unwrap();
         crate::runtime::register_test_context(&ctx_id, creator);
@@ -3704,7 +3690,7 @@ mod tests {
             ..ContextParams::default()
         };
         manager
-            .create_context(ctx_id.clone(), params, DID(creator.to_owned()))
+            .create_context(ctx_id.clone(), params, DID(creator.to_owned()), None)
             .await
             .unwrap();
         crate::runtime::register_test_context(&ctx_id, creator);
@@ -3757,7 +3743,7 @@ mod tests {
             ..ContextParams::default()
         };
         manager
-            .create_context(ctx_id.clone(), params, DID(creator.to_owned()))
+            .create_context(ctx_id.clone(), params, DID(creator.to_owned()), None)
             .await
             .unwrap();
         crate::runtime::register_test_context(&ctx_id, creator);

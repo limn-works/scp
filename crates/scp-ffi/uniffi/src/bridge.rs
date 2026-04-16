@@ -3038,7 +3038,7 @@ pub async fn context_create(
             // Delegate to the shared ContextManager with pseudonym.
             let manager = crate::runtime::context_manager()?;
             let _core_handle = manager
-                .create_context_with_pseudonym(
+                .create_context(
                     context_id.clone(),
                     core_params,
                     identity.did.clone().into(),
@@ -3205,7 +3205,7 @@ pub async fn context_join(
             };
 
             manager
-                .join_context_with_pseudonym(
+                .join_context(
                     &core_handle,
                     key_package,
                     spending_ucan.as_ref(),

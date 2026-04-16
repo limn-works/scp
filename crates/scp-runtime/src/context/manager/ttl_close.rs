@@ -122,6 +122,12 @@ impl ContextManager {
                 // Drop broadcast context state -- keys are zeroed by Zeroize.
                 ctx.broadcast_context = None;
 
+                // §9.10.4: clear pseudonym state on close. The local pseudonym
+                // is derived from secret key material; zeroing it prevents
+                // leaking the routing ID after context teardown.
+                ctx.local_pseudonym = None;
+                ctx.pseudonym_registry.clear();
+
                 // Participation decay: clear participation cache and cooldown
                 // state on context close (#1530).
                 ctx.governance.decay_participation();

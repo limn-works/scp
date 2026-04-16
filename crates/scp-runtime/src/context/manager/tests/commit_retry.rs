@@ -114,7 +114,7 @@ async fn setup_retry_manager() -> (
 
     let admin_did: DID = "did:key:admin".into();
     let _handle = manager
-        .create_context("retry-ctx".into(), params, admin_did.clone())
+        .create_context("retry-ctx".into(), params, admin_did.clone(), None)
         .await
         .unwrap();
 

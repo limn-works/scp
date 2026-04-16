@@ -1133,6 +1133,7 @@ struct TtlState {
 /// they announce it to other members via this structure serialized with
 /// `MessagePack`. Recipients store the mapping in their pseudonym registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct PseudonymAnnouncement {
     /// Magic prefix to distinguish from regular application messages.
     pub tag: String,
@@ -1858,7 +1859,7 @@ pub enum ContextManagerBuildError {
 ///
 /// ```ignore
 /// let manager = ContextManager::new(crypto, transport, event_log, key_resolver);
-/// let handle = manager.create_context("ctx-1".into(), params, "did:key:creator".into()).await?;
+/// let handle = manager.create_context("ctx-1".into(), params, "did:key:creator".into(), None).await?;
 /// assert_eq!(handle.state().await, ContextState::Active);
 /// ```
 pub struct ContextManager {

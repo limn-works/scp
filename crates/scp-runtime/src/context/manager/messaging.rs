@@ -305,10 +305,23 @@ fn deliver_plaintext_or_announcement(
     plaintext: &[u8],
     context_id: &str,
 ) {
+    // KNOWN LIMITATION (§9.10.4 vs §9.10.4.A): Spec says receivers should verify
+    // the pseudonym-to-DID mapping, but the privacy model (pseudonym_secret from
+    // private key) makes independent verification impossible. We trust MLS-
+    // authenticated senders to honestly announce their pseudonyms. A malicious
+    // member can only misdirect their own message copies.
     if let Ok(announcement) = rmp_serde::from_slice::<super::PseudonymAnnouncement>(plaintext)
         && announcement.tag == super::PSEUDONYM_ANNOUNCEMENT_TAG
-        && announcement.member_did == sender_did
     {
+        if announcement.member_did != sender_did {
+            tracing::warn!(
+                context_id,
+                sender_did,
+                claimed_did = %announcement.member_did,
+                "buffered pseudonym announcement sender mismatch — dropping"
+            );
+            return; // Drop forged announcement, don't deliver as message
+        }
         let did = DID(announcement.member_did.clone());
         ctx.pseudonym_registry
             .insert(did.clone(), announcement.pseudonym);
@@ -508,14 +521,19 @@ impl ContextManager {
                 // For encrypted contexts with known pseudonyms, send to each
                 // member's pseudonym. Always include the shared routing ID as
                 // fallback for members whose pseudonym is not yet known.
+                //
+                // KNOWN LIMITATION (§9.10.4): Fan-out sends the SAME MLS ciphertext to all
+                // routing IDs. A relay can correlate pseudonyms by observing identical blobs.
+                // Per-recipient re-encryption (different nonce per blob) would fix this but
+                // increases bandwidth by O(N). Acceptable until relay-blinding is implemented.
                 let mut routing_ids: Vec<[u8; 32]> =
                     ctx.pseudonym_registry.values().copied().collect();
                 let shared_rid = scp_protocol::context::context_routing_id(&context_id);
                 // Always include the shared routing ID for backward compat /
-                // members who haven't announced a pseudonym yet.
-                if !routing_ids.contains(&shared_rid) {
-                    routing_ids.push(shared_rid);
-                }
+                // members who haven't announced a pseudonym yet. Duplicates
+                // in the fan-out are harmless (same blob to same routing ID
+                // is idempotent at the relay).
+                routing_ids.push(shared_rid);
                 (
                     None,
                     ctx.access.access_key_store.get_all(&context_id),
@@ -1231,6 +1249,12 @@ impl ContextManager {
         // as a regular message. Announcements are internal protocol messages
         // that update the pseudonym registry — they are NOT forwarded to the
         // application receive buffer as regular MessageReceived events.
+        //
+        // KNOWN LIMITATION (§9.10.4 vs §9.10.4.A): Spec says receivers should verify
+        // the pseudonym-to-DID mapping, but the privacy model (pseudonym_secret from
+        // private key) makes independent verification impossible. We trust MLS-
+        // authenticated senders to honestly announce their pseudonyms. A malicious
+        // member can only misdirect their own message copies.
         if let Ok(announcement) = rmp_serde::from_slice::<super::PseudonymAnnouncement>(plaintext)
             && announcement.tag == super::PSEUDONYM_ANNOUNCEMENT_TAG
         {
