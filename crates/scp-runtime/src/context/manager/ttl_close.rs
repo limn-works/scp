@@ -142,8 +142,7 @@ impl ContextManager {
                 let close_event = ContextEvent::SystemClose {
                     initiator_did: initiator_did.clone(),
                 };
-                ctx.receive_buffer.push(close_event.clone());
-                self.fire_event(&context_id, &close_event);
+                ctx.emit_event(close_event, &context_id, self.event_tx.as_ref());
             }
         }
 
@@ -242,8 +241,7 @@ impl ContextManager {
                 ctx.governance.decay_participation();
                 if result.is_complete() {
                     let event = ContextEvent::Expired;
-                    ctx.receive_buffer.push(event.clone());
-                    self.fire_event(&context_id, &event);
+                    ctx.emit_event(event, &context_id, self.event_tx.as_ref());
                 } else {
                     let event = ContextEvent::ExpiryFailed {
                         reason: result.to_string(),
@@ -252,8 +250,7 @@ impl ContextManager {
                         sender_key_destroyed: result.sender_key_destroyed(),
                         event_logged: result.event_logged(),
                     };
-                    ctx.receive_buffer.push(event.clone());
-                    self.fire_event(&context_id, &event);
+                    ctx.emit_event(event, &context_id, self.event_tx.as_ref());
                 }
             } else {
                 tracing::warn!(
@@ -446,10 +443,7 @@ impl ContextManager {
                                 );
                             } else if result.is_complete() {
                                 let event = ContextEvent::Expired;
-                                ctx.receive_buffer.push(event.clone());
-                                if let Some(tx) = &event_tx {
-                                    let _ = tx.send((context_id_owned.clone(), event));
-                                }
+                                ctx.emit_event(event, &context_id_owned, event_tx.as_ref());
                                 ctx.governance.timeout_task.cancel();
                                 ctx.governance.decay_participation();
                             } else {
@@ -460,10 +454,7 @@ impl ContextManager {
                                     sender_key_destroyed: result.sender_key_destroyed(),
                                     event_logged: result.event_logged(),
                                 };
-                                ctx.receive_buffer.push(event.clone());
-                                if let Some(tx) = &event_tx {
-                                    let _ = tx.send((context_id_owned.clone(), event));
-                                }
+                                ctx.emit_event(event, &context_id_owned, event_tx.as_ref());
                                 ctx.governance.timeout_task.cancel();
                                 ctx.governance.decay_participation();
                             }

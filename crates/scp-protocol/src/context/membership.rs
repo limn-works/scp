@@ -782,6 +782,60 @@ pub enum ContextEvent {
     },
 }
 
+impl ContextEvent {
+    /// Returns the variant name as a static string slice.
+    ///
+    /// Useful for serialization, logging, and webhook payloads where the
+    /// variant identity is needed without parsing `Debug` output.
+    #[must_use]
+    pub const fn variant_name(&self) -> &'static str {
+        match self {
+            Self::MemberJoined { .. } => "MemberJoined",
+            Self::MemberLeft { .. } => "MemberLeft",
+            Self::MessageSent { .. } => "MessageSent",
+            Self::MessageReceived { .. } => "MessageReceived",
+            Self::SystemClose { .. } => "SystemClose",
+            Self::MemberBlocked { .. } => "MemberBlocked",
+            Self::MemberUnblocked { .. } => "MemberUnblocked",
+            Self::AuthorBlocked { .. } => "AuthorBlocked",
+            Self::ReadAccessRevoked { .. } => "ReadAccessRevoked",
+            Self::ReadAccessRestored { .. } => "ReadAccessRestored",
+            Self::WriteAccessRevoked { .. } => "WriteAccessRevoked",
+            Self::CapabilitiesSuspended { .. } => "CapabilitiesSuspended",
+            Self::WriteAccessRestored { .. } => "WriteAccessRestored",
+            Self::AccessKeyRevoked { .. } => "AccessKeyRevoked",
+            Self::AccessKeyRestored { .. } => "AccessKeyRestored",
+            Self::ContentKeysRotated { .. } => "ContentKeysRotated",
+            Self::GovernanceActionExecuted { .. } => "GovernanceActionExecuted",
+            Self::CeilingChangeNotification { .. } => "CeilingChangeNotification",
+            Self::EconomicPolicyChangeNotification { .. } => "EconomicPolicyChangeNotification",
+            Self::Expired => "Expired",
+            Self::ExpiryFailed { .. } => "ExpiryFailed",
+            Self::VoteWithdrawn { .. } => "VoteWithdrawn",
+            Self::ProposalTimedOut { .. } => "ProposalTimedOut",
+            Self::DeadlockDetected { .. } => "DeadlockDetected",
+            Self::AppBound { .. } => "AppBound",
+            Self::AppUnbound { .. } => "AppUnbound",
+            Self::DegradedMode { .. } => "DegradedMode",
+            Self::WelcomeGenerated { .. } => "WelcomeGenerated",
+            Self::BufferOverflow { .. } => "BufferOverflow",
+            Self::SequenceGapDetected { .. } => "SequenceGapDetected",
+            Self::CheckpointCosignatureRequired { .. } => "CheckpointCosignatureRequired",
+            Self::ContextMigrationProposed { .. } => "ContextMigrationProposed",
+            Self::ContextMigrationStarted { .. } => "ContextMigrationStarted",
+            Self::ContextMigrationCancelled { .. } => "ContextMigrationCancelled",
+            Self::ContextTombstoned { .. } => "ContextTombstoned",
+            Self::ConsequenceTriggered { .. } => "ConsequenceTriggered",
+            Self::ConsequenceEnforced { .. } => "ConsequenceEnforced",
+            Self::PaymentCaptureFailed { .. } => "PaymentCaptureFailed",
+            Self::CommitBroadcastPending { .. } => "CommitBroadcastPending",
+            Self::CommitBroadcastSucceeded { .. } => "CommitBroadcastSucceeded",
+            Self::EquivocationDetected { .. } => "EquivocationDetected",
+            Self::CommitBroadcastFailed { .. } => "CommitBroadcastFailed",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ReceiveBuffer
 // ---------------------------------------------------------------------------

@@ -267,22 +267,29 @@ pub struct CommitFaultMarker {
 /// Used by both `join_context` and `execute_add_member` to avoid
 /// duplicating the emission logic.
 fn push_welcome_event(
-    buffer: &mut ReceiveBuffer,
+    ctx: &mut PerContextState,
     context_id: &str,
     creator_did: &DID,
     member_did: &DID,
     add_output: scp_protocol::context::builder::AddMemberOutput,
+    event_tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
 ) {
     if !add_output.welcome_bytes.is_empty() {
-        buffer.push(ContextEvent::WelcomeGenerated {
-            context_id: context_id.to_owned(),
-            creator_did: creator_did.clone(),
-            member_did: member_did.clone(),
-            welcome_bytes: scp_protocol::context::membership::RedactedBytes(
-                add_output.welcome_bytes,
-            ),
-            commit_bytes: scp_protocol::context::membership::RedactedBytes(add_output.commit_bytes),
-        });
+        ctx.emit_event(
+            ContextEvent::WelcomeGenerated {
+                context_id: context_id.to_owned(),
+                creator_did: creator_did.clone(),
+                member_did: member_did.clone(),
+                welcome_bytes: scp_protocol::context::membership::RedactedBytes(
+                    add_output.welcome_bytes,
+                ),
+                commit_bytes: scp_protocol::context::membership::RedactedBytes(
+                    add_output.commit_bytes,
+                ),
+            },
+            context_id,
+            event_tx,
+        );
     }
 }
 
@@ -1178,6 +1185,24 @@ pub(super) struct PerContextState {
     /// Not persisted in `ContextSnapshot` — the tree is rebuilt from the
     /// `MerkleEventLogProvider`'s entries on `restore_context` / `import_context`.
     merkle_tree: scp_event_log::EventLog,
+}
+
+impl PerContextState {
+    /// Pushes an event to the receive buffer and, if a broadcast channel is
+    /// provided, sends it there too. Consolidates the two-step
+    /// `receive_buffer.push` + `fire_event` / `tx.send` pattern into a single
+    /// call site to prevent future omissions.
+    pub(super) fn emit_event(
+        &mut self,
+        event: ContextEvent,
+        context_id: &str,
+        tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+    ) {
+        self.receive_buffer.push(event.clone());
+        if let Some(tx) = tx {
+            let _ = tx.send((context_id.to_owned(), event));
+        }
+    }
 }
 
 /// Helper type for generation tokens captured during Phase 1 lock acquisition.
@@ -2182,9 +2207,11 @@ impl ContextManager {
 
     /// Sends a context event on the broadcast channel if one is configured.
     ///
-    /// This is an internal helper called after each `receive_buffer.push`
-    /// in the submodules. `SendError` (no active receivers) is silently
-    /// ignored — best-effort delivery.
+    /// Standalone channel-only send for cases where `PerContextState` is
+    /// not directly available (e.g., tests). Production code should prefer
+    /// [`PerContextState::emit_event`] which combines buffer push + channel
+    /// send in a single call.
+    #[allow(dead_code)] // Used in tests (fire_event_noop_without_channel).
     pub(super) fn fire_event(&self, context_id: &str, event: &ContextEvent) {
         if let Some(tx) = &self.event_tx {
             let _ = tx.send((context_id.to_owned(), event.clone()));
@@ -2589,8 +2616,7 @@ impl ContextManager {
                 error: error_msg.to_owned(),
                 cost: cost.map(scp_protocol::economy::types::Amount::value),
             };
-            ctx.receive_buffer.push(event.clone());
-            self.fire_event(context_id, &event);
+            ctx.emit_event(event, context_id, self.event_tx.as_ref());
         }
     }
 }

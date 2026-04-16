@@ -2179,16 +2179,16 @@ impl ContextManager {
             member_did: member_did.clone(),
             role_name: "member".into(),
         };
-        ctx.receive_buffer.push(join_event.clone());
-        self.fire_event(context_id, &join_event);
+        ctx.emit_event(join_event, context_id, self.event_tx.as_ref());
 
         // Emit WelcomeGenerated event if the add produced a Welcome message.
         push_welcome_event(
-            &mut ctx.receive_buffer,
+            ctx,
             context_id,
             &DID(creator_did),
             member_did,
             add_output,
+            self.event_tx.as_ref(),
         );
 
         Ok(())
@@ -2375,8 +2375,7 @@ impl ContextManager {
             let left_event = ContextEvent::MemberLeft {
                 member_did: member_did.clone(),
             };
-            ctx.receive_buffer.push(left_event.clone());
-            self.fire_event(&context_id, &left_event);
+            ctx.emit_event(left_event, &context_id, self.event_tx.as_ref());
 
             ctx.membership.count() == 0
         };

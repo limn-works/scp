@@ -688,8 +688,7 @@ impl ContextManager {
                     sequence_number: sequence,
                     payload: payload.to_vec(),
                 };
-                ctx.receive_buffer.push(event.clone());
-                self.fire_event(context_id, &event);
+                ctx.emit_event(event, context_id, self.event_tx.as_ref());
 
                 // Velocity already recorded in send_message Phase 1 (M4: before
                 // economy enforcement). No duplicate record_message here.
@@ -999,8 +998,7 @@ impl ContextManager {
                 first_delivered_sequence: gap_info.first_buffered_sequence,
                 reason: format!("{:?}", gap_info.reason),
             };
-            ctx.receive_buffer.push(gap_event.clone());
-            self.fire_event(context_id, &gap_event);
+            ctx.emit_event(gap_event, context_id, self.event_tx.as_ref());
             for msg in &messages {
                 // Re-check membership and capability — sender may have been
                 // removed or had capability revoked while the message was
@@ -1022,8 +1020,7 @@ impl ContextManager {
                     sender_did: DID(msg.sender_did.clone()),
                     payload: msg.plaintext.clone(),
                 };
-                ctx.receive_buffer.push(recv_event.clone());
-                self.fire_event(context_id, &recv_event);
+                ctx.emit_event(recv_event, context_id, self.event_tx.as_ref());
             }
         }
 
@@ -1068,8 +1065,7 @@ impl ContextManager {
                 first_delivered_sequence: gap_info.first_buffered_sequence,
                 reason: format!("{:?}", gap_info.reason),
             };
-            ctx.receive_buffer.push(gap_event.clone());
-            self.fire_event(context_id, &gap_event);
+            ctx.emit_event(gap_event, context_id, self.event_tx.as_ref());
 
             for msg in &messages {
                 // Re-check membership and capability — sender may have been
@@ -1092,8 +1088,7 @@ impl ContextManager {
                     sender_did: DID(msg.sender_did.clone()),
                     payload: msg.plaintext.clone(),
                 };
-                ctx.receive_buffer.push(recv_event.clone());
-                self.fire_event(context_id, &recv_event);
+                ctx.emit_event(recv_event, context_id, self.event_tx.as_ref());
             }
         }
 
@@ -1160,8 +1155,7 @@ impl ContextManager {
             sender_did: sender_did_obj,
             payload: plaintext.to_vec(),
         };
-        ctx.receive_buffer.push(recv_event.clone());
-        self.fire_event(context_id, &recv_event);
+        ctx.emit_event(recv_event, context_id, self.event_tx.as_ref());
 
         // Drain consecutive buffered messages that are now unblocked (§9.8.5).
         let next_expected = inner.sequence.saturating_add(1);
@@ -1189,8 +1183,7 @@ impl ContextManager {
                 sender_did: DID(msg.sender_did.clone()),
                 payload: msg.plaintext.clone(),
             };
-            ctx.receive_buffer.push(buffered_recv_event.clone());
-            self.fire_event(context_id, &buffered_recv_event);
+            ctx.emit_event(buffered_recv_event, context_id, self.event_tx.as_ref());
         }
 
         // H5: Append the durable event log entry for `MessageReceived` BEFORE

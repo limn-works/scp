@@ -257,8 +257,7 @@ impl ContextManager {
                     remote_version: (remote_major, remote_minor),
                     unsupported_features,
                 };
-                ctx.receive_buffer.push(event.clone());
-                self.fire_event(context_id, &event);
+                ctx.emit_event(event, context_id, self.event_tx.as_ref());
             }
         }
     }
@@ -879,8 +878,7 @@ impl ContextManager {
                     remote_sender_did: remote.sender_did.clone(),
                     event_count: remote.event_count,
                 };
-                ctx.receive_buffer.push(event.clone());
-                self.fire_event(context_id, &event);
+                ctx.emit_event(event, context_id, self.event_tx.as_ref());
             }
         }
 

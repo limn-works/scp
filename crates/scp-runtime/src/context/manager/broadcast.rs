@@ -79,8 +79,7 @@ impl ContextManager {
                 .add_member(subscriber_did.clone(), "subscriber".into(), vec![]);
 
             // Push event to receive buffer.
-            ctx.receive_buffer.push(result.event.clone());
-            self.fire_event(context_id, &result.event);
+            ctx.emit_event(result.event.clone(), context_id, self.event_tx.as_ref());
 
             (result, snapshot)
         };
@@ -169,8 +168,7 @@ impl ContextManager {
             let left_event = ContextEvent::MemberLeft {
                 member_did: subscriber_did.clone(),
             };
-            ctx.receive_buffer.push(left_event.clone());
-            self.fire_event(context_id, &left_event);
+            ctx.emit_event(left_event, context_id, self.event_tx.as_ref());
 
             (result, snapshot)
         };
@@ -314,8 +312,7 @@ impl ContextManager {
                 sequence_number: seq,
                 payload: payload.to_vec(),
             };
-            ctx.receive_buffer.push(sent_event.clone());
-            self.fire_event(context_id, &sent_event);
+            ctx.emit_event(sent_event, context_id, self.event_tx.as_ref());
 
             envelope
         };
@@ -434,8 +431,7 @@ impl ContextManager {
                 blocked_did: subscriber_did.clone(),
                 author_did: author_did.clone(),
             };
-            ctx.receive_buffer.push(block_event.clone());
-            self.fire_event(context_id, &block_event);
+            ctx.emit_event(block_event, context_id, self.event_tx.as_ref());
 
             (result, snapshot)
         };
@@ -514,8 +510,7 @@ impl ContextManager {
                 unblocked_did: subscriber_did.clone(),
                 author_did: author_did.clone(),
             };
-            ctx.receive_buffer.push(unblock_event.clone());
-            self.fire_event(context_id, &unblock_event);
+            ctx.emit_event(unblock_event, context_id, self.event_tx.as_ref());
 
             snapshot
         };

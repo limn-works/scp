@@ -551,17 +551,10 @@ pub fn map_context_event(
             }),
         ),
         // Generic fallback for all other event variants.
-        _ => {
-            let debug_str = format!("{event:?}");
-            let variant_name = debug_str
-                .split_once('{')
-                .or_else(|| debug_str.split_once(' '))
-                .map_or_else(|| debug_str.clone(), |(name, _)| name.trim().to_owned());
-            (
-                "context.event",
-                serde_json::json!({ "variant": variant_name }),
-            )
-        }
+        _ => (
+            "context.event",
+            serde_json::json!({ "variant": event.variant_name() }),
+        ),
     }
 }
 
