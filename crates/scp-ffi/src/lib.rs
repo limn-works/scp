@@ -219,6 +219,53 @@ fn shutdown_runtime() {
     }
 }
 
+/// Suspends the bridge instance for mobile app backgrounding.
+///
+/// Disconnects transport (clears relay connection) and marks the instance as
+/// suspended. Context state is preserved — the instance remains alive but
+/// inactive. Transport-dependent operations will fail until [`scp_resume`]
+/// is called.
+///
+/// After suspension, callers should call [`scp_resume`] to re-activate,
+/// then re-establish the relay connection via `transport_connect`.
+///
+/// No-op if the instance is already shut down or not initialized.
+///
+/// # Errors
+///
+/// Raises `TransportError` if transport cleanup fails (transport lock is
+/// poisoned).
+#[pyfunction]
+fn scp_suspend() -> PyResult<()> {
+    if let Some(bi) = runtime::BRIDGE_INSTANCE.get() {
+        bi.suspend()
+            .map_err(|e| crate::error::ScpPyError::transport(format!("suspend failed: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Resumes a suspended bridge instance.
+///
+/// Clears the suspended flag so bridge operations can proceed. The caller
+/// must re-establish the relay connection via `transport_connect` — resume
+/// does not reconnect automatically. Use `transport_status()` to check
+/// the previous relay URL.
+///
+/// No-op if the instance is not initialized.
+///
+/// # Errors
+///
+/// Raises `ContextError` if the instance has been permanently shut down
+/// (call `shutdown_runtime` was already made).
+#[pyfunction]
+fn scp_resume() -> PyResult<()> {
+    if let Some(bi) = runtime::BRIDGE_INSTANCE.get() {
+        bi.resume()
+            .map_err(|e| crate::error::ScpPyError::context(format!("resume failed: {e}")))?;
+    }
+    Ok(())
+}
+
 /// The `_scp_core` Python extension module.
 ///
 /// This is the entry point for the FFI bridge. It initializes the tokio
@@ -244,6 +291,8 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(runtime_is_initialized, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown_runtime, m)?)?;
+    m.add_function(wrap_pyfunction!(scp_suspend, m)?)?;
+    m.add_function(wrap_pyfunction!(scp_resume, m)?)?;
 
     // Step 5: Register atexit handler for graceful shutdown.
     // Must come AFTER shutdown_runtime is added to the module (step 4).

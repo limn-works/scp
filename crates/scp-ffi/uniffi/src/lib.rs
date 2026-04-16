@@ -333,6 +333,64 @@ pub fn scp_shutdown(timeout_secs: u64) {
     // before that point.
 }
 
+/// Suspends the bridge instance for mobile app backgrounding.
+///
+/// Disconnects transport (clears the relay connection) and marks the instance
+/// as suspended. Context state is preserved — the instance remains alive but
+/// inactive. Transport-dependent operations will fail until [`scp_resume`]
+/// is called.
+///
+/// After suspension, callers should call `scpResume()` to re-activate, then
+/// re-establish the relay connection via `transportConnect()`.
+///
+/// No-op if the instance is already shut down or not initialized.
+///
+/// # Example (Swift)
+///
+/// ```swift
+/// // When the app enters background:
+/// scpSuspend()
+/// // When returning to foreground:
+/// try await scpResume()
+/// try await transportConnect(relayUrl: savedUrl)
+/// ```
+///
+/// # Errors
+///
+/// Returns `ScpError::Transport` if transport cleanup fails.
+#[uniffi::export]
+pub fn scp_suspend() -> Result<(), bridge::ScpError> {
+    if let Some(bi) = runtime::bridge_instance_raw() {
+        bi.suspend().map_err(|e| bridge::ScpError::Transport {
+            msg: format!("suspend failed: {e}"),
+            code: codes::TRANS_5001.to_owned(),
+        })?;
+    }
+    Ok(())
+}
+
+/// Resumes a suspended bridge instance.
+///
+/// Clears the suspended flag so bridge operations can proceed. The caller
+/// must re-establish the relay connection via `transportConnect()` — resume
+/// does not reconnect automatically.
+///
+/// No-op if the instance is not initialized.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the instance has been permanently shut down.
+#[uniffi::export]
+pub fn scp_resume() -> Result<(), bridge::ScpError> {
+    if let Some(bi) = runtime::bridge_instance_raw() {
+        bi.resume().map_err(|e| bridge::ScpError::Context {
+            msg: format!("resume failed: {e}"),
+            code: codes::CTX_2000.to_owned(),
+        })?;
+    }
+    Ok(())
+}
+
 /// Returns a handle to the shared tokio runtime, initializing it on first call.
 ///
 /// Uses `OnceLock::get_or_init` for thread-safe lazy initialization. All async
