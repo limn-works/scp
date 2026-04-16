@@ -1007,9 +1007,14 @@ where
 /// # Panics
 ///
 /// Panics if the bridge has not been initialized via `init_context_manager`.
-/// This is a programming error — the bridge must be initialized before any
-/// identity operation.
-#[allow(clippy::panic)]
+/// Fallback empty identity registry for when `BridgeInstance` is not initialized.
+static EMPTY_IDENTITY_REGISTRY: std::sync::OnceLock<DashMap<String, IdentityEntry>> =
+    std::sync::OnceLock::new();
+
+/// Returns the global identity registry.
+///
+/// Falls back to an empty registry if `BridgeInstance` is not yet initialized
+/// (matching the `get_or_init` behavior of the removed standalone `OnceLock`).
 fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
     BRIDGE_INSTANCE
         .get()
@@ -1017,11 +1022,7 @@ fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
             bi.get_identity_registry_as::<Arc<DashMap<String, IdentityEntry>>>()
                 .map(Arc::as_ref)
         })
-        .unwrap_or_else(|| {
-            panic!(
-                "identity registry not initialized — call init_context_manager before identity operations"
-            )
-        })
+        .unwrap_or_else(|| EMPTY_IDENTITY_REGISTRY.get_or_init(DashMap::new))
 }
 
 /// Retained identity state for a single DID.
@@ -1571,6 +1572,7 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn remove_identity_if_present_returns_true_when_found() {
+        init_context_manager_for_test();
         let did = "did:dht:z6MkRemoveIfPresent";
         let entry = IdentityEntry {
             identity: ScpIdentity {
@@ -1592,6 +1594,7 @@ mod tests {
 
     #[test]
     fn remove_identity_if_present_returns_false_when_not_found() {
+        init_context_manager_for_test();
         assert!(!remove_identity_if_present("did:dht:z6MkNotPresent9999"));
     }
 

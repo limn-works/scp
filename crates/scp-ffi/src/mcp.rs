@@ -3137,6 +3137,7 @@ mod tests {
 
     #[test]
     fn mcp_registry_stats_returns_consistent_counts() {
+        crate::runtime::init_context_manager_for_test();
         let stats = mcp_registry_stats();
         // Cannot assert exact values due to parallel tests, but structural
         // invariants must hold: stopped_servers can never exceed total servers.

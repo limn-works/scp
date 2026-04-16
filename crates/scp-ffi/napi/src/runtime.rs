@@ -722,6 +722,11 @@ pub(crate) struct NapiIdentityEntry {
 /// Panics if the bridge has not been initialized. This is a programming error.
 #[cfg(feature = "allow_in_memory_custody")]
 #[allow(clippy::panic)]
+/// Fallback empty identity registry for when `BridgeInstance` is not initialized
+/// or the identity registry feature gate is disabled.
+static EMPTY_IDENTITY_REGISTRY: std::sync::OnceLock<DashMap<String, NapiIdentityEntry>> =
+    std::sync::OnceLock::new();
+
 fn identity_registry() -> &'static DashMap<String, NapiIdentityEntry> {
     BRIDGE_INSTANCE
         .get()
@@ -729,11 +734,7 @@ fn identity_registry() -> &'static DashMap<String, NapiIdentityEntry> {
             bi.get_identity_registry_as::<Arc<DashMap<String, NapiIdentityEntry>>>()
                 .map(Arc::as_ref)
         })
-        .unwrap_or_else(|| {
-            panic!(
-                "identity registry not initialized — call init_context_manager before identity operations"
-            )
-        })
+        .unwrap_or_else(|| EMPTY_IDENTITY_REGISTRY.get_or_init(DashMap::new))
 }
 
 /// Registers an identity in the global identity registry.
