@@ -4341,3 +4341,87 @@ async fn tool_invoke_happy_path_with_valid_spending_ucan() {
         "happy-path invoke must deduct at least per_tool_invoke=10: before={before} after={after}"
     );
 }
+
+// -----------------------------------------------------------------------
+// Event channel tests (#1539 AC3)
+// -----------------------------------------------------------------------
+
+/// Verify that `with_event_channel` + `subscribe_events` yields a working
+/// broadcast receiver and that `send_message` fires `MessageSent` on it.
+#[tokio::test]
+async fn event_channel_receives_message_sent() {
+    let mut manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    manager.with_event_channel(1024);
+    let mut rx = manager.subscribe_events().expect("channel configured");
+
+    let params = ContextParams {
+        ceiling: vec![
+            Capability::new("messages:read"),
+            Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+    let handle = manager
+        .create_context("evt-ctx".into(), params, "did:key:creator".into())
+        .await
+        .unwrap();
+
+    let sk = signing_key_for_did(&"did:key:creator".into());
+    manager
+        .send_message(
+            &handle,
+            &"did:key:creator".into(),
+            b"event channel test",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The channel should contain the MessageSent event.
+    let (ctx_id, event) = rx.try_recv().expect("should receive event");
+    assert_eq!(ctx_id, "evt-ctx");
+    match event {
+        ContextEvent::MessageSent {
+            sender_did,
+            sequence_number,
+            payload,
+        } => {
+            assert_eq!(sender_did.as_ref(), "did:key:creator");
+            assert_eq!(sequence_number, 1);
+            assert_eq!(payload, b"event channel test");
+        }
+        other => panic!("expected MessageSent, got: {other:?}"),
+    }
+}
+
+/// Verify that `subscribe_events` returns `None` when no channel is configured.
+#[tokio::test]
+async fn event_channel_none_when_not_configured() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    assert!(manager.subscribe_events().is_none());
+}
+
+/// Verify that `fire_event` is a no-op (no panic) when no channel is configured.
+#[tokio::test]
+async fn fire_event_noop_without_channel() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    // This must not panic.
+    manager.fire_event("ctx", &ContextEvent::Expired);
+}

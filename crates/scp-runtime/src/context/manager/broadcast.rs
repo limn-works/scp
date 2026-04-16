@@ -80,6 +80,7 @@ impl ContextManager {
 
             // Push event to receive buffer.
             ctx.receive_buffer.push(result.event.clone());
+            self.fire_event(context_id, &result.event);
 
             (result, snapshot)
         };
@@ -165,9 +166,11 @@ impl ContextManager {
             ctx.membership.remove_member(subscriber_did);
 
             // Emit MemberLeft event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::MemberLeft {
+            let left_event = ContextEvent::MemberLeft {
                 member_did: subscriber_did.clone(),
-            });
+            };
+            ctx.receive_buffer.push(left_event.clone());
+            self.fire_event(context_id, &left_event);
 
             (result, snapshot)
         };
@@ -306,11 +309,13 @@ impl ContextManager {
                 .next_sequence_number(author_did)
                 .ok_or_else(|| ContextError::MemberNotFound(author_did.to_string()))?;
 
-            ctx.receive_buffer.push(ContextEvent::MessageSent {
+            let sent_event = ContextEvent::MessageSent {
                 sender_did: author_did.clone(),
                 sequence_number: seq,
                 payload: payload.to_vec(),
-            });
+            };
+            ctx.receive_buffer.push(sent_event.clone());
+            self.fire_event(context_id, &sent_event);
 
             envelope
         };
@@ -425,10 +430,12 @@ impl ContextManager {
             };
 
             // Emit block event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::MemberBlocked {
+            let block_event = ContextEvent::MemberBlocked {
                 blocked_did: subscriber_did.clone(),
                 author_did: author_did.clone(),
-            });
+            };
+            ctx.receive_buffer.push(block_event.clone());
+            self.fire_event(context_id, &block_event);
 
             (result, snapshot)
         };
@@ -503,10 +510,12 @@ impl ContextManager {
             };
 
             // Emit unblock event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::MemberUnblocked {
+            let unblock_event = ContextEvent::MemberUnblocked {
                 unblocked_did: subscriber_did.clone(),
                 author_did: author_did.clone(),
-            });
+            };
+            ctx.receive_buffer.push(unblock_event.clone());
+            self.fire_event(context_id, &unblock_event);
 
             snapshot
         };

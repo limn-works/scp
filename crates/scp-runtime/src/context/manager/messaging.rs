@@ -683,11 +683,13 @@ impl ContextManager {
                     ctx.membership.rollback_sequence_number(sender_did);
                     return Ok(());
                 }
-                ctx.receive_buffer.push(ContextEvent::MessageSent {
+                let event = ContextEvent::MessageSent {
                     sender_did: sender_did.clone(),
                     sequence_number: sequence,
                     payload: payload.to_vec(),
-                });
+                };
+                ctx.receive_buffer.push(event.clone());
+                self.fire_event(context_id, &event);
 
                 // Velocity already recorded in send_message Phase 1 (M4: before
                 // economy enforcement). No duplicate record_message here.
@@ -990,12 +992,14 @@ impl ContextManager {
             .reorder_buffer
             .drain_timed_out(now_ms, &ctx.sequence_tracker);
         for (gap_info, messages) in timed_out {
-            ctx.receive_buffer.push(ContextEvent::SequenceGapDetected {
+            let gap_event = ContextEvent::SequenceGapDetected {
                 sender_did: DID(gap_info.sender_did.clone()),
                 expected_sequence: gap_info.expected_sequence,
                 first_delivered_sequence: gap_info.first_buffered_sequence,
                 reason: format!("{:?}", gap_info.reason),
-            });
+            };
+            ctx.receive_buffer.push(gap_event.clone());
+            self.fire_event(context_id, &gap_event);
             for msg in &messages {
                 // Re-check membership and capability — sender may have been
                 // removed or had capability revoked while the message was
@@ -1013,10 +1017,12 @@ impl ContextManager {
                     msg.inner.sequence,
                     msg.inner.timestamp,
                 );
-                ctx.receive_buffer.push(ContextEvent::MessageReceived {
+                let recv_event = ContextEvent::MessageReceived {
                     sender_did: DID(msg.sender_did.clone()),
                     payload: msg.plaintext.clone(),
-                });
+                };
+                ctx.receive_buffer.push(recv_event.clone());
+                self.fire_event(context_id, &recv_event);
             }
         }
 
@@ -1055,12 +1061,14 @@ impl ContextManager {
                 .unwrap_or(1);
             gap_info.expected_sequence = expected;
 
-            ctx.receive_buffer.push(ContextEvent::SequenceGapDetected {
+            let gap_event = ContextEvent::SequenceGapDetected {
                 sender_did: DID(gap_info.sender_did.clone()),
                 expected_sequence: gap_info.expected_sequence,
                 first_delivered_sequence: gap_info.first_buffered_sequence,
                 reason: format!("{:?}", gap_info.reason),
-            });
+            };
+            ctx.receive_buffer.push(gap_event.clone());
+            self.fire_event(context_id, &gap_event);
 
             for msg in &messages {
                 // Re-check membership and capability — sender may have been
@@ -1079,10 +1087,12 @@ impl ContextManager {
                     msg.inner.sequence,
                     msg.inner.timestamp,
                 );
-                ctx.receive_buffer.push(ContextEvent::MessageReceived {
+                let recv_event = ContextEvent::MessageReceived {
                     sender_did: DID(msg.sender_did.clone()),
                     payload: msg.plaintext.clone(),
-                });
+                };
+                ctx.receive_buffer.push(recv_event.clone());
+                self.fire_event(context_id, &recv_event);
             }
         }
 
@@ -1145,10 +1155,12 @@ impl ContextManager {
         // Advance sequence tracker and deliver the in-order message.
         ctx.sequence_tracker
             .advance(context_id, sender_did, inner.sequence, inner.timestamp);
-        ctx.receive_buffer.push(ContextEvent::MessageReceived {
+        let recv_event = ContextEvent::MessageReceived {
             sender_did: sender_did_obj,
             payload: plaintext.to_vec(),
-        });
+        };
+        ctx.receive_buffer.push(recv_event.clone());
+        self.fire_event(context_id, &recv_event);
 
         // Drain consecutive buffered messages that are now unblocked (§9.8.5).
         let next_expected = inner.sequence.saturating_add(1);
@@ -1172,10 +1184,12 @@ impl ContextManager {
                 msg.inner.sequence,
                 msg.inner.timestamp,
             );
-            ctx.receive_buffer.push(ContextEvent::MessageReceived {
+            let buffered_recv_event = ContextEvent::MessageReceived {
                 sender_did: DID(msg.sender_did.clone()),
                 payload: msg.plaintext.clone(),
-            });
+            };
+            ctx.receive_buffer.push(buffered_recv_event.clone());
+            self.fire_event(context_id, &buffered_recv_event);
         }
 
         // H5: Append the durable event log entry for `MessageReceived` BEFORE

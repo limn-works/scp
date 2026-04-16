@@ -1907,6 +1907,14 @@ pub struct ContextManager {
     /// `Relaxed` ordering — uniqueness is guaranteed by the `fetch_add`
     /// atomicity, and no other memory accesses depend on the ordering.
     next_generation: std::sync::atomic::AtomicU64,
+    /// Optional broadcast channel for notifying external consumers of context
+    /// events (e.g., webhook dispatchers in scp-node). When `Some`, every event
+    /// pushed to a per-context `ReceiveBuffer` is also sent on this channel as
+    /// `(context_id, ContextEvent)`. Lagging receivers lose events (bounded
+    /// channel) — this is acceptable because webhook delivery is best-effort.
+    ///
+    /// Created via [`with_event_channel`](Self::with_event_channel).
+    event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
 }
 
 // Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
@@ -1944,6 +1952,7 @@ impl ContextManager {
             payment_adapter: None,
             task_set: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
             next_generation: std::sync::atomic::AtomicU64::new(1),
+            event_tx: None,
         }
     }
 
@@ -1982,6 +1991,7 @@ impl ContextManager {
             payment_adapter: None,
             task_set: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
             next_generation: std::sync::atomic::AtomicU64::new(1),
+            event_tx: None,
         }
     }
 
@@ -2133,6 +2143,52 @@ impl ContextManager {
             flushed,
             skipped,
         );
+    }
+
+    /// Attaches a bounded broadcast channel for external event consumers.
+    ///
+    /// After calling this, every event pushed to a per-context
+    /// `ReceiveBuffer` is also sent on the channel as
+    /// `(context_id, ContextEvent)`. Lagging receivers lose events —
+    /// this is acceptable because external consumers (e.g., webhook
+    /// dispatchers) treat delivery as best-effort.
+    ///
+    /// Returns `&mut Self` for chaining.
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` — bounded channel capacity. `1024` is a sensible
+    ///   default for most deployments.
+    pub fn with_event_channel(&mut self, capacity: usize) -> &mut Self {
+        let (tx, _rx) = tokio::sync::broadcast::channel(capacity);
+        self.event_tx = Some(tx);
+        self
+    }
+
+    /// Returns a new [`tokio::sync::broadcast::Receiver`] for the event
+    /// channel, if one was configured via [`with_event_channel`](Self::with_event_channel).
+    ///
+    /// Each call returns an independent receiver. Multiple consumers
+    /// (e.g., webhook dispatcher, metrics collector) can subscribe
+    /// concurrently.
+    #[must_use]
+    pub fn subscribe_events(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<(String, ContextEvent)>> {
+        self.event_tx
+            .as_ref()
+            .map(tokio::sync::broadcast::Sender::subscribe)
+    }
+
+    /// Sends a context event on the broadcast channel if one is configured.
+    ///
+    /// This is an internal helper called after each `receive_buffer.push`
+    /// in the submodules. `SendError` (no active receivers) is silently
+    /// ignored — best-effort delivery.
+    pub(super) fn fire_event(&self, context_id: &str, event: &ContextEvent) {
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send((context_id.to_owned(), event.clone()));
+        }
     }
 
     // -----------------------------------------------------------------

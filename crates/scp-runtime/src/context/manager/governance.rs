@@ -1182,14 +1182,15 @@ impl ContextManager {
 
                 // 1. Push GovernanceActionExecuted to receive buffer so SDK
                 //    consumers observe outcomes with rich context.
-                ctx.receive_buffer
-                    .push(ContextEvent::GovernanceActionExecuted {
-                        proposal_id: proposal.proposal_id,
-                        action_summary,
-                        executor_did: proposal.proposer_did.clone(),
-                        resulting_epoch,
-                        target_did,
-                    });
+                let gov_event = ContextEvent::GovernanceActionExecuted {
+                    proposal_id: proposal.proposal_id,
+                    action_summary,
+                    executor_did: proposal.proposer_did.clone(),
+                    resulting_epoch,
+                    target_did,
+                };
+                ctx.receive_buffer.push(gov_event.clone());
+                self.fire_event(context_id, &gov_event);
 
                 // 2. Trigger checkpoint cosignature collection for multi-admin
                 //    contexts (ADR-031 §9, issue #630). SingleAdmin contexts
@@ -2797,10 +2798,12 @@ impl ContextManager {
                 .access_key_store
                 .set(context_id, did.as_ref(), access_key);
 
-            ctx.receive_buffer.push(ContextEvent::MemberJoined {
+            let join_event = ContextEvent::MemberJoined {
                 member_did: did.clone(),
                 role_name: role.to_owned(),
-            });
+            };
+            ctx.receive_buffer.push(join_event.clone());
+            self.fire_event(context_id, &join_event);
 
             // Emit WelcomeGenerated event if the add produced a Welcome message.
             push_welcome_event(
@@ -2905,9 +2908,11 @@ impl ContextManager {
             // Destroy the removed member's access key (§9.17.2, ADR-038).
             ctx.access.access_key_store.remove(context_id, did.as_ref());
 
-            ctx.receive_buffer.push(ContextEvent::MemberLeft {
+            let left_event = ContextEvent::MemberLeft {
                 member_did: did.clone(),
-            });
+            };
+            ctx.receive_buffer.push(left_event.clone());
+            self.fire_event(context_id, &left_event);
 
             (
                 remove_output,

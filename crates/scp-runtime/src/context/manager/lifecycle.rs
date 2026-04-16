@@ -2175,10 +2175,12 @@ impl ContextManager {
             .set(context_id, member_did, member_access_key);
 
         // Emit MemberJoined event to receive buffer.
-        ctx.receive_buffer.push(ContextEvent::MemberJoined {
+        let join_event = ContextEvent::MemberJoined {
             member_did: member_did.clone(),
             role_name: "member".into(),
-        });
+        };
+        ctx.receive_buffer.push(join_event.clone());
+        self.fire_event(context_id, &join_event);
 
         // Emit WelcomeGenerated event if the add produced a Welcome message.
         push_welcome_event(
@@ -2370,9 +2372,11 @@ impl ContextManager {
                 .remove(&context_id, member_did.as_ref());
 
             // Emit MemberLeft event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::MemberLeft {
+            let left_event = ContextEvent::MemberLeft {
                 member_did: member_did.clone(),
-            });
+            };
+            ctx.receive_buffer.push(left_event.clone());
+            self.fire_event(&context_id, &left_event);
 
             ctx.membership.count() == 0
         };
