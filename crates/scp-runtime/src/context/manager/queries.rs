@@ -251,12 +251,14 @@ impl ContextManager {
             if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
-                ctx.receive_buffer.push(ContextEvent::DegradedMode {
+                let event = ContextEvent::DegradedMode {
                     context_id: context_id.to_owned(),
                     local_version: (local_major, local_minor),
                     remote_version: (remote_major, remote_minor),
                     unsupported_features,
-                });
+                };
+                ctx.receive_buffer.push(event.clone());
+                self.fire_event(context_id, &event);
             }
         }
     }
@@ -872,11 +874,13 @@ impl ContextManager {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
-                ctx.receive_buffer.push(ContextEvent::EquivocationDetected {
+                let event = ContextEvent::EquivocationDetected {
                     context_id: context_id.to_owned(),
                     remote_sender_did: remote.sender_did.clone(),
                     event_count: remote.event_count,
-                });
+                };
+                ctx.receive_buffer.push(event.clone());
+                self.fire_event(context_id, &event);
             }
         }
 

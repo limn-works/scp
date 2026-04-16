@@ -69,6 +69,7 @@ pub(super) fn dispatch_consequences(
     now: u64,
     clock: &dyn scp_primitives::Clock,
     event_log: &dyn super::super::builder::ContextEventLogProvider,
+    event_tx: Option<&tokio::sync::broadcast::Sender<(String, super::ContextEvent)>>,
 ) {
     if ctx.governance.consequence_rules.is_empty() {
         return;
@@ -96,6 +97,7 @@ pub(super) fn dispatch_consequences(
             rules: &rules,
             clock,
             event_log,
+            event_tx,
         },
     );
 }
@@ -203,6 +205,9 @@ pub(super) struct EnforceConsequencesCtx<'a> {
     pub rules: &'a [ConsequenceRule],
     pub clock: &'a dyn scp_primitives::Clock,
     pub event_log: &'a dyn super::super::builder::ContextEventLogProvider,
+    /// Optional broadcast channel for `fire_event` propagation from free
+    /// functions that lack `&self` access to [`ContextManager`].
+    pub event_tx: Option<&'a tokio::sync::broadcast::Sender<(String, super::ContextEvent)>>,
 }
 
 /// Enforces a set of pre-evaluated triggered consequences.
@@ -367,13 +372,17 @@ fn emit_consequence_triggered(
         &payload,
     );
     ctx.checkpoint_events_since += 1;
-    ctx.receive_buffer.push(ContextEvent::ConsequenceTriggered {
+    let event = ContextEvent::ConsequenceTriggered {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
         rule_index: consequence.rule_index,
         trigger_type: trigger_kind.to_owned(),
         action_type: action_type.to_owned(),
-    });
+    };
+    ctx.receive_buffer.push(event.clone());
+    if let Some(tx) = args.event_tx {
+        let _ = tx.send((args.context_id.to_owned(), event));
+    }
 }
 
 /// Emits a `ConsequenceEnforcementFailed` durable entry plus the matching
@@ -404,12 +413,16 @@ fn emit_absent_member_enforcement_failed(
         &payload,
     );
     ctx.checkpoint_events_since += 1;
-    ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+    let event = ContextEvent::ConsequenceEnforced {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
         action_type: action_type.to_owned(),
         success: false,
-    });
+    };
+    ctx.receive_buffer.push(event.clone());
+    if let Some(tx) = args.event_tx {
+        let _ = tx.send((args.context_id.to_owned(), event));
+    }
 }
 
 /// Emits a `ConsequenceEnforced { success: true }` durable entry plus the
@@ -437,12 +450,16 @@ fn emit_consequence_enforced_success(
         &payload,
     );
     ctx.checkpoint_events_since += 1;
-    ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+    let event = ContextEvent::ConsequenceEnforced {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
         action_type: action_type.to_owned(),
         success: true,
-    });
+    };
+    ctx.receive_buffer.push(event.clone());
+    if let Some(tx) = args.event_tx {
+        let _ = tx.send((args.context_id.to_owned(), event));
+    }
 }
 
 /// Per-arm enforcement dispatch. Each match arm calls a named function as
@@ -584,12 +601,16 @@ fn emit_failure_escalation(
         &escalation_payload,
     );
     ctx.checkpoint_events_since += 1;
-    ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+    let event = ContextEvent::ConsequenceEnforced {
         context_id: context_id.to_owned(),
         member_did: member_did.clone(),
         action_type: "SuspendAll(escalated)".to_owned(),
         success: true,
-    });
+    };
+    ctx.receive_buffer.push(event.clone());
+    if let Some(tx) = args.event_tx {
+        let _ = tx.send((context_id.to_owned(), event));
+    }
 }
 
 /// Converts receive buffer events into `scp_event_log::Event` format for
@@ -1228,6 +1249,7 @@ impl ContextManager {
                     self.clock.now_secs(),
                     &*self.clock,
                     &*self.event_log,
+                    self.event_tx.as_ref(),
                 );
                 if let Some(target) = proposal.action.target_did()
                     && target != &proposal.proposer_did
@@ -1239,6 +1261,7 @@ impl ContextManager {
                         self.clock.now_secs(),
                         &*self.clock,
                         &*self.event_log,
+                        self.event_tx.as_ref(),
                     );
                 }
 
@@ -2703,12 +2726,16 @@ impl ContextManager {
                         .set(context_id, did.as_ref(), restored_key);
                 }
 
-                ctx.receive_buffer
-                    .push(ContextEvent::ReadAccessRestored { did: did.clone() });
-                ctx.receive_buffer.push(ContextEvent::AccessKeyRestored {
+                let read_event = ContextEvent::ReadAccessRestored { did: did.clone() };
+                ctx.receive_buffer.push(read_event.clone());
+                self.fire_event(context_id, &read_event);
+
+                let key_event = ContextEvent::AccessKeyRestored {
                     did: did.clone(),
                     new_epoch: 1,
-                });
+                };
+                ctx.receive_buffer.push(key_event.clone());
+                self.fire_event(context_id, &key_event);
 
                 snap
             } else {
@@ -2716,8 +2743,9 @@ impl ContextManager {
             };
 
             if capabilities.contains(&Capability::MessagesWrite) {
-                ctx.receive_buffer
-                    .push(ContextEvent::WriteAccessRestored { did: did.clone() });
+                let write_event = ContextEvent::WriteAccessRestored { did: did.clone() };
+                ctx.receive_buffer.push(write_event.clone());
+                self.fire_event(context_id, &write_event);
             }
 
             let snap = if self.has_persistence() {
@@ -4339,9 +4367,11 @@ impl ContextManager {
             };
 
             // Emit content keys rotated event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::ContentKeysRotated {
+            let rotated_event = ContextEvent::ContentKeysRotated {
                 reason: reason.map(String::from),
-            });
+            };
+            ctx.receive_buffer.push(rotated_event.clone());
+            self.fire_event(context_id, &rotated_event);
 
             let snap = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -5188,10 +5218,12 @@ impl ContextManager {
                 })?;
 
             // Emit tombstone event.
-            ctx.receive_buffer.push(ContextEvent::ContextTombstoned {
+            let tombstone_event = ContextEvent::ContextTombstoned {
                 destination_context_id: dest_id.clone(),
                 migration_proposal_id: m_pid,
-            });
+            };
+            ctx.receive_buffer.push(tombstone_event.clone());
+            self.fire_event(context_id, &tombstone_event);
 
             // Cancel TTL timer and governance timeout task.
             ctx.ttl.timer.cancel();
@@ -5337,6 +5369,7 @@ impl ContextManager {
         // re-attempt MLS Commit broadcasts without needing a `&self` reference
         // (the spawned task does not own the manager).
         let transport = Arc::clone(&self.transport);
+        let event_tx = self.event_tx.clone();
         let ctx_id = context_id.to_owned();
 
         // Lock ordering: task_set before contexts (consistent with spawn_ttl_timer).
@@ -5352,10 +5385,12 @@ impl ContextManager {
             let clock = Arc::clone(&clock);
             let event_log = Arc::clone(&event_log);
             let transport = Arc::clone(&transport);
+            let event_tx = event_tx.clone();
             move || {
                 let contexts = Arc::clone(&contexts);
                 let clock = Arc::clone(&clock);
                 let event_log = Arc::clone(&event_log);
+                let event_tx = event_tx.clone();
                 let transport_for_retry = Arc::clone(&transport);
                 let event_log_for_retry = Arc::clone(&event_log);
                 let clock_for_retry = Arc::clone(&clock);
@@ -5461,7 +5496,10 @@ impl ContextManager {
                         let mut guard = ctx_arc.lock().await;
                         let ctx = &mut *guard;
                         for ctx_event in ctx_events {
-                            ctx.receive_buffer.push(ctx_event);
+                            ctx.receive_buffer.push(ctx_event.clone());
+                            if let Some(tx) = &event_tx {
+                                let _ = tx.send((ctx_id.clone(), ctx_event));
+                            }
                         }
                         // Reset recovery_in_progress when deadlock conditions
                         // clear so future deadlocks can be detected.
@@ -5473,8 +5511,14 @@ impl ContextManager {
                     }
 
                     // Phase 4: Periodic consequence evaluation (#1531).
-                    Self::evaluate_periodic_consequences(&contexts, &ctx_id, &*clock, &*event_log)
-                        .await;
+                    Self::evaluate_periodic_consequences(
+                        &contexts,
+                        &ctx_id,
+                        &*clock,
+                        &*event_log,
+                        event_tx.as_ref(),
+                    )
+                    .await;
 
                     // Phase 5 (PR #1606 C6): drain the persistent MLS
                     // commit retry queue. Retries any pending commits
@@ -5514,6 +5558,7 @@ impl ContextManager {
         ctx_id: &str,
         clock: &dyn Clock,
         event_log: &dyn super::super::builder::ContextEventLogProvider,
+        event_tx: Option<&tokio::sync::broadcast::Sender<(String, super::ContextEvent)>>,
     ) {
         // M9: Clone data under lock, drop lock for evaluation, reacquire
         // for enforcement. This prevents holding the contexts lock for
@@ -5566,6 +5611,7 @@ impl ContextManager {
                     rules: &rules,
                     clock,
                     event_log,
+                    event_tx,
                 },
             );
         }

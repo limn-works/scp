@@ -2583,12 +2583,14 @@ impl ContextManager {
         if let Ok(arc) = self.get_context_arc(context_id) {
             let mut ctx = arc.lock().await;
             ctx.checkpoint_events_since += 1;
-            ctx.receive_buffer.push(ContextEvent::PaymentCaptureFailed {
+            let event = ContextEvent::PaymentCaptureFailed {
                 action: action.to_owned(),
                 actor_did: actor_did.clone(),
                 error: error_msg.to_owned(),
                 cost: cost.map(scp_protocol::economy::types::Amount::value),
-            });
+            };
+            ctx.receive_buffer.push(event.clone());
+            self.fire_event(context_id, &event);
         }
     }
 }

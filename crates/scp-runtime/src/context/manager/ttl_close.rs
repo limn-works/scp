@@ -139,9 +139,11 @@ impl ContextManager {
                     );
                 }
 
-                ctx.receive_buffer.push(ContextEvent::SystemClose {
+                let close_event = ContextEvent::SystemClose {
                     initiator_did: initiator_did.clone(),
-                });
+                };
+                ctx.receive_buffer.push(close_event.clone());
+                self.fire_event(&context_id, &close_event);
             }
         }
 
@@ -239,15 +241,19 @@ impl ContextManager {
                 // not carry over if the context is later restored.
                 ctx.governance.decay_participation();
                 if result.is_complete() {
-                    ctx.receive_buffer.push(ContextEvent::Expired);
+                    let event = ContextEvent::Expired;
+                    ctx.receive_buffer.push(event.clone());
+                    self.fire_event(&context_id, &event);
                 } else {
-                    ctx.receive_buffer.push(ContextEvent::ExpiryFailed {
+                    let event = ContextEvent::ExpiryFailed {
                         reason: result.to_string(),
                         state_transitioned: result.state_transitioned(),
                         mls_destroyed: result.mls_destroyed(),
                         sender_key_destroyed: result.sender_key_destroyed(),
                         event_logged: result.event_logged(),
-                    });
+                    };
+                    ctx.receive_buffer.push(event.clone());
+                    self.fire_event(&context_id, &event);
                 }
             } else {
                 tracing::warn!(
@@ -399,6 +405,7 @@ impl ContextManager {
         let crypto = Arc::clone(&self.crypto);
         let transport = Arc::clone(&self.transport);
         let event_log = Arc::clone(&self.event_log);
+        let event_tx = self.event_tx.clone();
         let contexts_ref = self.contexts_arc();
         let context_id_owned = context_id.to_owned();
 
@@ -438,17 +445,25 @@ impl ContextManager {
                                     "TTL timer fired for stale context generation; skipping"
                                 );
                             } else if result.is_complete() {
-                                ctx.receive_buffer.push(ContextEvent::Expired);
+                                let event = ContextEvent::Expired;
+                                ctx.receive_buffer.push(event.clone());
+                                if let Some(tx) = &event_tx {
+                                    let _ = tx.send((context_id_owned.clone(), event));
+                                }
                                 ctx.governance.timeout_task.cancel();
                                 ctx.governance.decay_participation();
                             } else {
-                                ctx.receive_buffer.push(ContextEvent::ExpiryFailed {
+                                let event = ContextEvent::ExpiryFailed {
                                     reason: result.to_string(),
                                     state_transitioned: result.state_transitioned(),
                                     mls_destroyed: result.mls_destroyed(),
                                     sender_key_destroyed: result.sender_key_destroyed(),
                                     event_logged: result.event_logged(),
-                                });
+                                };
+                                ctx.receive_buffer.push(event.clone());
+                                if let Some(tx) = &event_tx {
+                                    let _ = tx.send((context_id_owned.clone(), event));
+                                }
                                 ctx.governance.timeout_task.cancel();
                                 ctx.governance.decay_participation();
                             }

@@ -15298,6 +15298,7 @@ async fn enforce_triggered_consequences_skips_absent_member() {
                 rules: &rules,
                 clock: &scp_primitives::SystemClock,
                 event_log: &MockEventLog::default(),
+                event_tx: None,
             },
         );
 
@@ -17068,6 +17069,7 @@ async fn suspend_all_consequence_preserves_mls_membership() {
                 rules: &rules,
                 clock: &scp_primitives::SystemClock,
                 event_log: &MockEventLog::default(),
+                event_tx: None,
             },
         );
     }
@@ -17280,6 +17282,7 @@ async fn suspend_capability_consequence_preserves_mls_membership() {
                 rules: &rules,
                 clock: &scp_primitives::SystemClock,
                 event_log: &MockEventLog::default(),
+                event_tx: None,
             },
         );
     }
@@ -17453,6 +17456,7 @@ async fn restore_access_after_suspend_all_regrants_capabilities() {
                 rules: &rules,
                 clock: &scp_primitives::SystemClock,
                 event_log: &MockEventLog::default(),
+                event_tx: None,
             },
         );
     }
