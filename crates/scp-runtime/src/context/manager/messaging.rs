@@ -291,6 +291,44 @@ fn verify_and_unwrap(
     .map_err(|e| ContextError::CryptoFailed(e.to_string()))
 }
 
+/// Delivers a single plaintext to the receive buffer, checking if it is a
+/// pseudonym announcement first. If it is a valid announcement from the
+/// authenticated sender, updates the pseudonym registry and emits a
+/// `PseudonymAnnounced` event instead of `MessageReceived`.
+///
+/// Used by all buffered/drained delivery paths (`drain_timed_out`,
+/// `drain_consecutive`, buffer overflow) to ensure announcements received
+/// out of order are still handled correctly.
+fn deliver_plaintext_or_announcement(
+    ctx: &mut PerContextState,
+    sender_did: &str,
+    plaintext: &[u8],
+    context_id: &str,
+) {
+    if let Ok(announcement) = rmp_serde::from_slice::<super::PseudonymAnnouncement>(plaintext)
+        && announcement.tag == super::PSEUDONYM_ANNOUNCEMENT_TAG
+        && announcement.member_did == sender_did
+    {
+        let did = DID(announcement.member_did.clone());
+        ctx.pseudonym_registry
+            .insert(did.clone(), announcement.pseudonym);
+        ctx.receive_buffer.push(ContextEvent::PseudonymAnnounced {
+            member_did: did,
+            pseudonym: announcement.pseudonym,
+        });
+        tracing::debug!(
+            context_id,
+            sender_did,
+            "processed buffered pseudonym announcement"
+        );
+        return;
+    }
+    ctx.receive_buffer.push(ContextEvent::MessageReceived {
+        sender_did: DID(sender_did.to_owned()),
+        payload: plaintext.to_vec(),
+    });
+}
+
 #[allow(clippy::significant_drop_tightening)]
 impl ContextManager {
     /// Sends a message within a context.
@@ -616,10 +654,29 @@ impl ContextManager {
             result
         };
         // §9.10.4: fan-out — seal once, send to all routing IDs.
+        // Best-effort: only fail if ALL sends fail. A partial fan-out
+        // (some routing IDs succeed, others fail) is acceptable — at least
+        // some members will receive the message. Record a metric per
+        // successful send to avoid undercounting (Bug 6).
+        let mut last_err = None;
+        let mut any_success = false;
         for rid in routing_ids {
-            self.transport.send_message(rid, &encrypted)?;
+            match self.transport.send_message(rid, &encrypted) {
+                Ok(()) => {
+                    any_success = true;
+                    crate::metrics::record_message_sent();
+                }
+                Err(e) => {
+                    tracing::warn!(routing_id = ?rid, error = %e, "fan-out send failed");
+                    last_err = Some(e);
+                }
+            }
         }
-        crate::metrics::record_message_sent();
+        if !any_success {
+            return Err(last_err.unwrap_or_else(|| {
+                ContextError::TransportFailed("all fan-out sends failed".into())
+            }));
+        }
         Ok(())
     }
 
@@ -1047,10 +1104,7 @@ impl ContextManager {
                     msg.inner.sequence,
                     msg.inner.timestamp,
                 );
-                ctx.receive_buffer.push(ContextEvent::MessageReceived {
-                    sender_did: DID(msg.sender_did.clone()),
-                    payload: msg.plaintext.clone(),
-                });
+                deliver_plaintext_or_announcement(ctx, &msg.sender_did, &msg.plaintext, context_id);
             }
         }
 
@@ -1113,10 +1167,7 @@ impl ContextManager {
                     msg.inner.sequence,
                     msg.inner.timestamp,
                 );
-                ctx.receive_buffer.push(ContextEvent::MessageReceived {
-                    sender_did: DID(msg.sender_did.clone()),
-                    payload: msg.plaintext.clone(),
-                });
+                deliver_plaintext_or_announcement(ctx, &msg.sender_did, &msg.plaintext, context_id);
             }
         }
 
@@ -1183,6 +1234,21 @@ impl ContextManager {
         if let Ok(announcement) = rmp_serde::from_slice::<super::PseudonymAnnouncement>(plaintext)
             && announcement.tag == super::PSEUDONYM_ANNOUNCEMENT_TAG
         {
+            // Bug fix: verify announcement.member_did matches the MLS-authenticated
+            // sender_did. Without this check, any member could forge a pseudonym
+            // announcement for another member, redirecting their messages.
+            if announcement.member_did != sender_did {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    claimed_did = %announcement.member_did,
+                    "pseudonym announcement sender mismatch — rejecting forged announcement"
+                );
+                return Err(ContextError::PermissionDenied(format!(
+                    "pseudonym announcement member_did ({}) does not match sender ({sender_did})",
+                    announcement.member_did
+                )));
+            }
             let announced_did = DID(announcement.member_did.clone());
             ctx.pseudonym_registry
                 .insert(announced_did.clone(), announcement.pseudonym);
@@ -1214,10 +1280,7 @@ impl ContextManager {
                     msg.inner.sequence,
                     msg.inner.timestamp,
                 );
-                ctx.receive_buffer.push(ContextEvent::MessageReceived {
-                    sender_did: DID(msg.sender_did.clone()),
-                    payload: msg.plaintext.clone(),
-                });
+                deliver_plaintext_or_announcement(ctx, &msg.sender_did, &msg.plaintext, context_id);
             }
 
             // Velocity, consequence, event log — same as normal messages.
@@ -1267,10 +1330,7 @@ impl ContextManager {
                 msg.inner.sequence,
                 msg.inner.timestamp,
             );
-            ctx.receive_buffer.push(ContextEvent::MessageReceived {
-                sender_did: DID(msg.sender_did.clone()),
-                payload: msg.plaintext.clone(),
-            });
+            deliver_plaintext_or_announcement(ctx, &msg.sender_did, &msg.plaintext, context_id);
         }
 
         // H5: Append the durable event log entry for `MessageReceived` BEFORE

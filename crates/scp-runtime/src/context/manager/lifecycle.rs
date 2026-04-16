@@ -2212,6 +2212,64 @@ impl ContextManager {
         Ok(())
     }
 
+    /// Sends a `PseudonymAnnouncement` to inform other members of this
+    /// member's per-context routing ID (§9.10.4).
+    ///
+    /// Called by the FFI bridges after `create_context_with_pseudonym` or
+    /// `join_context_with_pseudonym` succeeds. The signing key is available
+    /// at the FFI bridge layer but NOT in the runtime lifecycle methods, so
+    /// this method is separated from the create/join paths.
+    ///
+    /// Best-effort: logs a warning but does not fail if the announcement
+    /// cannot be sent (e.g. transport not yet connected, or the context is
+    /// a single-member context with nobody to announce to).
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` -- The context handle.
+    /// * `sender_did` -- The announcing member's DID.
+    /// * `signing_key` -- Ed25519 signing key for MLS application message.
+    pub async fn send_pseudonym_announcement(
+        &self,
+        handle: &ContextHandle,
+        sender_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) {
+        let context_id = handle.context_id().to_owned();
+        let pseudonym = {
+            let Ok(ctx_arc) = self.get_context_arc(&context_id) else {
+                return;
+            };
+            let guard = ctx_arc.lock().await;
+            guard.local_pseudonym
+        };
+        let Some(pseudonym) = pseudonym else {
+            return;
+        };
+        let announcement = super::PseudonymAnnouncement {
+            tag: super::PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+            member_did: sender_did.as_ref().to_owned(),
+            pseudonym,
+        };
+        let Ok(payload) = rmp_serde::to_vec_named(&announcement) else {
+            tracing::warn!(
+                context_id = %context_id,
+                "failed to serialize pseudonym announcement"
+            );
+            return;
+        };
+        if let Err(e) = self
+            .send_message(handle, sender_did, &payload, Some(signing_key), None, None)
+            .await
+        {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to send pseudonym announcement — other members will use shared routing"
+            );
+        }
+    }
+
     /// Performs the membership state mutations for `join_context` (Phase 4).
     ///
     /// Extracted to keep `join_context` within the clippy `too_many_lines` limit.

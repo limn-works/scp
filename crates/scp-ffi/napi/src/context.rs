@@ -626,11 +626,87 @@ pub async fn context_join(
         mls_key_package_bytes: Some(kp_bytes),
     };
 
+    // §9.10.4: Derive pseudonym for the joining member so it can be stored
+    // in PerContextState and announced to other members.
+    let context_id = handle.context_id.clone();
+    let local_pseudonym: Option<[u8; 32]> = {
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            crate::runtime::with_identity(&identity_did, |entry| {
+                let custody = &entry.custody;
+                let scp_id = &entry.identity;
+                let ctx = context_id.clone();
+                // Block on the async pseudonym derivation.
+                let rt_handle = tokio::runtime::Handle::current();
+                let pseudonym = rt_handle
+                    .block_on(async {
+                        custody
+                            .0
+                            .derive_pseudonym(&scp_id.identity_key, ctx.as_bytes())
+                            .await
+                    })
+                    .map_err(|e| ScpNapiError::Context {
+                        message: format!("pseudonym derivation failed: {e}"),
+                        code: codes::CTX_2014.to_owned(),
+                    })?;
+                let bytes: [u8; 32] = pseudonym.public_key.as_bytes().try_into().map_err(|_| {
+                    ScpNapiError::Context {
+                        message: "pseudonym public key must be 32 bytes".to_owned(),
+                        code: codes::CTX_2014.to_owned(),
+                    }
+                })?;
+                Ok(bytes)
+            })
+            .ok()
+        }
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        {
+            None
+        }
+    };
+
     let manager = context_manager()?;
     manager
-        .join_context(core_handle, key_package, spending_ucan.as_ref())
+        .join_context_with_pseudonym(
+            core_handle,
+            key_package,
+            spending_ucan.as_ref(),
+            local_pseudonym,
+        )
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+    // §9.10.4: Send pseudonym announcement to inform existing members.
+    // Best-effort: if signing key is not available, skip silently.
+    if local_pseudonym.is_some() {
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            let _ = async {
+                let entry = crate::runtime::with_identity(&identity_did, |e| {
+                    let key_handle = e.identity.active_signing_key;
+                    let rt_handle = tokio::runtime::Handle::current();
+                    let sk = rt_handle
+                        .block_on(async {
+                            e.custody.0.export_ed25519_signing_key(&key_handle).await
+                        })
+                        .map_err(|err| ScpNapiError::Context {
+                            message: format!("signing key export failed: {err}"),
+                            code: codes::CTX_2014.to_owned(),
+                        })?;
+                    Ok(sk)
+                });
+                if let Ok(sk) = entry {
+                    let sender_did = DID(identity_did.clone());
+                    let mgr = context_manager().ok()?;
+                    let ann_handle = handle.require_core_handle().ok()?;
+                    mgr.send_pseudonym_announcement(ann_handle, &sender_did, &sk)
+                        .await;
+                }
+                Some(())
+            }
+            .await;
+        }
+    }
 
     Ok(())
 }
@@ -911,11 +987,6 @@ pub fn context_subscribe(
     let shared_routing_id_bytes = scp_core::context::context_routing_id(&context_id);
     let shared_routing_id = scp_transport::RoutingId::new(shared_routing_id_bytes);
 
-    // Collect the member's pseudonym from the ContextManager state.
-    let local_pseudonym = context_manager()
-        .ok()
-        .and_then(|mgr| mgr.local_pseudonym(&context_id).ok().flatten());
-
     // Replace the cancellation token with a fresh one so a previously
     // cancelled token doesn't immediately cancel the new subscription.
     let cancel_token = {
@@ -945,6 +1016,13 @@ pub fn context_subscribe(
     // which has no active tokio runtime context.
     crate::runtime().spawn(async move {
         use futures::StreamExt;
+
+        // Collect the member's pseudonym from the ContextManager state.
+        // Done inside the async block because local_pseudonym is async.
+        let local_pseudonym = match context_manager() {
+            Ok(mgr) => mgr.local_pseudonym(&context_id).await.ok().flatten(),
+            Err(_) => None,
+        };
 
         // §9.10.4: dual subscription — always subscribe to the shared routing
         // ID (MLS management messages, backward compat). If the member has a

@@ -3173,10 +3173,84 @@ pub async fn context_join(
                 mls_key_package_bytes: None,
             };
 
+            // §9.10.4: Derive pseudonym for per-member routing. Uses the
+            // identity's custody provider (callback or in-memory).
+            let identity_key = identity.core_id.as_ref().map(|id| id.identity_key);
+            let local_pseudonym: Option<[u8; 32]> = if let Some(ik) = identity_key {
+                let pseudonym = if let Some(ref cb) = identity.callback_custody {
+                    cb.derive_pseudonym(&ik, handle.context_id.as_bytes())
+                        .await
+                        .ok()
+                } else {
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    {
+                        if let Some(ref custody) = identity.in_memory_custody {
+                            custody
+                                .0
+                                .derive_pseudonym(&ik, handle.context_id.as_bytes())
+                                .await
+                                .ok()
+                        } else {
+                            None
+                        }
+                    }
+                    #[cfg(not(feature = "allow_in_memory_custody"))]
+                    {
+                        None
+                    }
+                };
+                pseudonym.and_then(|p| p.public_key.as_bytes().try_into().ok())
+            } else {
+                None
+            };
+
             manager
-                .join_context(&core_handle, key_package, spending_ucan.as_ref())
+                .join_context_with_pseudonym(
+                    &core_handle,
+                    key_package,
+                    spending_ucan.as_ref(),
+                    local_pseudonym,
+                )
                 .await
                 .map_err(ScpError::from)?;
+
+            // §9.10.4: Send pseudonym announcement to inform existing members.
+            // Best-effort: if signing key is not available, skip silently.
+            if local_pseudonym.is_some() {
+                let sender_did = scp_identity::DID(identity.did.clone());
+                let sk_opt: Option<ed25519_dalek::SigningKey> =
+                    if let Some(ref ik) = identity.core_id {
+                        if let Some(ref cb) = identity.callback_custody {
+                            cb.export_ed25519_signing_key(&ik.active_signing_key)
+                                .await
+                                .ok()
+                        } else {
+                            #[cfg(feature = "allow_in_memory_custody")]
+                            {
+                                if let Some(ref custody) = identity.in_memory_custody {
+                                    custody
+                                        .0
+                                        .export_ed25519_signing_key(&ik.active_signing_key)
+                                        .await
+                                        .ok()
+                                } else {
+                                    None
+                                }
+                            }
+                            #[cfg(not(feature = "allow_in_memory_custody"))]
+                            {
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                if let Some(sk) = sk_opt {
+                    manager
+                        .send_pseudonym_announcement(&core_handle, &sender_did, &sk)
+                        .await;
+                }
+            }
 
             Ok(())
         })

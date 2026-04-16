@@ -57,15 +57,15 @@ impl ContextManager {
     /// # Errors
     ///
     /// Returns [`ContextError::ContextNotRegistered`] if the context is not registered.
-    pub fn local_pseudonym(&self, context_id: &str) -> Result<Option<[u8; 32]>, ContextError> {
+    pub async fn local_pseudonym(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<[u8; 32]>, ContextError> {
         let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        // Use try_lock to avoid blocking on the per-context mutex. If
-        // contended (unlikely during subscribe setup), fall back to None.
-        Ok(ctx_arc
-            .try_lock()
-            .map_or(None, |guard| guard.local_pseudonym))
+        let guard = ctx_arc.lock().await;
+        Ok(guard.local_pseudonym)
     }
 
     /// Returns the broadcast key and epoch for a locally controlled author

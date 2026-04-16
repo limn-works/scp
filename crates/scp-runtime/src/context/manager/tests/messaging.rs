@@ -4368,7 +4368,7 @@ async fn create_context_with_pseudonym_stores_in_state() {
         .expect("create_context_with_pseudonym should succeed");
 
     // Verify the pseudonym is stored.
-    let stored = manager.local_pseudonym("pseudonym-ctx-1").unwrap();
+    let stored = manager.local_pseudonym("pseudonym-ctx-1").await.unwrap();
     assert_eq!(
         stored,
         Some(pseudonym),
@@ -4395,7 +4395,7 @@ async fn create_context_without_pseudonym_stores_none() {
         .await
         .expect("create_context should succeed");
 
-    let stored = manager.local_pseudonym("no-pseudonym-ctx").unwrap();
+    let stored = manager.local_pseudonym("no-pseudonym-ctx").await.unwrap();
     assert_eq!(stored, None, "pseudonym must be None when not provided");
 }
 
@@ -4513,4 +4513,94 @@ async fn send_message_encrypted_uses_pseudonym_fanout() {
         has_pseudonym,
         "Bob's pseudonym routing ID must be included in fan-out"
     );
+}
+
+/// Verifies that a forged `PseudonymAnnouncement` where `member_did` does not
+/// match the MLS-authenticated sender is rejected with `PermissionDenied`.
+#[tokio::test]
+async fn forged_pseudonym_announcement_rejected() {
+    use super::super::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let params = governance_params();
+
+    manager.register_local_did("did:key:alice".into()).await;
+
+    let _handle = manager
+        .create_context("forge-ctx".into(), params, "did:key:alice".into())
+        .await
+        .unwrap();
+
+    // Add Bob as a member.
+    {
+        let arc = manager.get_context_arc("forge-ctx").unwrap();
+        let mut guard = arc.lock().await;
+        let ctx = &mut *guard;
+        ctx.membership
+            .add_member("did:key:bob".into(), "member".into(), vec![]);
+        ctx.role_state.members.insert("did:key:bob".to_owned());
+        // Grant Bob messages:write via admin-like role (default ceiling includes it).
+        let bob_did: DID = "did:key:bob".into();
+        let _ = scp_protocol::context::roles::system_assign_role(
+            &mut ctx.role_state,
+            &bob_did,
+            "member",
+            &scp_primitives::SystemClock,
+        );
+    }
+
+    let context_id_bytes = scp_protocol::context::context_id_bytes("forge-ctx");
+
+    // Build a forged announcement: Bob sends an announcement claiming to be Alice.
+    let forged = PseudonymAnnouncement {
+        tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+        member_did: "did:key:alice".to_owned(), // <-- forged: claims to be Alice
+        pseudonym: [0xEEu8; 32],
+    };
+    let payload = rmp_serde::to_vec_named(&forged).unwrap();
+
+    let inner = minimal_inner_envelope("forge-ctx", "did:key:bob", 1);
+
+    // Deliver as if Bob sent this message (MLS-authenticated sender = Bob).
+    let result = manager
+        .deliver_message_and_drain_buffered(
+            "forge-ctx",
+            &context_id_bytes,
+            "did:key:bob", // MLS says this is Bob
+            &inner,
+            &payload,
+            false,
+        )
+        .await;
+
+    // Must be rejected with PermissionDenied.
+    match result {
+        Err(scp_protocol::context::ContextError::PermissionDenied(msg)) => {
+            assert!(
+                msg.contains("does not match sender"),
+                "error should mention sender mismatch: {msg}"
+            );
+        }
+        other => {
+            panic!(
+                "forged pseudonym announcement must be rejected with PermissionDenied, got: {other:?}"
+            );
+        }
+    }
+
+    // Verify the forged pseudonym was NOT stored in the registry.
+    {
+        let arc = manager.get_context_arc("forge-ctx").unwrap();
+        let guard = arc.lock().await;
+        assert!(
+            !guard.pseudonym_registry.contains_key("did:key:alice"),
+            "forged pseudonym must not be stored in registry"
+        );
+    }
 }
