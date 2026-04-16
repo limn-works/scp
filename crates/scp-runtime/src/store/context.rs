@@ -1762,6 +1762,8 @@ mod tests {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             generation: 0,
+            local_pseudonym: None,
+            pseudonym_registry: std::collections::HashMap::new(),
         }
     }
 

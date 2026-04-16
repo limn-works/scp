@@ -4341,3 +4341,176 @@ async fn tool_invoke_happy_path_with_valid_spending_ucan() {
         "happy-path invoke must deduct at least per_tool_invoke=10: before={before} after={after}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// §9.10.4 Pseudonym Routing Tests
+// ---------------------------------------------------------------------------
+
+/// Verifies that creating a context with a pseudonym stores it in `PerContextState`.
+#[tokio::test]
+async fn create_context_with_pseudonym_stores_in_state() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let pseudonym: [u8; 32] = [42u8; 32];
+
+    let _handle = manager
+        .create_context_with_pseudonym(
+            "pseudonym-ctx-1".into(),
+            scp_protocol::context::ContextParams::default(),
+            "did:key:creator".into(),
+            Some(pseudonym),
+        )
+        .await
+        .expect("create_context_with_pseudonym should succeed");
+
+    // Verify the pseudonym is stored.
+    let stored = manager.local_pseudonym("pseudonym-ctx-1").unwrap();
+    assert_eq!(
+        stored,
+        Some(pseudonym),
+        "pseudonym must be stored in context state"
+    );
+}
+
+/// Verifies that creating a context without a pseudonym stores None.
+#[tokio::test]
+async fn create_context_without_pseudonym_stores_none() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let _handle = manager
+        .create_context(
+            "no-pseudonym-ctx".into(),
+            scp_protocol::context::ContextParams::default(),
+            "did:key:creator".into(),
+        )
+        .await
+        .expect("create_context should succeed");
+
+    let stored = manager.local_pseudonym("no-pseudonym-ctx").unwrap();
+    assert_eq!(stored, None, "pseudonym must be None when not provided");
+}
+
+/// Verifies that `PseudonymAnnouncement` deserialization round-trips correctly.
+#[test]
+fn pseudonym_announcement_roundtrip() {
+    use super::super::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
+
+    let announcement = PseudonymAnnouncement {
+        tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+        member_did: "did:key:alice".to_owned(),
+        pseudonym: [7u8; 32],
+    };
+
+    let bytes = rmp_serde::to_vec_named(&announcement).expect("serialize");
+    let decoded: PseudonymAnnouncement = rmp_serde::from_slice(&bytes).expect("deserialize");
+
+    assert_eq!(decoded.tag, PSEUDONYM_ANNOUNCEMENT_TAG);
+    assert_eq!(decoded.member_did, "did:key:alice");
+    assert_eq!(decoded.pseudonym, [7u8; 32]);
+}
+
+/// Verifies that `broadcast_routing_id` uses plain SHA-256 (no domain separator).
+#[test]
+fn broadcast_routing_id_uses_plain_sha256() {
+    let ctx_id = "broadcast-test-ctx";
+    let broadcast_rid = scp_protocol::context::broadcast_routing_id(ctx_id);
+    let raw_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    assert_eq!(
+        broadcast_rid, raw_bytes,
+        "broadcast routing ID must be plain SHA-256(context_id)"
+    );
+
+    // Must differ from encrypted routing ID.
+    let encrypted_rid = scp_protocol::context::context_routing_id(ctx_id);
+    assert_ne!(
+        broadcast_rid, encrypted_rid,
+        "broadcast and encrypted routing IDs must differ"
+    );
+}
+
+/// Verifies that `send_message` for encrypted contexts uses pseudonym fan-out
+/// when members have announced pseudonyms.
+#[tokio::test]
+async fn send_message_encrypted_uses_pseudonym_fanout() {
+    let transport = MockTransport::connected();
+    let routing_ids = transport.routing_ids_handle();
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(transport),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+
+    manager.register_local_did("did:key:alice".into()).await;
+
+    let handle = manager
+        .create_context("fanout-ctx".into(), params, "did:key:alice".into())
+        .await
+        .unwrap();
+
+    // Add Bob as a member.
+    {
+        let arc = manager.get_context_arc("fanout-ctx").unwrap();
+        let mut guard = arc.lock().await;
+        let ctx = &mut *guard;
+        ctx.membership
+            .add_member("did:key:bob".into(), "member".into(), vec![]);
+        ctx.role_state.members.insert("did:key:bob".to_owned());
+        let bob_access_key =
+            scp_protocol::crypto::access_keys::generate_access_key("fanout-ctx", "did:key:bob");
+        ctx.access
+            .access_key_store
+            .set("fanout-ctx", "did:key:bob", bob_access_key);
+
+        // Insert a pseudonym for Bob into the registry.
+        ctx.pseudonym_registry
+            .insert("did:key:bob".into(), [0xBBu8; 32]);
+    }
+
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+
+    // Send a message — should fan out to both Bob's pseudonym and shared routing ID.
+    manager
+        .send_message(&handle, &alice_did, b"hello", Some(&alice_sk), None, None)
+        .await
+        .expect("send should succeed");
+
+    // The transport should have received sends to multiple routing IDs.
+    let sent_rids = routing_ids.lock().unwrap();
+    assert!(
+        sent_rids.len() >= 2,
+        "expected at least 2 transport sends (pseudonym + shared), got {}",
+        sent_rids.len()
+    );
+
+    // Verify that the shared routing ID is among the sends.
+    let shared_rid = scp_protocol::context::context_routing_id("fanout-ctx");
+    let has_shared = sent_rids.contains(&shared_rid);
+    assert!(has_shared, "shared routing ID must be included in fan-out");
+
+    // Verify that Bob's pseudonym is among the sends.
+    let has_pseudonym = sent_rids.contains(&[0xBBu8; 32]);
+    assert!(
+        has_pseudonym,
+        "Bob's pseudonym routing ID must be included in fan-out"
+    );
+}

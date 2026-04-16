@@ -320,8 +320,17 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
-        let routing_id = scp_protocol::context::context_routing_id(&context_id);
-        let (broadcast_envelope, recipients_data, sequence, is_broadcast, ticket, ctx_gen) = {
+        // Routing ID computation is deferred to Phase 1 (under lock) where
+        // the context mode and pseudonym registry are available.
+        let (
+            broadcast_envelope,
+            recipients_data,
+            sequence,
+            is_broadcast,
+            ticket,
+            ctx_gen,
+            send_routing_ids,
+        ) = {
             let (mut guard, ctx_gen) = self
                 .lock_context(&context_id)
                 .await
@@ -436,6 +445,8 @@ impl ContextManager {
                         return Err(e);
                     }
                 };
+                // Broadcast: use plain SHA-256(context_id) per spec §5.14.
+                let broadcast_rid = scp_protocol::context::broadcast_routing_id(&context_id);
                 (
                     Some(env),
                     std::collections::HashMap::new(),
@@ -443,6 +454,7 @@ impl ContextManager {
                     true,
                     ticket,
                     ctx_gen,
+                    vec![broadcast_rid],
                 )
             } else {
                 // Capability already checked above (H7: before budget deduction).
@@ -454,6 +466,18 @@ impl ContextManager {
                         "cannot assign sequence: {sender_did} is not a member"
                     )));
                 };
+                // §9.10.4: collect pseudonym routing IDs for fan-out.
+                // For encrypted contexts with known pseudonyms, send to each
+                // member's pseudonym. Always include the shared routing ID as
+                // fallback for members whose pseudonym is not yet known.
+                let mut routing_ids: Vec<[u8; 32]> =
+                    ctx.pseudonym_registry.values().copied().collect();
+                let shared_rid = scp_protocol::context::context_routing_id(&context_id);
+                // Always include the shared routing ID for backward compat /
+                // members who haven't announced a pseudonym yet.
+                if !routing_ids.contains(&shared_rid) {
+                    routing_ids.push(shared_rid);
+                }
                 (
                     None,
                     ctx.access.access_key_store.get_all(&context_id),
@@ -461,6 +485,7 @@ impl ContextManager {
                     false,
                     ticket,
                     ctx_gen,
+                    routing_ids,
                 )
             }
         };
@@ -490,6 +515,7 @@ impl ContextManager {
         };
 
         // Phase 2: encrypt + send (no lock held).
+        // §9.10.4: fan-out — send to all collected routing IDs.
         let phase2_result = self.encrypt_and_send(
             broadcast_envelope,
             signing_key,
@@ -499,7 +525,7 @@ impl ContextManager {
             &recipients_data,
             sequence,
             source_provenance,
-            &routing_id,
+            &send_routing_ids,
         );
         if let Err(e) = phase2_result {
             // Void the escrow hold and roll back the full ticket (budget,
@@ -546,6 +572,11 @@ impl ContextManager {
 
     /// Encrypts the payload and sends it via transport (Phase 2 of `send_message`).
     ///
+    /// For pseudonym routing (§9.10.4), `routing_ids` may contain multiple
+    /// targets: each member's pseudonym plus the shared context routing ID
+    /// as a fallback. The encrypted blob is computed once and sent to each
+    /// routing ID.
+    ///
     /// Extracted to keep `send_message` within the clippy `too_many_lines` limit.
     #[allow(clippy::too_many_arguments)]
     fn encrypt_and_send(
@@ -561,7 +592,7 @@ impl ContextManager {
         >,
         sequence: u64,
         source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
-        routing_id: &[u8; 32],
+        routing_ids: &[[u8; 32]],
     ) -> Result<(), ContextError> {
         let encrypted = if let Some(envelope) = broadcast_envelope {
             rmp_serde::to_vec_named(&envelope)
@@ -584,7 +615,10 @@ impl ContextManager {
             crate::metrics::record_encrypt_duration(encrypt_start.elapsed());
             result
         };
-        self.transport.send_message(routing_id, &encrypted)?;
+        // §9.10.4: fan-out — seal once, send to all routing IDs.
+        for rid in routing_ids {
+            self.transport.send_message(rid, &encrypted)?;
+        }
         crate::metrics::record_message_sent();
         Ok(())
     }
@@ -1140,6 +1174,67 @@ impl ContextManager {
                 format!("member {sender_did} does not have messages:write capability")
             };
             return Err(ContextError::PermissionDenied(msg));
+        }
+
+        // §9.10.4: check if this is a pseudonym announcement before treating
+        // as a regular message. Announcements are internal protocol messages
+        // that update the pseudonym registry — they are NOT forwarded to the
+        // application receive buffer as regular MessageReceived events.
+        if let Ok(announcement) = rmp_serde::from_slice::<super::PseudonymAnnouncement>(plaintext)
+            && announcement.tag == super::PSEUDONYM_ANNOUNCEMENT_TAG
+        {
+            let announced_did = DID(announcement.member_did.clone());
+            ctx.pseudonym_registry
+                .insert(announced_did.clone(), announcement.pseudonym);
+            ctx.receive_buffer.push(ContextEvent::PseudonymAnnounced {
+                member_did: announced_did,
+                pseudonym: announcement.pseudonym,
+            });
+            // Advance sequence tracker for the announcement message.
+            ctx.sequence_tracker
+                .advance(context_id, sender_did, inner.sequence, inner.timestamp);
+            // Skip the normal message delivery path — announcements are
+            // consumed by the protocol, not forwarded to the application.
+            // Still drain buffered messages that may now be unblocked.
+            let next_expected = inner.sequence.saturating_add(1);
+            let consecutive =
+                ctx.reorder_buffer
+                    .drain_consecutive(context_id, sender_did, next_expected);
+            for msg in &consecutive {
+                if !ctx.membership.contains(&msg.sender_did)
+                    || !ctx
+                        .role_state
+                        .member_has_capability(&msg.sender_did, &Capability::MessagesWrite)
+                {
+                    continue;
+                }
+                ctx.sequence_tracker.advance(
+                    &msg.inner.context_id,
+                    &msg.sender_did,
+                    msg.inner.sequence,
+                    msg.inner.timestamp,
+                );
+                ctx.receive_buffer.push(ContextEvent::MessageReceived {
+                    sender_did: DID(msg.sender_did.clone()),
+                    payload: msg.plaintext.clone(),
+                });
+            }
+
+            // Velocity, consequence, event log — same as normal messages.
+            if !skip_velocity {
+                let now_secs = self.clock.now_secs();
+                ctx.governance
+                    .velocity_tracker
+                    .record_message(&DID(sender_did.to_owned()), now_secs);
+            }
+            self.event_log.append_context_event(
+                context_id_bytes,
+                "PseudonymAnnounced",
+                sender_did,
+            )?;
+            ctx.checkpoint_events_since += 1;
+
+            return Ok(());
         }
 
         // Advance sequence tracker and deliver the in-order message.

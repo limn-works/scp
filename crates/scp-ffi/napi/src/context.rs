@@ -346,23 +346,31 @@ pub struct NapiMessage {
 // Helper — pseudonym derivation (SCP-214 criterion 5)
 // ---------------------------------------------------------------------------
 
-/// Derives the context-scoped pseudonym routing ID via the retained
-/// `KeyCustody` provider (SCP-214 criterion 5, spec §9.10.4).
+/// Derives the pseudonym routing ID for a context (§9.10.4).
 ///
-/// Returns `Ok(())` on success or if no custody/identity is available
-/// (graceful no-op). Errors are logged but not propagated.
+/// Returns the 32-byte Ed25519 public key derived via
+/// `KeyCustody::derive_pseudonym`. The pseudonym is used as the member's
+/// per-context routing ID for encrypted contexts, replacing the shared
+/// `context_routing_id` to prevent relay-side correlation.
 #[cfg(feature = "allow_in_memory_custody")]
-async fn derive_context_pseudonym(identity: &NapiIdentity, context_id: &str) {
-    if let (Some(scp_id), Some(custody)) = (
-        identity.inner.scp_identity.as_ref(),
-        &identity.inner.in_memory_custody,
-    ) {
-        let _pseudonym = custody
-            .0
-            .derive_pseudonym(&scp_id.identity_key, context_id.as_bytes())
-            .await
-            .ok();
-    }
+async fn derive_context_pseudonym(identity: &NapiIdentity, context_id: &str) -> Option<[u8; 32]> {
+    let (scp_id, custody) = (
+        identity.inner.scp_identity.as_ref()?,
+        identity.inner.in_memory_custody.as_ref()?,
+    );
+    let pseudonym = custody
+        .0
+        .derive_pseudonym(&scp_id.identity_key, context_id.as_bytes())
+        .await
+        .ok()?;
+    let bytes: [u8; 32] = pseudonym.public_key.as_bytes().try_into().ok()?;
+    Some(bytes)
+}
+
+/// Fallback for non-custody builds — always returns `None`.
+#[cfg(not(feature = "allow_in_memory_custody"))]
+async fn derive_context_pseudonym(_identity: &NapiIdentity, _context_id: &str) -> Option<[u8; 32]> {
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -510,19 +518,24 @@ pub async fn context_create(
     // Passes the creator DID to MlsCryptoProvider for real MLS encryption (#1294).
     crate::runtime::init_context_manager(&creator_did);
 
-    // Delegate to ContextManager.
+    // Derive the context-scoped pseudonym routing ID (§9.10.4, SCP-214 criterion 5).
+    // Derived BEFORE create_context so it can be passed to the ContextManager.
+    let local_pseudonym = derive_context_pseudonym(identity, &context_id).await;
+
+    // Delegate to ContextManager with pseudonym for per-member routing.
     let manager = context_manager()?;
     let core_handle = manager
-        .create_context(context_id.clone(), context_params, DID(creator_did.clone()))
+        .create_context_with_pseudonym(
+            context_id.clone(),
+            context_params,
+            DID(creator_did.clone()),
+            local_pseudonym,
+        )
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
     // Register the creator's DID as a local DID for defense-in-depth.
     manager.register_local_did(DID(creator_did.clone())).await;
-
-    // Derive the context-scoped pseudonym routing ID (SCP-214 criterion 5).
-    #[cfg(feature = "allow_in_memory_custody")]
-    derive_context_pseudonym(identity, &context_id).await;
 
     let handle = NapiContextHandle {
         context_id,
@@ -892,10 +905,16 @@ pub fn context_subscribe(
     };
 
     let context_id = handle.context_id.clone();
-    // Both subscribe and send paths use domain-separated
-    // SHA-256("scp:context-routing:" || context_id) as the routing ID.
-    let routing_id_bytes = scp_core::context::context_routing_id(&context_id);
-    let routing_id = scp_transport::RoutingId::new(routing_id_bytes);
+    // §9.10.4: dual subscription — subscribe to both the shared context
+    // routing ID (for backward compat and MLS management messages) and the
+    // member's pseudonym routing ID (for pseudonym-routed application messages).
+    let shared_routing_id_bytes = scp_core::context::context_routing_id(&context_id);
+    let shared_routing_id = scp_transport::RoutingId::new(shared_routing_id_bytes);
+
+    // Collect the member's pseudonym from the ContextManager state.
+    let local_pseudonym = context_manager()
+        .ok()
+        .and_then(|mgr| mgr.local_pseudonym(&context_id).ok().flatten());
 
     // Replace the cancellation token with a fresh one so a previously
     // cancelled token doesn't immediately cancel the new subscription.
@@ -927,8 +946,11 @@ pub fn context_subscribe(
     crate::runtime().spawn(async move {
         use futures::StreamExt;
 
-        let stream_result = transport_mgr.subscribe(&routing_id, None).await;
-        let mut stream = match stream_result {
+        // §9.10.4: dual subscription — always subscribe to the shared routing
+        // ID (MLS management messages, backward compat). If the member has a
+        // pseudonym, also subscribe to it for pseudonym-routed messages.
+        let stream_result = transport_mgr.subscribe(&shared_routing_id, None).await;
+        let stream = match stream_result {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(
@@ -946,6 +968,27 @@ pub fn context_subscribe(
                 return;
             }
         };
+
+        // §9.10.4: if the member has a pseudonym, subscribe to that routing
+        // ID too and merge both streams. Best-effort: if the pseudonym
+        // subscription fails, we still have the shared subscription.
+        let mut stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = scp_transport::TransportEvent> + Send>,
+        > = stream;
+        if let Some(pseudonym_bytes) = local_pseudonym {
+            let pseudonym_rid = scp_transport::RoutingId::new(pseudonym_bytes);
+            if let Ok(pseudonym_stream) = transport_mgr.subscribe(&pseudonym_rid, None).await {
+                // Merge the pseudonym stream into the main stream using
+                // futures::stream::select so events from either routing ID
+                // are delivered through the same processing loop.
+                stream = Box::pin(futures::stream::select(stream, pseudonym_stream));
+            } else {
+                tracing::warn!(
+                    context_id = %context_id,
+                    "pseudonym relay subscription failed — using shared routing ID only"
+                );
+            }
+        }
 
         let manager = match context_manager() {
             Ok(m) => m.clone(),

@@ -657,6 +657,8 @@ fn governance_snapshot_serde_roundtrip() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -4256,7 +4258,7 @@ async fn setup_budget_context(ctx_id: &str) -> (ContextManager, DID, DID) {
 /// Verifies that `ApproveSpend` grants budget and additive grants accumulate.
 #[tokio::test]
 async fn approve_spend_grants_budget_to_member_tracker() {
-    let (manager, admin, spender) = setup_budget_context("budget-ctx").await;
+    let (manager, admin, spender) = Box::pin(setup_budget_context("budget-ctx")).await;
     let sk = signing_key_for_did(&admin);
 
     // No budget initially.
@@ -4365,7 +4367,7 @@ async fn approve_spend_rejects_non_member_spender() {
 /// and survives serde roundtrip.
 #[tokio::test]
 async fn budget_tracker_included_in_snapshot() {
-    let (manager, admin, spender) = setup_budget_context("snap-ctx").await;
+    let (manager, admin, spender) = Box::pin(setup_budget_context("snap-ctx")).await;
     let sk = signing_key_for_did(&admin);
     manager
         .propose_governance_action(
@@ -12651,6 +12653,8 @@ fn velocity_tracker_state_in_context_snapshot_roundtrip() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -12737,6 +12741,8 @@ fn velocity_tracker_backward_compat_deserialization() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     let mut json_value: serde_json::Value =

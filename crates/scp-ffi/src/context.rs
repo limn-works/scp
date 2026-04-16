@@ -913,6 +913,31 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
         .map_err(|e| PyRuntimeError::new_err(format!("failed to register context state: {e}")))?;
 
     // Delegate context creation to the shared ContextManager for lifecycle tracking.
+    // §9.10.4: Derive pseudonym BEFORE context creation so it can be passed
+    // to the ContextManager for per-member routing. The pseudonym derivation
+    // is also reused for the known-contexts registry below.
+    let local_pseudonym: Option<[u8; 32]> = crate::runtime::with_identity(identity_did, |entry| {
+        let rt = crate::runtime().map_err(|e| {
+            crate::error::ScpPyError::identity(format!("runtime not available: {e}"))
+        })?;
+        let pseudonym = rt.block_on(async {
+            entry
+                .custody
+                .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
+                .await
+        });
+        let pk = pseudonym
+            .map_err(|e| {
+                crate::error::ScpPyError::identity(format!("pseudonym derivation failed: {e}"))
+            })?
+            .public_key;
+        let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
+            crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
+        })?;
+        Ok(bytes)
+    })
+    .ok();
+
     // Build scp-core ContextParams from the parsed PyContextParams.
     {
         let core_params = build_core_context_params(&parsed)?;
@@ -924,9 +949,14 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
         let ctx_id = context_id.clone();
         let creator_did_for_register = scp_identity::DID(identity_did.to_owned());
         rt.block_on(async move {
-            mgr.create_context(ctx_id, core_params, creator_did_owned)
-                .await
-                .map_err(|e| scp_core::context::ContextError::CreationFailed(e.to_string()))?;
+            mgr.create_context_with_pseudonym(
+                ctx_id,
+                core_params,
+                creator_did_owned,
+                local_pseudonym,
+            )
+            .await
+            .map_err(|e| scp_core::context::ContextError::CreationFailed(e.to_string()))?;
             // Register the creator's DID as a local DID for defense-in-depth,
             // matching NAPI's behavior.
             mgr.register_local_did(creator_did_for_register).await;
@@ -940,32 +970,12 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
     }
 
     // Register in the known-contexts registry for discovery via
-    // py_mcp_load_contexts. Derive a per-identity routing ID using
-    // KeyCustody::derive_pseudonym with real key material (§9.10.4).
-    // The pseudonym is deterministic for the same identity + context pair,
-    // providing unlinkability across contexts. See SCP-214 criterion 4.
+    // py_mcp_load_contexts. Reuse the pre-derived pseudonym routing ID
+    // (§9.10.4, SCP-214 criterion 4). Falls back to context_routing_id
+    // if pseudonym derivation was not available.
     {
-        let routing_id = crate::runtime::with_identity(identity_did, |entry| {
-            let rt = crate::runtime().map_err(|e| {
-                crate::error::ScpPyError::identity(format!("runtime not available: {e}"))
-            })?;
-            let pseudonym = rt.block_on(async {
-                entry
-                    .custody
-                    .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
-                    .await
-            });
-            let pk = pseudonym
-                .map_err(|e| {
-                    crate::error::ScpPyError::identity(format!("pseudonym derivation failed: {e}"))
-                })?
-                .public_key;
-            let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
-                crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
-            })?;
-            Ok(bytes)
-        })
-        .map_err(|e| PyRuntimeError::new_err(format!("routing ID derivation failed: {e}")))?;
+        let routing_id =
+            local_pseudonym.unwrap_or_else(|| scp_core::context::context_routing_id(&context_id));
 
         // Get the relay URL from transport status if a relay is connected.
         let relay_url = match crate::transport::py_transport_status() {

@@ -2998,10 +2998,52 @@ pub async fn context_create(
             // Initialize the ContextManager if not already done (first context_create call).
             crate::runtime::init_context_manager();
 
-            // Delegate to the shared ContextManager.
+            // Extract key custody and signing key from the identity.
+            #[cfg(feature = "allow_in_memory_custody")]
+            let in_memory_custody = identity.in_memory_custody.clone();
+            let callback_custody = identity.callback_custody.clone();
+            let signing_key = identity.core_id.as_ref().map(|id| id.active_signing_key);
+
+            // §9.10.4: Derive the context-scoped pseudonym routing ID via the
+            // retained KeyCustody BEFORE context creation so it can be passed
+            // to the ContextManager for per-member routing.
+            let local_pseudonym: Option<[u8; 32]> =
+                if let Some(identity_key) = identity.core_id.as_ref().map(|id| &id.identity_key) {
+                    let pseudonym = if let Some(ref cb) = callback_custody {
+                        cb.derive_pseudonym(identity_key, context_id.as_bytes())
+                            .await
+                            .ok()
+                    } else {
+                        #[cfg(feature = "allow_in_memory_custody")]
+                        {
+                            if let Some(ref imc) = identity.in_memory_custody {
+                                imc.0
+                                    .derive_pseudonym(identity_key, context_id.as_bytes())
+                                    .await
+                                    .ok()
+                            } else {
+                                None
+                            }
+                        }
+                        #[cfg(not(feature = "allow_in_memory_custody"))]
+                        {
+                            None
+                        }
+                    };
+                    pseudonym.and_then(|p| p.public_key.as_bytes().try_into().ok())
+                } else {
+                    None
+                };
+
+            // Delegate to the shared ContextManager with pseudonym.
             let manager = crate::runtime::context_manager()?;
             let _core_handle = manager
-                .create_context(context_id.clone(), core_params, identity.did.clone().into())
+                .create_context_with_pseudonym(
+                    context_id.clone(),
+                    core_params,
+                    identity.did.clone().into(),
+                    local_pseudonym,
+                )
                 .await
                 .map_err(ScpError::from)?;
 
@@ -3010,47 +3052,6 @@ pub async fn context_create(
             manager
                 .register_local_did(identity.did.clone().into())
                 .await;
-
-            // Extract key custody and signing key from the identity.
-            #[cfg(feature = "allow_in_memory_custody")]
-            let in_memory_custody = identity.in_memory_custody.clone();
-            let callback_custody = identity.callback_custody.clone();
-            let signing_key = identity.core_id.as_ref().map(|id| id.active_signing_key);
-
-            // Derive the context-scoped pseudonym routing ID via the retained
-            // KeyCustody (SCP-214 criterion 5, spec §9.10.4). This produces a
-            // deterministic pseudonym from the identity key + context ID.
-            if let (Some(core_id), Some(identity_key)) = (
-                identity.core_id.as_ref(),
-                identity.core_id.as_ref().map(|id| &id.identity_key),
-            ) {
-                let _pseudonym = if let Some(ref cb) = callback_custody {
-                    cb.derive_pseudonym(identity_key, context_id.as_bytes())
-                        .await
-                        .ok()
-                } else {
-                    #[cfg(feature = "allow_in_memory_custody")]
-                    {
-                        if let Some(ref imc) = identity.in_memory_custody {
-                            imc.0
-                                .derive_pseudonym(identity_key, context_id.as_bytes())
-                                .await
-                                .ok()
-                        } else {
-                            None
-                        }
-                    }
-                    #[cfg(not(feature = "allow_in_memory_custody"))]
-                    {
-                        None
-                    }
-                };
-                // The pseudonym is derived for routing ID use. The actual
-                // routing ID is stored by the ContextManager's transport
-                // provider. Here we validate the derivation succeeds and
-                // the custody provider is functional for this context.
-                let _ = core_id;
-            }
 
             // Register per-context UCAN validation state (revocation list,
             // nonce tracker, event log) for the UCAN pipeline.

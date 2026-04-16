@@ -775,6 +775,8 @@ async fn persist_drop_restore_roundtrip() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -902,6 +904,8 @@ async fn restore_preserves_executed_proposals() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     persistence
@@ -1017,6 +1021,8 @@ async fn restore_respawns_ttl_timer() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -1111,6 +1117,8 @@ async fn restore_all_contexts_restores_persisted() {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             generation: 0,
+            local_pseudonym: None,
+            pseudonym_registry: std::collections::HashMap::new(),
         };
         persistence.persist_context(ctx_name, &snapshot).unwrap();
     }
@@ -1203,6 +1211,8 @@ async fn restore_context_rejects_duplicate() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -1317,6 +1327,8 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-incon-ctx");
@@ -1438,6 +1450,8 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-ok-ctx");
@@ -1574,6 +1588,8 @@ async fn restore_preserves_spending_nonce_tracker_across_restart() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     persistence
@@ -1711,6 +1727,8 @@ fn reconnect_test_snapshot(
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     }
 }
 
@@ -3113,6 +3131,8 @@ fn c3_test_snapshot(context_id: &str) -> super::ContextSnapshot {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     }
 }
 
@@ -3676,6 +3696,8 @@ fn make_epoch_test_export(context_id: &str) -> crate::context::export_import::Co
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     crate::context::export_import::ContextExport {

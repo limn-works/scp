@@ -807,6 +807,15 @@ pub struct ContextSnapshot {
     /// deserialize as `0` via `#[serde(default)]`.
     #[serde(default)]
     pub generation: u64,
+    /// This member's pseudonym-derived routing ID for this context (§9.10.4).
+    /// Pre-derived by the FFI bridge. `None` for legacy snapshots and
+    /// broadcast contexts.
+    #[serde(default)]
+    pub local_pseudonym: Option<[u8; 32]>,
+    /// Known members' pseudonym routing IDs (§9.10.4), learned via
+    /// `PseudonymAnnouncement` MLS messages. Keyed by member DID string.
+    #[serde(default)]
+    pub pseudonym_registry: HashMap<String, [u8; 32]>,
 }
 
 /// Serializable snapshot of [`SenderVelocityTracker`](scp_protocol::economy::antispam::SenderVelocityTracker)
@@ -1118,6 +1127,27 @@ struct TtlState {
     extension: Option<TtlExtension>,
 }
 
+/// Wire format for pseudonym announcements sent as MLS application messages.
+///
+/// When a member joins or creates a context with a pre-derived pseudonym,
+/// they announce it to other members via this structure serialized with
+/// `MessagePack`. Recipients store the mapping in their pseudonym registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct PseudonymAnnouncement {
+    /// Magic prefix to distinguish from regular application messages.
+    pub tag: String,
+    /// The announcing member's DID.
+    pub member_did: String,
+    /// The 32-byte pseudonym routing ID.
+    pub pseudonym: [u8; 32],
+}
+
+/// Magic tag used to identify pseudonym announcement messages in the MLS
+/// application message stream. Prefixed with `\0` to avoid collision with
+/// user-generated content (which is always valid UTF-8 and will never start
+/// with a null byte when deserialized from `MessagePack`).
+pub(super) const PSEUDONYM_ANNOUNCEMENT_TAG: &str = "\0scp:pseudonym-announce:v1";
+
 /// Internal state tracked by the manager for each context.
 pub(super) struct PerContextState {
     /// Monotonic generation counter. Assigned on insertion into the contexts
@@ -1148,6 +1178,15 @@ pub(super) struct PerContextState {
     access: AccessControlState,
     /// TTL timer and extension state (SCP-021).
     ttl: TtlState,
+    /// This member's pseudonym-derived routing ID for this context (§9.10.4).
+    /// Pre-derived by the FFI bridge via `KeyCustody::derive_pseudonym` and
+    /// passed into `create_context` / `join_context`. `None` if the bridge
+    /// did not supply a pseudonym (legacy callers, broadcast contexts).
+    local_pseudonym: Option<[u8; 32]>,
+    /// Known members' pseudonym routing IDs, learned via
+    /// [`PseudonymAnnouncement`] MLS application messages. Keyed by member
+    /// DID so `send_message` can fan-out to each member's pseudonym.
+    pseudonym_registry: HashMap<DID, [u8; 32]>,
     /// Per-sender sequence tracker for anti-replay protection (§9.8.2).
     /// Validates that per-sender sequence numbers and timestamps are
     /// monotonically increasing within this context.
@@ -2481,6 +2520,12 @@ impl ContextManager {
             checkpoint_events_since: ctx.checkpoint_events_since,
             checkpoint_last_time_secs: ctx.checkpoint_last_time_secs,
             generation: ctx.generation,
+            local_pseudonym: ctx.local_pseudonym,
+            pseudonym_registry: ctx
+                .pseudonym_registry
+                .iter()
+                .map(|(did, p)| (did.to_string(), *p))
+                .collect(),
         }
     }
 

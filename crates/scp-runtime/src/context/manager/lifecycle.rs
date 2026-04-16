@@ -588,6 +588,13 @@ impl ContextManager {
             // are needed. Deferred to the Welcome delivery plan (#1311)
             // which adds cross-process event log synchronization.
             merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
+            // §9.10.4: restore pseudonym routing state from snapshot.
+            local_pseudonym: ctx_snapshot.local_pseudonym,
+            pseudonym_registry: ctx_snapshot
+                .pseudonym_registry
+                .into_iter()
+                .map(|(did_str, p)| (DID(did_str), p))
+                .collect(),
         };
 
         // Atomic check-and-insert — eliminates TOCTOU race between
@@ -1305,6 +1312,10 @@ impl ContextManager {
             // Fresh Merkle tree for imported contexts. Proofs cover
             // post-import events only (same rationale as restore_context).
             merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
+            // §9.10.4: pseudonym state is local-instance — wiped on import.
+            // The importing member must re-derive and re-announce.
+            local_pseudonym: None,
+            pseudonym_registry: HashMap::new(),
         };
 
         // 7. Register the context.
@@ -1394,6 +1405,41 @@ impl ContextManager {
         context_id: String,
         params: ContextParams,
         creator_did: DID,
+    ) -> Result<ContextHandle, ContextCreationError> {
+        self.create_context_inner(context_id, params, creator_did, None)
+            .await
+    }
+
+    /// Creates a new SCP context with a pre-derived pseudonym routing ID.
+    ///
+    /// The `local_pseudonym` is the 32-byte Ed25519 public key derived via
+    /// `KeyCustody::derive_pseudonym` in the FFI bridge. For encrypted
+    /// contexts, this pseudonym will be used as the member's per-context
+    /// routing ID (§9.10.4) instead of the shared `context_routing_id`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`create_context`](Self::create_context).
+    pub async fn create_context_with_pseudonym(
+        &self,
+        context_id: String,
+        params: ContextParams,
+        creator_did: DID,
+        local_pseudonym: Option<[u8; 32]>,
+    ) -> Result<ContextHandle, ContextCreationError> {
+        self.create_context_inner(context_id, params, creator_did, local_pseudonym)
+            .await
+    }
+
+    /// Internal implementation for context creation, shared by both
+    /// `create_context` and `create_context_with_pseudonym`.
+    #[allow(clippy::too_many_lines)] // Context creation initializes many subsystems including pseudonym routing.
+    async fn create_context_inner(
+        &self,
+        context_id: String,
+        params: ContextParams,
+        creator_did: DID,
+        local_pseudonym: Option<[u8; 32]>,
     ) -> Result<ContextHandle, ContextCreationError> {
         // Defense-in-depth: verify creator's SDK version satisfies min_protocol_version.
         params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
@@ -1503,6 +1549,10 @@ impl ContextManager {
             checkpoint_last_time_secs: self.clock.now_secs(),
             checkpoints: Vec::new(),
             merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
+            // §9.10.4: pseudonym routing. Only meaningful for encrypted
+            // contexts; broadcast contexts ignore this field.
+            local_pseudonym,
+            pseudonym_registry: HashMap::new(),
         };
 
         // Atomic check-and-insert — eliminates TOCTOU race between
@@ -1834,6 +1884,11 @@ impl ContextManager {
             checkpoint_last_time_secs: self.clock.now_secs(),
             checkpoints: Vec::new(),
             merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
+            // §9.10.4: pseudonym routing — governance-path creation does not
+            // yet support pseudonym injection. The FFI bridge can set this
+            // later via the standard create_context_with_pseudonym path.
+            local_pseudonym: None,
+            pseudonym_registry: HashMap::new(),
         })
     }
 
@@ -1850,13 +1905,46 @@ impl ContextManager {
     /// Returns [`ContextError`] if:
     /// - The context is not in `Active` state.
     /// - The key package is invalid.
-    #[allow(clippy::too_many_lines)]
-    #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn join_context(
         &self,
         handle: &ContextHandle,
         key_package: KeyPackage,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+    ) -> Result<(), ContextError> {
+        self.join_context_inner(handle, key_package, spending_ucan, None)
+            .await
+    }
+
+    /// Joins a member to a context with a pre-derived pseudonym routing ID.
+    ///
+    /// The `local_pseudonym` is stored in `PerContextState` and used for
+    /// per-member pseudonym routing (§9.10.4). After a successful join, a
+    /// `PseudonymAnnouncement` MLS message is sent to inform other members.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`join_context`](Self::join_context).
+    pub async fn join_context_with_pseudonym(
+        &self,
+        handle: &ContextHandle,
+        key_package: KeyPackage,
+        spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+        local_pseudonym: Option<[u8; 32]>,
+    ) -> Result<(), ContextError> {
+        self.join_context_inner(handle, key_package, spending_ucan, local_pseudonym)
+            .await
+    }
+
+    /// Internal join implementation shared by `join_context` and
+    /// `join_context_with_pseudonym`.
+    #[allow(clippy::too_many_lines)]
+    #[instrument(skip_all, fields(context_id = handle.context_id()))]
+    async fn join_context_inner(
+        &self,
+        handle: &ContextHandle,
+        key_package: KeyPackage,
+        spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+        local_pseudonym: Option<[u8; 32]>,
     ) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
@@ -2077,6 +2165,17 @@ impl ContextManager {
             }
             super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
             return Err(e);
+        }
+
+        // Phase 4.5: Store local pseudonym after membership mutation succeeds.
+        // The pseudonym was pre-derived by the FFI bridge; storing it here
+        // makes it available for subsequent send_message fan-out (§9.10.4).
+        if let Some(pseudonym) = local_pseudonym
+            && let Ok(ctx_arc) = self.get_context_arc(&context_id)
+        {
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
+            ctx.local_pseudonym = Some(pseudonym);
         }
 
         // Phase 5: Capture the escrow hold after all mutations succeeded.
