@@ -425,6 +425,7 @@ mod tests {
 
     #[test]
     fn create_shadow_returns_observer_role() {
+        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().blocking_lock();
         crate::runtime::init_context_manager_for_test();
         let result = bridge_create_shadow(
             "bridge-1".to_owned(),

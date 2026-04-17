@@ -255,13 +255,23 @@ pub fn scp_suspend() -> PyResult<()> {
 ///
 /// # Errors
 ///
-/// Raises `ContextError` if the instance has been permanently shut down
-/// (call `shutdown_runtime` was already made).
+/// Raises `ContextError` (code `SCP-CTX-2000`) if the instance has been
+/// permanently shut down (`shutdown_runtime` was already called). The
+/// `CTX_2000` code matches the NAPI and `UniFFI` bridges exactly so the
+/// Python SDK wrapper can surface a consistent identifier across runtimes.
 #[pyfunction]
 pub fn scp_resume() -> PyResult<()> {
     if let Some(bi) = runtime::bridge_instance_raw() {
+        // Construct ContextError with explicit CTX_2000 (not the `context()`
+        // helper, which defaults to CTX_2001). Matches NAPI
+        // (`scp-ffi/napi/src/lib.rs::scp_resume`) and UniFFI
+        // (`scp-ffi/uniffi/src/lib.rs::scp_resume`) behaviour so all three
+        // bridges emit the same code on shutdown.
         bi.resume()
-            .map_err(|e| crate::error::ScpPyError::context(format!("resume failed: {e}")))?;
+            .map_err(|e| crate::error::ScpPyError::ContextError {
+                message: format!("resume failed: {e}"),
+                code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
+            })?;
     }
     Ok(())
 }

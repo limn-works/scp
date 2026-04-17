@@ -1,25 +1,32 @@
 //! Shared runtime helpers for non-WASM FFI bridges.
 //!
 //! Contains duplicated logic that was previously copy-pasted across the `PyO3`,
-//! NAPI, and `UniFFI` bridges:
+//! NAPI, and `UniFFI` bridges. Each non-WASM bridge re-exports the relevant
+//! helpers via its own `runtime` module — this file is the single source of
+//! truth.
 //!
 //! - [`not_configured_key_resolver`] — governance key resolver that rejects
 //!   all lookups (identical in all 3 bridges).
 //! - [`init_did_resolver_on`] — stores a DID resolver in a [`BridgeInstance`].
-//! - [`did_resolver_from`] — retrieves the DID resolver from a [`BridgeInstance`].
+//!   All three bridges delegate to it from their thin `init_did_resolver`
+//!   wrapper.
+//! - [`did_resolver_from`] — retrieves the DID resolver from a
+//!   [`BridgeInstance`]. All three bridges delegate to it from their thin
+//!   `did_resolver` wrapper.
 //! - [`BridgeInMemoryStorage`] — in-memory `Storage` impl for event log
 //!   persistence without pulling in `scp-platform/testing` (identical in
 //!   NAPI and `UniFFI`; `PyO3` uses `scp-platform::testing::InMemoryStorage`).
 //! - [`build_event_log_provider`] — constructs a persistent
 //!   `MerkleEventLogProvider` backed by `BridgeInMemoryStorage` (identical in
-//!   NAPI and `UniFFI`).
+//!   NAPI and `UniFFI`). Returns both the provider and the underlying
+//!   `ProtocolRepository` so callers can stash it on [`BridgeInstance`].
 //! - [`UcanContextStateCore`] — shared UCAN validation state fields common to
 //!   NAPI and `UniFFI` bridges.
 //!
 //! Gated behind the `resolvers` feature. Not available for WASM (ADR-034).
 
 use std::future::Future;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use scp_core::context::builder::ContextEventLogProvider;
 use scp_core::context::providers::MerkleEventLogProvider;
@@ -224,27 +231,6 @@ impl Storage for BridgeInMemoryStorage {
 // Event log provider builder
 // ---------------------------------------------------------------------------
 
-/// Global `ProtocolRepository` instance, shared between the event log
-/// provider and the trust store bridge.
-///
-/// Used by the trust aggregation bridge to construct a
-/// `ProtocolRepositoryTrustBridge` backed by persistent (in-process) storage.
-/// Returns `None` if `build_event_log_provider` has not been called yet.
-static PROTOCOL_REPOSITORY: OnceLock<
-    Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
-> = OnceLock::new();
-
-/// Returns the global `ProtocolRepository` if initialized.
-///
-/// Used by the trust aggregation bridge to construct a
-/// `ProtocolRepositoryTrustBridge` backed by persistent (in-process) storage.
-/// Returns `None` if [`build_event_log_provider`] has not been called yet.
-#[must_use]
-pub fn protocol_repository()
--> Option<&'static Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>> {
-    PROTOCOL_REPOSITORY.get()
-}
-
 /// Constructs a persistent event log provider backed by encrypted in-memory
 /// storage.
 ///
@@ -255,7 +241,10 @@ pub fn protocol_repository()
 ///
 /// Returns both the event log provider (for `ContextManager` initialization)
 /// and the `ProtocolRepository` (for trust store usage and `BridgeInstance`
-/// storage).
+/// storage). Callers own the repository handle and typically stash it in
+/// [`BridgeInstance::set_protocol_repository`](crate::bridge_instance::BridgeInstance::set_protocol_repository)
+/// so the trust-aggregation bridge can downcast it back via
+/// [`BridgeInstance::get_protocol_repository_as`](crate::bridge_instance::BridgeInstance::get_protocol_repository_as).
 ///
 /// Uses [`BridgeInMemoryStorage`] instead of
 /// `scp_platform::testing::InMemoryStorage` so that the `testing` feature
@@ -271,9 +260,6 @@ pub fn build_event_log_provider() -> (
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
     let encrypted = EncryptingAdapter::new(BridgeInMemoryStorage::new(), key);
     let store = Arc::new(ProtocolRepository::new(encrypted));
-
-    // Expose the ProtocolRepository globally for trust store usage (#502).
-    let _ = PROTOCOL_REPOSITORY.set(Arc::clone(&store));
 
     let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(&store));
     let event_log = Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)));

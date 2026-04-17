@@ -77,6 +77,11 @@ def resume() -> None:
     try:
         bridge.scp_resume()
     except Exception as exc:  # PyO3 raises ScpContextError
+        # The PyO3 bridge emits SCP-CTX-2000 for resume failures (matching
+        # the NAPI and UniFFI bridges — see `scp-ffi/src/lib.rs::scp_resume`).
+        # Keeping the code hardcoded here makes the SDK contract explicit
+        # even when running against an older bridge where the PyO3
+        # constructor used the CTX_2001 default.
         raise ContextError(
             f"resume failed: {exc}",
             code="SCP-CTX-2000",

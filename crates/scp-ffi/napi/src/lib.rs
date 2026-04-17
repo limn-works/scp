@@ -383,26 +383,28 @@ mod tests {
     // Consolidated into a single `#[test]` so that cargo's parallel test
     // runner does not interleave suspend/resume across the shared
     // `BridgeInstance::suspended` flag with other tests in this binary.
-    // NAPI transport tests that call `bridge_instance()` DO check
-    // `is_err()` on clear_transport_manager before init, not `is_ok()`,
-    // so the interleaving risk is lower than in PyO3 — but keeping
-    // suspend/resume paired in one test avoids the problem entirely.
     //
-    // A process-wide `suspend_serial()` async mutex serializes this test
-    // against other tests in this binary that call `context_manager()` /
-    // `bridge_instance()` (e.g. `role_state_syncs_*` in `context.rs`),
-    // which error when the bridge is suspended. Because NAPI is a cdylib
-    // and cannot link integration tests (napi_wrap is only defined when
-    // loaded by Node), moving these assertions into a separate
-    // `tests/lifecycle.rs` binary is not possible — the mutex is the
-    // portable alternative. Uses `tokio::sync::Mutex` so async callers
-    // can `.await` its `lock()` without tripping the
-    // `await_holding_lock` lint.
+    // A process-wide `bridge_lifecycle_serial()` async mutex serializes
+    // this test against EVERY other test in this binary that calls
+    // `context_manager()` / `bridge_instance()` — NOT just the
+    // governance-style `role_state_syncs_*` tests in `context.rs`, but
+    // also context-create, context-join, economy tracker, and
+    // bridge-connector tests that would otherwise observe
+    // `is_suspended=true` mid-roundtrip and fail. Every test that
+    // touches shared bridge state acquires the mutex; see
+    // `bridge_lifecycle_serial()` in `runtime.rs` for the invariant.
+    //
+    // Because NAPI is a cdylib and cannot link integration tests
+    // (`napi_wrap` is only defined when loaded by Node), moving these
+    // assertions into a separate `tests/lifecycle.rs` binary is not
+    // possible — the mutex is the portable alternative. Uses
+    // `tokio::sync::Mutex` so async callers can `.await` its `lock()`
+    // without tripping the `await_holding_lock` lint.
     // -----------------------------------------------------------------------
 
     #[test]
     fn scp_suspend_resume_roundtrip() {
-        let _guard = crate::runtime::suspend_serial().blocking_lock();
+        let _guard = crate::runtime::bridge_lifecycle_serial().blocking_lock();
 
         // Case 1: suspend / resume before any bridge init must succeed.
         scp_suspend().expect("scp_suspend must succeed");
@@ -412,7 +414,60 @@ mod tests {
         // round-trip.
         crate::runtime::ensure_bridge_instance();
         scp_suspend().expect("scp_suspend after init must succeed");
+
+        // Semantic assertion (L4): while suspended, `context_manager()`
+        // and `bridge_instance()` must return the CTX_2000 "suspended"
+        // error rather than some other error. This is the whole contract
+        // the `bridge_lifecycle_serial()` mutex exists to protect —
+        // verify it directly so a future refactor that accidentally
+        // weakens `is_suspended` propagation (e.g. checking only in
+        // `context_manager()` but not `bridge_instance()`) is caught
+        // here.
+        //
+        // Both accessors return `Err`; we only assert the error *shape*
+        // includes the suspended sentinel. Asserting `Ok` after resume
+        // would be brittle because this test does not attach a
+        // `ContextManager` (see `init_context_manager_for_test` usage in
+        // other tests) — after resume, `try_context_manager()` would
+        // still fail with the distinct "not yet attached" error, which
+        // is a correct but unrelated code path.
+        let cm_err = crate::runtime::context_manager()
+            .err()
+            .expect("context_manager must error while suspended");
+        let cm_msg = cm_err.to_string();
+        assert!(
+            cm_msg.contains("suspended") && cm_msg.contains(scp_ffi_common::error_codes::CTX_2000),
+            "context_manager error should mention suspended + CTX_2000, got: {cm_msg}"
+        );
+        let bi_err = crate::runtime::bridge_instance()
+            .err()
+            .expect("bridge_instance must error while suspended");
+        let bi_msg = bi_err.to_string();
+        assert!(
+            bi_msg.contains("suspended") && bi_msg.contains(scp_ffi_common::error_codes::CTX_2000),
+            "bridge_instance error should mention suspended + CTX_2000, got: {bi_msg}"
+        );
+
         scp_resume().expect("scp_resume after suspend must succeed");
+
+        // After resume, the suspended sentinel must no longer appear on
+        // either accessor. If `try_context_manager()` was not attached
+        // in this binary, the accessors return the distinct "not yet
+        // attached" error (also CTX_2000) — that's fine for the
+        // assertion below because the text diverges from the suspended
+        // message.
+        if let Err(e) = crate::runtime::context_manager() {
+            assert!(
+                !e.to_string().contains("suspended"),
+                "context_manager must not report suspended after resume, got: {e}"
+            );
+        }
+        if let Err(e) = crate::runtime::bridge_instance() {
+            assert!(
+                !e.to_string().contains("suspended"),
+                "bridge_instance must not report suspended after resume, got: {e}"
+            );
+        }
 
         // Case 3: double-suspend / double-resume are idempotent.
         scp_suspend().expect("double suspend must succeed");

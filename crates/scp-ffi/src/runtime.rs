@@ -448,36 +448,30 @@ fn build_context_manager(
 
 /// Returns the production DID resolver, if initialized.
 ///
-/// Delegates to [`BridgeInstance::did_resolver`].
+/// Delegates to [`scp_ffi_common::bridge_runtime::did_resolver_from`], which
+/// reads the resolver slot on the current [`BridgeInstance`]. Returns `None`
+/// when the bridge has not been initialized or no resolver has been set.
 #[must_use]
 pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
     // SAFETY: BRIDGE_INSTANCE is in a OnceLock<Arc<...>> which is 'static.
-    // The DID resolver inside it is in a OnceLock<Arc<...>> which is also 'static.
-    // The returned reference has 'static lifetime because both OnceLocks are static.
-    BRIDGE_INSTANCE.get().and_then(|bi| bi.did_resolver())
+    // The DID resolver inside it is in a OnceLock<Arc<...>> which is also
+    // 'static. The returned reference has 'static lifetime because both
+    // OnceLocks are static.
+    scp_ffi_common::bridge_runtime::did_resolver_from(BRIDGE_INSTANCE.get())
 }
 
 /// Initializes the production DID resolver.
 ///
 /// Wraps any `scp_identity::resolver::DidResolver` implementation (typically
-/// `DualLayerResolver`) in an `IdentityBackedDidResolver` and stores it
-/// in the `BridgeInstance` for UCAN validation and attestation verification.
-///
-/// Called once during identity system setup. Subsequent calls are no-ops
-/// (the resolver is initialized via `OnceLock` inside `BridgeInstance`).
+/// `DualLayerResolver`) in an `IdentityBackedDidResolver` and stores it in
+/// the `BridgeInstance`. Delegates to
+/// [`scp_ffi_common::bridge_runtime::init_did_resolver_on`] so all three
+/// non-WASM bridges share one implementation.
 pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
 where
     R: scp_identity::resolver::DidResolver + 'static,
 {
-    if let Some(bi) = BRIDGE_INSTANCE.get() {
-        bi.set_did_resolver(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
-            resolver, handle,
-        )));
-    } else {
-        tracing::error!(
-            "init_did_resolver called before BridgeInstance initialized — resolver not stored"
-        );
-    }
+    scp_ffi_common::bridge_runtime::init_did_resolver_on(BRIDGE_INSTANCE.get(), resolver, handle);
 }
 
 // ---------------------------------------------------------------------------
