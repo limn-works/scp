@@ -68,7 +68,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 pub mod bridge;
-pub(crate) mod runtime;
+pub mod runtime;
 
 // Server startup (relay + application node) — behind the `server` feature on
 // scp-ffi-common. Not available for WASM (ADR-034).
@@ -763,6 +763,12 @@ mod tests {
         assert!(identity.to_string().contains("identity error"));
         assert!(context.to_string().contains("context error"));
     }
+
+    // scp_suspend / scp_resume tests live in tests/lifecycle.rs — in a
+    // separate integration test binary — so that flipping the process-wide
+    // BridgeInstance `suspended` flag does not interleave with other tests
+    // in this binary that read `bridge_instance()` (which errors on
+    // suspended state).
 
     // -----------------------------------------------------------------------
     // Conformance tests (SCP-078)

@@ -228,6 +228,12 @@ export { classifyOffline, classifyOfflineCustom, getSyncPolicy } from "./sync";
 export { connectLocalTransport, Node, Relay } from "./server";
 
 // ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+export { scpResume, scpSuspend } from "./lifecycle";
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 

@@ -522,6 +522,28 @@ fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProv
 /// Test variant of [`context_manager`] initialization that uses
 /// [`LocalTransportProvider`](scp_core::context::LocalTransportProvider) instead of
 /// [`NotConfiguredTransportProvider`](scp_core::context::NotConfiguredTransportProvider)
+/// Process-wide async mutex that serializes the
+/// `scp_suspend_resume_roundtrip` test with any other test in this binary
+/// that calls `context_manager()` or `bridge_instance()` (both of which
+/// error when the `BridgeInstance::suspended` flag is set). Cargo runs
+/// lib-tests in parallel by default, and because NAPI is a cdylib
+/// (`napi_wrap` is only defined when loaded by Node), suspend/resume
+/// cannot be moved into a separate integration-test binary as in the
+/// `PyO3` and `UniFFI` bridges.
+///
+/// Every test that touches shared bridge state must acquire this mutex
+/// for the duration of its assertions. A `tokio::sync::Mutex` is used
+/// (not `std::sync::Mutex`) because several callers are `async` tests
+/// that hold the guard across `.await` points — `std::sync::Mutex`
+/// guards are not `Send` and would trigger the `await_holding_lock`
+/// lint, which specifically warns against deadlock via blocked worker
+/// threads.
+#[cfg(test)]
+pub(crate) fn suspend_serial() -> &'static tokio::sync::Mutex<()> {
+    static SUSPEND_SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    SUSPEND_SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// and a no-op crypto provider for Rust unit tests that pass `None` key
 /// package bytes with `did:key:` test DIDs.
 ///
@@ -1208,6 +1230,7 @@ mod tests {
 
     #[test]
     fn bridge_instance_populated_by_init_context_manager() {
+        let _suspend_guard = suspend_serial().blocking_lock();
         // init_context_manager_for_test populates BRIDGE_INSTANCE which owns
         // the ContextManager. Since OnceLock is process-global, the first call
         // BRIDGE_INSTANCE. Since OnceLock is process-global, the first call
@@ -1227,6 +1250,7 @@ mod tests {
 
     #[test]
     fn bridge_instance_not_shutdown_initially() {
+        let _suspend_guard = suspend_serial().blocking_lock();
         init_context_manager_for_test();
 
         let bi = bridge_instance().expect("bridge_instance should be initialized");

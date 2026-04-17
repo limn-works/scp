@@ -316,6 +316,7 @@ pub fn scp_resume() -> napi::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -374,5 +375,49 @@ mod tests {
             after <= baseline,
             "expected saturated at {baseline}, got {after}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // scp_suspend / scp_resume lifecycle tests
+    //
+    // Consolidated into a single `#[test]` so that cargo's parallel test
+    // runner does not interleave suspend/resume across the shared
+    // `BridgeInstance::suspended` flag with other tests in this binary.
+    // NAPI transport tests that call `bridge_instance()` DO check
+    // `is_err()` on clear_transport_manager before init, not `is_ok()`,
+    // so the interleaving risk is lower than in PyO3 — but keeping
+    // suspend/resume paired in one test avoids the problem entirely.
+    //
+    // A process-wide `suspend_serial()` async mutex serializes this test
+    // against other tests in this binary that call `context_manager()` /
+    // `bridge_instance()` (e.g. `role_state_syncs_*` in `context.rs`),
+    // which error when the bridge is suspended. Because NAPI is a cdylib
+    // and cannot link integration tests (napi_wrap is only defined when
+    // loaded by Node), moving these assertions into a separate
+    // `tests/lifecycle.rs` binary is not possible — the mutex is the
+    // portable alternative. Uses `tokio::sync::Mutex` so async callers
+    // can `.await` its `lock()` without tripping the
+    // `await_holding_lock` lint.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scp_suspend_resume_roundtrip() {
+        let _guard = crate::runtime::suspend_serial().blocking_lock();
+
+        // Case 1: suspend / resume before any bridge init must succeed.
+        scp_suspend().expect("scp_suspend must succeed");
+        scp_resume().expect("scp_resume must succeed");
+
+        // Case 2: after ensure_bridge_instance(), suspend then resume
+        // round-trip.
+        crate::runtime::ensure_bridge_instance();
+        scp_suspend().expect("scp_suspend after init must succeed");
+        scp_resume().expect("scp_resume after suspend must succeed");
+
+        // Case 3: double-suspend / double-resume are idempotent.
+        scp_suspend().expect("double suspend must succeed");
+        scp_suspend().expect("double suspend must succeed");
+        scp_resume().expect("double resume must succeed");
+        scp_resume().expect("double resume must succeed");
     }
 }

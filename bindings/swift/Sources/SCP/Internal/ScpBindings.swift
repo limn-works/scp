@@ -11691,6 +11691,43 @@ public func scpShutdown(timeoutSecs: UInt64)  {try! rustCall() {
 }
 }
 /**
+ * Suspends the bridge instance for mobile app backgrounding.
+ *
+ * Disconnects transport (clears the relay connection) and marks the instance
+ * as suspended. Context state is preserved — the instance remains alive but
+ * inactive. Transport-dependent operations will fail until `scpResume()`
+ * is called.
+ *
+ * No-op if the instance is already shut down or not initialized.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Transport` if transport cleanup fails.
+ */
+public func scpSuspend()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_scp_suspend($0
+    )
+}
+}
+/**
+ * Resumes a suspended bridge instance.
+ *
+ * Clears the suspended flag so bridge operations can proceed. The caller
+ * must re-establish the relay connection via `transportConnect()` — resume
+ * does not reconnect automatically.
+ *
+ * No-op if the instance is not initialized.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Context` if the instance has been permanently shut down.
+ */
+public func scpResume()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_scp_resume($0
+    )
+}
+}
+/**
  * Generates an SCPID challenge for the given audience (§3.11.8).
  *
  * Returns the challenge as a JSON string containing `protocol`, `nonce`,
@@ -13005,7 +13042,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_scope_register() != 44834) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_scp_resume() != 11235) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_scp_shutdown() != 6072) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_scp_suspend() != 8123) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_scpid_challenge() != 19241) {

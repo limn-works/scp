@@ -542,6 +542,7 @@ pub fn protocol_repository()
 /// Delegates to [`scp_ffi_common::bridge_runtime::build_event_log_provider`].
 /// Returns both the event log provider and the underlying `ProtocolRepository`
 /// (for registration in `BridgeInstance`).
+#[must_use]
 pub fn build_event_log_provider() -> (
     Box<dyn ContextEventLogProvider>,
     Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
@@ -562,6 +563,7 @@ pub fn build_event_log_provider() -> (
 static FFI_CRYPTO: FfiBridgeCrypto = FfiBridgeCrypto;
 
 /// Returns a reference to the bridge crypto provider for `CloseOrchestrator`.
+#[must_use]
 pub fn context_manager_crypto() -> &'static dyn ContextCryptoProvider {
     &FFI_CRYPTO
 }
