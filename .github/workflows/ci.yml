@@ -555,6 +555,111 @@ jobs:
       - name: Check fuzz crate compiles
         run: cargo +nightly check --manifest-path fuzz/Cargo.toml
 
+  # ── Bridge parity (ADR-046) ────────────────────────────────────────
+  # Cross-bridge runtime parity harness: drives PyO3 (in-process) and
+  # NAPI/WASM (Bun child) with identical inputs, asserts normalized
+  # output equality. Layer C of the bridge enforcement stack (Layer A =
+  # FFI conformance, Layer B = SDK capability matrix).
+  bridge-parity:
+    needs: changes
+    if: >-
+      needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.typescript == 'true' ||
+      needs.changes.outputs.rust == 'true'
+    name: Cross-bridge runtime parity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v5
+      - name: Check for unresolved issue placeholders
+        # Runs immediately after checkout — a 1-second grep should not wait
+        # on ~10 minutes of toolchain setup and native builds below.
+        # Guards against merging bindings/python/tests/bridge_parity/FOLLOWUP.md
+        # (or any bridge_parity doc) with literal "issue to be filed" strings.
+        # Each xfail tracked in FOLLOWUP.md must resolve to a real #NNNN ref
+        # before merge — CLAUDE.md forbids fabricated story references.
+        run: |
+          if grep -rn "issue to be filed" bindings/python/tests/bridge_parity/; then
+            echo "ERROR: Unresolved issue placeholder in bridge_parity docs. File the GitHub issues and substitute real #NNNN refs before merging." >&2
+            exit 1
+          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Python deps
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install pytest pytest-asyncio maturin
+      - name: Build PyO3 native module
+        run: |
+          source .venv/bin/activate
+          cd bindings/python
+          maturin develop --release --features scp-core/testing,allow_in_memory_custody
+      - name: Build NAPI native addon
+        run: |
+          cargo build -p scp-ffi-napi --release \
+            --features scp-ffi-napi/allow_in_memory_custody,scp-core/testing
+      - name: Wire NAPI addon into node_modules
+        run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64|amd64) NAPI_PKG="@limn-works/scp-ts-napi-linux-x64-gnu" ;;
+            aarch64|arm64) NAPI_PKG="@limn-works/scp-ts-napi-linux-arm64-gnu" ;;
+            *) echo "Unsupported arch: $ARCH"; exit 1 ;;
+          esac
+          PKG_DIR="bindings/typescript/node_modules/${NAPI_PKG}"
+          mkdir -p "$PKG_DIR"
+          LIB_FILE="target/release/libscp_ffi_napi.so"
+          if [ ! -f "$LIB_FILE" ]; then
+            echo "ERROR: cdylib not found at $LIB_FILE"
+            ls -la target/release/libscp_ffi_napi* 2>/dev/null || true
+            exit 1
+          fi
+          cp "$LIB_FILE" "$PKG_DIR/index.node"
+          echo '{"name":"'"$NAPI_PKG"'","version":"0.1.0","main":"index.node"}' > "$PKG_DIR/package.json"
+      - name: Build WASM bridge (nodejs target for Bun runtime)
+        run: |
+          # The parity harness runs the WASM bridge under Bun, which
+          # uses a Node-style runtime loader. `--target bundler` emits
+          # ESM with a bare `import * from "./X.wasm"` that only works
+          # behind a bundler. `--target nodejs` emits a self-loading
+          # CJS-compatible module that Bun can consume directly.
+          cd crates/scp-ffi/wasm
+          wasm-pack build --target nodejs --release --out-dir pkg-node
+      - name: Wire WASM package into node_modules
+        run: |
+          WASM_PKG_DIR="bindings/typescript/node_modules/@limn-works/scp-ts-wasm"
+          mkdir -p "$WASM_PKG_DIR"
+          cp -r crates/scp-ffi/wasm/pkg-node/* "$WASM_PKG_DIR/"
+          # Patch the package name to match the dynamic import target.
+          python3 -c "
+          import json
+          p = '$WASM_PKG_DIR/package.json'
+          with open(p) as f:
+              j = json.load(f)
+          j['name'] = '@limn-works/scp-ts-wasm'
+          with open(p, 'w') as f:
+              json.dump(j, f, indent=2)
+          "
+      - name: Install TypeScript workspace deps
+        working-directory: bindings/typescript
+        run: bun install
+      - name: Run parity tests
+        run: |
+          source .venv/bin/activate
+          cd bindings/python
+          PYTHONPATH=. pytest tests/bridge_parity/ -v -m parity
+
   # ── CI Gate ─────────────────────────────────────────────────────────
   # Single required check for branch protection. Depends on all CI jobs
   # and uses if: always() so it runs even when paths-filter skips jobs.
@@ -583,6 +688,7 @@ jobs:
       - swift-lint
       - swift-build-test
       - fuzz-build
+      - bridge-parity
     runs-on: ubuntu-latest
     steps:
       - name: Check job results
@@ -609,6 +715,7 @@ jobs:
             "${{ needs.swift-lint.result }}" \
             "${{ needs.swift-build-test.result }}" \
             "${{ needs.fuzz-build.result }}" \
+            "${{ needs.bridge-parity.result }}" \
           )
           for r in "${results[@]}"; do
             if [[ "$r" == "failure" || "$r" == "cancelled" ]]; then
