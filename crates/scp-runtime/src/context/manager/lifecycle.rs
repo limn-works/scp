@@ -1398,22 +1398,9 @@ impl ContextManager {
     /// persists.
     ///
     /// See ADR-008 acceptance criterion 2.
-    #[allow(clippy::too_many_lines)] // Context creation initializes many subsystems including nonce tracking.
+    #[allow(clippy::too_many_lines)] // Context creation initializes many subsystems including pseudonym routing.
     #[instrument(skip_all, fields(context_id = %context_id))]
     pub async fn create_context(
-        &self,
-        context_id: String,
-        params: ContextParams,
-        creator_did: DID,
-        local_pseudonym: Option<[u8; 32]>,
-    ) -> Result<ContextHandle, ContextCreationError> {
-        self.create_context_inner(context_id, params, creator_did, local_pseudonym)
-            .await
-    }
-
-    /// Internal implementation for context creation.
-    #[allow(clippy::too_many_lines)] // Context creation initializes many subsystems including pseudonym routing.
-    async fn create_context_inner(
         &self,
         context_id: String,
         params: ContextParams,
@@ -1884,21 +1871,9 @@ impl ContextManager {
     /// Returns [`ContextError`] if:
     /// - The context is not in `Active` state.
     /// - The key package is invalid.
-    pub async fn join_context(
-        &self,
-        handle: &ContextHandle,
-        key_package: KeyPackage,
-        spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
-        local_pseudonym: Option<[u8; 32]>,
-    ) -> Result<(), ContextError> {
-        self.join_context_inner(handle, key_package, spending_ucan, local_pseudonym)
-            .await
-    }
-
-    /// Internal join implementation.
     #[allow(clippy::too_many_lines)]
     #[instrument(skip_all, fields(context_id = handle.context_id()))]
-    async fn join_context_inner(
+    pub async fn join_context(
         &self,
         handle: &ContextHandle,
         key_package: KeyPackage,
