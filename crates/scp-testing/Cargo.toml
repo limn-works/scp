@@ -53,7 +53,17 @@ futures = "0.3"
 hex = { workspace = true }
 openmls = { workspace = true }
 openmls_traits = { workspace = true }
+# serde (with derive) is required by the ffi_conformance test's JSON alias
+# loader. serde_json is already listed below for the same test module.
+serde = { workspace = true }
 serde_json = { workspace = true }
+# syn is used by the ffi_conformance test to parse bridge source files with a
+# real Rust parser. This replaces a substring-match scanner that false-positived
+# on trait method declarations and doc-comments, and false-negatived on
+# functions hidden inside `#[cfg(test)] mod tests { ... }` blocks. The bash
+# script `scripts/check-bridge-symmetry.sh` uses an awk-based brace-tracking
+# collector to get the same semantics; syn here gives the Rust side parity.
+syn = { version = "2", features = ["full", "visit"] }
 rmp-serde = { workspace = true }
 tempfile = "3"
 x25519-dalek = { workspace = true }

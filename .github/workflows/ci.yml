@@ -100,6 +100,28 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: bash scripts/check-cross-layer.sh
 
+  # ── Bridge symmetry (ADR-047) ────────────────────────────────────────
+  # Verifies that the four FFI bridges (PyO3, UniFFI, NAPI, WASM) expose the
+  # same canonical operation set (per scripts/bridge-aliases.json). Scope is
+  # SURFACE-AREA symmetry only; call-ordering invariants are enforced by
+  # Layer B (scripts/check-call-invariants.py). Complements the Rust-side
+  # enforcement in crates/scp-testing/tests/integration/ffi_conformance.rs —
+  # the JSON alias table is the shared source of truth. See
+  # .docs/adrs/ADR-047-bridge-symmetry-enforcement.md for rationale,
+  # alternatives considered, and enforcement invariants.
+  bridge-symmetry:
+    needs: check-draft
+    name: Bridge symmetry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Run bridge-symmetry CI check
+        run: bash scripts/check-bridge-symmetry.sh
+      - name: Run bridge-symmetry fixture tests
+        run: bash scripts/tests/bridge-symmetry/run-tests.sh
+
   # ── SDK coverage ─────────────────────────────────────────────────────
   sdk-coverage:
     needs: check-draft
@@ -535,6 +557,7 @@ jobs:
     needs:
       - error-codes
       - cross-layer
+      - bridge-symmetry
       - sdk-coverage
       - protocol-sync
       - protocol-deps
@@ -560,6 +583,7 @@ jobs:
           results=( \
             "${{ needs.error-codes.result }}" \
             "${{ needs.cross-layer.result }}" \
+            "${{ needs.bridge-symmetry.result }}" \
             "${{ needs.sdk-coverage.result }}" \
             "${{ needs.protocol-sync.result }}" \
             "${{ needs.protocol-deps.result }}" \

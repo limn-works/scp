@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0",
+  "operations": [
+    {
+      "canonical": "widget_create",
+      "category": "widgets",
+      "wasm_required": true,
+      "pyo3": ["py_widget_create"],
+      "uniffi": ["widget_create"],
+      "napi": ["widget_create"],
+      "wasm": ["widget_create"]
+    }
+  ],
+  "call_ordering_rules": [],
+  "exemptions": {
+    "pyo3": [],
+    "uniffi": [],
+    "napi": [
+      {
+        "canonical": "widget_create",
+        "reason": "documented exemption for fixture test"
+      }
+    ],
+    "wasm": []
+  }
+}
