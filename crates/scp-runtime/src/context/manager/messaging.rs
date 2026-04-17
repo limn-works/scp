@@ -299,12 +299,17 @@ fn verify_and_unwrap(
 /// Used by all buffered/drained delivery paths (`drain_timed_out`,
 /// `drain_consecutive`, buffer overflow) to ensure announcements received
 /// out of order are still handled correctly.
+///
+/// Returns the event-log event name for the delivered message, or `None`
+/// when the message was silently dropped (e.g. forged announcement).
+/// Callers use the return value to drive post-delivery logic (velocity,
+/// event log, consequences, checkpoint).
 fn deliver_plaintext_or_announcement(
     ctx: &mut PerContextState,
     sender_did: &str,
     plaintext: &[u8],
     context_id: &str,
-) {
+) -> Option<&'static str> {
     // KNOWN LIMITATION (§9.10.4 vs §9.10.4.A): Spec says receivers should verify
     // the pseudonym-to-DID mapping, but the privacy model (pseudonym_secret from
     // private key) makes independent verification impossible. We trust MLS-
@@ -320,7 +325,7 @@ fn deliver_plaintext_or_announcement(
                 claimed_did = %announcement.member_did,
                 "buffered pseudonym announcement sender mismatch — dropping"
             );
-            return; // Drop forged announcement, don't deliver as message
+            return None; // Drop forged announcement, don't deliver as message
         }
         let did = DID(announcement.member_did.clone());
         ctx.pseudonym_registry
@@ -334,12 +339,78 @@ fn deliver_plaintext_or_announcement(
             sender_did,
             "processed buffered pseudonym announcement"
         );
-        return;
+        return Some("PseudonymAnnounced");
     }
     ctx.receive_buffer.push(ContextEvent::MessageReceived {
         sender_did: DID(sender_did.to_owned()),
         payload: plaintext.to_vec(),
     });
+    Some("MessageReceived")
+}
+
+/// Runs post-delivery governance logic for a single buffered/drained message.
+///
+/// This ensures that messages delivered via reorder-buffer drain (timeout,
+/// consecutive fill, overflow) receive the same velocity tracking, event-log
+/// append, consequence evaluation, and checkpoint increment as messages
+/// delivered directly through `deliver_message_and_drain_buffered`.
+///
+/// Bug fix (#1534): previously, all buffered delivery paths skipped these
+/// steps, allowing a malicious sender to evade rate limiting and consequence
+/// enforcement by exploiting out-of-order delivery.
+fn run_buffered_post_delivery(
+    ctx: &mut PerContextState,
+    context_id: &str,
+    context_id_bytes: &[u8; 32],
+    sender_did: &str,
+    event_name: &str,
+    clock: &dyn scp_primitives::Clock,
+    event_log: &dyn super::ContextEventLogProvider,
+) {
+    let now = clock.now_secs();
+
+    // Velocity tracking — always record for buffered messages. Buffered
+    // messages arrived via the receive path; we cannot determine whether the
+    // sender is local (the info isn't stored in BufferedMessage). Recording
+    // unconditionally is the safe default: a minor double-count on single-node
+    // self-loops is preferable to a missed count that bypasses rate limiting.
+    ctx.governance
+        .velocity_tracker
+        .record_message(&DID(sender_did.to_owned()), now);
+
+    // Durable event-log append — mirrors the direct delivery path.
+    if let Err(e) = event_log.append_context_event(context_id_bytes, event_name, sender_did) {
+        tracing::warn!(
+            context_id,
+            sender_did,
+            event_name,
+            "failed to append buffered event to event log: {e}"
+        );
+    }
+
+    // Consequence evaluation — same rules as the direct path.
+    let consequence_rules: Vec<super::ConsequenceRule> = ctx.governance.consequence_rules.clone();
+    if !consequence_rules.is_empty() {
+        let events =
+            super::governance::event_log_entries_for_consequences(ctx, context_id, now, event_log);
+        let triggered = evaluate_consequence_rules(&consequence_rules, &events, sender_did, now);
+        let member_did = DID(sender_did.to_owned());
+        super::governance::enforce_triggered_consequences(
+            ctx,
+            &super::governance::EnforceConsequencesCtx {
+                context_id,
+                member_did: &member_did,
+                now,
+                triggered: &triggered,
+                rules: &consequence_rules,
+                clock,
+                event_log,
+            },
+        );
+    }
+
+    // Checkpoint tracking — increment so thresholds stay accurate.
+    ctx.checkpoint_events_since += 1;
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -1104,6 +1175,7 @@ impl ContextManager {
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         // Also drain any timed-out gaps on each delivery call.
+        let context_id_bytes = context_id_to_bytes(context_id);
         let timed_out = ctx
             .reorder_buffer
             .drain_timed_out(now_ms, &ctx.sequence_tracker);
@@ -1131,7 +1203,25 @@ impl ContextManager {
                     msg.inner.sequence,
                     msg.inner.timestamp,
                 );
-                deliver_plaintext_or_announcement(ctx, &msg.sender_did, &msg.plaintext, context_id);
+                if let Some(event_name) = deliver_plaintext_or_announcement(
+                    ctx,
+                    &msg.sender_did,
+                    &msg.plaintext,
+                    context_id,
+                ) {
+                    // Bug fix (#1534): buffered messages now receive the same
+                    // post-delivery governance treatment as directly delivered
+                    // messages — velocity, event log, consequence evaluation.
+                    run_buffered_post_delivery(
+                        ctx,
+                        context_id,
+                        &context_id_bytes,
+                        &msg.sender_did,
+                        event_name,
+                        &*self.clock,
+                        &*self.event_log,
+                    );
+                }
             }
         }
 
@@ -1164,6 +1254,7 @@ impl ContextManager {
         let ctx = &mut *guard;
 
         if let Some((mut gap_info, messages)) = ctx.reorder_buffer.buffer(buffered_msg) {
+            let context_id_bytes = context_id_to_bytes(context_id);
             let expected = ctx
                 .sequence_tracker
                 .expected_sequence(context_id, sender_did)
@@ -1194,7 +1285,24 @@ impl ContextManager {
                     msg.inner.sequence,
                     msg.inner.timestamp,
                 );
-                deliver_plaintext_or_announcement(ctx, &msg.sender_did, &msg.plaintext, context_id);
+                if let Some(event_name) = deliver_plaintext_or_announcement(
+                    ctx,
+                    &msg.sender_did,
+                    &msg.plaintext,
+                    context_id,
+                ) {
+                    // Bug fix (#1534): overflow-forced delivery now runs
+                    // consequence evaluation, matching the direct path.
+                    run_buffered_post_delivery(
+                        ctx,
+                        context_id,
+                        &context_id_bytes,
+                        &msg.sender_did,
+                        event_name,
+                        &*self.clock,
+                        &*self.event_log,
+                    );
+                }
             }
         }
 
@@ -1313,7 +1421,24 @@ impl ContextManager {
                     msg.inner.sequence,
                     msg.inner.timestamp,
                 );
-                deliver_plaintext_or_announcement(ctx, &msg.sender_did, &msg.plaintext, context_id);
+                if let Some(event_name) = deliver_plaintext_or_announcement(
+                    ctx,
+                    &msg.sender_did,
+                    &msg.plaintext,
+                    context_id,
+                ) {
+                    // Bug fix (#1534): drain_consecutive within announcement
+                    // path now runs consequence evaluation per message.
+                    run_buffered_post_delivery(
+                        ctx,
+                        context_id,
+                        context_id_bytes,
+                        &msg.sender_did,
+                        event_name,
+                        &*self.clock,
+                        &*self.event_log,
+                    );
+                }
             }
 
             // Velocity, consequence, event log — same as normal messages.
@@ -1398,7 +1523,21 @@ impl ContextManager {
                 msg.inner.sequence,
                 msg.inner.timestamp,
             );
-            deliver_plaintext_or_announcement(ctx, &msg.sender_did, &msg.plaintext, context_id);
+            if let Some(event_name) =
+                deliver_plaintext_or_announcement(ctx, &msg.sender_did, &msg.plaintext, context_id)
+            {
+                // Bug fix (#1534): drain_consecutive within normal message
+                // path now runs consequence evaluation per message.
+                run_buffered_post_delivery(
+                    ctx,
+                    context_id,
+                    context_id_bytes,
+                    &msg.sender_did,
+                    event_name,
+                    &*self.clock,
+                    &*self.event_log,
+                );
+            }
         }
 
         // H5: Append the durable event log entry for `MessageReceived` BEFORE
