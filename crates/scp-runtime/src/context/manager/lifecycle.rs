@@ -588,6 +588,13 @@ impl ContextManager {
             // are needed. Deferred to the Welcome delivery plan (#1311)
             // which adds cross-process event log synchronization.
             merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
+            // §9.10.4: restore pseudonym routing state from snapshot.
+            local_pseudonym: ctx_snapshot.local_pseudonym,
+            pseudonym_registry: ctx_snapshot
+                .pseudonym_registry
+                .into_iter()
+                .map(|(did_str, p)| (DID(did_str), p))
+                .collect(),
         };
 
         // Atomic check-and-insert — eliminates TOCTOU race between
@@ -1305,6 +1312,10 @@ impl ContextManager {
             // Fresh Merkle tree for imported contexts. Proofs cover
             // post-import events only (same rationale as restore_context).
             merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
+            // §9.10.4: pseudonym state is local-instance — wiped on import.
+            // The importing member must re-derive and re-announce.
+            local_pseudonym: None,
+            pseudonym_registry: HashMap::new(),
         };
 
         // 7. Register the context.
@@ -1387,13 +1398,14 @@ impl ContextManager {
     /// persists.
     ///
     /// See ADR-008 acceptance criterion 2.
-    #[allow(clippy::too_many_lines)] // Context creation initializes many subsystems including nonce tracking.
+    #[allow(clippy::too_many_lines)] // Context creation initializes many subsystems including pseudonym routing.
     #[instrument(skip_all, fields(context_id = %context_id))]
     pub async fn create_context(
         &self,
         context_id: String,
         params: ContextParams,
         creator_did: DID,
+        local_pseudonym: Option<[u8; 32]>,
     ) -> Result<ContextHandle, ContextCreationError> {
         // Defense-in-depth: verify creator's SDK version satisfies min_protocol_version.
         params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
@@ -1503,6 +1515,10 @@ impl ContextManager {
             checkpoint_last_time_secs: self.clock.now_secs(),
             checkpoints: Vec::new(),
             merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
+            // §9.10.4: pseudonym routing. Only meaningful for encrypted
+            // contexts; broadcast contexts ignore this field.
+            local_pseudonym,
+            pseudonym_registry: HashMap::new(),
         };
 
         // Atomic check-and-insert — eliminates TOCTOU race between
@@ -1834,6 +1850,11 @@ impl ContextManager {
             checkpoint_last_time_secs: self.clock.now_secs(),
             checkpoints: Vec::new(),
             merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
+            // §9.10.4: pseudonym routing — governance-path creation does not
+            // yet support pseudonym injection. The FFI bridge can set this
+            // later via the standard create_context path.
+            local_pseudonym: None,
+            pseudonym_registry: HashMap::new(),
         })
     }
 
@@ -1857,6 +1878,7 @@ impl ContextManager {
         handle: &ContextHandle,
         key_package: KeyPackage,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+        local_pseudonym: Option<[u8; 32]>,
     ) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
@@ -2079,6 +2101,17 @@ impl ContextManager {
             return Err(e);
         }
 
+        // Phase 4.5: Store local pseudonym after membership mutation succeeds.
+        // The pseudonym was pre-derived by the FFI bridge; storing it here
+        // makes it available for subsequent send_message fan-out (§9.10.4).
+        if let Some(pseudonym) = local_pseudonym
+            && let Ok(ctx_arc) = self.get_context_arc(&context_id)
+        {
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
+            ctx.local_pseudonym = Some(pseudonym);
+        }
+
         // Phase 5: Capture the escrow hold after all mutations succeeded.
         // Consume the ticket — commit returns the deducted cost for the
         // capture step and marks the ticket as committed so the Drop
@@ -2111,6 +2144,64 @@ impl ContextManager {
         }
 
         Ok(())
+    }
+
+    /// Sends a `PseudonymAnnouncement` to inform other members of this
+    /// member's per-context routing ID (§9.10.4).
+    ///
+    /// Called by the FFI bridges after `create_context` or `join_context`
+    /// succeeds with a pseudonym. The signing key is available
+    /// at the FFI bridge layer but NOT in the runtime lifecycle methods, so
+    /// this method is separated from the create/join paths.
+    ///
+    /// Best-effort: logs a warning but does not fail if the announcement
+    /// cannot be sent (e.g. transport not yet connected, or the context is
+    /// a single-member context with nobody to announce to).
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` -- The context handle.
+    /// * `sender_did` -- The announcing member's DID.
+    /// * `signing_key` -- Ed25519 signing key for MLS application message.
+    pub async fn send_pseudonym_announcement(
+        &self,
+        handle: &ContextHandle,
+        sender_did: &DID,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) {
+        let context_id = handle.context_id().to_owned();
+        let pseudonym = {
+            let Ok(ctx_arc) = self.get_context_arc(&context_id) else {
+                return;
+            };
+            let guard = ctx_arc.lock().await;
+            guard.local_pseudonym
+        };
+        let Some(pseudonym) = pseudonym else {
+            return;
+        };
+        let announcement = super::PseudonymAnnouncement {
+            tag: super::PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+            member_did: sender_did.as_ref().to_owned(),
+            pseudonym,
+        };
+        let Ok(payload) = rmp_serde::to_vec_named(&announcement) else {
+            tracing::warn!(
+                context_id = %context_id,
+                "failed to serialize pseudonym announcement"
+            );
+            return;
+        };
+        if let Err(e) = self
+            .send_message(handle, sender_did, &payload, Some(signing_key), None, None)
+            .await
+        {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to send pseudonym announcement — other members will use shared routing"
+            );
+        }
     }
 
     /// Performs the membership state mutations for `join_context` (Phase 4).
@@ -2368,6 +2459,9 @@ impl ContextManager {
             ctx.access
                 .access_key_store
                 .remove(&context_id, member_did.as_ref());
+
+            // §9.10.4: remove the departing member's pseudonym routing ID.
+            ctx.pseudonym_registry.remove(member_did);
 
             // Emit MemberLeft event to receive buffer.
             ctx.receive_buffer.push(ContextEvent::MemberLeft {

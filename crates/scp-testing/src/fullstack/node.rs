@@ -161,7 +161,7 @@ impl FullStackNode {
     ) -> Result<ContextHandle, ContextCreationError> {
         let handle = self
             .manager
-            .create_context(context_id.to_owned(), params, self.did.clone())
+            .create_context(context_id.to_owned(), params, self.did.clone(), None)
             .await?;
 
         // Copy the creator's access key from ContextManager's PerContextState
@@ -196,7 +196,7 @@ impl FullStackNode {
         member_did: &str,
     ) -> Result<(), ContextError> {
         let kp = KeyPackage::mock(DID::from(member_did));
-        self.manager.join_context(handle, kp, None).await?;
+        self.manager.join_context(handle, kp, None, None).await?;
 
         // Deposit ALL existing members' access keys in the KeyExchange for
         // the joiner. This includes:

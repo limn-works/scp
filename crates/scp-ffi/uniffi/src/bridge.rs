@@ -2998,10 +2998,52 @@ pub async fn context_create(
             // Initialize the ContextManager if not already done (first context_create call).
             crate::runtime::init_context_manager();
 
-            // Delegate to the shared ContextManager.
+            // Extract key custody and signing key from the identity.
+            #[cfg(feature = "allow_in_memory_custody")]
+            let in_memory_custody = identity.in_memory_custody.clone();
+            let callback_custody = identity.callback_custody.clone();
+            let signing_key = identity.core_id.as_ref().map(|id| id.active_signing_key);
+
+            // §9.10.4: Derive the context-scoped pseudonym routing ID via the
+            // retained KeyCustody BEFORE context creation so it can be passed
+            // to the ContextManager for per-member routing.
+            let local_pseudonym: Option<[u8; 32]> =
+                if let Some(identity_key) = identity.core_id.as_ref().map(|id| &id.identity_key) {
+                    let pseudonym = if let Some(ref cb) = callback_custody {
+                        cb.derive_pseudonym(identity_key, context_id.as_bytes())
+                            .await
+                            .ok()
+                    } else {
+                        #[cfg(feature = "allow_in_memory_custody")]
+                        {
+                            if let Some(ref imc) = identity.in_memory_custody {
+                                imc.0
+                                    .derive_pseudonym(identity_key, context_id.as_bytes())
+                                    .await
+                                    .ok()
+                            } else {
+                                None
+                            }
+                        }
+                        #[cfg(not(feature = "allow_in_memory_custody"))]
+                        {
+                            None
+                        }
+                    };
+                    pseudonym.and_then(|p| p.public_key.as_bytes().try_into().ok())
+                } else {
+                    None
+                };
+
+            // Delegate to the shared ContextManager with pseudonym.
             let manager = crate::runtime::context_manager()?;
             let _core_handle = manager
-                .create_context(context_id.clone(), core_params, identity.did.clone().into())
+                .create_context(
+                    context_id.clone(),
+                    core_params,
+                    identity.did.clone().into(),
+                    local_pseudonym,
+                )
                 .await
                 .map_err(ScpError::from)?;
 
@@ -3011,50 +3053,57 @@ pub async fn context_create(
                 .register_local_did(identity.did.clone().into())
                 .await;
 
-            // Extract key custody and signing key from the identity.
-            #[cfg(feature = "allow_in_memory_custody")]
-            let in_memory_custody = identity.in_memory_custody.clone();
-            let callback_custody = identity.callback_custody.clone();
-            let signing_key = identity.core_id.as_ref().map(|id| id.active_signing_key);
-
-            // Derive the context-scoped pseudonym routing ID via the retained
-            // KeyCustody (SCP-214 criterion 5, spec §9.10.4). This produces a
-            // deterministic pseudonym from the identity key + context ID.
-            if let (Some(core_id), Some(identity_key)) = (
-                identity.core_id.as_ref(),
-                identity.core_id.as_ref().map(|id| &id.identity_key),
-            ) {
-                let _pseudonym = if let Some(ref cb) = callback_custody {
-                    cb.derive_pseudonym(identity_key, context_id.as_bytes())
-                        .await
-                        .ok()
-                } else {
-                    #[cfg(feature = "allow_in_memory_custody")]
-                    {
-                        if let Some(ref imc) = identity.in_memory_custody {
-                            imc.0
-                                .derive_pseudonym(identity_key, context_id.as_bytes())
-                                .await
-                                .ok()
-                        } else {
-                            None
-                        }
-                    }
-                    #[cfg(not(feature = "allow_in_memory_custody"))]
-                    {
-                        None
-                    }
-                };
-                // The pseudonym is derived for routing ID use. The actual
-                // routing ID is stored by the ContextManager's transport
-                // provider. Here we validate the derivation succeeds and
-                // the custody provider is functional for this context.
-                let _ = core_id;
-            }
-
             // Register per-context UCAN validation state (revocation list,
             // nonce tracker, event log) for the UCAN pipeline.
             crate::runtime::ensure_ucan_registered(&context_id, &identity.did, &params.ceiling);
+
+            // §9.10.4: Send pseudonym announcement to inform other members of
+            // the creator's per-context routing ID. For freshly created
+            // single-member contexts this is a no-op (no recipients), but on
+            // restored/imported contexts with existing members the announcement
+            // is needed. Best-effort: if signing key is not available, skip.
+            if local_pseudonym.is_some() {
+                let sender_did = scp_identity::DID(identity.did.clone());
+                let core_handle = scp_core::context::ContextHandle::new(
+                    context_id.clone(),
+                    retained_core_params.clone(),
+                );
+                let _ = core_handle
+                    .transition_to(&scp_core::context::ContextState::Active)
+                    .await;
+                let sk_opt: Option<ed25519_dalek::SigningKey> =
+                    if let Some(ref ik) = identity.core_id {
+                        if let Some(ref cb) = identity.callback_custody {
+                            cb.export_ed25519_signing_key(&ik.active_signing_key)
+                                .await
+                                .ok()
+                        } else {
+                            #[cfg(feature = "allow_in_memory_custody")]
+                            {
+                                if let Some(ref custody) = identity.in_memory_custody {
+                                    custody
+                                        .0
+                                        .export_ed25519_signing_key(&ik.active_signing_key)
+                                        .await
+                                        .ok()
+                                } else {
+                                    None
+                                }
+                            }
+                            #[cfg(not(feature = "allow_in_memory_custody"))]
+                            {
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                if let Some(sk) = sk_opt {
+                    manager
+                        .send_pseudonym_announcement(&core_handle, &sender_did, &sk)
+                        .await;
+                }
+            }
 
             let handle = Arc::new(ContextHandle {
                 context_id,
@@ -3172,10 +3221,84 @@ pub async fn context_join(
                 mls_key_package_bytes: None,
             };
 
+            // §9.10.4: Derive pseudonym for per-member routing. Uses the
+            // identity's custody provider (callback or in-memory).
+            let identity_key = identity.core_id.as_ref().map(|id| id.identity_key);
+            let local_pseudonym: Option<[u8; 32]> = if let Some(ik) = identity_key {
+                let pseudonym = if let Some(ref cb) = identity.callback_custody {
+                    cb.derive_pseudonym(&ik, handle.context_id.as_bytes())
+                        .await
+                        .ok()
+                } else {
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    {
+                        if let Some(ref custody) = identity.in_memory_custody {
+                            custody
+                                .0
+                                .derive_pseudonym(&ik, handle.context_id.as_bytes())
+                                .await
+                                .ok()
+                        } else {
+                            None
+                        }
+                    }
+                    #[cfg(not(feature = "allow_in_memory_custody"))]
+                    {
+                        None
+                    }
+                };
+                pseudonym.and_then(|p| p.public_key.as_bytes().try_into().ok())
+            } else {
+                None
+            };
+
             manager
-                .join_context(&core_handle, key_package, spending_ucan.as_ref())
+                .join_context(
+                    &core_handle,
+                    key_package,
+                    spending_ucan.as_ref(),
+                    local_pseudonym,
+                )
                 .await
                 .map_err(ScpError::from)?;
+
+            // §9.10.4: Send pseudonym announcement to inform existing members.
+            // Best-effort: if signing key is not available, skip silently.
+            if local_pseudonym.is_some() {
+                let sender_did = scp_identity::DID(identity.did.clone());
+                let sk_opt: Option<ed25519_dalek::SigningKey> =
+                    if let Some(ref ik) = identity.core_id {
+                        if let Some(ref cb) = identity.callback_custody {
+                            cb.export_ed25519_signing_key(&ik.active_signing_key)
+                                .await
+                                .ok()
+                        } else {
+                            #[cfg(feature = "allow_in_memory_custody")]
+                            {
+                                if let Some(ref custody) = identity.in_memory_custody {
+                                    custody
+                                        .0
+                                        .export_ed25519_signing_key(&ik.active_signing_key)
+                                        .await
+                                        .ok()
+                                } else {
+                                    None
+                                }
+                            }
+                            #[cfg(not(feature = "allow_in_memory_custody"))]
+                            {
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                if let Some(sk) = sk_opt {
+                    manager
+                        .send_pseudonym_announcement(&core_handle, &sender_did, &sk)
+                        .await;
+                }
+            }
 
             Ok(())
         })

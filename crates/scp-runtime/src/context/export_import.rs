@@ -373,6 +373,10 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         // Generation counter is local runtime state — no meaning to a
         // public observer. Always zero in public scope.
         generation: 0,
+        // §9.10.4: pseudonym state is local-instance routing state —
+        // no meaning to a public observer. Always empty/None in public scope.
+        local_pseudonym: None,
+        pseudonym_registry: HashMap::new(),
     }
 }
 
@@ -496,6 +500,8 @@ mod tests {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             generation: 0,
+            local_pseudonym: None,
+            pseudonym_registry: HashMap::new(),
         }
     }
 

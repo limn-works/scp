@@ -2905,6 +2905,10 @@ impl ContextManager {
             // Destroy the removed member's access key (§9.17.2, ADR-038).
             ctx.access.access_key_store.remove(context_id, did.as_ref());
 
+            // §9.10.4: remove the member's pseudonym routing ID so future
+            // fan-outs do not send messages to a stale routing ID.
+            ctx.pseudonym_registry.remove(did);
+
             ctx.receive_buffer.push(ContextEvent::MemberLeft {
                 member_did: did.clone(),
             });
@@ -4987,7 +4991,12 @@ impl ContextManager {
         // Create the destination context AFTER the source has been
         // transitioned to MigratingOut. If creation fails, roll back.
         if let Err(e) = self
-            .create_context(destination_context_id.clone(), dest_params, creator_did)
+            .create_context(
+                destination_context_id.clone(),
+                dest_params,
+                creator_did,
+                None,
+            )
             .await
         {
             // Roll back: revert source to Active and clear migration state.

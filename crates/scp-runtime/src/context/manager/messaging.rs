@@ -291,6 +291,128 @@ fn verify_and_unwrap(
     .map_err(|e| ContextError::CryptoFailed(e.to_string()))
 }
 
+/// Delivers a single plaintext to the receive buffer, checking if it is a
+/// pseudonym announcement first. If it is a valid announcement from the
+/// authenticated sender, updates the pseudonym registry and emits a
+/// `PseudonymAnnounced` event instead of `MessageReceived`.
+///
+/// Used by all buffered/drained delivery paths (`drain_timed_out`,
+/// `drain_consecutive`, buffer overflow) to ensure announcements received
+/// out of order are still handled correctly.
+///
+/// Returns the event-log event name for the delivered message, or `None`
+/// when the message was silently dropped (e.g. forged announcement).
+/// Callers use the return value to drive post-delivery logic (velocity,
+/// event log, consequences, checkpoint).
+fn deliver_plaintext_or_announcement(
+    ctx: &mut PerContextState,
+    sender_did: &str,
+    plaintext: &[u8],
+    context_id: &str,
+) -> Option<&'static str> {
+    // KNOWN LIMITATION (§9.10.4 vs §9.10.4.A): Spec says receivers should verify
+    // the pseudonym-to-DID mapping, but the privacy model (pseudonym_secret from
+    // private key) makes independent verification impossible. We trust MLS-
+    // authenticated senders to honestly announce their pseudonyms. A malicious
+    // member can only misdirect their own message copies.
+    if let Ok(announcement) = rmp_serde::from_slice::<super::PseudonymAnnouncement>(plaintext)
+        && announcement.tag == super::PSEUDONYM_ANNOUNCEMENT_TAG
+    {
+        if announcement.member_did != sender_did {
+            tracing::warn!(
+                context_id,
+                sender_did,
+                claimed_did = %announcement.member_did,
+                "buffered pseudonym announcement sender mismatch — dropping"
+            );
+            return None; // Drop forged announcement, don't deliver as message
+        }
+        let did = DID(announcement.member_did.clone());
+        ctx.pseudonym_registry
+            .insert(did.clone(), announcement.pseudonym);
+        ctx.receive_buffer.push(ContextEvent::PseudonymAnnounced {
+            member_did: did,
+            pseudonym: announcement.pseudonym,
+        });
+        tracing::debug!(
+            context_id,
+            sender_did,
+            "processed buffered pseudonym announcement"
+        );
+        return Some("PseudonymAnnounced");
+    }
+    ctx.receive_buffer.push(ContextEvent::MessageReceived {
+        sender_did: DID(sender_did.to_owned()),
+        payload: plaintext.to_vec(),
+    });
+    Some("MessageReceived")
+}
+
+/// Runs post-delivery governance logic for a single buffered/drained message.
+///
+/// This ensures that messages delivered via reorder-buffer drain (timeout,
+/// consecutive fill, overflow) receive the same velocity tracking, event-log
+/// append, consequence evaluation, and checkpoint increment as messages
+/// delivered directly through `deliver_message_and_drain_buffered`.
+///
+/// Bug fix (#1534): previously, all buffered delivery paths skipped these
+/// steps, allowing a malicious sender to evade rate limiting and consequence
+/// enforcement by exploiting out-of-order delivery.
+fn run_buffered_post_delivery(
+    ctx: &mut PerContextState,
+    context_id: &str,
+    context_id_bytes: &[u8; 32],
+    sender_did: &str,
+    event_name: &str,
+    clock: &dyn scp_primitives::Clock,
+    event_log: &dyn super::ContextEventLogProvider,
+) {
+    let now = clock.now_secs();
+
+    // Velocity tracking — always record for buffered messages. Buffered
+    // messages arrived via the receive path; we cannot determine whether the
+    // sender is local (the info isn't stored in BufferedMessage). Recording
+    // unconditionally is the safe default: a minor double-count on single-node
+    // self-loops is preferable to a missed count that bypasses rate limiting.
+    ctx.governance
+        .velocity_tracker
+        .record_message(&DID(sender_did.to_owned()), now);
+
+    // Durable event-log append — mirrors the direct delivery path.
+    if let Err(e) = event_log.append_context_event(context_id_bytes, event_name, sender_did) {
+        tracing::warn!(
+            context_id,
+            sender_did,
+            event_name,
+            "failed to append buffered event to event log: {e}"
+        );
+    }
+
+    // Consequence evaluation — same rules as the direct path.
+    let consequence_rules: Vec<super::ConsequenceRule> = ctx.governance.consequence_rules.clone();
+    if !consequence_rules.is_empty() {
+        let events =
+            super::governance::event_log_entries_for_consequences(ctx, context_id, now, event_log);
+        let triggered = evaluate_consequence_rules(&consequence_rules, &events, sender_did, now);
+        let member_did = DID(sender_did.to_owned());
+        super::governance::enforce_triggered_consequences(
+            ctx,
+            &super::governance::EnforceConsequencesCtx {
+                context_id,
+                member_did: &member_did,
+                now,
+                triggered: &triggered,
+                rules: &consequence_rules,
+                clock,
+                event_log,
+            },
+        );
+    }
+
+    // Checkpoint tracking — increment so thresholds stay accurate.
+    ctx.checkpoint_events_since += 1;
+}
+
 #[allow(clippy::significant_drop_tightening)]
 impl ContextManager {
     /// Sends a message within a context.
@@ -320,8 +442,17 @@ impl ContextManager {
     ) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
-        let routing_id = scp_protocol::context::context_routing_id(&context_id);
-        let (broadcast_envelope, recipients_data, sequence, is_broadcast, ticket, ctx_gen) = {
+        // Routing ID computation is deferred to Phase 1 (under lock) where
+        // the context mode and pseudonym registry are available.
+        let (
+            broadcast_envelope,
+            recipients_data,
+            sequence,
+            is_broadcast,
+            ticket,
+            ctx_gen,
+            send_routing_ids,
+        ) = {
             let (mut guard, ctx_gen) = self
                 .lock_context(&context_id)
                 .await
@@ -436,6 +567,8 @@ impl ContextManager {
                         return Err(e);
                     }
                 };
+                // Broadcast: use plain SHA-256(context_id) per spec §5.14.
+                let broadcast_rid = scp_protocol::context::broadcast_routing_id(&context_id);
                 (
                     Some(env),
                     std::collections::HashMap::new(),
@@ -443,6 +576,7 @@ impl ContextManager {
                     true,
                     ticket,
                     ctx_gen,
+                    vec![broadcast_rid],
                 )
             } else {
                 // Capability already checked above (H7: before budget deduction).
@@ -454,6 +588,23 @@ impl ContextManager {
                         "cannot assign sequence: {sender_did} is not a member"
                     )));
                 };
+                // §9.10.4: collect pseudonym routing IDs for fan-out.
+                // For encrypted contexts with known pseudonyms, send to each
+                // member's pseudonym. Always include the shared routing ID as
+                // fallback for members whose pseudonym is not yet known.
+                //
+                // KNOWN LIMITATION (§9.10.4): Fan-out sends the SAME MLS ciphertext to all
+                // routing IDs. A relay can correlate pseudonyms by observing identical blobs.
+                // Per-recipient re-encryption (different nonce per blob) would fix this but
+                // increases bandwidth by O(N). Acceptable until relay-blinding is implemented.
+                let mut routing_ids: Vec<[u8; 32]> =
+                    ctx.pseudonym_registry.values().copied().collect();
+                let shared_rid = scp_protocol::context::context_routing_id(&context_id);
+                // Always include the shared routing ID for backward compat /
+                // members who haven't announced a pseudonym yet. Duplicates
+                // in the fan-out are harmless (same blob to same routing ID
+                // is idempotent at the relay).
+                routing_ids.push(shared_rid);
                 (
                     None,
                     ctx.access.access_key_store.get_all(&context_id),
@@ -461,6 +612,7 @@ impl ContextManager {
                     false,
                     ticket,
                     ctx_gen,
+                    routing_ids,
                 )
             }
         };
@@ -490,6 +642,7 @@ impl ContextManager {
         };
 
         // Phase 2: encrypt + send (no lock held).
+        // §9.10.4: fan-out — send to all collected routing IDs.
         let phase2_result = self.encrypt_and_send(
             broadcast_envelope,
             signing_key,
@@ -499,7 +652,7 @@ impl ContextManager {
             &recipients_data,
             sequence,
             source_provenance,
-            &routing_id,
+            &send_routing_ids,
         );
         if let Err(e) = phase2_result {
             // Void the escrow hold and roll back the full ticket (budget,
@@ -546,6 +699,11 @@ impl ContextManager {
 
     /// Encrypts the payload and sends it via transport (Phase 2 of `send_message`).
     ///
+    /// For pseudonym routing (§9.10.4), `routing_ids` may contain multiple
+    /// targets: each member's pseudonym plus the shared context routing ID
+    /// as a fallback. The encrypted blob is computed once and sent to each
+    /// routing ID.
+    ///
     /// Extracted to keep `send_message` within the clippy `too_many_lines` limit.
     #[allow(clippy::too_many_arguments)]
     fn encrypt_and_send(
@@ -561,7 +719,7 @@ impl ContextManager {
         >,
         sequence: u64,
         source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
-        routing_id: &[u8; 32],
+        routing_ids: &[[u8; 32]],
     ) -> Result<(), ContextError> {
         let encrypted = if let Some(envelope) = broadcast_envelope {
             rmp_serde::to_vec_named(&envelope)
@@ -584,8 +742,30 @@ impl ContextManager {
             crate::metrics::record_encrypt_duration(encrypt_start.elapsed());
             result
         };
-        self.transport.send_message(routing_id, &encrypted)?;
-        crate::metrics::record_message_sent();
+        // §9.10.4: fan-out — seal once, send to all routing IDs.
+        // Best-effort: only fail if ALL sends fail. A partial fan-out
+        // (some routing IDs succeed, others fail) is acceptable — at least
+        // some members will receive the message. Record a metric per
+        // successful send to avoid undercounting (Bug 6).
+        let mut last_err = None;
+        let mut any_success = false;
+        for rid in routing_ids {
+            match self.transport.send_message(rid, &encrypted) {
+                Ok(()) => {
+                    any_success = true;
+                    crate::metrics::record_message_sent();
+                }
+                Err(e) => {
+                    tracing::warn!(routing_id = ?rid, error = %e, "fan-out send failed");
+                    last_err = Some(e);
+                }
+            }
+        }
+        if !any_success {
+            return Err(last_err.unwrap_or_else(|| {
+                ContextError::TransportFailed("all fan-out sends failed".into())
+            }));
+        }
         Ok(())
     }
 
@@ -938,16 +1118,25 @@ impl ContextManager {
         match sequence_check {
             SequenceCheck::Expected => {
                 // Message is in order — deliver immediately.
-                self.deliver_message_and_drain_buffered(
-                    context_id,
-                    &context_id_bytes,
-                    &sender_did,
-                    &inner,
-                    &plaintext,
-                    is_local_sender,
-                )
-                .await?;
-                Ok(Some((plaintext, sender_did)))
+                // Bug fix (#1534): `deliver_message_and_drain_buffered` returns
+                // `true` when the message was consumed as a pseudonym announcement
+                // (internal protocol message). Announcements must NOT be forwarded
+                // to FFI callers as regular user messages.
+                let consumed_as_announcement = self
+                    .deliver_message_and_drain_buffered(
+                        context_id,
+                        &context_id_bytes,
+                        &sender_did,
+                        &inner,
+                        &plaintext,
+                        is_local_sender,
+                    )
+                    .await?;
+                if consumed_as_announcement {
+                    Ok(None)
+                } else {
+                    Ok(Some((plaintext, sender_did)))
+                }
             }
             SequenceCheck::Ahead { expected: _ } => {
                 // Message is ahead of expected — buffer it (§9.8.5).
@@ -986,6 +1175,7 @@ impl ContextManager {
             .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
 
         // Also drain any timed-out gaps on each delivery call.
+        let context_id_bytes = context_id_to_bytes(context_id);
         let timed_out = ctx
             .reorder_buffer
             .drain_timed_out(now_ms, &ctx.sequence_tracker);
@@ -1013,10 +1203,25 @@ impl ContextManager {
                     msg.inner.sequence,
                     msg.inner.timestamp,
                 );
-                ctx.receive_buffer.push(ContextEvent::MessageReceived {
-                    sender_did: DID(msg.sender_did.clone()),
-                    payload: msg.plaintext.clone(),
-                });
+                if let Some(event_name) = deliver_plaintext_or_announcement(
+                    ctx,
+                    &msg.sender_did,
+                    &msg.plaintext,
+                    context_id,
+                ) {
+                    // Bug fix (#1534): buffered messages now receive the same
+                    // post-delivery governance treatment as directly delivered
+                    // messages — velocity, event log, consequence evaluation.
+                    run_buffered_post_delivery(
+                        ctx,
+                        context_id,
+                        &context_id_bytes,
+                        &msg.sender_did,
+                        event_name,
+                        &*self.clock,
+                        &*self.event_log,
+                    );
+                }
             }
         }
 
@@ -1049,6 +1254,7 @@ impl ContextManager {
         let ctx = &mut *guard;
 
         if let Some((mut gap_info, messages)) = ctx.reorder_buffer.buffer(buffered_msg) {
+            let context_id_bytes = context_id_to_bytes(context_id);
             let expected = ctx
                 .sequence_tracker
                 .expected_sequence(context_id, sender_did)
@@ -1079,10 +1285,24 @@ impl ContextManager {
                     msg.inner.sequence,
                     msg.inner.timestamp,
                 );
-                ctx.receive_buffer.push(ContextEvent::MessageReceived {
-                    sender_did: DID(msg.sender_did.clone()),
-                    payload: msg.plaintext.clone(),
-                });
+                if let Some(event_name) = deliver_plaintext_or_announcement(
+                    ctx,
+                    &msg.sender_did,
+                    &msg.plaintext,
+                    context_id,
+                ) {
+                    // Bug fix (#1534): overflow-forced delivery now runs
+                    // consequence evaluation, matching the direct path.
+                    run_buffered_post_delivery(
+                        ctx,
+                        context_id,
+                        &context_id_bytes,
+                        &msg.sender_did,
+                        event_name,
+                        &*self.clock,
+                        &*self.event_log,
+                    );
+                }
             }
         }
 
@@ -1106,7 +1326,7 @@ impl ContextManager {
         inner: &scp_protocol::envelope::inner::InnerEnvelope,
         plaintext: &[u8],
         skip_velocity: bool,
-    ) -> Result<(), ContextError> {
+    ) -> Result<bool, ContextError> {
         let sender_did_obj = DID(sender_did.to_owned());
 
         let ctx_arc = self
@@ -1142,6 +1362,137 @@ impl ContextManager {
             return Err(ContextError::PermissionDenied(msg));
         }
 
+        // §9.10.4: check if this is a pseudonym announcement before treating
+        // as a regular message. Announcements are internal protocol messages
+        // that update the pseudonym registry — they are NOT forwarded to the
+        // application receive buffer as regular MessageReceived events.
+        //
+        // KNOWN LIMITATION (§9.10.4 vs §9.10.4.A): Spec says receivers should verify
+        // the pseudonym-to-DID mapping, but the privacy model (pseudonym_secret from
+        // private key) makes independent verification impossible. We trust MLS-
+        // authenticated senders to honestly announce their pseudonyms. A malicious
+        // member can only misdirect their own message copies.
+        if let Ok(announcement) = rmp_serde::from_slice::<super::PseudonymAnnouncement>(plaintext)
+            && announcement.tag == super::PSEUDONYM_ANNOUNCEMENT_TAG
+        {
+            // Bug fix: verify announcement.member_did matches the MLS-authenticated
+            // sender_did. Without this check, any member could forge a pseudonym
+            // announcement for another member, redirecting their messages.
+            if announcement.member_did != sender_did {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    claimed_did = %announcement.member_did,
+                    "pseudonym announcement sender mismatch — rejecting forged announcement"
+                );
+                return Err(ContextError::PermissionDenied(format!(
+                    "pseudonym announcement member_did ({}) does not match sender ({sender_did})",
+                    announcement.member_did
+                )));
+            }
+            let announced_did = DID(announcement.member_did.clone());
+            ctx.pseudonym_registry
+                .insert(announced_did.clone(), announcement.pseudonym);
+            ctx.receive_buffer.push(ContextEvent::PseudonymAnnounced {
+                member_did: announced_did,
+                pseudonym: announcement.pseudonym,
+            });
+            // Advance sequence tracker for the announcement message.
+            ctx.sequence_tracker
+                .advance(context_id, sender_did, inner.sequence, inner.timestamp);
+            // Skip the normal message delivery path — announcements are
+            // consumed by the protocol, not forwarded to the application.
+            // Still drain buffered messages that may now be unblocked.
+            let next_expected = inner.sequence.saturating_add(1);
+            let consecutive =
+                ctx.reorder_buffer
+                    .drain_consecutive(context_id, sender_did, next_expected);
+            for msg in &consecutive {
+                if !ctx.membership.contains(&msg.sender_did)
+                    || !ctx
+                        .role_state
+                        .member_has_capability(&msg.sender_did, &Capability::MessagesWrite)
+                {
+                    continue;
+                }
+                ctx.sequence_tracker.advance(
+                    &msg.inner.context_id,
+                    &msg.sender_did,
+                    msg.inner.sequence,
+                    msg.inner.timestamp,
+                );
+                if let Some(event_name) = deliver_plaintext_or_announcement(
+                    ctx,
+                    &msg.sender_did,
+                    &msg.plaintext,
+                    context_id,
+                ) {
+                    // Bug fix (#1534): drain_consecutive within announcement
+                    // path now runs consequence evaluation per message.
+                    run_buffered_post_delivery(
+                        ctx,
+                        context_id,
+                        context_id_bytes,
+                        &msg.sender_did,
+                        event_name,
+                        &*self.clock,
+                        &*self.event_log,
+                    );
+                }
+            }
+
+            // Velocity, consequence, event log — same as normal messages.
+            // Bug fix (#1534): consequence evaluation was previously missing from
+            // the announcement path, allowing a malicious member to send
+            // announcements at high velocity without triggering rate-limiting
+            // consequences. Now both paths share identical post-delivery logic.
+            let now = self.clock.now_secs();
+            if !skip_velocity {
+                ctx.governance
+                    .velocity_tracker
+                    .record_message(&DID(sender_did.to_owned()), now);
+            }
+            if let Err(e) = self.event_log.append_context_event(
+                context_id_bytes,
+                "PseudonymAnnounced",
+                sender_did,
+            ) {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    "failed to append PseudonymAnnounced to event log: {e}"
+                );
+            }
+            let consequence_rules: Vec<super::ConsequenceRule> =
+                ctx.governance.consequence_rules.clone();
+            if !consequence_rules.is_empty() {
+                let recv_events = super::governance::event_log_entries_for_consequences(
+                    ctx,
+                    context_id,
+                    now,
+                    &*self.event_log,
+                );
+                let recv_triggered =
+                    evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
+                let recv_member_did = DID(sender_did.to_owned());
+                super::governance::enforce_triggered_consequences(
+                    ctx,
+                    &super::governance::EnforceConsequencesCtx {
+                        context_id,
+                        member_did: &recv_member_did,
+                        now,
+                        triggered: &recv_triggered,
+                        rules: &consequence_rules,
+                        clock: &*self.clock,
+                        event_log: &*self.event_log,
+                    },
+                );
+            }
+            ctx.checkpoint_events_since += 1;
+
+            return Ok(true);
+        }
+
         // Advance sequence tracker and deliver the in-order message.
         ctx.sequence_tracker
             .advance(context_id, sender_did, inner.sequence, inner.timestamp);
@@ -1172,10 +1523,21 @@ impl ContextManager {
                 msg.inner.sequence,
                 msg.inner.timestamp,
             );
-            ctx.receive_buffer.push(ContextEvent::MessageReceived {
-                sender_did: DID(msg.sender_did.clone()),
-                payload: msg.plaintext.clone(),
-            });
+            if let Some(event_name) =
+                deliver_plaintext_or_announcement(ctx, &msg.sender_did, &msg.plaintext, context_id)
+            {
+                // Bug fix (#1534): drain_consecutive within normal message
+                // path now runs consequence evaluation per message.
+                run_buffered_post_delivery(
+                    ctx,
+                    context_id,
+                    context_id_bytes,
+                    &msg.sender_did,
+                    event_name,
+                    &*self.clock,
+                    &*self.event_log,
+                );
+            }
         }
 
         // H5: Append the durable event log entry for `MessageReceived` BEFORE
@@ -1262,6 +1624,6 @@ impl ContextManager {
 
         crate::metrics::record_message_received();
 
-        Ok(())
+        Ok(false)
     }
 }

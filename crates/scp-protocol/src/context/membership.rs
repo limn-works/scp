@@ -780,6 +780,18 @@ pub enum ContextEvent {
         /// Total attempt count.
         attempts: u32,
     },
+    /// A member announced their pseudonym routing ID for this context (§9.10.4).
+    ///
+    /// Emitted when an incoming MLS application message carries a pseudonym
+    /// announcement. The pseudonym is stored in the per-context pseudonym
+    /// registry so that subsequent `send_message` calls route messages to the
+    /// member's pseudonym rather than the shared context routing ID.
+    PseudonymAnnounced {
+        /// The DID of the member who announced their pseudonym.
+        member_did: DID,
+        /// The 32-byte pseudonym-derived routing ID.
+        pseudonym: [u8; 32],
+    },
 }
 
 // ---------------------------------------------------------------------------

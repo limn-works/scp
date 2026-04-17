@@ -775,6 +775,7 @@ async fn broadcast_close_context_drops_state() {
             "broadcast-close-ctx".into(),
             params,
             "did:key:author1".into(),
+            None,
         )
         .await
         .unwrap();
@@ -1328,7 +1329,7 @@ async fn revoke_read_access_rejected_without_member_ban_ceiling() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context("no-ban-ctx".into(), params, "did:key:alice".into())
+        .create_context("no-ban-ctx".into(), params, "did:key:alice".into(), None)
         .await
         .unwrap();
     {
@@ -1470,7 +1471,12 @@ async fn restore_read_access_rejected_without_member_ban_ceiling() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context("no-ban-restore-ctx".into(), params, "did:key:alice".into())
+        .create_context(
+            "no-ban-restore-ctx".into(),
+            params,
+            "did:key:alice".into(),
+            None,
+        )
         .await
         .unwrap();
     let ctx_id = "no-ban-restore-ctx".to_owned();
@@ -2513,7 +2519,12 @@ async fn revoke_write_access_rejected_without_member_ban() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context("no-ban-write-ctx".into(), params, "did:key:alice".into())
+        .create_context(
+            "no-ban-write-ctx".into(),
+            params,
+            "did:key:alice".into(),
+            None,
+        )
         .await
         .unwrap();
     {

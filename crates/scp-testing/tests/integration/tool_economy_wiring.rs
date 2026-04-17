@@ -427,7 +427,7 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
     params.economic_policy = Some(priced_policy(7));
 
     let _handle = manager
-        .create_context(context_id.clone(), params, invoker.clone())
+        .create_context(context_id.clone(), params, invoker.clone(), None)
         .await
         .expect("create_context");
 
@@ -548,7 +548,7 @@ async fn invoke_tool_with_economy_rejects_insufficient_budget() {
     params.economic_policy = Some(priced_policy(100));
 
     let _handle = manager
-        .create_context(context_id.clone(), params, invoker.clone())
+        .create_context(context_id.clone(), params, invoker.clone(), None)
         .await
         .expect("create_context");
 

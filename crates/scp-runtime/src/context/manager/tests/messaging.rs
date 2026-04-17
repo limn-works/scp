@@ -150,7 +150,12 @@ async fn send_message_transport_failure_no_phantom_event() {
     };
 
     let handle = manager
-        .create_context("test-ctx-fail".into(), params, "did:key:creator".into())
+        .create_context(
+            "test-ctx-fail".into(),
+            params,
+            "did:key:creator".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -382,7 +387,7 @@ async fn setup_two_member_verified_context() -> (
     manager.register_local_did("did:key:alice".into()).await;
 
     let handle = manager
-        .create_context("test-ctx".into(), params, "did:key:alice".into())
+        .create_context("test-ctx".into(), params, "did:key:alice".into(), None)
         .await
         .unwrap();
 
@@ -667,7 +672,7 @@ async fn revoked_member_cannot_decrypt_new_messages() {
         ..ContextParams::default()
     };
     let _bob_handle = bob_manager
-        .create_context("test-ctx".into(), bob_params, "did:key:bob".into())
+        .create_context("test-ctx".into(), bob_params, "did:key:bob".into(), None)
         .await
         .unwrap();
 
@@ -1328,7 +1333,12 @@ async fn send_message_produces_valid_outer_envelope() {
     };
 
     let handle = manager
-        .create_context("envelope-test-ctx".into(), params, "did:key:creator".into())
+        .create_context(
+            "envelope-test-ctx".into(),
+            params,
+            "did:key:creator".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -1584,7 +1594,7 @@ async fn velocity_consequence_trigger_on_send() {
         window: Duration::from_hours(1),
     }];
     let _handle = manager
-        .create_context("vel-msg-ctx".into(), params, "did:key:admin".into())
+        .create_context("vel-msg-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -1669,7 +1679,12 @@ async fn escalation_kicks_in_at_velocity_threshold_10() {
     let mut params = governance_params();
     params.economic_policy = Some(escalation_test_policy());
     let handle = manager
-        .create_context("escalation-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "escalation-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -1787,7 +1802,12 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
         .push(scp_protocol::context::params::Capability::ToolInvokeAll);
     params.economic_policy = Some(escalation_test_policy());
     let _handle = manager
-        .create_context("tool-esc-ctx".into(), params, "did:key:invoker".into())
+        .create_context(
+            "tool-esc-ctx".into(),
+            params,
+            "did:key:invoker".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -1891,7 +1911,12 @@ async fn try_consume_hard_rate_limit_async_variant_is_safe_from_async_context() 
     );
     let alice: DID = "did:key:alice".into();
     let _handle = manager
-        .create_context("async-hrl-ctx".into(), governance_params(), alice.clone())
+        .create_context(
+            "async-hrl-ctx".into(),
+            governance_params(),
+            alice.clone(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -1953,7 +1978,12 @@ fn any_context_helper_survives_current_thread_runtime() {
     let alice_for_setup = alice.clone();
     rt.block_on(async move {
         manager_for_setup
-            .create_context("ct-rt-ctx".into(), governance_params(), alice_for_setup)
+            .create_context(
+                "ct-rt-ctx".into(),
+                governance_params(),
+                alice_for_setup,
+                None,
+            )
             .await
             .expect("create_context must succeed");
     });
@@ -2008,7 +2038,7 @@ fn any_context_helper_survives_no_runtime() {
         let alice_setup = alice.clone();
         rt.block_on(async move {
             manager_setup
-                .create_context("no-rt-ctx".into(), governance_params(), alice_setup)
+                .create_context("no-rt-ctx".into(), governance_params(), alice_setup, None)
                 .await
                 .expect("create_context must succeed");
         });
@@ -2047,7 +2077,12 @@ async fn block_in_place_bridge_pattern_survives_mcp_sync_in_async_call() {
     );
     let alice: DID = "did:key:alice".into();
     let _handle = manager
-        .create_context("mcp-sync-ctx".into(), governance_params(), alice.clone())
+        .create_context(
+            "mcp-sync-ctx".into(),
+            governance_params(),
+            alice.clone(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -2096,7 +2131,7 @@ async fn tool_invoke_respects_hard_rate_limit() {
         .push(scp_protocol::context::params::Capability::ToolInvokeAll);
     // Free context — the hard rate limit fires independent of cost.
     let _handle = manager
-        .create_context("tool-rl-ctx".into(), params, "did:key:spammer".into())
+        .create_context("tool-rl-ctx".into(), params, "did:key:spammer".into(), None)
         .await
         .unwrap();
 
@@ -2205,6 +2240,7 @@ async fn tool_invoke_failure_refunds_hard_rate_limit_token() {
             "tool-rl-refund-ctx".into(),
             params,
             "did:key:invoker".into(),
+            None,
         )
         .await
         .unwrap();
@@ -2541,6 +2577,7 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
             "h17-output-fail-ctx".into(),
             params,
             "did:key:invoker".into(),
+            None,
         )
         .await
         .unwrap();
@@ -2734,7 +2771,12 @@ async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
         .push(scp_protocol::context::params::Capability::ToolInvokeAll);
     params.economic_policy = Some(h17_priced_tool_policy());
     let _handle = manager
-        .create_context("h17-happy-ctx".into(), params, "did:key:invoker".into())
+        .create_context(
+            "h17-happy-ctx".into(),
+            params,
+            "did:key:invoker".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -2856,7 +2898,12 @@ async fn join_context_records_velocity_for_joiner() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("join-vel-ctx".into(), params, "did:key:creator".into())
+        .create_context(
+            "join-vel-ctx".into(),
+            params,
+            "did:key:creator".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -2864,7 +2911,7 @@ async fn join_context_records_velocity_for_joiner() {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     let velocity = {
         let arc = manager
@@ -2908,7 +2955,7 @@ async fn enforcement_failure_rolls_back_velocity_and_rate_limit() {
     let mut params = governance_params();
     params.economic_policy = Some(escalation_test_policy());
     let handle = manager
-        .create_context("rollback-ctx".into(), params, "did:key:sender".into())
+        .create_context("rollback-ctx".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
 
@@ -3008,7 +3055,7 @@ async fn hard_rate_limit_rejects_burst_over_ten() {
     // independent of cost and should still fire.
     let params = governance_params();
     let handle = manager
-        .create_context("rate-ctx".into(), params, "did:key:spammer".into())
+        .create_context("rate-ctx".into(), params, "did:key:spammer".into(), None)
         .await
         .unwrap();
 
@@ -3077,7 +3124,7 @@ async fn governance_actions_stay_free_under_priced_policy() {
     let mut params = governance_params();
     params.economic_policy = Some(escalation_test_policy());
     let _handle = manager
-        .create_context("gov-free-ctx".into(), params, "did:key:admin".into())
+        .create_context("gov-free-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -3348,7 +3395,12 @@ async fn capture_send_payment_success_no_failure_event() {
         ..ContextParams::default()
     };
     let handle = manager
-        .create_context("h19-success-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "h19-success-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -3454,7 +3506,12 @@ async fn deliver_message_skips_velocity_for_local_sender() {
 
     let params = governance_params();
     manager
-        .create_context("vel-skip-ctx".into(), params, "did:key:local-sender".into())
+        .create_context(
+            "vel-skip-ctx".into(),
+            params,
+            "did:key:local-sender".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -3613,7 +3670,7 @@ async fn setup_two_member_context_with(
     manager.register_local_did("did:key:alice".into()).await;
 
     let handle = manager
-        .create_context("test-ctx".into(), params, "did:key:alice".into())
+        .create_context("test-ctx".into(), params, "did:key:alice".into(), None)
         .await
         .unwrap();
 
@@ -3955,7 +4012,7 @@ async fn c1b_paid_tool_context(
     });
 
     let _handle = manager
-        .create_context(name.to_owned(), params, invoker.clone())
+        .create_context(name.to_owned(), params, invoker.clone(), None)
         .await
         .unwrap();
 
@@ -4340,4 +4397,268 @@ async fn tool_invoke_happy_path_with_valid_spending_ucan() {
         before - after >= 10,
         "happy-path invoke must deduct at least per_tool_invoke=10: before={before} after={after}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// §9.10.4 Pseudonym Routing Tests
+// ---------------------------------------------------------------------------
+
+/// Verifies that creating a context with a pseudonym stores it in `PerContextState`.
+#[tokio::test]
+async fn create_context_with_pseudonym_stores_in_state() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let pseudonym: [u8; 32] = [42u8; 32];
+
+    let _handle = manager
+        .create_context(
+            "pseudonym-ctx-1".into(),
+            scp_protocol::context::ContextParams::default(),
+            "did:key:creator".into(),
+            Some(pseudonym),
+        )
+        .await
+        .expect("create_context should succeed");
+
+    // Verify the pseudonym is stored.
+    let stored = manager.local_pseudonym("pseudonym-ctx-1").await.unwrap();
+    assert_eq!(
+        stored,
+        Some(pseudonym),
+        "pseudonym must be stored in context state"
+    );
+}
+
+/// Verifies that creating a context without a pseudonym stores None.
+#[tokio::test]
+async fn create_context_without_pseudonym_stores_none() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let _handle = manager
+        .create_context(
+            "no-pseudonym-ctx".into(),
+            scp_protocol::context::ContextParams::default(),
+            "did:key:creator".into(),
+            None,
+        )
+        .await
+        .expect("create_context should succeed");
+
+    let stored = manager.local_pseudonym("no-pseudonym-ctx").await.unwrap();
+    assert_eq!(stored, None, "pseudonym must be None when not provided");
+}
+
+/// Verifies that `PseudonymAnnouncement` deserialization round-trips correctly.
+#[test]
+fn pseudonym_announcement_roundtrip() {
+    use super::super::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
+
+    let announcement = PseudonymAnnouncement {
+        tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+        member_did: "did:key:alice".to_owned(),
+        pseudonym: [7u8; 32],
+    };
+
+    let bytes = rmp_serde::to_vec_named(&announcement).expect("serialize");
+    let decoded: PseudonymAnnouncement = rmp_serde::from_slice(&bytes).expect("deserialize");
+
+    assert_eq!(decoded.tag, PSEUDONYM_ANNOUNCEMENT_TAG);
+    assert_eq!(decoded.member_did, "did:key:alice");
+    assert_eq!(decoded.pseudonym, [7u8; 32]);
+}
+
+/// Verifies that `broadcast_routing_id` uses plain SHA-256 (no domain separator).
+#[test]
+fn broadcast_routing_id_uses_plain_sha256() {
+    let ctx_id = "broadcast-test-ctx";
+    let broadcast_rid = scp_protocol::context::broadcast_routing_id(ctx_id);
+    let raw_bytes = scp_protocol::context::context_id_bytes(ctx_id);
+    assert_eq!(
+        broadcast_rid, raw_bytes,
+        "broadcast routing ID must be plain SHA-256(context_id)"
+    );
+
+    // Must differ from encrypted routing ID.
+    let encrypted_rid = scp_protocol::context::context_routing_id(ctx_id);
+    assert_ne!(
+        broadcast_rid, encrypted_rid,
+        "broadcast and encrypted routing IDs must differ"
+    );
+}
+
+/// Verifies that `send_message` for encrypted contexts uses pseudonym fan-out
+/// when members have announced pseudonyms.
+#[tokio::test]
+async fn send_message_encrypted_uses_pseudonym_fanout() {
+    let transport = MockTransport::connected();
+    let routing_ids = transport.routing_ids_handle();
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(transport),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+
+    manager.register_local_did("did:key:alice".into()).await;
+
+    let handle = manager
+        .create_context("fanout-ctx".into(), params, "did:key:alice".into(), None)
+        .await
+        .unwrap();
+
+    // Add Bob as a member.
+    {
+        let arc = manager.get_context_arc("fanout-ctx").unwrap();
+        let mut guard = arc.lock().await;
+        let ctx = &mut *guard;
+        ctx.membership
+            .add_member("did:key:bob".into(), "member".into(), vec![]);
+        ctx.role_state.members.insert("did:key:bob".to_owned());
+        let bob_access_key =
+            scp_protocol::crypto::access_keys::generate_access_key("fanout-ctx", "did:key:bob");
+        ctx.access
+            .access_key_store
+            .set("fanout-ctx", "did:key:bob", bob_access_key);
+
+        // Insert a pseudonym for Bob into the registry.
+        ctx.pseudonym_registry
+            .insert("did:key:bob".into(), [0xBBu8; 32]);
+    }
+
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+
+    // Send a message — should fan out to both Bob's pseudonym and shared routing ID.
+    manager
+        .send_message(&handle, &alice_did, b"hello", Some(&alice_sk), None, None)
+        .await
+        .expect("send should succeed");
+
+    // The transport should have received sends to multiple routing IDs.
+    let sent_rids = routing_ids.lock().unwrap();
+    assert!(
+        sent_rids.len() >= 2,
+        "expected at least 2 transport sends (pseudonym + shared), got {}",
+        sent_rids.len()
+    );
+
+    // Verify that the shared routing ID is among the sends.
+    let shared_rid = scp_protocol::context::context_routing_id("fanout-ctx");
+    let has_shared = sent_rids.contains(&shared_rid);
+    assert!(has_shared, "shared routing ID must be included in fan-out");
+
+    // Verify that Bob's pseudonym is among the sends.
+    let has_pseudonym = sent_rids.contains(&[0xBBu8; 32]);
+    assert!(
+        has_pseudonym,
+        "Bob's pseudonym routing ID must be included in fan-out"
+    );
+}
+
+/// Verifies that a forged `PseudonymAnnouncement` where `member_did` does not
+/// match the MLS-authenticated sender is rejected with `PermissionDenied`.
+#[tokio::test]
+async fn forged_pseudonym_announcement_rejected() {
+    use super::super::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let params = governance_params();
+
+    manager.register_local_did("did:key:alice".into()).await;
+
+    let _handle = manager
+        .create_context("forge-ctx".into(), params, "did:key:alice".into(), None)
+        .await
+        .unwrap();
+
+    // Add Bob as a member.
+    {
+        let arc = manager.get_context_arc("forge-ctx").unwrap();
+        let mut guard = arc.lock().await;
+        let ctx = &mut *guard;
+        ctx.membership
+            .add_member("did:key:bob".into(), "member".into(), vec![]);
+        ctx.role_state.members.insert("did:key:bob".to_owned());
+        // Grant Bob messages:write via admin-like role (default ceiling includes it).
+        let bob_did: DID = "did:key:bob".into();
+        let _ = scp_protocol::context::roles::system_assign_role(
+            &mut ctx.role_state,
+            &bob_did,
+            "member",
+            &scp_primitives::SystemClock,
+        );
+    }
+
+    let context_id_bytes = scp_protocol::context::context_id_bytes("forge-ctx");
+
+    // Build a forged announcement: Bob sends an announcement claiming to be Alice.
+    let forged = PseudonymAnnouncement {
+        tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+        member_did: "did:key:alice".to_owned(), // <-- forged: claims to be Alice
+        pseudonym: [0xEEu8; 32],
+    };
+    let payload = rmp_serde::to_vec_named(&forged).unwrap();
+
+    let inner = minimal_inner_envelope("forge-ctx", "did:key:bob", 1);
+
+    // Deliver as if Bob sent this message (MLS-authenticated sender = Bob).
+    let result = manager
+        .deliver_message_and_drain_buffered(
+            "forge-ctx",
+            &context_id_bytes,
+            "did:key:bob", // MLS says this is Bob
+            &inner,
+            &payload,
+            false,
+        )
+        .await;
+
+    // Must be rejected with PermissionDenied.
+    match result {
+        Err(scp_protocol::context::ContextError::PermissionDenied(msg)) => {
+            assert!(
+                msg.contains("does not match sender"),
+                "error should mention sender mismatch: {msg}"
+            );
+        }
+        other => {
+            panic!(
+                "forged pseudonym announcement must be rejected with PermissionDenied, got: {other:?}"
+            );
+        }
+    }
+
+    // Verify the forged pseudonym was NOT stored in the registry.
+    {
+        let arc = manager.get_context_arc("forge-ctx").unwrap();
+        let guard = arc.lock().await;
+        assert!(
+            !guard.pseudonym_registry.contains_key("did:key:alice"),
+            "forged pseudonym must not be stored in registry"
+        );
+    }
 }

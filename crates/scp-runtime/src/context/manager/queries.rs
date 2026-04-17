@@ -50,6 +50,24 @@ impl ContextManager {
         self.local_dids.read().await.contains(did)
     }
 
+    /// Returns the local member's pseudonym routing ID for a context (§9.10.4).
+    ///
+    /// Returns `None` if no pseudonym was set (legacy callers, broadcast contexts).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is not registered.
+    pub async fn local_pseudonym(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<[u8; 32]>, ContextError> {
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let guard = ctx_arc.lock().await;
+        Ok(guard.local_pseudonym)
+    }
+
     /// Returns the broadcast key and epoch for a locally controlled author
     /// in a broadcast context.
     ///

@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let handle = manager
-        .create_context("my-context".to_owned(), params, did.clone())
+        .create_context("my-context".to_owned(), params, did.clone(), None)
         .await?;
     println!("Created context: {}", handle.context_id());
 

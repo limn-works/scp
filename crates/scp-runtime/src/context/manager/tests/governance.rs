@@ -105,6 +105,7 @@ async fn create_context_rejects_threshold_exceeding_signers() {
             "ctx-bad-threshold".into(),
             params,
             "did:dht:z6MkAlice".into(),
+            None,
         )
         .await;
 
@@ -133,6 +134,7 @@ async fn create_context_rejects_threshold_zero() {
             "ctx-zero-threshold".into(),
             params,
             "did:dht:z6MkAlice".into(),
+            None,
         )
         .await;
 
@@ -160,6 +162,7 @@ async fn create_context_rejects_majority_empty_voters() {
             "ctx-empty-majority".into(),
             params,
             "did:dht:z6MkAlice".into(),
+            None,
         )
         .await;
 
@@ -190,6 +193,7 @@ async fn create_context_rejects_unanimity_empty_voters() {
             "ctx-empty-unanimity".into(),
             params,
             "did:dht:z6MkAlice".into(),
+            None,
         )
         .await;
 
@@ -231,6 +235,7 @@ async fn single_admin_propose_auto_executes() {
             "ctx-single-admin-lifecycle".into(),
             params,
             creator_did.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -311,7 +316,7 @@ async fn threshold_context_proposal_lifecycle() {
 
     // Create context (alice is the creator/admin).
     let _handle = manager
-        .create_context("ctx-threshold".into(), params, alice.clone())
+        .create_context("ctx-threshold".into(), params, alice.clone(), None)
         .await
         .unwrap();
 
@@ -386,7 +391,7 @@ async fn majority_context_proposal_lifecycle() {
     };
 
     let _handle = manager
-        .create_context("ctx-majority".into(), params, alice.clone())
+        .create_context("ctx-majority".into(), params, alice.clone(), None)
         .await
         .unwrap();
 
@@ -452,7 +457,7 @@ async fn unanimity_context_single_rejection_defeats_proposal() {
 
     // Add bob as member so we can test RemoveMember doesn't happen.
     let _handle = manager
-        .create_context("ctx-unanimity".into(), params, alice.clone())
+        .create_context("ctx-unanimity".into(), params, alice.clone(), None)
         .await
         .unwrap();
 
@@ -550,7 +555,7 @@ async fn non_eligible_voter_rejected() {
     };
 
     let _handle = manager
-        .create_context("ctx-eligibility".into(), params, alice.clone())
+        .create_context("ctx-eligibility".into(), params, alice.clone(), None)
         .await
         .unwrap();
 
@@ -657,6 +662,8 @@ fn governance_snapshot_serde_roundtrip() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -748,7 +755,7 @@ async fn promote_context_succeeds_when_policy_is_promotable() {
     };
 
     let handle = manager
-        .create_context("promo-ctx".into(), params, "did:key:creator".into())
+        .create_context("promo-ctx".into(), params, "did:key:creator".into(), None)
         .await
         .unwrap();
 
@@ -829,7 +836,12 @@ async fn promote_context_does_not_mutate_promotion_policy() {
     };
 
     let handle = manager
-        .create_context("promo-immut-ctx".into(), params, "did:key:creator".into())
+        .create_context(
+            "promo-immut-ctx".into(),
+            params,
+            "did:key:creator".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -898,7 +910,12 @@ async fn setup_context_with_ceiling(
     };
 
     let handle = manager
-        .create_context("ceiling-test-ctx".into(), params, "did:key:creator".into())
+        .create_context(
+            "ceiling-test-ctx".into(),
+            params,
+            "did:key:creator".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -1087,7 +1104,7 @@ async fn revoke_rejected_without_member_ban_ceiling() {
     };
 
     let _handle = manager
-        .create_context("bc-no-ban".into(), params, "did:key:alice".into())
+        .create_context("bc-no-ban".into(), params, "did:key:alice".into(), None)
         .await
         .unwrap();
 
@@ -1135,7 +1152,7 @@ async fn governance_single_admin_engine_constructed() {
     };
     let creator: DID = "did:key:admin1".into();
     let handle = manager
-        .create_context("ctx-gov-sa".into(), params, creator.clone())
+        .create_context("ctx-gov-sa".into(), params, creator.clone(), None)
         .await
         .unwrap();
     assert_eq!(handle.state().await, ContextState::Active);
@@ -1511,7 +1528,7 @@ async fn governance_default_engine_all_variants() {
         };
         let ctx_id = format!("ctx-default-{i}");
         let handle = manager
-            .create_context(ctx_id.clone(), params, creator.clone())
+            .create_context(ctx_id.clone(), params, creator.clone(), None)
             .await
             .unwrap();
         assert_eq!(handle.state().await, ContextState::Active);
@@ -1546,7 +1563,7 @@ async fn setup_governance_context() -> (ContextManager, ContextHandle, String) {
 
     let admin_did: DID = "did:key:admin".into();
     let handle = manager
-        .create_context("gov-ctx".into(), params, admin_did)
+        .create_context("gov-ctx".into(), params, admin_did, None)
         .await
         .unwrap();
 
@@ -1620,7 +1637,10 @@ async fn governance_propose_checked_without_capability_rejected() {
         let ctx = arc.lock().await;
         ctx.handle.clone()
     };
-    manager.join_context(&handle_ref, kp, None).await.unwrap();
+    manager
+        .join_context(&handle_ref, kp, None, None)
+        .await
+        .unwrap();
 
     let bob_did: DID = "did:key:bob".into();
     let signing_key = signing_key_for_did(&bob_did);
@@ -1653,7 +1673,10 @@ async fn governance_vote_without_capability_rejected() {
         let ctx = arc.lock().await;
         ctx.handle.clone()
     };
-    manager.join_context(&handle_ref, kp, None).await.unwrap();
+    manager
+        .join_context(&handle_ref, kp, None, None)
+        .await
+        .unwrap();
 
     let bob_did: DID = "did:key:bob".into();
     let signing_key = signing_key_for_did(&bob_did);
@@ -1702,7 +1725,7 @@ async fn governance_propose_checked_records_events() {
 
     let admin_did: DID = "did:key:admin".into();
     let _handle = manager
-        .create_context("ev-ctx".into(), params, admin_did.clone())
+        .create_context("ev-ctx".into(), params, admin_did.clone(), None)
         .await
         .unwrap();
 
@@ -1753,13 +1776,13 @@ async fn governance_threshold_propose_approve_lifecycle() {
     };
 
     let handle = manager
-        .create_context("thresh-ctx".into(), params, alice_did.clone())
+        .create_context("thresh-ctx".into(), params, alice_did.clone(), None)
         .await
         .unwrap();
 
     // Join bob.
     let kp = KeyPackage::mock("did:key:bob".into());
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Grant governance capabilities to bob.
     {
@@ -1916,7 +1939,12 @@ async fn governance_dispatch_returns_typed_results() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("typed-result-ctx".into(), params, "did:key:creator".into())
+        .create_context(
+            "typed-result-ctx".into(),
+            params,
+            "did:key:creator".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -2033,7 +2061,7 @@ async fn governance_auto_execution_threshold_on_approval() {
     };
 
     let _handle = manager
-        .create_context("thresh-auto-ctx".into(), params, creator.clone())
+        .create_context("thresh-auto-ctx".into(), params, creator.clone(), None)
         .await
         .unwrap();
 
@@ -2088,7 +2116,7 @@ async fn close_context_through_governance_threshold() {
     };
 
     let handle = manager
-        .create_context("close-thresh-ctx".into(), params, creator.clone())
+        .create_context("close-thresh-ctx".into(), params, creator.clone(), None)
         .await
         .unwrap();
 
@@ -2116,7 +2144,12 @@ async fn extend_ttl_rejects_without_unanimity() {
     let mut params = governance_params();
     params.ttl = Some(std::time::Duration::from_hours(1));
     let _handle = manager
-        .create_context("ttl-unan-ctx".into(), params, "did:key:creator".into())
+        .create_context(
+            "ttl-unan-ctx".into(),
+            params,
+            "did:key:creator".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -2166,7 +2199,12 @@ async fn extend_ttl_succeeds_with_unanimity() {
     let mut params = governance_params();
     params.ttl = Some(std::time::Duration::from_hours(1));
     let _handle = manager
-        .create_context("ttl-unan2-ctx".into(), params, "did:key:creator".into())
+        .create_context(
+            "ttl-unan2-ctx".into(),
+            params,
+            "did:key:creator".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -2230,6 +2268,7 @@ async fn promote_context_requires_unanimity() {
             "promo-unanimity-ctx".into(),
             params,
             "did:key:creator".into(),
+            None,
         )
         .await
         .unwrap();
@@ -2307,7 +2346,7 @@ async fn governance_bypass_prevented_for_multi_admin_close() {
         eligible_voters: vec![creator.clone()],
     };
     let handle = manager
-        .create_context("bypass-test-ctx".into(), params, creator.clone())
+        .create_context("bypass-test-ctx".into(), params, creator.clone(), None)
         .await
         .unwrap();
 
@@ -2348,7 +2387,12 @@ async fn add_signer_mints_governance_ucans() {
         signers: vec!["did:key:creator".into()],
     };
     let _handle = manager
-        .create_context("signer-ucan-ctx".into(), params, "did:key:creator".into())
+        .create_context(
+            "signer-ucan-ctx".into(),
+            params,
+            "did:key:creator".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -2414,7 +2458,12 @@ async fn remove_signer_revokes_governance_ucans() {
         signers: vec!["did:key:creator".into()],
     };
     let _handle = manager
-        .create_context("rm-signer-ctx".into(), params, "did:key:creator".into())
+        .create_context(
+            "rm-signer-ctx".into(),
+            params,
+            "did:key:creator".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -2558,7 +2607,7 @@ async fn scp274_threshold_full_lifecycle() {
         signers: vec![creator.clone(), signer2.clone()],
     };
     let _handle = manager
-        .create_context("scp274-thresh".into(), params, creator.clone())
+        .create_context("scp274-thresh".into(), params, creator.clone(), None)
         .await
         .unwrap();
     {
@@ -2626,7 +2675,7 @@ async fn scp274_majority_full_lifecycle() {
         eligible_voters: vec![creator.clone()],
     };
     let _handle = manager
-        .create_context("scp274-maj".into(), params, creator.clone())
+        .create_context("scp274-maj".into(), params, creator.clone(), None)
         .await
         .unwrap();
     {
@@ -2676,7 +2725,7 @@ async fn scp274_unanimity_full_lifecycle() {
         eligible_voters: vec![creator.clone(), member2.clone()],
     };
     let _handle = manager
-        .create_context("scp274-unan".into(), params, creator.clone())
+        .create_context("scp274-unan".into(), params, creator.clone(), None)
         .await
         .unwrap();
     {
@@ -2736,7 +2785,7 @@ async fn scp274_rejected_proposal_does_not_execute() {
         signers: vec![creator.clone(), signer2.clone()],
     };
     let _handle = manager
-        .create_context("scp274-reject".into(), params, creator.clone())
+        .create_context("scp274-reject".into(), params, creator.clone(), None)
         .await
         .unwrap();
     {
@@ -2797,7 +2846,7 @@ async fn scp274_governance_events_in_log() {
         signers: vec![creator.clone(), signer2.clone()],
     };
     let _handle = manager
-        .create_context("scp274-events".into(), params, creator.clone())
+        .create_context("scp274-events".into(), params, creator.clone(), None)
         .await
         .unwrap();
     {
@@ -2866,7 +2915,7 @@ async fn scp274_bypass_prevention() {
         eligible_voters: vec![creator.clone()],
     };
     let handle = manager
-        .create_context("scp274-bypass".into(), params, creator.clone())
+        .create_context("scp274-bypass".into(), params, creator.clone(), None)
         .await
         .unwrap();
     let result = manager.close_context(&handle, &creator).await;
@@ -2887,7 +2936,7 @@ async fn scp274_exercises_seven_action_variants() {
     );
     let params = governance_params();
     let _handle = manager
-        .create_context("scp274-7a".into(), params, "did:key:admin".into())
+        .create_context("scp274-7a".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
     let add = approved_proposal(
@@ -2969,7 +3018,7 @@ async fn scp274_exercises_seven_action_variants() {
     let mut params2 = governance_params();
     params2.ttl = Some(std::time::Duration::from_hours(1));
     let _h2 = manager
-        .create_context("scp274-7b".into(), params2, "did:key:admin".into())
+        .create_context("scp274-7b".into(), params2, "did:key:admin".into(), None)
         .await
         .unwrap();
     {
@@ -3071,7 +3120,12 @@ async fn scp274_extend_ttl_unanimity_override_in_threshold() {
         signers: vec!["did:key:creator".into()],
     };
     let _handle = manager
-        .create_context("scp274-ttl-t".into(), params, "did:key:creator".into())
+        .create_context(
+            "scp274-ttl-t".into(),
+            params,
+            "did:key:creator".into(),
+            None,
+        )
         .await
         .unwrap();
     let add = approved_proposal(
@@ -3137,7 +3191,7 @@ async fn scp274_promote_context_unanimity_override_in_majority() {
     params.memory_scope = MemoryScope::Ephemeral;
     params.ttl = Some(std::time::Duration::from_hours(1));
     let _handle = manager
-        .create_context("scp274-promo".into(), params, creator.clone())
+        .create_context("scp274-promo".into(), params, creator.clone(), None)
         .await
         .unwrap();
     let add = approved_proposal(
@@ -3191,7 +3245,12 @@ async fn scp274_conflict_detection_change_role() {
     );
     let params = governance_params();
     let _handle = manager
-        .create_context("scp274-conflict".into(), params, "did:key:admin".into())
+        .create_context(
+            "scp274-conflict".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
     {
@@ -3387,7 +3446,7 @@ async fn execute_modify_ceiling_sets_pending_with_72h_period() {
     };
 
     let _handle = manager
-        .create_context("ctx-ceiling".into(), params, alice.clone())
+        .create_context("ctx-ceiling".into(), params, alice.clone(), None)
         .await
         .unwrap();
 
@@ -3449,7 +3508,7 @@ async fn apply_pending_ceiling_modification_respects_notification_period() {
     };
 
     let _handle = manager
-        .create_context("ctx-apply".into(), params, alice.clone())
+        .create_context("ctx-apply".into(), params, alice.clone(), None)
         .await
         .unwrap();
 
@@ -3532,7 +3591,7 @@ async fn execute_modify_ceiling_emits_ceiling_change_notification() {
     };
 
     let _handle = manager
-        .create_context("ctx-notify".into(), params, alice.clone())
+        .create_context("ctx-notify".into(), params, alice.clone(), None)
         .await
         .unwrap();
 
@@ -3684,7 +3743,7 @@ async fn execute_set_economic_policy_stages_with_24h_delay() {
     };
 
     let _handle = manager
-        .create_context("ctx-econ-delay".into(), params, alice.clone())
+        .create_context("ctx-econ-delay".into(), params, alice.clone(), None)
         .await
         .unwrap();
 
@@ -3757,7 +3816,7 @@ async fn apply_pending_economic_policy_change_respects_notification_period() {
     };
 
     let _handle = manager
-        .create_context("ctx-econ-apply".into(), params, alice.clone())
+        .create_context("ctx-econ-apply".into(), params, alice.clone(), None)
         .await
         .unwrap();
 
@@ -3856,7 +3915,7 @@ async fn execute_set_economic_policy_emits_notification_event() {
     };
 
     let _handle = manager
-        .create_context("ctx-econ-notify".into(), params, alice.clone())
+        .create_context("ctx-econ-notify".into(), params, alice.clone(), None)
         .await
         .unwrap();
 
@@ -3924,7 +3983,7 @@ async fn execute_set_economic_policy_rejects_when_already_pending() {
     };
 
     let _handle = manager
-        .create_context("ctx-econ-dup".into(), params, alice.clone())
+        .create_context("ctx-econ-dup".into(), params, alice.clone(), None)
         .await
         .unwrap();
 
@@ -3989,7 +4048,7 @@ async fn modify_hard_rate_limit_updates_live_limiter() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context("ctx-rl-modify".into(), params, alice.clone())
+        .create_context("ctx-rl-modify".into(), params, alice.clone(), None)
         .await
         .unwrap();
 
@@ -4083,7 +4142,7 @@ async fn modify_hard_rate_limit_clamps_preserved_state_when_tightening() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context("ctx-rl-clamp".into(), params, alice.clone())
+        .create_context("ctx-rl-clamp".into(), params, alice.clone(), None)
         .await
         .unwrap();
 
@@ -4172,7 +4231,7 @@ async fn modify_hard_rate_limit_rejects_invalid_config() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context("ctx-rl-invalid".into(), params, alice.clone())
+        .create_context("ctx-rl-invalid".into(), params, alice.clone(), None)
         .await
         .unwrap();
 
@@ -4234,7 +4293,7 @@ async fn setup_budget_context(ctx_id: &str) -> (ContextManager, DID, DID) {
         ..ContextParams::default()
     };
     manager
-        .create_context(ctx_id.into(), params, admin_did.clone())
+        .create_context(ctx_id.into(), params, admin_did.clone(), None)
         .await
         .unwrap();
     let sk = signing_key_for_did(&admin_did);
@@ -4256,7 +4315,7 @@ async fn setup_budget_context(ctx_id: &str) -> (ContextManager, DID, DID) {
 /// Verifies that `ApproveSpend` grants budget and additive grants accumulate.
 #[tokio::test]
 async fn approve_spend_grants_budget_to_member_tracker() {
-    let (manager, admin, spender) = setup_budget_context("budget-ctx").await;
+    let (manager, admin, spender) = Box::pin(setup_budget_context("budget-ctx")).await;
     let sk = signing_key_for_did(&admin);
 
     // No budget initially.
@@ -4338,7 +4397,7 @@ async fn approve_spend_rejects_non_member_spender() {
         ..ContextParams::default()
     };
     manager
-        .create_context("reject-ctx".into(), params, admin_did.clone())
+        .create_context("reject-ctx".into(), params, admin_did.clone(), None)
         .await
         .unwrap();
     let sk = signing_key_for_did(&admin_did);
@@ -4365,7 +4424,7 @@ async fn approve_spend_rejects_non_member_spender() {
 /// and survives serde roundtrip.
 #[tokio::test]
 async fn budget_tracker_included_in_snapshot() {
-    let (manager, admin, spender) = setup_budget_context("snap-ctx").await;
+    let (manager, admin, spender) = Box::pin(setup_budget_context("snap-ctx")).await;
     let sk = signing_key_for_did(&admin);
     manager
         .propose_governance_action(
@@ -5245,7 +5304,7 @@ async fn test_remove_member_sender_key_before_mls_removal() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("sk-order-ctx".into(), params, "did:key:admin".into())
+        .create_context("sk-order-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -5316,7 +5375,7 @@ async fn test_consequence_rule_triggers_enforcement_event() {
     let mut params = governance_params();
     params.economic_policy = None;
     let _handle = manager
-        .create_context("conseq-ctx".into(), params, "did:key:admin".into())
+        .create_context("conseq-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -5402,7 +5461,7 @@ async fn test_economy_cost_deducted_on_send() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("econ-ctx".into(), params, "did:key:admin".into())
+        .create_context("econ-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -5472,7 +5531,7 @@ async fn test_cooldown_prevents_consequence_retrigger() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("cooldown-ctx".into(), params, "did:key:admin".into())
+        .create_context("cooldown-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -5594,7 +5653,12 @@ async fn test_budget_exceeded_blocks_send() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("budget-fail-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "budget-fail-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -5660,7 +5724,12 @@ async fn test_access_revocation_revokes_read_and_write() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("access-rev-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "access-rev-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -5748,7 +5817,7 @@ async fn role_demotion_changes_member_role() {
             .collect(),
         });
     let _handle = manager
-        .create_context("demotion-ctx".into(), params, "did:key:admin".into())
+        .create_context("demotion-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -5820,7 +5889,7 @@ async fn test_participation_decay_clears_caches() {
     // Add ContextClose capability to allow close_context.
     params.ceiling.push(Capability::ContextClose);
     let handle = manager
-        .create_context("decay-ctx".into(), params, "did:key:admin".into())
+        .create_context("decay-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -5889,7 +5958,7 @@ async fn test_rotate_content_keys_advances_epoch() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("rotate-ctx".into(), params, "did:key:admin".into())
+        .create_context("rotate-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -5943,7 +6012,7 @@ async fn test_capability_suspension_no_match_returns_false() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("no-match-ctx".into(), params, "did:key:admin".into())
+        .create_context("no-match-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -6051,7 +6120,7 @@ async fn test_auto_accept_blocked_for_paid_contexts() {
         payee: DID::from("did:key:payee"),
     });
     let handle = manager
-        .create_context("paid-ctx".into(), params, "did:key:admin".into())
+        .create_context("paid-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -6060,7 +6129,7 @@ async fn test_auto_accept_blocked_for_paid_contexts() {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, key_package, None).await;
+    let result = manager.join_context(&handle, key_package, None, None).await;
     assert!(
         result.is_err(),
         "join should fail for paid contexts without explicit acceptance"
@@ -6094,7 +6163,7 @@ async fn pending_removal_blocks_proposal() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("standing-ctx".into(), params, admin.clone())
+        .create_context("standing-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -6103,7 +6172,7 @@ async fn pending_removal_blocks_proposal() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Manually insert a pending removal against Alice.
     {
@@ -6164,7 +6233,7 @@ async fn participation_influences_governance_eligibility() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("standing-vote-ctx".into(), params, admin.clone())
+        .create_context("standing-vote-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -6193,7 +6262,7 @@ async fn decay_participation_clears_state() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("decay-ctx".into(), params, "did:key:admin".into())
+        .create_context("decay-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -6262,7 +6331,7 @@ async fn sender_key_before_mls_removal_ordering() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("order-ctx".into(), params, admin.clone())
+        .create_context("order-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -6271,7 +6340,7 @@ async fn sender_key_before_mls_removal_ordering() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Clear call log from join operations so we only see removal calls.
     call_order.lock().unwrap().clear();
@@ -6377,7 +6446,7 @@ async fn participation_record_updated_after_message_send() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("part-msg-ctx".into(), params, "did:key:admin".into())
+        .create_context("part-msg-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -6456,7 +6525,7 @@ async fn consequence_triggers_after_governance_action() {
         window: Duration::from_hours(1),
     }];
     let _handle = manager
-        .create_context("gov-conseq-ctx".into(), params, admin.clone())
+        .create_context("gov-conseq-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -6542,7 +6611,12 @@ async fn cooldown_expires_allows_retrigger() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("cooldown-exp-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "cooldown-exp-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -6646,7 +6720,12 @@ async fn empty_consequence_rules_no_evaluation() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("empty-rules-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "empty-rules-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -6727,7 +6806,12 @@ async fn event_log_entries_feed_consequence_evaluation() {
         window: Duration::from_hours(1),
     }];
     let _handle = manager
-        .create_context("event-feed-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "event-feed-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -6805,7 +6889,7 @@ async fn remaining_members_keys_after_removal() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("remain-ctx".into(), params, admin.clone())
+        .create_context("remain-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -6815,7 +6899,7 @@ async fn remaining_members_keys_after_removal() {
             owner_did: did.clone(),
             mls_key_package_bytes: None,
         };
-        manager.join_context(&handle, kp, None).await.unwrap();
+        manager.join_context(&handle, kp, None, None).await.unwrap();
     }
 
     // Clear call log to isolate removal calls.
@@ -6882,7 +6966,7 @@ async fn broadcast_rotation_calls_rotate_author_keys() {
     params.mode = ContextMode::Broadcast;
     params.memory_scope = scp_protocol::context::params::MemoryScope::Full;
     let _handle = manager
-        .create_context("bc-rotate-ctx".into(), params, admin.clone())
+        .create_context("bc-rotate-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -6931,7 +7015,7 @@ async fn encrypted_rotation_updates_epoch_counter() {
     let mut params = governance_params();
     params.mode = ContextMode::Encrypted;
     let _handle = manager
-        .create_context("epoch-ctr-ctx".into(), params, admin.clone())
+        .create_context("epoch-ctr-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -7014,7 +7098,7 @@ async fn full_send_consequence_enforcement_round_trip() {
         window: Duration::from_hours(1),
     }];
     let _handle = manager
-        .create_context("roundtrip-ctx".into(), params, "did:key:admin".into())
+        .create_context("roundtrip-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -7124,7 +7208,7 @@ async fn governance_participation_round_trip() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("gov-stand-ctx".into(), params, admin.clone())
+        .create_context("gov-stand-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -7203,7 +7287,12 @@ async fn capability_suspension_blocks_subsequent_send() {
         window: Duration::from_hours(1),
     }];
     let _handle = manager
-        .create_context("block-send-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "block-send-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -7276,7 +7365,12 @@ async fn access_revocation_blocks_subsequent_send() {
         window: Duration::from_hours(1),
     }];
     let _handle = manager
-        .create_context("block-access-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "block-access-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -7350,7 +7444,7 @@ async fn join_context_with_join_cost_no_budget_rejected() {
         payee: DID::from("did:key:payee"),
     });
     let handle = manager
-        .create_context("join-cost-ctx".into(), params, "did:key:admin".into())
+        .create_context("join-cost-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -7359,7 +7453,7 @@ async fn join_context_with_join_cost_no_budget_rejected() {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp, None).await;
+    let result = manager.join_context(&handle, kp, None, None).await;
     assert!(
         result.is_err(),
         "join should fail for paid context: {result:?}"
@@ -7401,7 +7495,7 @@ async fn eligibility_blocks_low_participation() {
         signers: vec![admin.clone(), bob.clone()],
     };
     let handle = manager
-        .create_context("low-stand-ctx".into(), params, admin.clone())
+        .create_context("low-stand-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -7410,7 +7504,7 @@ async fn eligibility_blocks_low_participation() {
         owner_did: bob.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Drain events from the buffer so check_proposer_eligibility's refresh
     // finds an empty event list and preserves our injected cache entry.
@@ -7503,7 +7597,7 @@ async fn eligibility_allows_good_participation() {
         signers: vec![admin.clone(), alice.clone()],
     };
     let handle = manager
-        .create_context("good-stand-ctx".into(), params, admin.clone())
+        .create_context("good-stand-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -7512,7 +7606,7 @@ async fn eligibility_allows_good_participation() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Manually inject a good participation record for Alice: more actions
     // by than against.
@@ -7595,7 +7689,12 @@ async fn consequence_triggers_on_message_send() {
         window: Duration::from_hours(1),
     }];
     let _handle = manager
-        .create_context("msg-conseq-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "msg-conseq-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -7676,7 +7775,7 @@ async fn send_message_deducts_budget() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("deduct-ctx".into(), params, "did:key:sender".into())
+        .create_context("deduct-ctx".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
 
@@ -7925,7 +8024,7 @@ async fn velocity_tracker_records_messages() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("velocity-ctx".into(), params, "did:key:admin".into())
+        .create_context("velocity-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -8044,7 +8143,7 @@ async fn encrypted_rotation_advance_epoch_called() {
     let mut params = governance_params();
     params.mode = ContextMode::Encrypted;
     let _handle = manager
-        .create_context("adv-epoch-ctx".into(), params, admin.clone())
+        .create_context("adv-epoch-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -8109,7 +8208,7 @@ async fn paid_join_end_to_end_with_adapter() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("paid-join-ctx".into(), params, "did:key:admin".into())
+        .create_context("paid-join-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -8132,7 +8231,7 @@ async fn paid_join_end_to_end_with_adapter() {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp, None).await;
+    let result = manager.join_context(&handle, kp, None, None).await;
     assert!(
         result.is_err(),
         "join should fail for paid context even with adapter: {result:?}"
@@ -8195,7 +8294,7 @@ async fn sybil_resistance_evaluated_on_join() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("sybil-ctx".into(), params, "did:key:admin".into())
+        .create_context("sybil-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -8204,7 +8303,7 @@ async fn sybil_resistance_evaluated_on_join() {
         owner_did: "did:key:newmember".into(),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp, None).await;
+    let result = manager.join_context(&handle, kp, None, None).await;
     assert!(
         result.is_ok(),
         "join should succeed with valid member (sybil evaluation passes): {result:?}"
@@ -8253,7 +8352,12 @@ async fn join_context_deducts_budget_when_granted() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("join-budget-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "join-budget-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -8343,7 +8447,7 @@ async fn participation_record_updated_after_governance() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("part-gov2-ctx".into(), params, admin.clone())
+        .create_context("part-gov2-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -8429,7 +8533,7 @@ async fn test_send_rejected_insufficient_budget() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("insuf-ctx".into(), params, "did:key:admin".into())
+        .create_context("insuf-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -8554,7 +8658,12 @@ async fn test_join_rejected_insufficient_budget() {
         payee: DID::from("did:key:payee"),
     });
     let handle = manager
-        .create_context("join-insuf-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "join-insuf-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -8564,7 +8673,7 @@ async fn test_join_rejected_insufficient_budget() {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp, None).await;
+    let result = manager.join_context(&handle, kp, None, None).await;
     assert!(
         result.is_err(),
         "join should fail for paid context with insufficient budget: {result:?}"
@@ -8604,7 +8713,7 @@ async fn test_execute_paid_action_skips_without_adapter() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("no-adpt2-ctx".into(), params, "did:key:admin".into())
+        .create_context("no-adpt2-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -8658,7 +8767,7 @@ async fn test_execute_paid_action_full_flow_with_adapter() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("adpt2-ctx".into(), params, "did:key:admin".into())
+        .create_context("adpt2-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -8712,7 +8821,7 @@ async fn test_free_context_no_budget_deduction() {
     // No economic_policy set (free context).
     let params = governance_params();
     let _handle = manager
-        .create_context("free-ctx".into(), params, "did:key:admin".into())
+        .create_context("free-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -8782,7 +8891,7 @@ async fn test_remaining_members_unaffected_after_removal() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("remain2-ctx".into(), params, admin.clone())
+        .create_context("remain2-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -8792,7 +8901,7 @@ async fn test_remaining_members_unaffected_after_removal() {
             owner_did: did.clone(),
             mls_key_package_bytes: None,
         };
-        manager.join_context(&handle, kp, None).await.unwrap();
+        manager.join_context(&handle, kp, None, None).await.unwrap();
     }
 
     // Remove Bob.
@@ -8848,7 +8957,7 @@ async fn test_broadcast_rotation_rotates_author_keys() {
     params.mode = ContextMode::Broadcast;
     params.memory_scope = scp_protocol::context::params::MemoryScope::Full;
     let _handle = manager
-        .create_context("bc-rot2-ctx".into(), params, admin.clone())
+        .create_context("bc-rot2-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -8895,7 +9004,7 @@ async fn test_encrypted_rotation_increments_epoch() {
     let mut params = governance_params();
     params.mode = ContextMode::Encrypted;
     let _handle = manager
-        .create_context("enc-rot2-ctx".into(), params, admin.clone())
+        .create_context("enc-rot2-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -8957,7 +9066,7 @@ async fn test_send_consequence_economy_round_trip() {
         window: Duration::from_hours(1),
     }];
     let _handle = manager
-        .create_context("xcut-rt-ctx".into(), params, "did:key:admin".into())
+        .create_context("xcut-rt-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -9040,7 +9149,7 @@ async fn test_governance_eligibility_participation_round_trip() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("stand-rt-ctx".into(), params, admin.clone())
+        .create_context("stand-rt-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -9091,6 +9200,7 @@ async fn test_governance_eligibility_participation_round_trip() {
 
 /// Paid join with consequence rules — join cost and consequence evaluation (#1537, #1531).
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_paid_join_with_consequence_evaluation() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
     use scp_protocol::trust::consequence::{
@@ -9129,7 +9239,12 @@ async fn test_paid_join_with_consequence_evaluation() {
         window: Duration::from_hours(1),
     }];
     let handle = manager
-        .create_context("paid-join-cq-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "paid-join-cq-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -9138,7 +9253,7 @@ async fn test_paid_join_with_consequence_evaluation() {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp, None).await;
+    let result = manager.join_context(&handle, kp, None, None).await;
     assert!(result.is_err(), "join should fail for paid context");
 
     // Verify the budget deduction works by directly testing.
@@ -9246,7 +9361,12 @@ async fn test_full_lifecycle_economy() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("lifecycle-econ-ctx".into(), params, "did:key:user".into())
+        .create_context(
+            "lifecycle-econ-ctx".into(),
+            params,
+            "did:key:user".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -9482,7 +9602,7 @@ async fn setup_velocity_escalation_context() -> (
     });
 
     manager
-        .create_context("vel-esc-ctx".into(), params, "did:key:admin".into())
+        .create_context("vel-esc-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -9529,7 +9649,7 @@ async fn rotate_sender_key_called_after_remove_member() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("rotate-ctx".into(), params, admin.clone())
+        .create_context("rotate-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -9538,7 +9658,7 @@ async fn rotate_sender_key_called_after_remove_member() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Clear call log from join operations.
     call_order.lock().unwrap().clear();
@@ -9600,7 +9720,7 @@ async fn rotate_sender_key_error_propagates() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("rotate-err-ctx".into(), params, admin.clone())
+        .create_context("rotate-err-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -9609,7 +9729,7 @@ async fn rotate_sender_key_error_propagates() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Remove Alice — rotation failure is non-fatal, so the governance
     // action succeeds. MLS removal (the hard security boundary) completes;
@@ -9647,7 +9767,7 @@ async fn rotate_sender_key_called_on_leave() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("leave-rotate-ctx".into(), params, admin.clone())
+        .create_context("leave-rotate-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -9656,7 +9776,7 @@ async fn rotate_sender_key_called_on_leave() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Clear call log from join operations.
     call_order.lock().unwrap().clear();
@@ -9733,7 +9853,12 @@ async fn test_paid_send_rejected_without_spending_ucan() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("paid-no-ucan-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "paid-no-ucan-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -9840,7 +9965,7 @@ async fn test_paid_join_rejected_without_spending_ucan() {
         payee: DID::from("did:key:payee"),
     });
     let handle = manager
-        .create_context("paid-join-ctx".into(), params, "did:key:admin".into())
+        .create_context("paid-join-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -9849,7 +9974,7 @@ async fn test_paid_join_rejected_without_spending_ucan() {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp, None).await;
+    let result = manager.join_context(&handle, kp, None, None).await;
     assert!(
         result.is_err(),
         "paid join without spending UCAN should fail"
@@ -9876,7 +10001,7 @@ async fn test_free_join_ok_without_spending_ucan() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("free-join-ctx".into(), params, "did:key:admin".into())
+        .create_context("free-join-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -9885,7 +10010,7 @@ async fn test_free_join_ok_without_spending_ucan() {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp, None).await;
+    let result = manager.join_context(&handle, kp, None, None).await;
     assert!(
         result.is_ok(),
         "free join without spending UCAN should succeed: {result:?}"
@@ -9910,7 +10035,12 @@ async fn test_event_log_stores_actor_did() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("actor-did-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "actor-did-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -9984,7 +10114,7 @@ async fn test_consequence_evaluation_uses_full_history() {
         window: Duration::from_hours(1),
     }];
     let _handle = manager
-        .create_context("hist-ctx".into(), params, "did:key:admin".into())
+        .create_context("hist-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -10114,7 +10244,12 @@ async fn paid_send_with_valid_spending_ucan_succeeds() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("paid-ucan-ok-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "paid-ucan-ok-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -10221,7 +10356,12 @@ async fn zero_cost_per_message_no_ucan_required() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("zero-cost-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "zero-cost-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -10285,7 +10425,7 @@ async fn none_per_message_no_ucan_required() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("none-msg-ctx".into(), params, "did:key:sender".into())
+        .create_context("none-msg-ctx".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
 
@@ -10350,7 +10490,12 @@ async fn multiple_sends_unique_spending_ucans_all_succeed() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("multi-ucan-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "multi-ucan-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -10438,7 +10583,12 @@ async fn paid_join_with_spending_ucan_still_blocked_by_auto_accept() {
         payee: DID::from("did:key:payee"),
     });
     let handle = manager
-        .create_context("paid-join-ucan-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "paid-join-ucan-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -10462,7 +10612,7 @@ async fn paid_join_with_spending_ucan_still_blocked_by_auto_accept() {
         mls_key_package_bytes: None,
     };
     let ucan = dummy_spending_ucan();
-    let result = manager.join_context(&handle, kp, Some(&ucan)).await;
+    let result = manager.join_context(&handle, kp, Some(&ucan), None).await;
     // Paid contexts block auto-accept even with a spending UCAN (§19.3).
     // The spending UCAN covers payment, not the auto-accept gate.
     assert!(
@@ -10499,7 +10649,7 @@ async fn rotate_sender_key_not_called_when_remove_member_fails() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("no-rotate-ctx".into(), params, admin.clone())
+        .create_context("no-rotate-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -10508,7 +10658,7 @@ async fn rotate_sender_key_not_called_when_remove_member_fails() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Clear call log from join operations.
     call_order.lock().unwrap().clear();
@@ -10562,7 +10712,12 @@ async fn join_context_stores_actor_did() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("join-actor-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "join-actor-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -10571,7 +10726,7 @@ async fn join_context_stores_actor_did() {
         owner_did: "did:key:joiner".into(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Check event log for MemberJoined entry.
     let context_id_bytes = scp_protocol::context::context_id_bytes("join-actor-ctx");
@@ -10611,7 +10766,12 @@ async fn leave_context_stores_actor_did() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("leave-actor-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "leave-actor-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -10620,7 +10780,7 @@ async fn leave_context_stores_actor_did() {
         owner_did: "did:key:leaver".into(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Leave.
     manager
@@ -10666,7 +10826,7 @@ async fn governance_action_stores_actor_did() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("gov-actor-ctx".into(), params, admin.clone())
+        .create_context("gov-actor-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -10675,7 +10835,7 @@ async fn governance_action_stores_actor_did() {
         owner_did: target.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Execute governance action: RemoveMember.
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
@@ -10719,7 +10879,12 @@ async fn context_created_event_has_creator_actor_did() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("system-actor-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "system-actor-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -10777,7 +10942,12 @@ async fn no_auto_grant_requires_explicit_budget() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("no-autogrant-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "no-autogrant-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -10877,7 +11047,7 @@ async fn no_double_charge_on_paid_send() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("double-ctx".into(), params, "did:key:sender".into())
+        .create_context("double-ctx".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
 
@@ -10949,7 +11119,12 @@ async fn capability_suspension_exact_match_no_false_positive() {
     // to bypass validation (which now rejects unknown capability names).
     // This test exercises the enforcement path for an unrecognized capability.
     let _handle = manager
-        .create_context("cap-exact-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "cap-exact-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
     {
@@ -11064,7 +11239,12 @@ async fn capability_suspension_write_revokes_write() {
         window: Duration::from_hours(1),
     }];
     let _handle = manager
-        .create_context("cap-write-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "cap-write-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -11142,7 +11322,7 @@ async fn capability_suspension_read_revokes_read() {
         window: Duration::from_hours(1),
     }];
     let _handle = manager
-        .create_context("cap-read-ctx".into(), params, "did:key:sender".into())
+        .create_context("cap-read-ctx".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
 
@@ -11224,7 +11404,12 @@ async fn role_demotion_nonexistent_role_reports_failure() {
         window: Duration::from_hours(1),
     }];
     let _handle = manager
-        .create_context("role-noexist-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "role-noexist-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -11328,7 +11513,12 @@ async fn execute_paid_action_skips_zero_cost() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("zero-paid-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "zero-paid-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -11418,7 +11608,7 @@ async fn participation_cache_cleared_after_member_leaves() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("part-cache-ctx".into(), params, admin.clone())
+        .create_context("part-cache-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -11427,7 +11617,7 @@ async fn participation_cache_cleared_after_member_leaves() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Seed participation cache with an entry for Alice.
     {
@@ -11522,7 +11712,12 @@ async fn capability_suspension_empty_caps_no_action() {
     // bypass validation (which now rejects empty capabilities in
     // SuspendCapability).
     let _handle = manager
-        .create_context("empty-caps-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "empty-caps-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
     {
@@ -11650,7 +11845,12 @@ async fn multiple_consequence_rules_all_trigger() {
         },
     ];
     let _handle = manager
-        .create_context("multi-rule-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "multi-rule-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -11741,7 +11941,7 @@ async fn aggregate_velocity_via_manager_send() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("agg-vel-ctx".into(), params, "did:key:sender".into())
+        .create_context("agg-vel-ctx".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
 
@@ -11881,7 +12081,7 @@ async fn test_warning_count_trigger_fires_behavioral() {
         window: Duration::from_hours(1),
     }];
     let handle = manager
-        .create_context("warn-ctx".into(), params, admin.clone())
+        .create_context("warn-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -11890,7 +12090,7 @@ async fn test_warning_count_trigger_fires_behavioral() {
         owner_did: target.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Drain creation + join events.
     let _ = manager.drain_events("warn-ctx").await;
@@ -11918,7 +12118,10 @@ async fn test_warning_count_trigger_fires_behavioral() {
         owner_did: target.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp2, None).await.unwrap();
+    manager
+        .join_context(&handle, kp2, None, None)
+        .await
+        .unwrap();
     let _ = manager.drain_events("warn-ctx").await;
 
     // Second governance action against target — threshold met.
@@ -11972,7 +12175,7 @@ async fn test_participation_actions_against_populated() {
     let mut params = governance_params();
     params.consequence_rules = vec![];
     let handle = manager
-        .create_context("part-act-ctx".into(), params, admin.clone())
+        .create_context("part-act-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -11980,7 +12183,7 @@ async fn test_participation_actions_against_populated() {
         owner_did: target.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Execute a governance action against the target.
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
@@ -12031,7 +12234,7 @@ async fn event_log_entries_merge_buffer_and_history() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("merge-ctx".into(), params, "did:key:sender".into())
+        .create_context("merge-ctx".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
 
@@ -12109,6 +12312,7 @@ async fn buffer_event_timestamp_bounds_m18() {
             "bounds-ctx".into(),
             governance_params(),
             "did:key:admin".into(),
+            None,
         )
         .await
         .unwrap();
@@ -12253,7 +12457,7 @@ async fn budget_not_deducted_on_transport_failure() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("rollback-ctx".into(), params, "did:key:sender".into())
+        .create_context("rollback-ctx".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
 
@@ -12341,7 +12545,7 @@ async fn eligibility_check_uses_context_manager_clock() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("clock-ctx".into(), params, admin.clone())
+        .create_context("clock-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -12350,7 +12554,7 @@ async fn eligibility_check_uses_context_manager_clock() {
         owner_did: "did:key:member".into(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Execute a governance action — verifies clock is used without panicking.
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
@@ -12398,7 +12602,7 @@ async fn observable_metrics_time_of_day_populated() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("tod-ctx".into(), params, "did:key:sender".into())
+        .create_context("tod-ctx".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
 
@@ -12471,7 +12675,7 @@ async fn context_message_rate_from_aggregate_velocity() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("cmr-ctx".into(), params, "did:key:sender".into())
+        .create_context("cmr-ctx".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
 
@@ -12651,6 +12855,8 @@ fn velocity_tracker_state_in_context_snapshot_roundtrip() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -12737,6 +12943,8 @@ fn velocity_tracker_backward_compat_deserialization() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     let mut json_value: serde_json::Value =
@@ -12831,7 +13039,7 @@ async fn consequence_timer_fires_without_user_action() {
     }];
 
     let _handle = manager
-        .create_context("timer-conseq-ctx".into(), params, admin.clone())
+        .create_context("timer-conseq-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -12914,7 +13122,7 @@ async fn consequence_timer_respects_cooldown() {
     }];
 
     let _handle = manager
-        .create_context("cooldown-timer-ctx".into(), params, admin.clone())
+        .create_context("cooldown-timer-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -12987,7 +13195,7 @@ async fn consequence_timer_noop_without_rules() {
     // No consequence rules — default.
 
     let _handle = manager
-        .create_context("no-rules-ctx".into(), params, admin.clone())
+        .create_context("no-rules-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -13189,7 +13397,7 @@ async fn test_fabricated_spending_ucan_rejected() {
         payee: DID::from("did:dht:z6MkPayee"),
     });
     let handle = manager
-        .create_context("fab-ucan-ctx".into(), params, "did:key:sender".into())
+        .create_context("fab-ucan-ctx".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
 
@@ -13297,7 +13505,7 @@ async fn c1_paid_context(name: &str, sender_did: &DID) -> (ContextManager, Conte
     });
 
     let handle = manager
-        .create_context(name.to_owned(), params, sender_did.clone())
+        .create_context(name.to_owned(), params, sender_did.clone(), None)
         .await
         .unwrap();
 
@@ -13673,7 +13881,7 @@ async fn test_capability_failure_no_budget_leak() {
         payee: DID::from("did:dht:z6MkPayee"),
     });
     let handle = manager
-        .create_context("cap-leak-ctx".into(), params, "did:key:admin".into())
+        .create_context("cap-leak-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -13771,7 +13979,7 @@ async fn test_capture_failure_budget_retained() {
         payee: DID::from("did:dht:z6MkPayee"),
     });
     let handle = manager
-        .create_context("capture-ctx".into(), params, "did:key:sender".into())
+        .create_context("capture-ctx".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
     {
@@ -13848,7 +14056,12 @@ async fn spending_ucan_nonce_replay_rejected() {
         payee: DID::from("did:key:payee"),
     });
     let _handle = manager
-        .create_context("nonce-replay-ctx".into(), params, "did:key:sender".into())
+        .create_context(
+            "nonce-replay-ctx".into(),
+            params,
+            "did:key:sender".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -13956,7 +14169,7 @@ async fn test_sender_key_failure_still_removes_from_mls() {
 
     let params = governance_params();
     let handle = manager
-        .create_context("sk-fail-ctx".into(), params, admin.clone())
+        .create_context("sk-fail-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -13964,7 +14177,7 @@ async fn test_sender_key_failure_still_removes_from_mls() {
         owner_did: alice.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
     call_order.lock().unwrap().clear();
 
     // Remove Alice — sender key fails but MLS succeeds.
@@ -14017,7 +14230,7 @@ async fn test_consequence_failure_escalates() {
         window: Duration::from_hours(1),
     }];
     let _handle = manager
-        .create_context("esc-ctx".into(), params, "did:key:sender".into())
+        .create_context("esc-ctx".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
 
@@ -14155,7 +14368,7 @@ async fn test_velocity_includes_current_message() {
         payee: DID::from("did:dht:z6MkPayee"),
     });
     let handle = manager
-        .create_context("vel-msg-ctx2".into(), params, "did:key:sender".into())
+        .create_context("vel-msg-ctx2".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
     {
@@ -14257,12 +14470,12 @@ async fn test_member_reset_rotates_sender_keys() {
     ];
 
     let handle = manager
-        .create_context("reset-sk-ctx".into(), params, alice.clone())
+        .create_context("reset-sk-ctx".into(), params, alice.clone(), None)
         .await
         .unwrap();
     let context_id = handle.context_id().to_owned();
     manager
-        .join_context(&handle, KeyPackage::mock(bob.clone()), None)
+        .join_context(&handle, KeyPackage::mock(bob.clone()), None, None)
         .await
         .unwrap();
 
@@ -14322,6 +14535,7 @@ async fn test_governance_close_decays_participation() {
             "decay-close-ctx".into(),
             ContextParams::default(),
             alice.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -14490,7 +14704,12 @@ async fn h17_setup_alice_and_bob(
         ..ContextParams::default()
     };
     let alice_handle = alice_manager
-        .create_context(context_id.to_owned(), alice_params, alice_did_str.into())
+        .create_context(
+            context_id.to_owned(),
+            alice_params,
+            alice_did_str.into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -14526,7 +14745,7 @@ async fn h17_setup_alice_and_bob(
         ..ContextParams::default()
     };
     let _bob_handle = bob_manager
-        .create_context(context_id.to_owned(), bob_params, bob_did_str.into())
+        .create_context(context_id.to_owned(), bob_params, bob_did_str.into(), None)
         .await
         .unwrap();
 
@@ -14911,12 +15130,12 @@ async fn execute_revoke_write_rotates_sender_key() {
     };
 
     let handle = manager
-        .create_context("h7-write-ctx".into(), params, alice.clone())
+        .create_context("h7-write-ctx".into(), params, alice.clone(), None)
         .await
         .unwrap();
     let context_id = handle.context_id().to_owned();
     manager
-        .join_context(&handle, KeyPackage::mock(bob.clone()), None)
+        .join_context(&handle, KeyPackage::mock(bob.clone()), None, None)
         .await
         .unwrap();
 
@@ -14976,12 +15195,12 @@ async fn execute_revoke_both_rotates_sender_key() {
     };
 
     let handle = manager
-        .create_context("h7-both-ctx".into(), params, alice.clone())
+        .create_context("h7-both-ctx".into(), params, alice.clone(), None)
         .await
         .unwrap();
     let context_id = handle.context_id().to_owned();
     manager
-        .join_context(&handle, KeyPackage::mock(bob.clone()), None)
+        .join_context(&handle, KeyPackage::mock(bob.clone()), None, None)
         .await
         .unwrap();
 
@@ -15041,12 +15260,12 @@ async fn execute_revoke_read_does_not_rotate_sender_key() {
     };
 
     let handle = manager
-        .create_context("h7-read-ctx".into(), params, alice.clone())
+        .create_context("h7-read-ctx".into(), params, alice.clone(), None)
         .await
         .unwrap();
     let context_id = handle.context_id().to_owned();
     manager
-        .join_context(&handle, KeyPackage::mock(bob.clone()), None)
+        .join_context(&handle, KeyPackage::mock(bob.clone()), None, None)
         .await
         .unwrap();
 
@@ -15108,12 +15327,12 @@ async fn execute_revoke_rotation_failure_still_completes() {
     };
 
     let handle = manager
-        .create_context("h7-fail-ctx".into(), params, alice.clone())
+        .create_context("h7-fail-ctx".into(), params, alice.clone(), None)
         .await
         .unwrap();
     let context_id = handle.context_id().to_owned();
     manager
-        .join_context(&handle, KeyPackage::mock(bob.clone()), None)
+        .join_context(&handle, KeyPackage::mock(bob.clone()), None, None)
         .await
         .unwrap();
 
@@ -15164,6 +15383,7 @@ async fn test_decay_participation_clears_velocity_tracker() {
             "decay-vt-ctx".into(),
             ContextParams::default(),
             alice.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -15205,7 +15425,12 @@ async fn test_evict_stale_entries_removes_non_members() {
 
     let alice = DID::from("did:dht:z6MkAlice");
     let handle = manager
-        .create_context("evict-ctx".into(), ContextParams::default(), alice.clone())
+        .create_context(
+            "evict-ctx".into(),
+            ContextParams::default(),
+            alice.clone(),
+            None,
+        )
         .await
         .unwrap();
     let context_id = handle.context_id().to_owned();
@@ -15352,7 +15577,7 @@ async fn earned_capacity_limits_governance_proposals() {
     params.sybil_policy = Some(ContextSybilPolicy::casual());
 
     let _handle = manager
-        .create_context("capacity-ctx".into(), params, admin.clone())
+        .create_context("capacity-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -15413,7 +15638,7 @@ async fn no_sybil_policy_allows_unlimited_proposals() {
     // No sybil_policy (default).
     let params = governance_params();
     let _handle = manager
-        .create_context("no-sybil-ctx".into(), params, admin.clone())
+        .create_context("no-sybil-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -15467,7 +15692,7 @@ async fn earned_capacity_evicts_stale_timestamps() {
     params.sybil_policy = Some(ContextSybilPolicy::casual());
 
     let _handle = manager
-        .create_context("evict-ctx".into(), params, admin.clone())
+        .create_context("evict-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -15576,7 +15801,7 @@ async fn revoke_access_event_carries_target_did_payload() {
     params.consequence_rules = vec![];
 
     let handle = manager
-        .create_context("rev-payload-ctx".into(), params, admin.clone())
+        .create_context("rev-payload-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -15585,7 +15810,7 @@ async fn revoke_access_event_carries_target_did_payload() {
         owner_did: target.clone(),
         mls_key_package_bytes: None,
     };
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Propose + auto-approve (SingleAdmin) a RevokeAccess governance action.
     let action = scp_protocol::context::governance::GovernanceAction::RevokeAccess {
@@ -15644,7 +15869,7 @@ async fn consequence_evaluation_caps_buffer_events() {
         ..ContextParams::default()
     };
     manager
-        .create_context("cap-buf-ctx".into(), params, creator.clone())
+        .create_context("cap-buf-ctx".into(), params, creator.clone(), None)
         .await
         .unwrap();
 
@@ -16031,6 +16256,7 @@ async fn h2_execute_change_role_works_when_creator_demoted() {
             "h2-change-role-ctx".into(),
             params,
             "did:key:creator".into(),
+            None,
         )
         .await
         .unwrap();
@@ -16133,7 +16359,12 @@ async fn h2_execute_add_member_works_when_creator_demoted() {
     );
     let params = governance_params();
     let _handle = manager
-        .create_context("h2-add-member-ctx".into(), params, "did:key:creator".into())
+        .create_context(
+            "h2-add-member-ctx".into(),
+            params,
+            "did:key:creator".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -16225,6 +16456,7 @@ async fn h2_execute_change_role_updates_tokens_correctly() {
             "h2-change-tokens-ctx".into(),
             params,
             "did:key:creator".into(),
+            None,
         )
         .await
         .unwrap();
@@ -16400,7 +16632,7 @@ async fn h10_setup_with_test_clock(
 
     let params = governance_params();
     let handle = manager
-        .create_context(context_id.into(), params, "did:key:admin".into())
+        .create_context(context_id.into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -16982,7 +17214,7 @@ async fn suspend_all_consequence_preserves_mls_membership() {
     }];
 
     let handle = manager
-        .create_context("h20a-ctx".into(), params, admin.clone())
+        .create_context("h20a-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
@@ -16992,7 +17224,10 @@ async fn suspend_all_consequence_preserves_mls_membership() {
     // this, `suspend_all` would have nothing to copy into the suspended
     // set and the assertions would be vacuous.
     let alice_kp = scp_protocol::context::membership::KeyPackage::mock(alice.clone());
-    manager.join_context(&handle, alice_kp, None).await.unwrap();
+    manager
+        .join_context(&handle, alice_kp, None, None)
+        .await
+        .unwrap();
 
     // Snapshot Alice's pre-condition state — she must be in membership,
     // hold the role-granted caps, and have a sender-key store entry.
@@ -17217,12 +17452,15 @@ async fn suspend_capability_consequence_preserves_mls_membership() {
     }];
 
     let handle = manager
-        .create_context("h20b-ctx".into(), params, admin.clone())
+        .create_context("h20b-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
     let alice_kp = scp_protocol::context::membership::KeyPackage::mock(alice.clone());
-    manager.join_context(&handle, alice_kp, None).await.unwrap();
+    manager
+        .join_context(&handle, alice_kp, None, None)
+        .await
+        .unwrap();
 
     // Pre-flight: Alice has both MessagesRead and MessagesWrite via the
     // member role.
@@ -17391,12 +17629,15 @@ async fn restore_access_after_suspend_all_regrants_capabilities() {
     let params = governance_params();
 
     let handle = manager
-        .create_context("h20c-ctx".into(), params, admin.clone())
+        .create_context("h20c-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
 
     let alice_kp = scp_protocol::context::membership::KeyPackage::mock(alice.clone());
-    manager.join_context(&handle, alice_kp, None).await.unwrap();
+    manager
+        .join_context(&handle, alice_kp, None, None)
+        .await
+        .unwrap();
 
     // Snapshot Alice's role-granted capability set BEFORE suspension so
     // we can compare it after RestoreAccess.
@@ -17606,7 +17847,12 @@ async fn consequence_enforced_appended_to_durable_event_log() {
     let mut params = governance_params();
     params.economic_policy = None;
     let _handle = manager
-        .create_context("h4-enforce-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "h4-enforce-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -17744,7 +17990,7 @@ async fn consequence_escalation_appended_with_distinct_event_type() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("h4-escal-ctx".into(), params, "did:key:sender".into())
+        .create_context("h4-escal-ctx".into(), params, "did:key:sender".into(), None)
         .await
         .unwrap();
 
@@ -17872,7 +18118,7 @@ async fn consequence_events_visible_to_subsequent_rule_evaluation() {
 
     let params = governance_params();
     let _handle = manager
-        .create_context("h4-recur-ctx".into(), params, "did:key:alice".into())
+        .create_context("h4-recur-ctx".into(), params, "did:key:alice".into(), None)
         .await
         .unwrap();
 
@@ -18195,7 +18441,7 @@ async fn consequence_rule_with_empty_rules_no_durable_append() {
     let mut params = governance_params();
     params.consequence_rules = vec![];
     let _handle = manager
-        .create_context("h4-empty-ctx".into(), params, "did:key:admin".into())
+        .create_context("h4-empty-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
