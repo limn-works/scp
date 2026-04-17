@@ -14,7 +14,7 @@ use super::{
     SuspendMemberResult, ToolInterface, ToolRegistration, TriggeredConsequence, classify_action,
     collect_active_voters, commit_retry_backoff, context_id_to_bytes, evaluate_consequence_rules,
     generate_mls_operations, instrument, process_pending_proposals, push_welcome_event,
-    require_active, require_migrating_out, roles, update_detection_state,
+    require_active, require_migrating_out, roles, strip_event_payload, update_detection_state,
 };
 
 // ---------------------------------------------------------------------------
@@ -1345,11 +1345,14 @@ impl ContextManager {
 
                     ctx.role_state.suspend_all(did.as_ref());
 
-                    ctx.receive_buffer
-                        .push(ContextEvent::CapabilitiesSuspended {
+                    ctx.emit_event(
+                        ContextEvent::CapabilitiesSuspended {
                             did: did.clone(),
                             capabilities: vec![], // all — indicated by empty
-                        });
+                        },
+                        context_id,
+                        self.event_tx.as_ref(),
+                    );
 
                     if self.has_persistence() {
                         Some(Self::snapshot_context(ctx))
@@ -2442,11 +2445,14 @@ impl ContextManager {
             // exact capability list so consumers can render accurate
             // UI and so the event payload matches the underlying
             // role_state mutation.
-            ctx.receive_buffer
-                .push(ContextEvent::CapabilitiesSuspended {
+            ctx.emit_event(
+                ContextEvent::CapabilitiesSuspended {
                     did: did.clone(),
                     capabilities: capabilities.to_vec(),
-                });
+                },
+                context_id,
+                self.event_tx.as_ref(),
+            );
 
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -2537,8 +2543,11 @@ impl ContextManager {
                     }
                 }
 
-                ctx.receive_buffer
-                    .push(ContextEvent::WriteAccessRevoked { did: did.clone() });
+                ctx.emit_event(
+                    ContextEvent::WriteAccessRevoked { did: did.clone() },
+                    context_id,
+                    self.event_tx.as_ref(),
+                );
             }
 
             // Read revocation: suspend read capabilities + destroy access keys.
@@ -2569,10 +2578,16 @@ impl ContextManager {
                     ctx.access.access_key_store.remove(context_id, did.as_ref());
                 }
 
-                ctx.receive_buffer
-                    .push(ContextEvent::ReadAccessRevoked { did: did.clone() });
-                ctx.receive_buffer
-                    .push(ContextEvent::AccessKeyRevoked { did: did.clone() });
+                ctx.emit_event(
+                    ContextEvent::ReadAccessRevoked { did: did.clone() },
+                    context_id,
+                    self.event_tx.as_ref(),
+                );
+                ctx.emit_event(
+                    ContextEvent::AccessKeyRevoked { did: did.clone() },
+                    context_id,
+                    self.event_tx.as_ref(),
+                );
             }
 
             // Encrypted non-broadcast mode: Write and Both revocations need a
@@ -4935,7 +4950,7 @@ impl ContextManager {
         // migration state — all under ONE lock acquisition to prevent a
         // race where another task observes the source as Active between
         // destination creation and the state transition (F4).
-        let (creator_did, snapshot, buffer_len_before_migration) = {
+        let (creator_did, snapshot, buffer_len_before_migration, proposed_event, started_event) = {
             let ctx_arc = self
                 .get_context_arc(context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
@@ -4984,28 +4999,23 @@ impl ContextManager {
             // events pushed by concurrent operations.
             let buffer_len_before_migration = ctx.receive_buffer.len();
 
-            // Emit ContextMigrationProposed event to receive buffer.
-            ctx.emit_event(
-                ContextEvent::ContextMigrationProposed {
-                    destination_context_id: destination_context_id.clone(),
-                    reason: reason.to_owned(),
-                    grace_period_secs,
-                    auto_invite,
-                    proposal_id,
-                },
-                context_id,
-                self.event_tx.as_ref(),
-            );
-
-            // Emit ContextMigrationStarted event to receive buffer.
-            ctx.emit_event(
-                ContextEvent::ContextMigrationStarted {
-                    destination_context_id: destination_context_id.clone(),
-                    grace_period_end,
-                },
-                context_id,
-                self.event_tx.as_ref(),
-            );
+            // Buffer migration events WITHOUT broadcasting. These events
+            // are in a rollback-able block — if create_context fails, the
+            // receive buffer is truncated back. Broadcasting here would leak
+            // phantom events that cannot be retracted from the channel.
+            let proposed_event = ContextEvent::ContextMigrationProposed {
+                destination_context_id: destination_context_id.clone(),
+                reason: reason.to_owned(),
+                grace_period_secs,
+                auto_invite,
+                proposal_id,
+            };
+            let started_event = ContextEvent::ContextMigrationStarted {
+                destination_context_id: destination_context_id.clone(),
+                grace_period_end,
+            };
+            ctx.receive_buffer.push(proposed_event.clone());
+            ctx.receive_buffer.push(started_event.clone());
 
             let snap = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -5013,7 +5023,13 @@ impl ContextManager {
                 None
             };
 
-            (creator, snap, buffer_len_before_migration)
+            (
+                creator,
+                snap,
+                buffer_len_before_migration,
+                proposed_event,
+                started_event,
+            )
         };
 
         // Create the destination context AFTER the source has been
@@ -5035,6 +5051,13 @@ impl ContextManager {
             return Err(ContextError::PermissionDenied(format!(
                 "failed to create destination context: {e}"
             )));
+        }
+
+        // Destination context created successfully — now safe to broadcast
+        // the migration events that were buffered above.
+        if let Some(tx) = self.event_tx.as_ref() {
+            let _ = tx.send((context_id.to_owned(), strip_event_payload(&proposed_event)));
+            let _ = tx.send((context_id.to_owned(), strip_event_payload(&started_event)));
         }
 
         if let Some(snapshot) = snapshot {

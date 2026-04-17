@@ -1231,7 +1231,7 @@ impl PerContextState {
 /// The match is exhaustive (no wildcard catch-all) so that adding a new
 /// `ContextEvent` variant with sensitive data causes a compile error,
 /// forcing the developer to decide whether the variant needs stripping.
-fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
+pub(super) fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
     match event {
         ContextEvent::MessageReceived { sender_did, .. } => ContextEvent::MessageReceived {
             sender_did: sender_did.clone(),
