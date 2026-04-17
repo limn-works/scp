@@ -237,7 +237,7 @@ fn shutdown_runtime() {
 /// poisoned).
 #[pyfunction]
 fn scp_suspend() -> PyResult<()> {
-    if let Some(bi) = runtime::BRIDGE_INSTANCE.get() {
+    if let Some(bi) = runtime::bridge_instance_raw() {
         bi.suspend()
             .map_err(|e| crate::error::ScpPyError::transport(format!("suspend failed: {e}")))?;
     }
@@ -259,7 +259,7 @@ fn scp_suspend() -> PyResult<()> {
 /// (call `shutdown_runtime` was already made).
 #[pyfunction]
 fn scp_resume() -> PyResult<()> {
-    if let Some(bi) = runtime::BRIDGE_INSTANCE.get() {
+    if let Some(bi) = runtime::bridge_instance_raw() {
         bi.resume()
             .map_err(|e| crate::error::ScpPyError::context(format!("resume failed: {e}")))?;
     }
