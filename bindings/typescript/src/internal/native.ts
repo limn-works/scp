@@ -1795,5 +1795,13 @@ export function createNativeBridge(): Bridge {
     shutdown(timeoutSecs: number): void {
       (addon.scpShutdown as (t: number) => void)(timeoutSecs);
     },
+
+    suspend(): void {
+      (addon.scpSuspend as () => void)();
+    },
+
+    resume(): void {
+      (addon.scpResume as () => void)();
+    },
   };
 }

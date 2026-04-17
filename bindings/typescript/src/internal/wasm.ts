@@ -2140,5 +2140,16 @@ export function createWasmBridge(): Bridge {
     shutdown(_timeoutSecs: number): void {
       // No-op in the WASM bridge -- browser manages resource cleanup.
     },
+
+    suspend(): void {
+      // No-op in the WASM bridge -- there is no BridgeInstance in WASM
+      // (ADR-034: WASM has no tokio runtime or relay connection to clear).
+      // Provided for API parity with the NAPI bridge so isomorphic
+      // callers can share code.
+    },
+
+    resume(): void {
+      // No-op in the WASM bridge -- see `suspend` for rationale.
+    },
   };
 }

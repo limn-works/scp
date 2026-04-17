@@ -19,9 +19,9 @@
 //! See issue #388 and `.docs/adrs/phase-4.md` (ADR-022).
 
 use scp_ffi_common::bridge_instance::BridgeInstance;
+use scp_ffi_common::bridge_runtime::BridgeInMemoryStorage;
 use scp_ffi_common::error_codes as codes;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
@@ -36,10 +36,7 @@ use scp_core::store::ProtocolRepository;
 use scp_core::store::context::ProtocolRepositoryEventLogBridge;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
-use scp_platform::Storage;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
-use scp_platform::error::PlatformError;
-use zeroize::Zeroizing;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
@@ -67,10 +64,11 @@ static SHARED_DHT_CLIENT: OnceLock<Arc<scp_identity::InMemoryDhtClient>> = OnceL
 
 /// Returns the production DID resolver, if initialized.
 ///
-/// Delegates to [`BridgeInstance::did_resolver`].
+/// Delegates to [`scp_ffi_common::bridge_runtime::did_resolver_from`] so all
+/// three non-WASM bridges share one implementation.
 #[must_use]
 pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
-    BRIDGE_INSTANCE.get().and_then(|bi| bi.did_resolver())
+    scp_ffi_common::bridge_runtime::did_resolver_from(BRIDGE_INSTANCE.get())
 }
 
 /// Returns the shared `InMemoryDhtClient`, if initialized.
@@ -92,41 +90,22 @@ pub fn init_shared_dht_client(client: Arc<scp_identity::InMemoryDhtClient>) {
 
 /// Initializes the production DID resolver.
 ///
-/// Stores the resolver in the `BridgeInstance`. If `BridgeInstance` is not
-/// initialized yet, logs an error (`identity_create` should always run after
-/// `init_context_manager`).
+/// Delegates to [`scp_ffi_common::bridge_runtime::init_did_resolver_on`] so
+/// all three non-WASM bridges share one implementation. If `BridgeInstance`
+/// is not initialized yet, the common helper logs an error
+/// (`identity_create` should always run after `init_context_manager`).
 pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
 where
     R: scp_identity::resolver::DidResolver + 'static,
 {
-    if let Some(bi) = BRIDGE_INSTANCE.get() {
-        bi.set_did_resolver(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
-            resolver, handle,
-        )));
-    } else {
-        tracing::error!(
-            "init_did_resolver called before BridgeInstance initialized — resolver not stored"
-        );
-    }
+    scp_ffi_common::bridge_runtime::init_did_resolver_on(BRIDGE_INSTANCE.get(), resolver, handle);
 }
 
 /// Returns a key resolver that rejects all lookups with a logged error.
 ///
-/// Logs an error once (via `std::sync::Once`) to signal that key resolution
-/// is not configured. Subsequent lookups silently return `None` to avoid
-/// log spam in governance-heavy contexts. The `KeyResolver` type signature
-/// does not support `Result`, so `None` is the only way to signal failure.
+/// Delegates to [`scp_ffi_common::bridge_runtime::not_configured_key_resolver`].
 fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
-    Arc::new(|_did| {
-        static LOG_ONCE: std::sync::Once = std::sync::Once::new();
-        LOG_ONCE.call_once(|| {
-            tracing::error!(
-                "key resolver not configured — governance vote signature verification is disabled. \
-                 Wire a production KeyResolver to enable signature verification."
-            );
-        });
-        None
-    })
+    scp_ffi_common::bridge_runtime::not_configured_key_resolver()
 }
 
 /// Returns a reference to the shared `ContextManager`.
@@ -505,37 +484,16 @@ pub fn protocol_repository()
 }
 
 /// Constructs a persistent event log provider backed by encrypted in-memory
-/// storage, and returns both the event log provider and the underlying
-/// `ProtocolRepository` (for registration in `BridgeInstance`).
+/// storage.
 ///
-/// Creates an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
-/// AES-256-GCM key, wraps it in a `ProtocolRepository`, then builds a
-/// `ProtocolRepositoryEventLogBridge` that implements `EventLogPersistence`.
-/// The resulting `MerkleEventLogProvider` persists entries on each append.
-///
-/// The `Arc<ProtocolRepository<...>>` is returned alongside the event log
-/// provider so that `init_bridge_instance` can store it in `BridgeInstance`
-/// for trust aggregation (#502). `build_event_log_provider` is always called
-/// before `init_bridge_instance`, so the repository must be threaded through
-/// rather than stored via `BridgeInstance::set_protocol_repository` inside
-/// this function.
-///
-/// Uses [`BridgeInMemoryStorage`] (a bridge-local `Storage` implementation)
-/// instead of `scp_platform::testing::InMemoryStorage` so that the `testing`
-/// feature (which also exposes `InMemoryKeyCustody`) is not required in
-/// production builds. See issue #484.
+/// Delegates to [`scp_ffi_common::bridge_runtime::build_event_log_provider`].
+/// Returns both the event log provider and the underlying `ProtocolRepository`
+/// (for registration in `BridgeInstance`).
 pub(crate) fn build_event_log_provider() -> (
     Box<dyn ContextEventLogProvider>,
     Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
 ) {
-    let mut key = Zeroizing::new([0u8; 32]);
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
-    let encrypted = EncryptingAdapter::new(BridgeInMemoryStorage::new(), key);
-    let store = Arc::new(ProtocolRepository::new(encrypted));
-
-    let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(&store));
-    let event_log = Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)));
-    (event_log, store)
+    scp_ffi_common::bridge_runtime::build_event_log_provider()
 }
 
 /// Builds an event log provider that reuses the already-registered
@@ -555,8 +513,33 @@ fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProv
     )))
 }
 
+/// Process-wide async mutex that serializes the
+/// `scp_suspend_resume_roundtrip` test with EVERY other test in this
+/// binary that calls `context_manager()` or `bridge_instance()` (both of
+/// which error when the `BridgeInstance::suspended` flag is set). Cargo
+/// runs lib-tests in parallel by default, and because NAPI is a cdylib
+/// (`napi_wrap` is only defined when loaded by Node), suspend/resume
+/// cannot be moved into a separate integration-test binary as in the
+/// `PyO3` and `UniFFI` bridges.
+///
+/// Every test that touches shared bridge state — including context
+/// creation, governance, economy trackers, and bridge-connector
+/// registration — must acquire this mutex for the duration of its
+/// assertions so the roundtrip test cannot observe `is_suspended=true`
+/// mid-test. A `tokio::sync::Mutex` is used (not `std::sync::Mutex`)
+/// because several callers are `async` tests that hold the guard across
+/// `.await` points — `std::sync::Mutex` guards are not `Send` and would
+/// trigger the `await_holding_lock` lint, which specifically warns
+/// against deadlock via blocked worker threads.
+#[cfg(test)]
+pub(crate) fn bridge_lifecycle_serial() -> &'static tokio::sync::Mutex<()> {
+    static BRIDGE_LIFECYCLE_SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    BRIDGE_LIFECYCLE_SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Test variant of [`context_manager`] initialization that uses
-/// [`LocalTransportProvider`](scp_core::context::LocalTransportProvider) instead of
+/// [`LocalTransportProvider`](scp_core::context::LocalTransportProvider)
+/// instead of
 /// [`NotConfiguredTransportProvider`](scp_core::context::NotConfiguredTransportProvider)
 /// and a no-op crypto provider for Rust unit tests that pass `None` key
 /// package bytes with `did:key:` test DIDs.
@@ -675,107 +658,10 @@ impl scp_core::context::builder::ContextCryptoProvider for TestNoOpCryptoProvide
 }
 
 // ---------------------------------------------------------------------------
-// BridgeInMemoryStorage — bridge-local Storage implementation
-//
-// This avoids pulling in `scp-platform/testing` (which also exposes
-// `InMemoryKeyCustody`) just for event log persistence. Production builds
-// must not compile `InMemoryKeyCustody` unconditionally.
+// BridgeInMemoryStorage — previously defined locally with identical code.
+// Consolidated in `scp-ffi-common::bridge_runtime` (#1447). Imported via
+// `use scp_ffi_common::bridge_runtime::BridgeInMemoryStorage` at the top.
 // ---------------------------------------------------------------------------
-
-/// In-memory `Storage` implementation for the NAPI bridge event log.
-///
-/// Identical in behavior to `scp_platform::testing::InMemoryStorage` but
-/// defined locally so the `testing` feature is not required in production
-/// dependencies. Only used as the backing store for the
-/// `EncryptingAdapter`-wrapped `ProtocolRepository` that feeds the
-/// `MerkleEventLogProvider`.
-pub struct BridgeInMemoryStorage {
-    data: tokio::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
-}
-
-impl BridgeInMemoryStorage {
-    fn new() -> Self {
-        Self {
-            data: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-}
-
-#[allow(clippy::manual_async_fn)]
-impl Storage for BridgeInMemoryStorage {
-    fn store(
-        &self,
-        key: &str,
-        data: &[u8],
-    ) -> impl Future<Output = Result<(), PlatformError>> + Send {
-        let key = key.to_owned();
-        let data = data.to_vec();
-        async move {
-            self.data.lock().await.insert(key, data);
-            Ok(())
-        }
-    }
-
-    fn retrieve(
-        &self,
-        key: &str,
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, PlatformError>> + Send {
-        let key = key.to_owned();
-        async move { Ok(self.data.lock().await.get(&key).cloned()) }
-    }
-
-    fn delete(&self, key: &str) -> impl Future<Output = Result<(), PlatformError>> + Send {
-        let key = key.to_owned();
-        async move {
-            self.data.lock().await.remove(&key);
-            Ok(())
-        }
-    }
-
-    fn list_keys(
-        &self,
-        prefix: &str,
-    ) -> impl Future<Output = Result<Vec<String>, PlatformError>> + Send {
-        let prefix = prefix.to_owned();
-        async move {
-            let store = self.data.lock().await;
-            let mut keys: Vec<String> = store
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .cloned()
-                .collect();
-            drop(store);
-            keys.sort();
-            Ok(keys)
-        }
-    }
-
-    fn delete_prefix(
-        &self,
-        prefix: &str,
-    ) -> impl Future<Output = Result<u64, PlatformError>> + Send {
-        let prefix = prefix.to_owned();
-        async move {
-            let mut store = self.data.lock().await;
-            let keys_to_delete: Vec<String> = store
-                .keys()
-                .filter(|k| k.starts_with(&prefix))
-                .cloned()
-                .collect();
-            let count = keys_to_delete.len() as u64;
-            for key in keys_to_delete {
-                store.remove(&key);
-            }
-            drop(store);
-            Ok(count)
-        }
-    }
-
-    fn exists(&self, key: &str) -> impl Future<Output = Result<bool, PlatformError>> + Send {
-        let key = key.to_owned();
-        async move { Ok(self.data.lock().await.contains_key(&key)) }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Global identity registry — retained identity state for UCAN delegation
@@ -804,21 +690,18 @@ pub(crate) struct NapiIdentityEntry {
         Vec<scp_core::identity::attestation::IdentityLinkAttestation>,
 }
 
-/// Returns a reference to the global identity registry.
-///
-/// The registry is stored as a type-erased `Arc<DashMap<String, NapiIdentityEntry>>`
-/// in the `BridgeInstance`. Panics if called before `init_context_manager`.
-///
-/// # Panics
-///
-/// Panics if the bridge has not been initialized. This is a programming error.
-#[cfg(feature = "allow_in_memory_custody")]
-#[allow(clippy::panic)]
 /// Fallback empty identity registry for when `BridgeInstance` is not initialized
 /// or the identity registry feature gate is disabled.
+#[cfg(feature = "allow_in_memory_custody")]
 static EMPTY_IDENTITY_REGISTRY: std::sync::OnceLock<DashMap<String, NapiIdentityEntry>> =
     std::sync::OnceLock::new();
 
+/// Returns a reference to the global identity registry.
+///
+/// The registry is stored as a type-erased `Arc<DashMap<String, NapiIdentityEntry>>`
+/// in the `BridgeInstance`. Falls back to an empty registry when the bridge
+/// has not been initialized (e.g. in unit tests that don't call
+/// `init_context_manager`).
 #[cfg(feature = "allow_in_memory_custody")]
 fn identity_registry() -> &'static DashMap<String, NapiIdentityEntry> {
     BRIDGE_INSTANCE
@@ -928,23 +811,15 @@ where
 // lightweight registry for them, keyed by context ID.
 // ---------------------------------------------------------------------------
 
-/// Per-context UCAN validation state.
+/// Per-context UCAN validation state (NAPI bridge).
 ///
-/// Retains the `RevocationList` and `NonceTracker` needed by the UCAN
-/// validation pipeline (ADR-016). These are NOT duplicates of `ContextManager`
-/// state — the manager does not track UCAN revocation or nonces.
+/// Wraps [`scp_ffi_common::bridge_runtime::UcanContextStateCore`] with
+/// NAPI-specific fields for tool management and role state. The core
+/// fields (revocation list, nonce tracker, ceiling, creator DID, event log)
+/// are shared with the `UniFFI` bridge (#1447).
 pub struct UcanContextState {
-    /// UCAN revocation list for this context.
-    pub revocation_list: RevocationList,
-    /// UCAN nonce tracker for replay prevention (ADR-016 step 9).
-    pub nonce_tracker: NonceTracker<SystemClock>,
-    /// Capability ceiling as a set of `{resource}:{action}` strings for
-    /// UCAN validation (ADR-016 step 8).
-    pub ceiling_strings: HashSet<String>,
-    /// The DID of the context creator.
-    pub creator_did: String,
-    /// Event log (Merkle tree) for this context.
-    pub event_log: EventLog,
+    /// Core UCAN validation state shared with `UniFFI` bridge.
+    pub core: scp_ffi_common::bridge_runtime::UcanContextStateCore,
     /// Role state for capability checking (tool registration, invocation).
     pub role_state: ContextRoleState,
     /// Tool registry for this context (cross-context + session support).
@@ -1034,11 +909,13 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
     };
 
     let state = UcanContextState {
-        revocation_list,
-        nonce_tracker,
-        ceiling_strings,
-        creator_did,
-        event_log,
+        core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
+            revocation_list,
+            nonce_tracker,
+            ceiling_strings,
+            creator_did,
+            event_log,
+        },
         role_state,
         tool_registry: ToolRegistry::new(),
         tool_handlers: HashMap::new(),
@@ -1152,7 +1029,7 @@ pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
     let map = ucan_registry();
     match map.get(context_id) {
         Some(entry) => {
-            let total = u64::try_from(entry.event_log.leaves().len()).unwrap_or(u64::MAX);
+            let total = u64::try_from(entry.core.event_log.leaves().len()).unwrap_or(u64::MAX);
             (total, 0)
         }
         None => (0, 0),
@@ -1218,11 +1095,13 @@ pub fn register_test_context(context_id: &str, creator_did: &str) {
     .expect("ContextRoleState::new with default ceiling and no custom roles cannot fail");
 
     let state = UcanContextState {
-        event_log: EventLog::new(context_id.to_owned()),
-        revocation_list: RevocationList::new(context_id.to_owned()),
-        nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
-        ceiling_strings,
-        creator_did: creator_did.to_owned(),
+        core: scp_ffi_common::bridge_runtime::UcanContextStateCore {
+            event_log: EventLog::new(context_id.to_owned()),
+            revocation_list: RevocationList::new(context_id.to_owned()),
+            nonce_tracker: NonceTracker::new(context_id.to_owned(), SystemClock),
+            ceiling_strings,
+            creator_did: creator_did.to_owned(),
+        },
         role_state,
         tool_registry: ToolRegistry::new(),
         tool_handlers: HashMap::new(),
@@ -1348,6 +1227,7 @@ mod tests {
 
     #[test]
     fn bridge_instance_populated_by_init_context_manager() {
+        let _lifecycle_guard = bridge_lifecycle_serial().blocking_lock();
         // init_context_manager_for_test populates BRIDGE_INSTANCE which owns
         // the ContextManager. Since OnceLock is process-global, the first call
         // BRIDGE_INSTANCE. Since OnceLock is process-global, the first call
@@ -1367,6 +1247,7 @@ mod tests {
 
     #[test]
     fn bridge_instance_not_shutdown_initially() {
+        let _lifecycle_guard = bridge_lifecycle_serial().blocking_lock();
         init_context_manager_for_test();
 
         let bi = bridge_instance().expect("bridge_instance should be initialized");

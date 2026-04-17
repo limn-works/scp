@@ -90,6 +90,11 @@ pub mod attestation;
 #[cfg(feature = "resolvers")]
 pub mod bridge_instance;
 
+// Shared runtime helpers (key resolver, BridgeInMemoryStorage, event log provider).
+// Requires scp-core + scp-platform (behind `resolvers` feature). Not available for WASM.
+#[cfg(feature = "resolvers")]
+pub mod bridge_runtime;
+
 // Shared context-parameter builder for all non-WASM bridges.
 // Requires scp-core (behind `resolvers` feature). Not available for WASM.
 #[cfg(feature = "resolvers")]

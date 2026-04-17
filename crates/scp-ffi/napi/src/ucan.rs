@@ -261,10 +261,10 @@ pub async fn ucan_validate(
         let did_resolver =
             DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
         let revocation_checker = BridgeRevocationChecker {
-            revocation_list: &rt.revocation_list,
+            revocation_list: &rt.core.revocation_list,
         };
         let mut nonce_adapter = BridgeNonceTracker {
-            inner: &mut rt.nonce_tracker,
+            inner: &mut rt.core.nonce_tracker,
         };
 
         let mut ctx = ValidationContext {
@@ -272,8 +272,8 @@ pub async fn ucan_validate(
             nonce_tracker: &mut nonce_adapter,
             revocation_checker: &revocation_checker,
             proof_resolver: &proof_resolver,
-            ceiling: &rt.ceiling_strings,
-            context_creator_did: &rt.creator_did,
+            ceiling: &rt.core.ceiling_strings,
+            context_creator_did: &rt.core.creator_did,
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
@@ -653,16 +653,16 @@ pub async fn ucan_revoke(
 
         let authorizer = BridgeRevocationAuthorizer {
             issuer_did: parsed.payload.iss.clone(),
-            creator_did: rt.creator_did.clone(),
+            creator_did: rt.core.creator_did.clone(),
         };
         let distributor = BridgeRevocationDistributor;
-        let event_log_cell = RefCell::new(&mut rt.event_log);
+        let event_log_cell = RefCell::new(&mut rt.core.event_log);
         let event_logger = BridgeRevocationEventLogger {
             event_log: &event_log_cell,
         };
 
         scp_core::crypto::ucan::revoke::revoke_ucan(
-            &mut rt.revocation_list,
+            &mut rt.core.revocation_list,
             &token,
             &revoker_did,
             &authorizer,
@@ -939,14 +939,14 @@ mod tests {
 
         // First call: revoke a CID.
         runtime::with_context(&context_id, |rt| {
-            rt.revocation_list.revoke("revoked-cid-123".to_owned());
+            rt.core.revocation_list.revoke("revoked-cid-123".to_owned());
             Ok(())
         })
         .unwrap();
 
         // Second call: verify the revocation persists.
         let is_revoked = runtime::with_context(&context_id, |rt| {
-            Ok(rt.revocation_list.is_revoked("revoked-cid-123"))
+            Ok(rt.core.revocation_list.is_revoked("revoked-cid-123"))
         })
         .unwrap();
 
@@ -957,7 +957,7 @@ mod tests {
 
         // Unrevoked CIDs should not be affected.
         let other_revoked = runtime::with_context(&context_id, |rt| {
-            Ok(rt.revocation_list.is_revoked("other-cid-456"))
+            Ok(rt.core.revocation_list.is_revoked("other-cid-456"))
         })
         .unwrap();
 
@@ -988,7 +988,8 @@ mod tests {
 
         // First call: record the nonce — should succeed.
         let first_result = runtime::with_context(&context_id, |rt| {
-            rt.nonce_tracker
+            rt.core
+                .nonce_tracker
                 .check_and_record(&nonce, expiry)
                 .map_err(|e| crate::error::ScpNapiError::Permission {
                     message: format!("nonce check failed: {e}"),
@@ -999,7 +1000,8 @@ mod tests {
 
         // Second call: replay the same nonce — should fail.
         let second_result = runtime::with_context(&context_id, |rt| {
-            rt.nonce_tracker
+            rt.core
+                .nonce_tracker
                 .check_and_record(&nonce, expiry)
                 .map_err(|e| crate::error::ScpNapiError::Permission {
                     message: format!("nonce check failed: {e}"),
@@ -1014,7 +1016,8 @@ mod tests {
         // A different nonce should succeed.
         let different_nonce = format!("{}-bbccddee22334455bbccddee22334455", now_millis + 1);
         let third_result = runtime::with_context(&context_id, |rt| {
-            rt.nonce_tracker
+            rt.core
+                .nonce_tracker
                 .check_and_record(&different_nonce, expiry)
                 .map_err(|e| crate::error::ScpNapiError::Permission {
                     message: format!("nonce check failed: {e}"),
@@ -1050,16 +1053,16 @@ mod tests {
         runtime::with_context(&context_id, |rt| {
             let authorizer = BridgeRevocationAuthorizer {
                 issuer_did: issuer_did.clone(),
-                creator_did: rt.creator_did.clone(),
+                creator_did: rt.core.creator_did.clone(),
             };
             let distributor = BridgeRevocationDistributor;
-            let event_log_cell = RefCell::new(&mut rt.event_log);
+            let event_log_cell = RefCell::new(&mut rt.core.event_log);
             let event_logger = BridgeRevocationEventLogger {
                 event_log: &event_log_cell,
             };
 
             scp_core::crypto::ucan::revoke::revoke_ucan(
-                &mut rt.revocation_list,
+                &mut rt.core.revocation_list,
                 test_token,
                 creator_did,
                 &authorizer,
@@ -1076,7 +1079,7 @@ mod tests {
         let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(test_token);
         let checker_says_revoked = runtime::with_context(&context_id, |rt| {
             let checker = BridgeRevocationChecker {
-                revocation_list: &rt.revocation_list,
+                revocation_list: &rt.core.revocation_list,
             };
             Ok(checker.is_revoked(&token_cid))
         })
@@ -1089,7 +1092,7 @@ mod tests {
 
         // Verify a TokenRevoked event was appended to the event log.
         let event_count = runtime::with_context(&context_id, |rt| {
-            Ok(scp_event_log::tree::event_count(&rt.event_log))
+            Ok(scp_event_log::tree::event_count(&rt.core.event_log))
         })
         .unwrap();
         assert!(
@@ -1119,16 +1122,16 @@ mod tests {
         let result = runtime::with_context(&context_id, |rt| {
             let authorizer = BridgeRevocationAuthorizer {
                 issuer_did: issuer_did.clone(),
-                creator_did: rt.creator_did.clone(),
+                creator_did: rt.core.creator_did.clone(),
             };
             let distributor = BridgeRevocationDistributor;
-            let event_log_cell = RefCell::new(&mut rt.event_log);
+            let event_log_cell = RefCell::new(&mut rt.core.event_log);
             let event_logger = BridgeRevocationEventLogger {
                 event_log: &event_log_cell,
             };
 
             let result = scp_core::crypto::ucan::revoke::revoke_ucan(
-                &mut rt.revocation_list,
+                &mut rt.core.revocation_list,
                 test_token,
                 "did:dht:zUnauthorized",
                 &authorizer,

@@ -377,6 +377,15 @@
         {"name": "scpid_sign", "python": true, "typescript": true, "kotlin": true, "swift": true},
         {"name": "scpid_verify", "python": true, "typescript": true, "kotlin": true, "swift": true}
       ]
+    },
+    {
+      "domain": "Lifecycle",
+      "operations": [
+        {"name": "suspend", "python": true, "typescript": true, "kotlin": true, "swift": true,
+         "notes": "Disconnects transport and marks BridgeInstance as suspended for mobile/desktop backgrounding. No-op on WASM (no long-lived native runtime). All three FFI bridges (PyO3 scp_suspend, NAPI scpSuspend, UniFFI scpSuspend) call BridgeInstance::suspend. SDK wrappers: Python scp_sdk.suspend(), TypeScript scpSuspend(), Kotlin works.limn.scp.suspend(bridge), Swift Lifecycle.suspend()."},
+        {"name": "resume", "python": true, "typescript": true, "kotlin": true, "swift": true,
+         "notes": "Clears suspended flag so operations can proceed. Caller must re-establish the relay connection via transportConnect. No-op on WASM. All three FFI bridges call BridgeInstance::resume. SDK wrappers: Python scp_sdk.resume(), TypeScript scpResume(), Kotlin works.limn.scp.resume(bridge), Swift Lifecycle.resume()."}
+      ]
     }
   ]
 }

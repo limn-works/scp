@@ -593,6 +593,8 @@ export interface Bridge {
   // Lifecycle
   version(): string;
   shutdown(timeoutSecs: number): void;
+  suspend(): void;
+  resume(): void;
 }
 
 // ---------------------------------------------------------------------------

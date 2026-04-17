@@ -1975,6 +1975,14 @@ export function createMockBridge(): Bridge & {
       contexts.clear();
       transports.clear();
     },
+
+    suspend(): void {
+      // Mock: no-op. Real bridges call BridgeInstance::suspend.
+    },
+
+    resume(): void {
+      // Mock: no-op. Real bridges call BridgeInstance::resume.
+    },
   };
 
   return bridge;

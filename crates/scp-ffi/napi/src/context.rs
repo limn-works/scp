@@ -3585,6 +3585,7 @@ mod tests {
     /// creator); after a join it becomes 2.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn member_count_reflects_actual_membership() {
+        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().lock().await;
         crate::runtime::init_context_manager_for_test();
         let manager = context_manager().expect("manager initialized above");
         let ctx_id = format!("test-member-count-{}", uuid::Uuid::new_v4());
@@ -3661,6 +3662,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_change_role() {
+        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().lock().await;
         crate::runtime::init_context_manager_for_test();
         let manager = context_manager().expect("manager initialized above");
         let ctx_id = format!("napi-sync-role-{}", uuid::Uuid::new_v4());
@@ -3722,6 +3724,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_add_member() {
+        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().lock().await;
         crate::runtime::init_context_manager_for_test();
         let manager = context_manager().expect("manager initialized above");
         let ctx_id = format!("napi-sync-add-{}", uuid::Uuid::new_v4());
@@ -3774,6 +3777,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_remove_member() {
+        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().lock().await;
         crate::runtime::init_context_manager_for_test();
         let manager = context_manager().expect("manager initialized above");
         let ctx_id = format!("napi-sync-rm-{}", uuid::Uuid::new_v4());
@@ -3998,6 +4002,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_create_threads_consequence_rules_and_config() {
+        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().lock().await;
         crate::runtime::init_context_manager_for_test();
 
         let identity = crate::identity::identity_create("in_memory".to_owned())
@@ -4052,6 +4057,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_create_rejects_revoke_access_when_config_disallows() {
+        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().lock().await;
         crate::runtime::init_context_manager_for_test();
 
         let identity = crate::identity::identity_create("in_memory".to_owned())
@@ -4089,6 +4095,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_rejects_malformed_spending_ucan_jwt() {
+        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().lock().await;
         crate::runtime::init_context_manager_for_test();
 
         let identity = crate::identity::identity_create("in_memory".to_owned())
@@ -4128,6 +4135,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_accepts_none_spending_ucan_jwt() {
+        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().lock().await;
         crate::runtime::init_context_manager_for_test();
 
         let identity = crate::identity::identity_create("in_memory".to_owned())
