@@ -671,21 +671,18 @@ pub(crate) struct NapiIdentityEntry {
         Vec<scp_core::identity::attestation::IdentityLinkAttestation>,
 }
 
-/// Returns a reference to the global identity registry.
-///
-/// The registry is stored as a type-erased `Arc<DashMap<String, NapiIdentityEntry>>`
-/// in the `BridgeInstance`. Panics if called before `init_context_manager`.
-///
-/// # Panics
-///
-/// Panics if the bridge has not been initialized. This is a programming error.
-#[cfg(feature = "allow_in_memory_custody")]
-#[allow(clippy::panic)]
 /// Fallback empty identity registry for when `BridgeInstance` is not initialized
 /// or the identity registry feature gate is disabled.
+#[cfg(feature = "allow_in_memory_custody")]
 static EMPTY_IDENTITY_REGISTRY: std::sync::OnceLock<DashMap<String, NapiIdentityEntry>> =
     std::sync::OnceLock::new();
 
+/// Returns a reference to the global identity registry.
+///
+/// The registry is stored as a type-erased `Arc<DashMap<String, NapiIdentityEntry>>`
+/// in the `BridgeInstance`. Falls back to an empty registry when the bridge
+/// has not been initialized (e.g. in unit tests that don't call
+/// `init_context_manager`).
 #[cfg(feature = "allow_in_memory_custody")]
 fn identity_registry() -> &'static DashMap<String, NapiIdentityEntry> {
     BRIDGE_INSTANCE
