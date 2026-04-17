@@ -2266,18 +2266,20 @@ impl ContextManager {
             .set(context_id, member_did, member_access_key);
 
         // Emit MemberJoined event to receive buffer.
-        ctx.receive_buffer.push(ContextEvent::MemberJoined {
+        let join_event = ContextEvent::MemberJoined {
             member_did: member_did.clone(),
             role_name: "member".into(),
-        });
+        };
+        ctx.emit_event(join_event, context_id, self.event_tx.as_ref());
 
         // Emit WelcomeGenerated event if the add produced a Welcome message.
         push_welcome_event(
-            &mut ctx.receive_buffer,
+            ctx,
             context_id,
             &DID(creator_did),
             member_did,
             add_output,
+            self.event_tx.as_ref(),
         );
 
         Ok(())
@@ -2464,9 +2466,10 @@ impl ContextManager {
             ctx.pseudonym_registry.remove(member_did);
 
             // Emit MemberLeft event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::MemberLeft {
+            let left_event = ContextEvent::MemberLeft {
                 member_did: member_did.clone(),
-            });
+            };
+            ctx.emit_event(left_event, &context_id, self.event_tx.as_ref());
 
             ctx.membership.count() == 0
         };

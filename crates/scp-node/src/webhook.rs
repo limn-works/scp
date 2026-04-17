@@ -480,6 +480,155 @@ impl Default for WebhookDispatcher {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ContextEvent → webhook event mapping (#1539 AC3)
+// ---------------------------------------------------------------------------
+
+/// Maps a [`scp_core::context::membership::ContextEvent`] to a `(event_type, payload)`
+/// tuple suitable for [`WebhookDispatcher::dispatch_event`].
+///
+/// The `event_type` string follows the dot-separated convention used by
+/// existing webhook consumers: `"message.received"`, `"member.joined"`,
+/// `"member.left"`, `"governance.action"`, and `"context.event"` (generic
+/// fallback).
+#[must_use]
+pub fn map_context_event(
+    event: &scp_core::context::membership::ContextEvent,
+) -> (&'static str, serde_json::Value) {
+    use scp_core::context::membership::ContextEvent;
+    match event {
+        ContextEvent::MessageReceived { sender_did, .. } => (
+            "message.received",
+            serde_json::json!({
+                "sender_did": sender_did.as_ref(),
+            }),
+        ),
+        ContextEvent::MessageSent {
+            sender_did,
+            sequence_number,
+            ..
+        } => (
+            "message.sent",
+            serde_json::json!({
+                "sender_did": sender_did.as_ref(),
+                "sequence_number": sequence_number,
+            }),
+        ),
+        ContextEvent::MemberJoined {
+            member_did,
+            role_name,
+        } => (
+            "member.joined",
+            serde_json::json!({
+                "member_did": member_did.as_ref(),
+                "role_name": role_name,
+            }),
+        ),
+        ContextEvent::MemberLeft { member_did } => (
+            "member.left",
+            serde_json::json!({
+                "member_did": member_did.as_ref(),
+            }),
+        ),
+        ContextEvent::GovernanceActionExecuted {
+            proposal_id,
+            action_summary,
+            executor_did,
+            resulting_epoch,
+            target_did,
+        } => (
+            "governance.action",
+            serde_json::json!({
+                "proposal_id": hex::encode(proposal_id),
+                "action_summary": action_summary,
+                "executor_did": executor_did.as_ref(),
+                "resulting_epoch": resulting_epoch,
+                "target_did": target_did.as_ref().map(AsRef::as_ref),
+            }),
+        ),
+        // All other variants — emit generic event type with variant name only.
+        // Listed exhaustively so that adding a new ContextEvent variant causes
+        // a compile error, forcing the developer to decide whether the variant
+        // should be exposed to webhooks with structured fields or generic form.
+        ContextEvent::SystemClose { .. }
+        | ContextEvent::Expired
+        | ContextEvent::ExpiryFailed { .. }
+        | ContextEvent::MemberBlocked { .. }
+        | ContextEvent::MemberUnblocked { .. }
+        | ContextEvent::AuthorBlocked { .. }
+        | ContextEvent::ReadAccessRevoked { .. }
+        | ContextEvent::ReadAccessRestored { .. }
+        | ContextEvent::WriteAccessRevoked { .. }
+        | ContextEvent::CapabilitiesSuspended { .. }
+        | ContextEvent::WriteAccessRestored { .. }
+        | ContextEvent::AccessKeyRevoked { .. }
+        | ContextEvent::AccessKeyRestored { .. }
+        | ContextEvent::ContentKeysRotated { .. }
+        | ContextEvent::CeilingChangeNotification { .. }
+        | ContextEvent::EconomicPolicyChangeNotification { .. }
+        | ContextEvent::VoteWithdrawn { .. }
+        | ContextEvent::ProposalTimedOut { .. }
+        | ContextEvent::DeadlockDetected { .. }
+        | ContextEvent::AppBound { .. }
+        | ContextEvent::AppUnbound { .. }
+        | ContextEvent::DegradedMode { .. }
+        | ContextEvent::WelcomeGenerated { .. }
+        | ContextEvent::BufferOverflow { .. }
+        | ContextEvent::SequenceGapDetected { .. }
+        | ContextEvent::CheckpointCosignatureRequired { .. }
+        | ContextEvent::ContextMigrationProposed { .. }
+        | ContextEvent::ContextMigrationStarted { .. }
+        | ContextEvent::ContextMigrationCancelled { .. }
+        | ContextEvent::ContextTombstoned { .. }
+        | ContextEvent::ConsequenceTriggered { .. }
+        | ContextEvent::ConsequenceEnforced { .. }
+        | ContextEvent::PaymentCaptureFailed { .. }
+        | ContextEvent::CommitBroadcastPending { .. }
+        | ContextEvent::CommitBroadcastSucceeded { .. }
+        | ContextEvent::EquivocationDetected { .. }
+        | ContextEvent::CommitBroadcastFailed { .. }
+        | ContextEvent::PseudonymAnnounced { .. } => (
+            "context.event",
+            serde_json::json!({ "variant": event.variant_name() }),
+        ),
+    }
+}
+
+/// Spawns a background task that reads events from a
+/// [`tokio::sync::broadcast::Receiver`] and forwards them to a
+/// [`WebhookDispatcher`].
+///
+/// The task runs until the receiver's channel is closed (all senders
+/// dropped) or the returned [`tokio::task::JoinHandle`] is aborted.
+/// Lagged events are logged and skipped.
+pub fn spawn_event_consumer(
+    mut rx: tokio::sync::broadcast::Receiver<(String, scp_core::context::membership::ContextEvent)>,
+    dispatcher: Arc<WebhookDispatcher>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok((context_id, event)) => {
+                    let (event_type, payload) = map_context_event(&event);
+                    dispatcher
+                        .dispatch_event(&context_id, event_type, payload)
+                        .await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                    tracing::warn!(
+                        count,
+                        "webhook event consumer lagged — {count} events dropped"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    tracing::info!("webhook event channel closed — consumer stopping");
+                    break;
+                }
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -965,5 +1114,100 @@ mod tests {
         verify_webhook_request(&captured, &verifying_key);
 
         server_handle.abort();
+    }
+
+    // -------------------------------------------------------------------
+    // ContextEvent mapping tests (#1539 AC3)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn map_context_event_message_received() {
+        use scp_core::context::membership::ContextEvent;
+        let event = ContextEvent::MessageReceived {
+            sender_did: scp_identity::DID::from("did:key:alice"),
+            payload: vec![1, 2, 3],
+        };
+        let (event_type, payload) = super::map_context_event(&event);
+        assert_eq!(event_type, "message.received");
+        assert_eq!(payload["sender_did"], "did:key:alice");
+        // payload_size intentionally omitted — the event channel delivers
+        // stripped events (payload = vec![]), so the size would always be 0.
+        assert!(payload.get("payload_size").is_none());
+    }
+
+    #[test]
+    fn map_context_event_message_sent() {
+        use scp_core::context::membership::ContextEvent;
+        let event = ContextEvent::MessageSent {
+            sender_did: scp_identity::DID::from("did:key:bob"),
+            sequence_number: 42,
+            payload: vec![0; 100],
+        };
+        let (event_type, payload) = super::map_context_event(&event);
+        assert_eq!(event_type, "message.sent");
+        assert_eq!(payload["sender_did"], "did:key:bob");
+        assert_eq!(payload["sequence_number"], 42);
+    }
+
+    #[test]
+    fn map_context_event_member_joined() {
+        use scp_core::context::membership::ContextEvent;
+        let event = ContextEvent::MemberJoined {
+            member_did: scp_identity::DID::from("did:key:carol"),
+            role_name: "admin".to_owned(),
+        };
+        let (event_type, payload) = super::map_context_event(&event);
+        assert_eq!(event_type, "member.joined");
+        assert_eq!(payload["member_did"], "did:key:carol");
+        assert_eq!(payload["role_name"], "admin");
+    }
+
+    #[test]
+    fn map_context_event_member_left() {
+        use scp_core::context::membership::ContextEvent;
+        let event = ContextEvent::MemberLeft {
+            member_did: scp_identity::DID::from("did:key:dave"),
+        };
+        let (event_type, payload) = super::map_context_event(&event);
+        assert_eq!(event_type, "member.left");
+        assert_eq!(payload["member_did"], "did:key:dave");
+    }
+
+    #[test]
+    fn map_context_event_governance_action() {
+        use scp_core::context::membership::ContextEvent;
+        let event = ContextEvent::GovernanceActionExecuted {
+            proposal_id: [0xAB; 32],
+            action_summary: "AddMember".to_owned(),
+            executor_did: scp_identity::DID::from("did:key:admin"),
+            resulting_epoch: Some(5),
+            target_did: Some(scp_identity::DID::from("did:key:new")),
+        };
+        let (event_type, payload) = super::map_context_event(&event);
+        assert_eq!(event_type, "governance.action");
+        assert_eq!(payload["action_summary"], "AddMember");
+        assert_eq!(payload["executor_did"], "did:key:admin");
+        assert_eq!(payload["resulting_epoch"], 5);
+        assert_eq!(payload["target_did"], "did:key:new");
+    }
+
+    #[test]
+    fn map_context_event_generic_fallback() {
+        use scp_core::context::membership::ContextEvent;
+        let event = ContextEvent::Expired;
+        let (event_type, _payload) = super::map_context_event(&event);
+        assert_eq!(event_type, "context.event");
+    }
+
+    #[test]
+    fn map_context_event_system_close_is_generic() {
+        use scp_core::context::membership::ContextEvent;
+        let event = ContextEvent::SystemClose {
+            initiator_did: scp_identity::DID::from("did:key:closer"),
+        };
+        let (event_type, payload) = super::map_context_event(&event);
+        assert_eq!(event_type, "context.event");
+        // Should have a variant field in the payload.
+        assert!(payload.get("variant").is_some());
     }
 }

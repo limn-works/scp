@@ -14,7 +14,7 @@ use super::{
     SuspendMemberResult, ToolInterface, ToolRegistration, TriggeredConsequence, classify_action,
     collect_active_voters, commit_retry_backoff, context_id_to_bytes, evaluate_consequence_rules,
     generate_mls_operations, instrument, process_pending_proposals, push_welcome_event,
-    require_active, require_migrating_out, roles, update_detection_state,
+    require_active, require_migrating_out, roles, strip_event_payload, update_detection_state,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,6 +69,7 @@ pub(super) fn dispatch_consequences(
     now: u64,
     clock: &dyn scp_primitives::Clock,
     event_log: &dyn super::super::builder::ContextEventLogProvider,
+    event_tx: Option<&tokio::sync::broadcast::Sender<(String, super::ContextEvent)>>,
 ) {
     if ctx.governance.consequence_rules.is_empty() {
         return;
@@ -96,6 +97,7 @@ pub(super) fn dispatch_consequences(
             rules: &rules,
             clock,
             event_log,
+            event_tx,
         },
     );
 }
@@ -203,6 +205,9 @@ pub(super) struct EnforceConsequencesCtx<'a> {
     pub rules: &'a [ConsequenceRule],
     pub clock: &'a dyn scp_primitives::Clock,
     pub event_log: &'a dyn super::super::builder::ContextEventLogProvider,
+    /// Optional broadcast channel for event propagation from free
+    /// functions that lack `&self` access to [`ContextManager`].
+    pub event_tx: Option<&'a tokio::sync::broadcast::Sender<(String, super::ContextEvent)>>,
 }
 
 /// Enforces a set of pre-evaluated triggered consequences.
@@ -367,13 +372,14 @@ fn emit_consequence_triggered(
         &payload,
     );
     ctx.checkpoint_events_since += 1;
-    ctx.receive_buffer.push(ContextEvent::ConsequenceTriggered {
+    let event = ContextEvent::ConsequenceTriggered {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
         rule_index: consequence.rule_index,
         trigger_type: trigger_kind.to_owned(),
         action_type: action_type.to_owned(),
-    });
+    };
+    ctx.emit_event(event, args.context_id, args.event_tx);
 }
 
 /// Emits a `ConsequenceEnforcementFailed` durable entry plus the matching
@@ -404,12 +410,13 @@ fn emit_absent_member_enforcement_failed(
         &payload,
     );
     ctx.checkpoint_events_since += 1;
-    ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+    let event = ContextEvent::ConsequenceEnforced {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
         action_type: action_type.to_owned(),
         success: false,
-    });
+    };
+    ctx.emit_event(event, args.context_id, args.event_tx);
 }
 
 /// Emits a `ConsequenceEnforced { success: true }` durable entry plus the
@@ -437,12 +444,13 @@ fn emit_consequence_enforced_success(
         &payload,
     );
     ctx.checkpoint_events_since += 1;
-    ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+    let event = ContextEvent::ConsequenceEnforced {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
         action_type: action_type.to_owned(),
         success: true,
-    });
+    };
+    ctx.emit_event(event, args.context_id, args.event_tx);
 }
 
 /// Per-arm enforcement dispatch. Each match arm calls a named function as
@@ -584,12 +592,13 @@ fn emit_failure_escalation(
         &escalation_payload,
     );
     ctx.checkpoint_events_since += 1;
-    ctx.receive_buffer.push(ContextEvent::ConsequenceEnforced {
+    let event = ContextEvent::ConsequenceEnforced {
         context_id: context_id.to_owned(),
         member_did: member_did.clone(),
         action_type: "SuspendAll(escalated)".to_owned(),
         success: true,
-    });
+    };
+    ctx.emit_event(event, context_id, args.event_tx);
 }
 
 /// Converts receive buffer events into `scp_event_log::Event` format for
@@ -1182,14 +1191,14 @@ impl ContextManager {
 
                 // 1. Push GovernanceActionExecuted to receive buffer so SDK
                 //    consumers observe outcomes with rich context.
-                ctx.receive_buffer
-                    .push(ContextEvent::GovernanceActionExecuted {
-                        proposal_id: proposal.proposal_id,
-                        action_summary,
-                        executor_did: proposal.proposer_did.clone(),
-                        resulting_epoch,
-                        target_did,
-                    });
+                let gov_event = ContextEvent::GovernanceActionExecuted {
+                    proposal_id: proposal.proposal_id,
+                    action_summary,
+                    executor_did: proposal.proposer_did.clone(),
+                    resulting_epoch,
+                    target_did,
+                };
+                ctx.emit_event(gov_event, context_id, self.event_tx.as_ref());
 
                 // 2. Trigger checkpoint cosignature collection for multi-admin
                 //    contexts (ADR-031 §9, issue #630). SingleAdmin contexts
@@ -1198,13 +1207,16 @@ impl ContextManager {
                 let (required_signers, minimum_count) =
                     ctx.governance.engine.checkpoint_cosignature_requirements();
                 if minimum_count > 0 {
-                    ctx.receive_buffer
-                        .push(ContextEvent::CheckpointCosignatureRequired {
+                    ctx.emit_event(
+                        ContextEvent::CheckpointCosignatureRequired {
                             proposal_id: proposal.proposal_id,
                             required_signers,
                             minimum_count,
                             at_epoch: ctx.epoch.mls_epoch,
-                        });
+                        },
+                        context_id,
+                        self.event_tx.as_ref(),
+                    );
                 }
 
                 // 3. Remove the executed proposal from approved_proposals so
@@ -1227,6 +1239,7 @@ impl ContextManager {
                     self.clock.now_secs(),
                     &*self.clock,
                     &*self.event_log,
+                    self.event_tx.as_ref(),
                 );
                 if let Some(target) = proposal.action.target_did()
                     && target != &proposal.proposer_did
@@ -1238,6 +1251,7 @@ impl ContextManager {
                         self.clock.now_secs(),
                         &*self.clock,
                         &*self.event_log,
+                        self.event_tx.as_ref(),
                     );
                 }
 
@@ -1331,11 +1345,14 @@ impl ContextManager {
 
                     ctx.role_state.suspend_all(did.as_ref());
 
-                    ctx.receive_buffer
-                        .push(ContextEvent::CapabilitiesSuspended {
+                    ctx.emit_event(
+                        ContextEvent::CapabilitiesSuspended {
                             did: did.clone(),
                             capabilities: vec![], // all — indicated by empty
-                        });
+                        },
+                        context_id,
+                        self.event_tx.as_ref(),
+                    );
 
                     if self.has_persistence() {
                         Some(Self::snapshot_context(ctx))
@@ -2428,11 +2445,14 @@ impl ContextManager {
             // exact capability list so consumers can render accurate
             // UI and so the event payload matches the underlying
             // role_state mutation.
-            ctx.receive_buffer
-                .push(ContextEvent::CapabilitiesSuspended {
+            ctx.emit_event(
+                ContextEvent::CapabilitiesSuspended {
                     did: did.clone(),
                     capabilities: capabilities.to_vec(),
-                });
+                },
+                context_id,
+                self.event_tx.as_ref(),
+            );
 
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -2523,8 +2543,11 @@ impl ContextManager {
                     }
                 }
 
-                ctx.receive_buffer
-                    .push(ContextEvent::WriteAccessRevoked { did: did.clone() });
+                ctx.emit_event(
+                    ContextEvent::WriteAccessRevoked { did: did.clone() },
+                    context_id,
+                    self.event_tx.as_ref(),
+                );
             }
 
             // Read revocation: suspend read capabilities + destroy access keys.
@@ -2555,10 +2578,16 @@ impl ContextManager {
                     ctx.access.access_key_store.remove(context_id, did.as_ref());
                 }
 
-                ctx.receive_buffer
-                    .push(ContextEvent::ReadAccessRevoked { did: did.clone() });
-                ctx.receive_buffer
-                    .push(ContextEvent::AccessKeyRevoked { did: did.clone() });
+                ctx.emit_event(
+                    ContextEvent::ReadAccessRevoked { did: did.clone() },
+                    context_id,
+                    self.event_tx.as_ref(),
+                );
+                ctx.emit_event(
+                    ContextEvent::AccessKeyRevoked { did: did.clone() },
+                    context_id,
+                    self.event_tx.as_ref(),
+                );
             }
 
             // Encrypted non-broadcast mode: Write and Both revocations need a
@@ -2702,12 +2731,14 @@ impl ContextManager {
                         .set(context_id, did.as_ref(), restored_key);
                 }
 
-                ctx.receive_buffer
-                    .push(ContextEvent::ReadAccessRestored { did: did.clone() });
-                ctx.receive_buffer.push(ContextEvent::AccessKeyRestored {
+                let read_event = ContextEvent::ReadAccessRestored { did: did.clone() };
+                ctx.emit_event(read_event, context_id, self.event_tx.as_ref());
+
+                let key_event = ContextEvent::AccessKeyRestored {
                     did: did.clone(),
                     new_epoch: 1,
-                });
+                };
+                ctx.emit_event(key_event, context_id, self.event_tx.as_ref());
 
                 snap
             } else {
@@ -2715,8 +2746,8 @@ impl ContextManager {
             };
 
             if capabilities.contains(&Capability::MessagesWrite) {
-                ctx.receive_buffer
-                    .push(ContextEvent::WriteAccessRestored { did: did.clone() });
+                let write_event = ContextEvent::WriteAccessRestored { did: did.clone() };
+                ctx.emit_event(write_event, context_id, self.event_tx.as_ref());
             }
 
             let snap = if self.has_persistence() {
@@ -2797,18 +2828,20 @@ impl ContextManager {
                 .access_key_store
                 .set(context_id, did.as_ref(), access_key);
 
-            ctx.receive_buffer.push(ContextEvent::MemberJoined {
+            let join_event = ContextEvent::MemberJoined {
                 member_did: did.clone(),
                 role_name: role.to_owned(),
-            });
+            };
+            ctx.emit_event(join_event, context_id, self.event_tx.as_ref());
 
             // Emit WelcomeGenerated event if the add produced a Welcome message.
             push_welcome_event(
-                &mut ctx.receive_buffer,
+                ctx,
                 context_id,
                 &DID(creator_did),
                 did,
                 add_output,
+                self.event_tx.as_ref(),
             );
 
             if self.has_persistence() {
@@ -2909,9 +2942,10 @@ impl ContextManager {
             // fan-outs do not send messages to a stale routing ID.
             ctx.pseudonym_registry.remove(did);
 
-            ctx.receive_buffer.push(ContextEvent::MemberLeft {
+            let left_event = ContextEvent::MemberLeft {
                 member_did: did.clone(),
-            });
+            };
+            ctx.emit_event(left_event, context_id, self.event_tx.as_ref());
 
             (
                 remove_output,
@@ -3170,13 +3204,16 @@ impl ContextManager {
 
             // §5.3.2 step 2: "All current members receive a
             // CeilingChangeNotification message."
-            ctx.receive_buffer
-                .push(ContextEvent::CeilingChangeNotification {
+            ctx.emit_event(
+                ContextEvent::CeilingChangeNotification {
                     new_capabilities: new_ceiling.to_vec(),
                     notified_at: now,
                     effective_at,
                     proposal_id,
-                });
+                },
+                context_id,
+                self.event_tx.as_ref(),
+            );
 
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -4338,9 +4375,10 @@ impl ContextManager {
             };
 
             // Emit content keys rotated event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::ContentKeysRotated {
+            let rotated_event = ContextEvent::ContentKeysRotated {
                 reason: reason.map(String::from),
-            });
+            };
+            ctx.emit_event(rotated_event, context_id, self.event_tx.as_ref());
 
             let snap = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -4556,12 +4594,15 @@ impl ContextManager {
             });
 
             // §19.3: Notify all members of the pending change.
-            ctx.receive_buffer
-                .push(ContextEvent::EconomicPolicyChangeNotification {
+            ctx.emit_event(
+                ContextEvent::EconomicPolicyChangeNotification {
                     notified_at: now,
                     effective_at,
                     proposal_id,
-                });
+                },
+                context_id,
+                self.event_tx.as_ref(),
+            );
 
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -4913,7 +4954,7 @@ impl ContextManager {
         // migration state — all under ONE lock acquisition to prevent a
         // race where another task observes the source as Active between
         // destination creation and the state transition (F4).
-        let (creator_did, snapshot, buffer_len_before_migration) = {
+        let (creator_did, snapshot, buffer_len_before_migration, proposed_event, started_event) = {
             let ctx_arc = self
                 .get_context_arc(context_id)
                 .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
@@ -4962,22 +5003,23 @@ impl ContextManager {
             // events pushed by concurrent operations.
             let buffer_len_before_migration = ctx.receive_buffer.len();
 
-            // Emit ContextMigrationProposed event to receive buffer.
-            ctx.receive_buffer
-                .push(ContextEvent::ContextMigrationProposed {
-                    destination_context_id: destination_context_id.clone(),
-                    reason: reason.to_owned(),
-                    grace_period_secs,
-                    auto_invite,
-                    proposal_id,
-                });
-
-            // Emit ContextMigrationStarted event to receive buffer.
-            ctx.receive_buffer
-                .push(ContextEvent::ContextMigrationStarted {
-                    destination_context_id: destination_context_id.clone(),
-                    grace_period_end,
-                });
+            // Buffer migration events WITHOUT broadcasting. These events
+            // are in a rollback-able block — if create_context fails, the
+            // receive buffer is truncated back. Broadcasting here would leak
+            // phantom events that cannot be retracted from the channel.
+            let proposed_event = ContextEvent::ContextMigrationProposed {
+                destination_context_id: destination_context_id.clone(),
+                reason: reason.to_owned(),
+                grace_period_secs,
+                auto_invite,
+                proposal_id,
+            };
+            let started_event = ContextEvent::ContextMigrationStarted {
+                destination_context_id: destination_context_id.clone(),
+                grace_period_end,
+            };
+            ctx.receive_buffer.push(proposed_event.clone());
+            ctx.receive_buffer.push(started_event.clone());
 
             let snap = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -4985,7 +5027,13 @@ impl ContextManager {
                 None
             };
 
-            (creator, snap, buffer_len_before_migration)
+            (
+                creator,
+                snap,
+                buffer_len_before_migration,
+                proposed_event,
+                started_event,
+            )
         };
 
         // Create the destination context AFTER the source has been
@@ -5012,6 +5060,13 @@ impl ContextManager {
             return Err(ContextError::PermissionDenied(format!(
                 "failed to create destination context: {e}"
             )));
+        }
+
+        // Destination context created successfully — now safe to broadcast
+        // the migration events that were buffered above.
+        if let Some(tx) = self.event_tx.as_ref() {
+            let _ = tx.send((context_id.to_owned(), strip_event_payload(&proposed_event)));
+            let _ = tx.send((context_id.to_owned(), strip_event_payload(&started_event)));
         }
 
         if let Some(snapshot) = snapshot {
@@ -5092,10 +5147,13 @@ impl ContextManager {
             })?;
             let original_pid = migration.proposal_id;
 
-            ctx.receive_buffer
-                .push(ContextEvent::ContextMigrationCancelled {
+            ctx.emit_event(
+                ContextEvent::ContextMigrationCancelled {
                     original_proposal_id: original_pid,
-                });
+                },
+                context_id,
+                self.event_tx.as_ref(),
+            );
 
             let snapshot = if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
@@ -5192,10 +5250,11 @@ impl ContextManager {
                 })?;
 
             // Emit tombstone event.
-            ctx.receive_buffer.push(ContextEvent::ContextTombstoned {
+            let tombstone_event = ContextEvent::ContextTombstoned {
                 destination_context_id: dest_id.clone(),
                 migration_proposal_id: m_pid,
-            });
+            };
+            ctx.emit_event(tombstone_event, context_id, self.event_tx.as_ref());
 
             // Cancel TTL timer and governance timeout task.
             ctx.ttl.timer.cancel();
@@ -5341,6 +5400,7 @@ impl ContextManager {
         // re-attempt MLS Commit broadcasts without needing a `&self` reference
         // (the spawned task does not own the manager).
         let transport = Arc::clone(&self.transport);
+        let event_tx = self.event_tx.clone();
         let ctx_id = context_id.to_owned();
 
         // Lock ordering: task_set before contexts (consistent with spawn_ttl_timer).
@@ -5356,10 +5416,12 @@ impl ContextManager {
             let clock = Arc::clone(&clock);
             let event_log = Arc::clone(&event_log);
             let transport = Arc::clone(&transport);
+            let event_tx = event_tx.clone();
             move || {
                 let contexts = Arc::clone(&contexts);
                 let clock = Arc::clone(&clock);
                 let event_log = Arc::clone(&event_log);
+                let event_tx = event_tx.clone();
                 let transport_for_retry = Arc::clone(&transport);
                 let event_log_for_retry = Arc::clone(&event_log);
                 let clock_for_retry = Arc::clone(&clock);
@@ -5465,7 +5527,7 @@ impl ContextManager {
                         let mut guard = ctx_arc.lock().await;
                         let ctx = &mut *guard;
                         for ctx_event in ctx_events {
-                            ctx.receive_buffer.push(ctx_event);
+                            ctx.emit_event(ctx_event, &ctx_id, event_tx.as_ref());
                         }
                         // Reset recovery_in_progress when deadlock conditions
                         // clear so future deadlocks can be detected.
@@ -5477,8 +5539,14 @@ impl ContextManager {
                     }
 
                     // Phase 4: Periodic consequence evaluation (#1531).
-                    Self::evaluate_periodic_consequences(&contexts, &ctx_id, &*clock, &*event_log)
-                        .await;
+                    Self::evaluate_periodic_consequences(
+                        &contexts,
+                        &ctx_id,
+                        &*clock,
+                        &*event_log,
+                        event_tx.as_ref(),
+                    )
+                    .await;
 
                     // Phase 5 (PR #1606 C6): drain the persistent MLS
                     // commit retry queue. Retries any pending commits
@@ -5498,6 +5566,7 @@ impl ContextManager {
                         Arc::clone(&transport_for_retry),
                         Arc::clone(&event_log_for_retry),
                         Arc::clone(&clock_for_retry),
+                        event_tx.clone(),
                     )
                     .await;
 
@@ -5518,6 +5587,7 @@ impl ContextManager {
         ctx_id: &str,
         clock: &dyn Clock,
         event_log: &dyn super::super::builder::ContextEventLogProvider,
+        event_tx: Option<&tokio::sync::broadcast::Sender<(String, super::ContextEvent)>>,
     ) {
         // M9: Clone data under lock, drop lock for evaluation, reacquire
         // for enforcement. This prevents holding the contexts lock for
@@ -5570,6 +5640,7 @@ impl ContextManager {
                     rules: &rules,
                     clock,
                     event_log,
+                    event_tx,
                 },
             );
         }
@@ -5904,21 +5975,27 @@ impl ContextManager {
                             retry_count: 1,
                             failed_at: now,
                         });
-                        ctx.receive_buffer
-                            .push(ContextEvent::CommitBroadcastFailed {
+                        ctx.emit_event(
+                            ContextEvent::CommitBroadcastFailed {
                                 operation: label.clone(),
                                 reason: format!("queue full ({MAX_PENDING_COMMITS}): {error_str}"),
                                 attempts: 1,
-                            });
+                            },
+                            context_id,
+                            self.event_tx.as_ref(),
+                        );
                         return Ok(());
                     }
                     ctx.pending_commits.push_back(pending);
-                    ctx.receive_buffer
-                        .push(ContextEvent::CommitBroadcastPending {
+                    ctx.emit_event(
+                        ContextEvent::CommitBroadcastPending {
                             operation: label.clone(),
                             error: error_str.clone(),
                             attempt: 1,
-                        });
+                        },
+                        context_id,
+                        self.event_tx.as_ref(),
+                    );
                 }
                 self.event_log.append_context_event(
                     &context_id_bytes,
@@ -5959,6 +6036,7 @@ impl ContextManager {
             Arc::clone(&self.transport),
             Arc::clone(&self.event_log),
             Arc::clone(&self.clock),
+            self.event_tx.clone(),
         )
         .await;
     }
@@ -5984,6 +6062,7 @@ impl ContextManager {
         transport: Arc<dyn super::ContextTransportProvider>,
         event_log: Arc<dyn super::ContextEventLogProvider>,
         clock: Arc<dyn Clock>,
+        event_tx: Option<tokio::sync::broadcast::Sender<(String, super::ContextEvent)>>,
     ) {
         // Snapshot the queue under lock.
         let snapshot: Vec<PendingCommit> = {
@@ -6013,8 +6092,14 @@ impl ContextManager {
         }
         // Phase B (lock held): apply the outcomes to the queue.
         let context_id_bytes = context_id_to_bytes(context_id);
-        let event_log_writes =
-            Self::apply_commit_retry_outcomes(contexts, context_id, outcomes, &*clock).await;
+        let event_log_writes = Self::apply_commit_retry_outcomes(
+            contexts,
+            context_id,
+            outcomes,
+            &*clock,
+            event_tx.as_ref(),
+        )
+        .await;
         // Phase C (no lock held): append durable event log entries.
         let mut retry_event_count: u64 = 0;
         for label in event_log_writes {
@@ -6115,6 +6200,7 @@ impl ContextManager {
         context_id: &str,
         outcomes: Vec<CommitRetryOutcome>,
         clock: &dyn Clock,
+        event_tx: Option<&tokio::sync::broadcast::Sender<(String, super::ContextEvent)>>,
     ) -> Vec<&'static str> {
         let mut event_log_writes: Vec<&'static str> = Vec::new();
         let Some(ctx_entry) = contexts.get(context_id) else {
@@ -6139,11 +6225,14 @@ impl ContextManager {
                     attempts,
                     operation,
                 } => {
-                    ctx.receive_buffer
-                        .push(ContextEvent::CommitBroadcastSucceeded {
+                    ctx.emit_event(
+                        ContextEvent::CommitBroadcastSucceeded {
                             operation: operation.label(),
                             attempts,
-                        });
+                        },
+                        context_id,
+                        event_tx,
+                    );
                     event_log_writes.push("CommitBroadcastSucceeded");
                     to_remove.push(outcome.index);
                 }
@@ -6158,12 +6247,15 @@ impl ContextManager {
                         entry.next_attempt_at = next_attempt_at;
                         entry.last_error = Some(error.clone());
                     }
-                    ctx.receive_buffer
-                        .push(ContextEvent::CommitBroadcastPending {
+                    ctx.emit_event(
+                        ContextEvent::CommitBroadcastPending {
                             operation: operation.label(),
                             error,
                             attempt: new_retry_count,
-                        });
+                        },
+                        context_id,
+                        event_tx,
+                    );
                     event_log_writes.push("CommitBroadcastPending");
                 }
                 CommitRetryOutcomeKind::Failed {
@@ -6178,12 +6270,15 @@ impl ContextManager {
                         failed_at: now_failed,
                         retry_count: attempts,
                     });
-                    ctx.receive_buffer
-                        .push(ContextEvent::CommitBroadcastFailed {
+                    ctx.emit_event(
+                        ContextEvent::CommitBroadcastFailed {
                             operation: operation.label(),
                             reason,
                             attempts,
-                        });
+                        },
+                        context_id,
+                        event_tx,
+                    );
                     event_log_writes.push("CommitBroadcastFailed");
                     to_remove.push(outcome.index);
                 }

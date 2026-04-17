@@ -15523,6 +15523,7 @@ async fn enforce_triggered_consequences_skips_absent_member() {
                 rules: &rules,
                 clock: &scp_primitives::SystemClock,
                 event_log: &MockEventLog::default(),
+                event_tx: None,
             },
         );
 
@@ -17303,6 +17304,7 @@ async fn suspend_all_consequence_preserves_mls_membership() {
                 rules: &rules,
                 clock: &scp_primitives::SystemClock,
                 event_log: &MockEventLog::default(),
+                event_tx: None,
             },
         );
     }
@@ -17518,6 +17520,7 @@ async fn suspend_capability_consequence_preserves_mls_membership() {
                 rules: &rules,
                 clock: &scp_primitives::SystemClock,
                 event_log: &MockEventLog::default(),
+                event_tx: None,
             },
         );
     }
@@ -17694,6 +17697,7 @@ async fn restore_access_after_suspend_all_regrants_capabilities() {
                 rules: &rules,
                 clock: &scp_primitives::SystemClock,
                 event_log: &MockEventLog::default(),
+                event_tx: None,
             },
         );
     }
@@ -18324,7 +18328,7 @@ fn consequence_event_log_append_ordering() {
 
     // 2. Each leaf-level emission helper must reference the event type it
     //    emits AND must call append_consequence_event before any
-    //    receive_buffer.push(ContextEvent::Consequence...) call.
+    //    emit_event(...) call.
     //    This verifies the H4 durability ordering invariant at the source
     //    level for each event type.
     for (helper_name, expected_events) in [
@@ -18357,33 +18361,31 @@ fn consequence_event_log_append_ordering() {
             );
         }
 
-        let push_offset = body.find("receive_buffer.push(ContextEvent::Consequence");
-        if let Some(push_offset) = push_offset {
+        let emit_offset = body.find("emit_event(");
+        if let Some(emit_offset) = emit_offset {
             let append_offset = body.find("append_consequence_event(").unwrap_or_else(|| {
                 panic!(
-                    "{helper_name} body has a ContextEvent::Consequence push \
+                    "{helper_name} body has an emit_event call \
                      but no append_consequence_event call — H4 ordering invariant \
                      violated"
                 )
             });
             assert!(
-                append_offset < push_offset,
+                append_offset < emit_offset,
                 "{helper_name}: first append_consequence_event (offset {append_offset}) \
-                 must precede first ContextEvent::Consequence receive_buffer.push \
-                 (offset {push_offset}) — H4 invariant: durable record before \
+                 must precede first emit_event \
+                 (offset {emit_offset}) — H4 invariant: durable record before \
                  in-memory observation"
             );
         }
 
-        let push_count = body
-            .matches("receive_buffer.push(ContextEvent::Consequence")
-            .count();
+        let emit_count = body.matches("emit_event(").count();
         let append_count = body.matches("append_consequence_event(").count();
         assert!(
-            append_count >= push_count,
-            "{helper_name}: every ContextEvent::Consequence buffer push must be \
+            append_count >= emit_count,
+            "{helper_name}: every emit_event call must be \
              paired with an append_consequence_event call. \
-             Pushes: {push_count}, appends: {append_count}. H4 invariant violated."
+             Emits: {emit_count}, appends: {append_count}. H4 invariant violated."
         );
     }
 

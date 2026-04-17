@@ -267,22 +267,29 @@ pub struct CommitFaultMarker {
 /// Used by both `join_context` and `execute_add_member` to avoid
 /// duplicating the emission logic.
 fn push_welcome_event(
-    buffer: &mut ReceiveBuffer,
+    ctx: &mut PerContextState,
     context_id: &str,
     creator_did: &DID,
     member_did: &DID,
     add_output: scp_protocol::context::builder::AddMemberOutput,
+    event_tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
 ) {
     if !add_output.welcome_bytes.is_empty() {
-        buffer.push(ContextEvent::WelcomeGenerated {
-            context_id: context_id.to_owned(),
-            creator_did: creator_did.clone(),
-            member_did: member_did.clone(),
-            welcome_bytes: scp_protocol::context::membership::RedactedBytes(
-                add_output.welcome_bytes,
-            ),
-            commit_bytes: scp_protocol::context::membership::RedactedBytes(add_output.commit_bytes),
-        });
+        ctx.emit_event(
+            ContextEvent::WelcomeGenerated {
+                context_id: context_id.to_owned(),
+                creator_did: creator_did.clone(),
+                member_did: member_did.clone(),
+                welcome_bytes: scp_protocol::context::membership::RedactedBytes(
+                    add_output.welcome_bytes,
+                ),
+                commit_bytes: scp_protocol::context::membership::RedactedBytes(
+                    add_output.commit_bytes,
+                ),
+            },
+            context_id,
+            event_tx,
+        );
     }
 }
 
@@ -1221,6 +1228,111 @@ pub(super) struct PerContextState {
     merkle_tree: scp_event_log::EventLog,
 }
 
+impl PerContextState {
+    /// Pushes an event to the receive buffer and, if a broadcast channel is
+    /// provided, sends a sanitized copy there too. Consolidates the two-step
+    /// `receive_buffer.push` + `tx.send` pattern into a single call site to
+    /// prevent future omissions.
+    ///
+    /// **Security invariants:**
+    /// - `WelcomeGenerated` events carry MLS key material and are NEVER sent
+    ///   on the broadcast channel (receive buffer only).
+    /// - `MessageReceived` / `MessageSent` payloads contain decrypted plaintext
+    ///   and are stripped (replaced with empty `Vec`) before broadcast to
+    ///   preserve encryption-as-access-control.
+    pub(super) fn emit_event(
+        &mut self,
+        event: ContextEvent,
+        context_id: &str,
+        tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+    ) {
+        // WelcomeGenerated carries MLS tree secrets and epoch keys.
+        // It must NEVER reach the broadcast channel.
+        if matches!(event, ContextEvent::WelcomeGenerated { .. }) {
+            self.receive_buffer.push(event);
+            return;
+        }
+
+        self.receive_buffer.push(event.clone());
+        if let Some(tx) = tx {
+            let sanitized = strip_event_payload(&event);
+            let _ = tx.send((context_id.to_owned(), sanitized));
+        }
+    }
+}
+
+/// Strips decrypted plaintext from event variants that carry message payloads.
+///
+/// The broadcast channel is observable by any subscriber (e.g., webhook
+/// consumers, SDK event listeners). Sending decrypted content on it would
+/// defeat MLS encryption-as-access-control. This function replaces payload
+/// bytes with an empty `Vec` for `MessageReceived` and `MessageSent`, and
+/// passes all other variants through unchanged.
+///
+/// The match is exhaustive (no wildcard catch-all) so that adding a new
+/// `ContextEvent` variant with sensitive data causes a compile error,
+/// forcing the developer to decide whether the variant needs stripping.
+pub(super) fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
+    match event {
+        ContextEvent::MessageReceived { sender_did, .. } => ContextEvent::MessageReceived {
+            sender_did: sender_did.clone(),
+            payload: vec![],
+        },
+        ContextEvent::MessageSent {
+            sender_did,
+            sequence_number,
+            ..
+        } => ContextEvent::MessageSent {
+            sender_did: sender_did.clone(),
+            sequence_number: *sequence_number,
+            payload: vec![],
+        },
+        // All remaining variants carry no message plaintext or key material.
+        // Listed exhaustively so new variants cause a compile error.
+        ContextEvent::MemberJoined { .. }
+        | ContextEvent::MemberLeft { .. }
+        | ContextEvent::SystemClose { .. }
+        | ContextEvent::MemberBlocked { .. }
+        | ContextEvent::MemberUnblocked { .. }
+        | ContextEvent::AuthorBlocked { .. }
+        | ContextEvent::ReadAccessRevoked { .. }
+        | ContextEvent::ReadAccessRestored { .. }
+        | ContextEvent::WriteAccessRevoked { .. }
+        | ContextEvent::CapabilitiesSuspended { .. }
+        | ContextEvent::WriteAccessRestored { .. }
+        | ContextEvent::AccessKeyRevoked { .. }
+        | ContextEvent::AccessKeyRestored { .. }
+        | ContextEvent::ContentKeysRotated { .. }
+        | ContextEvent::GovernanceActionExecuted { .. }
+        | ContextEvent::CeilingChangeNotification { .. }
+        | ContextEvent::EconomicPolicyChangeNotification { .. }
+        | ContextEvent::Expired
+        | ContextEvent::ExpiryFailed { .. }
+        | ContextEvent::VoteWithdrawn { .. }
+        | ContextEvent::ProposalTimedOut { .. }
+        | ContextEvent::DeadlockDetected { .. }
+        | ContextEvent::AppBound { .. }
+        | ContextEvent::AppUnbound { .. }
+        | ContextEvent::DegradedMode { .. }
+        | ContextEvent::WelcomeGenerated { .. }
+        | ContextEvent::BufferOverflow { .. }
+        | ContextEvent::SequenceGapDetected { .. }
+        | ContextEvent::CheckpointCosignatureRequired { .. }
+        | ContextEvent::ContextMigrationProposed { .. }
+        | ContextEvent::ContextMigrationStarted { .. }
+        | ContextEvent::ContextMigrationCancelled { .. }
+        | ContextEvent::ContextTombstoned { .. }
+        | ContextEvent::ConsequenceTriggered { .. }
+        | ContextEvent::ConsequenceEnforced { .. }
+        | ContextEvent::PaymentCaptureFailed { .. }
+        | ContextEvent::CommitBroadcastPending { .. }
+        | ContextEvent::CommitBroadcastSucceeded { .. }
+        | ContextEvent::EquivocationDetected { .. }
+        | ContextEvent::CommitBroadcastFailed { .. }
+        | ContextEvent::PseudonymAnnounced { .. } => event.clone(),
+    }
+}
+
 /// Helper type for generation tokens captured during Phase 1 lock acquisition.
 ///
 /// Captures the `context_id` and the `generation` counter at the time the
@@ -1948,6 +2060,14 @@ pub struct ContextManager {
     /// `Relaxed` ordering — uniqueness is guaranteed by the `fetch_add`
     /// atomicity, and no other memory accesses depend on the ordering.
     next_generation: std::sync::atomic::AtomicU64,
+    /// Optional broadcast channel for notifying external consumers of context
+    /// events (e.g., webhook dispatchers in scp-node). When `Some`, every event
+    /// pushed to a per-context `ReceiveBuffer` is also sent on this channel as
+    /// `(context_id, ContextEvent)`. Lagging receivers lose events (bounded
+    /// channel) — this is acceptable because webhook delivery is best-effort.
+    ///
+    /// Created via [`with_event_channel`](Self::with_event_channel).
+    event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
 }
 
 // Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
@@ -1985,6 +2105,7 @@ impl ContextManager {
             payment_adapter: None,
             task_set: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
             next_generation: std::sync::atomic::AtomicU64::new(1),
+            event_tx: None,
         }
     }
 
@@ -2023,6 +2144,7 @@ impl ContextManager {
             payment_adapter: None,
             task_set: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
             next_generation: std::sync::atomic::AtomicU64::new(1),
+            event_tx: None,
         }
     }
 
@@ -2174,6 +2296,47 @@ impl ContextManager {
             flushed,
             skipped,
         );
+    }
+
+    /// Attaches a bounded broadcast channel for external event consumers.
+    ///
+    /// After calling this, every event pushed to a per-context
+    /// `ReceiveBuffer` is also sent on the channel as
+    /// `(context_id, ContextEvent)`. Lagging receivers lose events —
+    /// this is acceptable because external consumers (e.g., webhook
+    /// dispatchers) treat delivery as best-effort.
+    ///
+    /// Returns `&mut Self` for chaining.
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` — bounded channel capacity. `1024` is a sensible
+    ///   default for most deployments. Values are clamped to
+    ///   `[1, MAX_EVENT_CHANNEL_CAPACITY]` to prevent resource exhaustion.
+    pub fn with_event_channel(&mut self, capacity: usize) -> &mut Self {
+        /// Maximum broadcast channel capacity to prevent unbounded memory
+        /// allocation from untrusted callers.
+        const MAX_EVENT_CHANNEL_CAPACITY: usize = 8192;
+
+        let clamped = capacity.clamp(1, MAX_EVENT_CHANNEL_CAPACITY);
+        let (tx, _rx) = tokio::sync::broadcast::channel(clamped);
+        self.event_tx = Some(tx);
+        self
+    }
+
+    /// Returns a new [`tokio::sync::broadcast::Receiver`] for the event
+    /// channel, if one was configured via [`with_event_channel`](Self::with_event_channel).
+    ///
+    /// Each call returns an independent receiver. Multiple consumers
+    /// (e.g., webhook dispatcher, metrics collector) can subscribe
+    /// concurrently.
+    #[must_use]
+    pub fn subscribe_events(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<(String, ContextEvent)>> {
+        self.event_tx
+            .as_ref()
+            .map(tokio::sync::broadcast::Sender::subscribe)
     }
 
     // -----------------------------------------------------------------
@@ -2574,12 +2737,13 @@ impl ContextManager {
         if let Ok(arc) = self.get_context_arc(context_id) {
             let mut ctx = arc.lock().await;
             ctx.checkpoint_events_since += 1;
-            ctx.receive_buffer.push(ContextEvent::PaymentCaptureFailed {
+            let event = ContextEvent::PaymentCaptureFailed {
                 action: action.to_owned(),
                 actor_did: actor_did.clone(),
                 error: error_msg.to_owned(),
                 cost: cost.map(scp_protocol::economy::types::Amount::value),
-            });
+            };
+            ctx.emit_event(event, context_id, self.event_tx.as_ref());
         }
     }
 }

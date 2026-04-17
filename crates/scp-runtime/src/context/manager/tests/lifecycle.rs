@@ -3932,3 +3932,62 @@ async fn import_context_fresh_context_accepts_any_epoch_within_ceiling() {
         result.err()
     );
 }
+
+// -----------------------------------------------------------------------
+// Event channel tests (#1539 AC3)
+// -----------------------------------------------------------------------
+
+/// Verify that `leave_context` fires `MemberLeft` on the event channel.
+#[tokio::test]
+async fn event_channel_receives_member_left_on_leave() {
+    let mut manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    manager.with_event_channel(1024);
+    let mut rx = manager.subscribe_events().expect("channel configured");
+
+    let params = ContextParams {
+        ceiling: vec![
+            Capability::new("messages:read"),
+            Capability::new("messages:write"),
+            Capability::MemberRemove,
+        ],
+        ..ContextParams::default()
+    };
+    let handle = manager
+        .create_context("evt-ctx".into(), params, "did:key:creator".into(), None)
+        .await
+        .unwrap();
+
+    // Add a second member directly via state mutation (bypass join_context
+    // which needs real MLS crypto).
+    {
+        let arc = manager.get_context_arc("evt-ctx").unwrap();
+        let mut g = arc.lock().await;
+        let ctx = &mut *g;
+        ctx.membership
+            .add_member("did:key:bob".into(), "member".into(), vec![]);
+    }
+
+    // Creator removes bob.
+    manager
+        .leave_context(&handle, &"did:key:creator".into(), &"did:key:bob".into())
+        .await
+        .unwrap();
+
+    // Drain channel to find MemberLeft for bob.
+    let mut found = false;
+    while let Ok((ctx_id, event)) = rx.try_recv() {
+        if ctx_id == "evt-ctx"
+            && let ContextEvent::MemberLeft { member_did } = &event
+            && member_did.as_ref() == "did:key:bob"
+        {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "expected MemberLeft event for bob on channel");
+}
