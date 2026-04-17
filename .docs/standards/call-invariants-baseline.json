@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.2",
+  "required_rule_ids": [
+    "economy-enforced-on-send-path",
+    "snapshot-validation-on-import",
+    "did-resolver-init-on-identity-create"
+  ],
+  "required_rule_ids_digest": "sha256:15c5224b95b17375",
+  "parse_error_allowlist_count": 3,
+  "parse_error_allowlist_paths": [
+    "crates/scp-ffi/wasm/src/context.rs",
+    "crates/scp-ffi/wasm/src/custody.rs",
+    "crates/scp-ffi/wasm/src/storage.rs"
+  ],
+  "note": "Every rule_id listed here must appear in sdk-capability-matrix.json call_invariants[]. Adding rules beyond this set is fine (expansion). Removing a rule from this list \u2014 i.e. retiring an enforced invariant \u2014 requires human approval: remove the rule_id here AND from sdk-capability-matrix.json AND update CLAUDE.md's 'NEVER modify enforcement files to bypass failures' file list in the same PR. Renaming a rule_id (e.g. did-resolver-init-on-identity-create \u2192 did-resolver-init-at-identity-create) is equivalent to retirement + new rule, even if the name is obviously similar: the PR MUST touch CLAUDE.md's enforcement-files list so the rename is visible, and reviewers should treat a rename that only edits matrix+baseline in the same commit as a RED FLAG. The check-call-invariants.py run prints a SHA-256 digest over the sorted required_rule_ids at startup AND asserts it matches required_rule_ids_digest so any rename changes the baseline in the same commit (reviewers must treat a digest change as enforcement-file modification requiring approval). The parse_error_allowlist_count and parse_error_allowlist_paths fields ratchet the KNOWN_PARSE_ERROR_FILES allowlist in check-call-invariants.py: growing the allowlist (smuggling broken Rust past the validator) is a hard fail that requires a deliberate bump to these fields in the same commit. Shrinking/removing entries is always fine (the tree-sitter limitation may have been fixed upstream)."
+}

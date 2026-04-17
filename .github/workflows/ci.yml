@@ -132,8 +132,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift
+      # Pin pytest and tree-sitter-rust to compatible version ranges so a
+      # breaking upstream release cannot silently break CI (round-6 MINOR-3).
+      # Other tree-sitter grammars remain unpinned to match the convention
+      # used by the protocol-sync job below and minimize churn.
+      - run: pip install 'pytest>=8,<10' 'tree-sitter-rust>=0.21,<0.25' tree-sitter tree-sitter-python tree-sitter-typescript tree-sitter-kotlin tree-sitter-swift
       - run: python3.12 scripts/check-sdk-coverage.py
+      - run: python3.12 scripts/check-call-invariants.py
+      - name: cfg-walker unit tests (regression guard for MAJOR-1/MINOR-1/MINOR-2)
+        run: python3.12 -m pytest scripts/tests/call-invariants/ -v
 
   # ── Protocol enforcement ─────────────────────────────────────────────
   protocol-sync:
