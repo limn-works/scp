@@ -1,8 +1,16 @@
 //! Self-contained bridge instance replacing process-global `OnceLock` singletons.
 //!
 //! `BridgeInstance` consolidates most per-bridge `OnceLock` statics into a
-//! single owned struct. Each instance holds its own `ContextManager`, local
-//! DID, shutdown flag, and shared state registries.
+//! single owned struct. Each instance holds its own `ContextManager`,
+//! shutdown flag, and shared state registries.
+//!
+//! # No local DID on the container
+//!
+//! Per spec §12.2.3, the FFI `BridgeInstance` is *infrastructure*, not a
+//! protocol entity. It has NO DID requirement — the authoritative local DID
+//! lives inside the `ContextManager`'s `MlsCryptoProvider`. An SDK consumer
+//! may hold a `BridgeInstance` purely to resolve DIDs or verify attestations
+//! without ever creating a local identity.
 //!
 //! # Owned state (consolidated into `BridgeInstance`)
 //!
@@ -113,10 +121,18 @@ pub struct KnownContext {
 
 /// A self-contained bridge instance replacing process-global `OnceLock` singletons.
 ///
-/// Each instance holds its own [`ContextManager`], local DID, shutdown flag,
-/// and shared state registries (transport, known contexts, rate limiters).
-/// Multiple instances can coexist (different identities, test isolation).
-/// Mobile platforms use `shutdown()` for lifecycle cleanup.
+/// Each instance holds its own [`ContextManager`], shutdown flag, and shared
+/// state registries (transport, known contexts, rate limiters). Multiple
+/// instances can coexist (different identities, test isolation). Mobile
+/// platforms use `shutdown()` for lifecycle cleanup.
+///
+/// # No local DID on the container
+///
+/// Per spec §12.2.3, `BridgeInstance` is infrastructure, not a protocol
+/// entity. The authoritative local DID lives inside the `ContextManager`'s
+/// `MlsCryptoProvider`. `BridgeInstance` carries no DID of its own — it may
+/// exist before any identity is created (to service DID resolution or
+/// attestation verification for remote DIDs).
 ///
 /// # `OnceLock` limitation — shutdown is terminal
 ///
@@ -132,7 +148,6 @@ pub struct KnownContext {
 ///
 /// # Invariants
 ///
-/// - `local_did` is immutable after construction.
 /// - Once `shutdown()` is called, `is_shutdown()` returns `true` permanently.
 ///   All bridge operations should check this flag and fail fast.
 /// - The `ContextManager` reference is shared (`Arc`) and may outlive this
@@ -140,10 +155,19 @@ pub struct KnownContext {
 ///   the `ContextManager` — it is a signal to the bridge layer only.
 pub struct BridgeInstance {
     /// Shared context lifecycle manager (MLS, membership, governance, broadcast).
-    context_manager: Arc<ContextManager>,
-
-    /// The local DID this instance was initialized with.
-    local_did: String,
+    ///
+    /// Stored in a `OnceLock` so that the `BridgeInstance` (and thus the DID
+    /// resolver slot it owns) can exist BEFORE the `ContextManager` is
+    /// constructed. The `ContextManager`'s `MlsCryptoProvider` needs the real
+    /// DID at construction time, but the DID is only known after
+    /// `DidDht::create()` runs inside `identity_create`. Deferring the CM
+    /// resolves this ordering.
+    ///
+    /// Accessors that expect a ready CM call [`context_manager`] / [`try_context_manager`]
+    /// which panic / return `None` when the CM hasn't been set yet. During
+    /// steady-state operation, callers go through bridge functions that ensure
+    /// `init_context_manager(real_did)` has been called first.
+    context_manager: OnceLock<Arc<ContextManager>>,
 
     /// Whether this instance has been shut down permanently.
     ///
@@ -331,24 +355,32 @@ pub struct BridgeInstance {
     ucan_registry_clear_fn: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
+impl Default for BridgeInstance {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BridgeInstance {
-    /// Creates a new bridge instance.
+    /// Creates a new bridge instance without a `ContextManager`.
     ///
     /// Initializes all shared state registries (transport, known contexts,
-    /// rate limiters) as empty. Transport is `None` until a relay connection
-    /// is established.
+    /// rate limiters) as empty. The `ContextManager` is **unbound** — call
+    /// [`set_context_manager`](Self::set_context_manager) once the identity
+    /// has been created and the `ContextManager` constructed with its
+    /// `MlsCryptoProvider` (which carries the real local DID).
     ///
-    /// # Arguments
-    ///
-    /// - `context_manager` — the shared `ContextManager` that owns context
-    ///   lifecycle state (MLS groups, membership, governance, broadcast).
-    /// - `local_did` — the DID this instance operates as. Passed through to
-    ///   `MlsCryptoProvider` for MLS credential identity.
+    /// This decoupling lets the FFI bridge construct a `BridgeInstance` (and
+    /// therefore initialize the DID resolver slot) BEFORE any identity is
+    /// known. This resolves the chicken-and-egg where the DID resolver lives
+    /// inside `BridgeInstance` but the DID itself is generated by
+    /// `DidDht::create()` which runs later. The `BridgeInstance` itself never
+    /// stores or tracks the DID — that is the `MlsCryptoProvider`'s job (spec
+    /// §12.2.3).
     #[must_use]
-    pub fn new(context_manager: Arc<ContextManager>, local_did: String) -> Self {
+    pub fn new() -> Self {
         Self {
-            context_manager,
-            local_did,
+            context_manager: OnceLock::new(),
             shutdown: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
@@ -370,34 +402,40 @@ impl BridgeInstance {
         }
     }
 
-    /// Creates a new bridge instance with a persistence provider.
+    /// Creates a new bridge instance pre-populated with a `ContextManager`.
     ///
-    /// Same as [`new`](Self::new) but additionally attaches a
-    /// [`ContextPersistence`] provider. When provided, [`suspend`] and
-    /// [`shutdown`] will flush all context snapshots to the provider via
+    /// Convenience constructor for callers that already have a `ContextManager`
+    /// (e.g., test fixtures, the NAPI/UniFFI `ensure_bridge_instance` helpers
+    /// that lazily construct a CM with placeholder providers). Equivalent to
+    /// [`new`](Self::new) followed by [`set_context_manager`](Self::set_context_manager).
+    #[must_use]
+    pub fn with_context_manager(context_manager: Arc<ContextManager>) -> Self {
+        let instance = Self::new();
+        instance.set_context_manager(context_manager);
+        instance
+    }
+
+    /// Creates a new bridge instance with a persistence provider, but no
+    /// `ContextManager`.
+    ///
+    /// Attaches a [`ContextPersistence`] provider. When provided, [`suspend`]
+    /// and [`shutdown`] will flush all context snapshots via
     /// [`ContextManager::flush_all_contexts_sync`] before tearing down
-    /// transport or destroying MLS groups.
+    /// transport or destroying MLS groups — but only after the `ContextManager`
+    /// itself has been set via [`set_context_manager`](Self::set_context_manager).
     ///
     /// The persistence provider should be the same one configured on the
-    /// [`ContextManager`] (typically constructed via
+    /// eventual [`ContextManager`] (typically constructed via
     /// [`ContextManager::with_persistence`] or the builder `.storage()` method).
     ///
     /// # Arguments
     ///
-    /// - `context_manager` — the shared `ContextManager` (must already have
-    ///   persistence configured via [`ContextManager::with_persistence`]).
-    /// - `local_did` — the DID this instance operates as.
     /// - `persistence` — the persistence provider for bridge-level flush on
     ///   suspend/shutdown.
     #[must_use]
-    pub fn with_persistence(
-        context_manager: Arc<ContextManager>,
-        local_did: String,
-        persistence: Box<dyn ContextPersistence + Send + Sync>,
-    ) -> Self {
+    pub fn with_persistence(persistence: Box<dyn ContextPersistence + Send + Sync>) -> Self {
         Self {
-            context_manager,
-            local_did,
+            context_manager: OnceLock::new(),
             shutdown: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
@@ -419,6 +457,19 @@ impl BridgeInstance {
         }
     }
 
+    /// Stores the shared [`ContextManager`] for this instance.
+    ///
+    /// Called by the FFI bridge's `init_context_manager*` family once the
+    /// `ContextManager` has been constructed (with the real DID passed
+    /// directly into its `MlsCryptoProvider` — the `BridgeInstance` itself
+    /// does not carry a DID). Subsequent calls are ignored with a warning
+    /// (`OnceLock` guarantees single initialization).
+    pub fn set_context_manager(&self, context_manager: Arc<ContextManager>) {
+        if self.context_manager.set(context_manager).is_err() {
+            tracing::warn!("set_context_manager called but ContextManager already set — ignoring");
+        }
+    }
+
     /// Returns a reference to the persistence provider, if configured.
     ///
     /// `None` if this instance was created without persistence (via [`new`]).
@@ -427,16 +478,28 @@ impl BridgeInstance {
         self.persistence.as_deref()
     }
 
-    /// Returns a reference to the shared [`ContextManager`].
+    /// Returns a reference to the shared [`ContextManager`], or `None` if not
+    /// yet set.
+    ///
+    /// All callers must handle the `None` case explicitly — returning an
+    /// appropriate lifecycle error at the FFI boundary (typically
+    /// `CTX_2000` / "`ContextManager` not yet attached"). Callers that only
+    /// touch `BridgeInstance`-owned state (transport, DID resolver, known
+    /// contexts) can proceed without the CM.
+    ///
+    /// There is intentionally no panic-variant accessor: a missing
+    /// `ContextManager` is a normal lifecycle state (bridge created for DID
+    /// resolution before any identity exists; bridge after shutdown) and
+    /// must not crash the host process.
     #[must_use]
-    pub const fn context_manager(&self) -> &Arc<ContextManager> {
-        &self.context_manager
+    pub fn try_context_manager(&self) -> Option<&Arc<ContextManager>> {
+        self.context_manager.get()
     }
 
-    /// Returns the local DID this instance was created with.
+    /// Returns whether a [`ContextManager`] has been set on this instance.
     #[must_use]
-    pub fn local_did(&self) -> &str {
-        &self.local_did
+    pub fn has_context_manager(&self) -> bool {
+        self.context_manager.get().is_some()
     }
 
     /// Whether this instance has been shut down permanently.
@@ -544,15 +607,19 @@ impl BridgeInstance {
         self.suspended.store(true, Ordering::SeqCst);
         // Flush all context snapshots before disconnecting transport.
         // Best-effort: errors are logged inside flush_all_contexts_sync and do
-        // not prevent suspension from completing.
-        self.context_manager.flush_all_contexts_sync();
+        // not prevent suspension from completing. Skipped if the
+        // ContextManager hasn't been set yet (i.e., suspend before any
+        // context operation has run).
+        if let Some(cm) = self.context_manager.get() {
+            cm.flush_all_contexts_sync();
+        }
         if let Err(e) = self.clear_transport() {
             // Revert the suspended flag — the instance is not cleanly
             // suspended if transport wasn't cleared.
             self.suspended.store(false, Ordering::SeqCst);
             return Err(e);
         }
-        tracing::debug!(local_did = %self.local_did, "bridge instance suspended");
+        tracing::debug!("bridge instance suspended");
         Ok(())
     }
 
@@ -571,7 +638,7 @@ impl BridgeInstance {
             return Err(LifecycleError::AlreadyShutDown);
         }
         self.suspended.store(false, Ordering::SeqCst);
-        tracing::debug!(local_did = %self.local_did, "bridge instance resumed");
+        tracing::debug!("bridge instance resumed");
         Ok(())
     }
 
@@ -620,12 +687,16 @@ impl BridgeInstance {
         // ensures durably-persisted state reflects the last known-good
         // context state before key material is zeroized.
         // Best-effort: errors are logged inside flush_all_contexts_sync.
-        self.context_manager.flush_all_contexts_sync();
+        // Skipped if the ContextManager hasn't been set yet (shutdown before
+        // any context operation).
+        if let Some(cm) = self.context_manager.get() {
+            cm.flush_all_contexts_sync();
 
-        // Remove all contexts from the ContextManager (MLS groups, sender
-        // keys, event logs). Best-effort — already-removed contexts are
-        // silently ignored.
-        self.context_manager.shutdown_all_contexts();
+            // Remove all contexts from the ContextManager (MLS groups, sender
+            // keys, event logs). Best-effort — already-removed contexts are
+            // silently ignored.
+            cm.shutdown_all_contexts();
+        }
 
         // Clear registries
         self.known_contexts.clear();
@@ -669,7 +740,7 @@ impl BridgeInstance {
         // Also clear suspended flag (shutdown supersedes suspension)
         self.suspended.store(false, Ordering::SeqCst);
 
-        tracing::debug!(local_did = %self.local_did, "bridge instance shut down");
+        tracing::debug!("bridge instance shut down");
     }
 
     // -----------------------------------------------------------------
@@ -1528,12 +1599,11 @@ mod tests {
     #[test]
     fn new_creates_instance_with_expected_state() {
         let cm = test_context_manager();
-        let instance = BridgeInstance::new(Arc::clone(&cm), "did:dht:z1234".to_owned());
+        let instance = BridgeInstance::with_context_manager(Arc::clone(&cm));
 
-        assert_eq!(instance.local_did(), "did:dht:z1234");
         assert!(!instance.is_shutdown());
         // Verify the ContextManager pointer is the same Arc
-        assert!(Arc::ptr_eq(instance.context_manager(), &cm));
+        assert!(Arc::ptr_eq(instance.try_context_manager().unwrap(), &cm));
         // Shared state starts empty
         assert!(!instance.has_transport());
         assert!(instance.known_contexts().is_empty());
@@ -1541,8 +1611,46 @@ mod tests {
     }
 
     #[test]
+    fn new_creates_instance_without_context_manager() {
+        // Per spec §12.2.3, BridgeInstance is infrastructure and has no DID
+        // requirement — it can exist before any identity is created.
+        let instance = BridgeInstance::new();
+
+        assert!(!instance.has_context_manager());
+        assert!(instance.try_context_manager().is_none());
+        assert!(!instance.is_shutdown());
+    }
+
+    #[test]
+    fn set_context_manager_is_idempotent_once_set() {
+        let instance = BridgeInstance::new();
+        let cm1 = test_context_manager();
+        instance.set_context_manager(Arc::clone(&cm1));
+        assert!(Arc::ptr_eq(instance.try_context_manager().unwrap(), &cm1));
+
+        // Second set is a silent no-op (OnceLock).
+        let cm2 = test_context_manager();
+        instance.set_context_manager(Arc::clone(&cm2));
+        assert!(
+            Arc::ptr_eq(instance.try_context_manager().unwrap(), &cm1),
+            "set_context_manager must not replace the existing CM"
+        );
+    }
+
+    #[test]
+    fn shutdown_without_context_manager_is_safe() {
+        // Simulates the case where the bridge was partially initialized
+        // (BridgeInstance exists but identity_create / init_context_manager
+        // never ran) and then shutdown is called.
+        let instance = BridgeInstance::new();
+        assert!(!instance.has_context_manager());
+        instance.shutdown();
+        assert!(instance.is_shutdown());
+    }
+
+    #[test]
     fn shutdown_transitions_flag_permanently() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
 
         assert!(!instance.is_shutdown());
         instance.shutdown();
@@ -1556,17 +1664,10 @@ mod tests {
     #[test]
     fn context_manager_returns_shared_reference() {
         let cm = test_context_manager();
-        let instance = BridgeInstance::new(Arc::clone(&cm), "did:dht:z5678".to_owned());
+        let instance = BridgeInstance::with_context_manager(Arc::clone(&cm));
 
         // Both should point to the same ContextManager allocation
-        assert!(Arc::ptr_eq(instance.context_manager(), &cm));
-    }
-
-    #[test]
-    fn local_did_returns_construction_value() {
-        let did = "did:dht:zabcdef0123456789";
-        let instance = BridgeInstance::new(test_context_manager(), did.to_owned());
-        assert_eq!(instance.local_did(), did);
+        assert!(Arc::ptr_eq(instance.try_context_manager().unwrap(), &cm));
     }
 
     #[test]
@@ -1581,7 +1682,7 @@ mod tests {
 
     #[test]
     fn transport_starts_empty() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         assert!(!instance.has_transport());
         assert_eq!(
             instance.with_transport(|_| ()).unwrap_err(),
@@ -1591,7 +1692,7 @@ mod tests {
 
     #[test]
     fn clear_transport_when_empty_is_ok() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         assert!(instance.clear_transport().is_ok());
         assert!(!instance.has_transport());
     }
@@ -1602,7 +1703,7 @@ mod tests {
 
     #[test]
     fn register_and_retrieve_known_context() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         let known = KnownContext {
             routing_id: [42u8; 32],
             relay_url: Some("wss://relay.example.com".to_owned()),
@@ -1621,7 +1722,7 @@ mod tests {
 
     #[test]
     fn known_contexts_for_member_filters() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.register_known_context(
             "ctx-alice",
             KnownContext {
@@ -1655,7 +1756,7 @@ mod tests {
 
     #[test]
     fn remove_known_context_works() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.register_known_context(
             "ctx-1",
             KnownContext {
@@ -1676,7 +1777,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_creates_default_on_first_access() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         assert!(instance.rate_limiters().is_empty());
 
         // Accessing a non-existent tracker creates a default one
@@ -1714,7 +1815,7 @@ mod tests {
 
     #[test]
     fn suspend_clears_transport() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
@@ -1728,7 +1829,7 @@ mod tests {
 
     #[test]
     fn suspend_is_noop_when_shutdown() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.shutdown();
 
         // Suspending an already-shutdown instance is a no-op (not an error)
@@ -1739,7 +1840,7 @@ mod tests {
 
     #[test]
     fn resume_clears_suspended_flag() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
         assert!(instance.is_suspended());
 
@@ -1749,7 +1850,7 @@ mod tests {
 
     #[test]
     fn resume_fails_after_shutdown() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.shutdown();
 
         let err = instance.resume().unwrap_err();
@@ -1762,7 +1863,7 @@ mod tests {
 
     #[test]
     fn shutdown_is_idempotent() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
 
         // Register some state
         instance.register_known_context(
@@ -1788,7 +1889,7 @@ mod tests {
 
     #[test]
     fn shutdown_clears_registries() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
 
         // Populate registries
         instance.register_known_context(
@@ -1823,7 +1924,7 @@ mod tests {
 
     #[test]
     fn shutdown_clears_suspended_flag() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
         assert!(instance.is_suspended());
 
@@ -1835,7 +1936,7 @@ mod tests {
 
     #[test]
     fn new_instance_is_not_suspended() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         assert!(!instance.is_suspended());
     }
 
@@ -1853,13 +1954,13 @@ mod tests {
 
     #[test]
     fn check_ready_passes_when_active() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         assert!(instance.check_ready().is_ok());
     }
 
     #[test]
     fn check_ready_fails_when_shutdown() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.shutdown();
         let err = instance.check_ready().unwrap_err();
         assert_eq!(err, LifecycleError::AlreadyShutDown);
@@ -1867,7 +1968,7 @@ mod tests {
 
     #[test]
     fn check_ready_fails_when_suspended() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
         let err = instance.check_ready().unwrap_err();
         assert_eq!(err, LifecycleError::Suspended);
@@ -1875,7 +1976,7 @@ mod tests {
 
     #[test]
     fn check_ready_passes_after_resume() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
         assert!(instance.check_ready().is_err());
         instance.resume().unwrap();
@@ -1884,7 +1985,7 @@ mod tests {
 
     #[test]
     fn known_contexts_cap_evicts_oldest() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
 
         // Register MAX_KNOWN_CONTEXTS entries.
         for i in 0..MAX_KNOWN_CONTEXTS {
@@ -1917,7 +2018,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_cap_evicts_oldest() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
 
         // Fill up to capacity.
         for i in 0..MAX_RATE_LIMITERS {
@@ -1944,7 +2045,7 @@ mod tests {
     #[test]
     fn shutdown_hooks_are_called_on_shutdown() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
 
         let counter = Arc::new(AtomicUsize::new(0));
         let c1 = Arc::clone(&counter);
@@ -1969,7 +2070,7 @@ mod tests {
     #[test]
     fn shutdown_hooks_run_only_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
 
         let counter = Arc::new(AtomicUsize::new(0));
         let c = Arc::clone(&counter);
@@ -1989,7 +2090,7 @@ mod tests {
     #[test]
     fn register_hook_after_shutdown_runs_immediately() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
 
         instance.shutdown();
 
@@ -2015,7 +2116,7 @@ mod tests {
 
     #[test]
     fn set_transport_warns_after_shutdown() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.shutdown();
 
         // set_transport after shutdown warns but does not error — matches
@@ -2032,7 +2133,7 @@ mod tests {
 
     #[test]
     fn set_transport_rejects_when_suspended() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
 
         let err = instance
@@ -2047,7 +2148,7 @@ mod tests {
 
     #[test]
     fn set_transport_accepts_after_resume() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
         instance.resume().unwrap();
 
@@ -2066,7 +2167,7 @@ mod tests {
     #[test]
     #[allow(clippy::panic)]
     fn register_hook_after_shutdown_catches_panic() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.shutdown();
 
         // A panicking hook registered after shutdown must not propagate.
@@ -2086,7 +2187,7 @@ mod tests {
     fn shutdown_hook_modifies_external_state() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         let state = Arc::new(AtomicBool::new(false));
         let state2 = Arc::clone(&state);
 
@@ -2113,7 +2214,7 @@ mod tests {
     fn multiple_hooks_all_run_even_if_one_panics() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         let counter = Arc::new(AtomicUsize::new(0));
         let c1 = Arc::clone(&counter);
         let c3 = Arc::clone(&counter);
@@ -2147,7 +2248,7 @@ mod tests {
 
     #[test]
     fn economy_budget_creates_default_on_first_access() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         let remaining = instance.with_economy_budget("ctx-1", |tracker| {
             tracker.remaining(&scp_primitives::DID::from("did:dht:zalice"))
         });
@@ -2156,7 +2257,7 @@ mod tests {
 
     #[test]
     fn economy_budget_mut_grants_and_reads() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         let did = scp_primitives::DID::from("did:dht:zalice");
         instance.with_economy_budget_mut("ctx-eco", |tracker| {
             tracker.grant(&did, scp_protocol::economy::Amount::new(500));
@@ -2167,7 +2268,7 @@ mod tests {
 
     #[test]
     fn economy_antispam_creates_default_on_first_access() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         let did = scp_primitives::DID::from("did:dht:zbob");
         let velocity =
             instance.with_economy_antispam("ctx-spam", |tracker| tracker.get_velocity(&did, 1000));
@@ -2176,7 +2277,7 @@ mod tests {
 
     #[test]
     fn remove_economy_state_clears_both() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         let did = scp_primitives::DID::from("did:dht:zalice");
         instance.with_economy_budget_mut("ctx-rm", |tracker| {
             tracker.grant(&did, scp_protocol::economy::Amount::new(100));
@@ -2194,7 +2295,7 @@ mod tests {
 
     #[test]
     fn economy_existing_context_id_bypasses_capacity_check() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         let did = scp_primitives::DID::from("did:dht:zalice");
 
         // Create one entry.
@@ -2215,7 +2316,7 @@ mod tests {
 
     #[test]
     fn economy_accessors_use_ephemeral_after_shutdown() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         let did = scp_primitives::DID::from("did:dht:zalice");
 
         // Grant a budget before shutdown.
@@ -2264,7 +2365,7 @@ mod tests {
 
     #[test]
     fn bridge_state_starts_empty() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         assert!(instance.bridge_state().is_empty());
     }
 
@@ -2273,7 +2374,7 @@ mod tests {
         use scp_protocol::bridge::shadow::ShadowRegistry;
         use scp_protocol::crypto::sender_keys::SenderKeyStore;
 
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.bridge_state().insert(
             "ctx-bs".to_owned(),
             BridgeContextState {
@@ -2293,7 +2394,7 @@ mod tests {
 
     #[test]
     fn did_resolver_starts_none() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         assert!(instance.did_resolver().is_none());
     }
 
@@ -2306,7 +2407,7 @@ mod tests {
         use scp_protocol::bridge::shadow::ShadowRegistry;
         use scp_protocol::crypto::sender_keys::SenderKeyStore;
 
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
 
         // Populate economy
         let did = scp_primitives::DID::from("did:dht:zalice");
@@ -2338,7 +2439,7 @@ mod tests {
 
     #[test]
     fn new_instance_has_no_persistence() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         assert!(
             instance.persistence().is_none(),
             "new() must not have a persistence provider"
@@ -2349,10 +2450,9 @@ mod tests {
     fn with_persistence_sets_provider() {
         use scp_core::context::providers::InMemoryPersistence;
 
-        let cm = test_context_manager();
         let persistence = Box::new(InMemoryPersistence::new());
-        let instance =
-            BridgeInstance::with_persistence(cm, "did:dht:zalice".to_owned(), persistence);
+        let instance = BridgeInstance::with_persistence(persistence);
+        instance.set_context_manager(test_context_manager());
         assert!(
             instance.persistence().is_some(),
             "with_persistence() must set the persistence provider"
@@ -2365,13 +2465,13 @@ mod tests {
 
     #[test]
     fn pending_relay_url_is_none_by_default() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         assert!(instance.pending_relay_url().is_none());
     }
 
     #[test]
     fn set_relay_url_stores_url() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.set_relay_url("wss://relay.example.com".to_owned());
         assert_eq!(
             instance.pending_relay_url().as_deref(),
@@ -2381,7 +2481,7 @@ mod tests {
 
     #[test]
     fn clear_transport_preserves_relay_url() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
@@ -2398,7 +2498,7 @@ mod tests {
 
     #[test]
     fn suspend_preserves_relay_url() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
@@ -2417,7 +2517,7 @@ mod tests {
     fn relay_url_survives_suspend_resume_cycle() {
         // The relay URL is preserved across suspend/resume so callers can
         // reconnect to the same relay after resume.
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
@@ -2438,7 +2538,7 @@ mod tests {
 
     #[test]
     fn shutdown_clears_relay_url() {
-        let instance = BridgeInstance::new(test_context_manager(), "did:dht:ztest".to_owned());
+        let instance = BridgeInstance::with_context_manager(test_context_manager());
         instance.set_relay_url("wss://relay.example.com".to_owned());
         assert!(instance.pending_relay_url().is_some());
 
@@ -2454,22 +2554,27 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn two_instances_with_different_dids_are_independent() {
+    fn two_instances_are_independent() {
+        // BridgeInstances are containers — they carry no DID of their own
+        // (spec §12.2.3). The DID belongs to the `MlsCryptoProvider` inside
+        // each `ContextManager`. Two instances with distinct CMs must be
+        // independently shut-down-able.
         let cm1 = test_context_manager();
         let cm2 = test_context_manager();
-        let bi1 = BridgeInstance::new(Arc::clone(&cm1), "did:dht:alice".to_owned());
-        let bi2 = BridgeInstance::new(Arc::clone(&cm2), "did:dht:bob".to_owned());
+        let bi1 = BridgeInstance::with_context_manager(Arc::clone(&cm1));
+        let bi2 = BridgeInstance::with_context_manager(Arc::clone(&cm2));
 
-        assert_eq!(bi1.local_did(), "did:dht:alice");
-        assert_eq!(bi2.local_did(), "did:dht:bob");
+        // Their ContextManager allocations are distinct.
+        assert!(!Arc::ptr_eq(
+            bi1.try_context_manager().unwrap(),
+            bi2.try_context_manager().unwrap()
+        ));
 
         // Shutting down one does not affect the other.
         bi1.shutdown();
         assert!(bi1.is_shutdown());
         assert!(!bi2.is_shutdown());
 
-        // bi2 local_did is still accessible.
-        assert_eq!(bi2.local_did(), "did:dht:bob");
         // bi2 is still ready to service operations.
         assert!(bi2.check_ready().is_ok());
     }
@@ -2498,11 +2603,8 @@ mod tests {
             key_resolver,
         ));
 
-        let instance = BridgeInstance::with_persistence(
-            cm,
-            "did:dht:ztest".to_owned(),
-            persistence_for_instance,
-        );
+        let instance = BridgeInstance::with_persistence(persistence_for_instance);
+        instance.set_context_manager(cm);
 
         // Verify the persistence accessor returns Some.
         assert!(instance.persistence().is_some());
@@ -2535,8 +2637,8 @@ mod tests {
     fn two_instances_operate_concurrently() {
         let cm1 = test_context_manager();
         let cm2 = test_context_manager();
-        let bi1 = BridgeInstance::new(Arc::clone(&cm1), "did:dht:alice".to_owned());
-        let bi2 = BridgeInstance::new(Arc::clone(&cm2), "did:dht:bob".to_owned());
+        let bi1 = BridgeInstance::with_context_manager(Arc::clone(&cm1));
+        let bi2 = BridgeInstance::with_context_manager(Arc::clone(&cm2));
 
         // Register known contexts independently.
         bi1.register_known_context(

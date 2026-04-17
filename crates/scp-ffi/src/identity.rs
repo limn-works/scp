@@ -483,6 +483,14 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
     let (key_custody, custody_str) = parse_custody(custody)?;
     let rt = crate::runtime()?;
 
+    // Ensure the BridgeInstance exists BEFORE the DID resolver is
+    // initialized — the DID resolver is stored inside the BridgeInstance and
+    // cannot be registered otherwise. The real ContextManager is attached
+    // later (by init_context_manager) once the identity has been created.
+    // Per spec §12.2.3 the BridgeInstance itself carries no DID; the DID
+    // lives inside the MlsCryptoProvider owned by the ContextManager.
+    crate::runtime::ensure_bridge_instance();
+
     // Ensure the global DID resolver is initialized (idempotent). #311
     ensure_did_resolver_initialized(rt.handle().clone());
 
@@ -554,6 +562,10 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
 fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
     let (key_custody, custody_str) = parse_custody(custody)?;
     let rt = crate::runtime()?;
+
+    // Ensure the BridgeInstance exists BEFORE the DID resolver is
+    // initialized. See py_identity_create for the full rationale.
+    crate::runtime::ensure_bridge_instance();
 
     // Ensure the global DID resolver is initialized (idempotent). #311
     ensure_did_resolver_initialized(rt.handle().clone());

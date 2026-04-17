@@ -125,7 +125,13 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, crate::ScpError
     if bi.is_shutdown() {
         tracing::warn!("context_manager() called after shutdown — operations may fail");
     }
-    Ok(bi.context_manager())
+    bi.try_context_manager()
+        .ok_or_else(|| crate::ScpError::Context {
+            msg: "ContextManager not yet attached — call context_create, \
+                  context_join, context_import, or init_context_manager first"
+                .to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -158,9 +164,7 @@ static BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>> = OnceLock::new();
 /// `BridgeInstance` and cleared in its `shutdown()` method.
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-fn init_bridge_instance(
-    context_manager: Arc<ContextManager>,
-    local_did: &str,
+fn init_bridge_instance_empty(
     protocol_repo: Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
 ) {
     // Guard against duplicate hook registration — OnceLock guarantees
@@ -169,7 +173,7 @@ fn init_bridge_instance(
         return;
     }
 
-    let instance = Arc::new(BridgeInstance::new(context_manager, local_did.to_owned()));
+    let instance = Arc::new(BridgeInstance::new());
     let bi = BRIDGE_INSTANCE.get_or_init(|| instance);
 
     // Register the protocol repository for trust aggregation (#502).
@@ -208,26 +212,40 @@ pub fn bridge_instance_raw() -> Option<&'static Arc<BridgeInstance>> {
     BRIDGE_INSTANCE.get()
 }
 
-/// Ensures a `BridgeInstance` exists, creating one from the given
-/// `ContextManager` if necessary.
+/// Ensures a `BridgeInstance` exists (without a `ContextManager`).
 ///
-/// Used by `transport_connect` to lazily create a `BridgeInstance` when
-/// the standard `UniFFI` flow (`init_context_manager()` without DID →
-/// `context_create` → `transport_connect`) did not create one during
-/// initialization.
+/// Called by `identity_create` before `DidDht::create()` runs, so that the
+/// DID resolver slot owned by `BridgeInstance` is available. The
+/// `ContextManager` is attached later via [`init_context_manager_with_did`]
+/// (or [`attach_context_manager_to_bridge`]) once the identity is known.
+/// Per spec §12.2.3 the `BridgeInstance` container has no DID requirement
+/// — the DID lives inside the `MlsCryptoProvider` owned by the
+/// `ContextManager`.
 ///
-/// Uses a placeholder DID (`"did:placeholder:uninitialized-uniffi"`) since the
-/// real DID is not available at this point. The DID is only used for logging
-/// and MLS credential identity — the `ContextManager` already has the real
-/// MLS provider if `init_context_manager_with_did` was called.
-pub fn ensure_bridge_instance(
-    cm: Arc<ContextManager>,
-    protocol_repo: Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
-) {
+/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
+pub fn ensure_bridge_instance() {
     if BRIDGE_INSTANCE.get().is_some() {
         return;
     }
-    init_bridge_instance(cm, "did:placeholder:uninitialized-uniffi", protocol_repo);
+    let (_event_log, protocol_repo) = build_event_log_provider();
+    init_bridge_instance_empty(protocol_repo);
+}
+
+/// Attaches an externally-constructed `ContextManager` to the global
+/// `BridgeInstance`.
+///
+/// Used by `transport_connect` and similar code paths that need to install
+/// a `ContextManager` that was not created by `init_context_manager*`. Creates
+/// the `BridgeInstance` if one does not yet exist.
+///
+/// No-op if the `BridgeInstance` already has a `ContextManager` attached.
+pub fn attach_context_manager_to_bridge(cm: Arc<ContextManager>) {
+    ensure_bridge_instance();
+    if let Some(bi) = BRIDGE_INSTANCE.get()
+        && !bi.has_context_manager()
+    {
+        bi.set_context_manager(cm);
+    }
 }
 
 /// Returns a reference to the global [`BridgeInstance`].
@@ -290,6 +308,33 @@ fn build_default_context_manager() -> (
     (cm, protocol_repo)
 }
 
+/// Builds a default `ContextManager` reusing the protocol repository already
+/// registered in the `BridgeInstance`.
+///
+/// Called by `context_manager_expect` / `init_context_manager` to attach a
+/// default CM after `ensure_bridge_instance` already registered the protocol
+/// repository. Reusing the repo is required — a fresh repo would have a
+/// different encryption key, so event log entries written via the default CM
+/// would be unreadable.
+///
+/// Falls back to a fresh repository (logging an error) if the `BridgeInstance`
+/// or registered repo is missing.
+fn build_default_context_manager_reusing_repo() -> Arc<ContextManager> {
+    let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
+        tracing::error!(
+            "build_default_context_manager_reusing_repo: missing ProtocolRepository — \
+             falling back to a fresh event log provider (persistence will be lost)"
+        );
+        build_event_log_provider().0
+    });
+    Arc::new(ContextManager::new(
+        Box::new(FfiBridgeCrypto),
+        Box::new(scp_core::context::NotConfiguredTransportProvider),
+        event_log,
+        not_configured_key_resolver(),
+    ))
+}
+
 /// Returns a reference to the shared `ContextManager`, initializing it with
 /// defaults if necessary.
 ///
@@ -311,36 +356,43 @@ fn build_default_context_manager() -> (
 /// is only used for logging — the `MlsCryptoProvider` gets the real DID
 /// via `init_context_manager_with_did`.
 pub fn context_manager_expect() -> &'static Arc<ContextManager> {
+    if let Some(bi) = BRIDGE_INSTANCE.get()
+        && let Some(cm) = bi.try_context_manager()
+    {
+        return cm;
+    }
+    // Lazily create the BridgeInstance and attach a default ContextManager.
+    ensure_bridge_instance();
     if let Some(bi) = BRIDGE_INSTANCE.get() {
-        return bi.context_manager();
-    }
-    // Lazily create both ContextManager and BridgeInstance.
-    let (cm, protocol_repo) = build_default_context_manager();
-    ensure_bridge_instance(cm.clone(), protocol_repo);
-    // Return from BRIDGE_INSTANCE to avoid holding two references.
-    match BRIDGE_INSTANCE.get() {
-        Some(bi) => bi.context_manager(),
-        None => {
-            // Should not happen — ensure_bridge_instance just set it.
-            // Leak the Arc to return a &'static reference as a last resort.
-            Box::leak(Box::new(cm))
+        if !bi.has_context_manager() {
+            bi.set_context_manager(build_default_context_manager_reusing_repo());
         }
+        if let Some(cm) = bi.try_context_manager() {
+            return cm;
+        }
+        tracing::error!(
+            "context_manager_expect: BridgeInstance had no CM after set_context_manager — falling back to a leaked default CM"
+        );
     }
+    // Defensive fallback — should not happen (ensure_bridge_instance just set it).
+    let (cm, _protocol_repo) = build_default_context_manager();
+    Box::leak(Box::new(cm))
 }
 
 /// Initializes the global [`ContextManager`] with bridge-local providers.
 ///
 /// This is called during `context_create` to ensure the manager is ready
-/// before any context operations. Also creates a `BridgeInstance` with a
-/// placeholder DID so shared registries are available.
+/// before any context operations. Creates a `BridgeInstance` (without a DID)
+/// and attaches a default `ContextManager` so shared registries are available.
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 pub fn init_context_manager() {
-    if BRIDGE_INSTANCE.get().is_some() {
-        return;
+    ensure_bridge_instance();
+    if let Some(bi) = BRIDGE_INSTANCE.get()
+        && !bi.has_context_manager()
+    {
+        bi.set_context_manager(build_default_context_manager_reusing_repo());
     }
-    let (cm, protocol_repo) = build_default_context_manager();
-    ensure_bridge_instance(cm, protocol_repo);
 }
 
 /// Initializes the global [`ContextManager`] with [`MlsCryptoProvider`]
@@ -357,16 +409,27 @@ pub fn init_context_manager() {
 ///
 /// Subsequent calls are no-ops (`OnceLock`).
 pub fn init_context_manager_with_did(local_did: &str) {
-    if BRIDGE_INSTANCE.get().is_some() {
-        tracing::warn!(
+    ensure_bridge_instance();
+    let Some(bi) = BRIDGE_INSTANCE.get() else {
+        tracing::error!("init_context_manager_with_did: BridgeInstance unexpectedly None");
+        return;
+    };
+    if bi.has_context_manager() {
+        tracing::debug!(
             requested_did = %local_did,
-            "init_context_manager already initialized — ignoring DID-parameterized init"
+            "init_context_manager_with_did: ContextManager already attached — using existing instance"
         );
         return;
     }
     let did = local_did.to_owned();
     let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
-    let (event_log, protocol_repo) = build_event_log_provider();
+    let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
+        tracing::error!(
+            "init_context_manager_with_did: missing ProtocolRepository after \
+             ensure_bridge_instance — falling back to a fresh event log provider"
+        );
+        build_event_log_provider().0
+    });
     let cm_arc = Arc::new(ContextManager::new(
         crypto,
         Box::new(scp_core::context::NotConfiguredTransportProvider),
@@ -374,7 +437,7 @@ pub fn init_context_manager_with_did(local_did: &str) {
         not_configured_key_resolver(),
     ));
 
-    init_bridge_instance(cm_arc, local_did, protocol_repo);
+    bi.set_context_manager(cm_arc);
 }
 
 /// Initializes the global [`ContextManager`] with [`RelayTransportProvider`].
@@ -403,17 +466,30 @@ pub fn init_context_manager_with_relay_transport(
     local_did: &str,
     adapter: scp_transport::native::adapter::NativeRelayAdapter,
 ) {
-    if BRIDGE_INSTANCE.get().is_some() {
+    ensure_bridge_instance();
+    let Some(bi) = BRIDGE_INSTANCE.get() else {
+        tracing::error!(
+            "init_context_manager_with_relay_transport: BridgeInstance unexpectedly None"
+        );
+        return;
+    };
+    if bi.has_context_manager() {
         tracing::warn!(
             requested_did = %local_did,
-            "init_context_manager already initialized — ignoring relay-transport init"
+            "init_context_manager_with_relay_transport: ContextManager already attached — ignoring"
         );
         return;
     }
     let did = local_did.to_owned();
     let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
-    let (event_log, protocol_repo) = build_event_log_provider();
+    let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
+        tracing::error!(
+            "init_context_manager_with_relay_transport: missing ProtocolRepository after \
+             ensure_bridge_instance — falling back to a fresh event log provider"
+        );
+        build_event_log_provider().0
+    });
     let cm_arc = Arc::new(ContextManager::new(
         crypto,
         transport,
@@ -421,7 +497,24 @@ pub fn init_context_manager_with_relay_transport(
         not_configured_key_resolver(),
     ));
 
-    init_bridge_instance(cm_arc, local_did, protocol_repo);
+    bi.set_context_manager(cm_arc);
+}
+
+/// Builds an event log provider that reuses the already-registered
+/// `ProtocolRepository` in the `BridgeInstance`.
+///
+/// Called by `init_context_manager*` after the `BridgeInstance` was created
+/// by `ensure_bridge_instance`. Reusing the repository is critical — a fresh
+/// repository would have a different encryption key, rendering any already
+/// persisted event log entries unreadable.
+fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProvider>> {
+    let bi = BRIDGE_INSTANCE.get()?;
+    let store = bi
+        .get_protocol_repository_as::<Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>>()?;
+    let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(store));
+    Some(Box::new(MerkleEventLogProvider::with_persistence(
+        Arc::new(bridge),
+    )))
 }
 
 /// Returns the global `ProtocolRepository` if initialized.
@@ -873,6 +966,7 @@ pub const fn query_trust_event_counts(_context_id: &str, _did: &str) -> (u64, u6
 // `bridge_instance()?.with_economy_budget(...)` etc. directly.
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -896,21 +990,8 @@ mod tests {
 
         // Both should point to the same ContextManager allocation.
         assert!(
-            Arc::ptr_eq(cm, bi.context_manager()),
+            Arc::ptr_eq(cm, bi.try_context_manager().unwrap()),
             "bridge_instance().context_manager() must be the same Arc as context_manager()"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn bridge_instance_has_local_did() -> Result<(), crate::ScpError> {
-        init_context_manager_with_did("did:dht:ztest");
-
-        let bi = bridge_instance()?;
-        // local_did should be non-empty (a real DID from the DID-aware init).
-        assert!(
-            !bi.local_did().is_empty(),
-            "bridge_instance local_did should not be empty"
         );
         Ok(())
     }
@@ -957,7 +1038,7 @@ mod tests {
         // interfering with the OnceLock-based singleton used by other tests.
         // BridgeInstance is in scope via `use super::*` (imported at module top).
         let (cm, _protocol_repo) = build_default_context_manager();
-        let bi = BridgeInstance::new(cm, "did:test:uniffi-hook-isolated".to_owned());
+        let bi = BridgeInstance::with_context_manager(cm);
 
         let ran = Arc::new(AtomicBool::new(false));
         let ran2 = Arc::clone(&ran);

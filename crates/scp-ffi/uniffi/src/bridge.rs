@@ -4764,33 +4764,22 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
 
             // Store the transport manager in BridgeInstance so that
             // suspend()/shutdown() lifecycle events automatically clear it.
-            // If BridgeInstance doesn't exist yet (init_context_manager()
-            // was called without a DID), create one from the existing
-            // ContextManager.
-            let bi = match crate::runtime::bridge_instance() {
-                Ok(bi) => bi,
-                Err(_) => {
-                    // BridgeInstance not created — try to bootstrap from
-                    // the existing ContextManager (standard UniFFI flow:
-                    // init_context_manager() → context_create →
-                    // transport_connect).
-                    if let Ok(cm) = crate::runtime::context_manager() {
-                        let (_event_log, protocol_repo) =
-                            crate::runtime::build_event_log_provider();
-                        crate::runtime::ensure_bridge_instance(cm.clone(), protocol_repo);
-                        crate::runtime::bridge_instance().map_err(|_| ScpError::Context {
-                            msg: "bridge not initialized — call identity_create before transport_connect"
-                                .to_owned(),
-                            code: codes::CTX_2000.to_owned(),
-                        })?
-                    } else {
-                        return Err(ScpError::Context {
-                            msg: "bridge not initialized — call identity_create before transport_connect"
-                                .to_owned(),
-                            code: codes::CTX_2000.to_owned(),
-                        });
-                    }
+            // The BridgeInstance container has no DID requirement (spec
+            // §12.2.3) — ensure it exists, and attach the ContextManager if
+            // one is already available.
+            let bi = if let Ok(bi) = crate::runtime::bridge_instance() {
+                bi
+            } else {
+                if let Ok(cm) = crate::runtime::context_manager() {
+                    crate::runtime::attach_context_manager_to_bridge(cm.clone());
+                } else {
+                    crate::runtime::ensure_bridge_instance();
                 }
+                crate::runtime::bridge_instance().map_err(|_| ScpError::Context {
+                    msg: "bridge not initialized — call identity_create before transport_connect"
+                        .to_owned(),
+                    code: codes::CTX_2000.to_owned(),
+                })?
             };
             bi.set_transport(std::sync::Arc::new(manager))
                 .map_err(|e| ScpError::Transport {
@@ -5077,7 +5066,7 @@ fn mcp_handle_id(prefix: &str) -> String {
 
 /// Clears both MCP server and client registries during shutdown.
 ///
-/// Called by the shutdown hook registered in [`crate::runtime::init_bridge_instance`].
+/// Called by the shutdown hook registered in `crate::runtime::init_bridge_instance_empty`.
 /// This ensures server shutdown senders and client connections are dropped,
 /// allowing background tasks to terminate cleanly.
 pub(crate) fn clear_mcp_registries() {

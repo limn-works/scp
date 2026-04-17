@@ -103,6 +103,18 @@ RevokeBridge {
 
 **Suspension** uses `SuspendBridge { bridge_id, reason, duration: Option<u64> }`. Suspension stops message processing but retains shadow state and credentials (§12.11.1). If `duration` is set, the bridge automatically reactivates after the specified seconds. Otherwise, explicit `ReactivateBridge { bridge_id }` governance action is required.
 
+### 12.2.3 Terminology: Bridge Connector vs. FFI `BridgeInstance`
+
+Two concepts share the name "bridge" in this system and MUST be kept distinct:
+
+1. **Bridge connector (this section).** A protocol-level entity that translates between an external platform and an SCP context. Every bridge connector has an operator DID (§12.2 above). This is a governed, accountable actor inside an SCP context.
+
+2. **FFI `BridgeInstance` (implementation detail).** A runtime container in the FFI layer (`scp-ffi-common`) that holds process-wide infrastructure — `ContextManager`, DID resolver, storage provider, identity registry. It is the SDK's entry point, not a protocol entity. An `FFI::BridgeInstance` has NO DID requirement; it is infrastructure that exists before any identity is created. An SDK consumer may use the FFI `BridgeInstance` purely to resolve DIDs or verify attestations without ever creating a local identity.
+
+The protocol invariant "every action traces to a human" (§04, §09) applies to **bridge connectors** (protocol entities with operator DIDs) — it does NOT apply to the FFI `BridgeInstance` container. Conflating the two produces a chicken-and-egg during SDK initialization: DID resolution is needed to verify signatures on any DID (including remote members'), and must not require a local identity to exist first.
+
+When reading protocol documents, "bridge" means bridge connector unless the context explicitly refers to FFI layer code.
+
 ## 12.3 Shadow Identities
 
 When a bridge connector brings external platform participants into an SCP context, it creates **shadow identities** — protocol-level representations of entities that exist on the external platform but do not (yet) have native SCP identities.

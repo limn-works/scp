@@ -75,7 +75,9 @@ fn set_transport_manager(manager: scp_transport::TransportManager) -> napi::Resu
         bi
     } else {
         if let Ok(cm) = crate::runtime::context_manager() {
-            crate::runtime::ensure_bridge_instance(cm.clone());
+            crate::runtime::attach_context_manager_to_bridge(cm.clone());
+        } else {
+            crate::runtime::ensure_bridge_instance();
         }
         crate::runtime::bridge_instance()?
     };

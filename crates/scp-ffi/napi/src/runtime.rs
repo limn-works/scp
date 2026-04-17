@@ -158,7 +158,14 @@ pub fn context_manager() -> napi::Result<&'static Arc<ContextManager>> {
     if bi.is_shutdown() {
         tracing::warn!("context_manager() called after shutdown — operations may fail");
     }
-    Ok(bi.context_manager())
+    bi.try_context_manager().ok_or_else(|| {
+        napi::Error::from(ScpNapiError::Context {
+            message: "ContextManager not yet attached — call context_create, \
+                      context_join, context_import, or init_context_manager first"
+                .to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -174,12 +181,14 @@ pub fn context_manager() -> napi::Result<&'static Arc<ContextManager>> {
 /// alternative path that will eventually replace all singletons (#1549).
 static BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>> = OnceLock::new();
 
-/// Initializes the global [`BridgeInstance`].
+/// Initializes the global [`BridgeInstance`] without a `ContextManager`.
 ///
-/// Called by [`init_context_manager`] (and its variants) after the
-/// `ContextManager` is created. The `BridgeInstance` wraps the same
-/// `Arc<ContextManager>` so that `bridge_instance().context_manager()` and
-/// `context_manager()` return pointers to the same allocation.
+/// Called by [`ensure_bridge_instance`] and (transitively) by the
+/// `init_context_manager*` family. The `ContextManager` is attached later via
+/// [`BridgeInstance::set_context_manager`] once `identity_create` has
+/// produced the local DID and the `MlsCryptoProvider` has been constructed
+/// with it. Per spec §12.2.3 the `BridgeInstance` container carries no DID
+/// — the DID lives inside the `MlsCryptoProvider`.
 ///
 /// Registers NAPI-specific state in `BridgeInstance`:
 /// - `ucan_registry` — `Arc<DashMap<String, UcanContextState>>` (type-erased)
@@ -190,9 +199,7 @@ static BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>> = OnceLock::new();
 /// `BridgeInstance` and cleared in its `shutdown()` method.
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-fn init_bridge_instance(
-    context_manager: Arc<ContextManager>,
-    local_did: &str,
+fn init_bridge_instance_empty(
     protocol_repo: Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
 ) {
     // Guard against duplicate hook registration — OnceLock guarantees
@@ -201,7 +208,7 @@ fn init_bridge_instance(
         return;
     }
 
-    let instance = Arc::new(BridgeInstance::new(context_manager, local_did.to_owned()));
+    let instance = Arc::new(BridgeInstance::new());
     let bi = BRIDGE_INSTANCE.get_or_init(|| instance);
 
     // Register the protocol repository for trust aggregation (#502).
@@ -253,17 +260,39 @@ pub fn bridge_instance_raw() -> Option<&'static Arc<BridgeInstance>> {
     BRIDGE_INSTANCE.get()
 }
 
-/// Ensures a `BridgeInstance` exists, creating one from the given
-/// `ContextManager` if necessary.
+/// Ensures a `BridgeInstance` exists (without a `ContextManager`).
 ///
-/// Used by `set_transport_manager` to lazily create a `BridgeInstance`
-/// when it wasn't created during initialization (defensive fallback).
-pub fn ensure_bridge_instance(cm: Arc<ContextManager>) {
+/// Called by [`crate::identity::ensure_did_resolver_initialized`] before
+/// `DidDht::create()` runs, so that the DID resolver slot owned by
+/// `BridgeInstance` is available. The `ContextManager` is attached later
+/// via [`init_context_manager`] (or [`attach_context_manager_to_bridge`])
+/// once the identity is known. Per spec §12.2.3 the `BridgeInstance`
+/// container has no DID requirement.
+///
+/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
+pub fn ensure_bridge_instance() {
     if BRIDGE_INSTANCE.get().is_some() {
         return;
     }
     let (_event_log, protocol_repo) = build_event_log_provider();
-    init_bridge_instance(cm, "did:placeholder:uninitialized-napi", protocol_repo);
+    init_bridge_instance_empty(protocol_repo);
+}
+
+/// Attaches an externally-constructed `ContextManager` to the global
+/// `BridgeInstance`.
+///
+/// Used by `set_transport_manager` and similar code paths that need to install
+/// a `ContextManager` that was not created by `init_context_manager*`. Creates
+/// the `BridgeInstance` if one does not yet exist.
+///
+/// No-op if the `BridgeInstance` already has a `ContextManager` attached.
+pub fn attach_context_manager_to_bridge(cm: Arc<ContextManager>) {
+    ensure_bridge_instance();
+    if let Some(bi) = BRIDGE_INSTANCE.get()
+        && !bi.has_context_manager()
+    {
+        bi.set_context_manager(cm);
+    }
 }
 
 /// Returns a reference to the global [`BridgeInstance`].
@@ -309,23 +338,33 @@ pub fn bridge_instance() -> napi::Result<&'static Arc<BridgeInstance>> {
 /// storage provider. This ensures event log entries are persisted on each
 /// append (issue #484 AC).
 ///
-/// Also populates the global [`BridgeInstance`] with the same `ContextManager`
-/// and `local_did`, enabling incremental migration of per-registry singletons
-/// to the consolidated `BridgeInstance` (#1549).
+/// The `local_did` is consumed only by `MlsCryptoProvider::new` — the
+/// `BridgeInstance` container carries no DID of its own (spec §12.2.3).
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 pub fn init_context_manager(local_did: &str) {
-    if BRIDGE_INSTANCE.get().is_some() {
-        tracing::warn!(
+    ensure_bridge_instance();
+    let Some(bi) = BRIDGE_INSTANCE.get() else {
+        tracing::error!("init_context_manager: BridgeInstance unexpectedly None");
+        return;
+    };
+    if bi.has_context_manager() {
+        tracing::debug!(
             requested_did = %local_did,
-            "init_context_manager already initialized — MLS crypto uses the original DID"
+            "init_context_manager: ContextManager already attached — using existing instance"
         );
         return;
     }
     let did = local_did.to_owned();
     let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let transport = Box::new(scp_core::context::NotConfiguredTransportProvider);
-    let (event_log, protocol_repo) = build_event_log_provider();
+    let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
+        tracing::error!(
+            "init_context_manager: missing ProtocolRepository after ensure_bridge_instance — \
+             falling back to a fresh event log provider (persistence will be lost)"
+        );
+        build_event_log_provider().0
+    });
     let persistence = Box::new(NapiBridgePersistence::new());
     let cm_arc = Arc::new(ContextManager::with_persistence(
         crypto,
@@ -335,7 +374,7 @@ pub fn init_context_manager(local_did: &str) {
         not_configured_key_resolver(),
     ));
 
-    init_bridge_instance(cm_arc, local_did, protocol_repo);
+    bi.set_context_manager(cm_arc);
 }
 
 /// Initializes the global [`ContextManager`] with [`LocalTransportProvider`].
@@ -354,17 +393,30 @@ pub fn init_context_manager(local_did: &str) {
 ///
 /// Subsequent calls are no-ops (`OnceLock`).
 pub fn init_context_manager_with_local_transport(local_did: &str) {
-    if BRIDGE_INSTANCE.get().is_some() {
+    ensure_bridge_instance();
+    let Some(bi) = BRIDGE_INSTANCE.get() else {
+        tracing::error!(
+            "init_context_manager_with_local_transport: BridgeInstance unexpectedly None"
+        );
+        return;
+    };
+    if bi.has_context_manager() {
         tracing::warn!(
             requested_did = %local_did,
-            "init_context_manager already initialized — ignoring local-transport init"
+            "init_context_manager_with_local_transport: ContextManager already attached — ignoring"
         );
         return;
     }
     let did = local_did.to_owned();
     let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let transport = Box::new(scp_core::context::LocalTransportProvider);
-    let (event_log, protocol_repo) = build_event_log_provider();
+    let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
+        tracing::error!(
+            "init_context_manager_with_local_transport: missing ProtocolRepository after \
+             ensure_bridge_instance — falling back to a fresh event log provider"
+        );
+        build_event_log_provider().0
+    });
     let persistence = Box::new(NapiBridgePersistence::new());
     let cm_arc = Arc::new(ContextManager::with_persistence(
         crypto,
@@ -374,7 +426,7 @@ pub fn init_context_manager_with_local_transport(local_did: &str) {
         not_configured_key_resolver(),
     ));
 
-    init_bridge_instance(cm_arc, local_did, protocol_repo);
+    bi.set_context_manager(cm_arc);
 }
 
 /// Initializes the global [`ContextManager`] with [`RelayTransportProvider`].
@@ -403,17 +455,30 @@ pub fn init_context_manager_with_relay_transport(
     local_did: &str,
     adapter: scp_transport::native::adapter::NativeRelayAdapter,
 ) {
-    if BRIDGE_INSTANCE.get().is_some() {
+    ensure_bridge_instance();
+    let Some(bi) = BRIDGE_INSTANCE.get() else {
+        tracing::error!(
+            "init_context_manager_with_relay_transport: BridgeInstance unexpectedly None"
+        );
+        return;
+    };
+    if bi.has_context_manager() {
         tracing::warn!(
             requested_did = %local_did,
-            "init_context_manager already initialized — ignoring relay-transport init"
+            "init_context_manager_with_relay_transport: ContextManager already attached — ignoring"
         );
         return;
     }
     let did = local_did.to_owned();
     let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
-    let (event_log, protocol_repo) = build_event_log_provider();
+    let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
+        tracing::error!(
+            "init_context_manager_with_relay_transport: missing ProtocolRepository after \
+             ensure_bridge_instance — falling back to a fresh event log provider"
+        );
+        build_event_log_provider().0
+    });
     let persistence = Box::new(NapiBridgePersistence::new());
     let cm_arc = Arc::new(ContextManager::with_persistence(
         crypto,
@@ -423,7 +488,7 @@ pub fn init_context_manager_with_relay_transport(
         not_configured_key_resolver(),
     ));
 
-    init_bridge_instance(cm_arc, local_did, protocol_repo);
+    bi.set_context_manager(cm_arc);
 }
 
 /// Returns the global `ProtocolRepository` if initialized.
@@ -473,6 +538,23 @@ pub(crate) fn build_event_log_provider() -> (
     (event_log, store)
 }
 
+/// Builds an event log provider that reuses the already-registered
+/// `ProtocolRepository` in the `BridgeInstance`.
+///
+/// Called by `init_context_manager*` after the `BridgeInstance` was created
+/// by `ensure_bridge_instance`. Reusing the repository is critical — a fresh
+/// repository would have a different encryption key, rendering any already
+/// persisted event log entries unreadable.
+fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProvider>> {
+    let bi = BRIDGE_INSTANCE.get()?;
+    let store = bi
+        .get_protocol_repository_as::<Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>>()?;
+    let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(store));
+    Some(Box::new(MerkleEventLogProvider::with_persistence(
+        Arc::new(bridge),
+    )))
+}
+
 /// Test variant of [`context_manager`] initialization that uses
 /// [`LocalTransportProvider`](scp_core::context::LocalTransportProvider) instead of
 /// [`NotConfiguredTransportProvider`](scp_core::context::NotConfiguredTransportProvider)
@@ -483,10 +565,21 @@ pub(crate) fn build_event_log_provider() -> (
 /// `OnceLock::get_or_init` ensures only the first initialization wins.
 #[cfg(test)]
 pub(crate) fn init_context_manager_for_test() {
-    if BRIDGE_INSTANCE.get().is_some() {
+    ensure_bridge_instance();
+    let Some(bi) = BRIDGE_INSTANCE.get() else {
+        tracing::error!("init_context_manager_for_test: BridgeInstance unexpectedly None");
+        return;
+    };
+    if bi.has_context_manager() {
         return;
     }
-    let (event_log, protocol_repo) = build_event_log_provider();
+    let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
+        tracing::error!(
+            "init_context_manager_for_test: missing ProtocolRepository after \
+             ensure_bridge_instance — falling back to a fresh event log provider"
+        );
+        build_event_log_provider().0
+    });
     let cm_arc = Arc::new(ContextManager::with_persistence(
         Box::new(TestNoOpCryptoProvider),
         Box::new(scp_core::context::LocalTransportProvider),
@@ -495,8 +588,7 @@ pub(crate) fn init_context_manager_for_test() {
         not_configured_key_resolver(),
     ));
 
-    // Populate the BridgeInstance with a synthetic test DID.
-    init_bridge_instance(cm_arc, "did:test:napi-bridge", protocol_repo);
+    bi.set_context_manager(cm_arc);
 }
 
 /// No-op crypto provider for Rust unit tests only.
@@ -1268,21 +1360,8 @@ mod tests {
 
         // Both should point to the same ContextManager allocation.
         assert!(
-            Arc::ptr_eq(cm, bi.context_manager()),
+            Arc::ptr_eq(cm, bi.try_context_manager().unwrap()),
             "bridge_instance().context_manager() must be the same Arc as context_manager()"
-        );
-    }
-
-    #[test]
-    fn bridge_instance_has_local_did() {
-        init_context_manager_for_test();
-
-        let bi = bridge_instance().expect("bridge_instance should be initialized");
-        // init_context_manager_for_test uses "did:test:napi-bridge" as the
-        // synthetic local DID.
-        assert!(
-            !bi.local_did().is_empty(),
-            "bridge_instance local_did should not be empty"
         );
     }
 
@@ -1314,7 +1393,7 @@ mod tests {
             Box::new(NapiBridgePersistence::new()),
             key_resolver,
         ));
-        let bi = BridgeInstance::new(cm, "did:test:napi-hook-isolated".to_owned());
+        let bi = BridgeInstance::with_context_manager(cm);
 
         let ran = Arc::new(AtomicBool::new(false));
         let ran2 = Arc::clone(&ran);
