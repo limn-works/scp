@@ -127,7 +127,7 @@ async fn join_adds_member_to_mls_group_and_issues_ucan_tokens() {
 
     let kp = KeyPackage::mock("did:key:bob".into());
 
-    let result = manager.join_context(&handle, kp, None).await;
+    let result = manager.join_context(&handle, kp, None, None).await;
     assert!(result.is_ok());
 
     // Verify member was added.
@@ -159,7 +159,7 @@ async fn join_rejects_when_context_not_active() {
 
     let kp = KeyPackage::mock("did:key:bob".into());
 
-    let result = manager.join_context(&handle, kp, None).await;
+    let result = manager.join_context(&handle, kp, None, None).await;
     assert!(result.is_err());
     assert!(matches!(
         result.unwrap_err(),
@@ -200,7 +200,9 @@ async fn join_version_check_rejects_before_crypto_ops() {
         .unwrap();
 
     let kp = KeyPackage::mock("did:key:bob".into());
-    let result = manager.join_context(&ephemeral_handle, kp, None).await;
+    let result = manager
+        .join_context(&ephemeral_handle, kp, None, None)
+        .await;
 
     // Must fail with VersionIncompatible — the early check rejects
     // before any crypto operations (validate_key_package, add_member,
@@ -263,7 +265,7 @@ async fn leave_does_not_close_when_members_remain() {
 
     // Add a second member.
     let kp = KeyPackage::mock("did:key:bob".into());
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
     assert_eq!(manager.member_count("test-ctx").await, Some(2));
 
     // Remove bob (self-removal).
@@ -324,13 +326,13 @@ async fn setup_context_with_member_remove() -> (ContextManager, ContextHandle) {
     };
 
     let handle = manager
-        .create_context("auth-ctx".into(), params, "did:key:creator".into())
+        .create_context("auth-ctx".into(), params, "did:key:creator".into(), None)
         .await
         .unwrap();
 
     // Add an observer member.
     let kp = KeyPackage::mock("did:key:observer".into());
-    manager.join_context(&handle, kp, None).await.unwrap();
+    manager.join_context(&handle, kp, None, None).await.unwrap();
 
     // Reassign to observer role (joined members default to "member").
     {
@@ -452,7 +454,7 @@ async fn concurrent_joins_and_sends_do_not_corrupt_state() {
     };
 
     let handle = manager
-        .create_context("conc-ctx".into(), params, "did:key:creator".into())
+        .create_context("conc-ctx".into(), params, "did:key:creator".into(), None)
         .await
         .unwrap();
 
@@ -465,7 +467,7 @@ async fn concurrent_joins_and_sends_do_not_corrupt_state() {
         let h = std::sync::Arc::clone(&handle);
         join_handles.push(tokio::spawn(async move {
             let kp = KeyPackage::mock(format!("did:key:member-{i}").into());
-            mgr.join_context(&h, kp, None).await
+            mgr.join_context(&h, kp, None, None).await
         }));
     }
 
@@ -526,7 +528,7 @@ async fn panic_does_not_poison_mutex() {
     };
 
     let handle = manager
-        .create_context("panic-ctx".into(), params, "did:key:creator".into())
+        .create_context("panic-ctx".into(), params, "did:key:creator".into(), None)
         .await
         .unwrap();
 
@@ -552,7 +554,7 @@ async fn panic_does_not_poison_mutex() {
 
     // Further operations should succeed.
     let kp = KeyPackage::mock("did:key:after-panic".into());
-    let join_result = manager.join_context(&handle_clone, kp, None).await;
+    let join_result = manager.join_context(&handle_clone, kp, None, None).await;
     assert!(join_result.is_ok(), "join after panic should succeed");
     assert_eq!(manager.member_count("panic-ctx").await, Some(2));
 }
@@ -712,6 +714,7 @@ async fn persist_drop_restore_roundtrip() {
             "persist-ctx".into(),
             params.clone(),
             "did:key:creator".into(),
+            None,
         )
         .await
         .unwrap();
@@ -775,6 +778,8 @@ async fn persist_drop_restore_roundtrip() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("persist-ctx-2");
@@ -902,6 +907,8 @@ async fn restore_preserves_executed_proposals() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     persistence
@@ -1017,6 +1024,8 @@ async fn restore_respawns_ttl_timer() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -1111,6 +1120,8 @@ async fn restore_all_contexts_restores_persisted() {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             generation: 0,
+            local_pseudonym: None,
+            pseudonym_registry: std::collections::HashMap::new(),
         };
         persistence.persist_context(ctx_name, &snapshot).unwrap();
     }
@@ -1203,6 +1214,8 @@ async fn restore_context_rejects_duplicate() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("dup-ctx");
@@ -1317,6 +1330,8 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-incon-ctx");
@@ -1438,6 +1453,8 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     let bc_snapshot = test_broadcast_snapshot("grace-ok-ctx");
@@ -1574,6 +1591,8 @@ async fn restore_preserves_spending_nonce_tracker_across_restart() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     persistence
@@ -1711,6 +1730,8 @@ fn reconnect_test_snapshot(
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     }
 }
 
@@ -1973,7 +1994,7 @@ async fn create_context_rejects_incompatible_min_protocol_version() {
         ..ContextParams::default()
     };
     let result = manager
-        .create_context("ver-reject".into(), params, "did:key:creator".into())
+        .create_context("ver-reject".into(), params, "did:key:creator".into(), None)
         .await;
     assert!(
         result.is_err(),
@@ -1999,7 +2020,7 @@ async fn create_context_accepts_compatible_min_protocol_version() {
         ..ContextParams::default()
     };
     let result = manager
-        .create_context("ver-accept".into(), params, "did:key:creator".into())
+        .create_context("ver-accept".into(), params, "did:key:creator".into(), None)
         .await;
     assert!(
         result.is_ok(),
@@ -2020,7 +2041,7 @@ async fn create_context_accepts_none_min_protocol_version() {
         ..ContextParams::default()
     };
     let result = manager
-        .create_context("ver-none".into(), params, "did:key:creator".into())
+        .create_context("ver-none".into(), params, "did:key:creator".into(), None)
         .await;
     assert!(
         result.is_ok(),
@@ -2625,7 +2646,7 @@ async fn auto_accept_blocked_by_economics_rejects_join() {
         payee: DID::from("did:key:payee"),
     });
     let handle = manager
-        .create_context("paid-join-ctx".into(), params, "did:key:admin".into())
+        .create_context("paid-join-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -2633,7 +2654,7 @@ async fn auto_accept_blocked_by_economics_rejects_join() {
         owner_did: DID::from("did:key:joiner"),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp, None).await;
+    let result = manager.join_context(&handle, kp, None, None).await;
     assert!(
         result.is_err(),
         "join should be blocked for paid context without explicit acceptance"
@@ -2659,7 +2680,7 @@ async fn sybil_reject_insufficient_signals() {
 
     let params = ContextParams::default();
     let _handle = manager
-        .create_context("sybil-ctx".into(), params, "did:key:admin".into())
+        .create_context("sybil-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -2709,7 +2730,12 @@ async fn budget_exceeded_on_join_rejects() {
         payee: DID::from("did:key:payee"),
     });
     let handle = manager
-        .create_context("budget-join-ctx".into(), params, "did:key:admin".into())
+        .create_context(
+            "budget-join-ctx".into(),
+            params,
+            "did:key:admin".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -2717,7 +2743,7 @@ async fn budget_exceeded_on_join_rejects() {
         owner_did: DID::from("did:key:joiner"),
         mls_key_package_bytes: None,
     };
-    let result = manager.join_context(&handle, kp, None).await;
+    let result = manager.join_context(&handle, kp, None, None).await;
     assert!(
         result.is_err(),
         "join should fail: paid context auto_accept blocked"
@@ -2767,7 +2793,7 @@ async fn test_spawn_ttl_timer_decays_governance_on_expiry() {
 
     let admin: DID = "did:key:h8-admin".into();
     let handle = manager
-        .create_context("h8-ttl-decay-ctx".into(), params, admin.clone())
+        .create_context("h8-ttl-decay-ctx".into(), params, admin.clone(), None)
         .await
         .unwrap();
     let context_id = handle.context_id().to_owned();
@@ -2875,7 +2901,7 @@ async fn test_spawn_ttl_timer_cancels_governance_timeout_task() {
 
     let admin: DID = "did:key:h8-cancel-admin".into();
     let handle = manager
-        .create_context("h8-ttl-cancel-ctx".into(), params, admin)
+        .create_context("h8-ttl-cancel-ctx".into(), params, admin, None)
         .await
         .unwrap();
     let context_id = handle.context_id().to_owned();
@@ -2945,7 +2971,7 @@ async fn capture_join_payment_failure_appends_event_log_entry() {
         ..ContextParams::default()
     };
     manager
-        .create_context("h19-join-ctx".into(), params, "did:key:admin".into())
+        .create_context("h19-join-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
 
@@ -3113,6 +3139,8 @@ fn c3_test_snapshot(context_id: &str) -> super::ContextSnapshot {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     }
 }
 
@@ -3676,6 +3704,8 @@ fn make_epoch_test_export(context_id: &str) -> crate::context::export_import::Co
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     crate::context::export_import::ContextExport {
@@ -3730,6 +3760,7 @@ async fn import_context_rejects_epoch_floor_regression() {
             ctx_id.to_owned(),
             ContextParams::default(),
             DID::from("did:key:test-creator"),
+            None,
         )
         .await
         .expect("create_context should succeed");
@@ -3790,6 +3821,7 @@ async fn import_context_accepts_epoch_advance_within_ceiling() {
             ctx_id.to_owned(),
             ContextParams::default(),
             DID::from("did:key:test-creator"),
+            None,
         )
         .await
         .expect("create_context should succeed");
@@ -3842,6 +3874,7 @@ async fn import_context_rejects_epoch_advance_beyond_ceiling() {
             ctx_id.to_owned(),
             ContextParams::default(),
             DID::from("did:key:test-creator"),
+            None,
         )
         .await
         .expect("create_context should succeed");
@@ -3925,7 +3958,7 @@ async fn event_channel_receives_member_left_on_leave() {
         ..ContextParams::default()
     };
     let handle = manager
-        .create_context("evt-ctx".into(), params, "did:key:creator".into())
+        .create_context("evt-ctx".into(), params, "did:key:creator".into(), None)
         .await
         .unwrap();
 

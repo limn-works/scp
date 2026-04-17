@@ -109,6 +109,18 @@ pub fn context_routing_id(context_id: &str) -> [u8; 32] {
     bytes
 }
 
+/// Derives a 32-byte routing ID for broadcast contexts using plain SHA-256.
+///
+/// Broadcast contexts use `SHA-256(context_id)` without the
+/// `"scp:context-routing:"` domain separator, per spec §5.14. This matches
+/// [`context_id_bytes`] by design — broadcast routing IDs are the raw hash
+/// of the context ID string, distinct from the domain-separated
+/// [`context_routing_id`] used by encrypted contexts.
+#[must_use]
+pub fn broadcast_routing_id(context_id: &str) -> [u8; 32] {
+    context_id_bytes(context_id)
+}
+
 // ---------------------------------------------------------------------------
 // ContextState
 // ---------------------------------------------------------------------------
@@ -463,5 +475,36 @@ mod tests {
 
         let actual = context_routing_id("test-ctx");
         assert_eq!(&actual[..], &expected[..]);
+    }
+
+    #[test]
+    fn broadcast_routing_id_equals_context_id_bytes() {
+        // Broadcast contexts use plain SHA-256(context_id) per spec §5.14,
+        // which is the same as context_id_bytes.
+        let broadcast = broadcast_routing_id("test-ctx");
+        let raw = context_id_bytes("test-ctx");
+        assert_eq!(
+            broadcast, raw,
+            "broadcast_routing_id must equal context_id_bytes"
+        );
+    }
+
+    #[test]
+    fn broadcast_routing_id_differs_from_context_routing_id() {
+        // Broadcast routing ID (no domain separator) must differ from
+        // encrypted context routing ID (domain-separated).
+        let broadcast = broadcast_routing_id("test-ctx");
+        let encrypted = context_routing_id("test-ctx");
+        assert_ne!(
+            broadcast, encrypted,
+            "broadcast and encrypted routing IDs must differ"
+        );
+    }
+
+    #[test]
+    fn broadcast_routing_id_is_deterministic() {
+        let id1 = broadcast_routing_id("test-ctx");
+        let id2 = broadcast_routing_id("test-ctx");
+        assert_eq!(id1, id2);
     }
 }

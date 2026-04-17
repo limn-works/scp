@@ -8,6 +8,10 @@ cognitive-complexity-threshold = 25
 # Increased from 800000 to 900000 after broadcast content tests (SCP-287)
 # added ~68 new test functions to scp-core.
 stack-size-threshold = 900000
+# Default large_futures threshold is 16384. Adding `local_pseudonym: Option<[u8; 32]>`
+# to create_context/join_context pushed test futures to 16416 bytes. Raise the
+# threshold slightly to accommodate. Production code is unaffected.
+future-size-threshold = 16512
 
 # ----- Disallowed methods -----
 # now_secs/now_millis are private to scp-primitives — the compiler enforces

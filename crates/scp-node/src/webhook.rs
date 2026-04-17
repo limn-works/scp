@@ -586,7 +586,8 @@ pub fn map_context_event(
         | ContextEvent::CommitBroadcastPending { .. }
         | ContextEvent::CommitBroadcastSucceeded { .. }
         | ContextEvent::EquivocationDetected { .. }
-        | ContextEvent::CommitBroadcastFailed { .. } => (
+        | ContextEvent::CommitBroadcastFailed { .. }
+        | ContextEvent::PseudonymAnnounced { .. } => (
             "context.event",
             serde_json::json!({ "variant": event.variant_name() }),
         ),

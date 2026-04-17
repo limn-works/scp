@@ -155,7 +155,7 @@ impl ContextManager {
         // ContextManager::create_context flow (membership, roles, governance).
         let params = template_params(&TemplateId::BilateralPersistent);
         match self
-            .create_context(context_id.clone(), params, local_did.clone())
+            .create_context(context_id.clone(), params, local_did.clone(), None)
             .await
         {
             Ok(_) => {}

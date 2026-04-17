@@ -1985,7 +1985,7 @@ mod tests {
 
         // Create the context. This registers it in the manager.
         let handle = manager
-            .create_context(context_id.to_owned(), params, creator_did.clone())
+            .create_context(context_id.to_owned(), params, creator_did.clone(), None)
             .await
             .expect("failed to create test context");
 
@@ -1993,7 +1993,7 @@ mod tests {
         for member_did in additional_members {
             let kp = KeyPackage::mock((*member_did).clone());
             manager
-                .join_context(&handle, kp, None)
+                .join_context(&handle, kp, None, None)
                 .await
                 .expect("failed to join test member");
         }

@@ -913,6 +913,31 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
         .map_err(|e| PyRuntimeError::new_err(format!("failed to register context state: {e}")))?;
 
     // Delegate context creation to the shared ContextManager for lifecycle tracking.
+    // §9.10.4: Derive pseudonym BEFORE context creation so it can be passed
+    // to the ContextManager for per-member routing. The pseudonym derivation
+    // is also reused for the known-contexts registry below.
+    let local_pseudonym: Option<[u8; 32]> = crate::runtime::with_identity(identity_did, |entry| {
+        let rt = crate::runtime().map_err(|e| {
+            crate::error::ScpPyError::identity(format!("runtime not available: {e}"))
+        })?;
+        let pseudonym = rt.block_on(async {
+            entry
+                .custody
+                .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
+                .await
+        });
+        let pk = pseudonym
+            .map_err(|e| {
+                crate::error::ScpPyError::identity(format!("pseudonym derivation failed: {e}"))
+            })?
+            .public_key;
+        let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
+            crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
+        })?;
+        Ok(bytes)
+    })
+    .ok();
+
     // Build scp-core ContextParams from the parsed PyContextParams.
     {
         let core_params = build_core_context_params(&parsed)?;
@@ -924,7 +949,7 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
         let ctx_id = context_id.clone();
         let creator_did_for_register = scp_identity::DID(identity_did.to_owned());
         rt.block_on(async move {
-            mgr.create_context(ctx_id, core_params, creator_did_owned)
+            mgr.create_context(ctx_id, core_params, creator_did_owned, local_pseudonym)
                 .await
                 .map_err(|e| scp_core::context::ContextError::CreationFailed(e.to_string()))?;
             // Register the creator's DID as a local DID for defense-in-depth,
@@ -939,33 +964,43 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
         })?;
     }
 
-    // Register in the known-contexts registry for discovery via
-    // py_mcp_load_contexts. Derive a per-identity routing ID using
-    // KeyCustody::derive_pseudonym with real key material (§9.10.4).
-    // The pseudonym is deterministic for the same identity + context pair,
-    // providing unlinkability across contexts. See SCP-214 criterion 4.
+    // §9.10.4: Send pseudonym announcement to inform other members of the
+    // creator's per-context routing ID. For freshly created single-member
+    // contexts this is a no-op (no recipients), but on restored/imported
+    // contexts with existing members the announcement is needed.
+    if local_pseudonym.is_some()
+        && let Ok(sk) = resolve_signing_key(identity_did)
     {
-        let routing_id = crate::runtime::with_identity(identity_did, |entry| {
-            let rt = crate::runtime().map_err(|e| {
-                crate::error::ScpPyError::identity(format!("runtime not available: {e}"))
-            })?;
-            let pseudonym = rt.block_on(async {
-                entry
-                    .custody
-                    .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
-                    .await
-            });
-            let pk = pseudonym
-                .map_err(|e| {
-                    crate::error::ScpPyError::identity(format!("pseudonym derivation failed: {e}"))
-                })?
-                .public_key;
-            let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
-                crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
-            })?;
-            Ok(bytes)
-        })
-        .map_err(|e| PyRuntimeError::new_err(format!("routing ID derivation failed: {e}")))?;
+        let rt = crate::runtime()?;
+        let mgr = crate::runtime::context_manager()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let mgr = mgr.clone();
+        let sender_did = scp_identity::DID(identity_did.to_owned());
+        let core_params = build_core_context_params(&handle.params)?;
+        let temp_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
+        rt.block_on(async move {
+            let _ = temp_handle
+                .transition_to(&scp_core::context::ContextState::Active)
+                .await;
+            mgr.send_pseudonym_announcement(&temp_handle, &sender_did, &sk)
+                .await;
+        });
+    }
+
+    // Register in the known-contexts registry for discovery via
+    // py_mcp_load_contexts. Reuse the pre-derived pseudonym routing ID
+    // (§9.10.4, SCP-214 criterion 4). Falls back to context_routing_id
+    // for encrypted contexts or broadcast_routing_id for broadcast contexts.
+    // Bug fix (#1534): broadcast contexts use broadcast_routing_id (plain
+    // SHA-256) matching the send path, not context_routing_id (domain-separated).
+    {
+        let routing_id = local_pseudonym.unwrap_or_else(|| {
+            if handle.params.mode == "broadcast" {
+                scp_core::context::broadcast_routing_id(&context_id)
+            } else {
+                scp_core::context::context_routing_id(&context_id)
+            }
+        });
 
         // Get the relay URL from transport status if a relay is connected.
         let relay_url = match crate::transport::py_transport_status() {
@@ -1068,6 +1103,33 @@ fn py_context_join(
             mls_key_package_bytes: Some(kp_bytes),
         };
 
+        // §9.10.4: Derive pseudonym for the joining member so it can be
+        // stored in PerContextState and announced to other members.
+        let local_pseudonym: Option<[u8; 32]> =
+            crate::runtime::with_identity(identity_did, |entry| {
+                let rt = crate::runtime().map_err(|e| {
+                    crate::error::ScpPyError::identity(format!("runtime init failed: {e}"))
+                })?;
+                let pseudonym = rt.block_on(async {
+                    entry
+                        .custody
+                        .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
+                        .await
+                });
+                let pk = pseudonym
+                    .map_err(|e| {
+                        crate::error::ScpPyError::identity(format!(
+                            "pseudonym derivation failed: {e}"
+                        ))
+                    })?
+                    .public_key;
+                let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
+                    crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
+                })?;
+                Ok(bytes)
+            })
+            .ok();
+
         // Look up the ContextHandle from a completed create_context call.
         // The ContextManager stores PerContextState keyed by context_id.
         // We need the handle to delegate. Since the handle is stored in
@@ -1076,14 +1138,39 @@ fn py_context_join(
         let core_params = build_core_context_params(&handle.params)?;
         let temp_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
         // Transition the temp handle to Active to match the real state.
+        // §9.10.4: pass the pseudonym to join_context so it is stored in
+        // PerContextState for subsequent send_message fan-out.
         rt.block_on(async {
             let _ = temp_handle
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
-            mgr.join_context(&temp_handle, key_package, spending_ucan.as_ref())
-                .await
+            mgr.join_context(
+                &temp_handle,
+                key_package,
+                spending_ucan.as_ref(),
+                local_pseudonym,
+            )
+            .await
         })
         .map_err(|e| PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}")))?;
+
+        // §9.10.4: Send pseudonym announcement to inform existing members.
+        if local_pseudonym.is_some()
+            && let Ok(sk) = resolve_signing_key(identity_did)
+        {
+            let sender_did = scp_identity::DID(member_did.clone());
+            let temp_handle2 = scp_core::context::ContextHandle::new(
+                context_id.clone(),
+                build_core_context_params(&handle.params)?,
+            );
+            rt.block_on(async move {
+                let _ = temp_handle2
+                    .transition_to(&scp_core::context::ContextState::Active)
+                    .await;
+                mgr.send_pseudonym_announcement(&temp_handle2, &sender_did, &sk)
+                    .await;
+            });
+        }
 
         // Also update FFI bridge state's role_state for UCAN/tool capability checks.
         crate::runtime::with_ffi_state(&context_id, |st| {
@@ -4611,6 +4698,7 @@ mod tests {
             ctx_id.clone(),
             params,
             scp_identity::DID(creator.to_owned()),
+            None,
         ))
         .unwrap();
         let new_did = "did:key:z6MkNewMember1";
@@ -4670,6 +4758,7 @@ mod tests {
             ctx_id.clone(),
             params,
             scp_identity::DID(creator.to_owned()),
+            None,
         ))
         .unwrap();
         let new_did = "did:key:z6MkAdded1";
@@ -4722,6 +4811,7 @@ mod tests {
             ctx_id.clone(),
             params,
             scp_identity::DID(creator.to_owned()),
+            None,
         ))
         .unwrap();
         let add = approved_proposal(

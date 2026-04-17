@@ -433,7 +433,7 @@ async fn e2e_message_round_trip_encrypted() {
 
     // Step 1: Alice creates a context with governance policy (SingleAdmin).
     let handle = manager
-        .create_context(ctx_id.to_owned(), encrypted_params(), alice_did.clone())
+        .create_context(ctx_id.to_owned(), encrypted_params(), alice_did.clone(), None)
         .await
         .unwrap();
     assert_eq!(handle.state().await, ContextState::Active);
@@ -495,7 +495,7 @@ async fn e2e_governance_role_change_and_unauthorized_rejection() {
 
     // Step 1: Admin creates context.
     let handle = manager
-        .create_context(ctx_id.to_owned(), encrypted_params(), admin_did.clone())
+        .create_context(ctx_id.to_owned(), encrypted_params(), admin_did.clone(), None)
         .await
         .unwrap();
 
@@ -597,7 +597,7 @@ async fn e2e_broadcast_publish_subscribe() {
 
     // Step 1: Publisher creates broadcast context.
     let _handle = manager
-        .create_context(ctx_id.to_owned(), broadcast_params(), publisher_did.clone())
+        .create_context(ctx_id.to_owned(), broadcast_params(), publisher_did.clone(), None)
         .await
         .unwrap();
 
@@ -717,7 +717,7 @@ async fn e2e_persistence_drop_and_restore() {
         );
 
         let handle = manager
-            .create_context(ctx_id.to_owned(), encrypted_params(), admin_did.clone())
+            .create_context(ctx_id.to_owned(), encrypted_params(), admin_did.clone(), None)
             .await
             .unwrap();
         assert_eq!(handle.state().await, ContextState::Active);
@@ -894,7 +894,7 @@ async fn e2e_broadcast_persistence_drop_and_restore() {
         manager.register_local_did(publisher_did.clone()).await;
 
         let _handle = manager
-            .create_context(ctx_id.to_owned(), broadcast_params(), publisher_did.clone())
+            .create_context(ctx_id.to_owned(), broadcast_params(), publisher_did.clone(), None)
             .await
             .unwrap();
 
@@ -966,7 +966,7 @@ async fn e2e_governance_replay_protection() {
     let ctx_id = "e2e-gov-replay";
 
     let handle = manager
-        .create_context(ctx_id.to_owned(), encrypted_params(), admin_did.clone())
+        .create_context(ctx_id.to_owned(), encrypted_params(), admin_did.clone(), None)
         .await
         .unwrap();
 
@@ -1036,7 +1036,7 @@ async fn e2e_full_lifecycle_create_join_send_leave_close() {
 
     // Create context.
     let handle = manager
-        .create_context(ctx_id.to_owned(), encrypted_params(), admin_did.clone())
+        .create_context(ctx_id.to_owned(), encrypted_params(), admin_did.clone(), None)
         .await
         .unwrap();
     assert_eq!(handle.state().await, ContextState::Active);
@@ -1117,7 +1117,7 @@ async fn e2e_multi_bridge_api_surface_verification() {
 
     let enc_ctx_id = "bridge-enc";
     let enc_handle = manager
-        .create_context(enc_ctx_id.to_owned(), encrypted_params(), alice.clone())
+        .create_context(enc_ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
         .await
         .unwrap();
 
@@ -1193,7 +1193,7 @@ async fn e2e_multi_bridge_api_surface_verification() {
     manager.register_local_did(alice.clone()).await;
 
     let _bc_handle = manager
-        .create_context(bc_ctx_id.to_owned(), broadcast_params(), alice.clone())
+        .create_context(bc_ctx_id.to_owned(), broadcast_params(), alice.clone(), None)
         .await
         .unwrap();
 

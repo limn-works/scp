@@ -114,7 +114,7 @@ async fn setup_retry_manager() -> (
 
     let admin_did: DID = "did:key:admin".into();
     let _handle = manager
-        .create_context("retry-ctx".into(), params, admin_did.clone())
+        .create_context("retry-ctx".into(), params, admin_did.clone(), None)
         .await
         .unwrap();
 
@@ -319,6 +319,7 @@ async fn test_execute_remove_member_commit_max_retries_marks_failed() {
 /// PR #1606 C6 test 3: `ContextSnapshot` round-trips `pending_commits`
 /// and `commit_fault` so retries survive process restart.
 #[test]
+#[allow(clippy::too_many_lines)] // Test verifies roundtrip of all snapshot fields.
 fn test_pending_commits_persist_across_snapshot_roundtrip() {
     let routing_id = scp_protocol::context::context_routing_id("snapshot-ctx");
     let pending = PendingCommit {
@@ -395,6 +396,8 @@ fn test_pending_commits_persist_across_snapshot_roundtrip() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: std::collections::HashMap::new(),
     };
 
     // Round-trip via JSON to ensure serde derive works for both new types.
