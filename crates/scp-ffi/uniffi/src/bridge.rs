@@ -3057,6 +3057,54 @@ pub async fn context_create(
             // nonce tracker, event log) for the UCAN pipeline.
             crate::runtime::ensure_ucan_registered(&context_id, &identity.did, &params.ceiling);
 
+            // §9.10.4: Send pseudonym announcement to inform other members of
+            // the creator's per-context routing ID. For freshly created
+            // single-member contexts this is a no-op (no recipients), but on
+            // restored/imported contexts with existing members the announcement
+            // is needed. Best-effort: if signing key is not available, skip.
+            if local_pseudonym.is_some() {
+                let sender_did = scp_identity::DID(identity.did.clone());
+                let core_handle = scp_core::context::ContextHandle::new(
+                    context_id.clone(),
+                    retained_core_params.clone(),
+                );
+                let _ = core_handle
+                    .transition_to(&scp_core::context::ContextState::Active)
+                    .await;
+                let sk_opt: Option<ed25519_dalek::SigningKey> =
+                    if let Some(ref ik) = identity.core_id {
+                        if let Some(ref cb) = identity.callback_custody {
+                            cb.export_ed25519_signing_key(&ik.active_signing_key)
+                                .await
+                                .ok()
+                        } else {
+                            #[cfg(feature = "allow_in_memory_custody")]
+                            {
+                                if let Some(ref custody) = identity.in_memory_custody {
+                                    custody
+                                        .0
+                                        .export_ed25519_signing_key(&ik.active_signing_key)
+                                        .await
+                                        .ok()
+                                } else {
+                                    None
+                                }
+                            }
+                            #[cfg(not(feature = "allow_in_memory_custody"))]
+                            {
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                if let Some(sk) = sk_opt {
+                    manager
+                        .send_pseudonym_announcement(&core_handle, &sender_did, &sk)
+                        .await;
+                }
+            }
+
             let handle = Arc::new(ContextHandle {
                 context_id,
                 state: tokio::sync::Mutex::new(ContextState::Active),

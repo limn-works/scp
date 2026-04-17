@@ -1140,6 +1140,7 @@ pub(super) struct PseudonymAnnouncement {
     /// The announcing member's DID.
     pub member_did: String,
     /// The 32-byte pseudonym routing ID.
+    #[serde(with = "serde_bytes")]
     pub pseudonym: [u8; 32],
 }
 

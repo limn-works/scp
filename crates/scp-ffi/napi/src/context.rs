@@ -537,6 +537,30 @@ pub async fn context_create(
     // Register the creator's DID as a local DID for defense-in-depth.
     manager.register_local_did(DID(creator_did.clone())).await;
 
+    // §9.10.4: Send pseudonym announcement to inform other members of the
+    // creator's per-context routing ID. For freshly created single-member
+    // contexts this is a no-op (no recipients), but on restored/imported
+    // contexts with existing members the announcement is needed.
+    // Best-effort: if signing key is not available, skip silently.
+    if local_pseudonym.is_some() {
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            let custody_and_key = crate::runtime::with_identity(&creator_did, |e| {
+                Ok((e.custody.clone(), e.identity.active_signing_key))
+            })
+            .ok();
+            if let Some((custody, key_handle)) = custody_and_key
+                && let Ok(sk) = custody.0.export_ed25519_signing_key(&key_handle).await
+            {
+                let sender_did = DID(creator_did.clone());
+                if let Ok(mgr) = context_manager() {
+                    mgr.send_pseudonym_announcement(&core_handle, &sender_did, &sk)
+                        .await;
+                }
+            }
+        }
+    }
+
     let handle = NapiContextHandle {
         context_id,
         state: std::sync::Mutex::new(ContextState::Active),
