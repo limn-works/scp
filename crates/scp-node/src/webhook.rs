@@ -497,14 +497,10 @@ pub fn map_context_event(
 ) -> (&'static str, serde_json::Value) {
     use scp_core::context::membership::ContextEvent;
     match event {
-        ContextEvent::MessageReceived {
-            sender_did,
-            payload,
-        } => (
+        ContextEvent::MessageReceived { sender_did, .. } => (
             "message.received",
             serde_json::json!({
                 "sender_did": sender_did.as_ref(),
-                "payload_size": payload.len(),
             }),
         ),
         ContextEvent::MessageSent {
@@ -1133,7 +1129,9 @@ mod tests {
         let (event_type, payload) = super::map_context_event(&event);
         assert_eq!(event_type, "message.received");
         assert_eq!(payload["sender_did"], "did:key:alice");
-        assert_eq!(payload["payload_size"], 3);
+        // payload_size intentionally omitted — the event channel delivers
+        // stripped events (payload = vec![]), so the size would always be 0.
+        assert!(payload.get("payload_size").is_none());
     }
 
     #[test]

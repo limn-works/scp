@@ -1227,6 +1227,10 @@ impl PerContextState {
 /// defeat MLS encryption-as-access-control. This function replaces payload
 /// bytes with an empty `Vec` for `MessageReceived` and `MessageSent`, and
 /// passes all other variants through unchanged.
+///
+/// The match is exhaustive (no wildcard catch-all) so that adding a new
+/// `ContextEvent` variant with sensitive data causes a compile error,
+/// forcing the developer to decide whether the variant needs stripping.
 fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
     match event {
         ContextEvent::MessageReceived { sender_did, .. } => ContextEvent::MessageReceived {
@@ -1242,7 +1246,48 @@ fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
             sequence_number: *sequence_number,
             payload: vec![],
         },
-        other => other.clone(),
+        // All remaining variants carry no message plaintext or key material.
+        // Listed exhaustively so new variants cause a compile error.
+        ContextEvent::MemberJoined { .. }
+        | ContextEvent::MemberLeft { .. }
+        | ContextEvent::SystemClose { .. }
+        | ContextEvent::MemberBlocked { .. }
+        | ContextEvent::MemberUnblocked { .. }
+        | ContextEvent::AuthorBlocked { .. }
+        | ContextEvent::ReadAccessRevoked { .. }
+        | ContextEvent::ReadAccessRestored { .. }
+        | ContextEvent::WriteAccessRevoked { .. }
+        | ContextEvent::CapabilitiesSuspended { .. }
+        | ContextEvent::WriteAccessRestored { .. }
+        | ContextEvent::AccessKeyRevoked { .. }
+        | ContextEvent::AccessKeyRestored { .. }
+        | ContextEvent::ContentKeysRotated { .. }
+        | ContextEvent::GovernanceActionExecuted { .. }
+        | ContextEvent::CeilingChangeNotification { .. }
+        | ContextEvent::EconomicPolicyChangeNotification { .. }
+        | ContextEvent::Expired
+        | ContextEvent::ExpiryFailed { .. }
+        | ContextEvent::VoteWithdrawn { .. }
+        | ContextEvent::ProposalTimedOut { .. }
+        | ContextEvent::DeadlockDetected { .. }
+        | ContextEvent::AppBound { .. }
+        | ContextEvent::AppUnbound { .. }
+        | ContextEvent::DegradedMode { .. }
+        | ContextEvent::WelcomeGenerated { .. }
+        | ContextEvent::BufferOverflow { .. }
+        | ContextEvent::SequenceGapDetected { .. }
+        | ContextEvent::CheckpointCosignatureRequired { .. }
+        | ContextEvent::ContextMigrationProposed { .. }
+        | ContextEvent::ContextMigrationStarted { .. }
+        | ContextEvent::ContextMigrationCancelled { .. }
+        | ContextEvent::ContextTombstoned { .. }
+        | ContextEvent::ConsequenceTriggered { .. }
+        | ContextEvent::ConsequenceEnforced { .. }
+        | ContextEvent::PaymentCaptureFailed { .. }
+        | ContextEvent::CommitBroadcastPending { .. }
+        | ContextEvent::CommitBroadcastSucceeded { .. }
+        | ContextEvent::EquivocationDetected { .. }
+        | ContextEvent::CommitBroadcastFailed { .. } => event.clone(),
     }
 }
 
