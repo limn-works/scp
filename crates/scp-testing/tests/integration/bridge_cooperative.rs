@@ -448,7 +448,7 @@ async fn data_provenance_construction() {
         counterparties: vec!["did:dht:z6MkAlice".into(), "did:dht:z6MkBob".into()],
         purpose: Some("test data flow".to_string()),
         discovery_method: DiscoveryMethod::SharedContext("ctx-discovery".to_string()),
-        age: Duration::from_secs(60),
+        age: Duration::from_mins(1),
         memory_scope: MemoryScope::Full,
         chain_depth: 1,
         chain_path: Some(vec!["ctx-hop-1".to_string()]),

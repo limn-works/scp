@@ -55,7 +55,7 @@
 //! roundtripping.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use scp_core::context::ContextError;
@@ -70,6 +70,7 @@ use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
+use scp_ffi_common::bridge_instance::BridgeInstance;
 use scp_identity::cache::SystemClock;
 use scp_identity::{DidDocument, ScpIdentity};
 use scp_platform::encrypting_adapter::EncryptingAdapter;
@@ -77,6 +78,10 @@ use scp_platform::testing::InMemoryStorage;
 use scp_primitives::Clock;
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
+
+// Re-export `KnownContext` from scp-ffi-common so that existing callers
+// (`context.rs`, `mcp.rs`) can continue using `crate::runtime::KnownContext`.
+pub use scp_ffi_common::bridge_instance::KnownContext;
 
 use crate::context::PyMessage;
 use crate::error::ScpPyError;
@@ -95,32 +100,163 @@ pub type ToolHandler =
 // ContextManager (shared, process-global)
 // ---------------------------------------------------------------------------
 
-/// Global shared [`ContextManager`] that owns all context lifecycle state.
-///
-/// Initialized once via [`init_context_manager`]. All context lifecycle
-/// operations (create, join, leave, close, send, governance, broadcast, TTL)
-/// delegate to this instance.
-///
-/// # Safety: Single-Tenant Only
-///
-/// See module-level documentation.
-static CONTEXT_MANAGER: OnceLock<Arc<ContextManager>> = OnceLock::new();
-
 /// Returns a reference to the shared [`ContextManager`].
+///
+/// Delegates to [`BridgeInstance::context_manager`].
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::ContextError` if the context manager has not been
-/// initialized via [`init_context_manager`].
+/// Returns `ScpPyError::ContextError` if the bridge has not been
+/// initialized via [`init_context_manager`], if the `ContextManager` has
+/// not been attached to the `BridgeInstance` yet (i.e.,
+/// `ensure_bridge_instance` ran but `init_context_manager` has not), or if
+/// the bridge is currently suspended.
 pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
-    CONTEXT_MANAGER.get().ok_or_else(|| {
+    let bi = BRIDGE_INSTANCE.get().ok_or_else(|| {
         ScpPyError::context(
             "ContextManager not initialized — call py_context_create, \
              py_context_join, py_context_import, or init_context_manager first"
                 .to_owned(),
         )
+    })?;
+    // Suspended: return error (recoverable — caller should call resume()).
+    // AlreadyShutDown: warn only. Shutdown already destroyed MLS groups,
+    // cleared registries, and disconnected transport — operations will fail
+    // naturally. Returning an error breaks test suites that call shutdown
+    // before exit, since OnceLock cannot be re-initialized.
+    if bi.is_suspended() {
+        return Err(ScpPyError::context(
+            "bridge is suspended — call resume() before performing operations".to_owned(),
+        ));
+    }
+    if bi.is_shutdown() {
+        tracing::warn!("context_manager() called after shutdown — operations may fail");
+    }
+    bi.try_context_manager().ok_or_else(|| {
+        ScpPyError::context(
+            "ContextManager not yet attached — call py_context_create, \
+             py_context_join, py_context_import, or init_context_manager first"
+                .to_owned(),
+        )
     })
 }
+
+// ---------------------------------------------------------------------------
+// BridgeInstance (consolidated singleton — #1549)
+// ---------------------------------------------------------------------------
+
+/// Global [`BridgeInstance`] that consolidates process-global state.
+///
+/// Holds the `ContextManager` plus the local DID, shutdown flag, and all
+/// shared state registries. Populated during
+/// [`init_context_manager`]. Existing callers continue using `context_manager()`
+/// and other per-registry accessors; the `BridgeInstance` provides an
+/// alternative path that will eventually replace all singletons (#1549).
+///
+/// # Safety: Single-Tenant Only
+///
+/// See module-level documentation.
+pub(crate) static BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>> = OnceLock::new();
+
+/// Initializes the global [`BridgeInstance`] without a `ContextManager`.
+///
+/// Called by [`ensure_bridge_instance`] and (transitively) by
+/// [`init_context_manager`]. The `ContextManager` is attached later via
+/// [`BridgeInstance::set_context_manager`] once `identity_create` has
+/// produced the local DID and the `MlsCryptoProvider` has been constructed
+/// with it.
+///
+/// `BridgeInstance` itself carries no DID (spec §12.2.3) — the authoritative
+/// local DID lives inside the `ContextManager`'s `MlsCryptoProvider`. The
+/// `BridgeInstance` is created before any identity exists so that the DID
+/// resolver slot (owned by `BridgeInstance`) is available while
+/// `DidDht::create()` runs.
+///
+/// Registers bridge-specific state in `BridgeInstance`:
+/// - `identity_registry` — `Arc<DashMap<String, IdentityEntry>>` (type-erased)
+/// - `storage_provider` — `Arc<EncryptingAdapter<InMemoryStorage>>` (type-erased, lazily)
+///
+/// `FFI_BRIDGE_STATE` (`PyO3`-specific per-context state) remains a separate
+/// `OnceLock` because it uses `PyO3` types that cannot be owned by `scp-ffi-common`.
+/// It is cleared via a shutdown hook registered here.
+///
+/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
+fn init_bridge_instance_empty() {
+    // Guard against duplicate hook registration — OnceLock guarantees
+    // single BridgeInstance creation, but hooks must only be registered once.
+    if BRIDGE_INSTANCE.get().is_some() {
+        return;
+    }
+
+    let instance = Arc::new(BridgeInstance::new());
+    let bi = BRIDGE_INSTANCE.get_or_init(|| instance);
+
+    // Register the identity registry in BridgeInstance. This transfers
+    // ownership of the map into BridgeInstance so that shutdown() can clear
+    // it (and release `Arc<FfiKeyCustody>` entries, triggering zeroization).
+    let identity_map = Arc::new(DashMap::<String, IdentityEntry>::new());
+    let clear_map = Arc::clone(&identity_map);
+    bi.set_identity_registry(
+        identity_map,
+        Box::new(move || {
+            clear_map.clear();
+        }),
+    );
+
+    // Register PyO3-specific shutdown hook for state that cannot be owned
+    // by BridgeInstance (FFI_BRIDGE_STATE, transport URL, MCP registries).
+    // The identity registry is cleared by BridgeInstance::shutdown() via its
+    // registered clear function — no need to reference it here.
+    bi.register_shutdown_hook(Box::new(|| {
+        if let Some(reg) = FFI_BRIDGE_STATE.get() {
+            reg.clear();
+        }
+        // Clear the connected relay URL tracking
+        if let Ok(mut url) = crate::transport::connected_url_state().write() {
+            *url = None;
+        }
+        // MCP server/client registries
+        crate::mcp::clear_registries();
+    }));
+}
+
+/// Returns the raw `BridgeInstance` reference without lifecycle checks.
+///
+/// Used by lifecycle / shutdown code that must touch the container even
+/// when the `ContextManager` has not been attached yet (which would
+/// otherwise cause the lifecycle-checked `bridge_instance()` to be used with
+/// a partially-initialized instance). Returns `None` if the instance was
+/// never initialized.
+#[must_use]
+pub fn bridge_instance_raw() -> Option<&'static Arc<BridgeInstance>> {
+    BRIDGE_INSTANCE.get()
+}
+
+/// Returns a reference to the global [`BridgeInstance`].
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the bridge has not been initialized
+/// via [`init_context_manager`] (which also creates the `BridgeInstance`),
+/// or if the bridge has been permanently shut down.
+pub fn bridge_instance() -> Result<&'static Arc<BridgeInstance>, ScpPyError> {
+    let bi = BRIDGE_INSTANCE.get().ok_or_else(|| {
+        ScpPyError::context("bridge not initialized — call identity_create first".to_owned())
+    })?;
+    if bi.is_suspended() {
+        return Err(ScpPyError::context(
+            "bridge is suspended — call resume() before performing operations".to_owned(),
+        ));
+    }
+    if bi.is_shutdown() {
+        tracing::warn!("bridge_instance() called after shutdown — operations may fail");
+    }
+    Ok(bi)
+}
+
+// ---------------------------------------------------------------------------
+// ContextManager initialization
+// ---------------------------------------------------------------------------
 
 /// Initializes the global [`ContextManager`] with production providers.
 ///
@@ -137,33 +273,63 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
 /// returning `None`, ensuring governance vote signature verification failures
 /// are visible rather than silently skipped.
 ///
-/// When the global storage provider (`STORAGE_PROVIDER`) has been
-/// initialized via [`init_storage`], a [`ProtocolRepositoryContextBridge`] is
-/// constructed from it and injected into the `ContextManager`. This enables
-/// context state persistence across process restarts without requiring
-/// callers to manually wire persistence. See issue #329.
+/// When the `BridgeInstance` storage provider has been initialized via
+/// [`init_storage`], a [`ProtocolRepositoryContextBridge`] is constructed
+/// from it and injected into the `ContextManager`. This enables context state
+/// persistence across process restarts without requiring callers to manually
+/// wire persistence. See issue #329.
+///
+/// The `local_did` is consumed only by `MlsCryptoProvider::new` — the
+/// `BridgeInstance` itself carries no DID (spec §12.2.3).
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 /// If the manager is already initialized with a different DID, a warning is logged.
 pub fn init_context_manager(local_did: &str) {
-    if CONTEXT_MANAGER.get().is_some() {
-        tracing::warn!(
+    // Always ensure the BridgeInstance exists first so that identity-time
+    // state (DID resolver, identity registry) is wired up before we attempt
+    // to attach a ContextManager.
+    ensure_bridge_instance();
+
+    let Some(bi) = BRIDGE_INSTANCE.get() else {
+        tracing::error!(
+            "init_context_manager: BridgeInstance unexpectedly None after ensure_bridge_instance"
+        );
+        return;
+    };
+
+    if bi.has_context_manager() {
+        tracing::debug!(
             requested_did = %local_did,
-            "init_context_manager already initialized — MLS crypto uses the original DID"
+            "init_context_manager: ContextManager already attached — using existing instance"
         );
         return;
     }
+
     let did = local_did.to_owned();
-    let _ = CONTEXT_MANAGER.get_or_init(|| {
-        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
-        let persistence = build_persistence_provider();
-        build_context_manager(
-            crypto,
-            Box::new(NotConfiguredTransportProvider),
-            Box::new(NoOpEventLogProvider),
-            persistence,
-        )
-    });
+    let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let persistence = build_persistence_provider();
+    let cm_arc = build_context_manager(
+        crypto,
+        Box::new(NotConfiguredTransportProvider),
+        Box::new(NoOpEventLogProvider),
+        persistence,
+    );
+
+    bi.set_context_manager(cm_arc);
+}
+
+/// Ensures the global [`BridgeInstance`] exists (without a `ContextManager`).
+///
+/// Called by [`crate::identity::ensure_did_resolver_initialized`] before
+/// `DidDht::create()` runs, so that the DID resolver slot owned by
+/// `BridgeInstance` is available. The `ContextManager` is attached later
+/// via [`init_context_manager`] once the identity is known and the
+/// `MlsCryptoProvider` has been constructed with it. Per spec §12.2.3
+/// the `BridgeInstance` container has no DID requirement.
+///
+/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
+pub fn ensure_bridge_instance() {
+    init_bridge_instance_empty();
 }
 
 /// Initializes the global [`ContextManager`] with custom providers.
@@ -175,15 +341,26 @@ pub fn init_context_manager(local_did: &str) {
 /// initialized, a [`ProtocolRepositoryContextBridge`] is automatically constructed
 /// from it. Pass `Some(...)` to override with a custom implementation.
 pub fn init_context_manager_with(
+    _local_did: &str,
     crypto: Box<dyn ContextCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
 ) {
-    let _ = CONTEXT_MANAGER.get_or_init(|| {
-        let persistence = persistence.or_else(build_persistence_provider);
-        build_context_manager(crypto, transport, event_log, persistence)
-    });
+    // `_local_did` is retained in the signature for API stability: callers
+    // construct `crypto` with the DID before calling into this function
+    // (it is the `MlsCryptoProvider` that carries the DID; see spec §12.2.3).
+    ensure_bridge_instance();
+    let Some(bi) = BRIDGE_INSTANCE.get() else {
+        tracing::error!("init_context_manager_with: BridgeInstance unexpectedly None");
+        return;
+    };
+    if bi.has_context_manager() {
+        return;
+    }
+    let persistence = persistence.or_else(build_persistence_provider);
+    let cm_arc = build_context_manager(crypto, transport, event_log, persistence);
+    bi.set_context_manager(cm_arc);
 }
 
 /// Test variant of [`init_context_manager`] that uses `LocalTransportProvider`
@@ -197,15 +374,23 @@ pub fn init_context_manager_with(
 /// Not behind `#[cfg(test)]` because integration tests (`tests/e2e_bridge.rs`)
 /// compile as separate crates and need access to this function.
 pub fn init_context_manager_for_test() {
-    let _ = CONTEXT_MANAGER.get_or_init(|| {
-        let persistence = build_persistence_provider();
-        build_context_manager(
-            Box::new(NoOpCryptoProvider),
-            Box::new(scp_core::context::LocalTransportProvider),
-            Box::new(NoOpEventLogProvider),
-            persistence,
-        )
-    });
+    ensure_bridge_instance();
+    let Some(bi) = BRIDGE_INSTANCE.get() else {
+        tracing::error!("init_context_manager_for_test: BridgeInstance unexpectedly None");
+        return;
+    };
+    if bi.has_context_manager() {
+        return;
+    }
+    let persistence = build_persistence_provider();
+    let cm_arc = build_context_manager(
+        Box::new(NoOpCryptoProvider),
+        Box::new(scp_core::context::LocalTransportProvider),
+        Box::new(NoOpEventLogProvider),
+        persistence,
+    );
+
+    bi.set_context_manager(cm_arc);
 }
 
 /// Constructs a [`ProtocolRepositoryContextBridge`] from the global storage provider,
@@ -225,11 +410,14 @@ pub fn init_context_manager_for_test() {
 /// AES-256-GCM encryption, satisfying the sealed `EncryptedStorage`
 /// bound required by `ProtocolRepository::new()`.
 fn build_persistence_provider() -> Option<Box<dyn ContextPersistence>> {
-    STORAGE_PROVIDER.get().map(|storage| {
-        let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
-        Box::new(ProtocolRepositoryContextBridge::new(protocol_repository))
-            as Box<dyn ContextPersistence>
-    })
+    BRIDGE_INSTANCE
+        .get()?
+        .get_storage_provider_as::<Arc<EncryptingAdapter<InMemoryStorage>>>()
+        .map(|storage| {
+            let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+            Box::new(ProtocolRepositoryContextBridge::new(protocol_repository))
+                as Box<dyn ContextPersistence>
+        })
 }
 
 /// Constructs a `ContextManager` with or without persistence.
@@ -260,39 +448,38 @@ fn build_context_manager(
 // DID resolver (global, production)
 // ---------------------------------------------------------------------------
 
-/// Global production DID resolver that delegates to `scp_identity::resolver::DidResolver`
-/// for full DID document validation (BEP44 signature verification, self-certification,
-/// sequence number comparison, caching, healing).
+/// Returns the production DID resolver, if initialized.
 ///
-/// Initialized by [`init_did_resolver`] when the identity layer is first set up.
-/// Used by UCAN validation and attestation verification when available; falls back
-/// to [`scp_ffi_common::BridgeDidResolver`] (string-only) when `None`.
-///
-/// See #311 for the unification design.
-static DID_RESOLVER: OnceLock<Arc<scp_ffi_common::IdentityBackedDidResolver>> = OnceLock::new();
-
-/// Returns the global production DID resolver, if initialized.
+/// Delegates to [`BridgeInstance::did_resolver`].
 #[must_use]
 pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
-    DID_RESOLVER.get()
+    // SAFETY: BRIDGE_INSTANCE is in a OnceLock<Arc<...>> which is 'static.
+    // The DID resolver inside it is in a OnceLock<Arc<...>> which is also 'static.
+    // The returned reference has 'static lifetime because both OnceLocks are static.
+    BRIDGE_INSTANCE.get().and_then(|bi| bi.did_resolver())
 }
 
-/// Initializes the global production DID resolver.
+/// Initializes the production DID resolver.
 ///
 /// Wraps any `scp_identity::resolver::DidResolver` implementation (typically
 /// `DualLayerResolver`) in an `IdentityBackedDidResolver` and stores it
-/// as the process-global resolver for UCAN validation and attestation
-/// verification.
+/// in the `BridgeInstance` for UCAN validation and attestation verification.
 ///
 /// Called once during identity system setup. Subsequent calls are no-ops
-/// (the resolver is initialized via `OnceLock`).
+/// (the resolver is initialized via `OnceLock` inside `BridgeInstance`).
 pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
 where
     R: scp_identity::resolver::DidResolver + 'static,
 {
-    let _ = DID_RESOLVER.set(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
-        resolver, handle,
-    )));
+    if let Some(bi) = BRIDGE_INSTANCE.get() {
+        bi.set_did_resolver(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
+            resolver, handle,
+        )));
+    } else {
+        tracing::error!(
+            "init_did_resolver called before BridgeInstance initialized — resolver not stored"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -654,13 +841,15 @@ pub fn register_tool_handler(
 /// (idempotent).
 pub fn remove_ffi_state(context_id: &str) {
     ffi_state_registry().remove(context_id);
-    known_contexts_registry().remove(context_id);
-    // Clean up per-context bridge connector state (ShadowRegistry + SenderKeyStore)
-    // to prevent unbounded memory growth in long-running processes.
-    scp_ffi_common::bridge_state::remove_bridge_state(context_id);
-    // Clean up per-context economy state (budget + antispam trackers) to prevent
-    // unbounded memory growth in long-running processes (#1433).
-    remove_economy_state(context_id);
+    // Clean up known-context discovery entry via BridgeInstance.
+    if let Ok(bi) = bridge_instance() {
+        bi.remove_known_context(context_id);
+    }
+    // Clean up per-context bridge connector state and economy state via BridgeInstance.
+    if let Ok(bi) = bridge_instance() {
+        bi.remove_bridge_state(context_id);
+        bi.remove_economy_state(context_id);
+    }
 }
 
 /// Re-syncs the `FfiBridgeState.role_state` for a context from the shared
@@ -781,44 +970,15 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
 // ---------------------------------------------------------------------------
 // Known context registry (SCP-213: context discovery)
 // ---------------------------------------------------------------------------
-
-/// Global registry of known context-to-relay mappings for discovery (SCP-213).
-///
-/// Tracks contexts that have been created/joined locally, along with their
-/// routing IDs and relay URLs. This allows `py_mcp_load_contexts` to probe
-/// relays for context activity even across process restarts (when combined
-/// with persistence, a future story).
-///
-/// # Safety: Single-Tenant Only
-///
-/// This registry is process-global. See module-level documentation.
-static KNOWN_CONTEXTS: OnceLock<DashMap<String, KnownContext>> = OnceLock::new();
-
-/// Returns a reference to the global known-contexts registry.
-fn known_contexts_registry() -> &'static DashMap<String, KnownContext> {
-    KNOWN_CONTEXTS.get_or_init(DashMap::new)
-}
-
-/// Metadata about a known context's relay presence.
-///
-/// Stored in the `KNOWN_CONTEXTS` registry so that `py_mcp_load_contexts`
-/// can probe relays for context activity. The relay is a dumb blob store
-/// with no identity-to-context mapping, so the client must track which
-/// routing IDs correspond to which contexts.
-///
-/// See SCP-213 and ADR-015 in `.docs/adrs/phase-3.md`.
-#[derive(Debug, Clone)]
-pub struct KnownContext {
-    /// The context's routing ID (32-byte pseudonym for relay routing).
-    pub routing_id: [u8; 32],
-    /// The relay URL where this context's blobs are stored. `None` if no relay
-    /// was connected at registration time.
-    pub relay_url: Option<String>,
-    /// The DID of the member who registered this known context.
-    pub member_did: String,
-    /// Unix timestamp (seconds) when this context was last seen active.
-    pub last_seen: u64,
-}
+//
+// Delegates to the `BridgeInstance`'s `known_contexts` DashMap.
+// The `KnownContext` type is defined in `scp-ffi-common::bridge_instance`
+// and re-exported at the top of this module for backward compatibility.
+//
+// These functions require the bridge to be initialized. Before
+// `init_context_manager` is called, `register_known_context` panics
+// (callers must initialize identity first, which initializes the bridge).
+// ---------------------------------------------------------------------------
 
 /// Registers a known context in the discovery registry.
 ///
@@ -826,87 +986,108 @@ pub struct KnownContext {
 /// relay URL for later discovery via `py_mcp_load_contexts`.
 ///
 /// Overwrites any existing entry for the same context ID (idempotent).
+///
+/// # Panics
+///
+/// Panics if the bridge has not been initialized via [`init_context_manager`].
 pub fn register_known_context(context_id: &str, known: KnownContext) {
-    known_contexts_registry().insert(context_id.to_owned(), known);
+    if let Ok(bi) = bridge_instance() {
+        bi.register_known_context(context_id, known);
+    } else {
+        tracing::warn!(
+            "register_known_context called before bridge init — context '{}' not tracked",
+            context_id
+        );
+    }
 }
 
 /// Returns all known contexts from the discovery registry.
 ///
 /// Used by `py_mcp_load_contexts` to find routing IDs to probe on the relay.
+/// Returns an empty `Vec` if the bridge has not been initialized.
 #[must_use]
 pub fn all_known_contexts() -> Vec<(String, KnownContext)> {
-    known_contexts_registry()
-        .iter()
-        .map(|entry| (entry.key().clone(), entry.value().clone()))
-        .collect()
+    bridge_instance()
+        .map(|bi| bi.all_known_contexts())
+        .unwrap_or_default()
 }
 
 /// Returns known contexts where the given DID is the registered member.
+///
+/// Returns an empty `Vec` if the bridge has not been initialized.
 #[must_use]
 pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)> {
-    known_contexts_registry()
-        .iter()
-        .filter(|entry| entry.value().member_did == member_did)
-        .map(|entry| (entry.key().clone(), entry.value().clone()))
-        .collect()
+    bridge_instance()
+        .map(|bi| bi.known_contexts_for_member(member_did))
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
 // Invitation rate limit tracker registry (#614)
 // ---------------------------------------------------------------------------
-
-/// Global rate limit tracker registry for invitation auto-accept, keyed by
-/// identity DID.
-///
-/// Each identity has its own [`RateLimitTracker`] that persists across
-/// invitation evaluations. The tracker enforces the rate limit specified in
-/// the auto-accept policy.
-///
-/// # Safety: Single-Tenant Only
-///
-/// This registry is process-global. See module-level documentation.
-static RATE_LIMIT_TRACKERS: OnceLock<
-    DashMap<String, scp_core::context::invitation::RateLimitTracker>,
-> = OnceLock::new();
-
-/// Returns a reference to the global rate limit tracker registry.
-fn rate_limit_registry() -> &'static DashMap<String, scp_core::context::invitation::RateLimitTracker>
-{
-    RATE_LIMIT_TRACKERS.get_or_init(DashMap::new)
-}
+//
+// Delegates to the `BridgeInstance`'s `rate_limiters` DashMap.
+// ---------------------------------------------------------------------------
 
 /// Returns a mutable reference to the rate limit tracker for the given
 /// identity DID, creating one if it does not exist.
+///
+/// Delegates to the `BridgeInstance`'s rate-limiter registry. If the bridge
+/// has not been initialized (unusual — identity must be created before
+/// invitation evaluation), falls back to a thread-local default tracker
+/// to preserve the original infallible signature.
 ///
 /// The caller passes a closure that receives `&mut RateLimitTracker`.
 pub fn with_rate_limit_tracker<F, T>(identity_did: &str, f: F) -> T
 where
     F: FnOnce(&mut scp_core::context::invitation::RateLimitTracker) -> T,
 {
-    let registry = rate_limit_registry();
-    let mut entry = registry.entry(identity_did.to_owned()).or_default();
-    f(entry.value_mut())
+    if let Ok(bi) = bridge_instance() {
+        bi.with_rate_limit_tracker(identity_did, f)
+    } else {
+        // Bridge not initialized — use a temporary tracker. This path
+        // should not be hit in normal operation (identity is always
+        // created before invitation evaluation).
+        tracing::warn!(
+            "with_rate_limit_tracker called before bridge init — using ephemeral tracker"
+        );
+        let mut tracker = scp_core::context::invitation::RateLimitTracker::default();
+        f(&mut tracker)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Identity registry (SCP-214: KeyCustody wiring)
 // ---------------------------------------------------------------------------
 
-/// Global identity registry mapping DID strings to retained identity state.
-///
-/// Stores the [`ScpIdentity`] (with opaque [`KeyHandle`]s), the
-/// [`Arc<FfiKeyCustody>`](crate::custody::FfiKeyCustody) that owns the key
-/// material, and the [`DidDocument`]. This allows bridge functions to perform
-/// crypto operations (signing, pseudonym derivation, key rotation) without
-/// private key material crossing the FFI boundary (ADR-006).
-///
-/// Uses [`DashMap`] for lock-free concurrent access matching the context
-/// registry pattern.
-static IDENTITY_REGISTRY: OnceLock<DashMap<String, IdentityEntry>> = OnceLock::new();
-
 /// Returns a reference to the global identity registry.
+///
+/// The registry is stored as a type-erased `Arc<DashMap<String, IdentityEntry>>`
+/// in the `BridgeInstance`. Panics if called before `init_context_manager` —
+/// identity functions are always called after the bridge is initialized.
+///
+/// The `DashMap` provides lock-free concurrent access matching the context
+/// registry pattern (ADR-006).
+///
+/// # Panics
+///
+/// Panics if the bridge has not been initialized via `init_context_manager`.
+/// Fallback empty identity registry for when `BridgeInstance` is not initialized.
+static EMPTY_IDENTITY_REGISTRY: std::sync::OnceLock<DashMap<String, IdentityEntry>> =
+    std::sync::OnceLock::new();
+
+/// Returns the global identity registry.
+///
+/// Falls back to an empty registry if `BridgeInstance` is not yet initialized
+/// (matching the `get_or_init` behavior of the removed standalone `OnceLock`).
 fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
-    IDENTITY_REGISTRY.get_or_init(DashMap::new)
+    BRIDGE_INSTANCE
+        .get()
+        .and_then(|bi| {
+            bi.get_identity_registry_as::<Arc<DashMap<String, IdentityEntry>>>()
+                .map(Arc::as_ref)
+        })
+        .unwrap_or_else(|| EMPTY_IDENTITY_REGISTRY.get_or_init(DashMap::new))
 }
 
 /// Retained identity state for a single DID.
@@ -1010,48 +1191,18 @@ pub fn remove_identity(did: &str) {
 // Storage provider registry (SCP-217: identity persistence)
 // ---------------------------------------------------------------------------
 
-/// Global storage provider for identity persistence.
-///
-/// Injected via [`init_storage`] at Python initialization time. Bridge
-/// functions use [`get_storage`] to access the provider for storing and
-/// loading identity state.
-///
-/// **Default is `InMemoryStorage`:** Data does NOT survive process restarts.
-/// SDK consumers requiring durable persistence should provide a file-backed
-/// `Storage` implementation (e.g., `SqliteStorage`) at the application layer.
-/// The in-memory default is suitable for testing and ephemeral workloads; the
-/// architecture supports real persistence — it is an SDK integration concern
-/// to wire a durable backend.
-///
-/// The storage backend is `InMemoryStorage` wrapped in
-/// [`EncryptingAdapter`] with a random AES-256-GCM key. This satisfies
-/// the sealed `EncryptedStorage` bound required by
-/// `ProtocolRepository::new()`, matching the `scp-node` ephemeral mode
-/// pattern. Persistent backends (`SQLite` via [`SqliteStorage`]) will
-/// replace it when platform storage adapters land.
-///
-/// Uses the same `OnceLock` pattern as `FFI_BRIDGE_STATE` and
-/// `TRANSPORT_MANAGER`. The `Arc` enables shared ownership across bridge
-/// functions without lifetime issues.
-///
-/// See spec section 17.3 for key conventions and section 17.4 for
-/// `ProtocolRepository` design.
-///
-/// # Safety: Single-Tenant Only
-///
-/// This registry is process-global. In multi-tenant deployments,
-/// ALL tenants share the storage provider.
-static STORAGE_PROVIDER: OnceLock<Arc<EncryptingAdapter<InMemoryStorage>>> = OnceLock::new();
-
-/// Initializes the global storage provider.
+/// Initializes the storage provider and stores it in the `BridgeInstance`.
 ///
 /// Must be called before any storage-dependent bridge function
 /// (`py_identity_create`, `py_identity_load`). Calling multiple times is
-/// a no-op — the first call wins.
+/// a no-op — the first call wins (`OnceLock` in `BridgeInstance`).
 ///
 /// Wraps `InMemoryStorage` in [`EncryptingAdapter`] with a random
 /// AES-256-GCM key generated via `OsRng`. This ensures all stored
 /// values are encrypted at rest, satisfying the `EncryptedStorage` bound.
+///
+/// See spec section 17.3 for key conventions and section 17.4 for
+/// `ProtocolRepository` design.
 ///
 /// # Arguments
 ///
@@ -1060,14 +1211,16 @@ static STORAGE_PROVIDER: OnceLock<Arc<EncryptingAdapter<InMemoryStorage>>> = Onc
 /// # Errors
 ///
 /// Returns `ScpPyError::ValidationError` if the storage type is not
-/// recognized.
+/// recognized, or `ScpPyError::ContextError` if the bridge has not been
+/// initialized.
 pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
     match storage_type {
         "in_memory" => {
             let mut key = Zeroizing::new([0u8; 32]);
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
             let encrypted = EncryptingAdapter::new(InMemoryStorage::new(), key);
-            let _ = STORAGE_PROVIDER.set(Arc::new(encrypted));
+            let bi = bridge_instance()?;
+            bi.set_storage_provider(Arc::new(encrypted));
             Ok(())
         }
         other => Err(ScpPyError::validation(format!(
@@ -1081,102 +1234,87 @@ pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
 /// # Errors
 ///
 /// Returns `ScpPyError::IdentityError` if storage has not been initialized
-/// via [`init_storage`].
+/// via [`init_storage`], or `ScpPyError::ContextError` if the bridge has
+/// not been initialized.
 pub fn get_storage() -> Result<&'static Arc<EncryptingAdapter<InMemoryStorage>>, ScpPyError> {
-    STORAGE_PROVIDER.get().ok_or_else(|| {
+    let bi = BRIDGE_INSTANCE.get().ok_or_else(|| {
         ScpPyError::identity(
-            "storage not initialized — call py_init_storage(\"in_memory\") first".to_owned(),
+            "bridge not initialized — call identity_create before storage operations".to_owned(),
         )
-    })
+    })?;
+    bi.get_storage_provider_as::<Arc<EncryptingAdapter<InMemoryStorage>>>()
+        .ok_or_else(|| {
+            ScpPyError::identity(
+                "storage not initialized — call py_init_storage(\"in_memory\") first".to_owned(),
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------
 // Relay connection state (SCP-213: transport wiring)
 // ---------------------------------------------------------------------------
-
-/// Global transport manager for multi-relay support.
-///
-/// Stores the real [`scp_transport::TransportManager`] with multi-relay
-/// fanout, per-context relay set assignment, suppression detection, and
-/// reliability scoring.
-///
-/// Initialized by [`set_transport_manager`] when `py_transport_connect`
-/// succeeds. Read by `py_mcp_load_contexts` to probe routing IDs on
-/// relays. Uses `RwLock` for infrequent writes (connect) and concurrent
-/// reads (probe/query).
-///
-/// # Safety: Single-Tenant Only
-///
-/// This registry is process-global. See module-level documentation.
-static TRANSPORT_MANAGER: OnceLock<RwLock<Option<scp_transport::TransportManager>>> =
-    OnceLock::new();
-
-/// Returns a reference to the global transport manager state.
-fn transport_state() -> &'static RwLock<Option<scp_transport::TransportManager>> {
-    TRANSPORT_MANAGER.get_or_init(|| RwLock::new(None))
-}
+//
+// Delegates to the `BridgeInstance`'s `transport` RwLock.
+// ---------------------------------------------------------------------------
 
 /// Stores a new `TransportManager` (called by `py_transport_connect`).
+///
+/// Delegates to [`BridgeInstance::set_transport`].
 ///
 /// # Errors
 ///
 /// Returns `ScpPyError::TransportError` if the transport manager lock is
-/// poisoned.
+/// poisoned or the bridge is not initialized.
 pub fn set_transport_manager(manager: scp_transport::TransportManager) -> Result<(), ScpPyError> {
-    let mut guard = transport_state()
-        .write()
-        .map_err(|_| ScpPyError::transport("transport manager lock poisoned".to_owned()))?;
-    *guard = Some(manager);
-    Ok(())
+    let bi = bridge_instance().map_err(|_| {
+        ScpPyError::transport(
+            "bridge not initialized — call identity_create before transport_connect".to_owned(),
+        )
+    })?;
+    bi.set_transport(Arc::new(manager))
+        .map_err(|e| ScpPyError::transport(e.to_string()))
 }
 
 /// Executes a closure with a read reference to the `TransportManager`.
 ///
-/// Used by callers that need to query, probe, or inspect the manager
-/// without mutating it.
+/// Delegates to [`BridgeInstance::with_transport`].
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::TransportError` if the lock is poisoned or no
-/// transport manager has been initialized.
+/// Returns `ScpPyError::TransportError` if the lock is poisoned, no
+/// transport manager has been initialized, or the bridge is not initialized.
 pub fn with_transport_manager<T>(
     f: impl FnOnce(&scp_transport::TransportManager) -> Result<T, ScpPyError>,
 ) -> Result<T, ScpPyError> {
-    let guard = transport_state()
-        .read()
-        .map_err(|_| ScpPyError::transport("transport manager lock poisoned".to_owned()))?;
-    let manager = guard.as_ref().ok_or_else(|| {
+    let bi = bridge_instance().map_err(|_| {
         ScpPyError::transport("no transport manager — call transport_connect first".to_owned())
     })?;
-    f(manager)
+    bi.with_transport(f)
+        .map_err(|e| ScpPyError::transport(e.to_string()))?
 }
 
 /// Executes a closure with a mutable reference to the `TransportManager`.
 ///
-/// Used by callers that need to add adapters or modify relay assignments.
+/// Delegates to [`BridgeInstance::with_transport_mut`].
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::TransportError` if the lock is poisoned or no
-/// transport manager has been initialized.
+/// Returns `ScpPyError::TransportError` if the lock is poisoned, no
+/// transport manager has been initialized, or the bridge is not initialized.
 pub fn with_transport_manager_mut<T>(
     f: impl FnOnce(&mut scp_transport::TransportManager) -> Result<T, ScpPyError>,
 ) -> Result<T, ScpPyError> {
-    let mut guard = transport_state()
-        .write()
-        .map_err(|_| ScpPyError::transport("transport manager lock poisoned".to_owned()))?;
-    let manager = guard.as_mut().ok_or_else(|| {
+    let bi = bridge_instance().map_err(|_| {
         ScpPyError::transport("no transport manager — call transport_connect first".to_owned())
     })?;
-    f(manager)
+    bi.with_transport_mut(f)
+        .map_err(|e| ScpPyError::transport(e.to_string()))?
 }
 
 /// Returns `true` if a transport manager has been initialized.
+#[must_use]
 pub fn has_transport_manager() -> bool {
-    TRANSPORT_MANAGER
-        .get()
-        .and_then(|lock| lock.read().ok())
-        .is_some_and(|guard| guard.is_some())
+    bridge_instance().is_ok_and(|bi| bi.has_transport())
 }
 
 /// Records a heartbeat suppression event for a relay, downgrading its
@@ -1184,15 +1322,16 @@ pub fn has_transport_manager() -> bool {
 ///
 /// Called from the background task spawned by `transport_add_relay` /
 /// `transport_connect` that drains the per-adapter suppression receiver
-/// (#1533 AC5). Silently no-ops if the transport manager has been cleared
-/// (e.g., after disconnect).
+/// (#1533 AC5). Silently no-ops if the bridge or transport manager has
+/// been cleared (e.g., after disconnect).
 pub fn record_suppression(relay_url: &str) {
-    let Ok(guard) = transport_state().read() else {
+    let Ok(bi) = bridge_instance() else {
         return;
     };
-    if let Some(manager) = guard.as_ref() {
+    let _ = bi.with_transport(|manager| {
         manager.update_score(relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
-    }
+        Ok::<(), ScpPyError>(())
+    });
 }
 
 /// Clears the transport manager (called by `py_transport_disconnect`).
@@ -1203,13 +1342,15 @@ pub fn record_suppression(relay_url: &str) {
 /// # Errors
 ///
 /// Returns `ScpPyError::TransportError` if the transport manager lock is
-/// poisoned.
+/// poisoned or the bridge is not initialized.
 pub fn clear_transport_manager() -> Result<(), ScpPyError> {
-    let mut guard = transport_state()
-        .write()
-        .map_err(|_| ScpPyError::transport("transport manager lock poisoned".to_owned()))?;
-    *guard = None;
-    Ok(())
+    let bi = bridge_instance().map_err(|_| {
+        ScpPyError::transport(
+            "bridge not initialized — call identity_create before transport_disconnect".to_owned(),
+        )
+    })?;
+    bi.clear_transport()
+        .map_err(|e| ScpPyError::transport(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,14 +1435,18 @@ pub struct RegistryStats {
 ///
 /// Intended for monitoring and debugging in long-running processes.
 /// All reads are lock-free (`DashMap`) or brief (`RwLock` on transport
-/// state).
+/// state). Known contexts and transport status are read from the
+/// `BridgeInstance` (returns 0/false if the bridge is not initialized).
 #[must_use]
 pub fn registry_stats() -> RegistryStats {
+    let (known_count, relay_connected) = bridge_instance().map_or((0, false), |bi| {
+        (bi.known_context_count(), bi.has_transport())
+    });
     RegistryStats {
         contexts: ffi_state_registry().len(),
-        known_contexts: known_contexts_registry().len(),
+        known_contexts: known_count,
         identities: identity_registry().len(),
-        relay_connected: has_transport_manager(),
+        relay_connected,
     }
 }
 
@@ -1348,86 +1493,8 @@ pub fn remove_identity_if_present(did: &str) -> bool {
     identity_registry().remove(did).is_some()
 }
 
-// ---------------------------------------------------------------------------
-// Economy state registries
-// ---------------------------------------------------------------------------
-
-/// Per-context member budget trackers for economic governance.
-///
-/// Keyed by context ID. Created lazily on first access via
-/// [`with_economy_budget`] / [`with_economy_budget_mut`]. Budget trackers are
-/// NOT removed automatically when contexts are closed -- call
-/// [`remove_economy_state`] for cleanup in long-running processes.
-static ECONOMY_BUDGETS: OnceLock<DashMap<String, scp_core::economy::MemberBudgetTracker>> =
-    OnceLock::new();
-
-fn economy_budget_registry() -> &'static DashMap<String, scp_core::economy::MemberBudgetTracker> {
-    ECONOMY_BUDGETS.get_or_init(DashMap::new)
-}
-
-/// Per-context antispam velocity trackers for economic governance.
-///
-/// Keyed by context ID. Created lazily on first access with a default 60-second
-/// sliding window. The window duration matches the spec section 19.7 example.
-static ECONOMY_ANTISPAM: OnceLock<DashMap<String, scp_core::economy::SenderVelocityTracker>> =
-    OnceLock::new();
-
-/// Default sliding window duration for antispam velocity tracking (seconds).
-/// Matches the spec section 19.7 example.
-const ANTISPAM_DEFAULT_WINDOW_SECS: u64 = 60;
-
-fn economy_antispam_registry() -> &'static DashMap<String, scp_core::economy::SenderVelocityTracker>
-{
-    ECONOMY_ANTISPAM.get_or_init(DashMap::new)
-}
-
-/// Reads the budget tracker for a context, creating one if it doesn't exist.
-///
-/// The closure receives an immutable reference to the tracker.
-pub fn with_economy_budget<T, F>(context_id: &str, f: F) -> T
-where
-    F: FnOnce(&scp_core::economy::MemberBudgetTracker) -> T,
-{
-    let registry = economy_budget_registry();
-    let entry = registry.entry(context_id.to_owned()).or_default();
-    f(entry.value())
-}
-
-/// Mutably accesses the budget tracker for a context, creating one if needed.
-///
-/// The closure receives a mutable reference to the tracker.
-pub fn with_economy_budget_mut<T, F>(context_id: &str, f: F) -> T
-where
-    F: FnOnce(&mut scp_core::economy::MemberBudgetTracker) -> T,
-{
-    let registry = economy_budget_registry();
-    let mut entry = registry.entry(context_id.to_owned()).or_default();
-    f(entry.value_mut())
-}
-
-/// Accesses the antispam velocity tracker for a context, creating one if needed.
-///
-/// The closure receives a reference to the tracker (which is internally
-/// `Mutex`-protected, so `&self` methods like `record_message` and
-/// `get_velocity` work without `&mut`).
-pub fn with_economy_antispam<T, F>(context_id: &str, f: F) -> T
-where
-    F: FnOnce(&scp_core::economy::SenderVelocityTracker) -> T,
-{
-    let registry = economy_antispam_registry();
-    let entry = registry.entry(context_id.to_owned()).or_insert_with(|| {
-        scp_core::economy::SenderVelocityTracker::new(ANTISPAM_DEFAULT_WINDOW_SECS)
-    });
-    f(entry.value())
-}
-
-/// Removes economy state (budget tracker and antispam tracker) for a context.
-///
-/// Should be called during context cleanup for long-running processes.
-pub fn remove_economy_state(context_id: &str) {
-    economy_budget_registry().remove(context_id);
-    economy_antispam_registry().remove(context_id);
-}
+// Economy state is now owned by BridgeInstance. Callers access it via
+// `bridge_instance()?.with_economy_budget(...)` etc. directly.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1460,6 +1527,7 @@ mod tests {
 
     #[test]
     fn registry_stats_reflects_context_registration() {
+        init_context_manager_for_test();
         let ctx_id = unique_ctx_id("stats-ctx");
         let creator = "did:dht:z6MkStatsTest";
 
@@ -1490,6 +1558,7 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn registry_stats_reflects_identity_registration() {
+        init_context_manager_for_test();
         let did = "did:dht:z6MkStatsIdentityUnique9988";
 
         let entry = IdentityEntry {
@@ -1528,6 +1597,10 @@ mod tests {
 
     #[test]
     fn registry_stats_reflects_known_context_registration() {
+        // Ensure bridge is initialized so known_contexts DashMap exists.
+        init_context_manager_for_test();
+        let bi = bridge_instance().unwrap();
+
         let ctx_id = unique_ctx_id("stats-known");
         let known = KnownContext {
             routing_id: [0xCC; 32],
@@ -1545,21 +1618,24 @@ mod tests {
             stats.known_contexts,
         );
         assert!(
-            known_contexts_registry().contains_key(&ctx_id),
-            "registered known context should be in registry"
+            bi.has_known_context(&ctx_id),
+            "registered known context should be in BridgeInstance"
         );
 
-        // remove_context clears both registries.
-        remove_context(&ctx_id);
+        // remove_ffi_state clears both registries (FFI state + known contexts).
+        // Register FFI state first so remove_ffi_state has something to remove.
+        let _ = register_ffi_state(&ctx_id, "did:dht:z6MkStatsKnown", &[]);
+        remove_ffi_state(&ctx_id);
         assert!(
-            !known_contexts_registry().contains_key(&ctx_id),
-            "removed known context should not be in registry"
+            !bi.has_known_context(&ctx_id),
+            "removed known context should not be in BridgeInstance"
         );
     }
 
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn remove_identity_if_present_returns_true_when_found() {
+        init_context_manager_for_test();
         let did = "did:dht:z6MkRemoveIfPresent";
         let entry = IdentityEntry {
             identity: ScpIdentity {
@@ -1581,11 +1657,13 @@ mod tests {
 
     #[test]
     fn remove_identity_if_present_returns_false_when_not_found() {
+        init_context_manager_for_test();
         assert!(!remove_identity_if_present("did:dht:z6MkNotPresent9999"));
     }
 
     #[test]
     fn registry_stats_returns_all_fields() {
+        init_context_manager_for_test();
         // Verifies the struct shape and that registry_stats() doesn't panic.
         let stats = registry_stats();
         // Destructure to catch struct changes at compile time. If a field is
@@ -1706,5 +1784,73 @@ mod tests {
         );
 
         remove_context(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // BridgeInstance tests (#1549)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bridge_instance_populated_by_init_context_manager() {
+        // init_context_manager_for_test populates BRIDGE_INSTANCE which owns
+        // the ContextManager. Since OnceLock is process-global, the first call
+        // in any test wins — subsequent calls are no-ops. We rely on this
+        // being called (possibly by other tests) before asserting.
+        init_context_manager_for_test();
+
+        let cm = context_manager().expect("context_manager should be initialized");
+        let bi = bridge_instance().expect("bridge_instance should be initialized");
+
+        // Both should point to the same ContextManager allocation.
+        assert!(
+            Arc::ptr_eq(cm, bi.try_context_manager().unwrap()),
+            "bridge_instance().context_manager() must be the same Arc as context_manager()"
+        );
+    }
+
+    #[test]
+    fn bridge_instance_not_shutdown_initially() {
+        init_context_manager_for_test();
+
+        let bi = bridge_instance().expect("bridge_instance should be initialized");
+        assert!(
+            !bi.is_shutdown(),
+            "bridge_instance should not be shutdown immediately after init"
+        );
+    }
+
+    #[test]
+    fn shutdown_hook_runs_with_external_state() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Build an isolated BridgeInstance (not the global one) to avoid
+        // interfering with the OnceLock-based singleton used by other tests.
+        // BridgeInstance is in scope via `use super::*` (imported at module top).
+        let persistence = build_persistence_provider();
+        let cm = build_context_manager(
+            Box::new(NoOpCryptoProvider),
+            Box::new(scp_core::context::LocalTransportProvider),
+            Box::new(NoOpEventLogProvider),
+            persistence,
+        );
+        let bi = BridgeInstance::with_context_manager(cm);
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = Arc::clone(&ran);
+
+        bi.register_shutdown_hook(Box::new(move || {
+            ran2.store(true, Ordering::SeqCst);
+        }));
+
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "hook must not fire before shutdown"
+        );
+        bi.shutdown();
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "shutdown hook must execute during BridgeInstance::shutdown()"
+        );
     }
 }

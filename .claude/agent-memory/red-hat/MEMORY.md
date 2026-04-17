@@ -99,3 +99,13 @@ After commit 54b8096 ("close 6 remaining gaps"), reassessed all chains.
 - `crates/scp-transport/src/relay/bridge.rs` -- Replay within 60s window (RED-204)
 - `crates/scp-node/src/lib.rs` -- No debounce on re-eval loop (RED-206), no post-change self-test (RED-208)
 - `crates/scp-node/src/projection.rs` -- RED-401 FIXED, RED-402 FIXED, missing delegation/attenuation/ceiling/nonce (RED-403), dead structural None arm (latent)
+
+## PR #1628 BridgeInstance Type-Erasure Assessment (2026-04-14)
+- **RED-901 (HIGH)**: Post-shutdown bridge_instance() returns Ok with warn, not Err. All 3 bridges. Zombie operations possible.
+- **RED-902 (MEDIUM)**: storage_provider/protocol_repository OnceLock fields NEVER cleared on shutdown. AES-256 key persists.
+- **RED-903 (NON-ISSUE)**: Type confusion via downcast impossible. Rust TypeId prevents. Returns None on mismatch.
+- **RED-904 (NON-ISSUE)**: clear_fn cannot be replaced (OnceLock write-once). Cannot be suppressed (called unconditionally in shutdown).
+- **RED-905 (LOW)**: Mutex poisoning in shutdown_hooks skips all bridge-specific hooks. Narrow prerequisite.
+- **RED-906 (MEDIUM)**: UniFFI identity custody NOT in BridgeInstance (separate OnceLock). Weaker cleanup vs PyO3/NAPI.
+- **RED-907 (MEDIUM)**: Post-shutdown re-registration possible. register_identity() has no is_shutdown() check.
+- Fix priority: (1) bridge_instance() should reject post-shutdown with Err, (2) clear storage_provider/protocol_repository, (3) UniFFI identity into BridgeInstance.

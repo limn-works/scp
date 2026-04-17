@@ -54,17 +54,10 @@ use scp_core::bridge::{
 use scp_core::crypto::sender_keys::{SenderKey, SenderKeyStore};
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 use scp_core::trust::attestation::Attestation;
-use scp_ffi_common::bridge_state::{BridgeContextState, bridge_state_registry};
+use scp_ffi_common::bridge_state::BridgeContextState;
 use zeroize::Zeroizing;
 
 use crate::error::ScpPyError;
-
-// ---------------------------------------------------------------------------
-// Per-context bridge state — persistent ShadowRegistry + SenderKeyStore
-// ---------------------------------------------------------------------------
-//
-// `BridgeContextState`, `bridge_state_registry()`, and `remove_bridge_state()`
-// are defined in `scp_ffi_common::bridge_state` and re-imported above.
 
 // ---------------------------------------------------------------------------
 // Global credential store (in-memory, per-process)
@@ -340,8 +333,9 @@ pub fn py_bridge_create_shadow(
         timestamp: 0,
     };
 
-    let registry = bridge_state_registry();
-    let mut entry = registry
+    let bi = crate::runtime::bridge_instance()?;
+    let mut entry = bi
+        .bridge_state()
         .entry(context_id.to_owned())
         .or_insert_with(|| BridgeContextState {
             shadow_registry: ShadowRegistry::new(context_id.to_string()),

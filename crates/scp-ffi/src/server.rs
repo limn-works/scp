@@ -95,13 +95,15 @@ fn auto_wire_context_manager(
             let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
             let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
                 Box::new(crate::runtime::NoOpEventLogProvider);
-            crate::runtime::init_context_manager_with(crypto, transport, event_log, None);
+            crate::runtime::init_context_manager_with(
+                &did_owned, crypto, transport, event_log, None,
+            );
 
-            // Also populate the TRANSPORT_MANAGER global so that broadcast
-            // publish, context subscribe, and discovery probing work without
-            // a separate `transport_connect` call. This requires a second
-            // WebSocket connection because NativeRelayAdapter is not Clone
-            // and the first was consumed by RelayTransportProvider.
+            // Also populate the BridgeInstance transport manager so that
+            // broadcast publish, context subscribe, and discovery probing
+            // work without a separate `transport_connect` call. This requires
+            // a second WebSocket connection because NativeRelayAdapter is not
+            // Clone and the first was consumed by RelayTransportProvider.
             match py.allow_threads(|| {
                 rt.block_on(NativeRelayAdapter::connect_sourced_with_bearer(
                     &sourced,
@@ -118,8 +120,8 @@ fn auto_wire_context_manager(
                         error = %e,
                         relay_url = %relay_url,
                         "auto_wire_context_manager: ContextManager wired but failed to \
-                         populate TRANSPORT_MANAGER — broadcast publish and discovery may \
-                         require a manual transport_connect call"
+                         populate BridgeInstance transport manager — broadcast publish and \
+                         discovery may require a manual transport_connect call"
                     );
                 }
             }
@@ -843,12 +845,15 @@ mod tests {
         inner.shutdown();
     }
 
-    /// Verifies that auto-wiring a node's relay populates the global
-    /// `TRANSPORT_MANAGER` so that broadcast publish, context subscribe,
+    /// Verifies that auto-wiring a node's relay populates the `BridgeInstance`
+    /// transport manager so that broadcast publish, context subscribe,
     /// and discovery probing work without a separate `transport_connect`.
     #[test]
     fn auto_wire_populates_transport_manager_global() {
         use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+
+        // BridgeInstance must exist for transport manager storage.
+        crate::runtime::init_context_manager_for_test();
 
         // Start a standalone relay to get a stable WebSocket endpoint.
         let relay = rt().block_on(server::start_relay_in_memory()).unwrap();
@@ -870,7 +875,7 @@ mod tests {
         // Verify the global is populated.
         assert!(
             crate::runtime::has_transport_manager(),
-            "TRANSPORT_MANAGER should be populated after auto-wire"
+            "BridgeInstance transport manager should be populated after auto-wire"
         );
 
         // Clean up.

@@ -1051,7 +1051,7 @@ mod tests {
             ChallengeType::schema_validation(),
             TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({"schema": "test"}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         );
 
@@ -1063,7 +1063,7 @@ mod tests {
         assert_eq!(req.challenge_type, ChallengeType::schema_validation());
         assert_eq!(req.capability_uri, TEST_CAPABILITY_URI);
         assert_eq!(req.parameters, serde_json::json!({"schema": "test"}));
-        assert_eq!(req.timeout, Duration::from_secs(300));
+        assert_eq!(req.timeout, Duration::from_mins(5));
         assert_eq!(req.signature.len(), 64);
     }
 
@@ -1078,7 +1078,7 @@ mod tests {
             ChallengeType::prompt_injection_resistance(),
             TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             &signer,
         )
         .unwrap();
@@ -1089,7 +1089,7 @@ mod tests {
             ChallengeType::prompt_injection_resistance(),
             TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             &signer,
         )
         .unwrap();
@@ -1114,7 +1114,7 @@ mod tests {
                 ct.clone(),
                 TEST_CAPABILITY_URI.to_owned(),
                 serde_json::json!({}),
-                Duration::from_secs(60),
+                Duration::from_mins(1),
                 &signer,
             );
             assert!(result.is_ok(), "failed for {ct:?}: {result:?}");
@@ -1143,7 +1143,7 @@ mod tests {
             ChallengeType::schema_validation(),
             TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({"schema": "test"}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         )
         .unwrap();
@@ -1196,7 +1196,7 @@ mod tests {
             ChallengeType::rate_limit_compliance(),
             TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
-            Duration::from_secs(600),
+            Duration::from_mins(10),
             &signer,
         )
         .unwrap();
@@ -1243,7 +1243,7 @@ mod tests {
             ChallengeType::schema_validation(),
             TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         )
         .unwrap();
@@ -1282,7 +1282,7 @@ mod tests {
             ChallengeType::schema_validation(),
             TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         )
         .unwrap();
@@ -1323,7 +1323,7 @@ mod tests {
             ChallengeType::schema_validation(),
             TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
-            Duration::from_secs(60), // 60 second timeout
+            Duration::from_mins(1), // 60 second timeout
             &signer,
         )
         .unwrap();
@@ -1364,7 +1364,7 @@ mod tests {
             ChallengeType::prompt_injection_resistance(),
             TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
-            Duration::from_secs(300), // 5-minute timeout
+            Duration::from_mins(5), // 5-minute timeout
             &signer,
         )
         .unwrap();
@@ -1401,7 +1401,7 @@ mod tests {
             ChallengeType::schema_validation(),
             TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         )
         .unwrap();
@@ -1445,7 +1445,7 @@ mod tests {
             ChallengeType::schema_validation(),
             TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         )
         .unwrap();
@@ -1483,7 +1483,7 @@ mod tests {
             ChallengeType::schema_validation(),
             TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         )
         .unwrap();
@@ -1518,7 +1518,7 @@ mod tests {
             ChallengeType::schema_validation(),
             TEST_CAPABILITY_URI.to_owned(),
             serde_json::json!({}),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             &signer,
         )
         .unwrap();
@@ -1577,7 +1577,7 @@ mod tests {
             subject_did: "did:key:s".into(),
             capability_uri: TEST_CAPABILITY_URI.to_owned(),
             parameters: serde_json::json!({"key": "value"}),
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_mins(1),
             signature: vec![],
         };
 
@@ -1670,7 +1670,7 @@ mod tests {
             ChallengeType::Uri(cap_uri),
             uri.to_string(),
             serde_json::json!({}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         )
     }
@@ -1707,7 +1707,7 @@ mod tests {
             ChallengeType::Uri("scp:capability:latency-compliance/v1".parse().unwrap()),
             "scp:capability:latency-compliance/v1".to_string(),
             serde_json::json!({"max_ms": 500}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         );
         assert!(result.is_ok(), "expected Ok, got {result:?}");
@@ -1731,7 +1731,7 @@ mod tests {
             ChallengeType::Uri("scp:capability:mathematical-reasoning/v1".parse().unwrap()),
             "scp:capability:mathematical-reasoning/v1".to_string(),
             serde_json::json!({"difficulty": "intermediate"}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         );
         assert!(result.is_ok(), "expected Ok, got {result:?}");
@@ -1748,7 +1748,7 @@ mod tests {
             ChallengeType::Uri("scp:capability:code-generation/v1".parse().unwrap()),
             "scp:capability:code-generation/v1".to_string(),
             serde_json::json!({"languages": ["rust", "python"]}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         );
         assert!(result.is_ok(), "expected Ok, got {result:?}");
@@ -1792,7 +1792,7 @@ mod tests {
             ChallengeType::Uri(cap_uri),
             "scp:capability:fake/v1".to_string(),
             serde_json::json!({}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         );
         assert!(result.is_err());
@@ -1819,7 +1819,7 @@ mod tests {
             ChallengeType::Uri("scp:capability:latency-compliance/v1".parse().unwrap()),
             "scp:capability:latency-compliance/v1".to_string(),
             serde_json::json!({"max_ms": "not-an-integer"}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         );
         assert!(result.is_err());
@@ -1842,7 +1842,7 @@ mod tests {
             ChallengeType::Uri("scp:capability:mathematical-reasoning/v1".parse().unwrap()),
             "scp:capability:mathematical-reasoning/v1".to_string(),
             serde_json::json!({"wrong_field": true}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         );
         assert!(result.is_err());
@@ -1865,7 +1865,7 @@ mod tests {
             ChallengeType::Uri("scp:capability:latency-compliance/v1".parse().unwrap()),
             "scp:capability:latency-compliance/v1".to_string(),
             serde_json::Value::Null,
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         );
         assert!(
@@ -1889,7 +1889,7 @@ mod tests {
             ),
             "scp:capability:prompt-injection-resistance/v1".to_string(),
             serde_json::json!({"test_vectors": ["attack1", "attack2"]}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         );
         assert!(
@@ -1913,7 +1913,7 @@ mod tests {
             ChallengeType::Uri(cap_uri),
             "scp:system:relay-operation".to_string(),
             serde_json::json!({}),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             &signer,
         );
         assert!(result.is_err());
@@ -1944,7 +1944,7 @@ mod tests {
                 ChallengeType::Uri(cap_uri),
                 system_uri.to_string(),
                 serde_json::json!({}),
-                Duration::from_secs(300),
+                Duration::from_mins(5),
                 &signer,
             );
             match result {

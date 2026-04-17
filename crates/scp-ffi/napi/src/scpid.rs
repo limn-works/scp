@@ -369,7 +369,7 @@ mod tests {
 
         // Challenge.
         let challenge =
-            scp_core::identity::scpid_challenge("https://example.com", Duration::from_secs(120))
+            scp_core::identity::scpid_challenge("https://example.com", Duration::from_mins(2))
                 .unwrap();
 
         // Sign.
@@ -384,7 +384,7 @@ mod tests {
         .unwrap();
 
         // Verify using IdentityBackedDidResolver — the same type the bridge
-        // function uses via the global DID_RESOLVER.
+        // function uses via the BridgeInstance DID resolver.
         let dual = DualLayerResolver::new(
             Arc::new(NoOpRelayQuerier),
             dht_client,

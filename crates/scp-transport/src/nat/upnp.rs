@@ -1027,7 +1027,7 @@ mod tests {
     #[tokio::test]
     async fn upnp_mapping_returns_correct_external_address() {
         let addr = test_addr();
-        let ttl = Duration::from_secs(600);
+        let ttl = Duration::from_mins(10);
         let upnp = Arc::new(MockMapper::always_ok(addr, ttl, MappingProtocol::UpnpIgd));
         let natpmp = Arc::new(MockMapper::always_fail("unused"));
         let (tx, mut rx) = mpsc::channel(16);
@@ -1049,7 +1049,7 @@ mod tests {
     #[tokio::test]
     async fn upnp_failure_falls_back_to_natpmp() {
         let addr = alt_addr();
-        let ttl = Duration::from_secs(300);
+        let ttl = Duration::from_mins(5);
         let upnp = Arc::new(MockMapper::always_fail("no UPnP gateway"));
         let natpmp = Arc::new(MockMapper::always_ok(addr, ttl, MappingProtocol::NatPmp));
         let (tx, mut rx) = mpsc::channel(16);
@@ -1264,8 +1264,8 @@ mod tests {
     #[tokio::test]
     async fn renewal_interval_is_50_percent_of_ttl() {
         assert_eq!(
-            renewal_interval(Duration::from_secs(600)),
-            Duration::from_secs(300),
+            renewal_interval(Duration::from_mins(10)),
+            Duration::from_mins(5),
         );
         assert_eq!(
             renewal_interval(Duration::from_secs(100)),
@@ -1289,7 +1289,7 @@ mod tests {
         let addr = test_addr();
         let upnp = Arc::new(MockMapper::always_ok(
             addr,
-            Duration::from_secs(600),
+            Duration::from_mins(10),
             MappingProtocol::UpnpIgd,
         ));
         let natpmp = Arc::new(MockMapper::always_fail("unused"));
@@ -1327,7 +1327,7 @@ mod tests {
     async fn try_acquire_prefers_upnp_over_natpmp() {
         let upnp_addr = test_addr();
         let natpmp_addr = alt_addr();
-        let ttl = Duration::from_secs(300);
+        let ttl = Duration::from_mins(5);
 
         let upnp = Arc::new(MockMapper::always_ok(
             upnp_addr,

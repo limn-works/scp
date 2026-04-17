@@ -51,7 +51,7 @@ impl RateLimit {
     pub const fn per_hour(count: u32) -> Self {
         Self {
             max_count: count,
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }
     }
 }

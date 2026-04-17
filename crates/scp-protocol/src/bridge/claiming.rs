@@ -483,7 +483,7 @@ mod tests {
             }),
             issued_at: 1_700_000_200,
             expires_at: Some(1_700_100_000),
-            renewal_interval: Some(Duration::from_secs(86_400)),
+            renewal_interval: Some(Duration::from_hours(24)),
             revocation_status: RevocationStatus::Active,
             signature: Vec::new(),
             renewed_at: None,
@@ -924,7 +924,7 @@ mod tests {
         assert!(json.is_ok(), "serialization should succeed");
 
         let deserialized: Result<ClaimRequest, _> =
-            serde_json::from_str(json.as_ref().map(String::as_str).unwrap_or(""));
+            serde_json::from_str(json.as_ref().map_or("", String::as_str));
         assert!(deserialized.is_ok(), "deserialization should succeed");
 
         let restored = deserialized.unwrap();
@@ -953,7 +953,7 @@ mod tests {
         assert!(json.is_ok(), "serialization should succeed");
 
         let deserialized: Result<ShadowClaimEvent, _> =
-            serde_json::from_str(json.as_ref().map(String::as_str).unwrap_or(""));
+            serde_json::from_str(json.as_ref().map_or("", String::as_str));
         assert!(deserialized.is_ok(), "deserialization should succeed");
 
         let restored = deserialized.unwrap();

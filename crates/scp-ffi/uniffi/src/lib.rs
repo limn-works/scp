@@ -308,6 +308,19 @@ pub(crate) fn decrement_handle_count() {
 /// ```
 #[uniffi::export]
 pub fn scp_shutdown(timeout_secs: u64) {
+    // Shut down the BridgeInstance first (clears registries, runs hooks,
+    // disconnects transport). Best-effort: if the instance was never
+    // initialized or is already shut down, this is a no-op.
+    //
+    // Skip in test builds: shutdown permanently poisons the OnceLock-based
+    // BridgeInstance, destroying contexts from concurrently-running tests.
+    #[cfg(not(test))]
+    if let Some(bi) = runtime::bridge_instance_raw()
+        && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bi.shutdown())).is_err()
+    {
+        tracing::error!("BridgeInstance shutdown panicked — cleanup may be incomplete");
+    }
+
     if timeout_secs == 0 {
         return;
     }

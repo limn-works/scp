@@ -226,6 +226,24 @@ pub fn scp_version() -> String {
 /// ```
 #[napi]
 pub fn scp_shutdown(timeout_secs: u32) {
+    // Shut down the BridgeInstance first (clears registries, runs hooks,
+    // disconnects transport). Best-effort: if the instance was never
+    // initialized or is already shut down, this is a no-op.
+    //
+    // Skip in test builds: shutdown permanently poisons the OnceLock-based
+    // BridgeInstance, and since cargo runs all tests in the same process,
+    // this would destroy contexts created by concurrently-running tests.
+    // Wrap in catch_unwind: during process teardown (e.g., bun test exit),
+    // MLS or tokio state may already be partially dropped, causing panics
+    // in destroy_mls_group or task abort. A panic here would abort the
+    // process with "failed to initiate panic" (double-panic).
+    #[cfg(not(test))]
+    if let Some(bi) = runtime::bridge_instance_raw()
+        && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bi.shutdown())).is_err()
+    {
+        tracing::error!("BridgeInstance shutdown panicked — cleanup may be incomplete");
+    }
+
     if timeout_secs == 0 {
         return;
     }

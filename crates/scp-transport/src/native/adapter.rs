@@ -264,7 +264,7 @@ impl NativeRelayAdapter {
             TransportProfile::Server | TransportProfile::Desktop => HeartbeatConfig::default(),
             // Mobile: 120s interval to reduce battery impact.
             TransportProfile::Mobile => HeartbeatConfig {
-                interval: std::time::Duration::from_secs(120),
+                interval: std::time::Duration::from_mins(2),
                 ..HeartbeatConfig::default()
             },
             // Constrained devices: no heartbeat monitoring (poll-based).

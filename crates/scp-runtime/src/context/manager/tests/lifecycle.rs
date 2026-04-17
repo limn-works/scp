@@ -952,7 +952,7 @@ async fn restore_respawns_ttl_timer() {
     let persistence = Arc::new(MockContextPersistence::default());
 
     let params = ContextParams {
-        ttl: Some(std::time::Duration::from_secs(300)),
+        ttl: Some(std::time::Duration::from_mins(5)),
         ceiling: vec![
             scp_protocol::context::params::Capability::new("messages:read"),
             scp_protocol::context::params::Capability::new("messages:write"),
@@ -3330,7 +3330,7 @@ async fn import_context_rejects_threshold_zero_in_rules() {
         trigger: ConsequenceTrigger::MessageVelocity,
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
         threshold: 0, // invalid — `validate()` rejects this
-        window: std::time::Duration::from_secs(60),
+        window: std::time::Duration::from_mins(1),
     });
 
     let export = c3_export_from_snapshot(snapshot);
@@ -3377,7 +3377,7 @@ async fn import_context_rejects_revokeaccess_without_config_opt_in() {
             access: AccessScope::Both,
         }),
         threshold: 3,
-        window: std::time::Duration::from_secs(3600),
+        window: std::time::Duration::from_hours(1),
     });
 
     let export = c3_export_from_snapshot(snapshot);
@@ -3411,7 +3411,7 @@ async fn import_context_clamps_cooldown_until() {
         trigger: ConsequenceTrigger::MessageVelocity,
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
         threshold: 5,
-        window: std::time::Duration::from_secs(60),
+        window: std::time::Duration::from_mins(1),
     });
     snapshot.cooldown_until.insert(0, u64::MAX);
     // Also include an out-of-range index so we exercise the drop path.
@@ -3576,7 +3576,7 @@ async fn restore_context_validates_consequence_rules() {
             access: AccessScope::Both,
         }),
         threshold: 3,
-        window: std::time::Duration::from_secs(3600),
+        window: std::time::Duration::from_hours(1),
     });
 
     persistence

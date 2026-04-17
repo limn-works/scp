@@ -1467,7 +1467,7 @@ mod tests {
         // Full (template expects Ephemeral). This should fail Phase 1
         // validation with no side effects.
         let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         params.memory_scope = MemoryScope::Full;
 
         let result = create_context(
@@ -1539,7 +1539,7 @@ mod tests {
 
         // BilateralEphemeral with required TTL should succeed.
         let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_secs(3600));
+        params.ttl = Some(Duration::from_hours(1));
 
         let result = create_context(
             "ctx-template-valid".into(),
@@ -1574,7 +1574,7 @@ mod tests {
         // for broadcast contexts. The scope validation runs before template
         // validation, so CreationFailed is the expected error.
         let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         params.mode = ContextMode::Broadcast;
 
         let result = create_context(

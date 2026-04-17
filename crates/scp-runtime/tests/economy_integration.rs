@@ -276,7 +276,7 @@ fn test_spending_capability() -> SpendingCapability {
         max_per_action: scp_protocol::crypto::ucan::spending::Amount(1000),
         max_total: scp_protocol::crypto::ucan::spending::Amount(10_000),
         currency: scp_protocol::crypto::ucan::spending::CurrencyCode::from_code("USD").unwrap(),
-        time_window: Duration::from_secs(86_400),
+        time_window: Duration::from_hours(24),
         allowed_adapters: vec!["test".to_owned()],
     }
 }

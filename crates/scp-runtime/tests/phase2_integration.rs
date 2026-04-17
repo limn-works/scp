@@ -343,7 +343,7 @@ async fn phase2_end_to_end_integration() {
             registered_at: 0,
             signature: Vec::new(),
         }],
-        ttl: Some(Duration::from_secs(300)), // 5 minutes
+        ttl: Some(Duration::from_mins(5)), // 5 minutes
         memory_scope: MemoryScope::Ephemeral,
         ..ContextParams::default()
     };
@@ -427,7 +427,7 @@ async fn phase2_end_to_end_integration() {
     append_and_hash(&mut bob_log, &context_created_event);
 
     // Verify params are correct.
-    assert_eq!(context.params().ttl, Some(Duration::from_secs(300)));
+    assert_eq!(context.params().ttl, Some(Duration::from_mins(5)));
     assert_eq!(context.params().memory_scope, MemoryScope::Ephemeral);
     assert_eq!(context.params().tools.len(), 1);
     assert_eq!(context.params().tools[0].name, "calculator");

@@ -366,7 +366,7 @@ mod tests {
                 capabilities: vec![Capability::MessagesWrite],
             }),
             threshold: 100,
-            window: std::time::Duration::from_secs(3600),
+            window: std::time::Duration::from_hours(1),
         }];
 
         let threshold_requirements = HashMap::new();

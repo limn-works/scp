@@ -51,7 +51,7 @@ const DEFAULT_REFRESH_THRESHOLD_PERCENT: u64 = 80;
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Maximum backoff delay for token refresh retries.
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
+const MAX_BACKOFF: Duration = Duration::from_mins(1);
 
 /// Maximum number of retry attempts for token refresh.
 const MAX_RETRIES: u32 = 5;

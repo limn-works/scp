@@ -54,7 +54,7 @@ const DEFAULT_DEDUP_CACHE_SIZE: usize = 10_000;
 /// the deduplication sliding window. Entries older than this duration are
 /// evicted even if the capacity has not been reached. This prevents stale
 /// entries from consuming memory in low-throughput scenarios.
-const DEFAULT_DEDUP_CACHE_TTL: Duration = Duration::from_secs(86_400);
+const DEFAULT_DEDUP_CACHE_TTL: Duration = Duration::from_hours(24);
 
 /// Transport layer configuration.
 ///
@@ -380,7 +380,7 @@ mod tests {
         assert!(config.relay_urls.is_empty());
         assert!(config.bootstrap_domain.is_none());
         assert_eq!(config.dedup_cache_size, 10_000);
-        assert_eq!(config.dedup_cache_ttl, Duration::from_secs(86_400));
+        assert_eq!(config.dedup_cache_ttl, Duration::from_hours(24));
         assert_eq!(config.max_publish_jitter_ms, 200);
     }
 

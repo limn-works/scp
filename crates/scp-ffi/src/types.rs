@@ -107,7 +107,7 @@ fn py_dict_to_json_depth(dict: &Bound<'_, PyDict>, depth: usize) -> Result<Value
                 .get_type()
                 .name()
                 .map_or_else(|_| "<unknown>".to_owned(), |n| n.to_string());
-            ScpPyError::validation(format!("dict key must be a string, got {type_name}: {e}",))
+            ScpPyError::validation(format!("dict key must be a string, got {type_name}: {e}"))
         })?;
         let json_value = py_any_to_json(&value, depth + 1)?;
         map.insert(key_str, json_value);

@@ -708,13 +708,10 @@ async fn run_node_with<
     did_method: Arc<D>,
     storage: S,
 ) {
-    let use_self_signed = env::var("SCP_NODE_TLS_SELF_SIGNED")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false);
+    let use_self_signed =
+        env::var("SCP_NODE_TLS_SELF_SIGNED").is_ok_and(|v| v == "1" || v == "true");
 
-    let use_dns_provider = env::var("SCP_NODE_DNS_PROVIDER")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false);
+    let use_dns_provider = env::var("SCP_NODE_DNS_PROVIDER").is_ok_and(|v| v == "1" || v == "true");
 
     let projection_rate: u32 = startup::env_or(
         "SCP_NODE_PROJECTION_RATE_LIMIT",

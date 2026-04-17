@@ -26,7 +26,7 @@ use tokio::time::Instant;
 
 /// Default heartbeat interval per spec 9.9.2: 60 seconds when the context has
 /// active participants.
-const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Default suppression threshold multiplier. Suppression is suspected when
 /// expected heartbeats are missing for longer than `interval * multiplier`.
@@ -260,18 +260,18 @@ mod tests {
     fn default_config_matches_spec() {
         let config = HeartbeatConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.interval, Duration::from_secs(60));
+        assert_eq!(config.interval, Duration::from_mins(1));
         assert!((config.suppression_threshold_multiplier - 2.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn suppression_threshold_is_interval_times_multiplier() {
         let config = HeartbeatConfig {
-            interval: Duration::from_secs(60),
+            interval: Duration::from_mins(1),
             suppression_threshold_multiplier: 2.0,
             ..HeartbeatConfig::default()
         };
-        assert_eq!(config.suppression_threshold(), Duration::from_secs(120));
+        assert_eq!(config.suppression_threshold(), Duration::from_mins(2));
     }
 
     #[test]
@@ -297,7 +297,7 @@ mod tests {
 
         assert!(
             monitor
-                .check_suppression(now + Duration::from_secs(300))
+                .check_suppression(now + Duration::from_mins(5))
                 .is_none()
         );
     }
@@ -310,7 +310,7 @@ mod tests {
 
         assert!(
             monitor
-                .check_suppression(now + Duration::from_secs(300))
+                .check_suppression(now + Duration::from_mins(5))
                 .is_none()
         );
     }
@@ -326,7 +326,7 @@ mod tests {
 
         assert!(
             monitor
-                .check_suppression(now + Duration::from_secs(60))
+                .check_suppression(now + Duration::from_mins(1))
                 .is_none()
         );
         assert!(
@@ -351,7 +351,7 @@ mod tests {
 
         assert_eq!(event.relay_url, "wss://relay.example.com");
         assert_eq!(event.last_received, now);
-        assert_eq!(event.expected_by, now + Duration::from_secs(120));
+        assert_eq!(event.expected_by, now + Duration::from_mins(2));
         assert_eq!(event.gap_duration, Duration::from_secs(1));
     }
 
@@ -392,7 +392,7 @@ mod tests {
             .expect("expected suppression event");
 
         assert_eq!(event.relay_url, "wss://relay.example.com");
-        assert_eq!(event.expected_by, now + Duration::from_secs(120));
+        assert_eq!(event.expected_by, now + Duration::from_mins(2));
     }
 
     #[test]
@@ -456,15 +456,15 @@ mod tests {
         assert_eq!(event1.gap_duration, Duration::from_secs(30));
 
         let event2 = monitor
-            .check_suppression(now + Duration::from_secs(180))
+            .check_suppression(now + Duration::from_mins(3))
             .expect("expected suppression");
-        assert_eq!(event2.gap_duration, Duration::from_secs(60));
+        assert_eq!(event2.gap_duration, Duration::from_mins(1));
     }
 
     #[test]
     fn custom_threshold_multiplier_changes_detection_time() {
         let config = HeartbeatConfig {
-            interval: Duration::from_secs(60),
+            interval: Duration::from_mins(1),
             suppression_threshold_multiplier: 3.0,
             ..HeartbeatConfig::default()
         };
@@ -491,17 +491,17 @@ mod tests {
 
     #[test]
     fn new_accepts_valid_multiplier() {
-        let config = HeartbeatConfig::new(Duration::from_secs(60), true, 2.0);
+        let config = HeartbeatConfig::new(Duration::from_mins(1), true, 2.0);
         assert!(config.is_ok());
         let config = config.unwrap();
-        assert_eq!(config.interval, Duration::from_secs(60));
+        assert_eq!(config.interval, Duration::from_mins(1));
         assert!(config.enabled);
         assert!((config.suppression_threshold_multiplier - 2.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn new_rejects_nan_multiplier() {
-        let result = HeartbeatConfig::new(Duration::from_secs(60), true, f64::NAN);
+        let result = HeartbeatConfig::new(Duration::from_mins(1), true, f64::NAN);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -511,31 +511,31 @@ mod tests {
 
     #[test]
     fn new_rejects_infinity_multiplier() {
-        let result = HeartbeatConfig::new(Duration::from_secs(60), true, f64::INFINITY);
+        let result = HeartbeatConfig::new(Duration::from_mins(1), true, f64::INFINITY);
         assert!(result.is_err());
     }
 
     #[test]
     fn new_rejects_negative_infinity_multiplier() {
-        let result = HeartbeatConfig::new(Duration::from_secs(60), true, f64::NEG_INFINITY);
+        let result = HeartbeatConfig::new(Duration::from_mins(1), true, f64::NEG_INFINITY);
         assert!(result.is_err());
     }
 
     #[test]
     fn new_rejects_zero_multiplier() {
-        let result = HeartbeatConfig::new(Duration::from_secs(60), true, 0.0);
+        let result = HeartbeatConfig::new(Duration::from_mins(1), true, 0.0);
         assert!(result.is_err());
     }
 
     #[test]
     fn new_rejects_negative_multiplier() {
-        let result = HeartbeatConfig::new(Duration::from_secs(60), true, -1.0);
+        let result = HeartbeatConfig::new(Duration::from_mins(1), true, -1.0);
         assert!(result.is_err());
     }
 
     #[test]
     fn new_accepts_small_positive_multiplier() {
-        let result = HeartbeatConfig::new(Duration::from_secs(60), true, 0.1);
+        let result = HeartbeatConfig::new(Duration::from_mins(1), true, 0.1);
         assert!(result.is_ok());
     }
 }

@@ -397,7 +397,7 @@ async fn challenge_request_response() {
         ct,
         uri_str,
         serde_json::json!(null),
-        Duration::from_secs(300),
+        Duration::from_mins(5),
         &signer,
     )
     .unwrap();
@@ -480,13 +480,13 @@ async fn consequence_rules_evaluation() {
                 capabilities: vec![Capability::MessagesWrite],
             }),
             threshold: 3,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         },
         ConsequenceRule {
             trigger: ConsequenceTrigger::ToolRateExceeded,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 2,
-            window: Duration::from_secs(120),
+            window: Duration::from_mins(2),
         },
     ];
 

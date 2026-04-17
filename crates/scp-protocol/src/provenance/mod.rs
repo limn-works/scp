@@ -278,7 +278,7 @@ mod tests {
             counterparties: vec!["did:dht:z6MkAlice".into(), "did:dht:z6MkBob".into()],
             purpose: Some("recipe sharing".to_string()),
             discovery_method: DiscoveryMethod::SharedContext("ctx-shared".to_string()),
-            age: Duration::from_secs(300),
+            age: Duration::from_mins(5),
             memory_scope: MemoryScope::Full,
             chain_depth: 0,
             chain_path: None,
@@ -304,7 +304,7 @@ mod tests {
             counterparties: vec!["did:dht:z6MkCharlie".into()],
             purpose: None,
             discovery_method: DiscoveryMethod::Registry("ctx-registry".to_string()),
-            age: Duration::from_secs(600),
+            age: Duration::from_mins(10),
             memory_scope: MemoryScope::Ephemeral,
             chain_depth: 2,
             chain_path: Some(vec!["ctx-hop-1".to_string(), "ctx-hop-2".to_string()]),
@@ -457,7 +457,7 @@ mod tests {
         assert!(json.is_ok(), "serialization should succeed");
 
         let deserialized: Result<DataProvenance, _> =
-            serde_json::from_str(json.as_ref().map(String::as_str).unwrap_or(""));
+            serde_json::from_str(json.as_ref().map_or("", String::as_str));
         assert!(deserialized.is_ok(), "deserialization should succeed");
 
         let roundtripped = deserialized.unwrap_or_else(|_| panic!("deserialization failed"));
@@ -481,7 +481,7 @@ mod tests {
                 "serialization of {source_type:?} should succeed"
             );
             let deserialized: Result<SourceType, _> =
-                serde_json::from_str(json.as_ref().map(String::as_str).unwrap_or(""));
+                serde_json::from_str(json.as_ref().map_or("", String::as_str));
             assert!(
                 deserialized.is_ok(),
                 "deserialization of {source_type:?} should succeed"
@@ -501,7 +501,7 @@ mod tests {
             let json = serde_json::to_string(&method);
             assert!(json.is_ok(), "serialization of {method:?} should succeed");
             let deserialized: Result<DiscoveryMethod, _> =
-                serde_json::from_str(json.as_ref().map(String::as_str).unwrap_or(""));
+                serde_json::from_str(json.as_ref().map_or("", String::as_str));
             assert!(
                 deserialized.is_ok(),
                 "deserialization of {method:?} should succeed"
@@ -522,7 +522,7 @@ mod tests {
             let json = serde_json::to_string(&quality);
             assert!(json.is_ok(), "serialization of {quality:?} should succeed");
             let deserialized: Result<ProvenanceQuality, _> =
-                serde_json::from_str(json.as_ref().map(String::as_str).unwrap_or(""));
+                serde_json::from_str(json.as_ref().map_or("", String::as_str));
             assert!(
                 deserialized.is_ok(),
                 "deserialization of {quality:?} should succeed"

@@ -374,7 +374,7 @@ mod tests {
 
         // Challenge.
         let challenge =
-            scp_core::identity::scpid_challenge("https://example.com", Duration::from_secs(120))
+            scp_core::identity::scpid_challenge("https://example.com", Duration::from_mins(2))
                 .unwrap();
 
         // Sign.
@@ -389,7 +389,7 @@ mod tests {
         .unwrap();
 
         // Verify using IdentityBackedDidResolver — the same type the bridge
-        // function uses via the global DID_RESOLVER. This validates that the
+        // function uses via the BridgeInstance DID resolver. This validates that the
         // `scp_identity::resolver::DidResolver` impl on
         // `IdentityBackedDidResolver` works end-to-end.
         let dual = DualLayerResolver::new(
@@ -412,8 +412,8 @@ mod tests {
 
     /// Exercises the bridge `py_scpid_verify` error path with malformed JSON.
     /// The bridge function cannot be called with valid data in unit tests
-    /// (requires `PyO3` GIL + global DID resolver initialization), but we can
-    /// verify it returns the correct error code for invalid input.
+    /// (requires `PyO3` GIL + `BridgeInstance` DID resolver initialization),
+    /// but we can verify it returns the correct error code for invalid input.
     #[test]
     fn py_scpid_verify_rejects_malformed_response_json() {
         pyo3::prepare_freethreaded_python();

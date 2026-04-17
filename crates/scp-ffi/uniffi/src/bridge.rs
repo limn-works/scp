@@ -1944,10 +1944,12 @@ impl Drop for UcanToken {
 
 /// Opaque handle to the transport layer.
 ///
-/// Wraps a real [`scp_transport::TransportManager`] that supports multi-relay
-/// routing, per-context relay set assignment, suppression detection, and
-/// reliability scoring (ADR-012). Swift/Kotlin callers get the full multi-relay
-/// API: `addRelay`, `assignRelaySet`, `adapterCount`, `reliabilityScore`.
+/// Wraps a real [`scp_transport::TransportManager`] that is stored in the
+/// shared [`BridgeInstance`]. This handle provides Swift/Kotlin callers with
+/// the full multi-relay API: `addRelay`, `assignRelaySet`, `adapterCount`,
+/// `reliabilityScore`. All operations delegate to the `BridgeInstance`'s
+/// transport slot, so `suspend()` / `shutdown()` lifecycle events
+/// automatically clear the transport.
 ///
 /// Generated as `class TransportManager` in both Swift and Kotlin.
 ///
@@ -1956,18 +1958,16 @@ impl Drop for UcanToken {
 pub struct TransportManager {
     /// Current connection state (relay URL, latency).
     pub(crate) status: std::sync::Mutex<TransportStatus>,
-    /// The real multi-relay transport manager.
-    /// Wrapped in `RwLock` for concurrent read access (status, adapter count)
-    /// with exclusive write access (add relay, disconnect).
-    pub(crate) inner: std::sync::RwLock<scp_transport::TransportManager>,
 }
 
 impl fmt::Debug for TransportManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let adapter_count = self
-            .inner
-            .read()
-            .map(|mgr| mgr.adapter_count())
+        let adapter_count = crate::runtime::bridge_instance()
+            .ok()
+            .and_then(|bi| {
+                bi.with_transport(scp_transport::TransportManager::adapter_count)
+                    .ok()
+            })
             .unwrap_or(0);
         f.debug_struct("TransportManager")
             .field("adapter_count", &adapter_count)
@@ -2004,20 +2004,18 @@ impl TransportManager {
     /// Reflects actual connection state: `connected` is `true` only if the
     /// inner transport manager has at least one adapter registered.
     pub fn status(&self) -> TransportStatus {
-        let has_adapters = self
-            .inner
-            .read()
-            .map(|mgr| mgr.adapter_count() > 0)
+        let has_adapters = crate::runtime::bridge_instance()
+            .ok()
+            .and_then(|bi| bi.with_transport(|mgr| mgr.adapter_count() > 0).ok())
             .unwrap_or(false);
-        let status = self
-            .status
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or(TransportStatus {
+        let status = self.status.lock().map_or(
+            TransportStatus {
                 connected: false,
                 relay_url: None,
                 latency_ms: None,
-            });
+            },
+            |s| s.clone(),
+        );
         TransportStatus {
             connected: has_adapters && status.connected,
             relay_url: if has_adapters { status.relay_url } else { None },
@@ -2027,18 +2025,18 @@ impl TransportManager {
 
     /// Returns `true` if the transport is currently connected (has adapters).
     pub fn is_connected(&self) -> bool {
-        self.inner
-            .read()
-            .map(|mgr| mgr.adapter_count() > 0)
+        crate::runtime::bridge_instance()
+            .ok()
+            .and_then(|bi| bi.with_transport(|mgr| mgr.adapter_count() > 0).ok())
             .unwrap_or(false)
     }
 
     /// Returns the number of adapters registered in the transport manager.
     #[allow(clippy::cast_possible_truncation)] // Adapter count is bounded by connection budget (<<u32::MAX).
     pub fn adapter_count(&self) -> u32 {
-        self.inner
-            .read()
-            .map(|mgr| mgr.adapter_count() as u32)
+        crate::runtime::bridge_instance()
+            .ok()
+            .and_then(|bi| bi.with_transport(|mgr| mgr.adapter_count() as u32).ok())
             .unwrap_or(0)
     }
 
@@ -2061,6 +2059,7 @@ impl TransportManager {
 
         validate_relay_url(&relay_url)?;
 
+        let bi = crate::runtime::bridge_instance()?;
         let rt = runtime();
         let sourced = SourcedRelayUrl {
             url: relay_url.clone(),
@@ -2079,18 +2078,22 @@ impl TransportManager {
         // events and downgrades the relay's reliability score (#1533 AC5).
         let suppression_rx = adapter.take_suppression_receiver();
 
-        let mut mgr = self.inner.write().map_err(|_| ScpError::Transport {
-            msg: "transport manager lock is poisoned".to_owned(),
-            code: codes::TRANS_5003.to_owned(),
-        })?;
-        let _eviction = mgr.add_adapter(Box::new(adapter));
-        #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
-        let count = mgr.adapter_count() as u32;
-        drop(mgr);
+        let count = bi
+            .with_transport_mut(|mgr| {
+                let _eviction = mgr.add_adapter(Box::new(adapter));
+                #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
+                let count = mgr.adapter_count() as u32;
+                count
+            })
+            .map_err(|e| ScpError::Transport {
+                msg: e.to_string(),
+                code: codes::TRANS_5003.to_owned(),
+            })?;
 
         // Spawn suppression → scoring bridge task.
+        // Uses BridgeInstance transport for score updates.
         if let Some(rx) = suppression_rx {
-            spawn_suppression_scoring_task(rx, relay_url, Arc::downgrade(&self));
+            spawn_suppression_scoring_task(rx, relay_url);
         }
 
         Ok(count)
@@ -2114,16 +2117,19 @@ impl TransportManager {
     /// Returns `ScpError::Transport` if no adapters are registered.
     pub fn assign_relay_set(&self, context_id: String) -> Result<Vec<u32>, ScpError> {
         validate_context_id(&context_id)?;
-        let mgr = self.inner.read().map_err(|_| ScpError::Transport {
-            msg: "transport manager lock is poisoned".to_owned(),
-            code: codes::TRANS_5003.to_owned(),
-        })?;
-        let indices = mgr
-            .assign_relay_set(&context_id)
+        let bi = crate::runtime::bridge_instance()?;
+        let indices = bi
+            .with_transport(|mgr| {
+                mgr.assign_relay_set(&context_id)
+                    .map_err(|e| ScpError::Transport {
+                        msg: format!("relay set assignment failed: {e}"),
+                        code: codes::TRANS_5004.to_owned(),
+                    })
+            })
             .map_err(|e| ScpError::Transport {
-                msg: format!("relay set assignment failed: {e}"),
-                code: codes::TRANS_5004.to_owned(),
-            })?;
+                msg: e.to_string(),
+                code: codes::TRANS_5003.to_owned(),
+            })??;
         #[allow(clippy::cast_possible_truncation)] // Adapter indices bounded by adapter count.
         Ok(indices.into_iter().map(|i| i as u32).collect())
     }
@@ -2136,8 +2142,10 @@ impl TransportManager {
     ///
     /// * `adapter_index` -- The adapter index (0-based) to query.
     pub fn reliability_score(&self, adapter_index: u32) -> Option<ReliabilityScoreRecord> {
-        let mgr = self.inner.read().ok()?;
-        let score = mgr.get_reliability_score(adapter_index as usize)?;
+        let bi = crate::runtime::bridge_instance().ok()?;
+        let score = bi
+            .with_transport(|mgr| mgr.get_reliability_score(adapter_index as usize))
+            .ok()??;
         Some(ReliabilityScoreRecord {
             relay_url: score.relay_url.clone(),
             delivery_success_rate: score.delivery_success_rate,
@@ -2173,26 +2181,25 @@ impl Drop for TransportManager {
 /// #1533 AC5). Each suppression event downgrades the relay's reliability
 /// score via `DeliveryOutcome::Failure`.
 ///
-/// Uses a `Weak` reference so the task exits gracefully when the
-/// `TransportManager` is dropped (no prevent-drop cycles).
+/// Accesses the transport via `BridgeInstance` — the task exits gracefully
+/// when the bridge is shut down or the transport is cleared.
 fn spawn_suppression_scoring_task(
     mut rx: tokio::sync::mpsc::Receiver<scp_transport::heartbeat::SuppressionSuspected>,
     relay_url: String,
-    manager: std::sync::Weak<TransportManager>,
 ) {
     tokio::spawn(async move {
         while let Some(_suppression) = rx.recv().await {
-            let Some(mgr) = manager.upgrade() else {
-                // TransportManager dropped — exit gracefully.
+            let Ok(bi) = crate::runtime::bridge_instance() else {
+                // Bridge shut down — exit gracefully.
                 break;
             };
             tracing::debug!(
                 relay_url = %relay_url,
                 "heartbeat suppression → downgrading relay reliability score"
             );
-            if let Ok(inner) = mgr.inner.read() {
+            let _ = bi.with_transport(|inner| {
                 inner.update_score(&relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
-            }
+            });
         }
         tracing::debug!(
             relay_url = %relay_url,
@@ -2314,6 +2321,7 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
 
                         // Initialize the production DID resolver for UCAN
                         // validation (H4 — matching PyO3/NAPI behavior).
+                        crate::runtime::ensure_bridge_instance();
                         ensure_did_resolver_initialized(tokio::runtime::Handle::current())?;
 
                         let handle = Arc::new(Identity {
@@ -2400,6 +2408,9 @@ pub async fn identity_create_with_custody(
                 .await
                 .map_err(ScpError::from)?;
 
+            // Ensure BridgeInstance exists so init_did_resolver can store the
+            // resolver. This matches the PyO3/NAPI identity_create pattern.
+            crate::runtime::ensure_bridge_instance();
             // Initialize the production DID resolver for UCAN validation.
             ensure_did_resolver_initialized(tokio::runtime::Handle::current())?;
 
@@ -2698,7 +2709,7 @@ fn identity_link_attestation_registry()
 /// up the issuer's public key without requiring the caller to pass the
 /// Identity object.
 #[cfg(feature = "allow_in_memory_custody")]
-fn identity_custody_registry()
+pub(crate) fn identity_custody_registry()
 -> &'static dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
     static REGISTRY: std::sync::OnceLock<
         dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)>,
@@ -3347,9 +3358,11 @@ pub async fn context_close(
             // Clean up per-context UCAN state.
             crate::runtime::remove_ucan_state(&handle.context_id);
 
-            // Clean up per-context bridge connector state (ShadowRegistry + SenderKeyStore)
-            // to prevent unbounded memory growth in long-running processes.
-            remove_bridge_state(&handle.context_id);
+            // Clean up per-context bridge connector state and economy state via BridgeInstance.
+            if let Ok(bi) = crate::runtime::bridge_instance() {
+                bi.remove_bridge_state(&handle.context_id);
+                bi.remove_economy_state(&handle.context_id);
+            }
 
             // Deregister the context handle from the MCP lookup registry.
             deregister_context_handle(&handle.context_id);
@@ -3663,8 +3676,7 @@ pub async fn tool_register(
                 cost,
                 registered_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+                    .map_or(0, |d| d.as_secs()),
                 signature: Vec::new(),
             };
 
@@ -4752,19 +4764,43 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
             // reliability scoring, and suppression detection.
             let manager = scp_transport::TransportManager::new(Box::new(adapter));
 
+            // Store the transport manager in BridgeInstance so that
+            // suspend()/shutdown() lifecycle events automatically clear it.
+            // The BridgeInstance container has no DID requirement (spec
+            // §12.2.3) — ensure it exists, and attach the ContextManager if
+            // one is already available.
+            let bi = if let Ok(bi) = crate::runtime::bridge_instance() {
+                bi
+            } else {
+                if let Ok(cm) = crate::runtime::context_manager() {
+                    crate::runtime::attach_context_manager_to_bridge(cm.clone());
+                } else {
+                    crate::runtime::ensure_bridge_instance();
+                }
+                crate::runtime::bridge_instance().map_err(|_| ScpError::Context {
+                    msg: "bridge not initialized — call identity_create before transport_connect"
+                        .to_owned(),
+                    code: codes::CTX_2000.to_owned(),
+                })?
+            };
+            bi.set_transport(std::sync::Arc::new(manager))
+                .map_err(|e| ScpError::Transport {
+                    msg: e.to_string(),
+                    code: codes::TRANS_5002.to_owned(),
+                })?;
+
             let handle = Arc::new(TransportManager {
                 status: std::sync::Mutex::new(TransportStatus {
                     connected: true,
                     relay_url: Some(relay_url.clone()),
                     latency_ms: None,
                 }),
-                inner: std::sync::RwLock::new(manager),
             });
             increment_handle_count();
 
             // Spawn suppression → scoring bridge task.
             if let Some(rx) = suppression_rx {
-                spawn_suppression_scoring_task(rx, relay_url, Arc::downgrade(&handle));
+                spawn_suppression_scoring_task(rx, relay_url);
             }
 
             Ok(handle)
@@ -4808,16 +4844,14 @@ pub async fn transport_status(manager: Arc<TransportManager>) -> Result<Transpor
 pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), ScpError> {
     runtime()
         .spawn(async move {
-            // Replace the inner manager with an empty one, dropping all adapters.
-            {
-                let mut inner_guard = manager.inner.write().map_err(|_| ScpError::Transport {
-                    msg: "transport manager lock is poisoned — cannot disconnect".to_owned(),
-                    code: codes::TRANS_5003.to_owned(),
-                })?;
-                *inner_guard = scp_transport::TransportManager::builder();
-            }
+            // Clear the transport from BridgeInstance, dropping all adapters.
+            let bi = crate::runtime::bridge_instance()?;
+            bi.clear_transport().map_err(|e| ScpError::Transport {
+                msg: e.to_string(),
+                code: codes::TRANS_5003.to_owned(),
+            })?;
 
-            // Update the status to disconnected.
+            // Update the handle's status to disconnected.
             {
                 let mut status_guard = manager.status.lock().map_err(|_| ScpError::Transport {
                     msg: "status mutex is poisoned — cannot update transport status".to_owned(),
@@ -5030,6 +5064,16 @@ fn mcp_client_registry() -> &'static dashmap::DashMap<String, McpClientEntry> {
 
 fn mcp_handle_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
+}
+
+/// Clears both MCP server and client registries during shutdown.
+///
+/// Called by the shutdown hook registered in `crate::runtime::init_bridge_instance_empty`.
+/// This ensures server shutdown senders and client connections are dropped,
+/// allowing background tasks to terminate cleanly.
+pub(crate) fn clear_mcp_registries() {
+    mcp_server_registry().clear();
+    mcp_client_registry().clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -9381,7 +9425,7 @@ pub fn trust_create_challenge(target_did: String) -> Result<ChallengeResult, Scp
         scp_core::trust::ChallengeType::schema_validation(),
         "scp:capability:schema-validation/v1".to_string(),
         serde_json::json!({}),
-        std::time::Duration::from_secs(300),
+        std::time::Duration::from_mins(5),
         &signer,
     )
     .map_err(|e| ScpError::Validation {
@@ -11219,6 +11263,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
                             .map_err(ScpError::from)?;
 
                         // Initialize the production DID resolver for UCAN validation.
+                        crate::runtime::ensure_bridge_instance();
                         ensure_did_resolver_initialized(tokio::runtime::Handle::current())?;
 
                         let handle = Arc::new(Identity {
@@ -11514,12 +11559,10 @@ pub fn sync_get_policy() -> SyncPolicyResult {
 // Bridge connector — register and create shadow (#421)
 // ---------------------------------------------------------------------------
 //
-// `BridgeContextState`, `bridge_state_registry()`, and `remove_bridge_state()`
-// are defined in `scp_ffi_common::bridge_state`.
+// `BridgeContextState` type is defined in `scp_ffi_common::bridge_state`.
+// Per-context state is owned by `BridgeInstance::bridge_state`.
 
-use scp_ffi_common::bridge_state::{
-    BridgeContextState, bridge_state_registry, remove_bridge_state,
-};
+use scp_ffi_common::bridge_state::BridgeContextState;
 
 /// Bridge registration result record.
 ///
@@ -11753,8 +11796,9 @@ pub fn bridge_create_shadow(
         timestamp: 0,
     };
 
-    let registry = bridge_state_registry();
-    let mut entry = registry
+    let bi = crate::runtime::bridge_instance()?;
+    let mut entry = bi
+        .bridge_state()
         .entry(context_id.clone())
         .or_insert_with(|| BridgeContextState {
             shadow_registry: scp_core::bridge::shadow::ShadowRegistry::new(context_id),
@@ -12627,8 +12671,8 @@ pub fn economy_evaluate_formula(
 pub fn economy_budget_remaining(context_id: String, did: String) -> Result<u64, ScpError> {
     validate_did(&did)?;
     let member_did = scp_identity::DID::from(did.as_str());
-    let remaining =
-        crate::runtime::with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
+    let remaining = crate::runtime::bridge_instance()?
+        .with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
     Ok(remaining.value())
 }
 
@@ -12637,7 +12681,7 @@ pub fn economy_budget_remaining(context_id: String, did: String) -> Result<u64, 
 pub fn economy_budget_grant(context_id: String, did: String, amount: u64) -> Result<(), ScpError> {
     validate_did(&did)?;
     let member_did = scp_identity::DID::from(did.as_str());
-    crate::runtime::with_economy_budget_mut(&context_id, |tracker| {
+    crate::runtime::bridge_instance()?.with_economy_budget_mut(&context_id, |tracker| {
         tracker.grant(&member_did, scp_core::economy::Amount::new(amount));
     });
     Ok(())
@@ -12652,7 +12696,7 @@ pub fn economy_budget_record_spend(
 ) -> Result<(), ScpError> {
     validate_did(&did)?;
     let member_did = scp_identity::DID::from(did.as_str());
-    crate::runtime::with_economy_budget_mut(&context_id, |tracker| {
+    crate::runtime::bridge_instance()?.with_economy_budget_mut(&context_id, |tracker| {
         tracker
             .record_spend(&member_did, scp_core::economy::Amount::new(amount))
             .map_err(|e| ScpError::Validation {
@@ -12671,7 +12715,7 @@ pub fn economy_antispam_record(
 ) -> Result<(), ScpError> {
     validate_did(&sender_did)?;
     let did = scp_identity::DID::from(sender_did.as_str());
-    crate::runtime::with_economy_antispam(&context_id, |tracker| {
+    crate::runtime::bridge_instance()?.with_economy_antispam(&context_id, |tracker| {
         tracker.record_message(&did, timestamp);
     });
     Ok(())
@@ -12686,9 +12730,8 @@ pub fn economy_antispam_velocity(
 ) -> Result<u64, ScpError> {
     validate_did(&sender_did)?;
     let did = scp_identity::DID::from(sender_did.as_str());
-    let velocity = crate::runtime::with_economy_antispam(&context_id, |tracker| {
-        tracker.get_velocity(&did, now)
-    });
+    let velocity = crate::runtime::bridge_instance()?
+        .with_economy_antispam(&context_id, |tracker| tracker.get_velocity(&did, now));
     Ok(velocity)
 }
 
@@ -12722,7 +12765,7 @@ pub fn economy_antispam_escalated_cost(
     };
 
     let did = scp_identity::DID::from(sender_did.as_str());
-    let cost = crate::runtime::with_economy_antispam(&context_id, |tracker| {
+    let cost = crate::runtime::bridge_instance()?.with_economy_antispam(&context_id, |tracker| {
         tracker.compute_escalated_cost(
             &did,
             now,
@@ -13183,7 +13226,7 @@ mod tests {
             discovery_method: scp_core::provenance::DiscoveryMethod::Registry(
                 "ctx-reg".to_string(),
             ),
-            age: std::time::Duration::from_secs(600),
+            age: std::time::Duration::from_mins(10),
             memory_scope: scp_core::context::MemoryScope::Summary,
             chain_depth: 1,
             chain_path: Some(vec!["ctx-mid".to_string()]),
@@ -13890,7 +13933,7 @@ mod tests {
         dht.publish(&identity, &doc).await.unwrap();
 
         // Challenge.
-        let challenge = core_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = core_challenge("https://example.com", Duration::from_mins(2)).unwrap();
 
         // Sign.
         let response = core_sign(
@@ -13904,7 +13947,7 @@ mod tests {
         .unwrap();
 
         // Verify using IdentityBackedDidResolver — the same type the bridge
-        // function uses via the global DID_RESOLVER.
+        // function uses via the BridgeInstance DID resolver.
         let dual = DualLayerResolver::new(
             Arc::new(NoOpRelayQuerier),
             dht_client,

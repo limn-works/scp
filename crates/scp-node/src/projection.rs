@@ -530,8 +530,7 @@ impl ProjectionUcanCache {
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         self.revoked.retain(|_, &mut exp| exp + 300 >= now);
     }
 }
@@ -700,8 +699,7 @@ impl ProjectedContext {
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         self.revoked_tokens.retain(|_, &mut exp| exp + 300 >= now);
     }
 
@@ -5549,7 +5547,7 @@ mod tests {
         );
         let sig = signing_key.sign(signing_input.as_bytes());
 
-        let token = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()),);
+        let token = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
 
         let mut member_keys = HashMap::new();
         member_keys.insert(issuer_did, pk);

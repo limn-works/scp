@@ -69,11 +69,12 @@ use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 ///
 /// Uses `std::sync::Once` to guard the entire initialization block atomically.
 /// Without this, two separate `OnceLock::set` calls (`SHARED_DHT_CLIENT` and
-/// `DID_RESOLVER`) could race under concurrent access: thread A creates
-/// `InMemoryDhtClient` X and sets `SHARED_DHT_CLIENT`, then thread B creates
-/// `InMemoryDhtClient` Y, fails to set `SHARED_DHT_CLIENT` (already set to X),
-/// but builds a `DualLayerResolver` around Y and sets `DID_RESOLVER` — the
-/// resolver and the shared DHT client would reference different instances.
+/// `BridgeInstance::did_resolver`) could race under concurrent access: thread A
+/// creates `InMemoryDhtClient` X and sets `SHARED_DHT_CLIENT`, then thread B
+/// creates `InMemoryDhtClient` Y, fails to set `SHARED_DHT_CLIENT` (already set
+/// to X), but builds a `DualLayerResolver` around Y and stores it in
+/// `BridgeInstance` — the resolver and the shared DHT client would reference
+/// different instances.
 fn ensure_did_resolver_initialized() {
     static INIT: std::sync::Once = std::sync::Once::new();
 
@@ -898,6 +899,14 @@ pub struct NapiDIDDocument {
 pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
     validate_custody_type(&custody).map_err(NapiError::from)?;
 
+    // Ensure the BridgeInstance exists BEFORE the DID resolver is
+    // initialized — the DID resolver is stored inside the BridgeInstance and
+    // cannot be registered otherwise. The real ContextManager is attached
+    // later (by init_context_manager) once the identity has been created.
+    // Per spec §12.2.3 the BridgeInstance container carries no DID; the
+    // DID lives inside the MlsCryptoProvider owned by the ContextManager.
+    crate::runtime::ensure_bridge_instance();
+
     // Ensure the global DID resolver is initialized (idempotent). #311
     ensure_did_resolver_initialized();
 
@@ -1002,6 +1011,10 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
 #[allow(clippy::unused_async)] // napi requires async for Promise return type
 pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<NapiIdentity> {
     validate_custody_type(&custody).map_err(NapiError::from)?;
+
+    // Ensure the BridgeInstance exists BEFORE the DID resolver is
+    // initialized. See `identity_create` for the full rationale.
+    crate::runtime::ensure_bridge_instance();
 
     // Ensure the global DID resolver is initialized (idempotent). #311
     ensure_did_resolver_initialized();

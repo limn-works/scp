@@ -11,7 +11,7 @@ publish = false
 default = ["resolvers"]
 # Full resolver implementations (BridgeDidResolver, IdentityBackedDidResolver, etc.).
 # Requires scp-core, scp-identity, tokio. Disable for WASM (which only needs validate).
-resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:tokio", "dep:tracing"]
+resolvers = ["dep:scp-core", "dep:scp-identity", "dep:scp-event-log", "dep:scp-transport", "dep:tokio", "dep:tracing"]
 # Enables the did:key:{hex} DID format in BridgeDidResolver. This is a
 # non-standard test convenience — production builds must resolve via did:dht:z.
 testing = ["resolvers"]

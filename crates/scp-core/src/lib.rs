@@ -73,6 +73,7 @@ pub mod context {
         NotConfiguredTransportProvider,
     };
     pub use scp_runtime::context::manager::ContextManager;
+    pub use scp_runtime::context::manager::ContextPersistence;
     // Broadcast content types (previously at context level).
     pub use scp_protocol::context::broadcast_content::{
         BROADCAST_CONTENT_MAGIC, BROADCAST_CONTENT_VERSION, BroadcastContent,

@@ -644,8 +644,8 @@ impl ContextManager {
 
         // Evaluate cost — zero cost means no payment needed.
         if scp_protocol::economy::policy::evaluate_cost(&policy, &action_type, &metrics)
-            .filter(|c| c.0 > 0)
-            .is_none()
+            .as_ref()
+            .is_none_or(|c| c.0 == 0)
         {
             return Ok(None);
         }

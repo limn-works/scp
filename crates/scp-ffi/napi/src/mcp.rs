@@ -154,6 +154,16 @@ fn mcp_handle_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
 
+/// Clears both MCP server and client registries during shutdown.
+///
+/// Called by the shutdown hook registered in `crate::runtime::init_bridge_instance_empty`.
+/// This ensures server shutdown senders and client connections are dropped,
+/// allowing background tasks to terminate cleanly.
+pub(crate) fn clear_registries() {
+    mcp_server_registry().clear();
+    mcp_client_registry().clear();
+}
+
 // ---------------------------------------------------------------------------
 // Transport implementations
 // ---------------------------------------------------------------------------

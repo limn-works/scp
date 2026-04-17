@@ -623,7 +623,7 @@ mod tests {
         assert!(json.is_ok(), "serialization should succeed");
 
         let deserialized: Result<BridgeProvenance, _> =
-            serde_json::from_str(json.as_ref().map(String::as_str).unwrap_or(""));
+            serde_json::from_str(json.as_ref().map_or("", String::as_str));
         assert!(deserialized.is_ok(), "deserialization should succeed");
 
         let restored = deserialized.unwrap();
@@ -649,7 +649,7 @@ mod tests {
             assert!(json.is_ok(), "serialization of {level:?} should succeed");
 
             let deserialized: Result<BridgeTrustLevel, _> =
-                serde_json::from_str(json.as_ref().map(String::as_str).unwrap_or(""));
+                serde_json::from_str(json.as_ref().map_or("", String::as_str));
             assert!(
                 deserialized.is_ok(),
                 "deserialization of {level:?} should succeed"

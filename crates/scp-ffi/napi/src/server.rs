@@ -81,11 +81,11 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
         Ok(adapter) => {
             crate::runtime::init_context_manager_with_relay_transport(did, adapter);
 
-            // Also populate the TRANSPORT_MANAGER global so that broadcast
-            // publish, context subscribe, and discovery probing work without
-            // a separate `transportConnect` call. This requires a second
-            // WebSocket connection because NativeRelayAdapter is not Clone
-            // and the first was consumed by RelayTransportProvider.
+            // Also populate the BridgeInstance transport manager so that
+            // broadcast publish, context subscribe, and discovery probing
+            // work without a separate `transportConnect` call. This requires
+            // a second WebSocket connection because NativeRelayAdapter is not
+            // Clone and the first was consumed by RelayTransportProvider.
             match scp_transport::native::NativeRelayAdapter::connect_sourced_with_bearer(
                 &sourced,
                 Some(token2),
@@ -103,8 +103,8 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
                         error = %e,
                         relay_url = %relay_url,
                         "auto_wire_context_manager: ContextManager wired but failed to \
-                         populate TRANSPORT_MANAGER — broadcast publish and discovery may \
-                         require a manual transportConnect call"
+                         populate BridgeInstance transport manager — broadcast publish and \
+                         discovery may require a manual transportConnect call"
                     );
                 }
             }

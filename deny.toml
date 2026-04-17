@@ -46,6 +46,10 @@ ignore = [
     # rustls-webpki CRL distribution point logic — transitive dep via aws-smithy-http-client
     # -> rustls 0.21 -> rustls-webpki 0.101.7. Fix requires >=0.103.10 but AWS SDK pins 0.101.x.
     "RUSTSEC-2026-0049",
+    # rustls-webpki: name constraints accepted for wildcard certs. Transitive
+    # dep via aws-sdk -> rustls -> rustls-webpki. Awaiting upstream patch.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
     # libcrux-ed25519: all-zero key on catastrophic RNG failure. Transitive via
     # openmls -> openmls_libcrux_crypto. Awaiting openmls upgrade.
     "RUSTSEC-2026-0075",

@@ -1095,7 +1095,7 @@ mod tests {
     #[test]
     fn validate_bilateral_ephemeral_with_ttl_passes() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_secs(3600));
+        params.ttl = Some(Duration::from_hours(1));
         assert!(validate_against_template(&params).is_ok());
     }
 
@@ -1108,7 +1108,7 @@ mod tests {
     #[test]
     fn validate_coordination_with_ttl_passes() {
         let mut params = template_params(&TemplateId::Coordination);
-        params.ttl = Some(Duration::from_secs(7200));
+        params.ttl = Some(Duration::from_hours(2));
         assert!(validate_against_template(&params).is_ok());
     }
 
@@ -1121,7 +1121,7 @@ mod tests {
     #[test]
     fn validate_group_discussion_with_ttl_passes() {
         let mut params = template_params(&TemplateId::GroupDiscussion);
-        params.ttl = Some(Duration::from_secs(86400));
+        params.ttl = Some(Duration::from_hours(24));
         assert!(validate_against_template(&params).is_ok());
     }
 
@@ -1159,7 +1159,7 @@ mod tests {
     #[test]
     fn validate_bilateral_persistent_with_ttl_returns_ttl_forbidden() {
         let mut params = template_params(&TemplateId::BilateralPersistent);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(err, TemplateError::TtlForbidden { .. }));
     }
@@ -1167,14 +1167,14 @@ mod tests {
     #[test]
     fn validate_public_broadcast_with_ttl_passes() {
         let mut params = template_params(&TemplateId::PublicBroadcast);
-        params.ttl = Some(Duration::from_secs(600));
+        params.ttl = Some(Duration::from_mins(10));
         assert!(validate_against_template(&params).is_ok());
     }
 
     #[test]
     fn validate_gated_broadcast_with_ttl_passes() {
         let mut params = template_params(&TemplateId::GatedBroadcast);
-        params.ttl = Some(Duration::from_secs(600));
+        params.ttl = Some(Duration::from_mins(10));
         assert!(validate_against_template(&params).is_ok());
     }
 
@@ -1185,7 +1185,7 @@ mod tests {
     #[test]
     fn validate_rejects_wrong_mode() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         params.mode = ContextMode::Broadcast;
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(err, TemplateError::Mismatch { field: "mode", .. }));
@@ -1194,7 +1194,7 @@ mod tests {
     #[test]
     fn validate_rejects_wrong_ceiling() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         params.ceiling.push(Capability::new(CAP_TOOL_INVOKE_ALL));
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
@@ -1209,7 +1209,7 @@ mod tests {
     #[test]
     fn validate_rejects_wrong_ceiling_policy() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         params.ceiling_policy = CeilingPolicy::Governed;
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
@@ -1224,7 +1224,7 @@ mod tests {
     #[test]
     fn validate_rejects_wrong_promotion_policy() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         params.promotion_policy = PromotionPolicy::Promotable;
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
@@ -1239,7 +1239,7 @@ mod tests {
     #[test]
     fn validate_rejects_wrong_memory_scope() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         params.memory_scope = MemoryScope::Full;
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
@@ -1254,7 +1254,7 @@ mod tests {
     #[test]
     fn validate_rejects_empty_ceiling_for_template() {
         let mut params = template_params(&TemplateId::Coordination);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         params.ceiling = Vec::new();
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
@@ -1273,7 +1273,7 @@ mod tests {
     #[test]
     fn validate_accepts_ceiling_in_different_order() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         // Reverse the ceiling order
         params.ceiling = vec![
             Capability::new(CAP_MEMBER_BAN),
@@ -1453,7 +1453,7 @@ mod tests {
     fn validate_rejects_coordination_params_with_bilateral_template_id() {
         // Coordination has 3 ceiling caps but BilateralEphemeral expects 2.
         let mut params = template_params(&TemplateId::Coordination);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         params.template_id = Some(TemplateId::BilateralEphemeral);
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(err, TemplateError::Mismatch { .. }));
@@ -1547,7 +1547,7 @@ mod tests {
     #[test]
     fn validate_rejects_unexpected_roles() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         params.roles = vec![super::super::roles::RoleDefinition {
             name: "smuggled".to_owned(),
             capabilities: std::collections::HashSet::from([
@@ -1564,7 +1564,7 @@ mod tests {
     #[test]
     fn validate_rejects_unexpected_tools() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         params.tools = vec![super::super::tools::ToolRegistration {
             tool_id: "rogue-tool".to_owned(),
             name: "rogue-tool".to_owned(),
@@ -1752,7 +1752,7 @@ mod tests {
     fn validate_paid_service_with_ttl_passes() {
         let mut params = template_params(&TemplateId::PaidService);
         params.economic_policy = Some(paid_service_policy());
-        params.ttl = Some(Duration::from_secs(3600));
+        params.ttl = Some(Duration::from_hours(1));
         assert!(validate_against_template(&params).is_ok());
     }
 
@@ -1809,7 +1809,7 @@ mod tests {
     fn validate_paid_broadcast_with_ttl_passes() {
         let mut params = template_params(&TemplateId::PaidBroadcast);
         params.economic_policy = Some(paid_broadcast_policy());
-        params.ttl = Some(Duration::from_secs(86400));
+        params.ttl = Some(Duration::from_hours(24));
         assert!(validate_against_template(&params).is_ok());
     }
 
@@ -2205,7 +2205,7 @@ mod tests {
     #[test]
     fn validate_rejects_wrong_metadata_visibility() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         // Set all-PreJoin visibility (the default), which does not match the
         // private_encrypted_visibility expected by BilateralEphemeral.
         params.metadata_visibility = MetadataVisibilityPolicy::default();
@@ -2244,7 +2244,7 @@ mod tests {
     #[test]
     fn validate_rejects_projection_policy_on_encrypted_template() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         // BilateralEphemeral expects projection_policy: None
         params.projection_policy = Some(ProjectionPolicy {
             default_rule: ProjectionRule::Public,

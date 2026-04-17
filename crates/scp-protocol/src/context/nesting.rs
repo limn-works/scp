@@ -1262,20 +1262,20 @@ mod tests {
     #[test]
     fn child_ttl_must_not_exceed_min_parent_ttl() {
         let result = validate_child_ttl(
-            Some(Duration::from_secs(7200)),
-            &[Some(Duration::from_secs(3600))],
+            Some(Duration::from_hours(2)),
+            &[Some(Duration::from_hours(1))],
         );
         assert!(result.is_err());
 
         let result = validate_child_ttl(
-            Some(Duration::from_secs(3600)),
-            &[Some(Duration::from_secs(3600))],
+            Some(Duration::from_hours(1)),
+            &[Some(Duration::from_hours(1))],
         );
         assert!(result.is_ok());
 
         let result = validate_child_ttl(
-            Some(Duration::from_secs(1800)),
-            &[Some(Duration::from_secs(3600))],
+            Some(Duration::from_mins(30)),
+            &[Some(Duration::from_hours(1))],
         );
         assert!(result.is_ok());
     }
@@ -1290,20 +1290,20 @@ mod tests {
     fn child_ttl_bounded_by_min_across_multiple_parents() {
         // Parent A: 1 hour, Parent B: 2 hours, Parent C: no TTL.
         let result = validate_child_ttl(
-            Some(Duration::from_secs(5400)), // 90 min
+            Some(Duration::from_mins(90)), // 90 min
             &[
-                Some(Duration::from_secs(3600)),
-                Some(Duration::from_secs(7200)),
+                Some(Duration::from_hours(1)),
+                Some(Duration::from_hours(2)),
                 None,
             ],
         );
         assert!(result.is_err());
 
         let result = validate_child_ttl(
-            Some(Duration::from_secs(3600)),
+            Some(Duration::from_hours(1)),
             &[
-                Some(Duration::from_secs(3600)),
-                Some(Duration::from_secs(7200)),
+                Some(Duration::from_hours(1)),
+                Some(Duration::from_hours(2)),
                 None,
             ],
         );
@@ -1312,7 +1312,7 @@ mod tests {
 
     #[test]
     fn no_child_ttl_rejected_when_parent_has_finite_ttl() {
-        let result = validate_child_ttl(None, &[Some(Duration::from_secs(3600))]);
+        let result = validate_child_ttl(None, &[Some(Duration::from_hours(1))]);
         assert!(result.is_err());
     }
 

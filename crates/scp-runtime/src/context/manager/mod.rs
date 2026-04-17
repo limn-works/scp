@@ -2004,6 +2004,137 @@ impl ContextManager {
         ContextManagerBuilder::new()
     }
 
+    /// Removes all registered contexts from the manager.
+    ///
+    /// This is a best-effort teardown: it clears the `DashMap` and cancels
+    /// all background tasks (TTL timers, governance timeouts) associated
+    /// with each context. MLS groups are destroyed via the crypto provider.
+    ///
+    /// Used by [`scp_ffi_common::BridgeInstance::shutdown`] to clean up
+    /// context state during bridge lifecycle teardown.
+    ///
+    /// Does NOT send leave messages to relays or notify remote peers —
+    /// this is a local cleanup operation for process exit / test teardown.
+    pub fn shutdown_all_contexts(&self) {
+        // Collect IDs first to avoid holding DashMap shard locks while
+        // performing cleanup (which may acquire per-context mutexes).
+        let context_ids: Vec<String> = self
+            .contexts
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for context_id in &context_ids {
+            let ctx_id_bytes = context_id_to_bytes(context_id);
+
+            // Destroy sender key BEFORE MLS group. The MLS crypto provider
+            // stores both in the same internal HashMap entry — destroy_mls_group
+            // removes the entry entirely, making a subsequent destroy_sender_key
+            // a no-op (key not zeroized). Ordering: zeroize secrets first,
+            // then tear down the group structure.
+            if let Err(e) = self.crypto.destroy_sender_key(&ctx_id_bytes) {
+                tracing::debug!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to destroy sender key during shutdown — may already be gone"
+                );
+            }
+            if let Err(e) = self.crypto.destroy_mls_group(&ctx_id_bytes) {
+                tracing::debug!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to destroy MLS group during shutdown — may already be gone"
+                );
+            }
+            if let Err(e) = self.event_log.destroy_event_log(&ctx_id_bytes) {
+                tracing::debug!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to destroy event log during shutdown — may already be gone"
+                );
+            }
+
+            // Remove from the DashMap (drops the Arc, which may drop the
+            // PerContextState if no other references exist).
+            self.contexts.remove(context_id);
+        }
+
+        // Clear standing contexts tracking.
+        if let Ok(mut standing) = self.standing_contexts.try_lock() {
+            standing.clear();
+        }
+
+        // Abort all background tasks (TTL timers, governance timeouts).
+        // Best-effort: if the mutex is contended, tasks will be cleaned
+        // up when their contexts are dropped.
+        if let Ok(mut tasks) = self.task_set.try_lock() {
+            tasks.abort_all();
+        }
+
+        tracing::info!(
+            removed_count = context_ids.len(),
+            "shutdown: removed all contexts and aborted background tasks"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Persistence flush (sync, best-effort)
+    // -----------------------------------------------------------------
+
+    /// Persists all currently-unlocked contexts as a best-effort snapshot flush.
+    ///
+    /// Iterates the context map and, for each context that can be locked
+    /// without blocking (via [`Mutex::try_lock`]), takes a snapshot and calls
+    /// [`ContextPersistence::persist_context`]. Contexts held by other tasks
+    /// are silently skipped — this is deliberate; their in-progress mutations
+    /// will be persisted by the normal per-operation persistence path.
+    ///
+    /// Intended for use by [`BridgeInstance::suspend`] and
+    /// [`BridgeInstance::shutdown`] to flush state before transport is
+    /// torn down or MLS groups are destroyed. Errors from individual
+    /// contexts are logged and do not abort the flush.
+    ///
+    /// No-op if no persistence provider is configured.
+    pub fn flush_all_contexts_sync(&self) {
+        if !self.has_persistence() {
+            return;
+        }
+        // Collect Arcs first to avoid holding DashMap shard locks.
+        let arcs = self.collect_context_arcs();
+        let mut flushed = 0usize;
+        let mut skipped = 0usize;
+        for (context_id, arc) in arcs {
+            match arc.try_lock() {
+                Ok(ctx) => {
+                    let snapshot = Self::snapshot_context(&ctx);
+                    let bc_snapshot = ctx
+                        .broadcast_context
+                        .as_ref()
+                        .map(BroadcastContext::to_snapshot);
+                    drop(ctx);
+                    self.persist_context_snapshot(&context_id, snapshot);
+                    if let Some(ref bcs) = bc_snapshot {
+                        self.persist_broadcast_snapshot(&context_id, bcs);
+                    }
+                    flushed += 1;
+                }
+                Err(_) => {
+                    // Context is locked by an in-progress operation — skip it.
+                    // That operation's normal completion path will persist the
+                    // final state.
+                    skipped += 1;
+                }
+            }
+        }
+        tracing::debug!(
+            flushed,
+            skipped,
+            "flush_all_contexts_sync: flushed {} context(s), skipped {} locked",
+            flushed,
+            skipped,
+        );
+    }
+
     // -----------------------------------------------------------------
     // Per-context lock helpers (DashMap → Arc<Mutex<PerContextState>>)
     // -----------------------------------------------------------------

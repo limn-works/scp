@@ -164,7 +164,7 @@ async fn context_params_all_fields() {
         promotion_policy: PromotionPolicy::Promotable,
         roles: Vec::new(),
         tools: Vec::new(),
-        ttl: Some(Duration::from_secs(3600)),
+        ttl: Some(Duration::from_hours(1)),
         memory_scope: MemoryScope::Full,
         governance: GovernanceModel::SingleAdmin,
         template_id: Some(TemplateId::PublicBroadcast),
@@ -190,7 +190,7 @@ async fn context_params_all_fields() {
     assert_eq!(params.ceiling.len(), 4);
     assert_eq!(params.ceiling_policy, CeilingPolicy::Governed);
     assert_eq!(params.promotion_policy, PromotionPolicy::Promotable);
-    assert_eq!(params.ttl, Some(Duration::from_secs(3600)));
+    assert_eq!(params.ttl, Some(Duration::from_hours(1)));
     assert_eq!(params.memory_scope, MemoryScope::Full);
     assert_eq!(params.template_id, Some(TemplateId::PublicBroadcast));
     assert!(params.discoverable);
@@ -446,7 +446,7 @@ async fn ttl_check() {
 
     // Finite TTL, not expired
     let created_at = 1000;
-    let ttl = TtlPolicy::Finite(Duration::from_secs(3600));
+    let ttl = TtlPolicy::Finite(Duration::from_hours(1));
     assert!(check_ttl(created_at, ttl, None, 2000).is_ok());
 
     // Finite TTL, expired (now >= created_at + ttl_secs)
@@ -468,7 +468,7 @@ async fn ttl_check() {
 async fn ttl_extension_proposal() {
     let _proposal = TtlExtensionProposal::new(
         "did:key:alice".into(),
-        Duration::from_secs(7200),
+        Duration::from_hours(2),
         2, // bilateral context
         GovernanceModel::SingleAdmin,
     );
@@ -589,32 +589,29 @@ async fn ceiling_intersection() {
 async fn child_ttl_validation() {
     // Child TTL <= parent TTL: ok
     let result = validate_child_ttl(
-        Some(Duration::from_secs(3600)),
-        &[Some(Duration::from_secs(7200))],
+        Some(Duration::from_hours(1)),
+        &[Some(Duration::from_hours(2))],
     );
     assert!(result.is_ok());
 
     // Child TTL == parent TTL: ok
     let result = validate_child_ttl(
-        Some(Duration::from_secs(3600)),
-        &[Some(Duration::from_secs(3600))],
+        Some(Duration::from_hours(1)),
+        &[Some(Duration::from_hours(1))],
     );
     assert!(result.is_ok());
 
     // Child TTL > parent TTL: error
     let result = validate_child_ttl(
-        Some(Duration::from_secs(7200)),
-        &[Some(Duration::from_secs(3600))],
+        Some(Duration::from_hours(2)),
+        &[Some(Duration::from_hours(1))],
     );
     assert!(result.is_err());
 
     // Multiple parents: child must not exceed the minimum
     let result = validate_child_ttl(
         Some(Duration::from_secs(5000)),
-        &[
-            Some(Duration::from_secs(7200)),
-            Some(Duration::from_secs(3600)),
-        ],
+        &[Some(Duration::from_hours(2)), Some(Duration::from_hours(1))],
     );
     assert!(result.is_err()); // 5000 > min(7200, 3600) = 3600
 

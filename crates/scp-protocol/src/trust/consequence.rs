@@ -962,7 +962,7 @@ mod tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: suspend_write(),
             threshold: 3,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         }];
 
         let events = vec![
@@ -989,7 +989,7 @@ mod tests {
             trigger: ConsequenceTrigger::ToolRateExceeded,
             action: suspend_all(),
             threshold: 5,
-            window: Duration::from_secs(120),
+            window: Duration::from_mins(2),
         }];
 
         let events: Vec<Event> = (0..5)
@@ -1023,7 +1023,7 @@ mod tests {
                 to_role: "observer".to_owned(),
             },
             threshold: 2,
-            window: Duration::from_secs(300),
+            window: Duration::from_mins(5),
         }];
 
         let payload =
@@ -1068,7 +1068,7 @@ mod tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: suspend_all(),
             threshold: 2,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         }];
 
         let events = vec![
@@ -1092,7 +1092,7 @@ mod tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: suspend_all(),
             threshold: 3,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         }];
 
         let events = vec![
@@ -1115,7 +1115,7 @@ mod tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: suspend_all(),
             threshold: 3,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         }];
 
         let events = vec![
@@ -1139,7 +1139,7 @@ mod tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: suspend_all(),
             threshold: 3,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         }];
 
         let events = vec![
@@ -1164,13 +1164,13 @@ mod tests {
                 trigger: ConsequenceTrigger::MessageVelocity,
                 action: suspend_write(),
                 threshold: 2,
-                window: Duration::from_secs(60),
+                window: Duration::from_mins(1),
             },
             ConsequenceRule {
                 trigger: ConsequenceTrigger::ToolRateExceeded,
                 action: suspend_all(),
                 threshold: 1,
-                window: Duration::from_secs(60),
+                window: Duration::from_mins(1),
             },
         ];
 
@@ -1203,7 +1203,7 @@ mod tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: suspend_all(),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         }];
 
         let result = evaluate_consequence_rules(&rules, &[], "did:key:alice", 1000);
@@ -1234,7 +1234,7 @@ mod tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: suspend_write(),
             threshold: 10,
-            window: Duration::from_secs(300),
+            window: Duration::from_mins(5),
         };
 
         let json = serde_json::to_string(&rule).unwrap();
@@ -1294,7 +1294,7 @@ mod tests {
             trigger: ConsequenceTrigger::Custom("<script>alert(1)</script>".to_owned()),
             action: suspend_all(),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
@@ -1309,7 +1309,7 @@ mod tests {
             trigger: ConsequenceTrigger::Custom("valid_trigger_name".to_owned()),
             action: suspend_all(),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         assert!(rule.validate().is_ok());
     }
@@ -1320,7 +1320,7 @@ mod tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: suspend_write(),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         assert!(rule.validate().is_ok());
     }
@@ -1333,7 +1333,7 @@ mod tests {
                 to_role: "member".to_owned(),
             },
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         assert!(rule.validate().is_ok());
     }
@@ -1346,7 +1346,7 @@ mod tests {
                 to_role: "<script>".to_owned(),
             },
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
@@ -1362,7 +1362,7 @@ mod tests {
             trigger: ConsequenceTrigger::Custom(long_key),
             action: suspend_all(),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
@@ -1377,7 +1377,7 @@ mod tests {
             trigger: ConsequenceTrigger::Custom("trigger\x00key".to_owned()),
             action: suspend_all(),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
@@ -1398,7 +1398,7 @@ mod tests {
                 capabilities: vec![],
             }),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
@@ -1418,7 +1418,7 @@ mod tests {
                 capabilities,
             }),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
@@ -1439,7 +1439,7 @@ mod tests {
                 capabilities,
             }),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         assert!(rule.validate().is_ok());
     }
@@ -1452,7 +1452,7 @@ mod tests {
                 capabilities: vec![Capability::MessagesWrite, Capability::MessagesWrite],
             }),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
@@ -1469,7 +1469,7 @@ mod tests {
                 capabilities: vec![Capability::ToolInvoke(String::new())],
             }),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
@@ -1486,7 +1486,7 @@ mod tests {
                 capabilities: vec![Capability::Custom(String::new())],
             }),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
@@ -1501,7 +1501,7 @@ mod tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         assert!(rule.validate().is_ok());
     }
@@ -1513,7 +1513,7 @@ mod tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::AssignRole { to_role: long_role },
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
@@ -1530,7 +1530,7 @@ mod tests {
                 trigger: ConsequenceTrigger::Custom(key),
                 action: suspend_all(),
                 threshold: 1,
-                window: Duration::from_secs(60),
+                window: Duration::from_mins(1),
             };
             assert!(
                 rule.validate().is_err(),
@@ -1545,7 +1545,7 @@ mod tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: suspend_all(),
             threshold: 0,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
@@ -1560,7 +1560,7 @@ mod tests {
             trigger: ConsequenceTrigger::Custom(String::new()),
             action: suspend_all(),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
@@ -1646,7 +1646,7 @@ mod tests {
                 reason: None,
             }),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
@@ -1671,7 +1671,7 @@ mod tests {
                 access: AccessScope::Both,
             }),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         // Shape-level validate() passes (RevokeAccess is well-formed).
         assert!(rule.validate().is_ok());
@@ -1698,7 +1698,7 @@ mod tests {
                 access: AccessScope::Write,
             }),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         let opt_in = ConsequenceConfig {
             allow_automatic_access_revocation: true,
@@ -1715,7 +1715,7 @@ mod tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: suspend_write(),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         assert!(rule.validate_against_config(&opt_in).is_ok());
 
@@ -1723,7 +1723,7 @@ mod tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: suspend_all(),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         assert!(rule.validate_against_config(&opt_in).is_ok());
     }
@@ -1779,7 +1779,7 @@ mod tests {
                 capabilities: vec![Capability::GovernanceVote],
             }),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         rule.validate().expect("well-formed rule");
         // Precise destructure confirms the capability is retained typed.
@@ -1799,7 +1799,7 @@ mod tests {
                 capabilities: vec![Capability::ToolInvoke("calculator".to_owned())],
             }),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         rule.validate().expect("well-formed rule");
         let ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability { capabilities }) =
@@ -1827,7 +1827,7 @@ mod tests {
                 capabilities: caps.clone(),
             }),
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         };
         rule.validate().expect("well-formed rule");
         let ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability { capabilities }) =

@@ -313,7 +313,7 @@ mod tests {
             &signing_key,
             1000,
             Some(5000),
-            Duration::from_secs(600),
+            Duration::from_mins(10),
             None,
         );
 
@@ -358,7 +358,7 @@ mod tests {
             &signing_key,
             1000,
             Some(5000),
-            Duration::from_secs(600),
+            Duration::from_mins(10),
             None,
         );
 
@@ -387,7 +387,7 @@ mod tests {
             &signing_key,
             1000,
             None,
-            Duration::from_secs(600),
+            Duration::from_mins(10),
             None,
         );
 
@@ -405,7 +405,7 @@ mod tests {
             &signing_key,
             1000,
             Some(5000),
-            Duration::from_secs(600),
+            Duration::from_mins(10),
             Some(2000),
         );
 
@@ -423,7 +423,7 @@ mod tests {
             &signing_key,
             1000,
             Some(5000),
-            Duration::from_secs(600),
+            Duration::from_mins(10),
             None,
         );
         attestation.signature[0] ^= 0xff;
@@ -457,7 +457,7 @@ mod tests {
             evidence: None,
             issued_at: 1000,
             expires_at: Some(5000),
-            renewal_interval: Some(Duration::from_secs(600)),
+            renewal_interval: Some(Duration::from_mins(10)),
             renewed_at: None,
             revocation_status: RevocationStatus::Revoked {
                 revoked_at: 1500,
@@ -500,7 +500,7 @@ mod tests {
             &signing_key,
             1000,
             Some(5000),
-            Duration::from_secs(600),
+            Duration::from_mins(10),
             None,
         );
 
@@ -524,7 +524,7 @@ mod tests {
         let clock = TestClock::new(2000);
         let checker = DefaultRenewalChecker::new(clock);
         let attestation =
-            make_unsigned_renewable_attestation(1000, Some(5000), Duration::from_secs(600), None);
+            make_unsigned_renewable_attestation(1000, Some(5000), Duration::from_mins(10), None);
 
         assert!(checker.needs_renewal(&attestation));
     }
@@ -534,7 +534,7 @@ mod tests {
         let clock = TestClock::new(1500);
         let checker = DefaultRenewalChecker::new(clock);
         let attestation =
-            make_unsigned_renewable_attestation(1000, Some(5000), Duration::from_secs(600), None);
+            make_unsigned_renewable_attestation(1000, Some(5000), Duration::from_mins(10), None);
 
         assert!(!checker.needs_renewal(&attestation));
     }
@@ -544,7 +544,7 @@ mod tests {
         let clock = TestClock::new(1700);
         let checker = DefaultRenewalChecker::new(clock);
         let attestation =
-            make_unsigned_renewable_attestation(1000, Some(5000), Duration::from_secs(600), None);
+            make_unsigned_renewable_attestation(1000, Some(5000), Duration::from_mins(10), None);
 
         assert!(
             checker.needs_renewal(&attestation),
@@ -559,7 +559,7 @@ mod tests {
         let attestation = make_unsigned_renewable_attestation(
             1000,
             Some(5000),
-            Duration::from_secs(600),
+            Duration::from_mins(10),
             Some(1500),
         );
 
@@ -599,7 +599,7 @@ mod tests {
         let clock = TestClock::new(1600);
         let checker = DefaultRenewalChecker::new(clock);
         let attestation =
-            make_unsigned_renewable_attestation(1000, Some(5000), Duration::from_secs(600), None);
+            make_unsigned_renewable_attestation(1000, Some(5000), Duration::from_mins(10), None);
 
         assert!(
             checker.needs_renewal(&attestation),

@@ -165,6 +165,28 @@
 - Empty-reason skip `if !r.is_empty()` NOT a bypass: required reasons still rejected via validate_non_empty
 - MissingPassphrase: fail-closed, no env fallback, user_message=Display (nothing sensitive to strip)
 
+## PR #1628 BridgeInstance Consolidation Review (2026-04-14)
+
+### P1 Findings
+- economy_budgets, economy_antispam, bridge_state DashMaps have NO capacity bounds (known_contexts/rate_limiters do). OOM from authenticated attacker.
+- Economy accessors (with_economy_budget[_mut], with_economy_antispam) re-create entries after shutdown via entry().or_default() -- fail-open zombie state.
+- bridge_state() returns raw &DashMap -- no lifecycle guard, no capacity enforcement.
+- ensure_bridge_instance uses placeholder DID ("did:unknown:*") -- immutable, indistinguishable from real DID by callers of local_did().
+
+### P2 Findings
+- did_resolver (OnceLock) never cleared during shutdown -- resources retained until process exit.
+- set_did_resolver silently ignores duplicate calls (no warning, unlike init_context_manager).
+- known_contexts(), rate_limiters(), bridge_state() are pub (should be pub(crate)) -- bypass capacity enforcement.
+
+### Well-Defended
+- Shutdown ordering: AtomicBool::swap(true, SeqCst) FIRST, then cleanup. Idempotent.
+- Suspend ordering: flag BEFORE transport teardown; reverted on failure.
+- Shutdown hooks: catch_unwind on each, immediate execution if registered post-shutdown.
+- Error messages sanitized (no architecture leakage in Display impls).
+- All 3 bridges register shutdown hooks correctly; all scp_shutdown uses catch_unwind.
+- Transport Arc pattern for async safety (RwLock<Option<Arc>>>, strong_count check for mut).
+- remove_ffi_state cleans up known_context + bridge_state + economy_state per context.
+
 ## Recurring Patterns
 - TOCTOU races in check-then-act patterns (nonce replay, standing channels, budget)
 - Missing zeroization on crypto key material

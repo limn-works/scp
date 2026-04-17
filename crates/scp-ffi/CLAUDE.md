@@ -37,10 +37,11 @@ DashMap provides lock-free concurrent access with internal sharding — no globa
 
 `py_context_create` in `context.rs` registers FFI bridge state and delegates lifecycle to `ContextManager`. Other modules (`tools.rs`, `ucan.rs`, `event_log.rs`) look up FFI state by context ID via `with_context` (alias for `with_ffi_state`).
 
-Additional global registries in `runtime.rs`:
-- `KNOWN_CONTEXTS: OnceLock<DashMap<String, KnownContext>>` — context-to-relay mappings for discovery (SCP-213)
-- `RELAY_CONNECTION: OnceLock<RwLock<Option<Arc<NativeRelayAdapter>>>>` — active relay connection
-- `STORAGE_PROVIDER: OnceLock<Arc<InMemoryStorage>>` — storage backend for identity persistence (SCP-217)
+Known contexts (SCP-213), transport, storage provider, identity registry, UCAN registry,
+economy trackers, and bridge connector state are now owned by `BridgeInstance` and
+accessed via `crate::runtime::bridge_instance()`. The old per-bridge `OnceLock` globals
+(`KNOWN_CONTEXTS`, `RELAY_CONNECTION`, `STORAGE_PROVIDER`, `IDENTITY_REGISTRY`, etc.)
+have been consolidated into `BridgeInstance` (see `scp-ffi-common/src/bridge_instance.rs`).
 
 ### Module Structure
 
@@ -118,7 +119,7 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
 - **Role state sync after governance**: `FfiBridgeState.role_state` is a local copy used by UCAN/tool capability checks. After any governance action that modifies roles (ChangeRole, ModifyCeiling, AddMember, RemoveMember, etc.), call `runtime::sync_role_state_from_manager(context_id)` to re-sync from the authoritative `ContextManager`. Without this, the FFI copy goes stale.
 - MCP bridge functions use opaque string handles (cryptographically random hex IDs) for server/client instances. Server and client state tracked in separate `DashMap` registries in `mcp.rs`.
 - `with_context` closures must return `Result<T, ScpPyError>` — use typed error variants (`ScpPyError::ContextError`, `ScpPyError::UcanError`, etc.) not raw strings.
-- **Identity registry (SCP-214)**: `py_identity_create` registers identity state in the global identity registry (`runtime::IDENTITY_REGISTRY`). All crypto bridge functions (`py_ucan_mint`, `py_ucan_delegate`, `py_context_send`, `py_identity_rotate_key`, `py_identity_migrate`) look up the retained `InMemoryKeyCustody` and `KeyHandle`s via `with_identity()`. The `KeyCustody` trait uses RPITIT (return-position impl Trait in trait), making it NOT object-safe — must use concrete `InMemoryKeyCustody` type directly. `parse_custody("platform")` returns an error (criterion 11) to prevent silent fallback.
+- **Identity registry (SCP-214)**: `py_identity_create` registers identity state in the `BridgeInstance` identity registry (type-erased, set via `set_identity_registry`). All crypto bridge functions (`py_ucan_mint`, `py_ucan_delegate`, `py_context_send`, `py_identity_rotate_key`, `py_identity_migrate`) look up the retained `InMemoryKeyCustody` and `KeyHandle`s via `with_identity()`. The `KeyCustody` trait uses RPITIT (return-position impl Trait in trait), making it NOT object-safe — must use concrete `InMemoryKeyCustody` type directly. `parse_custody("platform")` returns an error (criterion 11) to prevent silent fallback.
 - **Nested block_on prevention**: `with_identity` / `with_identity_mut` are sync closures wrapping DashMap access. If a crypto operation inside the closure is async (e.g., `derive_pseudonym`, `create_inner_envelope`), call `rt.block_on()` inside the closure — never nest `block_on` calls or tokio will deadlock. Pattern: `with_identity(did, |entry| { rt.block_on(async { ... }) })`.
 - UCAN validation (SCP-164) now delegates to scp-core's full 11-step ADR-016 pipeline including Ed25519 signature verification. Bridge trait implementations (`DispatchDidResolver`, `BridgeRevocationChecker`, `BridgeProofResolver`, `BridgeNonceTracker`) in `ucan.rs` adapt runtime state to scp-core's validation traits. The `py_ucan_validate` function accepts optional `presenting_agent_did` and `proof_tokens` parameters for delegation chain verification.
 - **Unified DID resolver (#311)**: `DispatchDidResolver` replaces `BridgeDidResolver` in production code paths. When the global `DID_RESOLVER` is initialized (via `runtime::init_did_resolver`, called from `py_identity_create`), it delegates to `IdentityBackedDidResolver` which performs full DID document validation (BEP44 sig, self-certification, sequence tracking). Falls back to `BridgeDidResolver` (string-only) when uninitialized. WASM bridge still uses `BridgeDidResolver` directly (ADR-034). The resolver is in `scp-ffi-common` — shared across all non-WASM bridges.
@@ -144,7 +145,7 @@ The MCP bridge delegates to real `scp-mcp` server/client implementations via two
   3. **Relay probe** — if a relay connection is active (via `py_transport_connect`), probes known routing IDs via QUERY to detect active contexts
   - Falls back gracefully to local-only when relay is unreachable. Results are deduplicated by context ID.
   - The relay is a dumb blob store with no identity-to-context mapping; discovery is purely client-side.
-  - `py_transport_connect(relay_url)` creates a `NativeRelayAdapter` and stores it in `runtime::RELAY_CONNECTION`. `py_transport_disconnect()` clears it.
+  - `py_transport_connect(relay_url)` creates a `NativeRelayAdapter` and stores the `TransportManager` in `BridgeInstance`. `py_transport_disconnect()` clears it.
   - `runtime::KnownContext` stores `routing_id`, `relay_url`, `member_did`, `last_seen` for each tracked context.
   - Each result dict contains: `context_id`, `source` ("local"/"relay"/"local+relay"), `relay_active` (bool), plus optional `creator_did`/`member_count`/`tool_count`.
   - Result dicts from bridge functions must be consumed with `h["key"]` syntax in Python — NOT `h.key`. Prefer returning a `#[pyclass]` struct for new structured return types.

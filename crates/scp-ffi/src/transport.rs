@@ -49,7 +49,7 @@ use crate::validate;
 static CONNECTED_RELAY_URL: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 
 /// Returns a reference to the connected relay URL state.
-fn connected_url_state() -> &'static RwLock<Option<String>> {
+pub(crate) fn connected_url_state() -> &'static RwLock<Option<String>> {
     CONNECTED_RELAY_URL.get_or_init(|| RwLock::new(None))
 }
 
@@ -280,7 +280,7 @@ pub fn py_configure_relay_transport(relay_url: &str, local_did: &str) -> PyResul
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
     let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
         Box::new(crate::runtime::NoOpEventLogProvider);
-    crate::runtime::init_context_manager_with(crypto, transport, event_log, None);
+    crate::runtime::init_context_manager_with(local_did, crypto, transport, event_log, None);
 
     Ok(())
 }
@@ -523,6 +523,8 @@ mod tests {
 
     #[test]
     fn transport_disconnect_is_idempotent() {
+        // BridgeInstance must exist for transport operations.
+        crate::runtime::init_context_manager_for_test();
         // Disconnecting when not connected should not error.
         let result = py_transport_disconnect();
         assert!(result.is_ok());

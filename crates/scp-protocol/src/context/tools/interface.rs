@@ -1379,7 +1379,7 @@ mod tests {
         let source_context = test_context_id("ctx-source");
         let registry = setup_registry_with_tool(&source_role_state, admin_did);
 
-        let rate_limit = RateLimit::new(10, Duration::from_secs(60), &scp_primitives::SystemClock);
+        let rate_limit = RateLimit::new(10, Duration::from_mins(1), &scp_primitives::SystemClock);
         let interface = expose_tool(
             &source_context,
             &"calculator".to_owned(),
@@ -1395,7 +1395,7 @@ mod tests {
         assert!(interface.rate_limit.is_some());
         let rl = interface.rate_limit.unwrap();
         assert_eq!(rl.max_calls, 10);
-        assert_eq!(rl.window, Duration::from_secs(60));
+        assert_eq!(rl.window, Duration::from_mins(1));
         assert_eq!(rl.burst_allowance, DEFAULT_BURST_ALLOWANCE);
         assert_eq!(
             rl.burst_window,
@@ -1737,7 +1737,7 @@ mod tests {
             // Zero burst to test base limit rejection.
             rate_limit: Some(RateLimit::with_burst(
                 2,
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
                 0,
                 Duration::from_secs(1),
                 &scp_primitives::SystemClock,
@@ -1993,7 +1993,7 @@ mod tests {
     fn rate_limit_serialization_roundtrip() {
         let rl = RateLimit {
             max_calls: 100,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
             current_count: 5,
             window_start: 1_000_000,
             burst_allowance: 10,
@@ -2018,7 +2018,7 @@ mod tests {
             tool_id: "tool-1".to_owned(),
             rate_limit: Some(RateLimit::new(
                 50,
-                Duration::from_secs(120),
+                Duration::from_mins(2),
                 &scp_primitives::SystemClock,
             )),
             per_caller_rate_limit: None,
@@ -2268,7 +2268,7 @@ mod tests {
     fn per_caller_rate_limit_tracks_independently() {
         // Zero burst to test base limit behavior independently.
         let mut rl =
-            PerCallerRateLimit::with_burst(2, Duration::from_secs(3600), 0, Duration::from_secs(1));
+            PerCallerRateLimit::with_burst(2, Duration::from_hours(1), 0, Duration::from_secs(1));
         let alice: DID = "did:dht:z6MkAlice".into();
         let bob: DID = "did:dht:z6MkBob".into();
 
@@ -2288,7 +2288,7 @@ mod tests {
         // Use a long window so CI timing can't cause spurious resets.
         // Zero burst to test base limit behavior independently.
         let mut rl =
-            PerCallerRateLimit::with_burst(1, Duration::from_secs(3600), 0, Duration::from_secs(1));
+            PerCallerRateLimit::with_burst(1, Duration::from_hours(1), 0, Duration::from_secs(1));
         let alice: DID = "did:dht:z6MkAlice".into();
 
         assert!(rl.check_and_increment(&alice, &scp_primitives::SystemClock));
@@ -2442,7 +2442,7 @@ mod tests {
         // Base limit: 2 calls, burst allowance: 5 within 1 second.
         let mut rl = RateLimit::with_burst(
             2,
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             5,
             Duration::from_secs(1),
             &scp_primitives::SystemClock,
@@ -2473,7 +2473,7 @@ mod tests {
         // 1-second window." Exactly 5 burst calls succeed, 6th fails.
         let mut rl = RateLimit::with_burst(
             1,
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             DEFAULT_BURST_ALLOWANCE,
             Duration::from_secs(DEFAULT_BURST_WINDOW_SECS),
             &scp_primitives::SystemClock,
@@ -2504,7 +2504,7 @@ mod tests {
     fn rate_limit_zero_burst_disables_burst() {
         let mut rl = RateLimit::with_burst(
             1,
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             0,
             Duration::from_secs(1),
             &scp_primitives::SystemClock,
@@ -2519,7 +2519,7 @@ mod tests {
     fn rate_limit_burst_allowance_clamped_to_max() {
         let rl = RateLimit::with_burst(
             10,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             100, // Above MAX_BURST_ALLOWANCE (50)
             Duration::from_secs(1),
             &scp_primitives::SystemClock,
@@ -2530,7 +2530,7 @@ mod tests {
 
     #[test]
     fn rate_limit_new_has_default_burst() {
-        let rl = RateLimit::new(60, Duration::from_secs(60), &scp_primitives::SystemClock);
+        let rl = RateLimit::new(60, Duration::from_mins(1), &scp_primitives::SystemClock);
         assert_eq!(rl.burst_allowance, DEFAULT_BURST_ALLOWANCE);
         assert_eq!(
             rl.burst_window,
@@ -2542,7 +2542,7 @@ mod tests {
     #[test]
     fn per_caller_rate_limit_burst_allows_calls_above_base_limit() {
         let mut rl =
-            PerCallerRateLimit::with_burst(2, Duration::from_secs(3600), 5, Duration::from_secs(1));
+            PerCallerRateLimit::with_burst(2, Duration::from_hours(1), 5, Duration::from_secs(1));
         let alice: DID = "did:dht:z6MkAlice".into();
 
         // Base: 2 calls.
@@ -2564,7 +2564,7 @@ mod tests {
     #[test]
     fn per_caller_rate_limit_burst_is_independent_per_caller() {
         let mut rl =
-            PerCallerRateLimit::with_burst(1, Duration::from_secs(3600), 2, Duration::from_secs(1));
+            PerCallerRateLimit::with_burst(1, Duration::from_hours(1), 2, Duration::from_secs(1));
         let alice: DID = "did:dht:z6MkAlice".into();
         let bob: DID = "did:dht:z6MkBob".into();
 
@@ -2583,7 +2583,7 @@ mod tests {
 
     #[test]
     fn per_caller_rate_limit_new_has_default_burst() {
-        let rl = PerCallerRateLimit::new(10, Duration::from_secs(60));
+        let rl = PerCallerRateLimit::new(10, Duration::from_mins(1));
         assert_eq!(rl.burst_allowance, DEFAULT_BURST_ALLOWANCE);
         assert_eq!(
             rl.burst_window,
@@ -2593,12 +2593,8 @@ mod tests {
 
     #[test]
     fn per_caller_rate_limit_burst_clamped_to_max() {
-        let rl = PerCallerRateLimit::with_burst(
-            10,
-            Duration::from_secs(60),
-            100,
-            Duration::from_secs(1),
-        );
+        let rl =
+            PerCallerRateLimit::with_burst(10, Duration::from_mins(1), 100, Duration::from_secs(1));
         assert_eq!(rl.burst_allowance, MAX_BURST_ALLOWANCE);
     }
 
@@ -2617,7 +2613,7 @@ mod tests {
             tool_id: "calculator".to_owned(),
             rate_limit: Some(RateLimit::with_burst(
                 2,
-                Duration::from_secs(3600),
+                Duration::from_hours(1),
                 5,
                 Duration::from_secs(1),
                 &scp_primitives::SystemClock,
@@ -2703,7 +2699,7 @@ mod tests {
         // Setup: 2 base calls, 1-hour window, 5 burst calls, 1s burst window.
         let mut rl = RateLimit::with_burst(
             2,
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             5,
             Duration::from_secs(1),
             &scp_primitives::SystemClock,
@@ -2744,7 +2740,7 @@ mod tests {
     fn per_caller_burst_works_when_base_exhausted_after_burst_window_would_expire() {
         // Same regression test for PerCallerRateLimit (#588 R2-01).
         let mut rl =
-            PerCallerRateLimit::with_burst(2, Duration::from_secs(3600), 5, Duration::from_secs(1));
+            PerCallerRateLimit::with_burst(2, Duration::from_hours(1), 5, Duration::from_secs(1));
         let alice: DID = "did:dht:z6MkAlice".into();
 
         // Consume the 2 base calls.
@@ -2783,7 +2779,7 @@ mod tests {
         // Burst: 3 calls within a 1-second burst window.
         let mut rl = RateLimit::with_burst(
             2,
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             3,
             Duration::from_secs(1),
             &scp_primitives::SystemClock,
@@ -2823,7 +2819,7 @@ mod tests {
         // Base limit: 2 calls within a 1-hour window.
         // Burst: 3 calls within a 1-second burst window.
         let mut rl =
-            PerCallerRateLimit::with_burst(2, Duration::from_secs(3600), 3, Duration::from_secs(1));
+            PerCallerRateLimit::with_burst(2, Duration::from_hours(1), 3, Duration::from_secs(1));
         let alice: DID = "did:dht:z6MkAlice".into();
 
         // Consume the 2 base calls.

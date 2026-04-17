@@ -259,8 +259,8 @@ pub fn py_economy_budget_remaining(context_id: &str, did: &str) -> PyResult<u64>
     validate::validate_did(did)?;
 
     let member_did = scp_identity::DID::from(did);
-    let remaining =
-        crate::runtime::with_economy_budget(context_id, |tracker| tracker.remaining(&member_did));
+    let remaining = crate::runtime::bridge_instance()?
+        .with_economy_budget(context_id, |tracker| tracker.remaining(&member_did));
     Ok(remaining.value())
 }
 
@@ -274,7 +274,7 @@ pub fn py_economy_budget_grant(context_id: &str, did: &str, amount: u64) -> PyRe
     validate::validate_did(did)?;
 
     let member_did = scp_identity::DID::from(did);
-    crate::runtime::with_economy_budget_mut(context_id, |tracker| {
+    crate::runtime::bridge_instance()?.with_economy_budget_mut(context_id, |tracker| {
         tracker.grant(&member_did, scp_core::economy::Amount::new(amount));
     });
     Ok(())
@@ -293,7 +293,7 @@ pub fn py_economy_budget_record_spend(context_id: &str, did: &str, amount: u64) 
     validate::validate_did(did)?;
 
     let member_did = scp_identity::DID::from(did);
-    crate::runtime::with_economy_budget_mut(context_id, |tracker| {
+    crate::runtime::bridge_instance()?.with_economy_budget_mut(context_id, |tracker| {
         tracker
             .record_spend(&member_did, scp_core::economy::Amount::new(amount))
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e}")))
@@ -322,7 +322,7 @@ pub fn py_economy_antispam_record(
     validate::validate_did(sender_did)?;
 
     let did = scp_identity::DID::from(sender_did);
-    crate::runtime::with_economy_antispam(context_id, |tracker| {
+    crate::runtime::bridge_instance()?.with_economy_antispam(context_id, |tracker| {
         tracker.record_message(&did, timestamp);
     });
     Ok(())
@@ -346,9 +346,8 @@ pub fn py_economy_antispam_velocity(context_id: &str, sender_did: &str, now: u64
     validate::validate_did(sender_did)?;
 
     let did = scp_identity::DID::from(sender_did);
-    let velocity = crate::runtime::with_economy_antispam(context_id, |tracker| {
-        tracker.get_velocity(&did, now)
-    });
+    let velocity = crate::runtime::bridge_instance()?
+        .with_economy_antispam(context_id, |tracker| tracker.get_velocity(&did, now));
     Ok(velocity)
 }
 
@@ -398,7 +397,7 @@ pub fn py_economy_antispam_escalated_cost(
     };
 
     let did = scp_identity::DID::from(sender_did);
-    let cost = crate::runtime::with_economy_antispam(context_id, |tracker| {
+    let cost = crate::runtime::bridge_instance()?.with_economy_antispam(context_id, |tracker| {
         tracker.compute_escalated_cost(
             &did,
             now,

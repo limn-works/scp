@@ -168,7 +168,7 @@ fn build_spending_ucan(
         max_per_action: Amount(max_per_action),
         max_total: Amount(max_total),
         currency: CurrencyCode::from_code("USD").unwrap_or(CurrencyCode(*b"USD\0")),
-        time_window: std::time::Duration::from_secs(3600),
+        time_window: std::time::Duration::from_hours(1),
         allowed_adapters: vec![],
     };
 

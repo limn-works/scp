@@ -1247,7 +1247,7 @@ mod tests {
             max_per_action: Amount(1000),
             max_total: Amount(10000),
             currency: usd(),
-            time_window: Duration::from_secs(86400),
+            time_window: Duration::from_hours(24),
             allowed_adapters: vec!["x402".to_owned(), "lightning".to_owned()],
         }
     }
@@ -1431,7 +1431,7 @@ mod tests {
             max_per_action: Amount(500),
             max_total: Amount(5000),
             currency: usd(),
-            time_window: Duration::from_secs(43200), // 12 hours
+            time_window: Duration::from_hours(12), // 12 hours
             allowed_adapters: vec!["x402".to_owned()],
         };
         assert!(validate_spending_attenuation(&parent, &child).is_ok());
@@ -1470,7 +1470,7 @@ mod tests {
     fn attenuation_widens_time_window() {
         let parent = sample_capability();
         let child = SpendingCapability {
-            time_window: Duration::from_secs(172800), // wider (2 days)
+            time_window: Duration::from_hours(48), // wider (2 days)
             ..parent.clone()
         };
         let err = validate_spending_attenuation(&parent, &child).unwrap_err();
@@ -1556,7 +1556,7 @@ mod tests {
             max_per_action: Amount(5000),
             max_total: Amount(10000),
             currency: usd(),
-            time_window: Duration::from_secs(3600),
+            time_window: Duration::from_hours(1),
             allowed_adapters: vec![],
         };
         let mut tracker = BudgetTracker::new(cap);
@@ -1585,7 +1585,7 @@ mod tests {
             max_per_action: Amount(5000),
             max_total: Amount(5000),
             currency: usd(),
-            time_window: Duration::from_secs(3600), // 1 hour
+            time_window: Duration::from_hours(1), // 1 hour
             allowed_adapters: vec![],
         };
         let mut tracker = BudgetTracker::new(cap);
@@ -1828,7 +1828,7 @@ mod tests {
             max_per_action: Amount(500),
             max_total: Amount(5000),
             currency: usd(),
-            time_window: Duration::from_secs(43200),
+            time_window: Duration::from_hours(12),
             allowed_adapters: vec!["x402".to_owned()],
         };
         let token = make_spending_token(&child_cap, "scp:spending:ctx123");
@@ -1847,7 +1847,7 @@ mod tests {
             max_per_action: Amount(500),
             max_total: Amount(5000),
             currency: usd(),
-            time_window: Duration::from_secs(43200),
+            time_window: Duration::from_hours(12),
             allowed_adapters: vec!["x402".to_owned()],
         };
         let child_cap = sample_capability(); // wider than parent
@@ -1914,7 +1914,7 @@ mod tests {
             max_per_action: Amount(1000),
             max_total: Amount(3000),
             currency: usd(),
-            time_window: Duration::from_secs(3600),
+            time_window: Duration::from_hours(1),
             allowed_adapters: vec!["x402".to_owned()],
         };
 
@@ -1989,7 +1989,7 @@ mod tests {
             max_per_action: Amount(1000),
             max_total: Amount(10000),
             currency: CurrencyCode::from_code("USD").unwrap(),
-            time_window: Duration::from_secs(3600),
+            time_window: Duration::from_hours(1),
             allowed_adapters: vec!["stripe".to_owned()],
         };
         let mut tracker = BudgetTracker::new(cap);
@@ -2025,7 +2025,7 @@ mod tests {
             max_per_action: Amount(1000),
             max_total: Amount(10000),
             currency: CurrencyCode::from_code("USD").unwrap(),
-            time_window: Duration::from_secs(3600),
+            time_window: Duration::from_hours(1),
             allowed_adapters: vec![],
         };
         let mut tracker = BudgetTracker::new(cap);
@@ -2157,7 +2157,7 @@ mod tests {
             max_per_action: Amount(500),
             max_total: Amount(1500),
             currency: usd(),
-            time_window: Duration::from_secs(3600),
+            time_window: Duration::from_hours(1),
             allowed_adapters: vec!["x402".to_owned()],
         };
 
