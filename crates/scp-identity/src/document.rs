@@ -1035,7 +1035,7 @@ impl DidDocument {
         }
 
         // Sort by sequence descending — keep the highest.
-        retired.sort_by(|a, b| b.1.cmp(&a.1));
+        retired.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
         // Indices to remove (the ones beyond the retention limit).
         let mut remove_indices: Vec<usize> = retired[MAX_RETIRED_AGENT_KEYS..]
