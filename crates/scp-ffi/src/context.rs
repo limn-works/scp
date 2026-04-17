@@ -990,10 +990,17 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
     // Register in the known-contexts registry for discovery via
     // py_mcp_load_contexts. Reuse the pre-derived pseudonym routing ID
     // (§9.10.4, SCP-214 criterion 4). Falls back to context_routing_id
-    // if pseudonym derivation was not available.
+    // for encrypted contexts or broadcast_routing_id for broadcast contexts.
+    // Bug fix (#1534): broadcast contexts use broadcast_routing_id (plain
+    // SHA-256) matching the send path, not context_routing_id (domain-separated).
     {
-        let routing_id =
-            local_pseudonym.unwrap_or_else(|| scp_core::context::context_routing_id(&context_id));
+        let routing_id = local_pseudonym.unwrap_or_else(|| {
+            if handle.params.mode == "broadcast" {
+                scp_core::context::broadcast_routing_id(&context_id)
+            } else {
+                scp_core::context::context_routing_id(&context_id)
+            }
+        });
 
         // Get the relay URL from transport status if a relay is connected.
         let relay_url = match crate::transport::py_transport_status() {

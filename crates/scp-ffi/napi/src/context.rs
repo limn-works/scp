@@ -963,14 +963,25 @@ pub fn context_subscribe(
     };
 
     let context_id = handle.context_id.clone();
-    // §9.10.4: dual subscription — subscribe to both the shared context
-    // routing ID (for backward compat and MLS management messages) and the
-    // member's pseudonym routing ID (for pseudonym-routed application messages).
+    let is_broadcast = handle.mode() == "Broadcast";
+    // §9.10.4 / §5.14: choose the correct shared routing ID based on context
+    // mode. Broadcast contexts use `broadcast_routing_id` = SHA-256(context_id)
+    // (plain hash, matching the send path in messaging.rs). Encrypted contexts
+    // use `context_routing_id` = SHA-256("scp:context-routing:" || context_id)
+    // (domain-separated). Using the wrong routing ID means messages never
+    // reach subscribers. Bug fix (#1534).
+    //
+    // For encrypted contexts, also subscribe to the member's pseudonym
+    // routing ID for pseudonym-routed application messages (§9.10.4).
     //
     // TODO(§9.10.4.A step 4): After all members have exchanged pseudonyms,
     // unsubscribe from the shared routing ID to achieve full pseudonym privacy.
     // Currently the shared subscription is permanent (migration never completes).
-    let shared_routing_id_bytes = scp_core::context::context_routing_id(&context_id);
+    let shared_routing_id_bytes = if is_broadcast {
+        scp_core::context::broadcast_routing_id(&context_id)
+    } else {
+        scp_core::context::context_routing_id(&context_id)
+    };
     let shared_routing_id = scp_transport::RoutingId::new(shared_routing_id_bytes);
 
     // Replace the cancellation token with a fresh one so a previously
@@ -1005,9 +1016,14 @@ pub fn context_subscribe(
 
         // Collect the member's pseudonym from the ContextManager state.
         // Done inside the async block because local_pseudonym is async.
-        let local_pseudonym = match context_manager() {
-            Ok(mgr) => mgr.local_pseudonym(&context_id).await.ok().flatten(),
-            Err(_) => None,
+        // Broadcast contexts do not use pseudonyms — skip the lookup.
+        let local_pseudonym = if is_broadcast {
+            None
+        } else {
+            match context_manager() {
+                Ok(mgr) => mgr.local_pseudonym(&context_id).await.ok().flatten(),
+                Err(_) => None,
+            }
         };
 
         // §9.10.4: dual subscription — always subscribe to the shared routing
@@ -1112,11 +1128,12 @@ pub fn context_subscribe(
                             );
                         }
                         Ok(None) => {
-                            // MLS Commit or Proposal — epoch advanced or proposal
-                            // cached, no application payload to deliver.
+                            // MLS Commit/Proposal or pseudonym announcement —
+                            // internal protocol message processed, no application
+                            // payload to forward to JS caller.
                             tracing::debug!(
                                 context_id = %context_id,
-                                "MLS control message processed (Commit/Proposal) — no payload"
+                                "protocol control message processed — no payload"
                             );
                         }
                         Err(e) => {

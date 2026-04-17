@@ -1047,16 +1047,25 @@ impl ContextManager {
         match sequence_check {
             SequenceCheck::Expected => {
                 // Message is in order — deliver immediately.
-                self.deliver_message_and_drain_buffered(
-                    context_id,
-                    &context_id_bytes,
-                    &sender_did,
-                    &inner,
-                    &plaintext,
-                    is_local_sender,
-                )
-                .await?;
-                Ok(Some((plaintext, sender_did)))
+                // Bug fix (#1534): `deliver_message_and_drain_buffered` returns
+                // `true` when the message was consumed as a pseudonym announcement
+                // (internal protocol message). Announcements must NOT be forwarded
+                // to FFI callers as regular user messages.
+                let consumed_as_announcement = self
+                    .deliver_message_and_drain_buffered(
+                        context_id,
+                        &context_id_bytes,
+                        &sender_did,
+                        &inner,
+                        &plaintext,
+                        is_local_sender,
+                    )
+                    .await?;
+                if consumed_as_announcement {
+                    Ok(None)
+                } else {
+                    Ok(Some((plaintext, sender_did)))
+                }
             }
             SequenceCheck::Ahead { expected: _ } => {
                 // Message is ahead of expected — buffer it (§9.8.5).
@@ -1209,7 +1218,7 @@ impl ContextManager {
         inner: &scp_protocol::envelope::inner::InnerEnvelope,
         plaintext: &[u8],
         skip_velocity: bool,
-    ) -> Result<(), ContextError> {
+    ) -> Result<bool, ContextError> {
         let sender_did_obj = DID(sender_did.to_owned());
 
         let ctx_arc = self
@@ -1308,20 +1317,55 @@ impl ContextManager {
             }
 
             // Velocity, consequence, event log — same as normal messages.
+            // Bug fix (#1534): consequence evaluation was previously missing from
+            // the announcement path, allowing a malicious member to send
+            // announcements at high velocity without triggering rate-limiting
+            // consequences. Now both paths share identical post-delivery logic.
+            let now = self.clock.now_secs();
             if !skip_velocity {
-                let now_secs = self.clock.now_secs();
                 ctx.governance
                     .velocity_tracker
-                    .record_message(&DID(sender_did.to_owned()), now_secs);
+                    .record_message(&DID(sender_did.to_owned()), now);
             }
-            self.event_log.append_context_event(
+            if let Err(e) = self.event_log.append_context_event(
                 context_id_bytes,
                 "PseudonymAnnounced",
                 sender_did,
-            )?;
+            ) {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    "failed to append PseudonymAnnounced to event log: {e}"
+                );
+            }
+            let consequence_rules: Vec<super::ConsequenceRule> =
+                ctx.governance.consequence_rules.clone();
+            if !consequence_rules.is_empty() {
+                let recv_events = super::governance::event_log_entries_for_consequences(
+                    ctx,
+                    context_id,
+                    now,
+                    &*self.event_log,
+                );
+                let recv_triggered =
+                    evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
+                let recv_member_did = DID(sender_did.to_owned());
+                super::governance::enforce_triggered_consequences(
+                    ctx,
+                    &super::governance::EnforceConsequencesCtx {
+                        context_id,
+                        member_did: &recv_member_did,
+                        now,
+                        triggered: &recv_triggered,
+                        rules: &consequence_rules,
+                        clock: &*self.clock,
+                        event_log: &*self.event_log,
+                    },
+                );
+            }
             ctx.checkpoint_events_since += 1;
 
-            return Ok(());
+            return Ok(true);
         }
 
         // Advance sequence tracker and deliver the in-order message.
@@ -1441,6 +1485,6 @@ impl ContextManager {
 
         crate::metrics::record_message_received();
 
-        Ok(())
+        Ok(false)
     }
 }
