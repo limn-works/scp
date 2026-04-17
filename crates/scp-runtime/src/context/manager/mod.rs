@@ -1190,8 +1190,8 @@ pub(super) struct PerContextState {
 impl PerContextState {
     /// Pushes an event to the receive buffer and, if a broadcast channel is
     /// provided, sends a sanitized copy there too. Consolidates the two-step
-    /// `receive_buffer.push` + `fire_event` / `tx.send` pattern into a single
-    /// call site to prevent future omissions.
+    /// `receive_buffer.push` + `tx.send` pattern into a single call site to
+    /// prevent future omissions.
     ///
     /// **Security invariants:**
     /// - `WelcomeGenerated` events carry MLS key material and are NEVER sent
@@ -2250,19 +2250,6 @@ impl ContextManager {
         self.event_tx
             .as_ref()
             .map(tokio::sync::broadcast::Sender::subscribe)
-    }
-
-    /// Sends a context event on the broadcast channel if one is configured.
-    ///
-    /// Standalone channel-only send for cases where `PerContextState` is
-    /// not directly available (e.g., tests). Production code should prefer
-    /// [`PerContextState::emit_event`] which combines buffer push + channel
-    /// send in a single call.
-    #[allow(dead_code)] // Used in tests (fire_event_noop_without_channel).
-    pub(super) fn fire_event(&self, context_id: &str, event: &ContextEvent) {
-        if let Some(tx) = &self.event_tx {
-            let _ = tx.send((context_id.to_owned(), event.clone()));
-        }
     }
 
     // -----------------------------------------------------------------

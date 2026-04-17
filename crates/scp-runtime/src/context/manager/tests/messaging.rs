@@ -4395,7 +4395,10 @@ async fn event_channel_receives_message_sent() {
         } => {
             assert_eq!(sender_did.as_ref(), "did:key:creator");
             assert_eq!(sequence_number, 1);
-            assert_eq!(payload, b"event channel test");
+            assert!(
+                payload.is_empty(),
+                "broadcast channel must strip plaintext from MessageSent"
+            );
         }
         other => panic!("expected MessageSent, got: {other:?}"),
     }
@@ -4411,17 +4414,4 @@ async fn event_channel_none_when_not_configured() {
         noop_key_resolver(),
     );
     assert!(manager.subscribe_events().is_none());
-}
-
-/// Verify that `fire_event` is a no-op (no panic) when no channel is configured.
-#[tokio::test]
-async fn fire_event_noop_without_channel() {
-    let manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
-    );
-    // This must not panic.
-    manager.fire_event("ctx", &ContextEvent::Expired);
 }

@@ -205,7 +205,7 @@ pub(super) struct EnforceConsequencesCtx<'a> {
     pub rules: &'a [ConsequenceRule],
     pub clock: &'a dyn scp_primitives::Clock,
     pub event_log: &'a dyn super::super::builder::ContextEventLogProvider,
-    /// Optional broadcast channel for `fire_event` propagation from free
+    /// Optional broadcast channel for event propagation from free
     /// functions that lack `&self` access to [`ContextManager`].
     pub event_tx: Option<&'a tokio::sync::broadcast::Sender<(String, super::ContextEvent)>>,
 }
