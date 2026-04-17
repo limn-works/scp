@@ -206,7 +206,7 @@ pub const MAX_SEQUENTIAL_COMMITS: u64 = 100;
 pub const COMMIT_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Timeout for sender key re-acquisition after missed rotations.
 /// Implementation recommended default, configurable via `SyncPolicy` (ADR-043).
-pub const SENDER_KEY_TIMEOUT: Duration = Duration::from_secs(60);
+pub const SENDER_KEY_TIMEOUT: Duration = Duration::from_mins(1);
 /// Multi-device reconnection deduplication window.
 /// Implementation recommended default, configurable via `SyncPolicy` (ADR-043).
 pub const RECONNECTION_DEDUP_WINDOW: Duration = Duration::from_secs(30);

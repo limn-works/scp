@@ -288,7 +288,7 @@ pub fn wrap_content(
     }
 
     // Sort by member_id for deterministic serialization
-    wrapped_ceks.sort_by(|a, b| a.member_id.cmp(&b.member_id));
+    wrapped_ceks.sort_by_key(|wk| wk.member_id);
 
     Ok(WrappedContent {
         ciphertext,
