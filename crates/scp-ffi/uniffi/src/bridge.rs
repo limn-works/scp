@@ -2322,6 +2322,7 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
 
                         // Initialize the production DID resolver for UCAN
                         // validation (H4 — matching PyO3/NAPI behavior).
+                        crate::runtime::ensure_bridge_instance();
                         ensure_did_resolver_initialized(tokio::runtime::Handle::current())?;
 
                         let handle = Arc::new(Identity {
@@ -2408,6 +2409,9 @@ pub async fn identity_create_with_custody(
                 .await
                 .map_err(ScpError::from)?;
 
+            // Ensure BridgeInstance exists so init_did_resolver can store the
+            // resolver. This matches the PyO3/NAPI identity_create pattern.
+            crate::runtime::ensure_bridge_instance();
             // Initialize the production DID resolver for UCAN validation.
             ensure_did_resolver_initialized(tokio::runtime::Handle::current())?;
 
@@ -11261,6 +11265,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
                             .map_err(ScpError::from)?;
 
                         // Initialize the production DID resolver for UCAN validation.
+                        crate::runtime::ensure_bridge_instance();
                         ensure_did_resolver_initialized(tokio::runtime::Handle::current())?;
 
                         let handle = Arc::new(Identity {
