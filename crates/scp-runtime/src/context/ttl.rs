@@ -1663,7 +1663,7 @@ mod tests {
 
     #[test]
     fn ttl_extension_requires_unanimous_consent() {
-        let mut ext = TtlExtension::new(Duration::from_secs(3600), 3);
+        let mut ext = TtlExtension::new(Duration::from_hours(1), 3);
         assert!(!ext.is_unanimous());
         ext.add_consent("did:key:alice".into());
         ext.add_consent("did:key:bob".into());
@@ -1673,7 +1673,7 @@ mod tests {
 
     #[test]
     fn ttl_extension_duplicate_consent_ignored() {
-        let mut ext = TtlExtension::new(Duration::from_secs(3600), 2);
+        let mut ext = TtlExtension::new(Duration::from_hours(1), 2);
         assert!(ext.add_consent("did:key:alice".into()));
         assert!(!ext.add_consent("did:key:alice".into()));
         assert_eq!(ext.consent_count(), 1);
@@ -1681,7 +1681,7 @@ mod tests {
 
     #[test]
     fn ttl_extension_single_member_unanimity() {
-        let mut ext = TtlExtension::new(Duration::from_secs(600), 1);
+        let mut ext = TtlExtension::new(Duration::from_mins(10), 1);
         assert!(ext.add_consent("did:key:alice".into()));
         assert!(ext.is_unanimous());
     }
@@ -1693,7 +1693,7 @@ mod tests {
     /// SCP-195: Active member's vote is counted in the tally.
     #[test]
     fn ttl_extension_active_member_vote_counted() {
-        let mut ext = TtlExtension::new(Duration::from_secs(3600), 2);
+        let mut ext = TtlExtension::new(Duration::from_hours(1), 2);
         ext.add_consent("did:key:alice".into());
         ext.add_consent("did:key:bob".into());
 
@@ -1708,7 +1708,7 @@ mod tests {
     /// SCP-195: Removed member's vote is excluded from the tally.
     #[test]
     fn ttl_extension_removed_member_vote_excluded() {
-        let mut ext = TtlExtension::new(Duration::from_secs(3600), 2);
+        let mut ext = TtlExtension::new(Duration::from_hours(1), 2);
         ext.add_consent("did:key:alice".into());
         ext.add_consent("did:key:bob".into());
 
@@ -1727,7 +1727,7 @@ mod tests {
     /// remain active, so the proposal is NOT approved.
     #[test]
     fn ttl_extension_threshold_against_active_votes_only() {
-        let mut ext = TtlExtension::new(Duration::from_secs(3600), 3);
+        let mut ext = TtlExtension::new(Duration::from_hours(1), 3);
         ext.add_consent("did:key:alice".into());
         ext.add_consent("did:key:bob".into());
         ext.add_consent("did:key:charlie".into());
@@ -1751,7 +1751,7 @@ mod tests {
     /// majority). 2 of 3 active members consent => passes.
     #[test]
     fn ttl_extension_majority_threshold_with_active_members() {
-        let mut ext = TtlExtension::new(Duration::from_secs(3600), 2);
+        let mut ext = TtlExtension::new(Duration::from_hours(1), 2);
         ext.add_consent("did:key:alice".into());
         ext.add_consent("did:key:bob".into());
 
@@ -1770,7 +1770,7 @@ mod tests {
     /// SCP-195: Edge case -- all voters removed means no consent.
     #[test]
     fn ttl_extension_all_voters_removed_no_consent() {
-        let mut ext = TtlExtension::new(Duration::from_secs(3600), 2);
+        let mut ext = TtlExtension::new(Duration::from_hours(1), 2);
         ext.add_consent("did:key:alice".into());
         ext.add_consent("did:key:bob".into());
 
@@ -1787,7 +1787,7 @@ mod tests {
     fn extension_proposal_active_member_validation() {
         let mut proposal = TtlExtensionProposal::new(
             "did:key:alice".into(),
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             2,
             GovernanceModel::SingleAdmin,
         );
@@ -1817,7 +1817,7 @@ mod tests {
         // requiring both members to consent.
         let mut proposal = TtlExtensionProposal::new(
             "did:key:alice".into(),
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             2,
             GovernanceModel::SingleAdmin,
         );
@@ -1840,42 +1840,20 @@ mod tests {
 
     #[test]
     fn check_ttl_returns_ok_when_active() {
-        assert!(
-            check_ttl(
-                1000,
-                TtlPolicy::Finite(Duration::from_secs(3600)),
-                None,
-                2000
-            )
-            .is_ok()
-        );
+        assert!(check_ttl(1000, TtlPolicy::Finite(Duration::from_hours(1)), None, 2000).is_ok());
     }
 
     #[test]
     fn check_ttl_returns_expired_when_elapsed() {
         assert!(matches!(
-            check_ttl(
-                1000,
-                TtlPolicy::Finite(Duration::from_secs(3600)),
-                None,
-                5000
-            )
-            .unwrap_err(),
+            check_ttl(1000, TtlPolicy::Finite(Duration::from_hours(1)), None, 5000).unwrap_err(),
             TtlError::Expired
         ));
     }
 
     #[test]
     fn check_ttl_returns_expired_at_exact_deadline() {
-        assert!(
-            check_ttl(
-                1000,
-                TtlPolicy::Finite(Duration::from_secs(3600)),
-                None,
-                4600
-            )
-            .is_err()
-        );
+        assert!(check_ttl(1000, TtlPolicy::Finite(Duration::from_hours(1)), None, 4600).is_err());
     }
 
     #[test]
@@ -1888,7 +1866,7 @@ mod tests {
         assert!(
             check_ttl(
                 1000,
-                TtlPolicy::Finite(Duration::from_secs(3600)),
+                TtlPolicy::Finite(Duration::from_hours(1)),
                 Some(10000),
                 5000
             )
@@ -1901,7 +1879,7 @@ mod tests {
         assert!(
             check_ttl(
                 1000,
-                TtlPolicy::Finite(Duration::from_secs(3600)),
+                TtlPolicy::Finite(Duration::from_hours(1)),
                 Some(8000),
                 9000
             )
@@ -1914,7 +1892,7 @@ mod tests {
     #[test]
     fn ttl_enforcer_check_active() {
         let clock = TestClock::new(1000);
-        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_hours(1)));
         assert!(enforcer.check(&clock).is_ok());
         assert!(!enforcer.is_expired());
     }
@@ -1922,7 +1900,7 @@ mod tests {
     #[test]
     fn ttl_enforcer_check_expired() {
         let clock = TestClock::new(5000);
-        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_hours(1)));
         assert!(enforcer.check(&clock).is_err());
         assert!(enforcer.is_expired());
     }
@@ -1930,7 +1908,7 @@ mod tests {
     #[test]
     fn ttl_enforcer_latches_expired() {
         let clock = TestClock::new(5000);
-        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_hours(1)));
         assert!(enforcer.check(&clock).is_err());
         clock.set(2000);
         assert!(enforcer.check(&clock).is_err());
@@ -1947,7 +1925,7 @@ mod tests {
     fn ttl_enforcer_apply_extension_resets_deadline() {
         // created_at=1000, TTL=3600s => deadline=4600. Clock at 4700 is past deadline.
         let clock = TestClock::new(4700);
-        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_hours(1)));
         assert!(enforcer.check(&clock).is_err());
         // Apply extension to 8000 -- this clears the expired latch and sets
         // extended_until.
@@ -1970,14 +1948,14 @@ mod tests {
     #[test]
     fn ttl_enforcer_remaining_secs() {
         let clock = TestClock::new(2000);
-        let enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        let enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_hours(1)));
         assert_eq!(enforcer.remaining_secs(&clock), Some(2600));
     }
 
     #[test]
     fn ttl_enforcer_remaining_secs_expired() {
         let clock = TestClock::new(5000);
-        let enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        let enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_hours(1)));
         assert_eq!(enforcer.remaining_secs(&clock), Some(0));
     }
 
@@ -1990,11 +1968,11 @@ mod tests {
 
     #[test]
     fn ttl_enforcer_accessors() {
-        let enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        let enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_hours(1)));
         assert_eq!(enforcer.created_at(), 1000);
         assert_eq!(
             enforcer.ttl_policy(),
-            TtlPolicy::Finite(Duration::from_secs(3600))
+            TtlPolicy::Finite(Duration::from_hours(1))
         );
         assert_eq!(enforcer.extended_until(), None);
         assert!(!enforcer.is_expired());
@@ -2024,7 +2002,7 @@ mod tests {
     fn extension_proposal_bilateral_requires_all_members() {
         let mut proposal = TtlExtensionProposal::new(
             "did:key:alice".into(),
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             2,
             GovernanceModel::SingleAdmin,
         );
@@ -2040,7 +2018,7 @@ mod tests {
     fn extension_proposal_multi_party_single_admin() {
         let mut proposal = TtlExtensionProposal::new(
             "did:key:admin".into(),
-            Duration::from_secs(7200),
+            Duration::from_hours(2),
             5,
             GovernanceModel::SingleAdmin,
         );
@@ -2053,7 +2031,7 @@ mod tests {
     fn extension_proposal_computes_deadline() {
         let proposal = TtlExtensionProposal::new(
             "did:key:alice".into(),
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             2,
             GovernanceModel::SingleAdmin,
         );
@@ -2105,7 +2083,7 @@ mod tests {
     fn ttl_timer_handle_reset() {
         let mut h = MockTimerHandle::new();
         h.cancel_timer();
-        h.reset_timer(Duration::from_secs(7200));
+        h.reset_timer(Duration::from_hours(2));
         assert!(h.is_timer_active());
     }
 
@@ -2114,11 +2092,11 @@ mod tests {
     #[test]
     fn full_extension_flow_bilateral() {
         let clock = TestClock::new(3000);
-        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_hours(1)));
         assert!(enforcer.check(&clock).is_ok());
         let mut proposal = TtlExtensionProposal::new(
             "did:key:alice".into(),
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             2,
             GovernanceModel::SingleAdmin,
         );
@@ -2136,10 +2114,10 @@ mod tests {
     #[test]
     fn full_extension_flow_multi_party() {
         let clock = TestClock::new(2000);
-        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_secs(3600)));
+        let mut enforcer = TtlEnforcer::new(1000, TtlPolicy::Finite(Duration::from_hours(1)));
         let mut proposal = TtlExtensionProposal::new(
             "did:key:admin".into(),
-            Duration::from_secs(7200),
+            Duration::from_hours(2),
             5,
             GovernanceModel::SingleAdmin,
         );

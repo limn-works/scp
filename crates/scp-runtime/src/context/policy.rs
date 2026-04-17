@@ -144,7 +144,7 @@ mod tests {
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
             from: TrustRequirement::SharedContext,
-            max_ttl: Some(Duration::from_secs(600)),
+            max_ttl: Some(Duration::from_mins(10)),
             rate_limit: Some(RateLimit::per_hour(5)),
         };
 
@@ -416,7 +416,7 @@ mod tests {
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
             from: TrustRequirement::SharedContext,
-            max_ttl: Some(Duration::from_secs(600)),
+            max_ttl: Some(Duration::from_mins(10)),
             rate_limit: Some(RateLimit::per_hour(5)),
         };
         let json = serde_json::to_string(&policy).unwrap();
@@ -451,7 +451,7 @@ mod tests {
         let alice_policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
             from: TrustRequirement::Any,
-            max_ttl: Some(Duration::from_secs(300)),
+            max_ttl: Some(Duration::from_mins(5)),
             rate_limit: None,
         };
         let bob_policy = AutoAcceptPolicy {
@@ -491,7 +491,7 @@ mod tests {
         let policy_v2 = AutoAcceptPolicy {
             template: TemplateId::BilateralPersistent,
             from: TrustRequirement::SharedContext,
-            max_ttl: Some(Duration::from_secs(600)),
+            max_ttl: Some(Duration::from_mins(10)),
             rate_limit: Some(RateLimit::per_hour(3)),
         };
 

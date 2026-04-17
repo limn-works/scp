@@ -73,7 +73,7 @@ const FULL_TIER_PADDING: usize = 1024;
 
 /// Cover traffic interval for the Reduced tier per spec §9.10.6:
 /// one padded message every 120 seconds per relay connection.
-const REDUCED_TIER_INTERVAL: Duration = Duration::from_secs(120);
+const REDUCED_TIER_INTERVAL: Duration = Duration::from_mins(2);
 
 /// Padding target size for the Reduced tier: 256 bytes.
 /// ~1.8MB/day for 5 relay connections (spec §9.10.6).
@@ -265,7 +265,7 @@ impl TransportProfile {
     pub const fn reconnect_backoff_range(&self) -> Option<(Duration, Duration)> {
         match self {
             Self::Server | Self::Desktop => Some((Duration::from_secs(1), Duration::from_secs(30))),
-            Self::Mobile => Some((Duration::from_secs(5), Duration::from_secs(60))),
+            Self::Mobile => Some((Duration::from_secs(5), Duration::from_mins(1))),
             Self::Constrained => None,
         }
     }
@@ -601,7 +601,7 @@ mod tests {
         let range = TransportProfile::Mobile.reconnect_backoff_range();
         assert_eq!(
             range,
-            Some((Duration::from_secs(5), Duration::from_secs(60)))
+            Some((Duration::from_secs(5), Duration::from_mins(1)))
         );
     }
 
@@ -698,7 +698,7 @@ mod tests {
     fn reduced_tier_interval() {
         assert_eq!(
             CoverTrafficTier::Reduced.interval(),
-            Some(Duration::from_secs(120))
+            Some(Duration::from_mins(2))
         );
     }
 
@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn custom_tier_is_enabled() {
         let tier = CoverTrafficTier::Custom {
-            interval: Duration::from_secs(60),
+            interval: Duration::from_mins(1),
             padding_bytes: 128,
         };
         assert!(tier.is_enabled());

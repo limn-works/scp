@@ -816,8 +816,7 @@ impl ContextProvider for FfiBridgeProvider {
         let invoker_did_typed: scp_primitives::DID = agent_did.clone().into();
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_secs());
         let manager = crate::runtime::context_manager().map_err(|e| format!("{e}"))?;
         if !manager.try_consume_hard_rate_limit_from_any_context(
             context_id,

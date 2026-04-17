@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_challenge_generation() {
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(60))
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(1))
             .expect("challenge generation should succeed");
 
         assert_eq!(challenge.protocol, "scpid/1.0");
@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn test_challenge_json_roundtrip() {
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120))
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2))
             .expect("challenge generation should succeed");
 
         let json = serde_json::to_string(&challenge).expect("serialize should succeed");
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn test_ttl_boundary_exactly_300() {
         // Exactly 300 seconds should succeed.
-        let result = scpid_challenge("https://example.com", Duration::from_secs(300));
+        let result = scpid_challenge("https://example.com", Duration::from_mins(5));
         assert!(result.is_ok());
     }
 
@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn test_audience_length_rejection() {
         let long_audience = "x".repeat(2049);
-        let result = scpid_challenge(&long_audience, Duration::from_secs(60));
+        let result = scpid_challenge(&long_audience, Duration::from_mins(1));
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -472,13 +472,13 @@ mod tests {
     #[test]
     fn test_audience_boundary_exactly_2048() {
         let audience = "x".repeat(2048);
-        let result = scpid_challenge(&audience, Duration::from_secs(60));
+        let result = scpid_challenge(&audience, Duration::from_mins(1));
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_protocol_field() {
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(60))
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(1))
             .expect("challenge generation should succeed");
         assert_eq!(challenge.protocol, "scpid/1.0");
     }
@@ -527,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_empty_audience_rejection() {
-        let result = scpid_challenge("", Duration::from_secs(60));
+        let result = scpid_challenge("", Duration::from_mins(1));
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -605,7 +605,7 @@ mod tests {
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let pubkey = custody.public_key(&handle).await.unwrap();
 
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
 
         let response = scpid_sign(
             &custody,
@@ -658,7 +658,7 @@ mod tests {
         let pubkey = custody.public_key(&handle).await.unwrap();
 
         let challenge =
-            scpid_challenge("https://agent-service.example.com", Duration::from_secs(60)).unwrap();
+            scpid_challenge("https://agent-service.example.com", Duration::from_mins(1)).unwrap();
 
         let response = scpid_sign(
             &custody,
@@ -730,7 +730,7 @@ mod tests {
 
         let custody = InMemoryKeyCustody::new();
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(60)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(1)).unwrap();
 
         let result = scpid_sign(&custody, &handle, "", SigningKeyId::Active, &challenge).await;
         assert!(
@@ -843,7 +843,7 @@ mod tests {
     #[tokio::test]
     async fn test_scpid_sign_then_verify_roundtrip_active() {
         let did = "did:dht:z6MkTest";
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
         let (response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
 
         let resolver = TestDidResolver::with_document(doc);
@@ -860,7 +860,7 @@ mod tests {
     async fn test_scpid_sign_then_verify_roundtrip_agent() {
         let did = "did:dht:z6MkAgent";
         let challenge =
-            scpid_challenge("https://agent-service.example.com", Duration::from_secs(60)).unwrap();
+            scpid_challenge("https://agent-service.example.com", Duration::from_mins(1)).unwrap();
         let (response, doc) = sign_and_build_doc(did, SigningKeyId::Agent, &challenge).await;
 
         let resolver = TestDidResolver::with_document(doc);
@@ -875,7 +875,7 @@ mod tests {
     #[tokio::test]
     async fn test_scpid_verify_nonce_mismatch() {
         let did = "did:dht:z6MkTest";
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
         let (mut response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
 
         // Tamper with the nonce in the response.
@@ -892,7 +892,7 @@ mod tests {
     #[tokio::test]
     async fn test_scpid_verify_audience_mismatch() {
         let did = "did:dht:z6MkTest";
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
         let (mut response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
 
         // Tamper with the audience in the response.
@@ -927,7 +927,7 @@ mod tests {
     #[tokio::test]
     async fn test_scpid_verify_signed_at_before_issued_at() {
         let did = "did:dht:z6MkTest";
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
         let (mut response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
 
         // Set signed_at before issued_at.
@@ -944,7 +944,7 @@ mod tests {
     #[tokio::test]
     async fn test_scpid_verify_signed_at_after_expires_at() {
         let did = "did:dht:z6MkTest";
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
         let (mut response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
 
         // Set signed_at after expires_at.
@@ -961,7 +961,7 @@ mod tests {
     #[tokio::test]
     async fn test_scpid_verify_did_not_found() {
         let did = "did:dht:z6MkTest";
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
         let (response, _doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
 
         let resolver = TestDidResolver::not_found();
@@ -975,7 +975,7 @@ mod tests {
     #[tokio::test]
     async fn test_scpid_verify_did_resolution_error() {
         let did = "did:dht:z6MkTest";
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
         let (response, _doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
 
         let resolver = TestDidResolver::failing();
@@ -989,7 +989,7 @@ mod tests {
     #[tokio::test]
     async fn test_scpid_verify_wrong_signing_key() {
         let did = "did:dht:z6MkTest";
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
         let (response, _doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
 
         // Build a DID document with a different key in the #active slot.
@@ -1012,7 +1012,7 @@ mod tests {
     #[tokio::test]
     async fn test_scpid_verify_invalid_signature() {
         let did = "did:dht:z6MkTest";
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
         let (mut response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
 
         // Tamper with the signature.
@@ -1029,7 +1029,7 @@ mod tests {
     #[tokio::test]
     async fn test_scpid_verify_key_not_in_authentication() {
         let did = "did:dht:z6MkTest";
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
         let (response, mut doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
 
         // Remove #active from the authentication relationship.
@@ -1046,7 +1046,7 @@ mod tests {
     #[tokio::test]
     async fn test_scpid_verify_vm_not_found() {
         let did = "did:dht:z6MkTest";
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
         let (response, mut doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
 
         // Remove all verification methods except #0.
@@ -1064,7 +1064,7 @@ mod tests {
     #[tokio::test]
     async fn test_scpid_verify_wrong_protocol() {
         let did = "did:dht:z6MkTest";
-        let challenge = scpid_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
         let (mut response, doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
 
         // Mutate the protocol field directly (deserialization would reject it,

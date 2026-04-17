@@ -374,7 +374,7 @@ mod tests {
 
         // Challenge.
         let challenge =
-            scp_core::identity::scpid_challenge("https://example.com", Duration::from_secs(120))
+            scp_core::identity::scpid_challenge("https://example.com", Duration::from_mins(2))
                 .unwrap();
 
         // Sign.

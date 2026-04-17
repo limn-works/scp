@@ -33,7 +33,7 @@ use zeroize::Zeroizing;
 const RENEWAL_THRESHOLD_DAYS: i64 = 30;
 
 /// How often the background renewal loop checks certificate expiry.
-const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60); // 12 hours
+const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_hours(12); // 12 hours
 
 // ---------------------------------------------------------------------------
 // Error types

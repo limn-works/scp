@@ -311,7 +311,7 @@ impl CoverTrafficGenerator {
         };
 
         // Reset counter when a new minute begins.
-        let one_minute = Duration::from_secs(60);
+        let one_minute = Duration::from_mins(1);
         match self.period_start {
             Some(start) if now >= start + one_minute => {
                 self.bytes_sent_this_period = 0;
@@ -470,7 +470,7 @@ mod tests {
         assert!(matches!(ctg.next_action(now), CoverAction::SendDummy(_)));
         // Within 120s interval -> skip
         assert_eq!(
-            ctg.next_action(now + Duration::from_secs(60)),
+            ctg.next_action(now + Duration::from_mins(1)),
             CoverAction::Skip,
         );
         // After 120s -> sends dummy
@@ -490,11 +490,11 @@ mod tests {
         let now = Instant::now();
         assert_eq!(ctg.next_action(now), CoverAction::Skip);
         assert_eq!(
-            ctg.next_action(now + Duration::from_secs(60)),
+            ctg.next_action(now + Duration::from_mins(1)),
             CoverAction::Skip,
         );
         assert_eq!(
-            ctg.next_action(now + Duration::from_secs(600)),
+            ctg.next_action(now + Duration::from_mins(10)),
             CoverAction::Skip,
         );
     }
@@ -644,7 +644,7 @@ mod tests {
             tier: CoverTrafficTier::Reduced,
             ..Default::default()
         });
-        assert_eq!(reduced.interval(), Some(Duration::from_secs(120)));
+        assert_eq!(reduced.interval(), Some(Duration::from_mins(2)));
 
         let off = CoverTrafficGenerator::new(CoverTrafficConfig {
             tier: CoverTrafficTier::Off,
@@ -780,7 +780,7 @@ mod tests {
 
         // A call at t=60.0s should fire.
         assert!(matches!(
-            ctg.next_action(start + Duration::from_secs(60)),
+            ctg.next_action(start + Duration::from_mins(1)),
             CoverAction::SendDummy(_)
         ));
     }
@@ -811,7 +811,7 @@ mod tests {
             CoverAction::Skip
         ));
         assert!(matches!(
-            ctg.next_action(start + Duration::from_secs(120)),
+            ctg.next_action(start + Duration::from_mins(2)),
             CoverAction::SendDummy(_)
         ));
     }

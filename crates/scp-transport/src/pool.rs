@@ -155,7 +155,7 @@ pub struct ConnectionPool {
 
 impl fmt::Debug for ConnectionPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let count = self.entries.read().map(|e| e.len()).unwrap_or(0);
+        let count = self.entries.read().map_or(0, |e| e.len());
         f.debug_struct("ConnectionPool")
             .field("entries", &count)
             .finish()

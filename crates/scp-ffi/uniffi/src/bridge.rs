@@ -2008,15 +2008,14 @@ impl TransportManager {
             .ok()
             .and_then(|bi| bi.with_transport(|mgr| mgr.adapter_count() > 0).ok())
             .unwrap_or(false);
-        let status = self
-            .status
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or(TransportStatus {
+        let status = self.status.lock().map_or(
+            TransportStatus {
                 connected: false,
                 relay_url: None,
                 latency_ms: None,
-            });
+            },
+            |s| s.clone(),
+        );
         TransportStatus {
             connected: has_adapters && status.connected,
             relay_url: if has_adapters { status.relay_url } else { None },
@@ -3677,8 +3676,7 @@ pub async fn tool_register(
                 cost,
                 registered_at: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+                    .map_or(0, |d| d.as_secs()),
                 signature: Vec::new(),
             };
 
@@ -9427,7 +9425,7 @@ pub fn trust_create_challenge(target_did: String) -> Result<ChallengeResult, Scp
         scp_core::trust::ChallengeType::schema_validation(),
         "scp:capability:schema-validation/v1".to_string(),
         serde_json::json!({}),
-        std::time::Duration::from_secs(300),
+        std::time::Duration::from_mins(5),
         &signer,
     )
     .map_err(|e| ScpError::Validation {
@@ -13228,7 +13226,7 @@ mod tests {
             discovery_method: scp_core::provenance::DiscoveryMethod::Registry(
                 "ctx-reg".to_string(),
             ),
-            age: std::time::Duration::from_secs(600),
+            age: std::time::Duration::from_mins(10),
             memory_scope: scp_core::context::MemoryScope::Summary,
             chain_depth: 1,
             chain_path: Some(vec!["ctx-mid".to_string()]),
@@ -13935,7 +13933,7 @@ mod tests {
         dht.publish(&identity, &doc).await.unwrap();
 
         // Challenge.
-        let challenge = core_challenge("https://example.com", Duration::from_secs(120)).unwrap();
+        let challenge = core_challenge("https://example.com", Duration::from_mins(2)).unwrap();
 
         // Sign.
         let response = core_sign(

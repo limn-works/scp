@@ -236,7 +236,7 @@ impl RelayMessageBuffer {
     /// After this call the buffer is empty.
     #[must_use]
     pub fn drain_sorted(mut self) -> Vec<BufferedMessage> {
-        self.messages.sort_by(|a, b| a.stored_at.cmp(&b.stored_at));
+        self.messages.sort_by_key(|a| a.stored_at);
         self.messages
     }
 }
@@ -869,7 +869,7 @@ impl ReconnectionCoordinator {
             member_did,
             context_ids,
             last_relay_contacts,
-            overall_timeout: Duration::from_secs(120),
+            overall_timeout: Duration::from_mins(2),
             policy,
         }
     }

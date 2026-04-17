@@ -447,10 +447,10 @@ mod tests {
     #[test]
     fn ttl_set() {
         let ctx = build_ok(&CommonContextParams {
-            ttl: Some(Duration::from_secs(3600)),
+            ttl: Some(Duration::from_hours(1)),
             ..Default::default()
         });
-        assert_eq!(ctx.ttl, Some(Duration::from_secs(3600)));
+        assert_eq!(ctx.ttl, Some(Duration::from_hours(1)));
     }
 
     #[test]

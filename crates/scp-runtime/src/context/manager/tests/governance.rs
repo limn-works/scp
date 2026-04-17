@@ -739,7 +739,7 @@ async fn promote_context_succeeds_when_policy_is_promotable() {
     let params = ContextParams {
         promotion_policy: PromotionPolicy::Promotable,
         memory_scope: MemoryScope::Ephemeral,
-        ttl: Some(std::time::Duration::from_secs(3600)),
+        ttl: Some(std::time::Duration::from_hours(1)),
         ceiling: vec![
             scp_protocol::context::params::Capability::new("messages:read"),
             scp_protocol::context::params::Capability::new("messages:write"),
@@ -2114,7 +2114,7 @@ async fn extend_ttl_rejects_without_unanimity() {
         noop_key_resolver(),
     );
     let mut params = governance_params();
-    params.ttl = Some(std::time::Duration::from_secs(3600));
+    params.ttl = Some(std::time::Duration::from_hours(1));
     let _handle = manager
         .create_context("ttl-unan-ctx".into(), params, "did:key:creator".into())
         .await
@@ -2164,7 +2164,7 @@ async fn extend_ttl_succeeds_with_unanimity() {
         noop_key_resolver(),
     );
     let mut params = governance_params();
-    params.ttl = Some(std::time::Duration::from_secs(3600));
+    params.ttl = Some(std::time::Duration::from_hours(1));
     let _handle = manager
         .create_context("ttl-unan2-ctx".into(), params, "did:key:creator".into())
         .await
@@ -2223,7 +2223,7 @@ async fn promote_context_requires_unanimity() {
     let mut params = governance_params();
     params.promotion_policy = PromotionPolicy::Promotable;
     params.memory_scope = MemoryScope::Ephemeral;
-    params.ttl = Some(std::time::Duration::from_secs(3600));
+    params.ttl = Some(std::time::Duration::from_hours(1));
 
     let _handle = manager
         .create_context(
@@ -2967,7 +2967,7 @@ async fn scp274_exercises_seven_action_variants() {
         "CloseContext"
     );
     let mut params2 = governance_params();
-    params2.ttl = Some(std::time::Duration::from_secs(3600));
+    params2.ttl = Some(std::time::Duration::from_hours(1));
     let _h2 = manager
         .create_context("scp274-7b".into(), params2, "did:key:admin".into())
         .await
@@ -3065,7 +3065,7 @@ async fn scp274_extend_ttl_unanimity_override_in_threshold() {
         noop_key_resolver(),
     );
     let mut params = governance_params();
-    params.ttl = Some(std::time::Duration::from_secs(3600));
+    params.ttl = Some(std::time::Duration::from_hours(1));
     params.governance = GovernanceModel::Threshold {
         threshold: 1,
         signers: vec!["did:key:creator".into()],
@@ -3135,7 +3135,7 @@ async fn scp274_promote_context_unanimity_override_in_majority() {
     };
     params.promotion_policy = PromotionPolicy::Promotable;
     params.memory_scope = MemoryScope::Ephemeral;
-    params.ttl = Some(std::time::Duration::from_secs(3600));
+    params.ttl = Some(std::time::Duration::from_hours(1));
     let _handle = manager
         .create_context("scp274-promo".into(), params, creator.clone())
         .await
@@ -5330,7 +5330,7 @@ async fn test_consequence_rule_triggers_enforcement_event() {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 1,
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }];
     }
 
@@ -5677,7 +5677,7 @@ async fn test_access_revocation_revokes_read_and_write() {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 1,
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }];
     }
 
@@ -5767,7 +5767,7 @@ async fn role_demotion_changes_member_role() {
                 to_role: "observer".to_owned(),
             },
             threshold: 1,
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }];
     }
 
@@ -5963,7 +5963,7 @@ async fn test_capability_suspension_no_match_returns_false() {
                 capabilities: vec![Capability::Custom("foobar".to_owned())],
             }),
             threshold: 1,
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }];
     }
 
@@ -6453,7 +6453,7 @@ async fn consequence_triggers_after_governance_action() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let _handle = manager
         .create_context("gov-conseq-ctx".into(), params, admin.clone())
@@ -6724,7 +6724,7 @@ async fn event_log_entries_feed_consequence_evaluation() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let _handle = manager
         .create_context("event-feed-ctx".into(), params, "did:key:admin".into())
@@ -7011,7 +7011,7 @@ async fn full_send_consequence_enforcement_round_trip() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let _handle = manager
         .create_context("roundtrip-ctx".into(), params, "did:key:admin".into())
@@ -7200,7 +7200,7 @@ async fn capability_suspension_blocks_subsequent_send() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let _handle = manager
         .create_context("block-send-ctx".into(), params, "did:key:admin".into())
@@ -7273,7 +7273,7 @@ async fn access_revocation_blocks_subsequent_send() {
         trigger: ConsequenceTrigger::MessageVelocity,
         threshold: 1,
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let _handle = manager
         .create_context("block-access-ctx".into(), params, "did:key:admin".into())
@@ -7592,7 +7592,7 @@ async fn consequence_triggers_on_message_send() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let _handle = manager
         .create_context("msg-conseq-ctx".into(), params, "did:key:admin".into())
@@ -8954,7 +8954,7 @@ async fn test_send_consequence_economy_round_trip() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let _handle = manager
         .create_context("xcut-rt-ctx".into(), params, "did:key:admin".into())
@@ -9126,7 +9126,7 @@ async fn test_paid_join_with_consequence_evaluation() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let handle = manager
         .create_context("paid-join-cq-ctx".into(), params, "did:key:admin".into())
@@ -9981,7 +9981,7 @@ async fn test_consequence_evaluation_uses_full_history() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let _handle = manager
         .create_context("hist-ctx".into(), params, "did:key:admin".into())
@@ -10967,7 +10967,7 @@ async fn capability_suspension_exact_match_no_false_positive() {
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
                 capabilities: vec![Capability::Custom("spreadsheet".to_owned())],
             }),
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }];
     }
 
@@ -11061,7 +11061,7 @@ async fn capability_suspension_write_revokes_write() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let _handle = manager
         .create_context("cap-write-ctx".into(), params, "did:key:sender".into())
@@ -11139,7 +11139,7 @@ async fn capability_suspension_read_revokes_read() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesRead],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let _handle = manager
         .create_context("cap-read-ctx".into(), params, "did:key:sender".into())
@@ -11221,7 +11221,7 @@ async fn role_demotion_nonexistent_role_reports_failure() {
         action: ConsequenceAction::AssignRole {
             to_role: "nonexistent_role".to_owned(),
         },
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let _handle = manager
         .create_context("role-noexist-ctx".into(), params, "did:key:sender".into())
@@ -11540,7 +11540,7 @@ async fn capability_suspension_empty_caps_no_action() {
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
                 capabilities: vec![],
             }),
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }];
     }
 
@@ -11638,7 +11638,7 @@ async fn multiple_consequence_rules_all_trigger() {
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
                 capabilities: vec![Capability::MessagesWrite],
             }),
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         },
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
@@ -11646,7 +11646,7 @@ async fn multiple_consequence_rules_all_trigger() {
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
                 capabilities: vec![Capability::MessagesRead],
             }),
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         },
     ];
     let _handle = manager
@@ -11878,7 +11878,7 @@ async fn test_warning_count_trigger_fires_behavioral() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let handle = manager
         .create_context("warn-ctx".into(), params, admin.clone())
@@ -12827,7 +12827,7 @@ async fn consequence_timer_fires_without_user_action() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
 
     let _handle = manager
@@ -12910,7 +12910,7 @@ async fn consequence_timer_respects_cooldown() {
             capabilities: vec![Capability::MessagesWrite],
         }),
         // Long cooldown window — rule should NOT re-fire on second tick.
-        window: Duration::from_secs(7200),
+        window: Duration::from_hours(2),
     }];
 
     let _handle = manager
@@ -13031,7 +13031,7 @@ fn consequence_can_suspend_capability() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
 
     let events = vec![Event {
@@ -13070,7 +13070,7 @@ fn consequence_triggered_on_dispatch_evaluation() {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 2,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         },
         ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
@@ -13078,7 +13078,7 @@ fn consequence_triggered_on_dispatch_evaluation() {
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
                 capabilities: vec![Capability::MessagesRead],
             }),
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         },
     ];
 
@@ -13451,7 +13451,7 @@ async fn test_spending_ucan_expired_c1() {
         max_per_action: SpendAmount(u64::MAX),
         max_total: SpendAmount(u64::MAX),
         currency: SpendCcy::from_code("USD").unwrap(),
-        time_window: std::time::Duration::from_secs(3600),
+        time_window: std::time::Duration::from_hours(1),
         allowed_adapters: vec![],
     };
     let mut fct = serde_json::Map::new();
@@ -14014,7 +14014,7 @@ async fn test_consequence_failure_escalates() {
         action: ConsequenceAction::AssignRole {
             to_role: "nonexistent".to_owned(),
         },
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let _handle = manager
         .create_context("esc-ctx".into(), params, "did:key:sender".into())
@@ -14582,7 +14582,7 @@ async fn deliver_incoming_evaluates_consequences_behavioral() {
             capabilities: vec![Capability::MessagesWrite],
         }),
         threshold: 3,
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     };
 
     let (alice_manager, alice_handle, sent, bob_manager) =
@@ -15259,7 +15259,7 @@ async fn enforce_triggered_consequences_skips_absent_member() {
             capabilities: vec![Capability::MessagesWrite],
         }),
         threshold: 1,
-        window: Duration::from_secs(60),
+        window: Duration::from_mins(1),
     }];
 
     let triggered = vec![TriggeredConsequence {
@@ -15748,7 +15748,7 @@ async fn create_with_governance_rejects_threshold_zero() {
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
                 capabilities: vec![Capability::MessagesWrite],
             }),
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }],
         ..ContextParams::default()
     };
@@ -15788,7 +15788,7 @@ async fn create_with_governance_rejects_empty_custom_trigger() {
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
                 capabilities: vec![Capability::MessagesWrite],
             }),
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }],
         ..ContextParams::default()
     };
@@ -15837,7 +15837,7 @@ async fn create_with_governance_rejects_remove_member_action() {
                 did: target,
                 reason: Some("test".to_owned()),
             }),
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }],
         ..ContextParams::default()
     };
@@ -15889,7 +15889,7 @@ async fn create_with_governance_rejects_revoke_access_without_config_opt_in() {
                 did: target,
                 access: AccessScope::Both,
             }),
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }],
         // consequence_config defaults to allow_automatic_access_revocation = false.
         ..ContextParams::default()
@@ -15940,7 +15940,7 @@ async fn create_with_governance_accepts_revoke_access_with_config_opt_in() {
                 did: target,
                 access: AccessScope::Both,
             }),
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }],
         ..ContextParams::default()
     };
@@ -15987,7 +15987,7 @@ async fn create_with_governance_accepts_valid_rules() {
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
                 capabilities: vec![Capability::MessagesWrite],
             }),
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }],
         ..ContextParams::default()
     };
@@ -16978,7 +16978,7 @@ async fn suspend_all_consequence_preserves_mls_membership() {
         trigger: ConsequenceTrigger::WarningCount,
         threshold: 1,
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
 
     let handle = manager
@@ -17041,7 +17041,7 @@ async fn suspend_all_consequence_preserves_mls_membership() {
         trigger: ConsequenceTrigger::WarningCount,
         threshold: 1,
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let triggered = vec![TriggeredConsequence {
         rule_index: 0,
@@ -17213,7 +17213,7 @@ async fn suspend_capability_consequence_preserves_mls_membership() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
 
     let handle = manager
@@ -17251,7 +17251,7 @@ async fn suspend_capability_consequence_preserves_mls_membership() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let triggered = vec![TriggeredConsequence {
         rule_index: 0,
@@ -17426,7 +17426,7 @@ async fn restore_access_after_suspend_all_regrants_capabilities() {
         trigger: ConsequenceTrigger::WarningCount,
         threshold: 1,
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let triggered = vec![TriggeredConsequence {
         rule_index: 0,
@@ -17625,7 +17625,7 @@ async fn consequence_enforced_appended_to_durable_event_log() {
                 capabilities: vec![Capability::MessagesWrite],
             }),
             threshold: 1,
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }];
     }
 
@@ -17766,7 +17766,7 @@ async fn consequence_escalation_appended_with_distinct_event_type() {
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
                 capabilities: vec![],
             }),
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }];
     }
 
@@ -17907,7 +17907,7 @@ async fn consequence_events_visible_to_subsequent_rule_evaluation() {
                     to_role: "observer".to_owned(),
                 },
                 threshold: 1,
-                window: Duration::from_secs(3600),
+                window: Duration::from_hours(1),
             },
         ];
     }

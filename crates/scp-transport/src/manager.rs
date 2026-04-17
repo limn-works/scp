@@ -46,7 +46,7 @@ pub type ContextId = String;
 const DEFAULT_DEDUP_CAPACITY: usize = 10_000;
 
 /// Default deduplication cache entry TTL.
-const DEFAULT_DEDUP_TTL: Duration = Duration::from_secs(3600);
+const DEFAULT_DEDUP_TTL: Duration = Duration::from_hours(1);
 
 // MIN_RELAYS_PER_CONTEXT and MIN_SUCCESSFUL_SENDS were formerly hardcoded
 // constants (3 and 2 respectively). They are now derived from the
@@ -60,7 +60,7 @@ const DEFAULT_DEDUP_TTL: Duration = Duration::from_secs(3600);
 /// The `Mobile` profile proactively sheds connections for inactive contexts
 /// (no sends or receives in the last 5 minutes) and relies on the push
 /// notification bridge (§10.7) to wake the connection on new messages.
-const MOBILE_IDLE_THRESHOLD: Duration = Duration::from_secs(300);
+const MOBILE_IDLE_THRESHOLD: Duration = Duration::from_mins(5);
 
 /// Outcome of an LRU eviction triggered by connection budget enforcement.
 ///
@@ -1032,7 +1032,7 @@ impl TransportManager {
         // If an adapter has no timestamp, treat it as the oldest possible
         // instant (Instant::now() minus 24 hours, falling back to epoch-ish).
         let fallback_instant = Instant::now()
-            .checked_sub(Duration::from_secs(86400))
+            .checked_sub(Duration::from_hours(24))
             .unwrap_or_else(Instant::now);
 
         (0..self.adapters.len())
@@ -1792,7 +1792,7 @@ mod tests {
         MergedStream::new(
             indexed_streams,
             std::num::NonZeroUsize::new(100).unwrap(),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             Arc::new(Mutex::new(SuppressionTracker::new())),
             Arc::new(Mutex::new(HashMap::new())),
             2,
@@ -2209,11 +2209,11 @@ mod tests {
     async fn with_config_uses_custom_dedup_settings() {
         let config = TransportConfig {
             dedup_cache_size: 500,
-            dedup_cache_ttl: Duration::from_secs(120),
+            dedup_cache_ttl: Duration::from_mins(2),
             ..TransportConfig::default()
         };
         let manager = TransportManager::with_config(&config);
-        assert_eq!(manager.dedup_ttl, Duration::from_secs(120));
+        assert_eq!(manager.dedup_ttl, Duration::from_mins(2));
         assert_eq!(
             manager.dedup_cache.cap(),
             std::num::NonZeroUsize::new(500).unwrap()
@@ -2919,9 +2919,7 @@ mod tests {
         // Adapter 2 remains recently used.
         {
             let mut last_used = manager.connection_last_used.lock().unwrap();
-            let old_time = Instant::now()
-                .checked_sub(Duration::from_secs(600))
-                .unwrap();
+            let old_time = Instant::now().checked_sub(Duration::from_mins(10)).unwrap();
             last_used.insert(0, old_time);
             last_used.insert(1, old_time);
             // Adapter 2 keeps its current (recent) timestamp.
@@ -2950,9 +2948,7 @@ mod tests {
         // Backdate both adapters past the idle threshold.
         {
             let mut last_used = manager.connection_last_used.lock().unwrap();
-            let old_time = Instant::now()
-                .checked_sub(Duration::from_secs(600))
-                .unwrap();
+            let old_time = Instant::now().checked_sub(Duration::from_mins(10)).unwrap();
             last_used.insert(0, old_time);
             last_used.insert(1, old_time);
         }
@@ -3011,9 +3007,7 @@ mod tests {
         // Backdate adapter 0 past the idle threshold. Adapter 1 stays recent.
         {
             let mut last_used = manager.connection_last_used.lock().unwrap();
-            let old_time = Instant::now()
-                .checked_sub(Duration::from_secs(600))
-                .unwrap();
+            let old_time = Instant::now().checked_sub(Duration::from_mins(10)).unwrap();
             last_used.insert(0, old_time);
         }
 
@@ -3059,7 +3053,7 @@ mod tests {
 
         // All adapters are recent — none should be idle.
         assert_eq!(
-            manager.idle_connection_count(Duration::from_secs(300)),
+            manager.idle_connection_count(Duration::from_mins(5)),
             0,
             "no connections should be idle immediately after creation"
         );
@@ -3067,22 +3061,20 @@ mod tests {
         // Backdate 2 of 3 adapters.
         {
             let mut last_used = manager.connection_last_used.lock().unwrap();
-            let old_time = Instant::now()
-                .checked_sub(Duration::from_secs(600))
-                .unwrap();
+            let old_time = Instant::now().checked_sub(Duration::from_mins(10)).unwrap();
             last_used.insert(0, old_time);
             last_used.insert(1, old_time);
         }
 
         assert_eq!(
-            manager.idle_connection_count(Duration::from_secs(300)),
+            manager.idle_connection_count(Duration::from_mins(5)),
             2,
             "2 backdated connections should be idle"
         );
 
         // With a very long threshold, none should be idle.
         assert_eq!(
-            manager.idle_connection_count(Duration::from_secs(3600)),
+            manager.idle_connection_count(Duration::from_hours(1)),
             0,
             "no connections should be idle with a 1-hour threshold"
         );

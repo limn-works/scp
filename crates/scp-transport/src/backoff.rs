@@ -199,7 +199,7 @@ mod tests {
     fn from_profile_mobile_has_correct_bounds() {
         let backoff = ReconnectBackoff::from_profile(&TransportProfile::Mobile).unwrap();
         assert_eq!(backoff.min_backoff(), Duration::from_secs(5));
-        assert_eq!(backoff.max_backoff(), Duration::from_secs(60));
+        assert_eq!(backoff.max_backoff(), Duration::from_mins(1));
     }
 
     #[test]
@@ -224,7 +224,7 @@ mod tests {
         // Third delay should be ~4s + jitter (doubled from 2s).
         let d3 = backoff.next_delay();
         assert!(d3 >= Duration::from_secs(4));
-        assert!(d3 <= Duration::from_millis(5000));
+        assert!(d3 <= Duration::from_secs(5));
     }
 
     #[test]
@@ -237,7 +237,7 @@ mod tests {
         let d4 = backoff.next_delay(); // Should still be <= 4s + jitter
 
         // The base delay is capped at 4s, jitter adds up to 25%.
-        assert!(d4 <= Duration::from_millis(5000));
+        assert!(d4 <= Duration::from_secs(5));
     }
 
     #[test]

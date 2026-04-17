@@ -361,7 +361,7 @@ mod tests {
         AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
             from: TrustRequirement::Any,
-            max_ttl: Some(Duration::from_secs(600)),
+            max_ttl: Some(Duration::from_mins(10)),
             rate_limit: Some(RateLimit::per_hour(5)),
         }
     }
@@ -372,7 +372,7 @@ mod tests {
 
     #[test]
     fn valid_template_passes() {
-        let params = bilateral_ephemeral_params(Duration::from_secs(300));
+        let params = bilateral_ephemeral_params(Duration::from_mins(5));
         let mut tracker = RateLimitTracker::new();
         let result = evaluate_invitation(
             &params,
@@ -389,7 +389,7 @@ mod tests {
     #[test]
     fn spoofed_template_with_tool_capabilities_rejected() {
         // Invitation claims bilateral-ephemeral but includes tool capabilities.
-        let mut params = bilateral_ephemeral_params(Duration::from_secs(300));
+        let mut params = bilateral_ephemeral_params(Duration::from_mins(5));
         params.ceiling.push(Capability::ToolInvokeAll);
 
         let mut tracker = RateLimitTracker::new();
@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn spoofed_template_wrong_mode_rejected() {
         // Claims bilateral-ephemeral but sets Broadcast mode.
-        let mut params = bilateral_ephemeral_params(Duration::from_secs(300));
+        let mut params = bilateral_ephemeral_params(Duration::from_mins(5));
         params.mode = ContextMode::Broadcast;
 
         let mut tracker = RateLimitTracker::new();
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn auto_accept_with_matching_policy() {
-        let params = bilateral_ephemeral_params(Duration::from_secs(300));
+        let params = bilateral_ephemeral_params(Duration::from_mins(5));
         let policy = default_policy();
         let mut tracker = RateLimitTracker::new();
 
@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn auto_accept_trust_requirement_not_met_prompts_agent() {
-        let params = bilateral_ephemeral_params(Duration::from_secs(300));
+        let params = bilateral_ephemeral_params(Duration::from_mins(5));
         let policy = default_policy();
         let mut tracker = RateLimitTracker::new();
 
@@ -723,11 +723,11 @@ mod tests {
 
     #[test]
     fn auto_accept_trust_explicit_list() {
-        let params = bilateral_ephemeral_params(Duration::from_secs(300));
+        let params = bilateral_ephemeral_params(Duration::from_mins(5));
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
             from: TrustRequirement::Explicit(vec![alice()]),
-            max_ttl: Some(Duration::from_secs(600)),
+            max_ttl: Some(Duration::from_mins(10)),
             rate_limit: None,
         };
         let oracle = ExplicitTrust {
@@ -762,11 +762,11 @@ mod tests {
 
     #[test]
     fn auto_accept_ttl_exceeds_cap_prompts_agent() {
-        let params = bilateral_ephemeral_params(Duration::from_secs(3600)); // 1 hour
+        let params = bilateral_ephemeral_params(Duration::from_hours(1)); // 1 hour
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
             from: TrustRequirement::Any,
-            max_ttl: Some(Duration::from_secs(600)), // Cap at 10 minutes
+            max_ttl: Some(Duration::from_mins(10)), // Cap at 10 minutes
             rate_limit: None,
         };
         let mut tracker = RateLimitTracker::new();
@@ -785,11 +785,11 @@ mod tests {
 
     #[test]
     fn auto_accept_ttl_within_cap_accepts() {
-        let params = bilateral_ephemeral_params(Duration::from_secs(300)); // 5 minutes
+        let params = bilateral_ephemeral_params(Duration::from_mins(5)); // 5 minutes
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
             from: TrustRequirement::Any,
-            max_ttl: Some(Duration::from_secs(600)), // Cap at 10 minutes
+            max_ttl: Some(Duration::from_mins(10)), // Cap at 10 minutes
             rate_limit: None,
         };
         let mut tracker = RateLimitTracker::new();
@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn auto_accept_no_ttl_cap_accepts_any_ttl() {
-        let params = bilateral_ephemeral_params(Duration::from_secs(86400)); // 24 hours
+        let params = bilateral_ephemeral_params(Duration::from_hours(24)); // 24 hours
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
             from: TrustRequirement::Any,
@@ -831,14 +831,14 @@ mod tests {
 
     #[test]
     fn auto_accept_rate_limited_prompts_agent() {
-        let params = bilateral_ephemeral_params(Duration::from_secs(300));
+        let params = bilateral_ephemeral_params(Duration::from_mins(5));
         let policy = AutoAcceptPolicy {
             template: TemplateId::BilateralEphemeral,
             from: TrustRequirement::Any,
             max_ttl: None,
             rate_limit: Some(RateLimit {
                 max_count: 2,
-                window: Duration::from_secs(3600),
+                window: Duration::from_hours(1),
             }),
         };
         let mut tracker = RateLimitTracker::new();
@@ -913,7 +913,7 @@ mod tests {
 
     #[test]
     fn no_policy_prompts_agent() {
-        let params = bilateral_ephemeral_params(Duration::from_secs(300));
+        let params = bilateral_ephemeral_params(Duration::from_mins(5));
         let mut tracker = RateLimitTracker::new();
 
         let result = evaluate_invitation(
@@ -959,7 +959,7 @@ mod tests {
         // Coordination template includes ToolInvokeAll -- auto-accept should
         // not apply even if policy matches.
         let mut params = ContextParams::from_template(TemplateId::Coordination);
-        params.ttl = Some(Duration::from_secs(300));
+        params.ttl = Some(Duration::from_mins(5));
         let policy = AutoAcceptPolicy {
             template: TemplateId::Coordination,
             from: TrustRequirement::Any,
@@ -989,7 +989,7 @@ mod tests {
     fn template_check_runs_before_economic_check() {
         // Spoofed template with economic policy. Template check should fail
         // before economic policy is evaluated.
-        let mut params = bilateral_ephemeral_params(Duration::from_secs(300));
+        let mut params = bilateral_ephemeral_params(Duration::from_mins(5));
         params.ceiling.push(Capability::ToolInvokeAll); // Spoofs template
         params.economic_policy = Some(EconomicPolicy {
             locked: false,
@@ -1084,7 +1084,7 @@ mod tests {
         let mut tracker = RateLimitTracker::new();
         let limit = RateLimit {
             max_count: 0,
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         };
         assert!(!tracker.is_allowed(&limit, &SystemClock));
     }
@@ -1095,7 +1095,7 @@ mod tests {
 
     #[test]
     fn free_economic_policy_allows_auto_accept() {
-        let mut params = bilateral_ephemeral_params(Duration::from_secs(300));
+        let mut params = bilateral_ephemeral_params(Duration::from_mins(5));
         params.economic_policy = Some(EconomicPolicy {
             locked: true,
             cost_schedule: CostSchedule {

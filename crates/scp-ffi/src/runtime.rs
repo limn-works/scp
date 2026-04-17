@@ -1314,9 +1314,7 @@ pub fn with_transport_manager_mut<T>(
 /// Returns `true` if a transport manager has been initialized.
 #[must_use]
 pub fn has_transport_manager() -> bool {
-    bridge_instance()
-        .map(|bi| bi.has_transport())
-        .unwrap_or(false)
+    bridge_instance().is_ok_and(|bi| bi.has_transport())
 }
 
 /// Records a heartbeat suppression event for a relay, downgrading its
@@ -1441,9 +1439,9 @@ pub struct RegistryStats {
 /// `BridgeInstance` (returns 0/false if the bridge is not initialized).
 #[must_use]
 pub fn registry_stats() -> RegistryStats {
-    let (known_count, relay_connected) = bridge_instance()
-        .map(|bi| (bi.known_context_count(), bi.has_transport()))
-        .unwrap_or((0, false));
+    let (known_count, relay_connected) = bridge_instance().map_or((0, false), |bi| {
+        (bi.known_context_count(), bi.has_transport())
+    });
     RegistryStats {
         contexts: ffi_state_registry().len(),
         known_contexts: known_count,

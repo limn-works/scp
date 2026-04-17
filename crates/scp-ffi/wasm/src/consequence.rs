@@ -270,7 +270,7 @@ mod tests {
             trigger: ConsequenceTrigger::MessageVelocity,
             action,
             threshold: 1,
-            window: Duration::from_secs(60),
+            window: Duration::from_mins(1),
         }
     }
 

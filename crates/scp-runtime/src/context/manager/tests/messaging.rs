@@ -1581,7 +1581,7 @@ async fn velocity_consequence_trigger_on_send() {
         action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
             capabilities: vec![Capability::MessagesWrite],
         }),
-        window: Duration::from_secs(3600),
+        window: Duration::from_hours(1),
     }];
     let _handle = manager
         .create_context("vel-msg-ctx".into(), params, "did:key:admin".into())
@@ -3664,7 +3664,7 @@ async fn deliver_incoming_event_log_append_precedes_consequence_eval() {
             // High threshold so eval observes but does not actually trigger,
             // keeping this test focused on call ORDER (not the trigger logic).
             threshold: 9999,
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
                 capabilities: vec![Capability::MessagesWrite],
             }),
@@ -3809,7 +3809,7 @@ async fn deliver_incoming_with_velocity_rule_counts_just_received_message() {
         ctx.governance.consequence_rules = vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             threshold: 4,
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
                 capabilities: vec![Capability::MessagesWrite],
             }),
@@ -4154,7 +4154,7 @@ async fn tool_invoke_spending_ucan_expired() {
         max_per_action: SpendAmount(u64::MAX),
         max_total: SpendAmount(u64::MAX),
         currency: SpendCcy::from_code("USD").unwrap(),
-        time_window: std::time::Duration::from_secs(3600),
+        time_window: std::time::Duration::from_hours(1),
         allowed_adapters: vec![],
     };
     let mut fct = serde_json::Map::new();

@@ -1903,7 +1903,7 @@ mod tests {
                 max_per_action: SpendingAmount(u64::MAX),
                 max_total: SpendingAmount(u64::MAX),
                 currency: SpendingCurrency([85, 83, 68, 0]),
-                time_window: std::time::Duration::from_secs(86400),
+                time_window: std::time::Duration::from_hours(24),
                 allowed_adapters: vec![],
             };
             let mut fct = serde_json::Map::new();

@@ -363,7 +363,7 @@ mod tests {
             memory_scope: MemoryScope::Full,
             members: members.into_iter().map(DID::from).collect(),
             discovery_method: DiscoveryMethod::OutOfBand,
-            data_age: Duration::from_secs(60),
+            data_age: Duration::from_mins(1),
             purpose: None,
             counterparty_policy: CounterpartyPolicy::Full,
         }
@@ -484,12 +484,12 @@ mod tests {
     #[test]
     fn attach_provenance_populates_age() {
         let mut source = make_source("ctx-src", vec![]);
-        source.data_age = Duration::from_secs(300);
+        source.data_age = Duration::from_mins(5);
         let target = "ctx-target".to_string();
 
         let prov = attach_provenance(&source, &target, None, None, None);
 
-        assert_eq!(prov.age, Duration::from_secs(300));
+        assert_eq!(prov.age, Duration::from_mins(5));
     }
 
     #[test]
@@ -872,7 +872,7 @@ mod tests {
             memory_scope: MemoryScope::Ephemeral,
             members: vec!["did:dht:z6MkA".into(), "did:dht:z6MkB".into()],
             discovery_method: DiscoveryMethod::Registry("ctx-reg".to_string()),
-            data_age: Duration::from_secs(120),
+            data_age: Duration::from_mins(2),
             purpose: Some("testing".to_string()),
             counterparty_policy: CounterpartyPolicy::Full,
         };
@@ -888,7 +888,7 @@ mod tests {
             prov.discovery_method,
             DiscoveryMethod::Registry("ctx-reg".to_string())
         );
-        assert_eq!(prov.age, Duration::from_secs(120));
+        assert_eq!(prov.age, Duration::from_mins(2));
         assert_eq!(prov.purpose.as_deref(), Some("testing"));
     }
 

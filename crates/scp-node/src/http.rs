@@ -268,7 +268,7 @@ pub fn build_cors_layer(origins: &Option<Vec<String>>) -> CorsLayer {
 /// If no data flows in either direction for this duration, the bridge
 /// connection is closed. This prevents stale connections from holding
 /// resources indefinitely (#229).
-const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 
 // ---------------------------------------------------------------------------
 // Router constructors
@@ -951,8 +951,8 @@ pub(crate) fn spawn_projection_rate_limit_cleanup(
     tokio::spawn(async move {
         limiter
             .cleanup_loop(
-                Duration::from_secs(60),
-                Duration::from_secs(300),
+                Duration::from_mins(1),
+                Duration::from_mins(5),
                 shutdown_token,
             )
             .await;

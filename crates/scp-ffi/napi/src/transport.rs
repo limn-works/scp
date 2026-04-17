@@ -141,9 +141,7 @@ pub(crate) fn with_transport_manager_mut<T>(
 
 /// Returns `true` if a transport manager has been initialized.
 fn has_transport_manager() -> bool {
-    crate::runtime::bridge_instance()
-        .map(|bi| bi.has_transport())
-        .unwrap_or(false)
+    crate::runtime::bridge_instance().is_ok_and(|bi| bi.has_transport())
 }
 
 /// Returns an `Arc` clone of the current transport manager, if one exists.
@@ -218,25 +216,25 @@ impl NapiTransportManager {
     #[napi(getter)]
     #[must_use]
     pub fn status(&self) -> NapiTransportStatus {
-        self.status
-            .lock()
-            .map(|s| NapiTransportStatus {
-                connected: s.connected,
-                relay_url: s.relay_url.clone(),
-                latency_ms: s.latency_ms,
-            })
-            .unwrap_or(NapiTransportStatus {
+        self.status.lock().map_or(
+            NapiTransportStatus {
                 connected: false,
                 relay_url: None,
                 latency_ms: None,
-            })
+            },
+            |s| NapiTransportStatus {
+                connected: s.connected,
+                relay_url: s.relay_url.clone(),
+                latency_ms: s.latency_ms,
+            },
+        )
     }
 
     /// Returns `true` if the transport is currently connected.
     #[napi(getter, js_name = "isConnected")]
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        self.status.lock().map(|s| s.connected).unwrap_or(false)
+        self.status.lock().is_ok_and(|s| s.connected)
     }
 
     /// Returns the relay URL if connected, `null` otherwise.

@@ -146,7 +146,7 @@ pub fn trust_create_challenge(target_did: String) -> napi::Result<NapiChallengeR
         scp_core::trust::ChallengeType::schema_validation(),
         "scp:capability:schema-validation/v1".to_string(),
         serde_json::json!({}),
-        std::time::Duration::from_secs(300),
+        std::time::Duration::from_mins(5),
         &signer,
     )
     .map_err(|e| validation_error(&format!("challenge creation failed: {e}")))?;

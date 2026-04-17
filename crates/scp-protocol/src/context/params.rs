@@ -1051,7 +1051,7 @@ mod tests {
                 registered_at: 0,
                 signature: Vec::new(),
             }],
-            ttl: Some(Duration::from_secs(3600)),
+            ttl: Some(Duration::from_hours(1)),
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::PublicBroadcast),
@@ -1079,7 +1079,7 @@ mod tests {
         assert_eq!(params.promotion_policy, PromotionPolicy::Promotable);
         assert_eq!(params.roles.len(), 2);
         assert_eq!(params.tools.len(), 1);
-        assert_eq!(params.ttl, Some(Duration::from_secs(3600)));
+        assert_eq!(params.ttl, Some(Duration::from_hours(1)));
         assert_eq!(params.memory_scope, MemoryScope::Full);
         assert_eq!(params.template_id, Some(TemplateId::PublicBroadcast));
         assert!(params.economic_policy.is_none());
@@ -1194,7 +1194,7 @@ mod tests {
                 capabilities: HashSet::from([Capability::MessagesRead]),
             }],
             tools: vec![],
-            ttl: Some(Duration::from_secs(300)),
+            ttl: Some(Duration::from_mins(5)),
             memory_scope: MemoryScope::Summary,
             governance: GovernanceModel::SingleAdmin,
             template_id: Some(TemplateId::BilateralEphemeral),
@@ -1525,7 +1525,7 @@ mod tests {
             ],
             ceiling_policy: CeilingPolicy::Governed,
             mode: ContextMode::Broadcast,
-            ttl: Some(Duration::from_secs(7200)),
+            ttl: Some(Duration::from_hours(2)),
             promotion_policy: PromotionPolicy::Promotable,
             memory_scope: MemoryScope::Full,
             governance: GovernanceModel::SingleAdmin,
@@ -1553,7 +1553,7 @@ mod tests {
         assert_eq!(meta.ceiling.len(), 2);
         assert_eq!(meta.ceiling_policy, CeilingPolicy::Governed);
         assert_eq!(meta.mode, ContextMode::Broadcast);
-        assert_eq!(meta.ttl, Some(Duration::from_secs(7200)));
+        assert_eq!(meta.ttl, Some(Duration::from_hours(2)));
         assert_eq!(meta.promotion_policy, PromotionPolicy::Promotable);
         assert_eq!(meta.memory_scope, MemoryScope::Full);
         assert_eq!(meta.governance, GovernanceModel::SingleAdmin);

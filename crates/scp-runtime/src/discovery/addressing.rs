@@ -32,18 +32,18 @@ pub use scp_protocol::discovery::addressing::{
 // ---------------------------------------------------------------------------
 
 /// Default TTL for domain handle cache entries (1 hour per §22.8.4).
-pub const DOMAIN_HANDLE_CACHE_TTL: Duration = Duration::from_secs(3600);
+pub const DOMAIN_HANDLE_CACHE_TTL: Duration = Duration::from_hours(1);
 
 /// Default TTL for context handle cache entries (15 minutes per §22.8.4).
-pub const DISCOVERY_HANDLE_CACHE_TTL: Duration = Duration::from_secs(900);
+pub const DISCOVERY_HANDLE_CACHE_TTL: Duration = Duration::from_mins(15);
 
 /// TTL for petname cache entries (effectively indefinite: 1 year per §22.8.4).
 /// Petnames are user-managed, so the cache is essentially permanent until the
 /// user changes the petname.
-pub const PETNAME_CACHE_TTL: Duration = Duration::from_secs(365 * 24 * 3600);
+pub const PETNAME_CACHE_TTL: Duration = Duration::from_hours(8760);
 
 /// Default TTL for attestation handle cache entries (1 day, matching renewal intervals per §22.8.4).
-pub const ATTESTATION_HANDLE_CACHE_TTL: Duration = Duration::from_secs(86400);
+pub const ATTESTATION_HANDLE_CACHE_TTL: Duration = Duration::from_hours(24);
 
 // ---------------------------------------------------------------------------
 // AddressType (§22.2)
@@ -812,7 +812,7 @@ mod tests {
             },
         }];
 
-        cache.insert("alice".to_owned(), results, Duration::from_secs(3600));
+        cache.insert("alice".to_owned(), results, Duration::from_hours(1));
 
         let cached = cache.get("alice").unwrap();
         assert_eq!(cached.len(), 1);
@@ -828,7 +828,7 @@ mod tests {
     fn cache_evict_expired_removes_old_entries() {
         let mut cache = ResolutionCache::new();
         cache.insert("expired".to_owned(), vec![], Duration::from_secs(0));
-        cache.insert("alive".to_owned(), vec![], Duration::from_secs(3600));
+        cache.insert("alive".to_owned(), vec![], Duration::from_hours(1));
 
         // The expired entry might or might not be stale yet (depends on timing).
         // Force eviction.

@@ -861,8 +861,7 @@ pub fn verify_webhook_signature(
 
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     let drift = now_secs.abs_diff(timestamp_secs);
 
@@ -1215,8 +1214,7 @@ mod tests {
     fn current_time() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
+            .map_or(0, |d| d.as_secs())
     }
 
     fn test_claims(did: &str) -> BridgeJwtClaims {

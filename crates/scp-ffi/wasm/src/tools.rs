@@ -733,7 +733,7 @@ pub fn tool_session_invoke(
         )
         .map_err(|e| {
             ScpWasmError::Permission {
-                message: format!("UCAN authorization failed for tool '{tool_id_for_ucan}': {e}",),
+                message: format!("UCAN authorization failed for tool '{tool_id_for_ucan}': {e}"),
                 code: codes::PERM_3000.to_owned(),
             }
             .into_js()
@@ -1404,7 +1404,7 @@ mod tests {
         let json = r#"{"max_calls": 10, "window_seconds": 60}"#;
         let rl = parse_rate_limit_json_with_clock(json, &test_clock()).unwrap();
         assert_eq!(rl.max_calls, 10);
-        assert_eq!(rl.window, std::time::Duration::from_secs(60));
+        assert_eq!(rl.window, std::time::Duration::from_mins(1));
         assert_eq!(
             rl.burst_allowance,
             scp_protocol::context::tools::interface::DEFAULT_BURST_ALLOWANCE
@@ -1632,7 +1632,7 @@ mod tests {
         let rl_json = r#"{"max_calls": 20, "window_seconds": 120}"#;
         let rl = parse_rate_limit_json_with_clock(rl_json, &test_clock()).unwrap();
         assert_eq!(rl.max_calls, 20);
-        assert_eq!(rl.window, std::time::Duration::from_secs(120));
+        assert_eq!(rl.window, std::time::Duration::from_mins(2));
 
         // Serialized rate_limit should appear in the interface JSON.
         let interface = serde_json::json!({

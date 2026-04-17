@@ -532,7 +532,7 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
-            ttl: Some(Duration::from_secs(60)),
+            ttl: Some(Duration::from_mins(1)),
             call_count: 0,
         };
         // 30 seconds later -- should not be expired.
@@ -547,7 +547,7 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
-            ttl: Some(Duration::from_secs(60)),
+            ttl: Some(Duration::from_mins(1)),
             call_count: 0,
         };
         // 61 seconds later -- should be expired.
@@ -562,7 +562,7 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
-            ttl: Some(Duration::from_secs(60)),
+            ttl: Some(Duration::from_mins(1)),
             call_count: 0,
         };
         // Exactly at TTL boundary -- should be expired (>= check).
@@ -612,7 +612,7 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
-            ttl: Some(Duration::from_secs(60)),
+            ttl: Some(Duration::from_mins(1)),
             call_count: 0,
         });
 
@@ -655,7 +655,7 @@ mod tests {
             &context,
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
-            Some(Duration::from_secs(300)),
+            Some(Duration::from_mins(5)),
             &scp_primitives::SystemClock,
         )
         .await;
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(session.tool_id, "calculator");
         assert_eq!(session.source_context, "ctx-source");
         assert_eq!(session.call_count, 0);
-        assert_eq!(session.ttl, Some(Duration::from_secs(300)));
+        assert_eq!(session.ttl, Some(Duration::from_mins(5)));
         assert!(session.state.is_null());
     }
 
@@ -691,7 +691,7 @@ mod tests {
             &context,
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
-            Some(Duration::from_secs(300)),
+            Some(Duration::from_mins(5)),
             &scp_primitives::SystemClock,
         )
         .await;
@@ -717,7 +717,7 @@ mod tests {
             &context,
             &"nonexistent-tool".to_owned(),
             &"ctx-source".to_owned(),
-            Some(Duration::from_secs(300)),
+            Some(Duration::from_mins(5)),
             &scp_primitives::SystemClock,
         )
         .await;
@@ -756,7 +756,7 @@ mod tests {
                 &context,
                 &"calculator".to_owned(),
                 &source_ctx,
-                Some(Duration::from_secs(300)),
+                Some(Duration::from_mins(5)),
                 &scp_primitives::SystemClock,
             )
             .await;
@@ -775,7 +775,7 @@ mod tests {
             &context,
             &"calculator".to_owned(),
             &source_ctx,
-            Some(Duration::from_secs(300)),
+            Some(Duration::from_mins(5)),
             &scp_primitives::SystemClock,
         )
         .await;
@@ -825,7 +825,7 @@ mod tests {
                 &context,
                 &"calculator".to_owned(),
                 &"ctx-caller-a".to_owned(),
-                Some(Duration::from_secs(300)),
+                Some(Duration::from_mins(5)),
                 &scp_primitives::SystemClock,
             )
             .await
@@ -839,7 +839,7 @@ mod tests {
             &context,
             &"calculator".to_owned(),
             &"ctx-caller-b".to_owned(),
-            Some(Duration::from_secs(300)),
+            Some(Duration::from_mins(5)),
             &scp_primitives::SystemClock,
         )
         .await;
@@ -930,7 +930,7 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::Value::Null,
             created_at: 1000,
-            ttl: Some(Duration::from_secs(120)), // Expires at 121000ms
+            ttl: Some(Duration::from_mins(2)), // Expires at 121000ms
             call_count: 0,
         });
 
@@ -974,7 +974,7 @@ mod tests {
             &context,
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
-            Some(Duration::from_secs(300)),
+            Some(Duration::from_mins(5)),
             &scp_primitives::SystemClock,
         )
         .await
@@ -1070,7 +1070,7 @@ mod tests {
             &context,
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
-            Some(Duration::from_secs(300)),
+            Some(Duration::from_mins(5)),
             &scp_primitives::SystemClock,
         )
         .await
@@ -1137,7 +1137,7 @@ mod tests {
             source_context: "ctx-source".to_owned(),
             state: serde_json::Value::Null,
             created_at: scp_primitives::SystemClock.now_millis(),
-            ttl: Some(Duration::from_secs(300)),
+            ttl: Some(Duration::from_mins(5)),
             call_count: 0,
         });
 
@@ -1173,7 +1173,7 @@ mod tests {
             source_context: "ctx-src".to_owned(),
             state: serde_json::json!({"key": "value"}),
             created_at: 1_000_000,
-            ttl: Some(Duration::from_secs(600)),
+            ttl: Some(Duration::from_mins(10)),
             call_count: 42,
         };
         let json = serde_json::to_string(&session).unwrap();
@@ -1202,7 +1202,7 @@ mod tests {
             &context,
             &"calculator".to_owned(),
             &"ctx-source".to_owned(),
-            Some(Duration::from_secs(300)),
+            Some(Duration::from_mins(5)),
             &scp_primitives::SystemClock,
         )
         .await

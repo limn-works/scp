@@ -413,8 +413,7 @@ async fn create_shadow_handler(
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     let bridge_mode = auth_ctx.bridge.mode.clone();
 
@@ -491,8 +490,7 @@ async fn attest_handler(
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
 
     let stored = StoredAttestation {
         attestation_id: attestation_id.clone(),

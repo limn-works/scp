@@ -953,7 +953,7 @@ mod tests {
                 },
             ),
             threshold: 10,
-            window: Duration::from_secs(3600),
+            window: Duration::from_hours(1),
         }];
 
         let threshold_requirements = HashMap::new();
@@ -1172,7 +1172,7 @@ mod tests {
                     super::super::consequence::EnforcementSeverity::SuspendAccess,
                 ),
                 threshold: 10,
-                window: Duration::from_secs(60),
+                window: Duration::from_mins(1),
             },
             ConsequenceRule {
                 trigger: super::super::consequence::ConsequenceTrigger::ToolRateExceeded,
@@ -1180,7 +1180,7 @@ mod tests {
                     to_role: "observer".to_owned(),
                 },
                 threshold: 5,
-                window: Duration::from_secs(120),
+                window: Duration::from_mins(2),
             },
         ];
 
@@ -1307,7 +1307,7 @@ mod tests {
         let stale_att = Attestation {
             issued_at: 500,
             expires_at: Some(5000),
-            renewal_interval: Some(Duration::from_secs(600)),
+            renewal_interval: Some(Duration::from_mins(10)),
             ..make_attestation("att-stale", "did:key:alice", AttestationType::Endorsement)
         };
 

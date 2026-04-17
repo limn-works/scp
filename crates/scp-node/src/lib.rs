@@ -1836,7 +1836,7 @@ impl<D: DidMethod + 'static> DidPublisher for DidMethodPublisher<D> {
 // ---------------------------------------------------------------------------
 
 /// Default re-evaluation interval per §10.12.1 recommendation.
-const TIER_REEVALUATION_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const TIER_REEVALUATION_INTERVAL: Duration = Duration::from_mins(30);
 
 /// Handle to the tier re-evaluation background task (SCP-243).
 ///
@@ -4852,7 +4852,7 @@ mod tests {
             Self {
                 result: tokio::sync::Mutex::new(Some(Ok(scp_transport::nat::PortMappingResult {
                     external_addr: addr,
-                    ttl: std::time::Duration::from_secs(600),
+                    ttl: std::time::Duration::from_mins(10),
                     protocol: scp_transport::nat::MappingProtocol::UpnpIgd,
                 }))),
             }
@@ -5525,7 +5525,7 @@ mod tests {
             "ws://198.51.100.7:32891/scp/v1".to_owned(),
             Some(event_tx),
             // Use a long interval so the periodic timer does NOT fire first.
-            Duration::from_secs(60 * 60),
+            Duration::from_hours(1),
         );
 
         // Give the spawned task a chance to enter the select! and start

@@ -301,7 +301,7 @@ fn dummy_spending_ucan() -> scp_core::crypto::ucan::UcanToken {
         max_per_action: SpendAmount(1_000),
         max_total: SpendAmount(10_000),
         currency: SpendCurrency::from_code("USD").unwrap_or(SpendCurrency(*b"USD\0")),
-        time_window: std::time::Duration::from_secs(3600),
+        time_window: std::time::Duration::from_hours(1),
         allowed_adapters: vec![],
     };
     let mut fct = serde_json::Map::new();
@@ -352,7 +352,7 @@ fn signed_spending_ucan_for(actor_did: &DID) -> scp_core::crypto::ucan::UcanToke
         max_per_action: SpendAmount(u64::MAX),
         max_total: SpendAmount(u64::MAX),
         currency: SpendCurrency::from_code("USD").unwrap_or(SpendCurrency(*b"USD\0")),
-        time_window: std::time::Duration::from_secs(3600),
+        time_window: std::time::Duration::from_hours(1),
         allowed_adapters: vec![],
     };
     let mut fct = serde_json::Map::new();
