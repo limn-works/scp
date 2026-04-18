@@ -230,6 +230,7 @@ pub async fn ucan_validate(
     presenting_agent_did: Option<String>,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_ucan_token(&token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_capability_uri(&capability).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
@@ -336,6 +337,7 @@ pub async fn ucan_mint(
     capabilities: Vec<String>,
     proofs: Option<Vec<String>>,
 ) -> napi::Result<NapiUcanToken> {
+    crate::napi_check_handle!(handle);
     validate_did(&member_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     if let Some(ref tokens) = proofs {
         for t in tokens {
@@ -480,6 +482,7 @@ pub async fn ucan_delegate(
     parent_token: String,
     capabilities: Vec<String>,
 ) -> napi::Result<NapiUcanToken> {
+    crate::napi_check_handle!(handle);
     validate_did(&delegator_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&delegatee_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_ucan_token(&parent_token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -653,6 +656,7 @@ pub async fn ucan_revoke(
     token: String,
     revoker_did: String,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_ucan_token(&token).map_err(ScpNapiError::from)?;
     validate_did(&revoker_did).map_err(ScpNapiError::from)?;
 

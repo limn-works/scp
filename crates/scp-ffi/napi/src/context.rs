@@ -316,6 +316,12 @@ impl NapiContextHandle {
     /// UCAN state (set up via `ensure_registered`).
     pub(crate) fn test_active(context_id: String, creator_did: String) -> Self {
         increment_handle_count();
+        // Stamp with the default bridge instance's id when available so
+        // `napi_check_handle!` accepts the handle at FFI entry points. Falls
+        // back to `UNSET_INSTANCE_ID` only if the default instance cannot be
+        // resolved (ensures this helper remains infallible).
+        let instance_id = crate::runtime::default_instance_id()
+            .unwrap_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID);
         Self {
             context_id,
             state: std::sync::Mutex::new(ContextState::Active),
@@ -333,7 +339,7 @@ impl NapiContextHandle {
             core_handle: None,
             subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
             subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
+            instance_id,
         }
     }
 }
@@ -961,6 +967,7 @@ pub fn context_subscribe(
     identity_did: String,
     on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     // Guard: prevent duplicate subscriptions. The AtomicBool is swapped to
     // true on the first call; subsequent calls see `true` and bail.
     // The flag is reset to `false` by the spawned task when it exits,
@@ -1237,6 +1244,7 @@ pub fn context_subscribe(
 /// block to prevent orphaned tasks when the consumer abandons iteration.
 #[napi(js_name = "contextCancelSubscription")]
 pub fn context_cancel_subscription(handle: &NapiContextHandle) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     if let Ok(token) = handle.subscription_cancel.lock() {
         token.cancel();
     }
@@ -1260,6 +1268,7 @@ pub fn context_cancel_subscription(handle: &NapiContextHandle) -> napi::Result<(
 /// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextMemberCount")]
 pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u32> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     let count = manager.member_count(&handle.context_id).await.unwrap_or(0);
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
@@ -1275,6 +1284,7 @@ pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u3
 #[napi(js_name = "contextIsMember")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi::Result<bool> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     Ok(manager.is_member(&handle.context_id, &did).await)
 }
@@ -1288,6 +1298,7 @@ pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi:
 /// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextMemberDids")]
 pub async fn context_member_dids(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     Ok(manager.member_dids(&handle.context_id).await)
 }
@@ -1306,6 +1317,7 @@ pub async fn context_member_role(
     handle: &NapiContextHandle,
     did: String,
 ) -> napi::Result<Option<String>> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     Ok(manager
         .member_role(&handle.context_id, &did)
@@ -1360,6 +1372,7 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
 /// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextDrainEvents")]
 pub async fn context_drain_events(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     let events = manager.drain_events(&handle.context_id).await;
     Ok(events.iter().map(format_context_event).collect())
@@ -1453,6 +1466,7 @@ pub async fn access_key_restore(
 pub async fn context_broadcast_subscriber_count(
     handle: &NapiContextHandle,
 ) -> napi::Result<Option<u32>> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     #[allow(clippy::cast_possible_truncation)]
     Ok(manager
@@ -1474,6 +1488,7 @@ pub async fn context_is_broadcast_subscriber(
     handle: &NapiContextHandle,
     did: String,
 ) -> napi::Result<bool> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     Ok(manager
         .is_broadcast_subscriber(&handle.context_id, &did)
@@ -1491,6 +1506,7 @@ pub async fn context_is_broadcast_subscriber(
 pub async fn context_broadcast_admission(
     handle: &NapiContextHandle,
 ) -> napi::Result<Option<String>> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     Ok(manager
         .broadcast_admission(&handle.context_id)
@@ -1589,6 +1605,7 @@ pub async fn broadcast_subscribe(
     handle: &NapiContextHandle,
     subscriber_did: String,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
     let context_id = handle.context_id.clone();
@@ -1628,6 +1645,7 @@ pub async fn broadcast_unsubscribe(
     subscriber_did: String,
     rotate_keys: Option<bool>,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
     let context_id = handle.context_id.clone();
@@ -1659,6 +1677,7 @@ pub async fn broadcast_publish(
     author_did: String,
     payload: Vec<u8>,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
     let context_id = handle.context_id.clone();
@@ -1758,6 +1777,7 @@ pub async fn broadcast_publish_asset(
     asset: NapiAssetEntry,
     deploy_id: Option<String>,
 ) -> napi::Result<NapiPublishResult> {
+    crate::napi_check_handle!(handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
     let context_id = handle.context_id.clone();
@@ -1897,6 +1917,7 @@ pub async fn broadcast_publish_assets(
     assets: Vec<NapiAssetEntry>,
     deploy_id: Option<String>,
 ) -> napi::Result<NapiBatchPublishResult> {
+    crate::napi_check_handle!(handle);
     const MAX_BATCH_ASSETS: usize = 10_000;
     if assets.len() > MAX_BATCH_ASSETS {
         return Err(NapiError::from(ScpNapiError::Context {
@@ -2040,6 +2061,7 @@ pub async fn broadcast_block_subscriber(
     subscriber_did: String,
     blocker_did: String,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&blocker_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
@@ -2071,6 +2093,7 @@ pub async fn broadcast_unblock_subscriber(
     subscriber_did: String,
     unblocker_did: String,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&unblocker_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
@@ -2106,6 +2129,7 @@ pub async fn broadcast_handle_key_request(
     author_did: String,
     requester_did: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&requester_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
@@ -2149,6 +2173,7 @@ pub async fn context_execute_governance_action(
     action_json: String,
     proposer_did: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid governance action JSON: {e}"),
@@ -2321,6 +2346,7 @@ pub async fn context_governance_propose(
     action_json: String,
     proposer_did: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid governance action JSON: {e}"),
@@ -2407,6 +2433,7 @@ pub async fn context_governance_approve(
     proposal_id_hex: String,
     voter_did: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
 
     #[cfg(feature = "allow_in_memory_custody")]
@@ -2468,6 +2495,7 @@ pub async fn context_governance_reject(
     proposal_id_hex: String,
     voter_did: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
 
     #[cfg(feature = "allow_in_memory_custody")]
@@ -2529,6 +2557,7 @@ pub async fn context_governance_withdraw(
     proposal_id_hex: String,
     voter_did: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
     let did = DID(voter_did);
     let manager = context_manager()?;
@@ -2572,6 +2601,7 @@ pub async fn context_governance_get_proposal(
     handle: &NapiContextHandle,
     proposal_id_hex: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
     let manager = context_manager()?;
@@ -2604,6 +2634,7 @@ pub async fn context_governance_get_proposal(
 /// - Rejects with `SCP-CTX-2046` if listing fails.
 #[napi(js_name = "contextGovernanceListProposals")]
 pub async fn context_governance_list_proposals(handle: &NapiContextHandle) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2638,6 +2669,7 @@ pub async fn context_apply_pending_ceiling_modification(
     handle: &NapiContextHandle,
     current_timestamp: f64,
 ) -> napi::Result<bool> {
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2665,6 +2697,7 @@ pub async fn context_apply_pending_ceiling_modification(
 /// - Rejects with `SCP-CTX-2061` if the context is not in `Closing` state.
 #[napi(js_name = "contextFinalizeClose")]
 pub async fn context_finalize_close(handle: &NapiContextHandle) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
 
     // Use the handle's actual core_handle (which carries correct ContextParams
@@ -2724,6 +2757,7 @@ pub async fn context_create_governance_checkpoint(
     creator_did: String,
     creator_signature_hex: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2783,6 +2817,7 @@ pub async fn context_add_checkpoint_cosignature(
     signer_did: String,
     signature_hex: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2917,6 +2952,7 @@ fn parse_napi_hex_32(hex_str: &str, field_name: &str) -> napi::Result<[u8; 32]> 
 ///   grace period has not expired.
 #[napi(js_name = "contextTombstoneMigrated")]
 pub async fn context_tombstone_migrated(handle: &NapiContextHandle) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2944,6 +2980,7 @@ pub async fn context_tombstone_migrated(handle: &NapiContextHandle) -> napi::Res
 /// context is not migrating.
 #[napi(js_name = "contextMigrationState")]
 pub async fn context_migration_state(handle: &NapiContextHandle) -> napi::Result<Option<String>> {
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2976,6 +3013,7 @@ pub async fn context_migration_state(handle: &NapiContextHandle) -> napi::Result
 /// - Rejects with `SCP-CTX-2005` if the context is not active.
 #[napi(js_name = "contextHandleTtlExpiry")]
 pub async fn context_handle_ttl_expiry(handle: &NapiContextHandle) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let manager = context_manager()?;
     manager
@@ -3001,6 +3039,7 @@ pub async fn context_propose_ttl_extension(
     proposer_did: String,
     extension_secs: u32,
 ) -> napi::Result<bool> {
+    crate::napi_check_handle!(handle);
     let did = DID(proposer_did.clone());
     let duration = std::time::Duration::from_secs(u64::from(extension_secs));
     let manager = context_manager()?;
@@ -3024,6 +3063,7 @@ pub async fn context_reset_ttl_timer(
     handle: &NapiContextHandle,
     new_duration_secs: u32,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let duration = std::time::Duration::from_secs(u64::from(new_duration_secs));
     let manager = context_manager()?;
@@ -3048,6 +3088,7 @@ pub async fn context_reset_ttl_timer(
 /// serialization fails.
 #[napi(js_name = "contextExport")]
 pub async fn context_export(handle: &NapiContextHandle) -> napi::Result<Vec<u8>> {
+    crate::napi_check_handle!(handle);
     let exporter_did = scp_identity::DID::from(handle.creator_did.clone());
     let manager = context_manager()?;
     let export = manager
@@ -3116,9 +3157,10 @@ pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
 #[napi(js_name = "contextSetEconomicPolicy")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub fn context_set_economic_policy(
-    _handle: &mut NapiContextHandle,
+    handle: &mut NapiContextHandle,
     _policy_json: String,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     Err(NapiError::from(ScpNapiError::Permission {
         message: "economic policy changes must go through governance \
                   (propose SetEconomicPolicy action). Direct mutation is \
@@ -3129,10 +3171,15 @@ pub fn context_set_economic_policy(
 }
 
 /// Returns the economic policy for a context as a JSON string, or `null`.
+///
+/// # Errors
+///
+/// Rejects with [`scp_ffi_common::error_codes::PERM_3030`] if `handle` was
+/// minted by a different `SCP` bridge instance.
 #[napi(js_name = "contextGetEconomicPolicy")]
-#[must_use]
-pub fn context_get_economic_policy(handle: &NapiContextHandle) -> Option<String> {
-    handle.economic_policy.clone()
+pub fn context_get_economic_policy(handle: &NapiContextHandle) -> napi::Result<Option<String>> {
+    crate::napi_check_handle!(handle);
+    Ok(handle.economic_policy.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -3644,6 +3691,11 @@ mod tests {
         use super::*;
         use std::sync::Mutex;
 
+        // Stamp the handle with the default bridge instance's id so
+        // `napi_check_handle!` accepts it.
+        let default_instance_id = crate::runtime::default_instance_id()
+            .expect("default instance id should be available in tests");
+
         let mut handle = NapiContextHandle {
             context_id: "test-ctx-econ".to_owned(),
             state: Mutex::new(ContextState::Active),
@@ -3661,11 +3713,15 @@ mod tests {
             core_handle: None,
             subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
             subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
+            instance_id: default_instance_id,
         };
 
         // Initially None.
-        assert!(context_get_economic_policy(&handle).is_none());
+        assert!(
+            context_get_economic_policy(&handle)
+                .expect("handle is default-instance")
+                .is_none()
+        );
 
         // Direct set always rejects — must use governance (#728).
         let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":100,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
@@ -3675,7 +3731,11 @@ mod tests {
             "direct set must be rejected — use governance"
         );
         // Policy should remain unchanged.
-        assert!(context_get_economic_policy(&handle).is_none());
+        assert!(
+            context_get_economic_policy(&handle)
+                .expect("handle is default-instance")
+                .is_none()
+        );
     }
 
     // -----------------------------------------------------------------------
