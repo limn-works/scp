@@ -24,34 +24,27 @@
 //! scoring. This manager is shared with `py_mcp_load_contexts` for
 //! relay-based context discovery.
 //!
-//! The relay URL is tracked in a module-level `RwLock` so that
-//! `py_transport_status` can report it without querying the adapter.
+//! The **currently-connected** relay URL is tracked on the
+//! [`PyBridgeInstance`](crate::runtime::PyBridgeInstance) as
+//! `connected_relay_url: RwLock<Option<String>>`. It is written by
+//! [`py_transport_connect`], cleared by [`py_transport_disconnect`], and
+//! read by [`py_transport_status`]. This is **distinct** from
+//! `CoreFields::relay_url` (in `scp-ffi-common`), which tracks the
+//! **pending** relay URL preserved across suspend/resume so the bridge can
+//! reconnect after the caller calls `resume()`. The two fields intentionally
+//! diverge: `connected_relay_url` is a live status value (cleared on
+//! disconnect); `CoreFields::relay_url` is a reconnection hint (survives
+//! disconnect on suspend).
 //!
 //! See ADR-013 in `.docs/adrs/phase-3.md` section 5 for the bridge specification.
-
-use std::sync::{OnceLock, RwLock};
 
 use pyo3::prelude::*;
 use scp_transport::native::adapter::NativeRelayAdapter;
 use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
 use crate::error::ScpPyError;
+use crate::runtime::default_bridge_instance;
 use crate::validate;
-
-// ---------------------------------------------------------------------------
-// Connected relay URL tracking
-// ---------------------------------------------------------------------------
-
-/// Tracks the URL of the currently connected relay.
-///
-/// Set by [`py_transport_connect`], cleared by [`py_transport_disconnect`],
-/// read by [`py_transport_status`].
-static CONNECTED_RELAY_URL: OnceLock<RwLock<Option<String>>> = OnceLock::new();
-
-/// Returns a reference to the connected relay URL state.
-pub(crate) fn connected_url_state() -> &'static RwLock<Option<String>> {
-    CONNECTED_RELAY_URL.get_or_init(|| RwLock::new(None))
-}
 
 // ---------------------------------------------------------------------------
 // PyTransportStatus
@@ -178,8 +171,11 @@ pub fn py_transport_connect(relay_url: &str, source: &str) -> PyResult<()> {
                 spawn_suppression_scoring_task(suppression_rx, url.clone());
             }
 
-            // Track the URL for status queries.
-            *connected_url_state().write().map_err(|_| {
+            // Track the URL for status queries on the per-bridge instance.
+            // Distinct from `CoreFields::relay_url` (pending URL for resume):
+            // this field is cleared on disconnect.
+            let bi = default_bridge_instance()?;
+            *bi.connected_relay_url().write().map_err(|_| {
                 ScpPyError::transport("connected relay URL lock is poisoned".to_owned())
             })? = Some(url);
 
@@ -204,20 +200,27 @@ pub fn py_transport_connect(relay_url: &str, source: &str) -> PyResult<()> {
 pub fn py_transport_disconnect() -> PyResult<()> {
     // Read the URL we'll be disconnecting before clearing the state so we
     // can remove it from the bridge's pending-reconnect set (#1678).
-    let disconnecting_url = connected_url_state()
+    let bi = default_bridge_instance()?;
+    let disconnecting_url = bi
+        .connected_relay_url()
         .read()
         .ok()
         .and_then(|guard| guard.clone());
 
     crate::runtime::clear_transport_manager()?;
 
+    // Drop the URL from the bridge's pending-reconnect set so resume() does
+    // not reopen it after an explicit disconnect (#1678).
     if let Some(ref url) = disconnecting_url
         && let Ok(bi) = crate::runtime::bridge_instance()
     {
         bi.core.remove_relay_url(url);
     }
 
-    *connected_url_state()
+    // Clear the currently-connected URL on the per-bridge instance.
+    // `CoreFields::relay_url` (pending) is NOT cleared here — it survives
+    // disconnect so resume() can reconnect after suspend().
+    *bi.connected_relay_url()
         .write()
         .map_err(|_| ScpPyError::transport("connected relay URL lock is poisoned".to_owned()))? =
         None;
@@ -241,10 +244,13 @@ pub fn py_transport_disconnect() -> PyResult<()> {
 pub fn py_transport_status() -> PyResult<PyTransportStatus> {
     let has_connection = crate::runtime::has_transport_manager();
 
-    let relay_url = connected_url_state()
-        .read()
+    // Read the currently-connected URL off the per-bridge instance. Unlike
+    // `CoreFields::relay_url` (which tracks the pending URL for resume),
+    // this reflects a live bound connection and is `None` when disconnected.
+    let relay_url = default_bridge_instance()
         .ok()
-        .and_then(|guard| guard.clone());
+        .and_then(|bi| bi.connected_relay_url().read().ok().map(|g| g.clone()))
+        .flatten();
 
     Ok(PyTransportStatus {
         connected: has_connection,
