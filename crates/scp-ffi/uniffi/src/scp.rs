@@ -137,15 +137,18 @@ impl Scp {
 
     /// Resumes a suspended bridge instance.
     ///
-    /// Clears the suspended flag. Caller reconnects transport via
-    /// `transportConnect`.
+    /// Clears the suspended flag, then runs any per-bridge async work chained
+    /// by the [`BridgeInstanceCore::resume`] override (transport reconnect
+    /// from pending relay URLs, persisted-context restoration).
+    ///
+    /// `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin.
     ///
     /// # Errors
     ///
     /// Returns `ScpError::Context` if the instance has been permanently
     /// shut down.
-    pub fn resume(&self) -> Result<(), ScpError> {
-        self.inner.core.resume().map_err(|e| ScpError::Context {
+    pub async fn resume(&self) -> Result<(), ScpError> {
+        self.inner.resume().await.map_err(|e| ScpError::Context {
             msg: format!("resume failed: {e}"),
             code: codes::CTX_2000.to_owned(),
         })

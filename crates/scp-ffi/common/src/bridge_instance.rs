@@ -737,15 +737,26 @@ impl CoreFields {
 
     /// Resumes a suspended bridge instance.
     ///
-    /// Clears the suspended flag so bridge operations can proceed. The caller
-    /// must re-establish the relay connection via `set_transport` — resume
-    /// does not reconnect automatically. Use [`pending_relay_url`] to
-    /// retrieve the URL that was active before suspension.
+    /// Clears the suspended flag so bridge operations can proceed.
+    ///
+    /// `resume` is `async` so per-bridge overrides (see
+    /// [`BridgeInstanceCore::resume`]) can chain async work — reconnecting
+    /// transport from pending relay URLs, rehydrating persisted context
+    /// state — after the core flag flip. The core-only body below is `.await`-
+    /// free and remains cheap.
     ///
     /// # Errors
     ///
     /// Returns `Err` if the instance has been permanently shut down.
-    pub fn resume(&self) -> Result<(), LifecycleError> {
+    //
+    // The body is currently `.await`-free, but the `async` keyword is the
+    // contract — the `BridgeInstanceCore::resume` trait method is async
+    // (default impl delegates to this method), and per-bridge overrides
+    // chain async transport reconnect and persisted-context restoration on
+    // top. Making the core method sync would force awkward `.await`ing of
+    // a non-future in every override.
+    #[allow(clippy::unused_async)]
+    pub async fn resume(&self) -> Result<(), LifecycleError> {
         if self.is_shutdown() {
             return Err(LifecycleError::AlreadyShutDown);
         }
@@ -1604,12 +1615,16 @@ pub trait BridgeInstanceCore: Send + Sync {
 
     /// Resumes the instance — see [`CoreFields::resume`].
     ///
+    /// Default implementation delegates to `CoreFields::resume` (flag flip
+    /// only). Per-bridge implementations override this to chain async work
+    /// such as transport reconnect and persisted-context restoration.
+    ///
     /// # Errors
     ///
     /// Returns [`LifecycleError::AlreadyShutDown`] if the instance has
     /// been permanently shut down.
-    fn resume(&self) -> Result<(), LifecycleError> {
-        self.core().resume()
+    async fn resume(&self) -> Result<(), LifecycleError> {
+        self.core().resume().await
     }
 
     /// Async shutdown with a graceful deadline.
@@ -2169,22 +2184,22 @@ mod tests {
         assert!(!instance.is_suspended());
     }
 
-    #[test]
-    fn resume_clears_suspended_flag() {
+    #[tokio::test]
+    async fn resume_clears_suspended_flag() {
         let instance = CoreFields::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
         assert!(instance.is_suspended());
 
-        instance.resume().unwrap();
+        instance.resume().await.unwrap();
         assert!(!instance.is_suspended());
     }
 
-    #[test]
-    fn resume_fails_after_shutdown() {
+    #[tokio::test]
+    async fn resume_fails_after_shutdown() {
         let instance = CoreFields::with_context_manager(test_context_manager());
         instance.shutdown();
 
-        let err = instance.resume().unwrap_err();
+        let err = instance.resume().await.unwrap_err();
         assert_eq!(err, LifecycleError::AlreadyShutDown);
         assert_eq!(
             err.to_string(),
@@ -2305,12 +2320,12 @@ mod tests {
         assert_eq!(err, LifecycleError::Suspended);
     }
 
-    #[test]
-    fn check_ready_passes_after_resume() {
+    #[tokio::test]
+    async fn check_ready_passes_after_resume() {
         let instance = CoreFields::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
         assert!(instance.check_ready().is_err());
-        instance.resume().unwrap();
+        instance.resume().await.unwrap();
         assert!(instance.check_ready().is_ok());
     }
 
@@ -2477,11 +2492,11 @@ mod tests {
         assert!(err.to_string().contains("suspended"));
     }
 
-    #[test]
-    fn set_transport_accepts_after_resume() {
+    #[tokio::test]
+    async fn set_transport_accepts_after_resume() {
         let instance = CoreFields::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
-        instance.resume().unwrap();
+        instance.resume().await.unwrap();
 
         assert!(
             instance
@@ -2844,8 +2859,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn relay_url_survives_suspend_resume_cycle() {
+    #[tokio::test]
+    async fn relay_url_survives_suspend_resume_cycle() {
         // The relay URL is preserved across suspend/resume so callers can
         // reconnect to the same relay after resume.
         let instance = CoreFields::with_context_manager(test_context_manager());
@@ -2859,7 +2874,7 @@ mod tests {
             Some("wss://relay.example.com"),
             "relay URL must survive suspend"
         );
-        instance.resume().unwrap();
+        instance.resume().await.unwrap();
         assert_eq!(
             instance.pending_relay_url().as_deref(),
             Some("wss://relay.example.com"),
@@ -2914,8 +2929,8 @@ mod tests {
     // AC 8: suspend/resume with persistence
     // -----------------------------------------------------------------
 
-    #[test]
-    fn suspend_flushes_contexts_to_persistence() {
+    #[tokio::test]
+    async fn suspend_flushes_contexts_to_persistence() {
         use scp_core::context::providers::InMemoryPersistence;
         use std::sync::Arc;
 
@@ -2948,7 +2963,7 @@ mod tests {
         assert!(instance.pending_relay_url().is_none());
 
         // Resume clears the suspended flag.
-        instance.resume().unwrap();
+        instance.resume().await.unwrap();
         assert!(!instance.is_suspended());
 
         // Instance is ready again.

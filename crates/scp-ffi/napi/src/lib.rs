@@ -386,9 +386,10 @@ pub fn scp_suspend() -> napi::Result<()> {
 ///
 /// Throws `ScpContextError` if the instance has been permanently shut down.
 #[napi]
-pub fn scp_resume() -> napi::Result<()> {
+pub async fn scp_resume() -> napi::Result<()> {
     if let Some(bi) = runtime::default_bridge_instance_raw() {
-        bi.core.resume().map_err(|e| {
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
+        bi.resume().await.map_err(|e| {
             napi::Error::from(crate::error::ScpNapiError::Context {
                 message: format!("resume failed: {e}"),
                 code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
@@ -489,13 +490,13 @@ mod tests {
     // without tripping the `await_holding_lock` lint.
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn scp_suspend_resume_roundtrip() {
-        let _guard = crate::runtime::bridge_lifecycle_serial().blocking_lock();
+    #[tokio::test]
+    async fn scp_suspend_resume_roundtrip() {
+        let _guard = crate::runtime::bridge_lifecycle_serial().lock().await;
 
         // Case 1: suspend / resume before any bridge init must succeed.
         scp_suspend().expect("scp_suspend must succeed");
-        scp_resume().expect("scp_resume must succeed");
+        scp_resume().await.expect("scp_resume must succeed");
 
         // Case 2: after ensure_bridge_instance(), suspend then resume
         // round-trip.
@@ -535,7 +536,9 @@ mod tests {
             "bridge_instance error should mention suspended + CTX_2000, got: {bi_msg}"
         );
 
-        scp_resume().expect("scp_resume after suspend must succeed");
+        scp_resume()
+            .await
+            .expect("scp_resume after suspend must succeed");
 
         // After resume, the suspended sentinel must no longer appear on
         // either accessor. If `try_context_manager()` was not attached
@@ -559,7 +562,7 @@ mod tests {
         // Case 3: double-suspend / double-resume are idempotent.
         scp_suspend().expect("double suspend must succeed");
         scp_suspend().expect("double suspend must succeed");
-        scp_resume().expect("double resume must succeed");
-        scp_resume().expect("double resume must succeed");
+        scp_resume().await.expect("double resume must succeed");
+        scp_resume().await.expect("double resume must succeed");
     }
 }

@@ -188,11 +188,13 @@ impl Scp {
 
     /// Resumes a suspended bridge instance.
     ///
-    /// Clears the suspended flag. Caller reconnects transport via
-    /// `transportConnect`.
+    /// Clears the suspended flag, then runs any per-bridge async work chained
+    /// by the [`BridgeInstanceCore::resume`] override (transport reconnect
+    /// from pending relay URLs, persisted-context restoration).
     #[napi]
-    pub fn resume(&self) -> napi::Result<()> {
-        self.inner.core.resume().map_err(|e| {
+    pub async fn resume(&self) -> napi::Result<()> {
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
+        self.inner.resume().await.map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("resume failed: {e}"),
                 code: codes::CTX_2000.to_owned(),

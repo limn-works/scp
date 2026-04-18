@@ -204,14 +204,22 @@ impl PyScp {
     ///
     /// Raises `ContextError` (code `SCP-CTX-2000`) if the instance has
     /// been permanently shut down.
-    pub fn resume(&self) -> PyResult<()> {
-        self.inner
-            .core
-            .resume()
-            .map_err(|e| ScpPyError::ContextError {
-                message: format!("resume failed: {e}"),
-                code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
-            })?;
+    pub fn resume(&self, py: Python<'_>) -> PyResult<()> {
+        let rt = crate::runtime()?;
+        let inner = Arc::clone(&self.inner);
+        // Release the GIL while we drive the tokio runtime. The
+        // `BridgeInstanceCore::resume` override performs async work
+        // (transport reconnect, context restore) that must not block the
+        // Python interpreter.
+        py.allow_threads(|| {
+            rt.block_on(async move {
+                scp_ffi_common::bridge_instance::BridgeInstanceCore::resume(&*inner).await
+            })
+        })
+        .map_err(|e| ScpPyError::ContextError {
+            message: format!("resume failed: {e}"),
+            code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
+        })?;
         Ok(())
     }
 
