@@ -466,103 +466,84 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // scp_suspend / scp_resume lifecycle tests
+    // SCP suspend / resume lifecycle tests
     //
-    // Consolidated into a single `#[test]` so that cargo's parallel test
-    // runner does not interleave suspend/resume across the shared
-    // `BridgeInstance::suspended` flag with other tests in this binary.
+    // Since #1549 Phase 4 PR 2 commit 11 the roundtrip exercises a fresh
+    // `Scp::new()` instance rather than the free `scp_suspend` / `scp_resume`
+    // functions that mutate the process-global `DEFAULT_BRIDGE_INSTANCE`.
+    // That design eliminates the need for the old
+    // `bridge_lifecycle_serial()` async mutex that previously had to guard
+    // EVERY test in this binary that called `context_manager()` /
+    // `bridge_instance()`.
     //
-    // A process-wide `bridge_lifecycle_serial()` async mutex serializes
-    // this test against EVERY other test in this binary that calls
-    // `context_manager()` / `bridge_instance()` — NOT just the
-    // governance-style `role_state_syncs_*` tests in `context.rs`, but
-    // also context-create, context-join, economy tracker, and
-    // bridge-connector tests that would otherwise observe
-    // `is_suspended=true` mid-roundtrip and fail. Every test that
-    // touches shared bridge state acquires the mutex; see
-    // `bridge_lifecycle_serial()` in `runtime.rs` for the invariant.
+    // Construction pattern:
     //
-    // Because NAPI is a cdylib and cannot link integration tests
-    // (`napi_wrap` is only defined when loaded by Node), moving these
-    // assertions into a separate `tests/lifecycle.rs` binary is not
-    // possible — the mutex is the portable alternative. Uses
-    // `tokio::sync::Mutex` so async callers can `.await` its `lock()`
-    // without tripping the `await_holding_lock` lint.
+    //   let scp = Scp::new().expect("construct");
+    //   scp.suspend().expect("suspend");
+    //   scp.resume().expect("resume");
+    //
+    // Each `Scp` owns an isolated `Arc<NapiBridgeInstance>`. Two tests
+    // running in parallel — even two roundtrips — cannot observe each
+    // other's `suspended` flag. Other tests in the binary continue to use
+    // `DEFAULT_BRIDGE_INSTANCE` via `init_context_manager_for_test()`, and
+    // because this test never touches the default they cannot race.
     // -----------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scp_suspend_resume_roundtrip() {
-        let _guard = crate::runtime::bridge_lifecycle_serial().lock().await;
+    async fn scp_class_suspend_resume_roundtrip() {
+        let scp = crate::scp::Scp::new().expect("Scp::new must succeed");
 
-        // Case 1: suspend / resume before any bridge init must succeed.
-        scp_suspend().expect("scp_suspend must succeed");
-        scp_resume().await.expect("scp_resume must succeed");
-
-        // Case 2: after ensure_bridge_instance(), suspend then resume
-        // round-trip.
-        crate::runtime::ensure_bridge_instance();
-        scp_suspend().expect("scp_suspend after init must succeed");
-
-        // Semantic assertion (L4): while suspended, `context_manager()`
-        // and `bridge_instance()` must return the CTX_2000 "suspended"
-        // error rather than some other error. This is the whole contract
-        // the `bridge_lifecycle_serial()` mutex exists to protect —
-        // verify it directly so a future refactor that accidentally
-        // weakens `is_suspended` propagation (e.g. checking only in
-        // `context_manager()` but not `bridge_instance()`) is caught
-        // here.
-        //
-        // Both accessors return `Err`; we only assert the error *shape*
-        // includes the suspended sentinel. Asserting `Ok` after resume
-        // would be brittle because this test does not attach a
-        // `ContextManager` (see `init_context_manager_for_test` usage in
-        // other tests) — after resume, `try_context_manager()` would
-        // still fail with the distinct "not yet attached" error, which
-        // is a correct but unrelated code path.
-        let cm_err = crate::runtime::context_manager()
-            .err()
-            .expect("context_manager must error while suspended");
-        let cm_msg = cm_err.to_string();
+        // Sanity: a freshly constructed instance is neither suspended
+        // nor shut down.
         assert!(
-            cm_msg.contains("suspended") && cm_msg.contains(scp_ffi_common::error_codes::CTX_2000),
-            "context_manager error should mention suspended + CTX_2000, got: {cm_msg}"
+            !scp.inner.core.is_suspended(),
+            "fresh instance must not be suspended"
         );
-        let bi_err = crate::runtime::bridge_instance()
-            .err()
-            .expect("bridge_instance must error while suspended");
-        let bi_msg = bi_err.to_string();
         assert!(
-            bi_msg.contains("suspended") && bi_msg.contains(scp_ffi_common::error_codes::CTX_2000),
-            "bridge_instance error should mention suspended + CTX_2000, got: {bi_msg}"
+            !scp.inner.core.is_shutdown(),
+            "fresh instance must not be shut down"
         );
 
-        scp_resume()
+        // Case 1: suspend / resume must round-trip.
+        scp.suspend().expect("Scp::suspend must succeed");
+        assert!(
+            scp.inner.core.is_suspended(),
+            "instance must report suspended after suspend()"
+        );
+        scp.resume().await.expect("Scp::resume must succeed");
+        assert!(
+            !scp.inner.core.is_suspended(),
+            "instance must not report suspended after resume()"
+        );
+
+        // Case 2: double-suspend / double-resume are idempotent.
+        scp.suspend().expect("double suspend must succeed");
+        scp.suspend().expect("double suspend must succeed");
+        assert!(scp.inner.core.is_suspended());
+        scp.resume().await.expect("double resume must succeed");
+        scp.resume().await.expect("double resume must succeed");
+        assert!(!scp.inner.core.is_suspended());
+
+        // Case 3: the default instance is unaffected — no free-function
+        // mutation leaked onto it.
+        if let Some(default_bi) = crate::runtime::default_bridge_instance_raw() {
+            assert!(
+                !default_bi.core.is_suspended(),
+                "default bridge instance must not be suspended after a scoped Scp roundtrip"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scp_class_shutdown_zero_timeout_returns_immediately() {
+        // Shutting down a caller-owned `Scp` with a zero-millisecond
+        // deadline must return without hanging even if handles are live,
+        // mirroring `scp_shutdown_zero_timeout_returns_immediately` but
+        // against an isolated `NapiBridgeInstance`. The default instance
+        // is untouched.
+        let scp = crate::scp::Scp::new().expect("Scp::new must succeed");
+        scp.shutdown(0)
             .await
-            .expect("scp_resume after suspend must succeed");
-
-        // After resume, the suspended sentinel must no longer appear on
-        // either accessor. If `try_context_manager()` was not attached
-        // in this binary, the accessors return the distinct "not yet
-        // attached" error (also CTX_2000) — that's fine for the
-        // assertion below because the text diverges from the suspended
-        // message.
-        if let Err(e) = crate::runtime::context_manager() {
-            assert!(
-                !e.to_string().contains("suspended"),
-                "context_manager must not report suspended after resume, got: {e}"
-            );
-        }
-        if let Err(e) = crate::runtime::bridge_instance() {
-            assert!(
-                !e.to_string().contains("suspended"),
-                "bridge_instance must not report suspended after resume, got: {e}"
-            );
-        }
-
-        // Case 3: double-suspend / double-resume are idempotent.
-        scp_suspend().expect("double suspend must succeed");
-        scp_suspend().expect("double suspend must succeed");
-        scp_resume().await.expect("double resume must succeed");
-        scp_resume().await.expect("double resume must succeed");
+            .expect("Scp::shutdown(0) must succeed");
     }
 }

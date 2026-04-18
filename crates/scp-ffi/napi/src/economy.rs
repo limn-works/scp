@@ -407,7 +407,6 @@ mod tests {
 
     #[test]
     fn budget_remaining_empty_context_returns_zero() {
-        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().blocking_lock();
         crate::runtime::init_context_manager_for_test();
         let result = economy_budget_remaining("test-ctx".to_owned(), "did:key:test".to_owned());
         assert_eq!(result.unwrap(), 0);
@@ -415,7 +414,6 @@ mod tests {
 
     #[test]
     fn budget_grant_and_spend() {
-        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().blocking_lock();
         crate::runtime::init_context_manager_for_test();
         economy_budget_grant("napi-econ-ctx".to_owned(), "did:key:alice".to_owned(), 1000).unwrap();
         let r = economy_budget_remaining("napi-econ-ctx".to_owned(), "did:key:alice".to_owned())
@@ -431,7 +429,6 @@ mod tests {
 
     #[test]
     fn antispam_velocity_starts_at_zero() {
-        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().blocking_lock();
         crate::runtime::init_context_manager_for_test();
         let v =
             economy_antispam_velocity("napi-spam-ctx".to_owned(), "did:key:bob".to_owned(), 1000);
@@ -446,7 +443,6 @@ mod tests {
 
     #[test]
     fn budget_grant_rejects_negative_amount() {
-        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().blocking_lock();
         crate::runtime::init_context_manager_for_test();
         let err =
             economy_budget_grant("ctx".to_owned(), "did:key:alice".to_owned(), -1).unwrap_err();
@@ -458,7 +454,6 @@ mod tests {
 
     #[test]
     fn budget_record_spend_rejects_negative_amount() {
-        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().blocking_lock();
         crate::runtime::init_context_manager_for_test();
         let err = economy_budget_record_spend("ctx".to_owned(), "did:key:alice".to_owned(), -100)
             .unwrap_err();
@@ -470,7 +465,6 @@ mod tests {
 
     #[test]
     fn antispam_record_rejects_negative_timestamp() {
-        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().blocking_lock();
         crate::runtime::init_context_manager_for_test();
         let err =
             economy_antispam_record("ctx".to_owned(), "did:key:bob".to_owned(), -1).unwrap_err();
@@ -482,7 +476,6 @@ mod tests {
 
     #[test]
     fn antispam_velocity_rejects_negative_now() {
-        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().blocking_lock();
         crate::runtime::init_context_manager_for_test();
         let err =
             economy_antispam_velocity("ctx".to_owned(), "did:key:bob".to_owned(), -1).unwrap_err();

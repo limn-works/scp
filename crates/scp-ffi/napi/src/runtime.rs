@@ -979,29 +979,16 @@ fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProv
     )))
 }
 
-/// Process-wide async mutex that serializes the
-/// `scp_suspend_resume_roundtrip` test with EVERY other test in this
-/// binary that calls `context_manager()` or `bridge_instance()` (both of
-/// which error when the `BridgeInstance::suspended` flag is set). Cargo
-/// runs lib-tests in parallel by default, and because NAPI is a cdylib
-/// (`napi_wrap` is only defined when loaded by Node), suspend/resume
-/// cannot be moved into a separate integration-test binary as in the
-/// `PyO3` and `UniFFI` bridges.
-///
-/// Every test that touches shared bridge state — including context
-/// creation, governance, economy trackers, and bridge-connector
-/// registration — must acquire this mutex for the duration of its
-/// assertions so the roundtrip test cannot observe `is_suspended=true`
-/// mid-test. A `tokio::sync::Mutex` is used (not `std::sync::Mutex`)
-/// because several callers are `async` tests that hold the guard across
-/// `.await` points — `std::sync::Mutex` guards are not `Send` and would
-/// trigger the `await_holding_lock` lint, which specifically warns
-/// against deadlock via blocked worker threads.
-#[cfg(test)]
-pub(crate) fn bridge_lifecycle_serial() -> &'static tokio::sync::Mutex<()> {
-    static BRIDGE_LIFECYCLE_SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    BRIDGE_LIFECYCLE_SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
-}
+// `bridge_lifecycle_serial` (and its backing `BRIDGE_LIFECYCLE_SERIAL`
+// `OnceLock`) were deleted in #1549 Phase 4 PR 2 commit 11. They existed
+// solely to serialize the `scp_suspend_resume_roundtrip` test — which
+// mutated the process-global `DEFAULT_BRIDGE_INSTANCE::suspended` flag —
+// against every other test that touched shared bridge state. The
+// roundtrip test has been rewritten to use a caller-owned `Scp::new()`
+// instance (see `scp_class_suspend_resume_roundtrip` in `lib.rs`), so the
+// default instance is never suspended mid-test and the serial is no
+// longer required. Other tests that previously acquired the guard now
+// simply run without it.
 
 /// Test variant of [`context_manager`] initialization that uses
 /// [`LocalTransportProvider`](scp_core::context::LocalTransportProvider)
@@ -1752,7 +1739,6 @@ mod tests {
 
     #[test]
     fn bridge_instance_populated_by_init_context_manager() {
-        let _lifecycle_guard = bridge_lifecycle_serial().blocking_lock();
         // init_context_manager_for_test populates DEFAULT_BRIDGE_INSTANCE which
         // owns the ContextManager. Since OnceLock is process-global, the first
         // call in any test wins — subsequent calls are no-ops. We rely on this
@@ -1771,7 +1757,6 @@ mod tests {
 
     #[test]
     fn bridge_instance_not_shutdown_initially() {
-        let _lifecycle_guard = bridge_lifecycle_serial().blocking_lock();
         init_context_manager_for_test();
 
         let core = bridge_instance().expect("bridge_instance should be initialized");
