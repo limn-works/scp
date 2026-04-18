@@ -2,7 +2,11 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    // `InMemoryKeyCustody::from_seed(u64)` is deprecated (entropy
+    // truncation). These tests use it deliberately for small-integer
+    // seeds.
+    deprecated
 )]
 
 //! End-to-end network simulation — run with `cargo test --test network_simulation -- --nocapture`

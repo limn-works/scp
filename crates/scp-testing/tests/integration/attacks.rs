@@ -4,7 +4,11 @@
     clippy::panic,
     clippy::items_after_statements,
     clippy::too_many_lines,
-    clippy::iter_on_single_items
+    clippy::iter_on_single_items,
+    // `InMemoryKeyCustody::from_seed(u64)` is deprecated (entropy
+    // truncation). These tests use it deliberately for small-integer
+    // seeds.
+    deprecated
 )]
 
 //! B14: Attack scenario integration tests.

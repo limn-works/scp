@@ -1780,7 +1780,15 @@ pub fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    // `InMemoryKeyCustody::from_seed(u64)` is deprecated (entropy
+    // truncation) but this test uses it deliberately as a small-integer
+    // determinism fixture.
+    deprecated
+)]
 mod tests {
     use std::sync::Arc;
 

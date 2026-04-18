@@ -116,11 +116,23 @@ impl InMemoryKeyCustody {
     }
 
     /// Creates a new in-memory key custody with a deterministic RNG seeded by
-    /// `seed`.
+    /// the low 8 bytes of `seed` (little-endian) and 24 zero bytes.
     ///
-    /// Useful for reproducible test scenarios: the same seed always produces
-    /// the same sequence of keys.
+    /// **Prefer [`InMemoryKeyCustody::from_seed_bytes`] for any new test.**
+    /// `from_seed(u64)` only supplies 64 bits of entropy across the 32-byte
+    /// seed that `rand::rngs::StdRng::from_seed` expects — the other 24
+    /// bytes are zero-padded. That is fine for "these two custodies make
+    /// the same keys" determinism assertions, but it silently truncates
+    /// when callers intend a 32-byte seed (e.g. from external test
+    /// vectors, ADR-046 parity fixtures). `from_seed_bytes` takes the
+    /// full seed and is the byte-exact path used by the cross-bridge
+    /// parity harness.
+    ///
+    /// Kept for existing callers in the scp-testing integration suite
+    /// that deliberately want a small-integer seed.
     #[must_use]
+    #[deprecated(note = "Use from_seed_bytes for full 32-byte seeds; `from_seed(u64)` \
+                silently truncates entropy to 8 bytes. See crate docs.")]
     pub fn from_seed(seed: u64) -> Self {
         let mut seed_bytes = [0u8; 32];
         seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
@@ -510,7 +522,14 @@ impl KeyCustody for InMemoryKeyCustody {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    // `InMemoryKeyCustody::from_seed(u64)` is deprecated (entropy
+    // truncation) but these tests exercise that API directly.
+    deprecated
+)]
 mod tests {
     use super::*;
 
