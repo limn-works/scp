@@ -5087,6 +5087,11 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
                     code: codes::TRANS_5002.to_owned(),
                 })?;
 
+            // Register the URL on the bridge's pending-reconnect set so
+            // `BridgeInstanceCore::resume` can rebuild the transport after
+            // suspend/resume cycles (#1678).
+            bi.core.add_relay_url(relay_url.clone());
+
             let handle = Arc::new(TransportManager {
                 status: std::sync::Mutex::new(TransportStatus {
                     connected: true,
@@ -5152,15 +5157,25 @@ pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), 
                 code: codes::TRANS_5003.to_owned(),
             })?;
 
-            // Update the handle's status to disconnected.
-            {
+            // Update the handle's status to disconnected and capture the
+            // URL we were connected to before clearing it.
+            let disconnecting_url = {
                 let mut status_guard = manager.status.lock().map_err(|_| ScpError::Transport {
                     msg: "status mutex is poisoned — cannot update transport status".to_owned(),
                     code: codes::TRANS_5003.to_owned(),
                 })?;
+                let url = status_guard.relay_url.clone();
                 status_guard.connected = false;
                 status_guard.relay_url = None;
                 status_guard.latency_ms = None;
+                url
+            };
+
+            // Remove the URL from the bridge's pending-reconnect set so a
+            // subsequent `resume()` does not re-open a URL the caller
+            // explicitly disconnected (#1678).
+            if let Some(ref url) = disconnecting_url {
+                bi.core.remove_relay_url(url);
             }
 
             Ok(())

@@ -333,6 +333,14 @@ pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportM
             let manager = scp_transport::TransportManager::new(Box::new(adapter));
             set_transport_manager(manager)?;
 
+            // Register the URL on the bridge's pending-reconnect set so
+            // `BridgeInstanceCore::resume` can rebuild the transport after
+            // suspend/resume cycles (#1678). NAPI's `bridge_instance()`
+            // already returns `&'static CoreFields`.
+            if let Ok(core) = crate::runtime::bridge_instance() {
+                core.add_relay_url(relay_url.clone());
+            }
+
             // Spawn suppression → scoring bridge task.
             if let Some(rx) = suppression_rx {
                 spawn_suppression_scoring_task(rx, relay_url.clone());
@@ -416,6 +424,10 @@ pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Resul
         .into());
     }
 
+    // Capture the URL we were connected to before clearing it so the
+    // bridge's pending-reconnect set can drop it too (#1678).
+    let disconnecting_url = s.relay_url.clone();
+
     s.connected = false;
     s.relay_url = None;
     s.latency_ms = None;
@@ -423,6 +435,12 @@ pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Resul
 
     // Drop the transport manager, closing all WebSocket connections.
     clear_transport_manager()?;
+
+    if let Some(ref url) = disconnecting_url
+        && let Ok(core) = crate::runtime::bridge_instance()
+    {
+        core.remove_relay_url(url);
+    }
 
     Ok(())
 }

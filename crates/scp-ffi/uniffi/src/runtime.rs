@@ -324,6 +324,20 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         &self.core
     }
 
+    /// `UniFFI`-specific resume: flag flip, then transport reconnect, then
+    /// persisted-context restore.
+    ///
+    /// Mirrors the `PyO3` / NAPI overrides so Swift and Kotlin callers get
+    /// the same resume semantics as Python and TypeScript.
+    async fn resume(&self) -> Result<(), scp_ffi_common::bridge_instance::LifecycleError> {
+        self.core.resume().await?;
+        // Reconnect transport BEFORE rehydrating persisted contexts so
+        // restored subscriptions can attach to a live relay connection.
+        self.core.reconnect_transport_if_pending().await?;
+        self.core.restore_all_persisted_contexts().await;
+        Ok(())
+    }
+
     async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
         // `bridge_specific_shutdown` MUST run even when
         // `shutdown_core_async` returns `AlreadyShutDown` — that variant

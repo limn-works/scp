@@ -19,7 +19,12 @@ use scp_ffi_uniffi::{runtime, scp_resume, scp_suspend};
 ///
 /// Consolidated into a single test to avoid cargo's parallel test runner
 /// interleaving concurrent invocations on the same global flag.
-#[tokio::test]
+///
+/// Multi-threaded flavor because `resume()` now reaches into async
+/// persistence paths (`ProtocolRepositoryEventLogBridge::store_entries`
+/// uses `block_in_place`), which panic on the default current-thread
+/// runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scp_suspend_resume_roundtrip() {
     // Case 1: suspend / resume before any bridge init must succeed.
     //

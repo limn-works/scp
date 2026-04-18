@@ -490,7 +490,7 @@ mod tests {
     // without tripping the `await_holding_lock` lint.
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scp_suspend_resume_roundtrip() {
         let _guard = crate::runtime::bridge_lifecycle_serial().lock().await;
 
