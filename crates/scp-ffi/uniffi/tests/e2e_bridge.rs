@@ -145,7 +145,7 @@ fn default_encrypted_params() -> ContextParams {
 
 #[tokio::test]
 async fn identity_create_in_memory_produces_valid_did() {
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let identity = identity_create("in_memory".to_owned(), None).await.unwrap();
     let did = identity.did();
     assert!(
         did.starts_with("did:dht:"),
@@ -157,7 +157,7 @@ async fn identity_create_in_memory_produces_valid_did() {
 
 #[tokio::test]
 async fn identity_create_rejects_unknown_custody() {
-    let result = identity_create("magic".to_owned()).await;
+    let result = identity_create("magic".to_owned(), None).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     let msg = err.to_string();
@@ -169,7 +169,7 @@ async fn identity_create_rejects_unknown_custody() {
 
 #[tokio::test]
 async fn identity_rotate_key() {
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let identity = identity_create("in_memory".to_owned(), None).await.unwrap();
     let original_did = identity.did();
 
     // rotate_key may fail with InMemoryDhtClient since each DidDht instance
@@ -198,7 +198,7 @@ async fn identity_rotate_key() {
 #[tokio::test]
 async fn identity_agent_key_lifecycle() {
     // Create without agent key
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let identity = identity_create("in_memory".to_owned(), None).await.unwrap();
     assert!(
         !identity.has_agent_key(),
         "New identity should not have agent key by default"
@@ -233,7 +233,7 @@ async fn identity_agent_key_lifecycle() {
 
 #[tokio::test]
 async fn identity_migrate_preserves_attestations() {
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let identity = identity_create("in_memory".to_owned(), None).await.unwrap();
     let original_did = identity.did();
 
     // Create an attestation on the original DID.
@@ -307,7 +307,7 @@ async fn identity_migrate_preserves_attestations() {
 
 #[tokio::test]
 async fn context_create_returns_active_context() {
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let identity = identity_create("in_memory".to_owned(), None).await.unwrap();
     let handle = context_create(identity.clone(), default_encrypted_params())
         .await
         .unwrap();
@@ -326,8 +326,8 @@ async fn context_create_returns_active_context() {
 
 #[tokio::test]
 async fn context_join_and_leave() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let bob = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
+    let bob = identity_create("in_memory".to_owned(), None).await.unwrap();
 
     // Use full capabilities so Alice can assign roles
     let handle = context_create(alice.clone(), full_capability_params())
@@ -363,8 +363,8 @@ async fn context_join_and_leave() {
 /// SCP-ECON-12061 code (mirrors PyO3/NAPI/WASM bridges).
 #[tokio::test]
 async fn context_join_rejects_malformed_spending_ucan_jwt() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let bob = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
+    let bob = identity_create("in_memory".to_owned(), None).await.unwrap();
 
     let handle = context_create(alice.clone(), full_capability_params())
         .await
@@ -388,8 +388,8 @@ async fn context_join_rejects_malformed_spending_ucan_jwt() {
 /// manager.
 #[tokio::test]
 async fn context_join_accepts_none_spending_ucan_jwt() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let bob = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
+    let bob = identity_create("in_memory".to_owned(), None).await.unwrap();
 
     let handle = context_create(alice.clone(), full_capability_params())
         .await
@@ -410,7 +410,7 @@ async fn context_join_accepts_none_spending_ucan_jwt() {
 /// is declared without the matching opt-in flag.
 #[tokio::test]
 async fn context_create_rejects_revoke_access_when_config_disallows() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
 
     let bad_rules = serde_json::json!([
         {
@@ -441,7 +441,7 @@ async fn context_create_rejects_revoke_access_when_config_disallows() {
 /// the context creation must succeed.
 #[tokio::test]
 async fn context_create_threads_consequence_rules_and_config() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
 
     let rules = serde_json::json!([
         {
@@ -472,7 +472,7 @@ async fn context_create_threads_consequence_rules_and_config() {
 
 #[tokio::test]
 async fn context_send_message() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
     let handle = context_create(alice.clone(), default_encrypted_params())
         .await
         .unwrap();
@@ -486,7 +486,7 @@ async fn context_send_message() {
 
 #[tokio::test]
 async fn context_close_lifecycle() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
     // Must include context:close capability
     let handle = context_create(alice.clone(), full_capability_params())
         .await
@@ -504,7 +504,7 @@ async fn context_close_lifecycle() {
 
 #[tokio::test]
 async fn context_drain_events_returns_vec() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
     let handle = context_create(alice, default_encrypted_params())
         .await
         .unwrap();
@@ -519,7 +519,7 @@ async fn context_drain_events_returns_vec() {
 
 #[tokio::test]
 async fn context_member_role_returns_role_for_creator() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
     let handle = context_create(alice.clone(), default_encrypted_params())
         .await
         .unwrap();
@@ -541,7 +541,7 @@ async fn context_member_role_returns_role_for_creator() {
 
 #[tokio::test]
 async fn context_ttl_operations() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
     let alice_did = alice.did();
     let handle = context_create(alice, default_encrypted_params())
         .await
@@ -563,8 +563,8 @@ async fn context_ttl_operations() {
 
 #[tokio::test]
 async fn governance_execute_add_member() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let bob = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
+    let bob = identity_create("in_memory".to_owned(), None).await.unwrap();
     let handle = context_create(alice, full_capability_params())
         .await
         .unwrap();
@@ -589,7 +589,7 @@ async fn governance_execute_add_member() {
 
 #[tokio::test]
 async fn broadcast_lifecycle() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
     let handle = context_create(alice, default_encrypted_params())
         .await
         .unwrap();
@@ -613,7 +613,7 @@ async fn broadcast_lifecycle() {
 
 #[tokio::test]
 async fn tool_register_and_verify() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
     let handle = context_create(alice.clone(), default_encrypted_params())
         .await
         .unwrap();
@@ -646,8 +646,8 @@ async fn tool_register_and_verify() {
 
 #[tokio::test]
 async fn ucan_mint_and_revoke() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let bob = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
+    let bob = identity_create("in_memory".to_owned(), None).await.unwrap();
     let handle = context_create(alice.clone(), default_encrypted_params())
         .await
         .unwrap();
@@ -682,7 +682,7 @@ async fn ucan_mint_and_revoke() {
 
 #[tokio::test]
 async fn event_log_query_returns_events() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let alice = identity_create("in_memory".to_owned(), None).await.unwrap();
     let handle = context_create(alice, default_encrypted_params())
         .await
         .unwrap();
@@ -943,9 +943,9 @@ async fn scp_shutdown_with_no_handles_returns_immediately() {
 
 #[tokio::test]
 async fn multiple_identities_produce_distinct_dids() {
-    let id1 = identity_create("in_memory".to_owned()).await.unwrap();
-    let id2 = identity_create("in_memory".to_owned()).await.unwrap();
-    let id3 = identity_create("in_memory".to_owned()).await.unwrap();
+    let id1 = identity_create("in_memory".to_owned(), None).await.unwrap();
+    let id2 = identity_create("in_memory".to_owned(), None).await.unwrap();
+    let id3 = identity_create("in_memory".to_owned(), None).await.unwrap();
 
     assert_ne!(id1.did(), id2.did());
     assert_ne!(id2.did(), id3.did());
@@ -958,7 +958,7 @@ async fn multiple_identities_produce_distinct_dids() {
 
 #[tokio::test]
 async fn context_create_with_all_governance_models() {
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let identity = identity_create("in_memory".to_owned(), None).await.unwrap();
 
     for model in [
         GovernanceModel::SingleAdmin,
@@ -988,7 +988,7 @@ async fn context_create_with_all_governance_models() {
 
 #[tokio::test]
 async fn context_create_with_all_memory_scopes() {
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let identity = identity_create("in_memory".to_owned(), None).await.unwrap();
 
     for scope in [
         MemoryScope::Ephemeral,
@@ -1022,7 +1022,7 @@ async fn context_create_with_all_memory_scopes() {
 
 #[tokio::test]
 async fn invalid_did_rejected_at_bridge_boundary() {
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let identity = identity_create("in_memory".to_owned(), None).await.unwrap();
     let handle = context_create(identity, default_encrypted_params())
         .await
         .unwrap();

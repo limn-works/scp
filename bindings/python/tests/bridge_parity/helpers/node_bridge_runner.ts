@@ -343,18 +343,50 @@ async function dispatch(req: BridgeRequest): Promise<OkResponse | ErrResponse> {
 // Op implementations
 // ---------------------------------------------------------------------------
 
+// Converts a hex string (expected 64 chars = 32 bytes) to the native seed
+// representation for the target bridge. NAPI accepts Node `Buffer`; WASM
+// accepts a `Uint8Array`. Both surface in Rust as the same 32 bytes.
+function seedFromHex(hex: string | undefined, forWasm: boolean): unknown {
+  if (hex === undefined) return undefined;
+  if (hex.length !== 64) {
+    throw new Error(
+      `seed_hex must be 64 chars (32 bytes), got ${hex.length}`,
+    );
+  }
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) {
+    bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return forWasm ? bytes : Buffer.from(bytes);
+}
+
 async function opIdentityCreate(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
   const custody = String(req.args.custody ?? "in_memory");
+  const seedHex =
+    typeof req.args.seed_hex === "string" ? req.args.seed_hex : undefined;
   if (req.bridgeMode === "napi") {
     const bridge = await loadNapi();
-    const handle = await bridge.identityCreate(custody);
-    return { did: handle.did, custody };
+    const seed = seedFromHex(seedHex, false);
+    // Pass `seed` through even when undefined — the bridge's
+    // `identityCreate(custody, seed)` signature accepts `Option<Buffer>`
+    // which surfaces as `Buffer | null | undefined` on the JS side.
+    const handle = await bridge.identityCreate(custody, seed);
+    return {
+      did: handle.did,
+      custody,
+      verifying_key: handle.verifyingKey ?? null,
+    };
   }
   const { raw } = await loadWasm();
-  const handle = await raw.identity_create(custody);
-  return { did: handle.did, custody };
+  const seed = seedFromHex(seedHex, true);
+  const handle = await raw.identity_create(custody, seed);
+  return {
+    did: handle.did,
+    custody,
+    verifying_key: handle.verifyingKey ?? handle.verifying_key ?? null,
+  };
 }
 
 async function opContextCreate(
@@ -464,9 +496,12 @@ async function opSignMessage(req: BridgeRequest): Promise<Record<string, unknown
     req.args.audience ?? "https://parity-test.example.com",
   );
   const ttl = Number(req.args.ttl_seconds ?? 60);
+  const seedHex =
+    typeof req.args.seed_hex === "string" ? req.args.seed_hex : undefined;
   if (req.bridgeMode === "napi") {
     const bridge = await loadNapi();
-    const identity = await bridge.identityCreate("in_memory");
+    const seed = seedFromHex(seedHex, false);
+    const identity = await bridge.identityCreate("in_memory", seed);
     const challenge = bridge.scpidChallenge(audience, ttl);
     const responseJson = bridge.scpidSign(identity.did, "#active", challenge);
     const response = JSON.parse(responseJson);
@@ -478,7 +513,8 @@ async function opSignMessage(req: BridgeRequest): Promise<Record<string, unknown
     };
   }
   const { raw } = await loadWasm();
-  const identity = await raw.identity_create("in_memory");
+  const seed = seedFromHex(seedHex, true);
+  const identity = await raw.identity_create("in_memory", seed);
   const challenge = raw.scpid_challenge(audience, ttl);
   const responseJson = raw.scpid_sign(identity.did, "#active", challenge);
   const response = JSON.parse(responseJson);

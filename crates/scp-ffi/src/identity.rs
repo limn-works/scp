@@ -112,6 +112,22 @@ pub struct PyIdentity {
     custody: String,
     /// Whether this identity has an agent signing key (`#agent` VM).
     has_agent_key: bool,
+    /// Hex-encoded Ed25519 verifying-key bytes for the identity key
+    /// (VM `#0`, the key that derives the DID). 64 hex chars = 32 raw
+    /// bytes. Populated for identities created via
+    /// [`py_identity_create`]; `None` for identities loaded from storage
+    /// without a live custody.
+    ///
+    /// Why `#0` (`identity_key`), not `#active`: the WASM bridge uses a
+    /// simplified single-key model where the DID-deriving key *is* the
+    /// signing key, while scp-core uses three distinct keys per
+    /// [`ScpIdentity`]. Exposing the identity key gives a byte-identical
+    /// value across all four bridges under a deterministic `seed`
+    /// (ADR-046). Note that SCPID signatures use `#active`, which is a
+    /// different key in scp-core — signatures are NOT byte-equal across
+    /// bridges on the seeded path for that reason (plus the non-
+    /// deterministic `signed_at` clock; see `FOLLOWUP.md`).
+    verifying_key_hex: Option<String>,
 }
 
 #[pymethods]
@@ -135,6 +151,20 @@ impl PyIdentity {
     #[getter]
     const fn has_agent_key(&self) -> bool {
         self.has_agent_key
+    }
+
+    /// Returns the hex-encoded Ed25519 verifying-key bytes for the
+    /// identity key (VM `#0`, the key that derives the DID), or `None`
+    /// if this handle was loaded without live key material (e.g. via
+    /// [`py_identity_load`]).
+    ///
+    /// Intended for cross-bridge parity assertions: under a deterministic
+    /// `seed`, this value is byte-identical across every bridge
+    /// (ADR-046). See the `verifying_key_hex` field docs for why `#0`
+    /// rather than `#active`.
+    #[getter]
+    fn verifying_key(&self) -> Option<String> {
+        self.verifying_key_hex.clone()
     }
 
     /// Returns the agent key's public key as a multibase-encoded string, or
@@ -322,6 +352,49 @@ impl PyDIDDocument {
 ///
 /// See issue #323, ADR-006, and SCP-294a.
 fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
+    parse_custody_with_seed(custody, None)
+}
+
+/// Variant of [`parse_custody`] that optionally accepts a 32-byte seed for the
+/// `"in_memory"` custody path, used by the cross-bridge parity harness
+/// (ADR-046). The seed is fed directly into
+/// [`InMemoryKeyCustody::from_seed_bytes`], making every subsequent
+/// `generate_keypair` call deterministic.
+///
+/// A non-`None` seed on any custody type other than `"in_memory"` is a
+/// validation error — seeded determinism is only meaningful for the
+/// in-process testing custody.
+#[cfg(feature = "allow_in_memory_custody")]
+fn parse_custody_with_seed(
+    custody: &str,
+    seed: Option<[u8; 32]>,
+) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
+    match custody {
+        "in_memory" => {
+            let kc = seed.map_or_else(InMemoryKeyCustody::new, InMemoryKeyCustody::from_seed_bytes);
+            Ok((Arc::new(FfiKeyCustody::InMemory(kc)), custody.to_owned()))
+        }
+        _ if seed.is_some() => Err(ScpPyError::validation(
+            "`seed` parameter is only valid for custody=\"in_memory\"",
+        )),
+        other => parse_custody_inner(other),
+    }
+}
+
+#[cfg(not(feature = "allow_in_memory_custody"))]
+fn parse_custody_with_seed(
+    custody: &str,
+    seed: Option<[u8; 32]>,
+) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
+    if seed.is_some() {
+        return Err(ScpPyError::validation(
+            "`seed` parameter requires the allow_in_memory_custody feature",
+        ));
+    }
+    parse_custody_inner(custody)
+}
+
+fn parse_custody_inner(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
     match custody {
         #[cfg(feature = "allow_in_memory_custody")]
         "in_memory" => {
@@ -479,8 +552,10 @@ fn py_init_storage(storage_type: &str) -> PyResult<()> {
 ///
 /// See ADR-013 acceptance criterion 2.
 #[pyfunction]
-fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
-    let (key_custody, custody_str) = parse_custody(custody)?;
+#[pyo3(signature = (custody, seed=None))]
+fn py_identity_create(py: Python<'_>, custody: &str, seed: Option<&[u8]>) -> PyResult<PyIdentity> {
+    let seed_array = parse_optional_seed(seed)?;
+    let (key_custody, custody_str) = parse_custody_with_seed(custody, seed_array)?;
     let rt = crate::runtime()?;
 
     // Ensure the BridgeInstance exists BEFORE the DID resolver is
@@ -503,6 +578,20 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
                 .map_err(ScpPyError::from)?;
 
             let did = identity.did.clone();
+
+            // Extract the verifying-key bytes for the `#active` signing key
+            // BEFORE moving the custody into the registry. Under a
+            // deterministic `seed`, this value is byte-identical across every
+            // bridge (ADR-046 / FOLLOWUP.md §1).
+            let pk = key_custody
+                .public_key(&identity.identity_key)
+                .await
+                .map_err(|e| {
+                    ScpPyError::identity(format!(
+                        "failed to read active signing key after identity create: {e}"
+                    ))
+                })?;
+            let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
 
             // Register the identity in the global registry so that
             // subsequent bridge functions (UCAN minting, pseudonym
@@ -534,7 +623,49 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
                 did,
                 custody: custody_str,
                 has_agent_key: false,
+                verifying_key_hex,
             })
+        })
+    })
+}
+
+/// Looks up a registered identity's `#active` verifying-key bytes and
+/// returns them hex-encoded, or `None` if the DID is not in the registry
+/// or the custody fails to produce a public key.
+///
+/// This is used by functions that mutate registered identities
+/// (`rotate_key`, `add_agent_key`, `rotate_agent_key`, `remove_agent_key`,
+/// `migrate`) to keep `PyIdentity.verifying_key` in sync with the current
+/// identity key. It is intentionally best-effort: if the custody read
+/// fails, the returned `PyIdentity` is still usable — only the
+/// parity-test field is dropped.
+async fn verifying_key_hex_for_registered_did(did: &str) -> Option<String> {
+    // Snapshot the custody + handle under the DashMap lock, then release
+    // the lock before awaiting on the custody. This avoids holding a
+    // DashMap guard across an await point.
+    let snapshot = crate::runtime::with_identity(did, |entry| {
+        Ok((Arc::clone(&entry.custody), entry.identity.identity_key))
+    })
+    .ok()?;
+    let (custody, handle) = snapshot;
+    custody
+        .public_key(&handle)
+        .await
+        .ok()
+        .map(|pk| hex::encode(pk.as_bytes()))
+}
+
+/// Validates that an optional `seed` byte slice is either `None` or exactly
+/// 32 bytes long. Used by `py_identity_create` (and future bridge functions
+/// that accept deterministic seeds) to keep seed-length validation on the
+/// FFI boundary, not in the runtime.
+fn parse_optional_seed(seed: Option<&[u8]>) -> Result<Option<[u8; 32]>, ScpPyError> {
+    seed.map_or(Ok(None), |bytes| {
+        <[u8; 32]>::try_from(bytes).map(Some).map_err(|_| {
+            ScpPyError::validation(format!(
+                "seed must be exactly 32 bytes, got {}",
+                bytes.len()
+            ))
         })
     })
 }
@@ -580,6 +711,16 @@ fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<
 
             let did = identity.did.clone();
 
+            let pk = key_custody
+                .public_key(&identity.identity_key)
+                .await
+                .map_err(|e| {
+                    ScpPyError::identity(format!(
+                        "failed to read active signing key after identity create: {e}"
+                    ))
+                })?;
+            let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
+
             crate::runtime::register_identity(
                 &did,
                 IdentityEntry {
@@ -606,6 +747,7 @@ fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<
                 did,
                 custody: custody_str,
                 has_agent_key: true,
+                verifying_key_hex,
             })
         })
     })
@@ -699,10 +841,16 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
                     Ok(entry.document.has_agent_key())
                 })
                 .unwrap_or(false);
+                // Recover the #active verifying key bytes from the live
+                // registry entry. Failures here are non-fatal — the loaded
+                // identity is still usable, just without the parity-test
+                // verifying_key field populated.
+                let verifying_key_hex = verifying_key_hex_for_registered_did(&did_owned).await;
                 return Ok(PyIdentity {
                     did: stored_did,
                     custody: custody_str,
                     has_agent_key: has_agent,
+                    verifying_key_hex,
                 });
             }
 
@@ -801,11 +949,16 @@ fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyI
             let has_agent = new_document.has_agent_key();
             entry.identity = new_identity;
             entry.document = new_document;
+            let verifying_key_hex = rt
+                .block_on(entry.custody.public_key(&entry.identity.identity_key))
+                .ok()
+                .map(|pk| hex::encode(pk.as_bytes()));
 
             Ok(PyIdentity {
                 did: did.clone(),
                 custody: custody_str.clone(),
                 has_agent_key: has_agent,
+                verifying_key_hex,
             })
         })
     });
@@ -862,11 +1015,16 @@ fn py_identity_add_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<
             let (new_identity, new_document) = add_result.map_err(ScpPyError::from)?;
             entry.identity = new_identity;
             entry.document = new_document;
+            let verifying_key_hex = rt
+                .block_on(entry.custody.public_key(&entry.identity.identity_key))
+                .ok()
+                .map(|pk| hex::encode(pk.as_bytes()));
 
             Ok(PyIdentity {
                 did: did.clone(),
                 custody: custody_str.clone(),
                 has_agent_key: true,
+                verifying_key_hex,
             })
         })
     });
@@ -923,11 +1081,16 @@ fn py_identity_rotate_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
             let (new_identity, new_document) = rotate_result.map_err(ScpPyError::from)?;
             entry.identity = new_identity;
             entry.document = new_document;
+            let verifying_key_hex = rt
+                .block_on(entry.custody.public_key(&entry.identity.identity_key))
+                .ok()
+                .map(|pk| hex::encode(pk.as_bytes()));
 
             Ok(PyIdentity {
                 did: did.clone(),
                 custody: custody_str.clone(),
                 has_agent_key: true,
+                verifying_key_hex,
             })
         })
     });
@@ -983,11 +1146,16 @@ fn py_identity_remove_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
             let (new_identity, new_document) = remove_result.map_err(ScpPyError::from)?;
             entry.identity = new_identity;
             entry.document = new_document;
+            let verifying_key_hex = rt
+                .block_on(entry.custody.public_key(&entry.identity.identity_key))
+                .ok()
+                .map(|pk| hex::encode(pk.as_bytes()));
 
             Ok(PyIdentity {
                 did: did.clone(),
                 custody: custody_str.clone(),
                 has_agent_key: false,
+                verifying_key_hex,
             })
         })
     });
@@ -1089,6 +1257,15 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
             let new_did = new_identity.did.clone();
             let has_agent = new_document.has_agent_key();
 
+            // Snapshot the identity-key (#0) verifying-key bytes BEFORE
+            // moving `new_identity` into the registry. See `PyIdentity`
+            // docs for why `#0` (not `#active`) is used here.
+            let verifying_key_hex = custody
+                .public_key(&new_identity.identity_key)
+                .await
+                .ok()
+                .map(|pk| hex::encode(pk.as_bytes()));
+
             // Preserve existing attestations from the old DID across migration.
             let existing_attestations = crate::runtime::with_identity(&old_did, |e| {
                 Ok(e.identity_link_attestations.clone())
@@ -1110,6 +1287,7 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                 did: new_did,
                 custody: custody_str,
                 has_agent_key: has_agent,
+                verifying_key_hex,
             })
         })
     })
@@ -1762,7 +1940,7 @@ mod tests {
 
         Python::with_gil(|py| {
             // Create an identity via the actual bridge function.
-            let original = py_identity_create(py, "in_memory").unwrap();
+            let original = py_identity_create(py, "in_memory", None).unwrap();
             let old_did = original.did.clone();
             assert!(old_did.starts_with("did:dht:"));
             assert!(crate::runtime::identity_registry_contains(&old_did));

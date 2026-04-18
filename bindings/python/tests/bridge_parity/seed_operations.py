@@ -11,9 +11,12 @@ Each OpSpec describes:
 Adding a new op is ~20 lines: one `OpSpec`, one `py_call`, one case in
 the Bun runner's dispatch. The library is append-only.
 
-MVP: 5 ops per ADR-046. Crypto outputs use shape-only comparators
-because we do not yet have a deterministic-seed parameter wired through
-all four bridges. See FOLLOWUP.md §1 for the forward-only plan.
+MVP: 5 ops per ADR-046. Crypto outputs now compare byte-exactly where
+possible: `identity_create_deterministic` pins DID + identity-key
+verifying bytes under a fixed seed. `sign_message` remains shape-only
+for the signature itself because Ed25519 covers a timestamp that
+cannot be frozen across bridges without a testing-feature clock
+injection — see FOLLOWUP.md §1 for the follow-up.
 
 Resolved divergences (previously xfail'd tripwires, now full parity):
   - context_id format (§18.4.1): all four bridges emit 64-char lowercase
@@ -150,29 +153,84 @@ def _extract_code(text: str) -> str | None:
 # ---------------------------------------------------------------------------
 # op 1: identity_create_deterministic
 #
-# Each bridge creates its own identity with OsRng-backed key generation
-# and returns the DID + custody type. DID shape is regex-checked. The
-# verifying key is NOT compared: PyO3's `identity_resolve` hits the
-# DHT (which does not contain the fresh identity), and the bridges do
-# not expose a direct pubkey getter on PyIdentity. Adding that accessor
-# is in FOLLOWUP.md along with the deterministic seed parameter.
+# Each bridge creates its own identity using a FIXED 32-byte seed fed
+# through the `testing`-gated `seed` parameter on `identity_create`. The
+# seed drives `rand::rngs::StdRng::from_seed` (same KDF across every
+# bridge per ADR-046 / FOLLOWUP.md §1), so:
+#   - the identity-key Ed25519 private bytes are byte-identical,
+#   - the DID derived from `z{zbase32(identity_pubkey)}` is byte-identical,
+#   - the exposed `verifying_key` hex is byte-identical.
+#
+# Both `did` and `verifying_key` are compared EXACTLY against the known
+# expected values below. Any drift in the underlying keygen or DID
+# derivation breaks the test immediately.
 # ---------------------------------------------------------------------------
 
 
+# Fixed 32-byte seed used by every bridge on this op. 0x7B chosen
+# arbitrarily — any stable seed works; changing it invalidates the
+# expected DID/verifying_key below (recompute both).
+PARITY_SEED_HEX = "7b" * 32
+
+# Expected outputs under `PARITY_SEED_HEX`. These are the ground truth
+# the bridges are being held to. If legitimate key-derivation changes
+# (e.g. StdRng algorithm update) require moving these, update all four
+# bridges AND these constants in the same PR.
+#
+# Derivation: `SigningKey::from_bytes(StdRng::from_seed([0x7b; 32])
+# .fill_bytes(32))`, verifying key = SigningKey.verifying_key().to_bytes().
+# DID = `did:dht:z{zbase32(verifying_key)}`.
+#
+# To regenerate after a legitimate KDF bump, run:
+#   cargo test -p scp-identity print_parity_seed_expected_values \
+#     -- --ignored --nocapture
+EXPECTED_SEEDED_VERIFYING_KEY_HEX = (
+    "4a08f8429d35967b4f0e2d987f45e1220d8173ace4097a539a6103ced5611f0c"
+)
+EXPECTED_SEEDED_DID = "did:dht:zjerxoow7gsm8suaqfsc86txbreganh7chorzwwh4crbh7imbdhgy"
+
+
 def _py_identity_create(ctx: OpContext) -> dict[str, Any]:
-    identity = ctx.scp_core.py_identity_create("in_memory")
-    return {"did": identity.did, "custody": "in_memory"}
+    seed = bytes.fromhex(PARITY_SEED_HEX)
+    identity = ctx.scp_core.py_identity_create("in_memory", seed)
+    return {
+        "did": identity.did,
+        "custody": "in_memory",
+        "verifying_key": identity.verifying_key,
+    }
 
 
 OP_IDENTITY_CREATE = OpSpec(
     name="identity_create_deterministic",
     py_call=_py_identity_create,
-    node_call={"op": "identity_create", "args": {"custody": "in_memory"}},
+    node_call={
+        "op": "identity_create",
+        "args": {"custody": "in_memory", "seed_hex": PARITY_SEED_HEX},
+    },
     schema=OpSchema(
         fields=(
-            FieldSpec("did", "regex", pattern=DID_DHT_PATTERN),
+            # Exact DID + verifying_key comparison is the whole point of
+            # the seeded path: both sides must derive the same bytes.
+            FieldSpec("did", "exact"),
             FieldSpec("custody", "exact"),
+            FieldSpec("verifying_key", "bytes_from_hex"),
         )
+    ),
+    # Ground-truth pinning: the `expected_values` tuples below anchor
+    # the DID + verifying_key to the literal outputs produced by
+    # `SigningKey::from_bytes(StdRng::from_seed([0x7b; 32]).fill_bytes(32))`.
+    # If the KDF ever changes (e.g. rand crate algorithm bump), these
+    # constants must move in the same PR that changes all four bridges.
+    expected_values=(
+        ("did", EXPECTED_SEEDED_DID),
+        # `bytes_from_hex` canonicalizes to base64 in the normalizer, so
+        # the expected value must also be the base64 of the raw key.
+        (
+            "verifying_key",
+            __import__("base64")
+            .b64encode(bytes.fromhex(EXPECTED_SEEDED_VERIFYING_KEY_HEX))
+            .decode("ascii"),
+        ),
     ),
 )
 
@@ -319,17 +377,28 @@ OP_EVENT_LOG_APPEND = OpSpec(
 # ---------------------------------------------------------------------------
 # op 5: sign_message (via SCPID)
 #
-# Each bridge creates an identity, generates a challenge with a fixed
-# audience + TTL, signs the challenge. Signature byte value is bridge-
-# specific (different keys); shape only: protocol exact, DID regex,
-# signing_key_id exact, signature regex (128 hex chars = 64 raw bytes).
-# When deterministic seeds land (FOLLOWUP.md §1), flip `signature` to
-# `bytes_from_hex` and add an expected value for byte-exact parity.
+# Each bridge creates an identity using the shared parity seed, then
+# generates a challenge and signs it. `did`, `signing_key_id`, and
+# `protocol` are byte-exact cross-bridge. Signature bytes remain
+# shape-only — Ed25519 signatures cover the canonical hash which
+# includes `signed_at = SystemTime::now() / js_sys::Date::now()`, so
+# two bridges signing a millisecond apart produce different signatures
+# even with identical keys and challenges. A future op may freeze the
+# clock via a testing-feature override to enable byte-exact signature
+# parity; see FOLLOWUP.md §1 for the clock-injection follow-up.
+#
+# Additionally, `#active` in scp-core is the SECOND key generated by
+# `DidDht::create` (see crate docs). The WASM bridge uses a single-key
+# model where `#active` resolves to the identity key. So even with a
+# shared seed, `#active`-signed signatures differ between WASM and
+# scp-core-backed bridges. The seed parity contract only covers the
+# identity key (VM `#0`) at this time.
 # ---------------------------------------------------------------------------
 
 
 def _py_sign_message(ctx: OpContext) -> dict[str, Any]:
-    identity = ctx.scp_core.py_identity_create("in_memory")
+    seed = bytes.fromhex(PARITY_SEED_HEX)
+    identity = ctx.scp_core.py_identity_create("in_memory", seed)
     challenge_json = ctx.scp_core.scpid_challenge(
         "https://parity-test.example.com",
         60,
@@ -353,16 +422,20 @@ OP_SIGN_MESSAGE = OpSpec(
             "audience": "https://parity-test.example.com",
             "ttl_seconds": 60,
             "payload": "parity-test-v1",
+            "seed_hex": PARITY_SEED_HEX,
         },
     },
     schema=OpSchema(
         fields=(
             FieldSpec("protocol", "exact"),
             FieldSpec("signing_key_id", "exact"),
-            FieldSpec("did", "regex", pattern=DID_DHT_PATTERN),
+            # DID is byte-exact under the shared seed.
+            FieldSpec("did", "exact"),
+            # Signatures remain shape-only — see module docstring above.
             FieldSpec("signature", "regex", pattern=r"[0-9a-f]{128}"),
         )
     ),
+    expected_values=(("did", EXPECTED_SEEDED_DID),),
 )
 
 

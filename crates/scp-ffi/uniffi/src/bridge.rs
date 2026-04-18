@@ -1349,6 +1349,16 @@ pub struct Identity {
     /// `None` for in-memory and external custody.
     #[allow(dead_code)]
     pub(crate) callback_custody: Option<Arc<CallbackKeyCustody>>,
+    /// Hex-encoded Ed25519 verifying-key bytes for the identity key
+    /// (VM `#0`, the key that derives the DID). 64 hex chars = 32 raw
+    /// bytes. `None` for externally loaded identities without live key
+    /// material.
+    ///
+    /// Uses `identity_key` (not `#active`) because the WASM bridge has a
+    /// simplified single-key model; exposing the identity key gives
+    /// byte-exact cross-bridge parity under a deterministic `seed`
+    /// (ADR-046).
+    pub(crate) verifying_key_hex: Option<String>,
 }
 
 #[uniffi::export]
@@ -1370,6 +1380,19 @@ impl Identity {
             CustodyMethod::Software => "software".to_owned(),
             CustodyMethod::External => "external".to_owned(),
         }
+    }
+
+    /// Returns the hex-encoded Ed25519 verifying-key bytes for the
+    /// identity key (VM `#0`, the DID-deriving key), or `null` if this
+    /// handle was loaded without live key material.
+    ///
+    /// Under a deterministic `seed`, this value is byte-identical across
+    /// every bridge (ADR-046 / FOLLOWUP.md §1). See the
+    /// `verifying_key_hex` field docs for why `#0` rather than
+    /// `#active`.
+    #[must_use]
+    pub fn verifying_key(&self) -> Option<String> {
+        self.verifying_key_hex.clone()
     }
 
     /// Rotates the active signing key for this identity (async).
@@ -1405,6 +1428,12 @@ impl Identity {
                 .await
                 .map_err(ScpError::from)?;
 
+            let verifying_key_hex = callback
+                .public_key(&new_identity.identity_key)
+                .await
+                .ok()
+                .map(|pk| hex::encode(pk.as_bytes()));
+
             let handle = Arc::new(Self {
                 did: new_identity.did.clone(),
                 custody_type: self.custody_type.clone(),
@@ -1413,6 +1442,7 @@ impl Identity {
                 #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody: None,
                 callback_custody: self.callback_custody.clone(),
+                verifying_key_hex,
             });
             increment_handle_count();
             return Ok(handle);
@@ -1426,6 +1456,13 @@ impl Identity {
                 .await
                 .map_err(ScpError::from)?;
 
+            let verifying_key_hex = custody
+                .0
+                .public_key(&new_identity.identity_key)
+                .await
+                .ok()
+                .map(|pk| hex::encode(pk.as_bytes()));
+
             let handle = Arc::new(Self {
                 did: new_identity.did.clone(),
                 custody_type: CustodyMethod::InMemory,
@@ -1433,6 +1470,7 @@ impl Identity {
                 core_document: Some(new_document),
                 in_memory_custody: self.in_memory_custody.clone(),
                 callback_custody: None,
+                verifying_key_hex,
             });
             increment_handle_count();
             return Ok(handle);
@@ -1558,6 +1596,13 @@ impl Identity {
                         .await
                         .map_err(ScpError::from)?;
 
+                    let verifying_key_hex = custody
+                        .0
+                        .public_key(&updated_identity.identity_key)
+                        .await
+                        .ok()
+                        .map(|pk| hex::encode(pk.as_bytes()));
+
                     let handle = Arc::new(Self {
                         did,
                         custody_type,
@@ -1565,6 +1610,7 @@ impl Identity {
                         core_document: Some(updated_doc),
                         in_memory_custody,
                         callback_custody: None,
+                        verifying_key_hex,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -1639,12 +1685,20 @@ impl Identity {
             let in_memory_custody = self.in_memory_custody.clone();
             let dht = make_dht_with_signer(custody)?;
 
+            let custody_for_key = custody.clone();
             runtime()
                 .spawn(async move {
                     let (updated_identity, updated_doc) = dht
                         .remove_agent_key(&identity_clone, &doc_clone)
                         .await
                         .map_err(ScpError::from)?;
+
+                    let verifying_key_hex = custody_for_key
+                        .0
+                        .public_key(&updated_identity.identity_key)
+                        .await
+                        .ok()
+                        .map(|pk| hex::encode(pk.as_bytes()));
 
                     let handle = Arc::new(Self {
                         did,
@@ -1653,6 +1707,7 @@ impl Identity {
                         core_document: Some(updated_doc),
                         in_memory_custody,
                         callback_custody: None,
+                        verifying_key_hex,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -1732,6 +1787,13 @@ impl Identity {
                         .await
                         .map_err(ScpError::from)?;
 
+                    let verifying_key_hex = custody
+                        .0
+                        .public_key(&updated_identity.identity_key)
+                        .await
+                        .ok()
+                        .map(|pk| hex::encode(pk.as_bytes()));
+
                     let handle = Arc::new(Self {
                         did,
                         custody_type,
@@ -1739,6 +1801,7 @@ impl Identity {
                         core_document: Some(updated_doc),
                         in_memory_custody,
                         callback_custody: None,
+                        verifying_key_hex,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -2279,8 +2342,24 @@ fn ensure_did_resolver_initialized(handle: tokio::runtime::Handle) -> Result<(),
 /// on mobile devices — use `"platform"` (Secure Enclave / Android Keystore)
 /// in production. See GitHub issue #88 and ADR-006.
 #[uniffi::export]
-pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError> {
+pub async fn identity_create(
+    custody: String,
+    seed: Option<Vec<u8>>,
+) -> Result<Arc<Identity>, ScpError> {
     let custody_method = parse_custody_method(&custody)?;
+
+    // Validate the optional 32-byte seed at the FFI boundary. A seed is
+    // only meaningful for the in_memory custody path (ADR-046 /
+    // FOLLOWUP.md §1).
+    let seed_bytes: Option<[u8; 32]> = match seed.as_deref() {
+        None => None,
+        Some(bytes) => Some(
+            <[u8; 32]>::try_from(bytes).map_err(|_| ScpError::Validation {
+                msg: format!("seed must be exactly 32 bytes, got {}", bytes.len()),
+                code: codes::VALID_7007.to_owned(),
+            })?,
+        ),
+    };
 
     runtime()
         .spawn(async move {
@@ -2291,6 +2370,7 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                     // mobile builds MUST NOT enable this feature. See #88.
                     #[cfg(not(feature = "allow_in_memory_custody"))]
                     {
+                        let _ = seed_bytes; // silence unused warning when feature-gated out
                         Err(ScpError::Identity {
                             msg: "\"in_memory\" custody is not available in this build \
                                       — enable the \"allow_in_memory_custody\" feature for \
@@ -2313,11 +2393,27 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                         // that are indices into `key_custody`'s internal store.
                         // Dropping `key_custody` destroys all private key material
                         // and renders those handles dangling.
-                        let key_custody =
-                            Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+                        //
+                        // When `seed` is supplied, the custody is backed by a
+                        // deterministic RNG (`StdRng::from_seed`), making
+                        // subsequent `generate_keypair` calls produce byte-
+                        // identical Ed25519 keys across bridges.
+                        let in_memory = seed_bytes.map_or_else(
+                            InMemoryKeyCustody::new,
+                            InMemoryKeyCustody::from_seed_bytes,
+                        );
+                        let key_custody = Arc::new(OpaqueInMemoryKeyCustody(in_memory));
                         let dht = DidDht::new();
                         let (identity, document) =
                             dht.create(&key_custody.0).await.map_err(ScpError::from)?;
+
+                        // Snapshot the #active verifying-key bytes for parity.
+                        let verifying_key_hex = key_custody
+                            .0
+                            .public_key(&identity.identity_key)
+                            .await
+                            .ok()
+                            .map(|pk| hex::encode(pk.as_bytes()));
 
                         // Initialize the production DID resolver for UCAN
                         // validation (H4 — matching PyO3/NAPI behavior).
@@ -2331,12 +2427,20 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                             core_document: Some(document),
                             in_memory_custody: Some(key_custody),
                             callback_custody: None,
+                            verifying_key_hex,
                         });
                         increment_handle_count();
                         Ok(handle)
                     }
                 }
                 CustodyMethod::Platform | CustodyMethod::Software => {
+                    if seed_bytes.is_some() {
+                        return Err(ScpError::Validation {
+                            msg: "`seed` parameter is only valid for custody=\"in_memory\""
+                                .to_owned(),
+                            code: codes::VALID_7007.to_owned(),
+                        });
+                    }
                     // Platform and software custody require a wired
                     // KeyCustodyProvider (ADR-006 platform abstraction).
                     // Use `identity_create_with_custody` to inject a
@@ -2408,6 +2512,12 @@ pub async fn identity_create_with_custody(
                 .await
                 .map_err(ScpError::from)?;
 
+            let verifying_key_hex = callback_custody
+                .public_key(&identity.identity_key)
+                .await
+                .ok()
+                .map(|pk| hex::encode(pk.as_bytes()));
+
             // Ensure BridgeInstance exists so init_did_resolver can store the
             // resolver. This matches the PyO3/NAPI identity_create pattern.
             crate::runtime::ensure_bridge_instance();
@@ -2422,6 +2532,7 @@ pub async fn identity_create_with_custody(
                 #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody: None,
                 callback_custody: Some(callback_custody),
+                verifying_key_hex,
             });
             increment_handle_count();
             Ok(handle)
@@ -2468,6 +2579,10 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
                 #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody: None,
                 callback_custody: None,
+                // External DIDs loaded by string have no live key material —
+                // parity-test consumers only need `verifying_key` for
+                // locally-created identities.
+                verifying_key_hex: None,
             });
             increment_handle_count();
             Ok(handle)
@@ -11393,6 +11508,13 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
                             .await
                             .map_err(ScpError::from)?;
 
+                        let verifying_key_hex = key_custody
+                            .0
+                            .public_key(&identity.identity_key)
+                            .await
+                            .ok()
+                            .map(|pk| hex::encode(pk.as_bytes()));
+
                         // Initialize the production DID resolver for UCAN validation.
                         crate::runtime::ensure_bridge_instance();
                         ensure_did_resolver_initialized(tokio::runtime::Handle::current())?;
@@ -11404,6 +11526,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
                             core_document: Some(document),
                             in_memory_custody: Some(key_custody),
                             callback_custody: None,
+                            verifying_key_hex,
                         });
                         increment_handle_count();
                         Ok(handle)
@@ -11520,6 +11643,11 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
 
                 let new_did = new_identity.did.clone();
                 let has_agent = new_document.has_agent_key();
+                let verifying_key_hex =
+                    kc.0.public_key(&new_identity.identity_key)
+                        .await
+                        .ok()
+                        .map(|pk| hex::encode(pk.as_bytes()));
                 let handle = Arc::new(Identity {
                     did: new_identity.did.clone(),
                     custody_type,
@@ -11528,6 +11656,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     #[cfg(feature = "allow_in_memory_custody")]
                     in_memory_custody: custody_arc,
                     callback_custody,
+                    verifying_key_hex,
                 });
                 increment_handle_count();
                 let _ = has_agent; // suppress unused warning
@@ -11582,6 +11711,11 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     .map_err(ScpError::from)?;
 
                 let new_did = new_identity.did.clone();
+                let verifying_key_hex = cc
+                    .public_key(&new_identity.identity_key)
+                    .await
+                    .ok()
+                    .map(|pk| hex::encode(pk.as_bytes()));
                 let handle = Arc::new(Identity {
                     did: new_identity.did.clone(),
                     custody_type,
@@ -11590,6 +11724,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     #[cfg(feature = "allow_in_memory_custody")]
                     in_memory_custody: None,
                     callback_custody: Some(Arc::clone(cc)),
+                    verifying_key_hex,
                 });
                 increment_handle_count();
 
@@ -13205,6 +13340,7 @@ mod tests {
             #[cfg(feature = "allow_in_memory_custody")]
             in_memory_custody: None,
             callback_custody: None,
+            verifying_key_hex: None,
         })
     }
 

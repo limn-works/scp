@@ -494,6 +494,14 @@ pub struct WasmIdentity {
     /// Stored as metadata for JS-side consumption. Actual key material is
     /// managed by the JS `SubtleCrypto` API via `JsKeyCustody`.
     agent_public_key_multibase: Option<String>,
+    /// Hex-encoded Ed25519 verifying-key bytes for the `#active` signing
+    /// key (64 hex chars = 32 raw bytes). `None` for identities constructed
+    /// via `fromDid` (no retained key material).
+    ///
+    /// Exposed for cross-bridge parity testing (ADR-046): with a
+    /// deterministic seed, every bridge's `identity_create` must produce
+    /// byte-identical verifying keys.
+    verifying_key_hex: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -512,6 +520,18 @@ impl WasmIdentity {
     #[wasm_bindgen(getter, js_name = "custodyType")]
     pub fn custody_type(&self) -> String {
         self.custody_type.clone()
+    }
+
+    /// Returns the hex-encoded Ed25519 verifying-key bytes for the `#active`
+    /// signing key, or `null` if this handle was constructed from a bare DID
+    /// string without live key material.
+    ///
+    /// Under a deterministic `seed`, this value is byte-identical across
+    /// every bridge (ADR-046 / FOLLOWUP.md §1).
+    #[must_use]
+    #[wasm_bindgen(getter, js_name = "verifyingKey")]
+    pub fn verifying_key(&self) -> Option<String> {
+        self.verifying_key_hex.clone()
     }
 
     /// Constructs a `WasmIdentity` from a DID string.
@@ -540,6 +560,11 @@ impl WasmIdentity {
             custody_type: "js_custody".to_owned(),
             has_agent_key: false,
             agent_public_key_multibase: None,
+            // `fromDid` builds a handle from a bare DID string without
+            // retained key material, so the verifying_key parity field is
+            // unpopulated. Callers that need byte-exact parity must go
+            // through `identity_create(custody, seed)`.
+            verifying_key_hex: None,
         })
     }
 
@@ -829,7 +854,7 @@ impl WasmDIDDocument {
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
-pub fn identity_create(custody: String) -> Promise {
+pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
     future_to_promise(async move {
         if custody != "js_custody" && custody != "in_memory" {
             return Err(ScpWasmError::Identity {
@@ -843,13 +868,64 @@ pub fn identity_create(custody: String) -> Promise {
             .into());
         }
 
-        // Generate Ed25519 keypair.
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        // Validate the optional 32-byte seed at the FFI boundary. A seed
+        // is only meaningful when the `testing` feature is enabled
+        // (cross-bridge parity harness, ADR-046).
+        let seed_bytes: Option<[u8; 32]> = match seed.as_deref() {
+            None => None,
+            #[cfg(feature = "testing")]
+            Some(bytes) => Some(<[u8; 32]>::try_from(bytes).map_err(|_| {
+                ScpWasmError::Validation {
+                    message: format!("seed must be exactly 32 bytes, got {}", bytes.len()),
+                    code: codes::VALID_7007.to_owned(),
+                }
+                .into_js()
+            })?),
+            #[cfg(not(feature = "testing"))]
+            Some(_) => {
+                return Err(ScpWasmError::Validation {
+                    message: "`seed` parameter requires the `testing` feature — not available \
+                              in production WASM builds"
+                        .to_owned(),
+                    code: codes::VALID_7007.to_owned(),
+                }
+                .into_js()
+                .into());
+            }
+        };
+
+        // Generate the identity-key Ed25519 keypair. Under the seeded
+        // path (only reachable when the `testing` feature is enabled) we
+        // derive the key from `rand::rngs::StdRng::from_seed(seed)` —
+        // the same KDF used by `InMemoryKeyCustody::from_seed_bytes` on
+        // the scp-core bridges, so the first generated key is byte-equal
+        // across all four bridges (ADR-046). The `rand` crate is pulled
+        // in only by the `testing` feature so production WASM bundles
+        // don't ship the extra code.
+        #[cfg(feature = "testing")]
+        let signing_key = if let Some(s) = seed_bytes {
+            use rand::{RngCore, SeedableRng};
+            let mut rng = rand::rngs::StdRng::from_seed(s);
+            let mut key_bytes = zeroize::Zeroizing::new([0u8; 32]);
+            rng.fill_bytes(key_bytes.as_mut());
+            ed25519_dalek::SigningKey::from_bytes(&key_bytes)
+        } else {
+            ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng)
+        };
+        #[cfg(not(feature = "testing"))]
+        let signing_key = {
+            // When `testing` is off, the seed-validation path above has
+            // already returned an error for non-None seeds, so
+            // `seed_bytes` is guaranteed to be None here.
+            let _ = seed_bytes;
+            ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng)
+        };
         let verifying_key = signing_key.verifying_key();
         let pub_bytes = verifying_key.to_bytes();
 
         // Derive did:dht DID from the public key using z-base-32 encoding.
         let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+        let verifying_key_hex = hex::encode(pub_bytes);
 
         // Store the signing key in the WASM-local identity registry so that
         // identity_resolve can return the public key from the DID document
@@ -880,6 +956,7 @@ pub fn identity_create(custody: String) -> Promise {
             custody_type: custody,
             has_agent_key: false,
             agent_public_key_multibase: None,
+            verifying_key_hex: Some(verifying_key_hex),
         }))
     })
 }
@@ -1099,6 +1176,7 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
             custody_type: custody,
             has_agent_key: true,
             agent_public_key_multibase: Some(agent_multibase),
+            verifying_key_hex: Some(hex::encode(pub_bytes)),
         }))
     })
 }
@@ -1148,6 +1226,9 @@ pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, J
         custody_type: identity.custody_type.clone(),
         has_agent_key: true,
         agent_public_key_multibase: Some(agent_multibase),
+        // The identity key does not change when an agent key is added, so
+        // the original `verifying_key` carries through.
+        verifying_key_hex: identity.verifying_key_hex.clone(),
     })
 }
 
@@ -1197,6 +1278,9 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
         custody_type: identity.custody_type.clone(),
         has_agent_key: true,
         agent_public_key_multibase: Some(agent_multibase),
+        // The identity key (and thus DID) does not change when only the
+        // agent key rotates.
+        verifying_key_hex: identity.verifying_key_hex.clone(),
     })
 }
 
@@ -1303,6 +1387,9 @@ pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsEr
         custody_type: custody,
         has_agent_key: has_agent,
         agent_public_key_multibase: agent_multibase,
+        // Key rotation produces a new identity key, hence a new
+        // verifying_key + new DID.
+        verifying_key_hex: Some(hex::encode(pub_bytes)),
     })
 }
 
@@ -1346,6 +1433,8 @@ pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
         custody_type: identity.custody_type.clone(),
         has_agent_key: false,
         agent_public_key_multibase: None,
+        // Removing an agent key does not change the identity key.
+        verifying_key_hex: identity.verifying_key_hex.clone(),
     })
 }
 
@@ -1436,6 +1525,9 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
             custody_type: custody,
             has_agent_key: had_agent_key,
             agent_public_key_multibase,
+            // Migration generates a fresh identity key, so the new DID and
+            // verifying_key match `pub_bytes` above.
+            verifying_key_hex: Some(hex::encode(pub_bytes)),
         }))
     })
 }
@@ -1683,32 +1775,39 @@ pub fn identity_load(did: String) -> Promise {
         }
 
         // Check the registry for existing identity state (agent key, custody type).
-        let (custody_type, has_agent_key, agent_pub_multibase) = IDENTITY_REGISTRY.with(|reg| {
-            let map = reg.borrow();
-            map.get(&did).map_or_else(
-                || ("js_custody".to_owned(), false, None),
-                |entry| {
-                    let has_agent = entry.agent_signing_key_bytes.is_some();
-                    let agent_pub = if has_agent {
-                        // Derive public key from agent signing key for the multibase field.
-                        entry.agent_signing_key_bytes.as_ref().map(|sk_bytes| {
-                            let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
-                            let pk = ed25519_dalek::VerifyingKey::from(&sk);
-                            format!("z{}", zbase32_encode(&pk.to_bytes()))
-                        })
-                    } else {
-                        None
-                    };
-                    (entry.custody_type.clone(), has_agent, agent_pub)
-                },
-            )
-        });
+        let (custody_type, has_agent_key, agent_pub_multibase, verifying_key_hex) =
+            IDENTITY_REGISTRY.with(|reg| {
+                let map = reg.borrow();
+                map.get(&did).map_or_else(
+                    || ("js_custody".to_owned(), false, None, None),
+                    |entry| {
+                        let has_agent = entry.agent_signing_key_bytes.is_some();
+                        let agent_pub = if has_agent {
+                            // Derive public key from agent signing key for the multibase field.
+                            entry.agent_signing_key_bytes.as_ref().map(|sk_bytes| {
+                                let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+                                let pk = ed25519_dalek::VerifyingKey::from(&sk);
+                                format!("z{}", zbase32_encode(&pk.to_bytes()))
+                            })
+                        } else {
+                            None
+                        };
+                        (
+                            entry.custody_type.clone(),
+                            has_agent,
+                            agent_pub,
+                            Some(hex::encode(entry.public_key_bytes)),
+                        )
+                    },
+                )
+            });
 
         Ok(JsValue::from(WasmIdentity {
             did,
             custody_type,
             has_agent_key,
             agent_public_key_multibase: agent_pub_multibase,
+            verifying_key_hex,
         }))
     })
 }

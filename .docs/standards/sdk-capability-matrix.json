@@ -1774,9 +1774,9 @@
       },
       "evidence": {
         "code_sites": [
-          "crates/scp-ffi/src/identity.rs:487 py_identity_create \u2192 ensure_did_resolver_initialized",
-          "crates/scp-ffi/napi/src/identity.rs:902 identity_create \u2192 ensure_did_resolver_initialized",
-          "crates/scp-ffi/uniffi/src/bridge.rs:2317 identity_create (in-memory arm) \u2192 ensure_did_resolver_initialized"
+          "crates/scp-ffi/src/identity.rs:577 py_identity_create \u2192 ensure_did_resolver_initialized",
+          "crates/scp-ffi/napi/src/identity.rs:979 identity_create \u2192 ensure_did_resolver_initialized",
+          "crates/scp-ffi/uniffi/src/bridge.rs:2419 identity_create (in-memory arm) \u2192 ensure_did_resolver_initialized"
         ]
       },
       "exemptions": {

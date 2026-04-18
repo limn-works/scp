@@ -124,7 +124,32 @@ impl InMemoryKeyCustody {
     pub fn from_seed(seed: u64) -> Self {
         let mut seed_bytes = [0u8; 32];
         seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
-        let rng = rand::rngs::StdRng::from_seed(seed_bytes);
+        Self::from_seed_bytes(seed_bytes)
+    }
+
+    /// Creates a new in-memory key custody with a deterministic RNG seeded by
+    /// the full 32-byte `seed`.
+    ///
+    /// This is the byte-level seed API used by cross-bridge parity testing
+    /// (ADR-046): bridges that accept a 32-byte seed from the harness feed it
+    /// directly into this constructor so that every bridge's
+    /// `generate_keypair` call sequence yields byte-identical Ed25519 signing
+    /// keys. Prefer this over [`InMemoryKeyCustody::from_seed`] (which only
+    /// supplies 64 bits of entropy) whenever the caller already has full
+    /// 32-byte seed material.
+    ///
+    /// # Determinism contract
+    ///
+    /// Given a fixed `seed`, `rand::rngs::StdRng::from_seed(seed)` produces a
+    /// deterministic byte stream. `KeyCustody::generate_keypair` consumes
+    /// exactly 32 bytes from the RNG per call (via `fill_bytes`) and feeds
+    /// them into `ed25519_dalek::SigningKey::from_bytes`, so the first
+    /// Ed25519 handle has private key `seed_stream[0..32]`, the second has
+    /// `seed_stream[32..64]`, and so on. This contract is the basis of the
+    /// cross-bridge byte-exact identity parity test.
+    #[must_use]
+    pub fn from_seed_bytes(seed: [u8; 32]) -> Self {
+        let rng = rand::rngs::StdRng::from_seed(seed);
         Self {
             store: Mutex::new(KeyStore::new()),
             rng: Mutex::new(Box::new(CryptoRngWrapper(rng))),
@@ -640,6 +665,35 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn from_seed_bytes_is_deterministic_across_instances() {
+        // Two custodies created with the same 32-byte seed must produce
+        // byte-identical Ed25519 key sequences. This is the invariant the
+        // cross-bridge parity harness relies on (ADR-046).
+        let seed = [0xA5u8; 32];
+        let c1 = InMemoryKeyCustody::from_seed_bytes(seed);
+        let c2 = InMemoryKeyCustody::from_seed_bytes(seed);
+
+        for _ in 0..3 {
+            let h1 = c1.generate_keypair(KeyType::Ed25519).await.unwrap();
+            let h2 = c2.generate_keypair(KeyType::Ed25519).await.unwrap();
+            let p1 = c1.public_key(&h1).await.unwrap();
+            let p2 = c2.public_key(&h2).await.unwrap();
+            assert_eq!(p1.as_bytes(), p2.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn from_seed_bytes_different_seeds_diverge() {
+        let c1 = InMemoryKeyCustody::from_seed_bytes([0u8; 32]);
+        let c2 = InMemoryKeyCustody::from_seed_bytes([1u8; 32]);
+        let h1 = c1.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let h2 = c2.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let p1 = c1.public_key(&h1).await.unwrap();
+        let p2 = c2.public_key(&h2).await.unwrap();
+        assert_ne!(p1.as_bytes(), p2.as_bytes());
     }
 
     #[tokio::test]

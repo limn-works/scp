@@ -4007,7 +4007,7 @@ mod tests {
     async fn context_create_threads_consequence_rules_and_config() {
         crate::runtime::init_context_manager_for_test();
 
-        let identity = crate::identity::identity_create("in_memory".to_owned())
+        let identity = crate::identity::identity_create("in_memory".to_owned(), None)
             .await
             .expect("identity_create should succeed");
 
@@ -4061,7 +4061,7 @@ mod tests {
     async fn context_create_rejects_revoke_access_when_config_disallows() {
         crate::runtime::init_context_manager_for_test();
 
-        let identity = crate::identity::identity_create("in_memory".to_owned())
+        let identity = crate::identity::identity_create("in_memory".to_owned(), None)
             .await
             .expect("identity_create should succeed");
 
@@ -4098,7 +4098,7 @@ mod tests {
     async fn context_join_rejects_malformed_spending_ucan_jwt() {
         crate::runtime::init_context_manager_for_test();
 
-        let identity = crate::identity::identity_create("in_memory".to_owned())
+        let identity = crate::identity::identity_create("in_memory".to_owned(), None)
             .await
             .expect("identity_create should succeed");
 
@@ -4137,7 +4137,7 @@ mod tests {
     async fn context_join_accepts_none_spending_ucan_jwt() {
         crate::runtime::init_context_manager_for_test();
 
-        let identity = crate::identity::identity_create("in_memory".to_owned())
+        let identity = crate::identity::identity_create("in_memory".to_owned(), None)
             .await
             .expect("identity_create should succeed");
 

@@ -1939,6 +1939,52 @@ mod tests {
         assert_eq!(doc1, doc2);
     }
 
+    /// Prints the DID and verifying-key hex produced under the fixed
+    /// parity seed ([0x7b; 32]). Used to regenerate the ground-truth
+    /// values committed in `bindings/python/tests/bridge_parity/
+    /// seed_operations.py` when the KDF algorithm is intentionally bumped.
+    /// Run with: `cargo test -p scp-identity
+    /// print_parity_seed_expected_values -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "diagnostic helper — run with --ignored --nocapture"]
+    async fn print_parity_seed_expected_values() {
+        let custody = InMemoryKeyCustody::from_seed_bytes([0x7bu8; 32]);
+        let dht = DidDht::new();
+        let (identity, _doc) = dht.create(&custody).await.unwrap();
+        let pk = custody.public_key(&identity.identity_key).await.unwrap();
+        println!("EXPECTED_SEEDED_DID = \"{}\"", identity.did);
+        println!(
+            "EXPECTED_SEEDED_VERIFYING_KEY_HEX = \"{}\"",
+            hex::encode(pk.as_bytes())
+        );
+    }
+
+    #[tokio::test]
+    async fn create_identity_deterministic_with_32byte_seed() {
+        // ADR-046 cross-bridge parity: a full 32-byte seed must produce the
+        // same DID AND the same active verifying key across two custodies.
+        // This is the invariant that bridges rely on when plumbing
+        // `identity_create(seed: [u8; 32])` through to a seeded
+        // `InMemoryKeyCustody`.
+        let seed = [0x7Bu8; 32];
+        let custody1 = InMemoryKeyCustody::from_seed_bytes(seed);
+        let custody2 = InMemoryKeyCustody::from_seed_bytes(seed);
+        let dht = DidDht::new();
+
+        let (id1, doc1) = dht.create(&custody1).await.unwrap();
+        let (id2, doc2) = dht.create(&custody2).await.unwrap();
+
+        assert_eq!(id1.did, id2.did);
+        assert_eq!(id1.pre_rotation_commitment, id2.pre_rotation_commitment);
+        assert_eq!(doc1, doc2);
+
+        // Active signing key (the #active VM that scpid_sign uses) is also
+        // byte-identical.
+        let active1 = custody1.public_key(&id1.active_signing_key).await.unwrap();
+        let active2 = custody2.public_key(&id2.active_signing_key).await.unwrap();
+        assert_eq!(active1.as_bytes(), active2.as_bytes());
+    }
+
     #[tokio::test]
     async fn document_json_roundtrip_from_create() {
         let custody = InMemoryKeyCustody::new();
