@@ -360,7 +360,7 @@ pub(crate) fn decrement_handle_count() {
 /// // Call before application exit:
 /// try await scpShutdown(timeoutMillis: 5_000)
 /// ```
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 pub async fn scp_shutdown(timeout_millis: u64) -> Result<(), bridge::ScpError> {
     // Shut down the default UniffiBridgeInstance first (clears registries,
     // runs hooks, disconnects transport). Best-effort: if the instance was

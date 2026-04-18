@@ -47,7 +47,7 @@ pub struct Scp {
     pub(crate) inner: Arc<UniffiBridgeInstance>,
 }
 
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 impl Scp {
     /// Constructs a fresh `SCP` instance with default in-memory state.
     ///
