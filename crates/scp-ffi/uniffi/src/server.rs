@@ -151,9 +151,11 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
                 "auto_wire_context_manager: failed to connect to node relay — \
                  context operations may fail until transport is configured manually"
             );
-            // Fall back to initializing with MLS crypto (not FfiBridgeCrypto
-            // no-op) so that at least the ContextManager exists with real
-            // crypto for the identity's DID, matching PyO3/NAPI behavior.
+            // Fall back to initializing with MLS crypto so that the
+            // ContextManager exists with real crypto bound to the identity's
+            // DID, matching PyO3/NAPI behavior. (The bridge no longer has a
+            // DID-less stub crypto path — see commit 4 of the phase 4
+            // persistence refactor.)
             crate::runtime::init_context_manager_with_did(did);
         }
     }

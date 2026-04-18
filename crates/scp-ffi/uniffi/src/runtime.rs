@@ -42,10 +42,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
-use scp_core::context::ContextError;
-use scp_core::context::builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
-};
+use scp_core::context::builder::{ContextCryptoProvider, ContextEventLogProvider};
 use scp_core::context::manager::ContextManager;
 use scp_core::context::providers::MerkleEventLogProvider;
 use scp_core::crypto::ucan::nonce::NonceTracker;
@@ -680,26 +677,6 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, crate::ScpError
         })
 }
 
-/// Builds a default `ContextManager` with bridge-local providers, and returns
-/// both the manager and the underlying `ProtocolRepository`.
-///
-/// Used only in tests that construct isolated bridge instances. The production
-/// path reuses the repository registered on the default instance so keys are
-/// consistent across restarts.
-fn build_default_context_manager() -> (
-    Arc<ContextManager>,
-    Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
-) {
-    let (event_log, protocol_repo) = build_event_log_provider();
-    let cm = build_context_manager(
-        Box::new(FfiBridgeCrypto),
-        Box::new(scp_core::context::NotConfiguredTransportProvider),
-        event_log,
-        None,
-    );
-    (cm, protocol_repo)
-}
-
 /// Adapter that lets a shared `Arc<dyn ContextPersistence + Send + Sync>` be
 /// consumed by [`ContextManager::with_persistence`] which requires a `Box`.
 ///
@@ -806,17 +783,6 @@ fn build_context_manager(
     }
 }
 
-/// Reads the shared persistence provider from the default bridge instance,
-/// if one has been attached (typically via
-/// [`UniffiBridgeInstance::with_storage_uniffi`] with a `SQLite` config).
-///
-/// Returns `None` when no persistence is configured — callers then fall
-/// back to the ephemeral `ContextManager::new` path.
-fn persistence_from_default_instance()
--> Option<Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>> {
-    DEFAULT_BRIDGE_INSTANCE.get()?.core.persistence_arc_clone()
-}
-
 /// Builds an event log provider that reuses the already-registered
 /// `ProtocolRepository` on the default [`UniffiBridgeInstance`].
 ///
@@ -831,81 +797,53 @@ fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProv
     )))
 }
 
-/// Builds a default `ContextManager` reusing the protocol repository already
-/// registered on the default instance.
-fn build_default_context_manager_reusing_repo() -> Arc<ContextManager> {
-    let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
-        tracing::error!(
-            "build_default_context_manager_reusing_repo: missing ProtocolRepository — \
-             falling back to a fresh event log provider (persistence will be lost)"
-        );
-        build_event_log_provider().0
-    });
-    let persistence = persistence_from_default_instance();
-    build_context_manager(
-        Box::new(FfiBridgeCrypto),
-        Box::new(scp_core::context::NotConfiguredTransportProvider),
-        event_log,
-        persistence,
-    )
+/// Returns a reference to the shared `ContextManager` on the default bridge
+/// instance.
+///
+/// Unlike [`context_manager`], this variant does not initialize the bridge
+/// instance lazily — callers must have already registered a local DID via
+/// [`init_context_manager_with_did`] (typically indirectly through
+/// `context_create`, `context_join`, `context_import`, `register_local_did`,
+/// or `identity_create`). This matches the `PyO3` / `NAPI` `context_manager()`
+/// semantics where no DID-less construction path exists.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` (code `SCP-CTX-2000`) when the bridge has not
+/// been initialized, when no local DID has been registered yet, or when the
+/// bridge is currently suspended.
+pub fn context_manager_expect() -> Result<&'static Arc<ContextManager>, crate::ScpError> {
+    let bi = DEFAULT_BRIDGE_INSTANCE
+        .get()
+        .ok_or_else(|| crate::ScpError::Context {
+            msg: "bridge not ready: no local DID registered".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })?;
+    if bi.core.is_suspended() {
+        return Err(crate::ScpError::Context {
+            msg: "bridge is suspended — call resume() before performing operations".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        });
+    }
+    if bi.core.is_shutdown() {
+        tracing::warn!("context_manager_expect() called after shutdown — operations may fail");
+    }
+    bi.core
+        .try_context_manager()
+        .ok_or_else(|| crate::ScpError::Context {
+            msg: "bridge not ready: no local DID registered".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })
 }
 
-/// Returns a reference to the shared `ContextManager`, initializing it with
-/// defaults if necessary.
+/// Initializes the global [`ContextManager`] with [`MlsCryptoProvider`] and
+/// [`scp_core::context::NotConfiguredTransportProvider`].
 ///
-/// For `#[uniffi::export]` functions that return non-Result types (bool, Vec,
-/// Option, ()), this provides access to the manager without requiring a
-/// `Result` return type. Callers should prefer [`context_manager`] when the
-/// return type supports `Result`.
-pub fn context_manager_expect() -> &'static Arc<ContextManager> {
-    if let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get()
-        && let Some(cm) = bi.core.try_context_manager()
-    {
-        return cm;
-    }
-    ensure_bridge_instance();
-    if let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() {
-        if !bi.core.has_context_manager() {
-            bi.core
-                .set_context_manager(build_default_context_manager_reusing_repo());
-        }
-        if let Some(cm) = bi.core.try_context_manager() {
-            return cm;
-        }
-        tracing::error!(
-            "context_manager_expect: default instance had no CM after set_context_manager — \
-             falling back to a leaked default CM"
-        );
-    }
-    // Defensive fallback — should not happen (ensure_bridge_instance just set it).
-    let (cm, _protocol_repo) = build_default_context_manager();
-    Box::leak(Box::new(cm))
-}
-
-/// Initializes the global [`ContextManager`] with bridge-local providers.
-///
-/// Called during `context_create` to ensure the manager is ready before any
-/// context operations. Creates the default instance (without a DID) and
-/// attaches a default `ContextManager` so shared registries are available.
-///
-/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-pub fn init_context_manager() {
-    ensure_bridge_instance();
-    if let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get()
-        && !bi.core.has_context_manager()
-    {
-        bi.core
-            .set_context_manager(build_default_context_manager_reusing_repo());
-    }
-}
-
-/// Initializes the global [`ContextManager`] with [`MlsCryptoProvider`]
-/// and `NotConfiguredTransportProvider`.
-///
-/// Unlike [`init_context_manager`] (which uses `FfiBridgeCrypto` no-op),
-/// this variant initializes real MLS crypto backed by the given DID. Used
-/// by `auto_wire_context_manager`'s fallback path when relay connection
-/// fails.
+/// Must be called before any context lifecycle operation — the bridge no
+/// longer supports a DID-less stub crypto path. Callers that have a local
+/// DID (for example `context_create`, `context_join`, `context_import`,
+/// `register_local_did`, or `identity_create`) invoke this to attach a real
+/// `MlsCryptoProvider::new(local_did)` to the default bridge instance.
 ///
 /// Subsequent calls are no-ops (`OnceLock`).
 pub fn init_context_manager_with_did(local_did: &str) {
@@ -1004,15 +942,6 @@ pub fn build_event_log_provider() -> (
     Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
 ) {
     scp_ffi_common::bridge_runtime::build_event_log_provider()
-}
-
-/// Global stub crypto provider shared with the `CloseOrchestrator`.
-static FFI_CRYPTO: FfiBridgeCrypto = FfiBridgeCrypto;
-
-/// Returns a reference to the bridge crypto provider for `CloseOrchestrator`.
-#[must_use]
-pub fn context_manager_crypto() -> &'static dyn ContextCryptoProvider {
-    &FFI_CRYPTO
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,83 +1047,6 @@ pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), crate:
             })?;
     tracing::debug!(context_id = %context_id, "UniFFI: role state synced after governance operation");
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Provider implementations for the FFI bridge
-// ---------------------------------------------------------------------------
-
-/// Stub crypto provider for the FFI bridge `ContextManager`.
-///
-/// All operations succeed (no-op). Real MLS and sender key operations are
-/// performed by the platform-injected `KeyCustodyProvider`.
-struct FfiBridgeCrypto;
-
-impl ContextCryptoProvider for FfiBridgeCrypto {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn create_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn generate_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn init_broadcast_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn destroy_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn destroy_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn validate_key_package(
-        &self,
-        _owner_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-
-    fn add_member(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
-        Ok(scp_core::context::AddMemberOutput::default())
-    }
-
-    fn remove_member(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<scp_core::context::RemoveMemberOutput, ContextError> {
-        Ok(scp_core::context::RemoveMemberOutput::default())
-    }
-
-    fn distribute_sender_key(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-
-    fn remove_member_sender_key(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------
