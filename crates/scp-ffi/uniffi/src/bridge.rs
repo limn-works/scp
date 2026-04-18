@@ -1453,6 +1453,12 @@ impl Identity {
     ///
     /// See SCP-214 acceptance criterion 9.
     pub async fn rotate_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        // #1646: every Category B (CoreFields-touching) UniFFI method must
+        // route through `default_bridge_instance()?` so `check_ready()`
+        // rejects operations against a suspended or shut-down bridge.
+        // `rotate_key` writes DID resolver state on `CoreFields` via the
+        // DHT signer path, so the gate is mandatory.
+        let _bi = crate::runtime::default_bridge_instance()?;
         let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
             msg: "key rotation requires retained crypto state — this identity \
                       was loaded without key material (use identity_create or \
@@ -1575,6 +1581,9 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn add_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        // #1646: Category B gate — writes DID resolver / DHT state through
+        // `CoreFields`, must not run on a suspended or shut-down bridge.
+        let _bi = crate::runtime::default_bridge_instance()?;
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -1663,6 +1672,9 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn remove_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        // #1646: Category B gate — writes DID resolver / DHT state through
+        // `CoreFields`, must not run on a suspended or shut-down bridge.
+        let _bi = crate::runtime::default_bridge_instance()?;
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -1753,6 +1765,9 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn rotate_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        // #1646: Category B gate — writes DID resolver / DHT state through
+        // `CoreFields`, must not run on a suspended or shut-down bridge.
+        let _bi = crate::runtime::default_bridge_instance()?;
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -2178,7 +2193,11 @@ impl TransportManager {
 
         validate_relay_url(&relay_url)?;
 
-        let bi = crate::runtime::bridge_instance()?;
+        // #1646: Category B gate — mutates `CoreFields::transport` state,
+        // must not run on a suspended or shut-down bridge.
+        // `default_bridge_instance()` errors on shutdown; `bridge_instance()`
+        // only warns, which is too permissive for a mutation.
+        let bi = crate::runtime::default_bridge_instance()?;
         let rt = runtime();
         let sourced = SourcedRelayUrl {
             url: relay_url.clone(),
@@ -2237,7 +2256,9 @@ impl TransportManager {
     /// Returns `ScpError::Transport` if no adapters are registered.
     pub fn assign_relay_set(&self, context_id: String) -> Result<Vec<u32>, ScpError> {
         validate_context_id(&context_id)?;
-        let bi = crate::runtime::bridge_instance()?;
+        // #1646: Category B gate — mutates `CoreFields::transport` state,
+        // must not run on a suspended or shut-down bridge.
+        let bi = crate::runtime::default_bridge_instance()?;
         let indices = bi
             .core
             .with_transport(|mgr| {
@@ -9128,7 +9149,9 @@ pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u6
     if check.is_err() {
         return None;
     }
-    let manager = crate::runtime::context_manager_expect().ok()?;
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return None;
+    };
     manager
         .broadcast_subscriber_count(&handle.context_id)
         .await
@@ -9166,7 +9189,9 @@ pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
     if check.is_err() {
         return None;
     }
-    let manager = crate::runtime::context_manager_expect().ok()?;
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return None;
+    };
     manager
         .broadcast_admission(&handle.context_id)
         .await
@@ -9189,7 +9214,9 @@ pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
     if check.is_err() {
         return None;
     }
-    let manager = crate::runtime::context_manager_expect().ok()?;
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return None;
+    };
     manager
         .member_count(&handle.context_id)
         .await
@@ -9240,7 +9267,9 @@ pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Opt
     if check.is_err() {
         return None;
     }
-    let manager = crate::runtime::context_manager_expect().ok()?;
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return None;
+    };
     manager
         .member_role(&handle.context_id, &did)
         .await

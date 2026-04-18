@@ -904,8 +904,10 @@ fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProv
 /// # Errors
 ///
 /// Returns `ScpError::Context` (code `SCP-CTX-2000`) when the bridge has not
-/// been initialized, when no local DID has been registered yet, or when the
-/// bridge is currently suspended.
+/// been initialized, when no local DID has been registered yet, when the
+/// bridge is currently suspended, or when the bridge has been permanently
+/// shut down. The shutdown branch is a hard error (not a warning) so
+/// stateful exports never run against a zombie bridge (ADR-048 §PR 2, #1646).
 pub fn context_manager_expect() -> Result<&'static Arc<ContextManager>, crate::ScpError> {
     let bi = DEFAULT_BRIDGE_INSTANCE
         .get()
@@ -915,12 +917,15 @@ pub fn context_manager_expect() -> Result<&'static Arc<ContextManager>, crate::S
         })?;
     if bi.core.is_suspended() {
         return Err(crate::ScpError::Context {
-            msg: "bridge is suspended — call resume() before performing operations".to_owned(),
+            msg: "bridge not ready: suspended".to_owned(),
             code: codes::CTX_2000.to_owned(),
         });
     }
     if bi.core.is_shutdown() {
-        tracing::warn!("context_manager_expect() called after shutdown — operations may fail");
+        return Err(crate::ScpError::Context {
+            msg: "bridge not ready: shut down".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        });
     }
     bi.core
         .try_context_manager()
