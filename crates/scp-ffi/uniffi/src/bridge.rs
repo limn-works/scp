@@ -5366,30 +5366,40 @@ pub(crate) struct McpClientEntry {
     pub(crate) client: std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>,
 }
 
+/// Fallback empty MCP server registry for when the default
+/// `UniffiBridgeInstance` has not been initialized yet. Mirrors the
+/// NAPI `EMPTY_SERVER_REGISTRY` fallback pattern.
+static EMPTY_MCP_SERVER_REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpServerEntry>> =
+    std::sync::OnceLock::new();
+
+/// Fallback empty MCP client registry.
+static EMPTY_MCP_CLIENT_REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpClientEntry>> =
+    std::sync::OnceLock::new();
+
+/// Returns a reference to the default bridge instance's MCP server registry.
+///
+/// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
+/// typed `mcp_server_registry` field on
+/// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 4.
+/// Falls back to an empty registry when the default instance has not been
+/// initialized yet.
 fn mcp_server_registry() -> &'static dashmap::DashMap<String, McpServerEntry> {
-    static REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpServerEntry>> =
-        std::sync::OnceLock::new();
-    REGISTRY.get_or_init(dashmap::DashMap::new)
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_MCP_SERVER_REGISTRY.get_or_init(dashmap::DashMap::new),
+        |bi| bi.mcp_server_registry().as_ref(),
+    )
 }
 
+/// Returns a reference to the default bridge instance's MCP client registry.
 fn mcp_client_registry() -> &'static dashmap::DashMap<String, McpClientEntry> {
-    static REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpClientEntry>> =
-        std::sync::OnceLock::new();
-    REGISTRY.get_or_init(dashmap::DashMap::new)
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_MCP_CLIENT_REGISTRY.get_or_init(dashmap::DashMap::new),
+        |bi| bi.mcp_client_registry().as_ref(),
+    )
 }
 
 fn mcp_handle_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
-}
-
-/// Clears both MCP server and client registries during shutdown.
-///
-/// Called by the shutdown hook registered in `crate::runtime::init_bridge_instance_empty`.
-/// This ensures server shutdown senders and client connections are dropped,
-/// allowing background tasks to terminate cleanly.
-pub(crate) fn clear_mcp_registries() {
-    mcp_server_registry().clear();
-    mcp_client_registry().clear();
 }
 
 // ---------------------------------------------------------------------------

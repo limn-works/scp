@@ -697,10 +697,12 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // is dropped.
         // Clear the typed per-context FFI state registry so per-context
         // `ToolRegistry`, `EventLog`, receive channel senders, and
-        // registered tool handlers drop. (MCP registries migrate off the
-        // module-level OnceLock in commit 4.)
+        // registered tool handlers drop.
         self.ffi_bridge_state.clear();
-        crate::mcp::clear_registries();
+        // Clear MCP registries so server shutdown senders and client
+        // connections drop, allowing background tasks to terminate cleanly.
+        self.mcp_server_registry.clear();
+        self.mcp_client_registry.clear();
     }
 }
 

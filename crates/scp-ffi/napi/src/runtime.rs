@@ -355,10 +355,12 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         self.ucan_registry.clear();
         #[cfg(feature = "allow_in_memory_custody")]
         self.identity_registry.clear();
-        // MCP registries continue to live in `crate::mcp` as their own
-        // `OnceLock`s during PR 1 (migrated onto this struct in PR 2).
-        // Their clear path runs via the core `shutdown_hooks` vector
-        // populated by `init_bridge_instance_empty`.
+        // Clear MCP registries so server shutdown senders and client
+        // connections drop, allowing background tasks to terminate cleanly.
+        // Migrated off `crate::mcp::clear_registries` (called by a
+        // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
+        self.mcp_server_registry.clear();
+        self.mcp_client_registry.clear();
     }
 }
 
@@ -503,23 +505,11 @@ static DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<NapiBridgeInstance>> = OnceLock::ne
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 fn init_default_bridge_instance() {
-    // Register the MCP shutdown hook INSIDE the `get_or_init` closure so it
-    // runs exactly once per process regardless of how many threads race
-    // through `init_default_bridge_instance` before the OnceLock is filled.
-    // A prior pattern registered the hook outside the closure, which caused
-    // duplicate-registration races under concurrent first-call scenarios.
-    let _ = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| {
-        let instance = Arc::new(NapiBridgeInstance::new_napi());
-        // Shutdown hook for state still living outside the
-        // `NapiBridgeInstance` during PR 1 (MCP registries — migrated onto
-        // the struct in PR 2). Identity + UCAN registries are now typed
-        // fields and are cleared by `bridge_specific_shutdown` without
-        // needing a hook.
-        instance.core.register_shutdown_hook(Box::new(|| {
-            crate::mcp::clear_registries();
-        }));
-        instance
-    });
+    // All typed registries (MCP, UCAN, identity) are now fields on
+    // `NapiBridgeInstance` and are cleared by
+    // `BridgeInstanceCore::bridge_specific_shutdown`; no shutdown hooks
+    // need to be registered here. Post commit 4 of #1549 Phase 4 PR 2.
+    let _ = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| Arc::new(NapiBridgeInstance::new_napi()));
 }
 
 /// Returns the raw default `NapiBridgeInstance`, if initialized.

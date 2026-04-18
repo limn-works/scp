@@ -441,10 +441,14 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         self.ucan_registry.clear();
         #[cfg(feature = "allow_in_memory_custody")]
         self.identity_custody_registry.clear();
-        // MCP, identity-link-attestation, and context-handle registries live
-        // in `crate::bridge` as their own `OnceLock`s during PR 1 (migrated
-        // onto this struct in PR 2). Their clear path runs via the core
-        // `shutdown_hooks` vector populated by `init_default_bridge_instance`.
+        // Clear MCP registries so server shutdown senders and client
+        // connections drop, allowing background tasks to terminate cleanly.
+        // Migrated off `crate::bridge::clear_mcp_registries` (called by a
+        // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
+        self.mcp_server_registry.clear();
+        self.mcp_client_registry.clear();
+        // Identity-link-attestation and context-handle registries migrate
+        // in commit 6.
     }
 }
 
@@ -464,27 +468,13 @@ pub(crate) static DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<UniffiBridgeInstance>> =
 
 /// Initializes the default [`UniffiBridgeInstance`] without a `ContextManager`.
 ///
-/// Registers the MCP shutdown hook (MCP registries still live in
-/// `crate::bridge` during PR 1). Subsequent calls are no-ops (`OnceLock`
-/// guarantees single initialization).
+/// All typed registries (MCP, UCAN, identity custody, etc.) are fields on
+/// `UniffiBridgeInstance` and are cleared by
+/// `BridgeInstanceCore::bridge_specific_shutdown`; no shutdown hooks need to
+/// be registered here. Subsequent calls are no-ops (`OnceLock` guarantees
+/// single initialization).
 fn init_default_bridge_instance() {
-    // Register the MCP shutdown hook INSIDE the `get_or_init` closure so it
-    // runs exactly once per process regardless of how many threads race
-    // through `init_default_bridge_instance` before the OnceLock is filled.
-    // A prior pattern registered the hook outside the closure, which caused
-    // duplicate-registration races under concurrent first-call scenarios.
-    let _ = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| {
-        let instance = Arc::new(UniffiBridgeInstance::new_uniffi());
-        // Shutdown hook for state still living outside
-        // `UniffiBridgeInstance` during PR 1 (MCP registries — migrated
-        // onto the struct in PR 2). Identity and UCAN registries are now
-        // typed fields and are cleared by `bridge_specific_shutdown`
-        // without needing a hook.
-        instance.core.register_shutdown_hook(Box::new(|| {
-            crate::bridge::clear_mcp_registries();
-        }));
-        instance
-    });
+    let _ = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| Arc::new(UniffiBridgeInstance::new_uniffi()));
 }
 
 /// Returns the raw default `UniffiBridgeInstance` without lifecycle checks.
