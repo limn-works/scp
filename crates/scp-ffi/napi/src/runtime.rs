@@ -285,6 +285,35 @@ impl NapiBridgeInstance {
     pub const fn instance_id(&self) -> u64 {
         self.core.instance_id()
     }
+
+    /// Returns a reference to the MCP server registry.
+    ///
+    /// `pub(crate)` because `McpServerEntry` is itself `pub(crate)`.
+    #[must_use]
+    pub(crate) const fn mcp_server_registry(
+        &self,
+    ) -> &Arc<DashMap<String, crate::mcp::McpServerEntry>> {
+        &self.mcp_server_registry
+    }
+
+    /// Returns a reference to the MCP client registry.
+    ///
+    /// `pub(crate)` — see `mcp_server_registry`.
+    #[must_use]
+    pub(crate) const fn mcp_client_registry(
+        &self,
+    ) -> &Arc<DashMap<String, crate::mcp::McpClientEntry>> {
+        &self.mcp_client_registry
+    }
+
+    /// Returns a reference to the shared full-stack test network slot.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[must_use]
+    pub const fn network(
+        &self,
+    ) -> &std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>> {
+        &self.network
+    }
 }
 
 #[async_trait]

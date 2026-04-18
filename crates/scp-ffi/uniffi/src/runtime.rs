@@ -365,6 +365,42 @@ impl UniffiBridgeInstance {
     ) -> &Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>> {
         &self.protocol_repository
     }
+
+    /// Returns a reference to the identity link attestation registry.
+    #[must_use]
+    pub const fn identity_link_attestation_registry(
+        &self,
+    ) -> &Arc<DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>> {
+        &self.identity_link_attestation_registry
+    }
+
+    /// Returns a reference to the context handle registry.
+    #[must_use]
+    pub const fn context_handle_registry(
+        &self,
+    ) -> &Arc<DashMap<String, Arc<crate::bridge::ContextHandle>>> {
+        &self.context_handle_registry
+    }
+
+    /// Returns a reference to the MCP server registry.
+    ///
+    /// `pub(crate)` because `McpServerEntry` is itself `pub(crate)`.
+    #[must_use]
+    pub(crate) const fn mcp_server_registry(
+        &self,
+    ) -> &Arc<DashMap<String, crate::bridge::McpServerEntry>> {
+        &self.mcp_server_registry
+    }
+
+    /// Returns a reference to the MCP client registry.
+    ///
+    /// `pub(crate)` — see `mcp_server_registry`.
+    #[must_use]
+    pub(crate) const fn mcp_client_registry(
+        &self,
+    ) -> &Arc<DashMap<String, crate::bridge::McpClientEntry>> {
+        &self.mcp_client_registry
+    }
 }
 
 #[async_trait]

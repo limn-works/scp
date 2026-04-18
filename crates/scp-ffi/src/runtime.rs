@@ -548,6 +548,65 @@ impl PyBridgeInstance {
         self.storage_provider.get()
     }
 
+    /// Returns a reference to the per-context FFI bridge state registry.
+    ///
+    /// Wired into the existing `with_ffi_state` / `register_ffi_state` /
+    /// `remove_ffi_state` free helpers in commit 3 via the default-instance
+    /// fallback pattern established for `identity_registry`.
+    #[must_use]
+    pub const fn ffi_bridge_state(&self) -> &Arc<DashMap<String, FfiBridgeState>> {
+        &self.ffi_bridge_state
+    }
+
+    /// Returns a reference to the MCP server registry.
+    ///
+    /// `pub(crate)` because `McpServerState` is itself `pub(crate)` — this
+    /// accessor is used from `crate::mcp` to migrate the registry off the
+    /// process-global `OnceLock` in commit 4.
+    #[must_use]
+    pub(crate) const fn mcp_server_registry(
+        &self,
+    ) -> &Arc<DashMap<String, crate::mcp::McpServerState>> {
+        &self.mcp_server_registry
+    }
+
+    /// Returns a reference to the MCP client registry.
+    ///
+    /// `pub(crate)` — see `mcp_server_registry`.
+    #[must_use]
+    pub(crate) const fn mcp_client_registry(
+        &self,
+    ) -> &Arc<DashMap<String, crate::mcp::McpClientState>> {
+        &self.mcp_client_registry
+    }
+
+    /// Returns a reference to the bridge credential store.
+    #[must_use]
+    pub const fn credential_store(
+        &self,
+    ) -> &Arc<scp_core::bridge::credentials::InMemoryCredentialStore> {
+        &self.credential_store
+    }
+
+    /// Returns a reference to the connected-relay URL slot.
+    ///
+    /// Distinct from `CoreFields::pending_relay_url`: this field tracks the
+    /// URL bound to the active `TransportManager`; the core's field tracks
+    /// the pending URL saved for resume.
+    #[must_use]
+    pub const fn connected_relay_url(&self) -> &RwLock<Option<String>> {
+        &self.connected_relay_url
+    }
+
+    /// Returns a reference to the shared full-stack test network slot.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[must_use]
+    pub const fn network(
+        &self,
+    ) -> &std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>> {
+        &self.network
+    }
+
     /// Initializes the in-memory storage provider on this instance.
     ///
     /// Returns an error if storage was already initialized on this instance
