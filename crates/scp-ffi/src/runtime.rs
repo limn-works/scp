@@ -695,13 +695,11 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // `storage_provider` is `OnceLock` — we cannot clear it. The
         // `Arc<EncryptingAdapter>` is released when the `PyBridgeInstance`
         // is dropped.
-        // Clear PyO3-specific singletons that are not owned by CoreFields
-        // (FFI_BRIDGE_STATE, MCP registries). These live at module scope
-        // because they hold PyO3 types that cannot cross the scp-ffi-common
-        // boundary.
-        if let Some(reg) = FFI_BRIDGE_STATE.get() {
-            reg.clear();
-        }
+        // Clear the typed per-context FFI state registry so per-context
+        // `ToolRegistry`, `EventLog`, receive channel senders, and
+        // registered tool handlers drop. (MCP registries migrate off the
+        // module-level OnceLock in commit 4.)
+        self.ffi_bridge_state.clear();
         crate::mcp::clear_registries();
     }
 }
@@ -1253,21 +1251,38 @@ impl ContextEventLogProvider for NoOpEventLogProvider {
 // FfiBridgeState -- per-context FFI-specific state
 // ---------------------------------------------------------------------------
 
-/// Global registry of per-context FFI-specific state.
+/// Fallback empty FFI bridge state registry for when the default
+/// `PyBridgeInstance` has not been initialized yet.
+///
+/// Mirrors the `EMPTY_IDENTITY_REGISTRY` pattern introduced for the
+/// identity-registry migration. Used by [`ffi_state_registry`] to keep the
+/// existing free-function signatures infallible even when callers touch
+/// bridge state before `ensure_bridge_instance` runs.
+static EMPTY_FFI_BRIDGE_STATE: OnceLock<DashMap<String, FfiBridgeState>> = OnceLock::new();
+
+/// Returns a reference to the default bridge instance's FFI bridge state
+/// registry.
+///
+/// Resolves the registry via the typed `ffi_bridge_state` field on the
+/// default [`PyBridgeInstance`]. Falls back to an empty registry when the
+/// default instance has not been initialized yet — matching the behaviour of
+/// the removed standalone `OnceLock<DashMap<...>>` (callers previously saw
+/// an empty registry on first touch; they still do).
 ///
 /// Stores state that is NOT managed by [`ContextManager`]: tool registries,
 /// event logs, UCAN revocation/nonce tracking, tool handlers, and message
-/// channels. Context lifecycle state (membership, roles, governance, broadcast,
-/// TTL) lives in the `ContextManager`.
+/// channels. Context lifecycle state (membership, roles, governance,
+/// broadcast, TTL) lives in the `ContextManager`.
 ///
 /// # Safety: Single-Tenant Only
 ///
-/// This registry is process-global. See module-level documentation.
-static FFI_BRIDGE_STATE: OnceLock<DashMap<String, FfiBridgeState>> = OnceLock::new();
-
-/// Returns a reference to the global FFI bridge state registry.
+/// The default instance's registry is process-global. See module-level
+/// documentation.
 fn ffi_state_registry() -> &'static DashMap<String, FfiBridgeState> {
-    FFI_BRIDGE_STATE.get_or_init(DashMap::new)
+    DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
+        || EMPTY_FFI_BRIDGE_STATE.get_or_init(DashMap::new),
+        |bi| bi.ffi_bridge_state.as_ref(),
+    )
 }
 
 /// Per-context FFI-specific state that does NOT duplicate [`ContextManager`].
