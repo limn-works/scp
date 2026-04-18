@@ -171,13 +171,21 @@ scan_bridge() {
                 for (i = 1; i <= n; i++) {
                     if (arr[i] != "") allow_map[arr[i]] = 1
                 }
+                # `in_test_depth > 0` ⇒ current line is inside a cfg(test)
+                # or `mod tests { }` block.
                 in_test_depth = 0
                 pending_cfg_test = 0
+                # Brace depth OUTSIDE any test mod. A module-level item is
+                # one where brace_depth == 0 AND in_test_depth == 0.
                 brace_depth = 0
+                # True on the same line that opens a test mod — suppresses
+                # double-counting of the `{` that appears on that line.
+                entered_test_this_line = 0
             }
 
             {
                 line = $0
+                entered_test_this_line = 0
 
                 # Count braces before doing anything else so brace_depth
                 # reflects the depth AT this line (we always treat the
@@ -202,10 +210,12 @@ scan_bridge() {
                 if (match(line, /mod[[:space:]]+tests[[:space:]]*\{/)) {
                     in_test_depth++
                     pending_cfg_test = 0
+                    entered_test_this_line = 1
                 }
                 else if (pending_cfg_test && match(line, /mod[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\{/)) {
                     in_test_depth++
                     pending_cfg_test = 0
+                    entered_test_this_line = 1
                 }
                 else if (pending_cfg_test && match(line, /^[[:space:]]*$/) == 0 && match(line, /#\[/) == 0) {
                     pending_cfg_test = 0
@@ -257,9 +267,22 @@ scan_bridge() {
                 }
 
                 # Apply brace delta now so the NEXT line sees correct depth.
+                #
+                # `brace_depth` tracks absolute file brace nesting — it sees
+                # every `{` and `}` including the one that opens a test mod.
+                # `in_test_depth` is a counter of "braces below the entry
+                # into a test scope" plus 1 for the entry itself. On the
+                # line that enters a test mod, we already incremented
+                # `in_test_depth` by 1 to represent the entry — consuming
+                # the mods opening `{`. If we also applied the full
+                # `(open_n - close_n)` delta to `in_test_depth` on that
+                # line, the opening `{` would be double-counted and the
+                # counter would never return to zero when the mod closes.
+                # Skip that brace on the entry line only.
+                test_brace_delta = (entered_test_this_line ? (open_n - 1 - close_n) : (open_n - close_n))
                 brace_depth += (open_n - close_n)
                 if (brace_depth < 0) brace_depth = 0
-                in_test_depth += (in_test_depth > 0 ? (open_n - close_n) : 0)
+                in_test_depth += (in_test_depth > 0 ? test_brace_delta : 0)
                 if (in_test_depth < 0) in_test_depth = 0
             }
             ' "$file"
