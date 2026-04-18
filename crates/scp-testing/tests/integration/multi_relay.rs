@@ -11,8 +11,8 @@
 //! 1. `add_relay_url` stores each URL.
 //! 2. `pending_relay_urls` returns a deduplicated snapshot.
 //! 3. `reconnect_transport_if_pending` connects successfully against both
-//!    live relays (one wins the installed `TransportManager` per the
-//!    documented last-write-wins behaviour).
+//!    live relays and installs BOTH adapters into a single
+//!    `TransportManager`, matching the pre-suspend multi-relay state.
 //! 4. Adding the same URL twice is idempotent at the set level.
 //!
 //! Full multi-relay routing (send on context A → relay 1; send on
@@ -129,14 +129,17 @@ async fn remove_relay_url_removes_one_entry() {
 // ---------------------------------------------------------------------------
 
 /// Single `CoreFields` + two real relays: `reconnect_transport_if_pending`
-/// must walk both URLs and connect to each without erroring.
+/// must connect to BOTH URLs and install both adapters in a single
+/// `TransportManager`.
 ///
-/// This is the core behaviour `#1678` introduces: when a user's bridge
-/// is connected to relay 1 and relay 2, `suspend()` preserves both URLs
-/// and `resume()` replays them. The implementation uses
-/// `NativeRelayAdapter::connect_sourced` for each URL and installs the
-/// last successful one as the active `TransportManager` (single-
-/// transport model — multi-transport routing is tracked separately).
+/// This is the core behaviour #1678 introduces: when a user's bridge is
+/// connected to relay 1 and relay 2, `suspend()` preserves both URLs and
+/// `resume()` replays them. The implementation uses
+/// `NativeRelayAdapter::connect_sourced` for each URL and installs every
+/// successful adapter into a single `TransportManager` built via
+/// `TransportManager::builder()` — so after reconnect, the manager
+/// carries both relay connections in parallel, matching the pre-suspend
+/// multi-relay state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconnect_transport_if_pending_against_two_relays() {
     let (r1_handle, r1_addr) = start_relay().await;
@@ -161,12 +164,21 @@ async fn reconnect_transport_if_pending_against_two_relays() {
         .await
         .expect("reconnect against two live relays must succeed");
 
-    // Transport is installed (last-write-wins). Exact winner is
-    // nondeterministic because HashSet iteration order is randomized;
-    // we only assert that A transport is installed.
+    // A single TransportManager must be installed carrying BOTH adapters.
+    // Before the #1678 follow-up fix the loop installed a fresh manager
+    // per URL (last-write-wins), silently dropping N-1 adapters. Now every
+    // successful reconnect ends up in the same manager.
     assert!(
         core.has_transport(),
         "reconnect_transport_if_pending must install a TransportManager on success"
+    );
+    let adapter_count = core
+        .with_transport(scp_transport::TransportManager::adapter_count)
+        .expect("installed TransportManager must be readable");
+    assert_eq!(
+        adapter_count, 2,
+        "reconnect_transport_if_pending must install every successful adapter, \
+         not just the last one"
     );
 
     // URLs remain in the pending set so a later resume can retry if
