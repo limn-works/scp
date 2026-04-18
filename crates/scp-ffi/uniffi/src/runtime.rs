@@ -197,18 +197,80 @@ impl UniffiBridgeInstance {
     /// - [`StorageConfig::InMemory`] — equivalent to
     ///   [`UniffiBridgeInstance::new_uniffi`]; no persistence provider is
     ///   attached to the embedded `CoreFields`.
-    /// - [`StorageConfig::Sqlite`] — wired in a later commit inside this PR.
-    ///   For now the variant is accepted and ignored (no persistence). This
-    ///   keeps the public API change atomic without partially-wired state.
+    /// - [`StorageConfig::Sqlite`] — opens a `SQLCipher`-encrypted
+    ///   database at `{path}/scp.db` and attaches a
+    ///   `ProtocolRepositoryContextBridge<Arc<SqliteStorage>>` to
+    ///   `CoreFields::persistence`. The subsequent
+    ///   `init_context_manager*` call picks the shared `Arc` up via
+    ///   [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`]
+    ///   so the `ContextManager` and the `CoreFields` mirror share a
+    ///   single `SqliteStorage` instance. If opening fails, the error is
+    ///   logged via `tracing::error!` and the instance is returned
+    ///   without persistence (matching the `PyO3` / NAPI bridges).
     #[must_use]
     pub fn with_storage_uniffi(config: StorageConfig) -> Self {
         match config {
             StorageConfig::InMemory => Self::new_uniffi(),
-            StorageConfig::Sqlite { path: _, key: _ } => {
-                // Wired in commit 3. The variant is accepted so the shape
-                // of the public API is stable from commit 1 on.
-                Self::new_uniffi()
+            StorageConfig::Sqlite { path, key } => {
+                let path_buf = std::path::PathBuf::from(&path);
+                match scp_platform::sqlite::SqliteStorage::new(&path_buf, &key) {
+                    Ok(storage) => {
+                        let arc_storage = Arc::new(storage);
+                        let repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                        let persistence: Arc<
+                            dyn scp_core::context::manager::ContextPersistence + Send + Sync,
+                        > = Arc::new(
+                            scp_core::store::context::ProtocolRepositoryContextBridge::new(repo),
+                        );
+                        // `arc_storage` is already held by the bridge via
+                        // the repo clone above; dropping it here just
+                        // decrements the local reference count.
+                        drop(arc_storage);
+                        // `key` is a `Vec<u8>` crossing the UniFFI
+                        // boundary — we cannot zero the caller's copy,
+                        // but we zero ours after SQLCipher has consumed
+                        // it internally.
+                        let mut key_owned = key;
+                        zeroize::Zeroize::zeroize(&mut key_owned);
+                        drop(key_owned);
+                        Self::with_persistence_uniffi_arc(persistence)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            path = %path,
+                            "with_storage_uniffi: SqliteStorage::new failed — instance created without persistence"
+                        );
+                        let mut key_owned = key;
+                        zeroize::Zeroize::zeroize(&mut key_owned);
+                        drop(key_owned);
+                        Self::new_uniffi()
+                    }
+                }
             }
+        }
+    }
+
+    /// Internal helper: constructs a new `UniffiBridgeInstance`
+    /// pre-populated with a shared [`ContextPersistence`] provider.
+    ///
+    /// Accepts an `Arc<dyn ContextPersistence + Send + Sync>` so the same
+    /// persistence provider is later picked up by
+    /// `init_context_manager*` via
+    /// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`],
+    /// avoiding duplicate `SqliteStorage` connections to the same database.
+    #[must_use]
+    fn with_persistence_uniffi_arc(
+        persistence: Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>,
+    ) -> Self {
+        let (_event_log, protocol_repository) =
+            scp_ffi_common::bridge_runtime::build_event_log_provider();
+        Self {
+            core: CoreFields::with_persistence_arc(persistence),
+            ucan_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "allow_in_memory_custody")]
+            identity_custody_registry: Arc::new(DashMap::new()),
+            protocol_repository,
         }
     }
 

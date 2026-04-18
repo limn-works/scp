@@ -377,45 +377,81 @@ impl PyBridgeInstance {
     /// [`StorageConfig`].
     ///
     /// - [`StorageConfig::InMemory`] — creates an
-    ///   `EncryptingAdapter<InMemoryStorage>` with a random AES-256-GCM key.
-    /// - [`StorageConfig::Sqlite`] — opens a SQLCipher-encrypted database at
-    ///   `{path}/scp.db`. If opening fails, the bridge instance is returned
-    ///   without storage and the caller sees an empty `storage_provider()`
-    ///   accessor, matching the existing "storage not initialized" error
-    ///   path. Errors are logged via `tracing::error!` so they are not
+    ///   `EncryptingAdapter<InMemoryStorage>` with a random AES-256-GCM
+    ///   key. `CoreFields::persistence` is left unset; the existing
+    ///   `build_persistence_provider` path constructs a
+    ///   `ProtocolRepositoryContextBridge` from `storage_provider()` on
+    ///   demand when `init_context_manager*` runs.
+    /// - [`StorageConfig::Sqlite`] — opens a `SQLCipher`-encrypted database at
+    ///   `{path}/scp.db` and attaches a
+    ///   [`ProtocolRepositoryContextBridge<Arc<SqliteStorage>>`] to
+    ///   `CoreFields::persistence`, so suspend / shutdown flush runs
+    ///   against the persistent store. The same `Arc<SqliteStorage>` is
+    ///   also registered as `storage_provider` so identity, event log,
+    ///   trust, and MCP reads hit the same connection pool (one DB
+    ///   connection per process — `SQLite` cannot share one across two
+    ///   `SqliteStorage::new` calls). If opening fails, the bridge is
+    ///   returned with neither `storage_provider` nor `persistence` set
+    ///   and the caller sees the existing "storage not initialized" error
+    ///   paths. Errors are logged via `tracing::error!` so they are not
     ///   silently swallowed.
     ///
     /// For fallible construction that surfaces the `SQLite` error, use
     /// [`PyBridgeInstance::new_py`] + [`PyBridgeInstance::init_sqlite_storage`].
     #[must_use]
     pub fn with_storage_py(cfg: StorageConfig) -> Self {
-        let instance = Self::new_py();
         match cfg {
             StorageConfig::InMemory => {
+                let instance = Self::new_py();
                 // OnceLock: first set wins. `new_py()` leaves this unset, so
                 // this set always succeeds.
                 let _ = instance
                     .storage_provider
                     .set(StorageProvider::new_in_memory_encrypted());
+                instance
             }
             StorageConfig::Sqlite { path, key } => {
-                match StorageProvider::new_sqlite(&path, &key) {
-                    Ok(provider) => {
-                        let _ = instance.storage_provider.set(provider);
+                // Open the database once — `SqliteStorage` owns a single
+                // `rusqlite::Connection` that every downstream consumer
+                // (storage_provider + persistence) must share. An earlier
+                // draft called `SqliteStorage::new` twice (once for the
+                // provider, once for the persistence bridge) and hit
+                // `SQLITE_BUSY` the moment both tried to write.
+                match SqliteStorage::new(&path, &key) {
+                    Ok(storage) => {
+                        let arc_storage = Arc::new(storage);
+                        // Build persistence bridge first so we can share
+                        // the same Arc across CoreFields + storage_provider.
+                        let repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                        let persistence: Arc<dyn ContextPersistence + Send + Sync> =
+                            Arc::new(ProtocolRepositoryContextBridge::new(repo));
+                        let instance = Self {
+                            core: CoreFields::with_persistence_arc(persistence),
+                            identity_registry: Arc::new(DashMap::new()),
+                            storage_provider: OnceLock::new(),
+                        };
+                        let _ = instance
+                            .storage_provider
+                            .set(StorageProvider::Sqlite(arc_storage));
+                        // `key` is `Zeroizing<Vec<u8>>`, zeroed on drop here.
+                        // SQLCipher has already retained its derived key
+                        // internally, so the caller's key material is safe
+                        // to wipe at this point.
+                        drop(key);
+                        instance
                     }
                     Err(e) => {
                         tracing::error!(
                             error = %e,
                             path = %path.display(),
-                            "with_storage_py: SqliteStorage::new failed — instance created without storage"
+                            "with_storage_py: SqliteStorage::new failed — instance created without storage or persistence"
                         );
+                        drop(key);
+                        Self::new_py()
                     }
                 }
-                // `key` is `Zeroizing<Vec<u8>>`, zeroed on drop here.
-                drop(key);
             }
         }
-        instance
     }
 
     /// Returns a reference to the identity registry.
@@ -795,19 +831,95 @@ pub fn init_context_manager_for_test() {
 /// AES-256-GCM encryption, satisfying the sealed `EncryptedStorage`
 /// bound required by `ProtocolRepository::new()`.
 fn build_persistence_provider() -> Option<Box<dyn ContextPersistence>> {
-    DEFAULT_BRIDGE_INSTANCE
-        .get()?
-        .storage_provider()
-        .map(|provider| match provider {
-            StorageProvider::InMemoryEncrypted(storage) => {
-                let repo = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
-                Box::new(ProtocolRepositoryContextBridge::new(repo)) as Box<dyn ContextPersistence>
-            }
-            StorageProvider::Sqlite(storage) => {
-                let repo = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
-                Box::new(ProtocolRepositoryContextBridge::new(repo)) as Box<dyn ContextPersistence>
-            }
-        })
+    let bi = DEFAULT_BRIDGE_INSTANCE.get()?;
+    // Prefer the shared provider attached to `CoreFields` at construction
+    // time — this is the path the `Sqlite` variant of `with_storage_py`
+    // uses, and it guarantees the ContextManager and the CoreFields
+    // mirror hand out the same underlying provider (one SQLite
+    // connection, not two).
+    if let Some(shared) = bi.core.persistence_arc_clone() {
+        return Some(Box::new(ArcContextPersistence::new(shared)) as Box<dyn ContextPersistence>);
+    }
+    bi.storage_provider().map(|provider| match provider {
+        StorageProvider::InMemoryEncrypted(storage) => {
+            let repo = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+            Box::new(ProtocolRepositoryContextBridge::new(repo)) as Box<dyn ContextPersistence>
+        }
+        StorageProvider::Sqlite(storage) => {
+            let repo = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+            Box::new(ProtocolRepositoryContextBridge::new(repo)) as Box<dyn ContextPersistence>
+        }
+    })
+}
+
+/// Adapter that lets a shared `Arc<dyn ContextPersistence + Send + Sync>`
+/// be consumed by APIs requiring a `Box<dyn ContextPersistence>`.
+///
+/// Mirrors the `UniFFI` bridge's `ArcContextPersistence`
+/// (`crates/scp-ffi/uniffi/src/runtime.rs`). See that file for rationale
+/// — the short version is that `ContextManager::with_persistence` takes
+/// `Box`, but we want the same underlying provider to back both the
+/// `CoreFields` mirror and the manager's reference so `SQLite` sees a
+/// single connection instead of two.
+struct ArcContextPersistence {
+    inner: Arc<dyn ContextPersistence + Send + Sync>,
+}
+
+impl ArcContextPersistence {
+    const fn new(inner: Arc<dyn ContextPersistence + Send + Sync>) -> Self {
+        Self { inner }
+    }
+}
+
+impl ContextPersistence for ArcContextPersistence {
+    fn persist_context(
+        &self,
+        context_id: &str,
+        snapshot: &scp_core::context::manager::ContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.persist_context(context_id, snapshot)
+    }
+
+    fn load_context(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Option<scp_core::context::manager::ContextSnapshot>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.inner.load_context(context_id)
+    }
+
+    fn persist_broadcast(
+        &self,
+        context_id: &str,
+        snapshot: &scp_core::context::broadcast::BroadcastContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.persist_broadcast(context_id, snapshot)
+    }
+
+    fn load_broadcast(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Option<scp_core::context::broadcast::BroadcastContextSnapshot>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.inner.load_broadcast(context_id)
+    }
+
+    fn delete_context(
+        &self,
+        context_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.delete_context(context_id)
+    }
+
+    fn list_persisted_contexts(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_persisted_contexts()
+    }
 }
 
 /// Constructs a `ContextManager` with or without persistence.
