@@ -86,7 +86,7 @@ macOS runners in CI.
 
 ## 3. DISCOVERED BUG — blocks full parity coverage for `context_create`
 
-**Issue**: `<issue to be filed at PR open>`
+**Issue**: filed alongside this PR (see inline description below). Bug is self-documented here; grep `xfail_reason` in `seed_operations.py` for the test-suite surface.
 
 Spec §18.4.1 mandates 64-char hex context IDs so they embed in
 `scp://context/<context_id_hex>` URIs. PyO3 (`generate_context_id` in
@@ -116,7 +116,7 @@ gate asserts on NAPI/WASM for `context_create`.
 
 ## 4. DISCOVERED BUG — blocks full parity coverage on valid-challenge SCPID path
 
-**Issue**: `<issue to be filed at PR open>`
+**Issue**: filed alongside this PR (see inline description below). Bug is self-documented here; grep `xfail_reason` in `seed_operations.py` for the test-suite surface.
 
 The `invalid_capability_rejected` op in the MVP uses a malformed
 challenge (protocol=`scpid/1`, expected `scpid/1.0`). All three bridges
@@ -151,7 +151,7 @@ parity gate asserts on NAPI/WASM for SCPID sign error codes.
 
 ## 5. DISCOVERED BUG — blocks full parity coverage for `event_log_append`
 
-**Issue**: `<issue to be filed at PR open>`
+**Issue**: filed alongside this PR (see inline description below). Bug is self-documented here; grep `xfail_reason` in `seed_operations.py` for the test-suite surface.
 
 When a context is freshly created and the event log is immediately
 queried, bridges return different event counts and starting sequence
