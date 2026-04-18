@@ -62,7 +62,7 @@ final class PersistenceTests: XCTestCase {
             "SCP.withStorage(sqliteDir:key:) must create scp.db at \(dbPath.path)"
         )
         XCTAssertGreaterThan(scp.instanceId, 0)
-        try await scp.shutdown(timeoutSecs: 1)
+        try await scp.shutdown(timeout: 1)
     }
 
     /// suspend → async resume → async shutdown roundtrip on a SQLite-
@@ -74,7 +74,7 @@ final class PersistenceTests: XCTestCase {
         let scp = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         try scp.suspend()
         try await scp.resume()
-        try await scp.shutdown(timeoutSecs: 1)
+        try await scp.shutdown(timeout: 1)
     }
 
     /// A second `SCP.withStorage(sqliteDir:key:)` against the same path
@@ -86,7 +86,7 @@ final class PersistenceTests: XCTestCase {
 
         let scp1 = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         let id1 = scp1.instanceId
-        try await scp1.shutdown(timeoutSecs: 1)
+        try await scp1.shutdown(timeout: 1)
 
         // Fresh SCP object, same underlying encrypted database.
         let scp2 = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
@@ -95,7 +95,7 @@ final class PersistenceTests: XCTestCase {
             id2, id1,
             "monotonic instance_id counter must advance across two SCP constructions"
         )
-        try await scp2.shutdown(timeoutSecs: 1)
+        try await scp2.shutdown(timeout: 1)
     }
 
     /// Construction with a wrong key must not corrupt the original
@@ -107,17 +107,17 @@ final class PersistenceTests: XCTestCase {
 
         // First open with the correct key — creates the encrypted DB.
         let scp1 = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
-        try await scp1.shutdown(timeoutSecs: 1)
+        try await scp1.shutdown(timeout: 1)
 
         // Second open with a wrong key. The bridge logs and falls back
         // to an in-memory-only instance; construction succeeds but the
         // original DB file must remain readable with the correct key.
         let wrongKey = Data(repeating: 0x11, count: 32)
         let scp2 = SCP.withStorage(sqliteDir: dir, key: wrongKey)
-        try await scp2.shutdown(timeoutSecs: 1)
+        try await scp2.shutdown(timeout: 1)
 
         // Third open with the correct key — must still succeed.
         let scp3 = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
-        try await scp3.shutdown(timeoutSecs: 1)
+        try await scp3.shutdown(timeout: 1)
     }
 }
