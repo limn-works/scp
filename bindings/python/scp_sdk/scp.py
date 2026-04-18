@@ -20,9 +20,20 @@ Example usage::
         # scp.instance_id is a monotonic u64 unique per process.
         ...
 
-    # Explicit storage config.
+    # Explicit in-memory storage config.
     scp = SCP(storage={"type": "in_memory"})
     scp.shutdown(timeout=5.0)
+
+    # SQLCipher-encrypted on-disk storage (Phase 4 PR 3, #1549).
+    scp = SCP(storage={
+        "type": "sqlite",
+        "path": "/var/lib/my-app",
+        "key": b"\\x00" * 32,
+    })
+
+    # `resume` is async — it awaits transport reconnect (#1678).
+    scp.suspend()
+    await scp.resume()
 
     # Shared process-wide default (deprecated — prefer explicit construction).
     default = SCP.default()
@@ -30,6 +41,7 @@ Example usage::
 
 from __future__ import annotations
 
+import asyncio
 import math
 import warnings
 from types import TracebackType
@@ -104,20 +116,31 @@ class SCP:
     ) -> None:
         """Construct a fresh :class:`SCP` instance.
 
-        :param storage: Optional storage configuration dict. In Phase 4 PR 1
-            only ``{"type": "in_memory"}`` is supported; PR 3 adds
-            ``{"type": "sqlite", "path": "..."}``. When ``None``, defaults
-            to in-memory storage.
+        :param storage: Optional storage configuration dict. Accepted shapes:
+
+            * ``{"type": "in_memory"}`` — ephemeral encrypted in-memory
+              storage (the default when ``storage`` is ``None``).
+            * ``{"type": "sqlite", "path": str, "key": bytes}`` —
+              SQLCipher-encrypted on-disk storage at ``{path}/scp.db``.
+              ``key`` is the raw encryption key material (32 bytes
+              recommended) and is zeroized on the Rust side once the
+              database is opened. Landed in Phase 4 PR 3 (#1549).
+
+            When ``None``, defaults to in-memory storage.
         :raises ValidationError: If ``storage`` contains an unknown
-            ``type``.
+            ``type`` or is missing required fields for the selected
+            variant.
 
         .. note::
 
-           A ``persistence`` parameter is reserved but not yet exposed at
-           the SDK surface. PR 3 wires the real
-           :class:`ContextPersistence` plumbing through the FFI boundary
-           and re-introduces it with a real signature — see #1260 and
-           #1491 to subscribe to progress.
+           A standalone ``persistence`` parameter (injecting a custom
+           :class:`ContextPersistence` impl across the FFI boundary)
+           remains unexposed at the SDK surface. The SQLite storage
+           variant above automatically constructs a real
+           :class:`ContextPersistence` internally — opt in via the
+           ``storage`` dict. A Python-accessible custom persistence
+           trait is deferred; no tracking issue is open because SQLite
+           covers the documented use cases.
         """
         cls = _native_cls()
         if storage is not None:
@@ -188,17 +211,29 @@ class SCP:
         """
         self._native.suspend()
 
-    def resume(self) -> None:
+    async def resume(self) -> None:
         """Resume a suspended bridge instance.
 
-        Clears the suspended flag. The caller must re-establish the relay
-        connection explicitly — :meth:`resume` does not reconnect
-        automatically.
+        Clears the suspended flag and — as of Phase 4 PR 3 (#1678) —
+        automatically reconnects the transport to every relay URL the
+        instance was subscribed to at suspend time. Callers no longer
+        need to re-invoke :func:`scp_sdk.connect_relay` manually; the
+        FFI layer replays the pending-URL list internally.
+
+        This is an ``async`` coroutine because the underlying PyO3
+        ``resume`` performs async work (transport reconnect, persisted
+        context restoration) behind a blocking ``block_on`` at the FFI
+        boundary. We wrap the blocking call in :func:`asyncio.to_thread`
+        so the Python event loop remains responsive while the reconnect
+        round-trips complete. Matches the async ``resume`` surface on
+        the NAPI and UniFFI bridges (see #1549 PR 3 — commit
+        ``refactor(ffi): make resume() async across bridge core + scp
+        handles``).
 
         :raises ContextError: If the instance has been permanently shut
-            down.
+            down (code ``SCP-CTX-2000``).
         """
-        self._native.resume()
+        await asyncio.to_thread(self._native.resume)
 
     def shutdown(self, timeout: float = 5.0) -> None:
         """Shut down this instance with a graceful deadline.

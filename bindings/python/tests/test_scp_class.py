@@ -1,4 +1,4 @@
-"""Tests for the SCP #[pyclass] exposed by the PyO3 bridge (#1549 Phase 4 PR 1).
+"""Tests for the SCP #[pyclass] exposed by the PyO3 bridge (#1549 Phase 4 PR 1 + PR 3).
 
 The SCP class wraps `PyBridgeInstance` and is the Python-facing entry
 point for the multi-instance refactor.  Each test verifies:
@@ -7,8 +7,14 @@ point for the multi-instance refactor.  Each test verifies:
 2. `SCP.default_instance()` returns the process-global default,
    stable across calls.
 3. `SCP.instance_id` is monotonic across new instances.
-4. `SCP.suspend()` / `.resume()` / `.shutdown(timeout)` drive the
-   lifecycle without errors.
+4. Native `SCP.suspend()` / `.resume()` / `.shutdown(timeout)` drive
+   the lifecycle without errors. (Native `.resume()` is sync-callable;
+   internally it uses `py.allow_threads(|| rt.block_on(...))`.)
+5. PR 3: the SDK wrapper's `.resume()` is `async def` and delegates
+   to the native call via `asyncio.to_thread` — see #1549 PR 3
+   (#1678).
+6. PR 3: `SCP(storage={"type": "sqlite", "path": str, "key": bytes})`
+   forwards the dict to the native `with_storage` staticmethod.
 
 Requires the native _scp_core extension built via maturin.
 """
@@ -193,3 +199,50 @@ def test_shutdown_finite_value_rounds_to_nearest_ms() -> None:
     wrapper, mock_native = _make_wrapper_with_mock()
     wrapper.shutdown(timeout=0.2505)
     mock_native.shutdown.assert_called_once_with(250)
+
+
+@pytest.mark.asyncio
+async def test_wrapper_resume_is_async_and_delegates_to_native() -> None:
+    """`WrapperSCP.resume()` must be awaitable and delegate to `_native.resume`.
+
+    Phase 4 PR 3 (#1549, #1678) flipped the wrapper from a blocking
+    ``def resume(self)`` to ``async def resume(self)`` so transport
+    reconnect work can happen off the asyncio event loop. The wrapper
+    uses ``asyncio.to_thread`` internally — we verify the call path by
+    checking the mock was invoked exactly once (argumentless), which
+    is what ``to_thread(self._native.resume)`` produces.
+    """
+    wrapper, mock_native = _make_wrapper_with_mock()
+    coro = wrapper.resume()
+    # Must be a coroutine, not a direct call result — asserts the
+    # signature change stuck.
+    import inspect
+
+    assert inspect.iscoroutine(coro), (
+        "WrapperSCP.resume() must return a coroutine after PR 3's async flip"
+    )
+    await coro
+    mock_native.resume.assert_called_once_with()
+
+
+def test_wrapper_with_storage_sqlite_passes_config_through() -> None:
+    """`SCP(storage={'type': 'sqlite', ...})` must forward the dict to `with_storage`.
+
+    We inspect the native class lookup path: constructing a wrapper
+    normally would load the real _scp_core module. Instead we patch
+    the private ``_native_cls`` helper so the wrapper receives a mock
+    class, and assert ``with_storage`` is called with our exact dict.
+    """
+    from unittest.mock import patch
+
+    mock_cls = MagicMock()
+    mock_cls.with_storage.return_value = MagicMock(instance_id=42)
+    sqlite_cfg = {
+        "type": "sqlite",
+        "path": "/tmp/scp-test",
+        "key": b"\x00" * 32,
+    }
+    with patch("scp_sdk.scp._native_cls", return_value=mock_cls):
+        wrapper = WrapperSCP(storage=sqlite_cfg)
+    mock_cls.with_storage.assert_called_once_with(sqlite_cfg)
+    assert wrapper.instance_id == 42
