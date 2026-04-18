@@ -968,22 +968,25 @@ pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
         let (signing_key, active_signing_key_bytes_opt): (
             ed25519_dalek::SigningKey,
             Option<zeroize::Zeroizing<[u8; 32]>>,
-        ) = if let Some(s) = seed_bytes {
-            use rand::{RngCore, SeedableRng};
-            let mut rng = rand::rngs::StdRng::from_seed(s);
-            let mut identity_key_bytes = zeroize::Zeroizing::new([0u8; 32]);
-            rng.fill_bytes(identity_key_bytes.as_mut());
-            let identity_key = ed25519_dalek::SigningKey::from_bytes(&identity_key_bytes);
-            // Consume the next 32 bytes for the distinct #active key.
-            let mut active_bytes = zeroize::Zeroizing::new([0u8; 32]);
-            rng.fill_bytes(active_bytes.as_mut());
-            (identity_key, Some(active_bytes))
-        } else {
-            (
-                ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng),
-                None,
-            )
-        };
+        ) = seed_bytes.map_or_else(
+            || {
+                (
+                    ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng),
+                    None,
+                )
+            },
+            |s| {
+                use rand::{RngCore, SeedableRng};
+                let mut rng = rand::rngs::StdRng::from_seed(s);
+                let mut identity_key_bytes = zeroize::Zeroizing::new([0u8; 32]);
+                rng.fill_bytes(identity_key_bytes.as_mut());
+                let identity_key = ed25519_dalek::SigningKey::from_bytes(&identity_key_bytes);
+                // Consume the next 32 bytes for the distinct #active key.
+                let mut active_bytes = zeroize::Zeroizing::new([0u8; 32]);
+                rng.fill_bytes(active_bytes.as_mut());
+                (identity_key, Some(active_bytes))
+            },
+        );
         #[cfg(not(feature = "testing"))]
         let signing_key = {
             // When `testing` is off, the seed-validation path above has
