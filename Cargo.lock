@@ -5489,6 +5489,7 @@ dependencies = [
  "rmp-serde",
  "scp-core",
  "scp-event-log",
+ "scp-ffi-common",
  "scp-identity",
  "scp-node",
  "scp-platform",
