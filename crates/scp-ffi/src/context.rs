@@ -1085,8 +1085,7 @@ fn py_context_join(
     identity_did: &str,
     spending_ucan_jwt: Option<&str>,
 ) -> PyResult<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(identity_did)?;
     let state = handle
         .state
@@ -1235,8 +1234,7 @@ fn py_context_join(
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did))]
 fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(identity_did)?;
     let state = handle
         .state
@@ -1311,8 +1309,7 @@ fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did))]
 fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(identity_did)?;
     let mut state = handle
         .state
@@ -1396,8 +1393,7 @@ fn py_context_send(
     payload: &Bound<'_, PyAny>,
     spending_ucan_jwt: Option<&str>,
 ) -> PyResult<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(identity_did)?;
     let state = handle
         .state
@@ -1652,8 +1648,7 @@ fn drain_and_deliver(context_id: &str) {
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_context_receive(handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let state = handle
         .state
         .lock()
@@ -1741,8 +1736,7 @@ fn build_core_context_params(
 #[pyfunction]
 #[pyo3(signature = (handle, policy_json))]
 fn py_set_economic_policy(handle: &mut PyContextHandle, policy_json: &str) -> PyResult<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let _ = policy_json;
     Err(pyo3::exceptions::PyPermissionError::new_err(
         "economic policy changes must go through governance \
@@ -1761,8 +1755,7 @@ fn py_set_economic_policy(handle: &mut PyContextHandle, policy_json: &str) -> Py
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_get_economic_policy(handle: &PyContextHandle) -> PyResult<Option<String>> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     Ok(handle.params.economic_policy.clone())
 }
 
@@ -1945,8 +1938,7 @@ impl scp_core::crypto::ucan::validate::ProofResolver for NoOpProofResolver {
 #[pyfunction]
 #[pyo3(signature = (handle, proposal_json))]
 fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyResult<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2080,8 +2072,7 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_tombstone_migrated_context(handle: &PyContextHandle) -> PyResult<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2122,8 +2113,7 @@ fn py_tombstone_migrated_context(handle: &PyContextHandle) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_migration_state(handle: &PyContextHandle) -> PyResult<Option<String>> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2205,8 +2195,7 @@ fn py_governance_propose(
     identity_did: &str,
     action_json: &str,
 ) -> PyResult<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2294,8 +2283,7 @@ fn py_governance_approve(
     identity_did: &str,
     proposal_id_hex: &str,
 ) -> PyResult<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2351,8 +2339,7 @@ fn py_governance_reject(
     identity_did: &str,
     proposal_id_hex: &str,
 ) -> PyResult<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2408,8 +2395,7 @@ fn py_governance_withdraw(
     identity_did: &str,
     proposal_id_hex: &str,
 ) -> PyResult<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2465,8 +2451,7 @@ fn py_governance_get_proposal(
     handle: &PyContextHandle,
     proposal_id_hex: String,
 ) -> PyResult<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let context_id = handle.context_id.clone();
     let proposal_id = parse_proposal_id(&proposal_id_hex)?;
 
@@ -2496,8 +2481,7 @@ fn py_governance_get_proposal(
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_governance_list_proposals(handle: &PyContextHandle) -> PyResult<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let context_id = handle.context_id.clone();
 
     let mgr = crate::runtime::context_manager()
@@ -2543,8 +2527,7 @@ fn py_apply_pending_ceiling_modification(
     handle: &PyContextHandle,
     current_timestamp: u64,
 ) -> PyResult<bool> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2579,8 +2562,7 @@ fn py_apply_pending_ceiling_modification(
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_finalize_close(handle: &PyContextHandle) -> PyResult<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2648,8 +2630,7 @@ fn py_create_governance_checkpoint(
     creator_did: &str,
     creator_signature_hex: &str,
 ) -> PyResult<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2715,8 +2696,7 @@ fn py_add_checkpoint_cosignature(
     signer_did: &str,
     signature_hex: &str,
 ) -> PyResult<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2866,8 +2846,7 @@ fn parse_hex_32(hex_str: &str, field_name: &str) -> PyResult<[u8; 32]> {
 #[pyfunction]
 #[pyo3(signature = (handle, subscriber_did))]
 fn py_broadcast_subscribe(handle: &PyContextHandle, subscriber_did: &str) -> PyResult<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(subscriber_did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -2906,8 +2885,7 @@ fn py_broadcast_unsubscribe(
     subscriber_did: &str,
     rotate_keys: bool,
 ) -> PyResult<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(subscriber_did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -2941,8 +2919,7 @@ fn py_broadcast_publish(
     author_did: &str,
     payload: Vec<u8>,
 ) -> PyResult<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(author_did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -2997,8 +2974,7 @@ fn py_broadcast_publish_asset(
     body: Vec<u8>,
     deploy_id: Option<&str>,
 ) -> PyResult<HashMap<String, String>> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(author_did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -3137,8 +3113,7 @@ fn py_broadcast_publish_assets(
     assets: Vec<(String, String, Vec<u8>)>,
     deploy_id: Option<&str>,
 ) -> PyResult<PyObject> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     const MAX_BATCH_ASSETS: usize = 10_000;
     if assets.len() > MAX_BATCH_ASSETS {
         return Err(PyRuntimeError::new_err(format!(
@@ -3255,8 +3230,7 @@ fn py_broadcast_block_subscriber(
     subscriber_did: &str,
     blocker_did: &str,
 ) -> PyResult<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(subscriber_did)?;
     validate::validate_did(blocker_did)?;
     let rt = crate::runtime()?;
@@ -3290,8 +3264,7 @@ fn py_broadcast_unblock_subscriber(
     subscriber_did: &str,
     unblocker_did: &str,
 ) -> PyResult<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(subscriber_did)?;
     validate::validate_did(unblocker_did)?;
     let rt = crate::runtime()?;
@@ -3326,8 +3299,7 @@ fn py_broadcast_handle_key_request(
     author_did: &str,
     requester_did: &str,
 ) -> PyResult<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(author_did)?;
     validate::validate_did(requester_did)?;
     let rt = crate::runtime()?;
@@ -3355,8 +3327,7 @@ fn py_broadcast_handle_key_request(
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_broadcast_subscriber_count(handle: &PyContextHandle) -> PyResult<Option<u64>> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -3370,8 +3341,7 @@ fn py_broadcast_subscriber_count(handle: &PyContextHandle) -> PyResult<Option<u6
 #[pyfunction]
 #[pyo3(signature = (handle, did))]
 fn py_broadcast_is_subscriber(handle: &PyContextHandle, did: &str) -> PyResult<bool> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -3387,8 +3357,7 @@ fn py_broadcast_is_subscriber(handle: &PyContextHandle, did: &str) -> PyResult<b
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_broadcast_admission(handle: &PyContextHandle) -> PyResult<Option<String>> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -3408,8 +3377,7 @@ fn py_broadcast_admission(handle: &PyContextHandle) -> PyResult<Option<String>> 
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_context_member_count(handle: &PyContextHandle) -> PyResult<Option<u64>> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -3421,8 +3389,7 @@ fn py_context_member_count(handle: &PyContextHandle) -> PyResult<Option<u64>> {
 #[pyfunction]
 #[pyo3(signature = (handle, did))]
 fn py_context_is_member(handle: &PyContextHandle, did: &str) -> PyResult<bool> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -3435,8 +3402,7 @@ fn py_context_is_member(handle: &PyContextHandle, did: &str) -> PyResult<bool> {
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_context_member_dids(handle: &PyContextHandle) -> PyResult<Vec<String>> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -3450,8 +3416,7 @@ fn py_context_member_dids(handle: &PyContextHandle) -> PyResult<Vec<String>> {
 #[pyfunction]
 #[pyo3(signature = (handle, did))]
 fn py_context_member_role(handle: &PyContextHandle, did: &str) -> PyResult<Option<String>> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -3473,8 +3438,7 @@ fn py_context_member_role(handle: &PyContextHandle, did: &str) -> PyResult<Optio
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_context_drain_events(handle: &PyContextHandle) -> PyResult<Vec<String>> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -3501,8 +3465,7 @@ fn py_context_drain_events(handle: &PyContextHandle) -> PyResult<Vec<String>> {
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_context_handle_ttl_expiry(handle: &PyContextHandle) -> PyResult<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -3546,8 +3509,7 @@ fn py_context_propose_ttl_extension(
     member_did: &str,
     proposed_seconds: u64,
 ) -> PyResult<bool> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate::validate_did(member_did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -3570,8 +3532,7 @@ fn py_context_propose_ttl_extension(
 #[pyfunction]
 #[pyo3(signature = (handle, new_seconds))]
 fn py_context_reset_ttl_timer(handle: &PyContextHandle, new_seconds: u64) -> PyResult<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi.core, handle);
+    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;

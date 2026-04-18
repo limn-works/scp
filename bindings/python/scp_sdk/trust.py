@@ -396,6 +396,7 @@ class TrustEvaluation:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 async def evaluate_trust(
     subject_did: str,
     context_id: str,

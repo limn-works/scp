@@ -105,16 +105,17 @@ use crate::error::ScpPyError;
 /// default instance) prevents a PR-2 regression where per-instance `SCP`
 /// methods would silently check against the default bridge instead of
 /// `self.inner.core`. For the free-function façade the caller passes
-/// `bi.core`, where `bi` comes from
-/// [`default_bridge_instance`](crate::runtime::default_bridge_instance).
+/// [`bridge_instance_for_affinity`](crate::runtime::bridge_instance_for_affinity)
+/// — this mirrors the NAPI/UniFFI bridges so the three bridges share an
+/// identical invocation shape and the affinity check is never blocked by
+/// transient lifecycle state (e.g., a suspended bridge).
 ///
 /// # Example
 ///
 /// ```ignore
 /// #[pyfunction]
 /// pub fn example(handle: &SomeHandle) -> PyResult<()> {
-///     let bi = crate::runtime::default_bridge_instance()?;
-///     pyscp_check_handle!(bi.core, handle);
+///     pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
 ///     // ... real work ...
 ///     Ok(())
 /// }
@@ -443,6 +444,37 @@ pub fn default_bridge_instance() -> Result<Arc<PyBridgeInstance>, ScpPyError> {
         tracing::warn!("default_bridge_instance() called after shutdown — operations may fail");
     }
     Ok(Arc::clone(bi))
+}
+
+/// Returns a reference to the default `PyBridgeInstance`'s `CoreFields` for
+/// handle-affinity checks only.
+///
+/// Unlike [`bridge_instance`] / [`default_bridge_instance`], this helper does
+/// NOT return an error when the bridge is suspended — a handle-affinity check
+/// is a pure compare-two-u64 operation that does not touch transport or
+/// `ContextManager` state, so suspending the bridge must not block it. Used
+/// exclusively by the [`crate::pyscp_check_handle!`] macro at FFI entry
+/// points to mirror the NAPI/UniFFI [`bridge_instance_for_affinity`] helpers
+/// (cross-bridge symmetry).
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the default bridge failed to
+/// initialize (very unlikely — [`ensure_bridge_instance`] runs first and is
+/// infallible in practice).
+#[must_use = "the returned CoreFields reference must be used for the affinity check"]
+pub fn bridge_instance_for_affinity() -> Result<&'static CoreFields, ScpPyError> {
+    ensure_bridge_instance();
+    DEFAULT_BRIDGE_INSTANCE
+        .get()
+        .map(|bi| &bi.core)
+        .ok_or_else(|| {
+            ScpPyError::context(
+                "bridge not initialized — call identity_create or \
+                 init_context_manager first"
+                    .to_owned(),
+            )
+        })
 }
 
 // ---------------------------------------------------------------------------

@@ -23,8 +23,6 @@ import threading
 from collections.abc import Coroutine
 from typing import Any, TypeVar
 
-from scp_sdk._deprecation import deprecated_default_instance
-
 _T = TypeVar("_T")
 
 _sync_loop: asyncio.AbstractEventLoop | None = None
@@ -96,7 +94,10 @@ def _bridge() -> Any:
         ) from exc
 
 
-@deprecated_default_instance
+# stateless helper — no SCP-instance state; `bridge.sync_classify_offline` is
+# pure arithmetic over `classify_offline_duration` (crates/scp-ffi/src/sync.rs).
+# No registries, no context lookups, no identity-scoped state. Per ADR-048
+# sunset rule, pure helpers skip the deprecation decorator.
 def classify_offline(last_relay_contact: int, now: int) -> str:
     """Classify an offline duration into the appropriate recovery tier.
 
@@ -117,7 +118,10 @@ def classify_offline(last_relay_contact: int, now: int) -> str:
     return bridge.sync_classify_offline(last_relay_contact, now)
 
 
-@deprecated_default_instance
+# stateless helper — no SCP-instance state; `bridge.sync_get_policy` returns
+# `SyncPolicy::default()` constants (crates/scp-ffi/src/sync.rs), not any
+# per-instance configuration. Per ADR-048 sunset rule, pure helpers skip the
+# deprecation decorator.
 def get_policy() -> dict[str, Any]:
     """Return the default sync policy parameters.
 

@@ -129,6 +129,7 @@ def discover(query: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 def petname_set(owner_did: str, target_did: str, name: str) -> None:
     """Assign a petname to a DID within the owner's local namespace.
 
@@ -144,6 +145,7 @@ def petname_set(owner_did: str, target_did: str, name: str) -> None:
     bridge.petname_set(owner_did, target_did, name)
 
 
+@deprecated_default_instance
 def petname_remove(owner_did: str, target_did: str) -> None:
     """Remove a petname from a DID.
 
@@ -158,6 +160,7 @@ def petname_remove(owner_did: str, target_did: str) -> None:
     bridge.petname_remove(owner_did, target_did)
 
 
+@deprecated_default_instance
 def petname_set_context(owner_did: str, context_id: str, name: str) -> None:
     """Assign a petname to a context within the owner's local namespace.
 
@@ -173,6 +176,7 @@ def petname_set_context(owner_did: str, context_id: str, name: str) -> None:
     bridge.petname_set_context(owner_did, context_id, name)
 
 
+@deprecated_default_instance
 def petname_remove_context(owner_did: str, context_id: str) -> None:
     """Remove a petname from a context.
 
@@ -187,6 +191,7 @@ def petname_remove_context(owner_did: str, context_id: str) -> None:
     bridge.petname_remove_context(owner_did, context_id)
 
 
+@deprecated_default_instance
 def petname_resolve_did(owner_did: str, name: str) -> list[str]:
     """Resolve a petname to a list of DIDs.
 
@@ -204,6 +209,7 @@ def petname_resolve_did(owner_did: str, name: str) -> list[str]:
     return list(bridge.petname_resolve_did(owner_did, name))
 
 
+@deprecated_default_instance
 def petname_resolve_context(owner_did: str, name: str) -> list[str]:
     """Resolve a petname to a list of context IDs.
 
@@ -221,6 +227,7 @@ def petname_resolve_context(owner_did: str, name: str) -> list[str]:
     return list(bridge.petname_resolve_context(owner_did, name))
 
 
+@deprecated_default_instance
 def petname_get_for_did(owner_did: str, target_did: str) -> str | None:
     """Get the petname assigned to a DID, if any.
 
@@ -238,6 +245,7 @@ def petname_get_for_did(owner_did: str, target_did: str) -> str | None:
     return bridge.petname_get_for_did(owner_did, target_did)
 
 
+@deprecated_default_instance
 def petname_get_for_context(owner_did: str, context_id: str) -> str | None:
     """Get the petname assigned to a context, if any.
 
@@ -260,6 +268,7 @@ def petname_get_for_context(owner_did: str, context_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 def handle_register(
     discovery_context_id: str,
     handle: str,
@@ -295,6 +304,7 @@ def handle_register(
     return json.loads(result)
 
 
+@deprecated_default_instance
 def handle_lookup(
     discovery_context_id: str,
     handle: str,
@@ -318,6 +328,7 @@ def handle_lookup(
     return json.loads(result)
 
 
+@deprecated_default_instance
 def handle_deregister(
     discovery_context_id: str,
     handle: str,
@@ -345,6 +356,7 @@ def handle_deregister(
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 def address_resolve(
     owner_did: str,
     address: str,
@@ -383,6 +395,7 @@ def address_resolve(
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 def scope_register(
     scope_context_id: str,
     name: str,
@@ -429,6 +442,7 @@ def scope_register(
     return json.loads(result)
 
 
+@deprecated_default_instance
 def scope_lookup(
     scope_context_id: str,
     name: str,
@@ -449,6 +463,7 @@ def scope_lookup(
     return json.loads(result)
 
 
+@deprecated_default_instance
 def scope_deregister(
     scope_context_id: str,
     name: str,

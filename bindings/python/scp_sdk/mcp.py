@@ -253,6 +253,7 @@ class McpServer:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 async def serve_mcp(
     identity: Identity,
     contexts: list[Context],

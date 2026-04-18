@@ -101,9 +101,8 @@ use napi_derive::napi;
 ///
 /// ```ignore
 /// // free-function (default instance)
-/// let bi = crate::runtime::default_bridge_instance()?;
-/// napi_check_handle!(&bi.core, handle);
-/// napi_check_handle!(&bi.core, identity, context_handle);
+/// napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+/// napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, identity, context_handle);
 ///
 /// // per-instance method (PR 2+)
 /// napi_check_handle!(&self.inner.core, handle);

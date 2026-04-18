@@ -96,9 +96,8 @@ pub mod server;
 //
 // ```ignore
 // // free-function (default instance)
-// let bi = crate::runtime::default_bridge_instance()?;
-// uniffi_check_handle!(&bi.core, handle);
-// uniffi_check_handle!(&bi.core, identity, context_handle);
+// uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+// uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, identity, context_handle);
 //
 // // per-instance method (PR 2+)
 // uniffi_check_handle!(&self.inner.core, handle);

@@ -152,7 +152,14 @@ public final class SCP: @unchecked Sendable {
         let millis: UInt64
         if timeout.isNaN || timeout <= 0 {
             millis = 0
-        } else if timeout.isInfinite || timeout > Double(UInt64.max) / 1000.0 {
+        } else if timeout.isInfinite || timeout >= Double(UInt64.max) / 1000.0 {
+            // `>=` (not `>`): `Double(UInt64.max) == 2^64` due to IEEE-754
+            // rounding (`Double` has 53 bits of mantissa, `UInt64` has 64),
+            // so any `timeout` that is *exactly* the rounded boundary lands
+            // on the "cast would overflow" side of `UInt64(x)`. A strict
+            // `>` would miss that single exact value and trap in the
+            // fallthrough cast. Clamping to `UInt64.max` there is correct
+            // and bounded — round 3 bug-catcher + api-design finding.
             millis = UInt64.max
         } else {
             millis = UInt64((timeout * 1000).rounded())
