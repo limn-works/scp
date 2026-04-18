@@ -1049,16 +1049,16 @@ pub type UcanContextState = scp_ffi_common::bridge_runtime::UcanContextStateCore
 
 /// Returns a reference to the default instance's UCAN registry.
 ///
-/// Falls back to an empty (process-static) registry when the default instance
-/// has not been initialized. Consistent with the previous behaviour of
-/// `EMPTY_UCAN_REGISTRY` in PR 0.
-static EMPTY_UCAN_REGISTRY: std::sync::OnceLock<DashMap<String, UcanContextState>> =
-    std::sync::OnceLock::new();
-
+/// The registry is a typed `Arc<DashMap<String, UcanContextState>>` field
+/// on [`UniffiBridgeInstance`]. `ensure_bridge_instance()` initializes
+/// `DEFAULT_BRIDGE_INSTANCE` if it is not yet set, so the registry is
+/// always real — there is no fallback empty map that writers could land in
+/// before a reader sees the instance registry (the H1 bug fixed in commit
+/// 10 of #1549 Phase 4 PR 2).
 fn ucan_registry() -> &'static DashMap<String, UcanContextState> {
     ensure_bridge_instance();
     DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
-        || EMPTY_UCAN_REGISTRY.get_or_init(DashMap::new),
+        || unreachable!("DEFAULT_BRIDGE_INSTANCE set by ensure_bridge_instance()"),
         |bi| bi.ucan_registry.as_ref(),
     )
 }

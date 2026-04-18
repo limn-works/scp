@@ -1725,30 +1725,26 @@ where
 // Identity registry (SCP-214: KeyCustody wiring)
 // ---------------------------------------------------------------------------
 
-/// Returns a reference to the default bridge instance's identity registry.
+/// Returns the default bridge instance's identity registry.
 ///
 /// The registry is a typed `Arc<DashMap<String, IdentityEntry>>` field on
-/// [`PyBridgeInstance`]. Falls back to an empty registry if the default
-/// instance has not been initialized yet — matching the previous
-/// `get_or_init` behavior of the standalone `OnceLock`.
+/// [`PyBridgeInstance`]. `ensure_bridge_instance()` initializes
+/// `DEFAULT_BRIDGE_INSTANCE` if it is not yet set, so the registry is
+/// always real — there is no fallback empty map that writers could land in
+/// before a reader sees the instance registry (the H1 bug fixed in commit
+/// 10 of #1549 Phase 4 PR 2).
 ///
 /// The `DashMap` provides lock-free concurrent access matching the context
 /// registry pattern (ADR-006).
-///
-/// Fallback empty identity registry for when the default `PyBridgeInstance`
-/// is not initialized.
-static EMPTY_IDENTITY_REGISTRY: std::sync::OnceLock<DashMap<String, IdentityEntry>> =
-    std::sync::OnceLock::new();
-
-/// Returns the default bridge instance's identity registry.
-///
-/// Eagerly initializes the default bridge so writers never silently land in
-/// the dead `EMPTY_IDENTITY_REGISTRY` fallback. The fallback branch remains
-/// as a safety net but is unreachable in normal code paths; PR 2 deletes it.
 fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
     ensure_bridge_instance();
+    // `ensure_bridge_instance()` returns early if the instance is already
+    // set, otherwise it runs `OnceLock::get_or_init` to allocate one. The
+    // only `None` path left is a compiler-level `OnceLock` bug — treat that
+    // as unreachable. A panicking fallback matches the previous behavior
+    // on instance-poisoned paths (e.g. `context_manager()` after shutdown).
     DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
-        || EMPTY_IDENTITY_REGISTRY.get_or_init(DashMap::new),
+        || unreachable!("DEFAULT_BRIDGE_INSTANCE set by ensure_bridge_instance()"),
         |bi| bi.identity_registry.as_ref(),
     )
 }
