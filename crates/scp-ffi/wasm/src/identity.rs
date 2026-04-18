@@ -322,7 +322,21 @@ pub(crate) fn resolve_verification_method_key(did: &str, kid: &str) -> Result<[u
             .ok_or_else(|| format!("DID '{did}' not found in identity registry"))?;
 
         match kid {
-            "#active" => Ok(entry.public_key_bytes),
+            // `#active` must mirror `sign_with_identity`'s key-selection
+            // logic: under the testing feature with a seeded identity, the
+            // active signing key is distinct from the identity key
+            // (ADR-046 parity harness). Deriving the verifying key from
+            // the active signing key keeps sign/verify paired; otherwise
+            // signatures produced under the testing seed would fail
+            // verification against `public_key_bytes`.
+            "#active" => {
+                #[cfg(feature = "testing")]
+                if let Some(sk_bytes) = entry.active_signing_key_bytes.as_deref() {
+                    let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+                    return Ok(sk.verifying_key().to_bytes());
+                }
+                Ok(entry.public_key_bytes)
+            }
             "#agent" => {
                 let agent_sk_bytes = entry.agent_signing_key_bytes.as_ref().ok_or_else(|| {
                     format!("no agent key bound for DID '{did}' — cannot verify kid '#agent'")
@@ -2642,7 +2656,7 @@ pub(crate) mod test_helpers {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -3040,5 +3054,127 @@ mod tests {
             }
             other => panic!("expected Validation error, got: {other:?}"),
         }
+    }
+
+    /// Regression test: under the `testing` feature, a seeded identity has
+    /// a distinct `#active` signing key (seed[32..64]) that is NOT the
+    /// identity key. `resolve_verification_method_key("#active")` must
+    /// return the verifying key derived from the active signing key so
+    /// that `sign_with_identity("#active", ...)` signatures verify.
+    ///
+    /// Prior bug: `resolve_verification_method_key` returned
+    /// `entry.public_key_bytes` unconditionally, causing signatures
+    /// produced with the active signing key to fail verification under
+    /// the parity-harness seed path (ADR-046).
+    #[cfg(feature = "testing")]
+    #[test]
+    fn test_sign_verify_active_roundtrip_seeded() {
+        use ed25519_dalek::{Signature, Verifier};
+
+        cleanup_registries();
+
+        // Register a seeded identity mirroring the testing+seed path in
+        // `identity_create`: identity_key from seed[0..32], active_signing
+        // from seed[32..64], via `StdRng::from_seed`.
+        use rand::{RngCore, SeedableRng};
+        let seed = [0x42u8; 32];
+        let mut rng = rand::rngs::StdRng::from_seed(seed);
+        let mut identity_key_bytes = [0u8; 32];
+        rng.fill_bytes(&mut identity_key_bytes);
+        let identity_key = ed25519_dalek::SigningKey::from_bytes(&identity_key_bytes);
+        let identity_pub_bytes = identity_key.verifying_key().to_bytes();
+        let mut active_bytes = [0u8; 32];
+        rng.fill_bytes(&mut active_bytes);
+
+        let did = format!("did:dht:z{}", zbase32_encode(&identity_pub_bytes));
+        IDENTITY_REGISTRY.with(|reg| {
+            reg.borrow_mut().insert(
+                did.clone(),
+                IdentityEntry {
+                    signing_key_bytes: zeroize::Zeroizing::new(identity_key.to_bytes()),
+                    public_key_bytes: identity_pub_bytes,
+                    custody_type: "in_memory".to_owned(),
+                    agent_signing_key_bytes: None,
+                    active_signing_key_bytes: Some(zeroize::Zeroizing::new(active_bytes)),
+                },
+            );
+        });
+
+        // Sanity: the active signing key is distinct from the identity
+        // key (otherwise the bug this test guards against could not
+        // manifest).
+        let active_key = ed25519_dalek::SigningKey::from_bytes(&active_bytes);
+        let active_pub_bytes = active_key.verifying_key().to_bytes();
+        assert_ne!(
+            active_pub_bytes, identity_pub_bytes,
+            "seeded testing path must produce a distinct #active key"
+        );
+
+        // Sign with #active.
+        let message = b"scp-parity-harness-roundtrip";
+        let sig_bytes = sign_with_identity(&did, "#active", message)
+            .expect("sign_with_identity(#active) should succeed");
+        let signature = Signature::from_bytes(&sig_bytes);
+
+        // Resolve the verifying key via the sibling path.
+        let resolved_pub_bytes = resolve_verification_method_key(&did, "#active")
+            .expect("resolve_verification_method_key(#active) should succeed");
+
+        // The resolver must return the ACTIVE signing key's verifying
+        // key, not the identity key's. Without the fix, this assertion
+        // fails.
+        assert_eq!(
+            resolved_pub_bytes, active_pub_bytes,
+            "resolver must return the active signing key's verifying key under testing seed"
+        );
+        assert_ne!(
+            resolved_pub_bytes, identity_pub_bytes,
+            "resolver must NOT return the identity key's verifying key for #active"
+        );
+
+        // Round-trip: signature produced by sign_with_identity(#active)
+        // MUST verify under resolve_verification_method_key(#active).
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&resolved_pub_bytes)
+            .expect("resolved public key bytes should decode to a valid Ed25519 verifying key");
+        verifying_key
+            .verify(message, &signature)
+            .expect("sign/verify round-trip must succeed under testing seed");
+
+        cleanup_registries();
+    }
+
+    /// Regression test: without the `testing` feature (production path),
+    /// `#active` resolves to the identity key (single-key model). This
+    /// test exercises the non-seeded code path to ensure the fix doesn't
+    /// regress the production resolver.
+    #[test]
+    fn test_sign_verify_active_roundtrip_production() {
+        use ed25519_dalek::{Signature, Verifier};
+
+        cleanup_registries();
+
+        let (did, pub_bytes) = register_identity();
+
+        let message = b"scp-production-roundtrip";
+        let sig_bytes = sign_with_identity(&did, "#active", message)
+            .expect("sign_with_identity(#active) should succeed");
+        let signature = Signature::from_bytes(&sig_bytes);
+
+        let resolved_pub_bytes = resolve_verification_method_key(&did, "#active")
+            .expect("resolve_verification_method_key(#active) should succeed");
+
+        // Production path: `#active` == identity key.
+        assert_eq!(
+            resolved_pub_bytes, pub_bytes,
+            "non-seeded path must resolve #active to the identity public key"
+        );
+
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&resolved_pub_bytes)
+            .expect("resolved public key bytes should decode to a valid Ed25519 verifying key");
+        verifying_key
+            .verify(message, &signature)
+            .expect("sign/verify round-trip must succeed on production path");
+
+        cleanup_registries();
     }
 }
