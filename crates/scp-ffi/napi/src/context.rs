@@ -412,7 +412,7 @@ pub async fn context_create(
     identity: &NapiIdentity,
     params_json: String,
 ) -> napi::Result<NapiContextHandle> {
-    crate::napi_check_handle!(identity);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, identity);
     validate_did(&identity.inner.did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
@@ -628,7 +628,7 @@ pub async fn context_join(
     identity_did: String,
     spending_ucan_jwt: Option<String>,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
@@ -752,7 +752,7 @@ pub async fn context_join(
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Context {
@@ -794,7 +794,7 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     // Authorization is enforced by the ContextManager (which delegates to
     // ttl::close_context checking the ContextClose capability). No bridge-layer
     // auth check — the ContextManager is authoritative.
@@ -855,7 +855,7 @@ pub async fn context_send(
     payload: Vec<u8>,
     spending_ucan_jwt: Option<String>,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
@@ -967,7 +967,7 @@ pub async fn context_subscribe(
     identity_did: String,
     on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     // Guard: prevent duplicate subscriptions. The AtomicBool is swapped to
     // true on the first call; subsequent calls see `true` and bail.
     // The flag is reset to `false` by the spawned task when it exits,
@@ -1083,6 +1083,22 @@ pub async fn context_subscribe(
     tasks.spawn(async move {
         use futures::StreamExt;
 
+        // Drop-guard: resets `subscription_active` on ALL exit paths of
+        // the spawned task — including panics. Without this, a panic
+        // inside the subscription body would leave `subscription_active`
+        // permanently `true`, rejecting every future `context_subscribe`
+        // call on this handle with `SCP-CTX-2022 "already subscribed"`
+        // (round 2 bug-catcher review finding).
+        //
+        // `SeqCst` matches the swap ordering on the entry-side guard.
+        struct ActiveFlagGuard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for ActiveFlagGuard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _active_flag_guard = ActiveFlagGuard(active_flag);
+
         // Collect the member's pseudonym from the ContextManager state.
         // Done inside the async block because local_pseudonym is async.
         // Broadcast contexts do not use pseudonyms — skip the lookup.
@@ -1112,8 +1128,7 @@ pub async fn context_subscribe(
                     Ok(None),
                     napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                 );
-                // Reset the active flag so re-subscription is possible.
-                active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                // `_active_flag_guard` resets the flag on drop.
                 return;
             }
         };
@@ -1147,8 +1162,7 @@ pub async fn context_subscribe(
                     Ok(None),
                     napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                 );
-                // Reset the active flag so re-subscription is possible.
-                active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                // `_active_flag_guard` resets the flag on drop.
                 return;
             }
         };
@@ -1253,9 +1267,9 @@ pub async fn context_subscribe(
             napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
         );
 
-        // Reset the active flag so re-subscription is possible after relay
-        // disconnect or task termination.
-        active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        // `_active_flag_guard` resets the flag on drop when this task
+        // returns normally (below) or panics (the guard's `Drop` impl
+        // fires on unwind).
     });
     // Drop the JoinSet guard now that spawn is done — shutdown requires
     // exclusive access to drain.
@@ -1274,7 +1288,7 @@ pub async fn context_subscribe(
 /// block to prevent orphaned tasks when the consumer abandons iteration.
 #[napi(js_name = "contextCancelSubscription")]
 pub fn context_cancel_subscription(handle: &NapiContextHandle) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     if let Ok(token) = handle.subscription_cancel.lock() {
         token.cancel();
     }
@@ -1298,7 +1312,7 @@ pub fn context_cancel_subscription(handle: &NapiContextHandle) -> napi::Result<(
 /// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextMemberCount")]
 pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u32> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let manager = context_manager()?;
     let count = manager.member_count(&handle.context_id).await.unwrap_or(0);
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
@@ -1314,7 +1328,7 @@ pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u3
 #[napi(js_name = "contextIsMember")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi::Result<bool> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let manager = context_manager()?;
     Ok(manager.is_member(&handle.context_id, &did).await)
 }
@@ -1328,7 +1342,7 @@ pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi:
 /// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextMemberDids")]
 pub async fn context_member_dids(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let manager = context_manager()?;
     Ok(manager.member_dids(&handle.context_id).await)
 }
@@ -1347,7 +1361,7 @@ pub async fn context_member_role(
     handle: &NapiContextHandle,
     did: String,
 ) -> napi::Result<Option<String>> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let manager = context_manager()?;
     Ok(manager
         .member_role(&handle.context_id, &did)
@@ -1402,7 +1416,7 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
 /// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextDrainEvents")]
 pub async fn context_drain_events(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let manager = context_manager()?;
     let events = manager.drain_events(&handle.context_id).await;
     Ok(events.iter().map(format_context_event).collect())
@@ -1496,7 +1510,7 @@ pub async fn access_key_restore(
 pub async fn context_broadcast_subscriber_count(
     handle: &NapiContextHandle,
 ) -> napi::Result<Option<u32>> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let manager = context_manager()?;
     #[allow(clippy::cast_possible_truncation)]
     Ok(manager
@@ -1518,7 +1532,7 @@ pub async fn context_is_broadcast_subscriber(
     handle: &NapiContextHandle,
     did: String,
 ) -> napi::Result<bool> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let manager = context_manager()?;
     Ok(manager
         .is_broadcast_subscriber(&handle.context_id, &did)
@@ -1536,7 +1550,7 @@ pub async fn context_is_broadcast_subscriber(
 pub async fn context_broadcast_admission(
     handle: &NapiContextHandle,
 ) -> napi::Result<Option<String>> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let manager = context_manager()?;
     Ok(manager
         .broadcast_admission(&handle.context_id)
@@ -1635,7 +1649,7 @@ pub async fn broadcast_subscribe(
     handle: &NapiContextHandle,
     subscriber_did: String,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
     let context_id = handle.context_id.clone();
@@ -1675,7 +1689,7 @@ pub async fn broadcast_unsubscribe(
     subscriber_did: String,
     rotate_keys: Option<bool>,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
     let context_id = handle.context_id.clone();
@@ -1707,7 +1721,7 @@ pub async fn broadcast_publish(
     author_did: String,
     payload: Vec<u8>,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
     let context_id = handle.context_id.clone();
@@ -1807,7 +1821,7 @@ pub async fn broadcast_publish_asset(
     asset: NapiAssetEntry,
     deploy_id: Option<String>,
 ) -> napi::Result<NapiPublishResult> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
     let context_id = handle.context_id.clone();
@@ -1947,7 +1961,7 @@ pub async fn broadcast_publish_assets(
     assets: Vec<NapiAssetEntry>,
     deploy_id: Option<String>,
 ) -> napi::Result<NapiBatchPublishResult> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     const MAX_BATCH_ASSETS: usize = 10_000;
     if assets.len() > MAX_BATCH_ASSETS {
         return Err(NapiError::from(ScpNapiError::Context {
@@ -2091,7 +2105,7 @@ pub async fn broadcast_block_subscriber(
     subscriber_did: String,
     blocker_did: String,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&blocker_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
@@ -2123,7 +2137,7 @@ pub async fn broadcast_unblock_subscriber(
     subscriber_did: String,
     unblocker_did: String,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&unblocker_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
@@ -2159,7 +2173,7 @@ pub async fn broadcast_handle_key_request(
     author_did: String,
     requester_did: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&requester_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
@@ -2203,7 +2217,7 @@ pub async fn context_execute_governance_action(
     action_json: String,
     proposer_did: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid governance action JSON: {e}"),
@@ -2376,7 +2390,7 @@ pub async fn context_governance_propose(
     action_json: String,
     proposer_did: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid governance action JSON: {e}"),
@@ -2463,7 +2477,7 @@ pub async fn context_governance_approve(
     proposal_id_hex: String,
     voter_did: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
 
     #[cfg(feature = "allow_in_memory_custody")]
@@ -2525,7 +2539,7 @@ pub async fn context_governance_reject(
     proposal_id_hex: String,
     voter_did: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
 
     #[cfg(feature = "allow_in_memory_custody")]
@@ -2587,7 +2601,7 @@ pub async fn context_governance_withdraw(
     proposal_id_hex: String,
     voter_did: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
     let did = DID(voter_did);
     let manager = context_manager()?;
@@ -2631,7 +2645,7 @@ pub async fn context_governance_get_proposal(
     handle: &NapiContextHandle,
     proposal_id_hex: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let context_id = handle.context_id.clone();
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
     let manager = context_manager()?;
@@ -2664,7 +2678,7 @@ pub async fn context_governance_get_proposal(
 /// - Rejects with `SCP-CTX-2046` if listing fails.
 #[napi(js_name = "contextGovernanceListProposals")]
 pub async fn context_governance_list_proposals(handle: &NapiContextHandle) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2699,7 +2713,7 @@ pub async fn context_apply_pending_ceiling_modification(
     handle: &NapiContextHandle,
     current_timestamp: f64,
 ) -> napi::Result<bool> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2727,7 +2741,7 @@ pub async fn context_apply_pending_ceiling_modification(
 /// - Rejects with `SCP-CTX-2061` if the context is not in `Closing` state.
 #[napi(js_name = "contextFinalizeClose")]
 pub async fn context_finalize_close(handle: &NapiContextHandle) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let manager = context_manager()?;
 
     // Use the handle's actual core_handle (which carries correct ContextParams
@@ -2787,7 +2801,7 @@ pub async fn context_create_governance_checkpoint(
     creator_did: String,
     creator_signature_hex: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2847,7 +2861,7 @@ pub async fn context_add_checkpoint_cosignature(
     signer_did: String,
     signature_hex: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2982,7 +2996,7 @@ fn parse_napi_hex_32(hex_str: &str, field_name: &str) -> napi::Result<[u8; 32]> 
 ///   grace period has not expired.
 #[napi(js_name = "contextTombstoneMigrated")]
 pub async fn context_tombstone_migrated(handle: &NapiContextHandle) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -3010,7 +3024,7 @@ pub async fn context_tombstone_migrated(handle: &NapiContextHandle) -> napi::Res
 /// context is not migrating.
 #[napi(js_name = "contextMigrationState")]
 pub async fn context_migration_state(handle: &NapiContextHandle) -> napi::Result<Option<String>> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -3043,7 +3057,7 @@ pub async fn context_migration_state(handle: &NapiContextHandle) -> napi::Result
 /// - Rejects with `SCP-CTX-2005` if the context is not active.
 #[napi(js_name = "contextHandleTtlExpiry")]
 pub async fn context_handle_ttl_expiry(handle: &NapiContextHandle) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let manager = context_manager()?;
     manager
@@ -3069,7 +3083,7 @@ pub async fn context_propose_ttl_extension(
     proposer_did: String,
     extension_secs: u32,
 ) -> napi::Result<bool> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let did = DID(proposer_did.clone());
     let duration = std::time::Duration::from_secs(u64::from(extension_secs));
     let manager = context_manager()?;
@@ -3093,7 +3107,7 @@ pub async fn context_reset_ttl_timer(
     handle: &NapiContextHandle,
     new_duration_secs: u32,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let duration = std::time::Duration::from_secs(u64::from(new_duration_secs));
     let manager = context_manager()?;
@@ -3118,7 +3132,7 @@ pub async fn context_reset_ttl_timer(
 /// serialization fails.
 #[napi(js_name = "contextExport")]
 pub async fn context_export(handle: &NapiContextHandle) -> napi::Result<Vec<u8>> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     let exporter_did = scp_identity::DID::from(handle.creator_did.clone());
     let manager = context_manager()?;
     let export = manager
@@ -3190,7 +3204,7 @@ pub fn context_set_economic_policy(
     handle: &mut NapiContextHandle,
     _policy_json: String,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     Err(NapiError::from(ScpNapiError::Permission {
         message: "economic policy changes must go through governance \
                   (propose SetEconomicPolicy action). Direct mutation is \
@@ -3208,7 +3222,7 @@ pub fn context_set_economic_policy(
 /// minted by a different `SCP` bridge instance.
 #[napi(js_name = "contextGetEconomicPolicy")]
 pub fn context_get_economic_policy(handle: &NapiContextHandle) -> napi::Result<Option<String>> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
     Ok(handle.economic_policy.clone())
 }
 
@@ -3666,7 +3680,7 @@ fn parse_template_id_napi(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use crate::runtime::context_manager;
     use scp_core::context::ContextParams;
@@ -4278,5 +4292,85 @@ mod tests {
                 "None spending_ucan_jwt must not trigger UCAN parse errors, got: {msg}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: ActiveFlagGuard resets subscription_active on panic
+    // (round 2 bug-catcher finding — `context_subscribe` previously had
+    // three manual `active_flag.store(false, …)` calls on normal exit
+    // paths only; a panic inside the subscription body would leave the
+    // flag `true` forever and reject every future subscribe call with
+    // `SCP-CTX-2022 "already subscribed"`).
+    //
+    // The drop-guard pattern ensures the flag resets on ALL exit paths
+    // including panics. This test verifies that behavior by running the
+    // guard inside a `catch_unwind`-wrapped async task and asserting the
+    // flag is `false` afterward.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_flag_guard_resets_on_panic() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Replicate the guard structure from `context_subscribe` verbatim
+        // so the test exercises the exact shape the production path uses.
+        struct ActiveFlagGuard(Arc<AtomicBool>);
+        impl Drop for ActiveFlagGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(true));
+        let flag_clone = Arc::clone(&flag);
+
+        // Spawn a task that panics while the guard is live.
+        let join = tokio::spawn(async move {
+            let _guard = ActiveFlagGuard(flag_clone);
+            panic!("simulated subscription-body panic");
+        });
+
+        // The task must return a JoinError (panic propagated).
+        let result = join.await;
+        assert!(
+            result.is_err(),
+            "spawned task should surface the panic as a JoinError"
+        );
+
+        // And the guard must have reset the flag on unwind.
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "ActiveFlagGuard::drop must reset subscription_active even when the \
+             spawned task panics — otherwise future context_subscribe calls \
+             get stuck on SCP-CTX-2022 'already subscribed'"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_flag_guard_resets_on_normal_return() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ActiveFlagGuard(Arc<AtomicBool>);
+        impl Drop for ActiveFlagGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(true));
+        let flag_clone = Arc::clone(&flag);
+
+        let join = tokio::spawn(async move {
+            let _guard = ActiveFlagGuard(flag_clone);
+            // Simulate ordinary exit path (no panic).
+        });
+        join.await.expect("task should complete without panic");
+
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "ActiveFlagGuard::drop must reset the flag on normal task exit too"
+        );
     }
 }

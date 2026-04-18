@@ -133,20 +133,30 @@ public final class SCP: @unchecked Sendable {
     ///
     /// Fractional seconds (e.g. `0.25`) are preserved to millisecond
     /// resolution before crossing the UniFFI boundary — the native
-    /// side takes a `u64` millisecond count. Negative values are
-    /// clamped to zero.
+    /// side takes a `u64` millisecond count.
+    ///
+    /// `timeout` is clamped defensively:
+    /// - `NaN` or values `<= 0` → `0` (abort in-flight tasks immediately).
+    /// - `.infinity` or values that would overflow `UInt64` milliseconds
+    ///   → `UInt64.max` (effectively unbounded).
+    /// - Finite values in range → rounded to the nearest millisecond.
+    ///
+    /// Clamping avoids the runtime trap that bare `UInt64(x)` exhibits
+    /// on `NaN` / `.infinity` / out-of-range Doubles (round 2
+    /// api-design review finding).
     ///
     /// - Parameter timeout: Maximum wall-clock duration to wait for
     ///   in-flight tasks, expressed as a ``Foundation/TimeInterval``
     ///   (`Double` seconds). Defaults to `5.0`.
     public func shutdown(timeout: TimeInterval = 5.0) async throws {
-        // Clamp negative durations to zero and convert to unsigned
-        // milliseconds. `TimeInterval.rounded(.down)` ensures we never
-        // silently extend the caller's budget when converting from
-        // Double-seconds to UInt64-millis.
-        let millis: UInt64 = timeout <= 0
-            ? 0
-            : UInt64((timeout * 1000).rounded(.down))
+        let millis: UInt64
+        if timeout.isNaN || timeout <= 0 {
+            millis = 0
+        } else if timeout.isInfinite || timeout > Double(UInt64.max) / 1000.0 {
+            millis = UInt64.max
+        } else {
+            millis = UInt64((timeout * 1000).rounded())
+        }
         try await inner.shutdown(timeoutMillis: millis)
     }
 }

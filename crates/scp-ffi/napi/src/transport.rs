@@ -374,7 +374,7 @@ pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportM
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn transport_status(manager: &NapiTransportManager) -> napi::Result<NapiTransportStatus> {
-    crate::napi_check_handle!(manager);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, manager);
     let mut status = manager.status();
     // Defense-in-depth: verify the transport manager is actually alive,
     // not just what the manager's local status believes. If the transport
@@ -402,7 +402,7 @@ pub async fn transport_status(manager: &NapiTransportManager) -> napi::Result<Na
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Result<()> {
-    crate::napi_check_handle!(manager);
+    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, manager);
     let mut s = manager.status.lock().map_err(|_| ScpNapiError::Transport {
         message: "transport status lock is poisoned".to_owned(),
         code: codes::TRANS_5002.to_owned(),

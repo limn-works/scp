@@ -30,6 +30,7 @@ Example usage::
 
 from __future__ import annotations
 
+import math
 import warnings
 from types import TracebackType
 from typing import Any
@@ -207,16 +208,27 @@ class SCP:
         no-op (the underlying :class:`ShutdownError::AlreadyShutDown` is
         swallowed at the SDK surface).
 
+        ``timeout`` is clamped defensively: ``NaN`` and negative values
+        map to ``0`` (abort immediately); ``math.inf`` or values that
+        would overflow ``u64`` milliseconds map to ``0xFFFFFFFF_FFFFFFFF``
+        (effectively unbounded). Finite in-range values are rounded to
+        the nearest millisecond (``round()`` rather than ``int()``
+        truncation — we were dropping up to 0.999 ms of caller budget
+        per call before the round 2 review).
+
         :param timeout: Maximum seconds to wait for in-flight tasks
             (float — fractional seconds are preserved to millisecond
-            resolution before crossing the FFI boundary). Negative values
-            are clamped to zero.
+            resolution before crossing the FFI boundary).
         :raises ContextError: If the tokio runtime is unavailable.
         """
-        # Native shutdown accepts unsigned milliseconds; clamp negatives
-        # to zero, round down to the nearest millisecond so we never
-        # quietly extend the caller's budget, and forward as u64.
-        millis = max(0, int(float(timeout) * 1000))
+        # u64::MAX milliseconds — matches the Rust-side PyO3 bridge type.
+        u64_max = 0xFFFFFFFF_FFFFFFFF
+        if not math.isfinite(timeout) or timeout <= 0:
+            millis = 0
+        elif timeout * 1000 > u64_max:
+            millis = u64_max
+        else:
+            millis = round(timeout * 1000)
         self._native.shutdown(millis)
 
     def __enter__(self) -> SCP:

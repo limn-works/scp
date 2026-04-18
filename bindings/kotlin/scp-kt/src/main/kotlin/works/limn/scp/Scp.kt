@@ -27,6 +27,9 @@
 
 package works.limn.scp
 
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.logging.Level
+import java.util.logging.Logger
 import kotlin.time.Duration
 import uniffi.scp.Scp as NativeScp
 import uniffi.scp.StorageConfig
@@ -61,6 +64,16 @@ import works.limn.scp.bridge.CoroutineBridge
 class SCP internal constructor(
     internal val inner: NativeScp,
 ) {
+    /**
+     * Tracks whether [shutdown] has completed successfully. Read from the
+     * finalizer fallback to decide whether to emit a "leaked without
+     * shutdown" warning; written inside [shutdown] after the FFI call
+     * returns. Must be atomic because finalizers run on a JVM-internal
+     * thread pool that does not happen-before the coroutine that invoked
+     * [shutdown].
+     */
+    private val isShutdown: AtomicBoolean = AtomicBoolean(false)
+
     /**
      * Constructs a fresh [SCP] with default in-memory state.
      *
@@ -124,6 +137,49 @@ class SCP internal constructor(
     suspend fun shutdown(bridge: CoroutineBridge, timeout: Duration) {
         val millis = timeout.inWholeMilliseconds.coerceAtLeast(0).toULong()
         bridge.ffiCall { inner.shutdown(timeoutMillis = millis) }
+        // Record shutdown AFTER the FFI call returns so that a failed
+        // shutdown does not silence the finalizer warning — a caller
+        // who sees an exception here should know the instance is still
+        // live and still worth a second [shutdown] attempt. SetRelease
+        // orders the flip after the FFI mutation, matching Atomic default.
+        isShutdown.set(true)
+    }
+
+    /**
+     * Finalizer fallback: warns if the JVM garbage-collects an [SCP]
+     * that was never [shutdown]. Callers MUST invoke [shutdown]
+     * explicitly — the underlying `JoinSet` on the Rust side aborts
+     * abruptly (not gracefully) when the opaque UniFFI handle is
+     * dropped, so subscriptions and in-flight governance tasks lose
+     * their chance to exit cleanly.
+     *
+     * Kotlin's `finalize()` is deprecated in favor of
+     * `java.lang.ref.Cleaner` (JDK 9+), but Cleaner adds ceremony
+     * (companion-hosted cleanup action, shared-executor, capturing
+     * references carefully to avoid resurrection). For a simple
+     * best-effort warning — where timing and ordering don't matter
+     * because the Rust side does its own teardown on Drop — the
+     * finalizer is sufficient and self-contained. When the JVM
+     * finalizer is removed in a future release we will migrate to
+     * Cleaner; the contract is unchanged.
+     *
+     * This is not a substitute for explicit shutdown. The Rust side
+     * still tears down its `JoinSet` via Drop; the warning just makes
+     * the resource leak visible to the developer.
+     */
+    @Suppress("ProtectedMemberInFinalClass", "Unused")
+    protected fun finalize() {
+        if (!isShutdown.get()) {
+            Logger.getLogger("works.limn.scp.SCP").log(
+                Level.WARNING,
+                "SCP instance (id={0}) was garbage-collected without a shutdown() call. " +
+                    "In-flight tasks (subscriptions, governance timeouts) were aborted " +
+                    "abruptly instead of draining gracefully. Always call SCP.shutdown() " +
+                    "explicitly — for example from a coroutine scope: " +
+                    "`scope.launch { scp.shutdown(bridge, 5.seconds) }`.",
+                arrayOf<Any>(instanceId),
+            )
+        }
     }
 
     companion object {

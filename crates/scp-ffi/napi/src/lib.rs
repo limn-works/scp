@@ -79,60 +79,51 @@ use napi_derive::napi;
 /// Runtime handle-affinity check at every `#[napi]` entry that accepts a
 /// handle.
 ///
-/// Two forms are supported; **per-instance `Scp` methods must use the
-/// two-argument form**:
+/// Single form, matching the `PyO3` bridge's
+/// [`pyscp_check_handle!`](../../scp_ffi/macro.pyscp_check_handle.html)
+/// for cross-bridge symmetry (round 2 simplifier review finding — the
+/// previous dual-form macro could silently route a per-instance
+/// `Scp::method` through the default `OnceLock` if the caller forgot
+/// the leading `&`). Every caller now spells the `CoreFields` target
+/// explicitly.
 ///
-/// 1. `napi_check_handle!(handle, …)` — default-instance shorthand.
-///    Delegates to [`crate::runtime::check_handle_affinity`] which looks
-///    up the default bridge's `CoreFields::instance_id` under the hood.
-///    Use this ONLY from free functions on the default façade. Do NOT
-///    use this inside per-instance `Scp::method` — that would silently
-///    check against the default instance instead of `self.inner.core`
-///    (PR 2 regression hazard).
+/// `$core` must be a `CoreFields` or something that implements or
+/// auto-derefs to one (`&CoreFields`, `Arc<NapiBridgeInstance>`, etc.).
+/// Method resolution on `check_handle` handles the indirection.
 ///
-/// 2. `napi_check_handle!(&core, handle, …)` — strict form. `&core`
-///    must be `&CoreFields`. Compares each handle against `core`
-///    directly without touching the default `OnceLock`. This is the
-///    form per-instance `Scp` methods call with `&self.inner.core`.
+/// `$handle` must carry an inherent `instance_id(&self) -> u64` method
+/// (`HandleInstance` in the runtime module).
 ///
-/// Handle types must carry an inherent `instance_id(&self) -> u64` method.
-/// The macro uses method syntax which auto-derefs through `&T`, `&Arc<T>`,
-/// and `Arc<T>`.
-///
-/// Both forms raise [`crate::error::ScpNapiError::Permission`] with error
-/// code `SCP-PERM-3030` on mismatch.
+/// Raises [`crate::error::ScpNapiError::Permission`] with error code
+/// `SCP-PERM-3030` on mismatch.
 ///
 /// Usage:
 ///
 /// ```ignore
 /// // free-function (default instance)
-/// napi_check_handle!(handle);
-/// napi_check_handle!(identity, context_handle);
+/// let bi = crate::runtime::default_bridge_instance()?;
+/// napi_check_handle!(&bi.core, handle);
+/// napi_check_handle!(&bi.core, identity, context_handle);
 ///
 /// // per-instance method (PR 2+)
 /// napi_check_handle!(&self.inner.core, handle);
 /// ```
 #[macro_export]
 macro_rules! napi_check_handle {
-    // Strict 2+-arg form with an explicit `&CoreFields` target. The
-    // leading `&` pattern matches callers that spell `&core` or
-    // `&self.inner.core` — that spelling reliably disambiguates from the
-    // default-instance shorthand below.
-    (& $core:expr, $($handle:expr),+ $(,)?) => {{
-        let __core: &$crate::runtime::CoreFields = &$core;
+    ($core:expr, $($handle:expr),+ $(,)?) => {{
+        // Method resolution on `check_handle` auto-derefs through `&T`,
+        // `&Arc<T>`, `Arc<T>`, and `CoreFields` directly. `CoreFields`
+        // has an inherent `check_handle` method, so the trait need not
+        // be in scope when `$core` resolves to `&CoreFields` (the
+        // typical free-function case). If a future caller passes
+        // `Arc<NapiBridgeInstance>` or similar, add
+        // `use scp_ffi_common::bridge_instance::BridgeInstanceCore;`
+        // at the call site. Mirrors the PyO3 bridge's
+        // `pyscp_check_handle!` pattern.
         $(
-            __core
+            $core
                 .check_handle($crate::runtime::HandleInstance::instance_id($handle))
                 .map_err(|e| ::napi::Error::from($crate::error::ScpNapiError::from(e)))?;
-        )+
-    }};
-    // Default-instance shorthand. Kept for the free-function façade only.
-    // Do not use inside per-instance `Scp::method` — use the 2-arg form.
-    ($($handle:expr),+ $(,)?) => {{
-        $(
-            $crate::runtime::check_handle_affinity(
-                $crate::runtime::HandleInstance::instance_id($handle),
-            )?;
         )+
     }};
 }

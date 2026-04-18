@@ -391,6 +391,35 @@ pub fn attach_context_manager_to_bridge(cm: Arc<ContextManager>) {
     }
 }
 
+/// Returns a reference to the default [`UniffiBridgeInstance`]'s core for
+/// handle-affinity checks only.
+///
+/// Unlike [`bridge_instance`], this helper does NOT return an error when
+/// the bridge is suspended — a handle-affinity check is a pure
+/// compare-two-u64 operation that does not touch transport or context
+/// manager state, so suspending the bridge must not block it. Used
+/// exclusively by the [`crate::uniffi_check_handle!`] macro at FFI entry
+/// points.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` if the default bridge has not been
+/// initialized. Initializes the bridge if needed — same semantics as
+/// the old `check_handle_affinity` path.
+#[must_use = "the returned CoreFields reference must be used for the affinity check"]
+pub fn bridge_instance_for_affinity() -> Result<&'static CoreFields, crate::ScpError> {
+    ensure_bridge_instance();
+    DEFAULT_BRIDGE_INSTANCE
+        .get()
+        .map(|bi| &bi.core)
+        .ok_or_else(|| crate::ScpError::Context {
+            msg: "bridge not initialized — call context_create, \
+                  context_join, context_import, or init_context_manager first"
+                .to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })
+}
+
 /// Returns a reference to the default [`UniffiBridgeInstance`].
 ///
 /// Called by rate-limiter delegation and other functions that access the

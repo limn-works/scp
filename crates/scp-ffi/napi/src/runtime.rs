@@ -434,6 +434,35 @@ pub fn attach_context_manager_to_bridge(cm: Arc<ContextManager>) {
     }
 }
 
+/// Returns a reference to the default [`NapiBridgeInstance`]'s core for
+/// handle-affinity checks only.
+///
+/// Unlike [`bridge_instance`], this helper does NOT return an error when
+/// the bridge is suspended — a handle-affinity check is a pure
+/// compare-two-u64 operation that does not touch transport or context
+/// manager state, so suspending the bridge must not block it. Used
+/// exclusively by the [`crate::napi_check_handle!`] macro at FFI entry
+/// points.
+///
+/// # Errors
+///
+/// Returns `napi::Error` if the default bridge has not been initialized
+/// via [`init_context_manager`] (initializes it if needed — same
+/// semantics as the old `check_handle_affinity` path).
+#[must_use = "the returned CoreFields reference must be used for the affinity check"]
+pub fn bridge_instance_for_affinity() -> napi::Result<&'static CoreFields> {
+    ensure_bridge_instance();
+    DEFAULT_BRIDGE_INSTANCE
+        .get()
+        .map(|bi| &bi.core)
+        .ok_or_else(|| {
+            napi::Error::from(ScpNapiError::Context {
+                message: "bridge not initialized — call identityCreate first".to_owned(),
+                code: codes::CTX_2000.to_owned(),
+            })
+        })
+}
+
 /// Returns a reference to the default [`NapiBridgeInstance`]'s core.
 ///
 /// Existing callers interacting with core state (known contexts, transport,

@@ -51,7 +51,7 @@ Every shared helper in `scp-ffi-common` operates on `&dyn BridgeInstanceCore`. P
 
 ### 3. Default-instance façade remains as a sunset scaffold
 
-`DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<BridgeInstance>>` (renamed from `BRIDGE_INSTANCE`) stays in each bridge for one deprecation window. Existing free-function exports (`py_context_create`, `napi context_create`, UniFFI `context_create`) continue to work by forwarding to `SCP::default()`. Each forward emits a one-time deprecation warning per function name:
+`DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<{Py,Napi,Uniffi}BridgeInstance>>` (renamed from `BRIDGE_INSTANCE`; the concrete type varies per bridge — `PyBridgeInstance` in PyO3, `NapiBridgeInstance` in NAPI, `UniffiBridgeInstance` in UniFFI) stays in each bridge for one deprecation window. Existing free-function exports (`py_context_create`, `napi context_create`, UniFFI `context_create`) continue to work by forwarding to `SCP::default()`. Each forward emits a one-time deprecation warning per function name:
 
 - Python: `warnings.warn(..., DeprecationWarning)`
 - TypeScript: `console.warn(...)`

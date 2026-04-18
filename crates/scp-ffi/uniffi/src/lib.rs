@@ -79,51 +79,44 @@ pub mod server;
 // Handle-affinity macro for every `#[uniffi::export]` entry that accepts a
 // handle with a stored `instance_id`.
 //
-// Two forms are supported; per-instance `Scp` methods MUST use the two-
-// argument form:
+// Single form, matching the PyO3 bridge's `pyscp_check_handle!` for
+// cross-bridge symmetry (round 2 simplifier review finding — the
+// previous dual-form macro could silently route a per-instance
+// `Scp::method` through the default `OnceLock` if the caller forgot
+// the leading `&`). Every caller now spells the `CoreFields` target
+// explicitly.
 //
-// 1. `uniffi_check_handle!(handle, …)` — default-instance shorthand.
-//    Delegates to [`crate::runtime::check_handle_affinity`] which looks
-//    up the default bridge's `CoreFields::instance_id`. Use this ONLY
-//    from free functions on the default façade. Do NOT use this inside
-//    per-instance `Scp::method` — that would silently check against the
-//    default instance instead of `self.inner.core` (PR-2 regression
-//    hazard).
+// `$core` must be a `CoreFields` or something that implements or
+// auto-derefs to one (`&CoreFields`, `Arc<UniffiBridgeInstance>`, etc.).
+// Method resolution on `check_handle` handles the indirection.
 //
-// 2. `uniffi_check_handle!(&core, handle, …)` — strict form. `&core`
-//    must be `&CoreFields`. Compares each handle against `core` directly
-//    without touching the default `OnceLock`. Per-instance `Scp`
-//    methods call with `&self.inner.core`.
-//
-// Handle types must carry an inherent `instance_id(&self) -> u64` method.
-// The macro uses method syntax which auto-derefs through `&T`, `&Arc<T>`,
-// and `Arc<T>`. No trait lookup is required.
+// `$handle` must carry an inherent `instance_id(&self) -> u64` method.
 //
 // Usage:
 //
 // ```ignore
 // // free-function (default instance)
-// uniffi_check_handle!(handle);
-// uniffi_check_handle!(identity, context_handle);
+// let bi = crate::runtime::default_bridge_instance()?;
+// uniffi_check_handle!(&bi.core, handle);
+// uniffi_check_handle!(&bi.core, identity, context_handle);
 //
 // // per-instance method (PR 2+)
 // uniffi_check_handle!(&self.inner.core, handle);
 // ```
 #[macro_export]
 macro_rules! uniffi_check_handle {
-    // Strict 2+-arg form with an explicit `&CoreFields` target.
-    (& $core:expr, $($handle:expr),+ $(,)?) => {{
-        let __core: &$crate::runtime::CoreFields = &$core;
+    ($core:expr, $($handle:expr),+ $(,)?) => {{
+        // `CoreFields` has an inherent `check_handle` method, so the
+        // trait need not be in scope when `$core` resolves to
+        // `&CoreFields` (the typical free-function case). If a future
+        // caller passes `Arc<UniffiBridgeInstance>` or similar, add
+        // `use scp_ffi_common::bridge_instance::BridgeInstanceCore;`
+        // at the call site. Mirrors the PyO3 bridge's
+        // `pyscp_check_handle!` pattern.
         $(
-            __core
+            $core
                 .check_handle($handle.instance_id())
                 .map_err($crate::ScpError::from)?;
-        )+
-    }};
-    // Default-instance shorthand. Kept for the free-function façade only.
-    ($($handle:expr),+ $(,)?) => {{
-        $(
-            $crate::runtime::check_handle_affinity($handle.instance_id())?;
         )+
     }};
 }
