@@ -1403,8 +1403,8 @@ class CoroutineBridge(
      *
      * The companion of [ffiCall] for UniFFI-generated async methods. UniFFI
      * compiles `async fn` Rust functions into Kotlin `suspend fun` bindings
-     * (e.g., `Scp.shutdown(timeoutMillis)`), which cannot be invoked from the
-     * non-suspend `() -> T` lambda accepted by [ffiCall].
+     * (e.g., `Scp.shutdown(timeoutMillis)`, `Scp.resume()`), which cannot be
+     * invoked from the non-suspend `() -> T` lambda accepted by [ffiCall].
      *
      * @param block The suspend FFI operation.
      * @return The FFI call result.

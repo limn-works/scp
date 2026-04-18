@@ -22,8 +22,14 @@ interface LifecycleBindings {
     /** Suspends the bridge instance (disconnects transport, sets suspended flag). */
     fun scpSuspend()
 
-    /** Resumes a suspended bridge instance (clears suspended flag). */
-    fun scpResume()
+    /**
+     * Resumes a suspended bridge instance (clears suspended flag).
+     *
+     * `suspend` since the UniFFI-generated `uniffi.scp.scpResume()` became an
+     * async Rust function in #1549 PR 3B — transport reconnect and persisted-
+     * context restoration now run inside `scp_resume()`.
+     */
+    suspend fun scpResume()
 }
 
 /**
@@ -43,7 +49,7 @@ object LifecycleBridge {
             uniffi.scp.scpSuspend()
         }
 
-        override fun scpResume() {
+        override suspend fun scpResume() {
             uniffi.scp.scpResume()
         }
     }
@@ -110,5 +116,5 @@ suspend fun resume(
     bridge: CoroutineBridge,
     bindings: LifecycleBindings = LifecycleBridge.default,
 ) {
-    bridge.ffiCall { bindings.scpResume() }
+    bridge.ffiCallSuspend { bindings.scpResume() }
 }
