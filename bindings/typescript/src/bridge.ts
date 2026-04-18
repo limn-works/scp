@@ -10,6 +10,7 @@
 
 import { mapBridgeError } from "./errors";
 import { getBridge } from "./internal/bridge";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -65,6 +66,7 @@ export async function bridgeRegister(
   platform: string,
   mode: BridgeMode,
 ): Promise<BridgeRegistration> {
+  deprecatedDefaultInstance("bridgeRegister");
   try {
     const bridge = await getBridge();
     const raw = bridge.bridgeRegister(contextId, operatorDid, governanceDid, platform, mode);
@@ -94,6 +96,7 @@ export async function bridgeEvaluateTrust(
   isNativeTransport = true,
   shadowStatus: ShadowStatus = "shadow",
 ): Promise<number> {
+  deprecatedDefaultInstance("bridgeEvaluateTrust");
   try {
     const bridge = await getBridge();
     return bridge.bridgeEvaluateTrust(isBridged, isNativeTransport, shadowStatus);
@@ -117,6 +120,7 @@ export async function bridgeCreateShadow(
   bridgeMode: BridgeMode,
   contextId?: string,
 ): Promise<ShadowIdentity> {
+  deprecatedDefaultInstance("bridgeCreateShadow");
   try {
     const bridge = await getBridge();
     const raw = bridge.bridgeCreateShadow(bridgeId, platformHandle, bridgeMode, contextId);

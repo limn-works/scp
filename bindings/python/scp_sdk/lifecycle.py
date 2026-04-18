@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import ContextError, ScpError, TransportError
 
 
@@ -31,6 +32,7 @@ def _bridge() -> Any:
         ) from exc
 
 
+@deprecated_default_instance
 def suspend() -> None:
     """Suspend the bridge instance for backgrounding.
 
@@ -59,6 +61,7 @@ def suspend() -> None:
         ) from exc
 
 
+@deprecated_default_instance
 def resume() -> None:
     """Resume a suspended bridge instance.
 

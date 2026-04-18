@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import ScpError
 
 
@@ -29,6 +30,7 @@ def _bridge() -> Any:
         ) from exc
 
 
+@deprecated_default_instance
 def parse_address(address: str) -> dict[str, Any]:
     """Parse an SCP address string into its components.
 
@@ -55,6 +57,7 @@ def parse_address(address: str) -> dict[str, Any]:
     return dict(result)
 
 
+@deprecated_default_instance
 def create_query(
     *,
     capabilities: list[str] | None = None,
@@ -75,6 +78,7 @@ def create_query(
     return bridge.discovery_create_query(capabilities, keywords, min_history_secs)
 
 
+@deprecated_default_instance
 def normalize_address(address: str) -> str:
     """Normalize an address string per SCP addressing rules.
 
@@ -90,6 +94,7 @@ def normalize_address(address: str) -> str:
     return bridge.discovery_normalize_address(address)
 
 
+@deprecated_default_instance
 def discover(query: str) -> list[dict[str, Any]]:
     """Discover contexts from a DID string or ``scp://`` URI.
 

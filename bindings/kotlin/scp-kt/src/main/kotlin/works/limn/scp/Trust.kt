@@ -70,6 +70,14 @@ interface TrustBindings {
  * @throws BridgeException if inputs are malformed or aggregation fails.
  * @throws IllegalStateException if trust bindings are not configured.
  */
+@Deprecated(
+    message = (
+        "Operates on the default SCP instance. Construct an explicit `SCP` and " +
+            "invoke trust aggregation through its scope instead. Removal target: " +
+            "two release cycles after Phase 4 merge (ADR-048)."
+    ),
+    level = DeprecationLevel.WARNING,
+)
 @Suppress("LongParameterList")
 suspend fun aggregateTrustInput(
     bridge: CoroutineBridge,

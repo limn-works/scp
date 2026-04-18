@@ -12,6 +12,7 @@
 import type { Context } from "./context";
 import { mapBridgeError } from "./errors";
 import { getBridge, getBridgeSync } from "./internal/bridge";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 import type {
   AttestationSummary,
   BehavioralRecord,
@@ -39,6 +40,7 @@ import { encodeConsequenceRules } from "./types";
  * @throws {ContextError} If the context is not active or evaluation fails.
  */
 export async function evaluateTrust(ctx: Context, subjectDid: string): Promise<TrustEvaluation> {
+  deprecatedDefaultInstance("evaluateTrust");
   try {
     const bridge = await getBridge();
 
@@ -156,6 +158,7 @@ export interface AggregatedTrustInput {
  * @throws {Error} If inputs are malformed or aggregation fails.
  */
 export async function aggregateTrustInput(input: AggregationInput): Promise<AggregatedTrustInput> {
+  deprecatedDefaultInstance("aggregateTrustInput");
   try {
     const bridge = await getBridge();
 
@@ -238,6 +241,7 @@ export function verifyParticipationRequirements(
   requirements: readonly RequireParticipation[],
   profiles: readonly ParticipationProfile[],
 ): void {
+  deprecatedDefaultInstance("verifyParticipationRequirements");
   const bridge = getBridgeSync();
 
   const profileJson = JSON.stringify(profiles.map(profileToBridgeJson));

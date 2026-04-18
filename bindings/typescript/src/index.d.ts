@@ -284,3 +284,51 @@ export declare class McpClient {
   callTool(name: string, input: Record<string, unknown>): Promise<Record<string, unknown>>;
   close(): Promise<void>;
 }
+
+// -- SCP multi-instance handle (#1549 Phase 4 PR 1, ADR-048) -----------------
+
+/**
+ * Storage configuration forwarded to `SCP.withStorage` / `new SCP({storage})`.
+ *
+ * Phase 4 PR 1 accepts only `{ type: "in_memory" }`; PR 3 adds SQLite
+ * variants. Unknown types raise `SCP-VALID-7005`.
+ */
+export type StorageConfig = { type: "in_memory" } | { type: string; [k: string]: unknown };
+
+/** Constructor options for `new SCP(...)`. */
+export interface ScpOptions {
+  storage?: StorageConfig;
+  persistence?: unknown;
+}
+
+/**
+ * Caller-owned SCP instance — the preferred SDK entry point.
+ *
+ * Each `SCP` wraps an independent native `BridgeInstance` (registries,
+ * transport, context manager). The free-function façade (`Identity.create`,
+ * `Context.create`, etc.) delegates to a process-wide default instance and
+ * emits a one-time `console.warn` on first use. Removal target for the
+ * façade: two release cycles after Phase 4 merge.
+ *
+ * `SCP` is a NAPI-only feature — constructing it in a WASM/browser
+ * environment throws `TransportError` (`SCP-TRANS-5001`).
+ */
+export declare class SCP {
+  /** Constructs a fresh `SCP` instance (NAPI-only). */
+  constructor(options?: ScpOptions);
+  /** Returns a wrapper around the process-wide default instance. */
+  static default(): SCP;
+  /**
+   * Monotonic u64 id as a base-10 string (u64 exceeds JS safe-integer
+   * range). Stable across calls on the default instance; unique per
+   * fresh `new SCP()`.
+   */
+  readonly instanceId: string;
+  suspend(): void;
+  resume(): void;
+  /**
+   * @param timeoutSecs Maximum seconds to wait for in-flight tasks.
+   *   Defaults to 5.
+   */
+  shutdown(timeoutSecs?: number): Promise<void>;
+}

@@ -11,6 +11,7 @@
  */
 
 import { getBridge } from "./internal/bridge";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 
 /**
  * Suspend the bridge instance for mobile/desktop backgrounding.
@@ -29,6 +30,7 @@ import { getBridge } from "./internal/bridge";
  * @throws {TransportError} If transport cleanup fails.
  */
 export async function scpSuspend(): Promise<void> {
+  deprecatedDefaultInstance("scpSuspend");
   const bridge = await getBridge();
   bridge.suspend();
 }
@@ -46,6 +48,7 @@ export async function scpSuspend(): Promise<void> {
  * @throws {ContextError} If the bridge has been permanently shut down.
  */
 export async function scpResume(): Promise<void> {
+  deprecatedDefaultInstance("scpResume");
   const bridge = await getBridge();
   bridge.resume();
 }

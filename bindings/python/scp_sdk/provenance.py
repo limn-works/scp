@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import ScpError
 
 
@@ -29,6 +30,7 @@ def _bridge() -> Any:
         ) from exc
 
 
+@deprecated_default_instance
 def evaluate_provenance_quality(
     *,
     source_context: str | None = None,
@@ -68,6 +70,7 @@ def evaluate_provenance_quality(
     )
 
 
+@deprecated_default_instance
 def attach(
     source_context_id: str,
     source_type: str,
@@ -116,6 +119,7 @@ def attach(
     )
 
 
+@deprecated_default_instance
 def check_chain_depth(
     chain_depth: int,
     *,

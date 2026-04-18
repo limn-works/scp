@@ -13,6 +13,7 @@ import json
 import logging
 from typing import Any
 
+from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import ScpError
 
 logger = logging.getLogger("scp_sdk")
@@ -37,6 +38,7 @@ def _bridge() -> Any:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 def estimate_cost(
     policy_json: str,
     action_type: str,
@@ -69,6 +71,7 @@ def estimate_cost(
     return bridge.economy_estimate_cost(policy_json, action_type, m)
 
 
+@deprecated_default_instance
 def policy_requires_payment(policy_json: str) -> bool:
     """Check whether an economic policy requires payment for any action.
 
@@ -82,6 +85,7 @@ def policy_requires_payment(policy_json: str) -> bool:
     return bridge.economy_policy_requires_payment(policy_json)
 
 
+@deprecated_default_instance
 def auto_accept_blocked(policy_json: str) -> bool:
     """Check whether auto-accept is blocked by the economic policy.
 
@@ -97,6 +101,7 @@ def auto_accept_blocked(policy_json: str) -> bool:
     return bridge.economy_auto_accept_blocked(policy_json)
 
 
+@deprecated_default_instance
 def check_policy_lock(policy_json: str) -> bool:
     """Check whether an economic policy is locked (immutable).
 
@@ -110,6 +115,7 @@ def check_policy_lock(policy_json: str) -> bool:
     return bridge.economy_check_policy_lock(policy_json)
 
 
+@deprecated_default_instance
 def validate_policy_change(current_json: str, proposed_json: str) -> bool:
     """Validate a proposed economic policy change.
 
@@ -127,6 +133,7 @@ def validate_policy_change(current_json: str, proposed_json: str) -> bool:
     return bridge.economy_validate_policy_change(current_json, proposed_json)
 
 
+@deprecated_default_instance
 def evaluate_formula(formula_json: str, metrics: dict[str, int] | None = None) -> int | None:
     """Evaluate a pricing formula against observable metrics.
 
@@ -150,6 +157,7 @@ def evaluate_formula(formula_json: str, metrics: dict[str, int] | None = None) -
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 def budget_remaining(context_id: str, did: str) -> int:
     """Query the remaining budget for a member in a context.
 
@@ -165,6 +173,7 @@ def budget_remaining(context_id: str, did: str) -> int:
     return bridge.economy_budget_remaining(context_id, did)
 
 
+@deprecated_default_instance
 def budget_grant(context_id: str, did: str, amount: int) -> None:
     """Grant spending budget to a member.
 
@@ -179,6 +188,7 @@ def budget_grant(context_id: str, did: str, amount: int) -> None:
     bridge.economy_budget_grant(context_id, did, amount)
 
 
+@deprecated_default_instance
 def budget_record_spend(context_id: str, did: str, amount: int) -> None:
     """Record a spend against a member's budget.
 
@@ -199,6 +209,7 @@ def budget_record_spend(context_id: str, did: str, amount: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 def antispam_record(context_id: str, sender_did: str, timestamp: int) -> None:
     """Record a message for antispam velocity tracking.
 
@@ -211,6 +222,7 @@ def antispam_record(context_id: str, sender_did: str, timestamp: int) -> None:
     bridge.economy_antispam_record(context_id, sender_did, timestamp)
 
 
+@deprecated_default_instance
 def antispam_velocity(context_id: str, sender_did: str, now: int) -> int:
     """Query the sender's message velocity within the sliding window.
 
@@ -226,6 +238,7 @@ def antispam_velocity(context_id: str, sender_did: str, now: int) -> int:
     return bridge.economy_antispam_velocity(context_id, sender_did, now)
 
 
+@deprecated_default_instance
 def antispam_escalated_cost(
     context_id: str,
     sender_did: str,

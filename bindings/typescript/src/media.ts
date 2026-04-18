@@ -9,6 +9,7 @@
 
 import { mapBridgeError } from "./errors";
 import { getBridge } from "./internal/bridge";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 import { safeJsonParse } from "./internal/json-utils";
 
 // ---------------------------------------------------------------------------
@@ -98,6 +99,7 @@ export async function mediaCheckCapability(
   ceiling: string[],
   capability: string,
 ): Promise<boolean> {
+  deprecatedDefaultInstance("mediaCheckCapability");
   try {
     const bridge = await getBridge();
     return bridge.mediaCheckCapability(ceiling, capability);
@@ -125,6 +127,7 @@ export async function mediaInitiateSession(
   participants: string[],
   timestamp: number,
 ): Promise<MediaSession> {
+  deprecatedDefaultInstance("mediaInitiateSession");
   try {
     const bridge = await getBridge();
     const raw = bridge.mediaInitiateSession(
@@ -149,6 +152,7 @@ export async function mediaInitiateSession(
  * @throws {ContextError} If the session is not in the Initiating state.
  */
 export async function mediaActivateSession(sessionJson: string): Promise<MediaSession> {
+  deprecatedDefaultInstance("mediaActivateSession");
   try {
     const bridge = await getBridge();
     const raw = bridge.mediaActivateSession(sessionJson);
@@ -171,6 +175,7 @@ export async function mediaJoinSession(
   sessionJson: string,
   participantDid: string,
 ): Promise<MediaSession> {
+  deprecatedDefaultInstance("mediaJoinSession");
   try {
     const bridge = await getBridge();
     const raw = bridge.mediaJoinSession(sessionJson, participantDid);
@@ -193,6 +198,7 @@ export async function mediaEndSession(
   sessionJson: string,
   timestamp: number,
 ): Promise<EndSessionResult> {
+  deprecatedDefaultInstance("mediaEndSession");
   try {
     const bridge = await getBridge();
     const raw = bridge.mediaEndSession(sessionJson, timestamp);
@@ -223,6 +229,7 @@ export async function mediaCreateOffer(
   sdp: string,
   senderDid: string,
 ): Promise<SignalingResult> {
+  deprecatedDefaultInstance("mediaCreateOffer");
   try {
     const bridge = await getBridge();
     const raw = bridge.mediaCreateOffer(sessionId, sdp, senderDid);
@@ -249,6 +256,7 @@ export async function mediaCreateAnswer(
   sdp: string,
   senderDid: string,
 ): Promise<SignalingResult> {
+  deprecatedDefaultInstance("mediaCreateAnswer");
   try {
     const bridge = await getBridge();
     const raw = bridge.mediaCreateAnswer(sessionId, sdp, senderDid);
@@ -280,6 +288,7 @@ export async function mediaCreateIceCandidate(
     sdpMlineIndex?: number;
   },
 ): Promise<SignalingResult> {
+  deprecatedDefaultInstance("mediaCreateIceCandidate");
   try {
     const bridge = await getBridge();
     const raw = bridge.mediaCreateIceCandidate(
@@ -310,6 +319,7 @@ export async function mediaCreateSessionEnd(
   sessionId: string,
   senderDid: string,
 ): Promise<SignalingResult> {
+  deprecatedDefaultInstance("mediaCreateSessionEnd");
   try {
     const bridge = await getBridge();
     const raw = bridge.mediaCreateSessionEnd(sessionId, senderDid);
@@ -331,6 +341,7 @@ export async function mediaCreateSessionEnd(
  * @throws {ValidationError} If the JSON is not a valid signaling message.
  */
 export async function mediaSendSignaling(signalingJson: string): Promise<SendSignalingResult> {
+  deprecatedDefaultInstance("mediaSendSignaling");
   try {
     const bridge = await getBridge();
     const raw = bridge.mediaSendSignaling(signalingJson);
@@ -357,6 +368,7 @@ export async function mediaVerifySenderAttribution(
   signalingJson: string,
   envelopeSenderDid: string,
 ): Promise<boolean> {
+  deprecatedDefaultInstance("mediaVerifySenderAttribution");
   try {
     const bridge = await getBridge();
     return bridge.mediaVerifySenderAttribution(signalingJson, envelopeSenderDid);

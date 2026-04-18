@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import ScpError
 
 
@@ -34,6 +35,7 @@ def _bridge() -> Any:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 def check_media_capability(
     ceiling: list[str],
     capability: str,
@@ -56,6 +58,7 @@ def check_media_capability(
     return bridge.media_check_capability(ceiling, capability)
 
 
+@deprecated_default_instance
 def initiate_session(
     context_id: str,
     ceiling: list[str],
@@ -89,6 +92,7 @@ def initiate_session(
     )
 
 
+@deprecated_default_instance
 def activate_session(session_json: str) -> dict[str, Any]:
     """Activate a media session (transition from Initiating to Active).
 
@@ -106,6 +110,7 @@ def activate_session(session_json: str) -> dict[str, Any]:
     return dict(bridge.media_activate_session(session_json))
 
 
+@deprecated_default_instance
 def join_session(session_json: str, participant_did: str) -> dict[str, Any]:
     """Add a participant to a media session.
 
@@ -123,6 +128,7 @@ def join_session(session_json: str, participant_did: str) -> dict[str, Any]:
     return dict(bridge.media_join_session(session_json, participant_did))
 
 
+@deprecated_default_instance
 def end_session(
     session_json: str,
     timestamp: int,
@@ -154,6 +160,7 @@ def end_session(
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 def create_offer(
     session_id: str,
     sdp: str,
@@ -174,6 +181,7 @@ def create_offer(
     return dict(bridge.media_create_offer(session_id, sdp, sender_did))
 
 
+@deprecated_default_instance
 def create_answer(
     session_id: str,
     sdp: str,
@@ -194,6 +202,7 @@ def create_answer(
     return dict(bridge.media_create_answer(session_id, sdp, sender_did))
 
 
+@deprecated_default_instance
 def create_ice_candidate(
     session_id: str,
     candidate: str,
@@ -224,6 +233,7 @@ def create_ice_candidate(
     )
 
 
+@deprecated_default_instance
 def create_session_end(
     session_id: str,
     sender_did: str,
@@ -242,6 +252,7 @@ def create_session_end(
     return dict(bridge.media_create_session_end(session_id, sender_did))
 
 
+@deprecated_default_instance
 def send_signaling(signaling_json: str) -> dict[str, str]:
     """Serialize a signaling message for transport.
 
@@ -259,6 +270,7 @@ def send_signaling(signaling_json: str) -> dict[str, str]:
     return dict(bridge.media_send_signaling(signaling_json))
 
 
+@deprecated_default_instance
 def verify_sender_attribution(
     signaling_json: str,
     envelope_sender_did: str,

@@ -15,6 +15,7 @@ import { ContextError, mapBridgeError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import type { BridgeContextHandle } from "./internal/bridge";
 import { getBridge, getBridgeSync } from "./internal/bridge";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 import { safeJsonParse } from "./internal/json-utils";
 import type {
   AssetEntry,
@@ -1530,6 +1531,7 @@ export class Context implements AsyncDisposable {
  * @throws {ContextError} If restoration fails (SCP-CTX-2064).
  */
 export async function restoreContext(contextId: string): Promise<void> {
+  deprecatedDefaultInstance("restoreContext");
   try {
     const bridge = await getBridge();
     await bridge.contextRestore(contextId);
@@ -1548,6 +1550,7 @@ export async function restoreContext(contextId: string): Promise<void> {
  * @throws {ContextError} If restoration fails (SCP-CTX-2065).
  */
 export async function restoreAllContexts(): Promise<string> {
+  deprecatedDefaultInstance("restoreAllContexts");
   try {
     const bridge = await getBridge();
     return await bridge.contextRestoreAll();
@@ -1666,6 +1669,7 @@ export async function evaluateInvitation(
   spendingJson?: string,
   trustedDids?: readonly string[],
 ): Promise<InvitationEvaluationResult> {
+  deprecatedDefaultInstance("evaluateInvitation");
   try {
     const bridge = await getBridge();
     const trustedDidsJson = trustedDids ? JSON.stringify(trustedDids) : undefined;

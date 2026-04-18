@@ -10,6 +10,7 @@
 
 import { mapBridgeError, ValidationError } from "./errors";
 import { getBridge } from "./internal/bridge";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 import { safeJsonParse } from "./internal/json-utils";
 import type { AddressResolution, ResolutionLayer, ResolutionPath, TrustLevel } from "./types";
 
@@ -152,6 +153,7 @@ function parseDiscoveryResult(item: Record<string, unknown>): DiscoveryResult {
  * @throws {ValidationError} If the address is malformed.
  */
 export async function parseAddress(address: string): Promise<ParsedAddress> {
+  deprecatedDefaultInstance("parseAddress");
   try {
     const bridge = await getBridge();
     const result = await bridge.discoveryParseAddress(address);
@@ -172,6 +174,7 @@ export async function createQuery(options?: {
   keywords?: string[];
   minHistorySecs?: number;
 }): Promise<string> {
+  deprecatedDefaultInstance("createQuery");
   try {
     const bridge = await getBridge();
     return bridge.discoveryCreateQuery(
@@ -191,6 +194,7 @@ export async function createQuery(options?: {
  * @returns The normalized address string.
  */
 export async function normalizeAddress(address: string): Promise<string> {
+  deprecatedDefaultInstance("normalizeAddress");
   try {
     const bridge = await getBridge();
     return bridge.discoveryNormalizeAddress(address);
@@ -208,6 +212,7 @@ export async function normalizeAddress(address: string): Promise<string> {
  * @throws {ValidationError} If the query is neither a DID nor an `scp://` URI.
  */
 export async function discoverContexts(query: string): Promise<DiscoveryResult[]> {
+  deprecatedDefaultInstance("discoverContexts");
   try {
     const bridge = await getBridge();
     const raw = await bridge.contextDiscover(query);
@@ -235,6 +240,7 @@ export async function discoverContexts(query: string): Promise<DiscoveryResult[]
  * @throws {ValidationError} If the query is neither a DID nor an `scp://` URI.
  */
 export async function resolveAddress(query: string): Promise<AddressResolution[]> {
+  deprecatedDefaultInstance("resolveAddress");
   const results = await discoverContexts(query);
   return results.map(
     (r): AddressResolution => ({
@@ -261,6 +267,7 @@ export async function resolveAddress(query: string): Promise<AddressResolution[]
  * @throws {ValidationError} If `ownerDid` is empty.
  */
 export async function petnameSet(ownerDid: string, targetDid: string, name: string): Promise<void> {
+  deprecatedDefaultInstance("petnameSet");
   try {
     const bridge = await getBridge();
     bridge.petnameSet(ownerDid, targetDid, name);
@@ -277,6 +284,7 @@ export async function petnameSet(ownerDid: string, targetDid: string, name: stri
  * @throws {ValidationError} If `ownerDid` is empty.
  */
 export async function petnameRemove(ownerDid: string, targetDid: string): Promise<void> {
+  deprecatedDefaultInstance("petnameRemove");
   try {
     const bridge = await getBridge();
     bridge.petnameRemove(ownerDid, targetDid);
@@ -298,6 +306,7 @@ export async function petnameSetContext(
   contextId: string,
   name: string,
 ): Promise<void> {
+  deprecatedDefaultInstance("petnameSetContext");
   try {
     const bridge = await getBridge();
     bridge.petnameSetContext(ownerDid, contextId, name);
@@ -314,6 +323,7 @@ export async function petnameSetContext(
  * @throws {ValidationError} If `ownerDid` is empty.
  */
 export async function petnameRemoveContext(ownerDid: string, contextId: string): Promise<void> {
+  deprecatedDefaultInstance("petnameRemoveContext");
   try {
     const bridge = await getBridge();
     bridge.petnameRemoveContext(ownerDid, contextId);
@@ -331,6 +341,7 @@ export async function petnameRemoveContext(ownerDid: string, contextId: string):
  * @throws {ValidationError} If `ownerDid` is empty.
  */
 export async function petnameResolveDid(ownerDid: string, name: string): Promise<string[]> {
+  deprecatedDefaultInstance("petnameResolveDid");
   try {
     const bridge = await getBridge();
     const json = bridge.petnameResolveDid(ownerDid, name);
@@ -349,6 +360,7 @@ export async function petnameResolveDid(ownerDid: string, name: string): Promise
  * @throws {ValidationError} If `ownerDid` is empty.
  */
 export async function petnameResolveContext(ownerDid: string, name: string): Promise<string[]> {
+  deprecatedDefaultInstance("petnameResolveContext");
   try {
     const bridge = await getBridge();
     const json = bridge.petnameResolveContext(ownerDid, name);
@@ -370,6 +382,7 @@ export async function petnameGetForDid(
   ownerDid: string,
   targetDid: string,
 ): Promise<string | null> {
+  deprecatedDefaultInstance("petnameGetForDid");
   try {
     const bridge = await getBridge();
     return bridge.petnameGetForDid(ownerDid, targetDid);
@@ -390,6 +403,7 @@ export async function petnameGetForContext(
   ownerDid: string,
   contextId: string,
 ): Promise<string | null> {
+  deprecatedDefaultInstance("petnameGetForContext");
   try {
     const bridge = await getBridge();
     return bridge.petnameGetForContext(ownerDid, contextId);
@@ -436,6 +450,7 @@ export async function handleRegister(
   registrantDid: string,
   options?: { description?: string; tags?: string[] },
 ): Promise<HandleRegisterResult> {
+  deprecatedDefaultInstance("handleRegister");
   try {
     const bridge = await getBridge();
     const result = bridge.handleRegister(
@@ -465,6 +480,7 @@ export async function handleLookup(
   handle: string,
   typeFilter?: string,
 ): Promise<HandleLookupResult> {
+  deprecatedDefaultInstance("handleLookup");
   try {
     const bridge = await getBridge();
     const result = bridge.handleLookup(discoveryContextId, handle, typeFilter);
@@ -487,6 +503,7 @@ export async function handleDeregister(
   handle: string,
   did: string,
 ): Promise<HandleDeregisterResult> {
+  deprecatedDefaultInstance("handleDeregister");
   try {
     const bridge = await getBridge();
     const result = bridge.handleDeregister(discoveryContextId, handle, did);
@@ -558,6 +575,7 @@ export async function scopeRegister(
   registrantDid: string,
   options?: { description?: string; tags?: string[] },
 ): Promise<ScopeRegisterResult> {
+  deprecatedDefaultInstance("scopeRegister");
   try {
     const bridge = await getBridge();
     const result = bridge.scopeRegister(
@@ -586,6 +604,7 @@ export async function scopeLookup(
   scopeContextId: string,
   name: string,
 ): Promise<ScopeLookupResult> {
+  deprecatedDefaultInstance("scopeLookup");
   try {
     const bridge = await getBridge();
     const result = bridge.scopeLookup(scopeContextId, name);
@@ -608,6 +627,7 @@ export async function scopeDeregister(
   name: string,
   did: string,
 ): Promise<ScopeDeregisterResult> {
+  deprecatedDefaultInstance("scopeDeregister");
   try {
     const bridge = await getBridge();
     const result = bridge.scopeDeregister(scopeContextId, name, did);
@@ -639,6 +659,7 @@ export async function addressResolve(
   address: string,
   knownContextsJson?: string,
 ): Promise<AddressResolution[]> {
+  deprecatedDefaultInstance("addressResolve");
   try {
     const bridge = await getBridge();
     const raw = await bridge.addressResolve(ownerDid, address, knownContextsJson);

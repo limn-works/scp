@@ -12,6 +12,7 @@
 import { mapBridgeError } from "./errors";
 import type { Identity } from "./identity";
 import { getBridge } from "./internal/bridge";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,6 +76,7 @@ export interface ScpIdAuthentication {
  *   or `ttlSeconds` is 0 or exceeds 300.
  */
 export async function scpidChallenge(audience: string, ttlSeconds = 300): Promise<ScpIdChallenge> {
+  deprecatedDefaultInstance("scpidChallenge");
   try {
     const bridge = await getBridge();
     const json = bridge.scpidChallenge(audience, ttlSeconds);
@@ -103,6 +105,7 @@ export async function scpidSign(
   signingKeyId: string,
   challenge: ScpIdChallenge,
 ): Promise<ScpIdResponse> {
+  deprecatedDefaultInstance("scpidSign");
   try {
     const bridge = await getBridge();
     const json = bridge.scpidSign(identity.did, signingKeyId, JSON.stringify(challenge));
@@ -135,6 +138,7 @@ export async function scpidVerify(
   response: ScpIdResponse,
   challenge: ScpIdChallenge,
 ): Promise<ScpIdAuthentication> {
+  deprecatedDefaultInstance("scpidVerify");
   try {
     const bridge = await getBridge();
     const json = bridge.scpidVerify(JSON.stringify(response), JSON.stringify(challenge));

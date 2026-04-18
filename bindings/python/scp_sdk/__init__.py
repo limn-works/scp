@@ -161,6 +161,7 @@ from scp_sdk.provenance import (
     check_chain_depth,
     evaluate_provenance_quality,
 )
+from scp_sdk.scp import SCP
 from scp_sdk.server import Node, Relay
 from scp_sdk.sync import classify_offline, get_policy, run_sync
 from scp_sdk.tools import (
@@ -217,6 +218,7 @@ __all__ = [
     "BRIDGE_ERROR_MAP",
     "PARTICIPATION_FACT_VARIANTS",
     "PARTICIPATION_THRESHOLD_OPERATORS",
+    "SCP",
     "AssetEntry",
     "Attestation",
     "BatchPublishResult",

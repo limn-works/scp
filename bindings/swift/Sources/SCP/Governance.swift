@@ -1340,6 +1340,11 @@ public extension Context {
 /// ## Provenance
 ///
 /// - Spec section 17.5
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func importContext(
     data: Data,
     importFn: ContextLifecycleBridge.ImportFn = ContextLifecycleBridge.defaultImport
@@ -1360,6 +1365,11 @@ public func importContext(
 /// ## Provenance
 ///
 /// - Spec section 5.14 (Broadcast)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func registerLocalDid(
     did: String,
     registerLocalDidFn: ContextLifecycleBridge.RegisterLocalDidFn =
@@ -1378,6 +1388,11 @@ public func registerLocalDid(
 /// ## Provenance
 ///
 /// - Spec section 5.14 (Broadcast)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func isLocalDid(
     did: String,
     isLocalDidFn: ContextLifecycleBridge.IsLocalDidFn =
@@ -1495,6 +1510,11 @@ public extension Context {
 /// ## Provenance
 ///
 /// - Issue #559 (context lifecycle methods)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func restoreContext(
     contextId: String,
     restoreFn: GovernanceBridge.RestoreContextFn =
@@ -1515,6 +1535,11 @@ public func restoreContext(
 /// ## Provenance
 ///
 /// - Issue #559 (context lifecycle methods)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func restoreAllContexts(
     restoreAllFn: GovernanceBridge.RestoreAllContextsFn =
         GovernanceBridge.defaultRestoreAllContexts
@@ -1550,6 +1575,11 @@ public func restoreAllContexts(
 ///
 /// - Spec section 23.7 (Participation Requirements)
 /// - ADR-017 Layer 2
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func verifyParticipationRequirementsBridge(
     profileJson: String,
     requirementsJson: String,

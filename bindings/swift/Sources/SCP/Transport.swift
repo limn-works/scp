@@ -112,6 +112,11 @@ public enum TransportBridge {
 /// - ADR-032 (Transport) in `.docs/adrs/phase-2.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func connectTransport(
     config: TransportConfig,
     connectFn: TransportBridge.ConnectFn = TransportBridge.defaultConnect
@@ -140,6 +145,11 @@ public func connectTransport(
 /// - ADR-032 (Transport) in `.docs/adrs/phase-2.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func queryTransportStatus(
     manager: TransportManager,
     statusFn: TransportBridge.StatusFn = TransportBridge.defaultStatus
@@ -165,6 +175,11 @@ public func queryTransportStatus(
 /// - ADR-032 (Transport) in `.docs/adrs/phase-2.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - GitHub issue #590
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func disconnectTransport(
     manager: TransportManager,
     disconnectFn: TransportBridge.DisconnectFn = TransportBridge.defaultDisconnect

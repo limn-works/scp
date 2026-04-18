@@ -23,6 +23,8 @@ import threading
 from collections.abc import Coroutine
 from typing import Any, TypeVar
 
+from scp_sdk._deprecation import deprecated_default_instance
+
 _T = TypeVar("_T")
 
 _sync_loop: asyncio.AbstractEventLoop | None = None
@@ -94,6 +96,7 @@ def _bridge() -> Any:
         ) from exc
 
 
+@deprecated_default_instance
 def classify_offline(last_relay_contact: int, now: int) -> str:
     """Classify an offline duration into the appropriate recovery tier.
 
@@ -114,6 +117,7 @@ def classify_offline(last_relay_contact: int, now: int) -> str:
     return bridge.sync_classify_offline(last_relay_contact, now)
 
 
+@deprecated_default_instance
 def get_policy() -> dict[str, Any]:
     """Return the default sync policy parameters.
 
