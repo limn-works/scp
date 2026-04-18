@@ -375,10 +375,35 @@ pub type ToolHandler =
 
 /// Global shared `InMemoryDhtClient` used by the DID resolver.
 ///
-/// Stored here so that `identity_create` can publish newly created DID
-/// documents to the same DHT client that the resolver reads from. Without
-/// this, UCAN validation fails because `IdentityBackedDidResolver` cannot
-/// find the issuer's DID document.
+/// # Why this remains a process-global after the #1549 Phase 4 singleton purge
+///
+/// Every other bridge-level `OnceLock` was migrated onto
+/// [`NapiBridgeInstance`] so that an `SCP` instance can be constructed, used,
+/// and dropped without leaking state into a second instance. `SHARED_DHT_CLIENT`
+/// intentionally stays process-global because the cross-identity Alice+Bob
+/// integration flows published and read from a single in-memory DHT:
+///
+///   1. `Alice.identity_create(...)` publishes a DID document into the DHT.
+///   2. `Bob.ucan_validate(token_minted_by_alice)` must resolve Alice's DID
+///      document to verify her signature — in the **same process** — using
+///      the **same DHT instance** Alice published to.
+///
+/// If this were per-bridge, Alice's document would land in her instance's DHT
+/// and Bob's resolver would see an empty DHT, and the test would spuriously
+/// report a missing DID document. That was the behaviour before #1144, and it
+/// broke every parity test that exercises multi-identity UCAN paths.
+///
+/// Production ecosystems do not share this constraint because they use real
+/// `did:dht` (Mainline DHT, bittorrent BEP44) or `did:web` resolvers backed by
+/// the public network, not an in-memory stub. The `InMemoryDhtClient` is a
+/// test/demo affordance; its process-global scope matches the scope of the
+/// network it is emulating, and it stores only signed, public DID documents.
+///
+/// # Ratchet justification
+///
+/// The #1549 Phase 4 PR 2 plan explicitly retains `SHARED_DHT_CLIENT` alongside
+/// `DEFAULT_BRIDGE_INSTANCE`, `RUNTIME`, `HANDLE_COUNT`, and `INSTANCE_ID_COUNTER`
+/// in the enforcement allowlist. See `scripts/check-no-bridge-globals.sh`.
 ///
 /// See issue #1144 (UCAN validation tests require shared DHT state).
 static SHARED_DHT_CLIENT: OnceLock<Arc<scp_identity::InMemoryDhtClient>> = OnceLock::new();
