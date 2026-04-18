@@ -126,6 +126,34 @@ pub struct NapiBridgeInstance {
     /// Wrapped in `Arc` for cheap clones into the `MerkleEventLogProvider`.
     pub(crate) protocol_repository:
         Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
+
+    // -----------------------------------------------------------------
+    // #1549 Phase 4 PR 2 commit 1 — additive typed fields replacing
+    // process-global singletons in later commits.
+    // -----------------------------------------------------------------
+    /// MCP server registry (replaces `mcp_server_registry` `OnceLock` in
+    /// `mcp.rs`).
+    ///
+    /// Migrated from a process-global
+    /// `OnceLock<DashMap<String, McpServerEntry>>` singleton in commit 4.
+    /// Cleared by [`BridgeInstanceCore::bridge_specific_shutdown`].
+    pub(crate) mcp_server_registry: Arc<DashMap<String, crate::mcp::McpServerEntry>>,
+
+    /// MCP client registry (replaces `mcp_client_registry` `OnceLock` in
+    /// `mcp.rs`).
+    ///
+    /// Migrated from a process-global
+    /// `OnceLock<DashMap<String, McpClientEntry>>` singleton in commit 4.
+    /// Cleared by [`BridgeInstanceCore::bridge_specific_shutdown`].
+    pub(crate) mcp_client_registry: Arc<DashMap<String, crate::mcp::McpClientEntry>>,
+
+    /// Shared full-stack test network (replaces `NETWORK` in `testing.rs`).
+    ///
+    /// Migrated from a process-global
+    /// `std::sync::Mutex<Option<FullStackNetwork>>` singleton in commit 9.
+    /// Feature-gated behind `allow_in_memory_custody` to mirror `testing.rs`.
+    #[cfg(feature = "allow_in_memory_custody")]
+    pub(crate) network: std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>>,
 }
 
 impl NapiBridgeInstance {
@@ -145,6 +173,10 @@ impl NapiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository,
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "allow_in_memory_custody")]
+            network: std::sync::Mutex::new(None),
         }
     }
 
@@ -164,6 +196,10 @@ impl NapiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository,
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "allow_in_memory_custody")]
+            network: std::sync::Mutex::new(None),
         }
     }
 
@@ -237,6 +273,10 @@ impl NapiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository,
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "allow_in_memory_custody")]
+            network: std::sync::Mutex::new(None),
         }
     }
 

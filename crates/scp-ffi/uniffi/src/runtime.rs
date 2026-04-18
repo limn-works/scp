@@ -145,6 +145,43 @@ pub struct UniffiBridgeInstance {
     /// Wrapped in `Arc` for cheap clones into the `MerkleEventLogProvider`.
     pub(crate) protocol_repository:
         Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
+
+    // -----------------------------------------------------------------
+    // #1549 Phase 4 PR 2 commit 1 — additive typed fields replacing
+    // process-global singletons in later commits.
+    // -----------------------------------------------------------------
+    /// Identity link attestation registry (replaces
+    /// `identity_link_attestation_registry` `OnceLock` in `bridge.rs`).
+    ///
+    /// Keyed by DID string. Migrated from a process-global
+    /// `OnceLock<DashMap<String, Vec<IdentityLinkAttestation>>>` singleton in
+    /// commit 6.
+    pub(crate) identity_link_attestation_registry:
+        Arc<DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>>,
+
+    /// Context handle registry (replaces `context_handle_registry` `OnceLock`
+    /// in `bridge.rs`).
+    ///
+    /// Maps `context_id` to `Arc<ContextHandle>`. Migrated from a process-
+    /// global `OnceLock<DashMap<String, Arc<ContextHandle>>>` singleton in
+    /// commit 6. Used by the MCP bridge provider to look up per-context state.
+    pub(crate) context_handle_registry: Arc<DashMap<String, Arc<crate::bridge::ContextHandle>>>,
+
+    /// MCP server registry (replaces `mcp_server_registry` `OnceLock` in
+    /// `bridge.rs`).
+    ///
+    /// Migrated from a process-global
+    /// `OnceLock<DashMap<String, McpServerEntry>>` singleton in commit 4.
+    /// Cleared by [`BridgeInstanceCore::bridge_specific_shutdown`].
+    pub(crate) mcp_server_registry: Arc<DashMap<String, crate::bridge::McpServerEntry>>,
+
+    /// MCP client registry (replaces `mcp_client_registry` `OnceLock` in
+    /// `bridge.rs`).
+    ///
+    /// Migrated from a process-global
+    /// `OnceLock<DashMap<String, McpClientEntry>>` singleton in commit 4.
+    /// Cleared by [`BridgeInstanceCore::bridge_specific_shutdown`].
+    pub(crate) mcp_client_registry: Arc<DashMap<String, crate::bridge::McpClientEntry>>,
 }
 
 impl UniffiBridgeInstance {
@@ -164,6 +201,10 @@ impl UniffiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository,
+            identity_link_attestation_registry: Arc::new(DashMap::new()),
+            context_handle_registry: Arc::new(DashMap::new()),
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -186,6 +227,10 @@ impl UniffiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository,
+            identity_link_attestation_registry: Arc::new(DashMap::new()),
+            context_handle_registry: Arc::new(DashMap::new()),
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -268,6 +313,10 @@ impl UniffiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository,
+            identity_link_attestation_registry: Arc::new(DashMap::new()),
+            context_handle_registry: Arc::new(DashMap::new()),
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
         }
     }
 

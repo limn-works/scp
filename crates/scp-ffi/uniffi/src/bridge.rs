@@ -5351,19 +5351,19 @@ fn deregister_context_handle(context_id: &str) {
 // ---------------------------------------------------------------------------
 
 /// Internal state for a running MCP server.
-struct McpServerEntry {
+pub(crate) struct McpServerEntry {
     /// Shutdown signal sender. Dropping this signals the transport task to stop.
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Handle to the tokio task running the transport.
-    _task_handle: tokio::task::JoinHandle<()>,
+    pub(crate) _task_handle: tokio::task::JoinHandle<()>,
     /// Whether the server has been stopped.
-    stopped: bool,
+    pub(crate) stopped: bool,
 }
 
 /// Internal state for an active MCP client connection.
-struct McpClientEntry {
+pub(crate) struct McpClientEntry {
     /// The real MCP client, connected and initialized.
-    client: std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>,
+    pub(crate) client: std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>,
 }
 
 fn mcp_server_registry() -> &'static dashmap::DashMap<String, McpServerEntry> {
@@ -5401,7 +5401,7 @@ pub(crate) fn clear_mcp_registries() {
 const MCP_MAX_LINE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Transport wrapper that delegates to either stdio or SSE.
-enum McpUniFFITransportWrapper {
+pub(crate) enum McpUniFFITransportWrapper {
     Stdio(McpStdioTransport),
     Sse(McpSseTransport),
 }
@@ -5431,7 +5431,7 @@ impl scp_mcp::client::McpTransport for McpUniFFITransportWrapper {
 }
 
 /// Stdio MCP transport: communicates with a subprocess via stdin/stdout.
-struct McpStdioTransport {
+pub(crate) struct McpStdioTransport {
     inner: std::sync::Mutex<McpStdioTransportInner>,
 }
 
@@ -5561,7 +5561,7 @@ impl Drop for McpStdioTransport {
 ///
 /// SSE transport is a placeholder — stdio is the primary transport for
 /// mobile clients. SSE methods return descriptive errors.
-struct McpSseTransport {
+pub(crate) struct McpSseTransport {
     _url: String,
 }
 

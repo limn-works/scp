@@ -1085,7 +1085,7 @@ impl ContextProvider for FfiBridgeProvider {
 // ---------------------------------------------------------------------------
 
 /// State for an active MCP server instance.
-struct McpServerState {
+pub(crate) struct McpServerState {
     /// The identity DID running this server.
     identity_did: String,
     /// The context IDs being served.
@@ -1107,7 +1107,7 @@ struct McpServerState {
 }
 
 /// State for an active MCP client connection.
-struct McpClientState {
+pub(crate) struct McpClientState {
     /// The transport mode (stdio or sse).
     transport: String,
     /// For stdio, the command used to spawn the subprocess.

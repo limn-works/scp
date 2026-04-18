@@ -53,6 +53,7 @@
 //! is wrapped in `tokio::sync::Mutex` because accesses happen across
 //! `.await` points.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -64,6 +65,9 @@ use std::time::Duration;
 use dashmap::DashMap;
 use scp_core::context::ContextManager;
 use scp_core::context::ContextPersistence;
+use scp_core::discovery::handles::HandleRegistry;
+use scp_core::discovery::petnames::PetnameMap;
+use scp_core::discovery::scope::ScopeRegistry;
 use scp_protocol::context::invitation::RateLimitTracker;
 use scp_protocol::economy::antispam::SenderVelocityTracker;
 use scp_protocol::economy::budget::MemberBudgetTracker;
@@ -373,6 +377,28 @@ pub struct CoreFields {
     /// [`std::sync::Mutex`] (guards cross `.await` points during shutdown
     /// drain).
     tasks: AsyncMutex<JoinSet<()>>,
+
+    // -----------------------------------------------------------------
+    // Petname / handle / scope — #1549 Phase 4 PR 2 commit 2 (additive)
+    // -----------------------------------------------------------------
+    //
+    // These three maps replace the global `OnceLock<Mutex<HashMap<...>>>`
+    // singletons in `scp_ffi_common::petname_helpers`. The petname helpers
+    // are migrated to use these fields in commit 7 (not this slice). Until
+    // then the fields sit empty — adding them here (commit 1/2) establishes
+    // the slot so downstream commits can migrate callers without re-touching
+    // this struct.
+    /// Per-identity petname maps. Keyed by owner DID (spec §3.7 — petnames
+    /// are per-identity private state).
+    petname_maps: Mutex<HashMap<String, PetnameMap>>,
+
+    /// Per-context handle registries. Keyed by context ID (spec §22.3.1).
+    handle_registries: Mutex<HashMap<String, HandleRegistry>>,
+
+    /// Per-context scope registries. Keyed by context ID (spec §22.3.5,
+    /// ADR-043). Separate from handle registries — scope entries and handle
+    /// entries never share storage.
+    scope_registries: Mutex<HashMap<String, ScopeRegistry>>,
 }
 
 impl Default for CoreFields {
@@ -418,6 +444,9 @@ impl CoreFields {
             instance_id: next_instance_id(),
             cancel: CancellationToken::new(),
             tasks: AsyncMutex::new(JoinSet::new()),
+            petname_maps: Mutex::new(HashMap::new()),
+            handle_registries: Mutex::new(HashMap::new()),
+            scope_registries: Mutex::new(HashMap::new()),
         }
     }
 
@@ -493,6 +522,9 @@ impl CoreFields {
             instance_id: next_instance_id(),
             cancel: CancellationToken::new(),
             tasks: AsyncMutex::new(JoinSet::new()),
+            petname_maps: Mutex::new(HashMap::new()),
+            handle_registries: Mutex::new(HashMap::new()),
+            scope_registries: Mutex::new(HashMap::new()),
         }
     }
 
@@ -618,6 +650,40 @@ impl CoreFields {
     #[must_use]
     pub fn has_context_manager(&self) -> bool {
         self.context_manager.get().is_some()
+    }
+
+    /// Returns a reference to the per-identity petname maps registry.
+    ///
+    /// Keyed by owner DID — each identity has its own [`PetnameMap`]
+    /// (spec §3.7, petnames are per-identity private state). Used by the
+    /// shared `petname_helpers` module to resolve address queries. Migrated
+    /// from a process-global `OnceLock<Mutex<HashMap<...>>>` singleton in
+    /// #1549 Phase 4 PR 2 commit 7.
+    #[must_use]
+    pub const fn petname_maps(&self) -> &Mutex<HashMap<String, PetnameMap>> {
+        &self.petname_maps
+    }
+
+    /// Returns a reference to the per-context handle registries registry.
+    ///
+    /// Keyed by context ID (spec §22.3.1). Used by the shared
+    /// `petname_helpers` module to resolve handle queries. Migrated from a
+    /// process-global `OnceLock<Mutex<HashMap<...>>>` singleton in #1549
+    /// Phase 4 PR 2 commit 7.
+    #[must_use]
+    pub const fn handle_registries(&self) -> &Mutex<HashMap<String, HandleRegistry>> {
+        &self.handle_registries
+    }
+
+    /// Returns a reference to the per-context scope registries registry.
+    ///
+    /// Keyed by context ID (spec §22.3.5, ADR-043). Used by the shared
+    /// `petname_helpers` module to resolve scope queries. Migrated from a
+    /// process-global `OnceLock<Mutex<HashMap<...>>>` singleton in #1549
+    /// Phase 4 PR 2 commit 7.
+    #[must_use]
+    pub const fn scope_registries(&self) -> &Mutex<HashMap<String, ScopeRegistry>> {
+        &self.scope_registries
     }
 
     /// Whether this instance has been shut down permanently.

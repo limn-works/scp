@@ -55,7 +55,7 @@
 //! roundtripping.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -345,6 +345,61 @@ pub struct PyBridgeInstance {
     /// construction) time. Typed (not `dyn`) because the `Storage` trait is
     /// not dyn-compatible (RPITIT).
     pub(crate) storage_provider: OnceLock<StorageProvider>,
+
+    // -----------------------------------------------------------------
+    // #1549 Phase 4 PR 2 commit 1 — additive typed fields replacing
+    // process-global singletons in later commits.
+    // -----------------------------------------------------------------
+    /// Per-context FFI bridge state registry (replaces `FFI_BRIDGE_STATE`).
+    ///
+    /// Migrated from a process-global `OnceLock<DashMap<String, FfiBridgeState>>`
+    /// singleton in commit 3. Wrapped in `Arc` so the existing free-function
+    /// helpers (`with_ffi_state` / `register_ffi_state` / `remove_ffi_state`)
+    /// can borrow it as `&'static` via the default-instance fallback pattern
+    /// established for `identity_registry`.
+    pub(crate) ffi_bridge_state: Arc<DashMap<String, FfiBridgeState>>,
+
+    /// MCP server registry (replaces `SERVER_REGISTRY` in `mcp.rs`).
+    ///
+    /// Migrated from a process-global `OnceLock<DashMap<String, McpServerState>>`
+    /// singleton in commit 4. Cleared by
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`] so server shutdown
+    /// senders drop during instance shutdown.
+    pub(crate) mcp_server_registry: Arc<DashMap<String, crate::mcp::McpServerState>>,
+
+    /// MCP client registry (replaces `CLIENT_REGISTRY` in `mcp.rs`).
+    ///
+    /// Migrated from a process-global `OnceLock<DashMap<String, McpClientState>>`
+    /// singleton in commit 4. Cleared by
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`] so client connections
+    /// drop during instance shutdown.
+    pub(crate) mcp_client_registry: Arc<DashMap<String, crate::mcp::McpClientState>>,
+
+    /// Bridge credential store (replaces `CREDENTIAL_STORE` in
+    /// `bridge_connector.rs`).
+    ///
+    /// Migrated from a process-global `OnceLock<InMemoryCredentialStore>`
+    /// singleton in commit 5. Production deployments should replace this with
+    /// a `Storage`-backed implementation when it lands (spec §12.11.2).
+    pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
+
+    /// Most recently connected relay URL (replaces `CONNECTED_RELAY_URL` in
+    /// `transport.rs`).
+    ///
+    /// Migrated from a process-global `OnceLock<RwLock<Option<String>>>`
+    /// singleton in commit 8. Distinct from `CoreFields::pending_relay_url`:
+    /// that tracks the pending URL saved for resume; this tracks the URL
+    /// currently bound to an active `TransportManager`.
+    pub(crate) connected_relay_url: RwLock<Option<String>>,
+
+    /// Shared full-stack test network (replaces `NETWORK` in `testing.rs`).
+    ///
+    /// Migrated from a process-global
+    /// `std::sync::Mutex<Option<FullStackNetwork>>` singleton in commit 9.
+    /// Feature-gated behind `allow_in_memory_custody` to mirror `testing.rs`
+    /// which is only compiled with that feature.
+    #[cfg(feature = "allow_in_memory_custody")]
+    pub(crate) network: std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>>,
 }
 
 impl PyBridgeInstance {
@@ -357,6 +412,15 @@ impl PyBridgeInstance {
             core: CoreFields::new(),
             identity_registry: Arc::new(DashMap::new()),
             storage_provider: OnceLock::new(),
+            ffi_bridge_state: Arc::new(DashMap::new()),
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
+            connected_relay_url: RwLock::new(None),
+            #[cfg(feature = "allow_in_memory_custody")]
+            network: std::sync::Mutex::new(None),
         }
     }
 
@@ -370,6 +434,15 @@ impl PyBridgeInstance {
             core: CoreFields::with_persistence(persistence),
             identity_registry: Arc::new(DashMap::new()),
             storage_provider: OnceLock::new(),
+            ffi_bridge_state: Arc::new(DashMap::new()),
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
+            connected_relay_url: RwLock::new(None),
+            #[cfg(feature = "allow_in_memory_custody")]
+            network: std::sync::Mutex::new(None),
         }
     }
 
@@ -429,6 +502,15 @@ impl PyBridgeInstance {
                             core: CoreFields::with_persistence_arc(persistence),
                             identity_registry: Arc::new(DashMap::new()),
                             storage_provider: OnceLock::new(),
+                            ffi_bridge_state: Arc::new(DashMap::new()),
+                            mcp_server_registry: Arc::new(DashMap::new()),
+                            mcp_client_registry: Arc::new(DashMap::new()),
+                            credential_store: Arc::new(
+                                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+                            ),
+                            connected_relay_url: RwLock::new(None),
+                            #[cfg(feature = "allow_in_memory_custody")]
+                            network: std::sync::Mutex::new(None),
                         };
                         let _ = instance
                             .storage_provider

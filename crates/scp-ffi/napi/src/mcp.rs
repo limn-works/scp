@@ -149,15 +149,15 @@ impl Drop for NapiMcpClientHandle {
 // ---------------------------------------------------------------------------
 
 /// Internal state for a running MCP server.
-struct McpServerEntry {
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    _task_handle: tokio::task::JoinHandle<()>,
-    stopped: bool,
+pub(crate) struct McpServerEntry {
+    pub(crate) shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) _task_handle: tokio::task::JoinHandle<()>,
+    pub(crate) stopped: bool,
 }
 
 /// Internal state for an active MCP client connection.
-struct McpClientEntry {
-    client: Mutex<McpClient<McpClientTransportWrapper>>,
+pub(crate) struct McpClientEntry {
+    pub(crate) client: Mutex<McpClient<McpClientTransportWrapper>>,
 }
 
 fn mcp_server_registry() -> &'static DashMap<String, McpServerEntry> {
@@ -189,7 +189,7 @@ pub(crate) fn clear_registries() {
 // ---------------------------------------------------------------------------
 
 /// Transport wrapper that delegates to either stdio or SSE.
-enum McpClientTransportWrapper {
+pub(crate) enum McpClientTransportWrapper {
     Stdio(StdioMcpTransport),
     Sse(SseMcpTransport),
 }
@@ -211,7 +211,7 @@ impl McpTransport for McpClientTransportWrapper {
 }
 
 /// Stdio MCP transport: communicates with a subprocess via stdin/stdout.
-struct StdioMcpTransport {
+pub(crate) struct StdioMcpTransport {
     inner: Mutex<StdioTransportInner>,
 }
 
@@ -328,7 +328,7 @@ impl Drop for StdioMcpTransport {
 }
 
 /// SSE MCP transport: communicates via HTTP with Server-Sent Events.
-struct SseMcpTransport {
+pub(crate) struct SseMcpTransport {
     _url: String,
 }
 
