@@ -1002,13 +1002,17 @@ static EMPTY_IDENTITY_REGISTRY: std::sync::OnceLock<DashMap<String, NapiIdentity
 
 /// Returns a reference to the default-instance identity registry.
 ///
-/// The registry is a typed field on [`NapiBridgeInstance`]. Falls back to
-/// an empty registry when the default bridge has not been initialized
-/// (e.g. in unit tests that don't call `init_context_manager`). The
-/// fallback is deleted in PR 2 once single-ownership sequencing is fully
-/// enforced.
+/// The registry is a typed field on [`NapiBridgeInstance`]. We eagerly call
+/// [`ensure_bridge_instance`] so writers never silently land in the dead
+/// `EMPTY_IDENTITY_REGISTRY` fallback — that was the H1 bug where
+/// `register_identity` wrote to the empty map before the bridge was
+/// initialized, and a later `with_identity` read from the real instance
+/// registry and missed the write. The fallback branch remains only for
+/// code paths that cannot trigger initialization (vanishingly rare); PR 2
+/// deletes it once single-ownership sequencing makes it unreachable.
 #[cfg(feature = "allow_in_memory_custody")]
 fn identity_registry() -> &'static DashMap<String, NapiIdentityEntry> {
+    ensure_bridge_instance();
     DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
         || EMPTY_IDENTITY_REGISTRY.get_or_init(DashMap::new),
         |bi| bi.identity_registry.as_ref(),
@@ -1148,6 +1152,7 @@ static EMPTY_UCAN_REGISTRY: std::sync::OnceLock<DashMap<String, UcanContextState
     std::sync::OnceLock::new();
 
 fn ucan_registry() -> &'static DashMap<String, UcanContextState> {
+    ensure_bridge_instance();
     DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
         || EMPTY_UCAN_REGISTRY.get_or_init(DashMap::new),
         |bi| bi.ucan_registry.as_ref(),

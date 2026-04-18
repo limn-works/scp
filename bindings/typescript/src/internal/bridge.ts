@@ -592,7 +592,22 @@ export interface Bridge {
 
   // Lifecycle
   version(): string;
-  shutdown(timeoutSecs: number): void;
+  /**
+   * Gracefully shuts down the default bridge instance.
+   *
+   * Awaits in-flight tasks up to `timeoutMillis` milliseconds, aborts any
+   * remaining tasks when the deadline expires, clears registries,
+   * disconnects transport, and runs shutdown hooks. The unit is
+   * milliseconds after the #1549 Phase 4 unit unification — pass `1000`
+   * for a 1-second deadline, not `1`.
+   *
+   * Returns a `Promise<void>` — **callers must `await` it**. Previously
+   * the NAPI implementation was synchronous; a fire-and-forget call
+   * worked by accident. After the async migration, fire-and-forget leaves
+   * the shutdown running in the background and clears bridge state under
+   * later tests/requests, causing spurious registry-miss failures.
+   */
+  shutdown(timeoutMillis: number): Promise<void>;
   suspend(): void;
   resume(): void;
 }

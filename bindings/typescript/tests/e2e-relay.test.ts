@@ -160,7 +160,10 @@ if (bridge === null || serverAddon === null) {
 
     // Shutdown timeout is in milliseconds after #1549 Phase 4 unit
     // unification — 1000 ms is enough for pending tasks to drain.
-    napi.shutdown(1000);
+    // `napi.shutdown` is async and must be awaited; prior to #1549
+    // Phase 4 it was synchronous, so a fire-and-forget call worked
+    // by accident and would clear bridge state under concurrent tests.
+    await napi.shutdown(1000);
     if (relayHandle && !relayHandle.isShutdown) {
       relayHandle.shutdown();
     }

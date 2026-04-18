@@ -81,9 +81,9 @@ class SCP internal constructor(
      * with the process-wide default instance.
      *
      * @param storage Storage configuration. Defaults to
-     *   [StorageConfig.InMemory]; filesystem variants land in Phase 4 PR 3.
+     *   [StorageConfig.IN_MEMORY]; filesystem variants land in Phase 4 PR 3.
      */
-    constructor(storage: StorageConfig = StorageConfig.InMemory) : this(NativeScp.withStorage(storage))
+    constructor(storage: StorageConfig = StorageConfig.IN_MEMORY) : this(NativeScp.withStorage(storage))
 
     /**
      * The monotonic identifier for this bridge instance, unique per
@@ -136,7 +136,7 @@ class SCP internal constructor(
      */
     suspend fun shutdown(bridge: CoroutineBridge, timeout: Duration) {
         val millis = timeout.inWholeMilliseconds.coerceAtLeast(0).toULong()
-        bridge.ffiCall { inner.shutdown(timeoutMillis = millis) }
+        bridge.ffiCallSuspend { inner.shutdown(timeoutMillis = millis) }
         // Record shutdown AFTER the FFI call returns so that a failed
         // shutdown does not silence the finalizer warning — a caller
         // who sees an exception here should know the instance is still

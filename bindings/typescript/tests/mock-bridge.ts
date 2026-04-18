@@ -1970,7 +1970,8 @@ export function createMockBridge(): Bridge & {
       return "0.1.0-mock";
     },
 
-    shutdown(_timeoutSecs: number): void {
+    // eslint-disable-next-line @typescript-eslint/require-await -- Signature must match the NAPI async shutdown, but the mock has no async work to drain.
+    async shutdown(_timeoutMillis: number): Promise<void> {
       identities.clear();
       contexts.clear();
       transports.clear();

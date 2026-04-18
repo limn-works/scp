@@ -1797,8 +1797,8 @@ export function createNativeBridge(): Bridge {
       return (addon.scpVersion as () => string)();
     },
 
-    shutdown(timeoutSecs: number): void {
-      (addon.scpShutdown as (t: number) => void)(timeoutSecs);
+    async shutdown(timeoutMillis: number): Promise<void> {
+      await (addon.scpShutdown as (t: number) => Promise<void>)(timeoutMillis);
     },
 
     suspend(): void {

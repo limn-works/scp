@@ -830,6 +830,7 @@ static EMPTY_UCAN_REGISTRY: std::sync::OnceLock<DashMap<String, UcanContextState
     std::sync::OnceLock::new();
 
 fn ucan_registry() -> &'static DashMap<String, UcanContextState> {
+    ensure_bridge_instance();
     DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
         || EMPTY_UCAN_REGISTRY.get_or_init(DashMap::new),
         |bi| bi.ucan_registry.as_ref(),

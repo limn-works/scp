@@ -1294,10 +1294,11 @@ static EMPTY_IDENTITY_REGISTRY: std::sync::OnceLock<DashMap<String, IdentityEntr
 
 /// Returns the default bridge instance's identity registry.
 ///
-/// Falls back to an empty registry if `DEFAULT_BRIDGE_INSTANCE` is not yet
-/// initialized (matching the `get_or_init` behavior of the removed
-/// standalone `OnceLock`).
+/// Eagerly initializes the default bridge so writers never silently land in
+/// the dead `EMPTY_IDENTITY_REGISTRY` fallback. The fallback branch remains
+/// as a safety net but is unreachable in normal code paths; PR 2 deletes it.
 fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
+    ensure_bridge_instance();
     DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
         || EMPTY_IDENTITY_REGISTRY.get_or_init(DashMap::new),
         |bi| bi.identity_registry.as_ref(),

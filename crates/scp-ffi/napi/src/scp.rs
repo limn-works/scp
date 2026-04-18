@@ -33,7 +33,7 @@ use crate::runtime::{NapiBridgeInstance, StorageConfig, default_bridge_instance}
 /// const shared = SCP.default();          // shared process-wide default
 /// await scp.shutdown(5);                 // async graceful shutdown
 /// ```
-#[napi]
+#[napi(js_name = "SCP")]
 pub struct Scp {
     /// The underlying per-bridge concrete instance.
     pub(crate) inner: Arc<NapiBridgeInstance>,

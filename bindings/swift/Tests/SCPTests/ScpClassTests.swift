@@ -64,14 +64,14 @@ final class ScpClassTests: XCTestCase {
         try scp.resume()
     }
 
-    /// `shutdown(timeoutSecs:)` must complete within the deadline and
+    /// `shutdown(timeout:)` must complete within the deadline and
     /// be idempotent on subsequent calls.
     func testShutdownWithTimeout() async throws {
         let scp = SCP()
-        try await scp.shutdown(timeoutSecs: 1)
+        try await scp.shutdown(timeout: 1)
         // Second call must not throw — the SDK surface treats
         // AlreadyShutDown as a harmless no-op.
-        try await scp.shutdown(timeoutSecs: 1)
+        try await scp.shutdown(timeout: 1)
     }
 
     /// `withStorage(.inMemory)` must produce a fresh instance with a
@@ -84,10 +84,9 @@ final class ScpClassTests: XCTestCase {
         XCTAssertGreaterThan(scp.instanceId, 0)
     }
 
-    /// `withPersistence()` currently returns a fresh in-memory instance
-    /// (placeholder; PR 3 wires real persistence).
-    func testWithPersistenceProducesFreshInstance() {
-        let scp = SCP.withPersistence()
-        XCTAssertGreaterThan(scp.instanceId, 0)
-    }
+    // NOTE: The SDK surface intentionally does not expose a
+    // `withPersistence()` factory until PR 3 wires the real
+    // `ContextPersistence` trait through UniFFI (see Scp.swift
+    // comment above the `withStorage(_:)` factory, issues #1260
+    // and #1491). A corresponding test will land with PR 3.
 }
