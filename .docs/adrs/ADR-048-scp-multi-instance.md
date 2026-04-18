@@ -208,6 +208,8 @@ New accessors on `CoreFields`:
 
 The old `set_relay_url` / `clear_relay_url` / `pending_relay_url` trio is deleted. Each per-bridge `resume()` override iterates the set, reconnects each URL via `reconnect_transport_if_pending`, and returns `LifecycleError::ReconnectFailed { url, reason }` on the first failure.
 
+`reconnect_transport_if_pending` builds a single `TransportManager::builder()` outside the loop, `add_adapter`s every successful reconnect, and calls `set_transport` once — preserving every reconnected adapter. An earlier draft constructed one `TransportManager::new(adapter)` per iteration and `set_transport`'d each; because `set_transport` replaces (not appends), only the last adapter survived. The corrected single-manager wiring matches the pre-suspend multi-relay invariant: if `TransportManager` carried N adapters before suspend, it carries N adapters after resume.
+
 ### Removal of `FfiBridgeCrypto` (closes #1342)
 
 The UniFFI bridge no longer constructs a DID-less `ContextManager` with a no-op `FfiBridgeCrypto` stub. Every entry point that attaches a manager — `context_create`, `context_join`, `context_import`, `register_local_did`, `is_local_did` — now carries a local DID into `init_context_manager_with_did`, which wires `MlsCryptoProvider::new(did)`. UniFFI now matches the PyO3 and NAPI bridges.
