@@ -995,7 +995,14 @@ impl CoreFields {
             return Ok(());
         }
         let profile = scp_transport::profile::TransportProfile::platform_default();
+        // Build ONE TransportManager and register every successful adapter
+        // in it. `TransportManager::new(adapter)` creates a manager with a
+        // single adapter, so calling it in a loop and set_transport'ing each
+        // time would keep only the last URL's adapter. Using `builder()` +
+        // `add_adapter` preserves multi-relay semantics.
+        let mut manager = scp_transport::TransportManager::builder();
         let mut first_failure: Option<LifecycleError> = None;
+        let mut connected_count = 0_usize;
         for url in urls {
             let sourced = scp_transport::relay::connection::SourcedRelayUrl {
                 url: url.clone(),
@@ -1023,19 +1030,28 @@ impl CoreFields {
                     continue;
                 }
             };
-            let manager = scp_transport::TransportManager::new(Box::new(adapter));
-            if let Err(e) = self.set_transport(Arc::new(manager)) {
-                tracing::warn!(
-                    url = %url,
-                    error = %e,
-                    "reconnect_transport_if_pending: set_transport failed after successful reconnect"
-                );
-                if first_failure.is_none() {
-                    first_failure = Some(LifecycleError::ReconnectFailed {
-                        url: url.clone(),
-                        reason: e.to_string(),
-                    });
-                }
+            // `add_adapter` may return an `EvictionOutcome` if we hit the
+            // connection budget; we don't surface it here because the
+            // caller's reconnect intent is best-effort multi-relay.
+            let _eviction = manager.add_adapter(Box::new(adapter));
+            connected_count += 1;
+        }
+        // Only install the manager if at least one adapter is registered —
+        // installing an empty manager would make later relay operations fail
+        // with a confusing "no adapters" error instead of the clearer
+        // "reconnect failed" we surface below.
+        if connected_count > 0
+            && let Err(e) = self.set_transport(Arc::new(manager))
+        {
+            tracing::warn!(
+                error = %e,
+                "reconnect_transport_if_pending: set_transport failed after successful reconnects"
+            );
+            if first_failure.is_none() {
+                first_failure = Some(LifecycleError::ReconnectFailed {
+                    url: String::new(),
+                    reason: e.to_string(),
+                });
             }
         }
         first_failure.map_or(Ok(()), Err)
@@ -3053,6 +3069,49 @@ mod tests {
                 .pending_relay_urls()
                 .contains("wss://relay.example.com"),
             "suspend must preserve relay URLs so callers can reconnect after resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_transport_if_pending_is_noop_when_empty() {
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        // No URLs registered — should return Ok(()) without touching
+        // the transport.
+        assert!(
+            instance.reconnect_transport_if_pending().await.is_ok(),
+            "reconnect must succeed when no URLs are pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_transport_if_pending_rejects_after_shutdown() {
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        instance.add_relay_url("wss://relay.example.com".to_owned());
+        instance.shutdown();
+        let result = instance.reconnect_transport_if_pending().await;
+        assert!(
+            matches!(result, Err(LifecycleError::AlreadyShutDown)),
+            "shutdown must short-circuit with AlreadyShutDown, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_transport_if_pending_reports_unreachable_urls() {
+        // All pending URLs point at unreachable hosts. The function must
+        // return a ReconnectFailed error (not panic, not silently succeed)
+        // and the URL must remain in the pending set so callers can retry.
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        // Reserved TEST-NET-1 address (RFC 5737) with a closed port.
+        let unreachable = "ws://192.0.2.1:1/".to_owned();
+        instance.add_relay_url(unreachable.clone());
+        let result = instance.reconnect_transport_if_pending().await;
+        assert!(
+            matches!(result, Err(LifecycleError::ReconnectFailed { .. })),
+            "unreachable URL must surface as ReconnectFailed, got {result:?}"
+        );
+        assert!(
+            instance.pending_relay_urls().contains(&unreachable),
+            "failing URL must remain in pending set for retry"
         );
     }
 
