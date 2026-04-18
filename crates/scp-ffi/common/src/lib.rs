@@ -90,6 +90,14 @@ pub mod attestation;
 #[cfg(feature = "resolvers")]
 pub mod bridge_instance;
 
+// Re-export the public bridge-instance surface so callers do not need to
+// `use scp_ffi_common::bridge_instance::CoreFields`.
+#[cfg(feature = "resolvers")]
+pub use bridge_instance::{
+    BridgeInstance, BridgeInstanceCore, CoreFields, HandleAffinityError, LifecycleError,
+    ShutdownError, ShutdownOutcome, TransportLockError, UNSET_INSTANCE_ID,
+};
+
 // Shared runtime helpers (key resolver, BridgeInMemoryStorage, event log provider).
 // Requires scp-core + scp-platform (behind `resolvers` feature). Not available for WASM.
 #[cfg(feature = "resolvers")]

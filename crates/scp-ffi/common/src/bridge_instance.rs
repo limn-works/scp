@@ -1,18 +1,32 @@
-//! Self-contained bridge instance replacing process-global `OnceLock` singletons.
+//! Bridge-agnostic core state for FFI bridges.
 //!
-//! `BridgeInstance` consolidates most per-bridge `OnceLock` statics into a
-//! single owned struct. Each instance holds its own `ContextManager`,
-//! shutdown flag, and shared state registries.
+//! [`CoreFields`] holds the state every non-WASM FFI bridge needs
+//! (`ContextManager`, transport, known contexts, rate limiters, economy
+//! trackers, bridge connector state, DID resolver, lifecycle flags,
+//! persistence, relay URL, shutdown hooks). Per-bridge concrete structs
+//! (`PyBridgeInstance`, `NapiBridgeInstance`, `UniffiBridgeInstance`) embed
+//! one `CoreFields` and add their own typed fields for bridge-specific
+//! registries (identity, UCAN, MCP, custody, etc.). They implement the
+//! [`BridgeInstanceCore`] trait so shared helpers can operate on
+//! `&dyn BridgeInstanceCore`.
+//!
+//! This is the Phase 4 refactor of `BridgeInstance` (see #1549 Phase 4
+//! remainder plan). The prior `Box<dyn Any>` slots for
+//! `identity_registry`/`ucan_registry`/`storage_provider`/`protocol_repository`
+//! are gone — each bridge now owns concrete typed fields. The transitional
+//! alias `pub type BridgeInstance = CoreFields;` keeps existing call sites
+//! compiling while the per-bridge structs (introduced in follow-up commits
+//! of this PR) take over.
 //!
 //! # No local DID on the container
 //!
-//! Per spec §12.2.3, the FFI `BridgeInstance` is *infrastructure*, not a
+//! Per spec §12.2.3, the FFI bridge instance is *infrastructure*, not a
 //! protocol entity. It has NO DID requirement — the authoritative local DID
 //! lives inside the `ContextManager`'s `MlsCryptoProvider`. An SDK consumer
-//! may hold a `BridgeInstance` purely to resolve DIDs or verify attestations
+//! may hold a bridge instance purely to resolve DIDs or verify attestations
 //! without ever creating a local identity.
 //!
-//! # Owned state (consolidated into `BridgeInstance`)
+//! # Owned state (bridge-agnostic, in [`CoreFields`])
 //!
 //! - `ContextManager` — context lifecycle (MLS, membership, governance, broadcast)
 //! - Transport manager — relay connections
@@ -21,42 +35,30 @@
 //! - Economy budgets + antispam — economic governance trackers
 //! - Bridge connector state — per-context shadow registries + sender key stores
 //! - DID resolver — production identity-backed resolver
-//!
-//! # Remaining per-bridge `OnceLock`s (not consolidated)
-//!
-//! Only truly process-scoped state remains as per-bridge `OnceLock`s:
-//!
-//! - `FFI_BRIDGE_STATE` — PyO3-specific per-context FFI state (`DashMap`)
-//!
-//! All bridge-specific singleton registries that were previously declared as
-//! per-bridge `OnceLock` statics are now owned by `BridgeInstance` via type
-//! erasure (`OnceLock<Box<dyn Any + Send + Sync>>`):
-//!
-//! - `identity_registry` — stores `Arc<DashMap<String, BridgeIdentityEntry>>`
-//! - `storage_provider` — stores `Arc<ConcreteStorageType>`
-//! - `protocol_repository` — stores `Arc<ProtocolRepository<ConcreteStorageType>>`
-//! - `ucan_registry` — stores `Arc<DashMap<String, BridgeUcanContextState>>`
-//!
-//! Each bridge calls `set_identity_registry` / `get_identity_registry_as::<T>()` etc.
-//! to store and retrieve its bridge-specific concrete type.
-//!
-//! `FFI_BRIDGE_STATE` is cleaned up during `shutdown()` via a registered shutdown hook.
+//! - `instance_id: u64` — monotonic counter used for runtime handle-affinity
+//!   checks so a handle created against instance A is rejected on instance B
+//! - [`CancellationToken`] — flipped during shutdown; long-running tasks
+//!   spawned under the instance's `JoinSet` can cooperatively exit
+//! - [`tokio::task::JoinSet`] — owns in-flight async tasks; shutdown awaits
+//!   graceful completion up to a deadline, then aborts the rest
 //!
 //! # Thread Safety
 //!
-//! `BridgeInstance` is `Send + Sync`. The `ContextManager` is behind `Arc`
-//! (interior `RwLock`/`DashMap`). The shutdown flag uses `AtomicBool` with
-//! `Ordering::SeqCst` for visibility across threads. Transport uses
-//! `std::sync::RwLock` for infrequent writes (connect/disconnect) and
-//! concurrent reads (probe/query). Known contexts and rate limiters use
-//! `DashMap` for lock-free concurrent access.
+//! [`CoreFields`] is `Send + Sync`. The `ContextManager` is behind `Arc`
+//! (interior `RwLock`/`DashMap`). Lifecycle flags (`shutdown`, `suspended`)
+//! use `AtomicBool` with `Ordering::SeqCst` for cross-thread visibility.
+//! Transport uses `std::sync::RwLock` for infrequent writes (connect/
+//! disconnect) and concurrent reads (probe/query). Known contexts and rate
+//! limiters use `DashMap` for lock-free concurrent access. The `JoinSet`
+//! is wrapped in `tokio::sync::Mutex` because accesses happen across
+//! `.await` points.
 
-use std::any::Any;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use scp_core::context::ContextManager;
@@ -64,9 +66,35 @@ use scp_core::context::ContextPersistence;
 use scp_protocol::context::invitation::RateLimitTracker;
 use scp_protocol::economy::antispam::SenderVelocityTracker;
 use scp_protocol::economy::budget::MemberBudgetTracker;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use crate::IdentityBackedDidResolver;
 use crate::bridge_state::BridgeContextState;
+
+/// Monotonic counter for [`CoreFields::instance_id`].
+///
+/// Starts at 1. The value `0` is reserved as "unset" so handle types that
+/// default-initialize the affinity id never accidentally match a live
+/// instance.
+static INSTANCE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Reserved instance id meaning "no instance bound yet."
+///
+/// Handles constructed before they are attached to a bridge instance should
+/// carry `UNSET_INSTANCE_ID`; [`CoreFields::check_handle`] treats this as a
+/// mismatch, forcing callers to attach the handle explicitly.
+pub const UNSET_INSTANCE_ID: u64 = 0;
+
+/// Allocates the next monotonically increasing instance id.
+///
+/// Each call returns a fresh `u64`. Wraparound would require 2^64 calls and
+/// is not defended against; it is not reachable in practice.
+#[must_use]
+fn next_instance_id() -> u64 {
+    INSTANCE_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
+}
 
 /// Maximum number of known contexts that can be registered in the discovery
 /// registry. When this limit is reached, the oldest entry (by `last_seen`)
@@ -119,41 +147,47 @@ pub struct KnownContext {
     pub last_seen: u64,
 }
 
-/// A self-contained bridge instance replacing process-global `OnceLock` singletons.
+/// Bridge-agnostic core state shared by every non-WASM FFI bridge.
 ///
-/// Each instance holds its own [`ContextManager`], shutdown flag, and shared
-/// state registries (transport, known contexts, rate limiters). Multiple
-/// instances can coexist (different identities, test isolation). Mobile
-/// platforms use `shutdown()` for lifecycle cleanup.
+/// Per-bridge concrete structs (`PyBridgeInstance`, `NapiBridgeInstance`,
+/// `UniffiBridgeInstance`) embed one `CoreFields` and expose their own
+/// bridge-specific fields (identity registry, UCAN registry, MCP registries,
+/// custody registries, etc.). They implement the [`BridgeInstanceCore`]
+/// trait so shared helpers can operate on `&dyn BridgeInstanceCore`.
+///
+/// While the Phase 4 refactor is in flight, the transitional alias
+/// [`BridgeInstance`] points at this type so existing call sites compile.
 ///
 /// # No local DID on the container
 ///
-/// Per spec §12.2.3, `BridgeInstance` is infrastructure, not a protocol
-/// entity. The authoritative local DID lives inside the `ContextManager`'s
-/// `MlsCryptoProvider`. `BridgeInstance` carries no DID of its own — it may
+/// Per spec §12.2.3, `CoreFields` is infrastructure, not a protocol entity.
+/// The authoritative local DID lives inside the `ContextManager`'s
+/// `MlsCryptoProvider`. `CoreFields` carries no DID of its own — it may
 /// exist before any identity is created (to service DID resolution or
 /// attestation verification for remote DIDs).
 ///
-/// # `OnceLock` limitation — shutdown is terminal
+/// # Lifecycle
 ///
-/// Each non-WASM FFI bridge stores its `BridgeInstance` in a
-/// `OnceLock<Arc<BridgeInstance>>`. `OnceLock` does not support re-initialization
-/// after the first `get_or_init` call, so once `shutdown()` is called the
-/// bridge cannot be re-created within the same process. This is deliberate:
-/// shutdown is a final cleanup step (process exit, test teardown).
-///
-/// For mobile app lifecycle (background/foreground), use `suspend()` /
-/// `resume()` instead — these toggle the `suspended` flag and
-/// disconnect/reconnect transport without touching the `OnceLock`.
+/// - Construction via [`CoreFields::new`] or [`CoreFields::with_persistence`]
+///   allocates a fresh [`CoreFields::instance_id`], a fresh
+///   [`CancellationToken`], and an empty [`JoinSet`].
+/// - [`CoreFields::suspend`] disconnects transport and flushes snapshots but
+///   leaves the instance alive for [`CoreFields::resume`].
+/// - [`CoreFields::shutdown`] is a sync, infallible terminal operation
+///   preserved for existing bridge call sites. For tasks that need a
+///   bounded graceful shutdown, use
+///   [`CoreFields::shutdown_core_async`]; it fires the cancellation token,
+///   drains the `JoinSet` within the caller's deadline, aborts the rest,
+///   and reports the outcome via [`ShutdownOutcome`].
 ///
 /// # Invariants
 ///
-/// - Once `shutdown()` is called, `is_shutdown()` returns `true` permanently.
+/// - Once shut down, [`CoreFields::is_shutdown`] returns `true` permanently.
 ///   All bridge operations should check this flag and fail fast.
 /// - The `ContextManager` reference is shared (`Arc`) and may outlive this
-///   instance if cloned elsewhere. `shutdown()` does NOT drop or invalidate
+///   instance if cloned elsewhere. Shutdown does NOT drop or invalidate
 ///   the `ContextManager` — it is a signal to the bridge layer only.
-pub struct BridgeInstance {
+pub struct CoreFields {
     /// Shared context lifecycle manager (MLS, membership, governance, broadcast).
     ///
     /// Stored in a `OnceLock` so that the `BridgeInstance` (and thus the DID
@@ -260,18 +294,15 @@ pub struct BridgeInstance {
 
     /// Registered shutdown hooks for bridge-specific state cleanup.
     ///
-    /// Each FFI bridge registers hooks that clear bridge-specific singletons
-    /// that cannot be owned by `BridgeInstance` due to crate dependency
-    /// boundaries (e.g., `PyO3` `FFI_BRIDGE_STATE`, MCP registries).
-    ///
-    /// Type-erased `DashMap` registries (`identity_registry`, `ucan_registry`)
-    /// are cleared directly in `shutdown()` via their registered clear
-    /// functions (`identity_registry_clear_fn`, `ucan_registry_clear_fn`),
-    /// not through this hook Vec.
+    /// During the Phase 4 transition, each FFI bridge registers hooks that
+    /// clear bridge-specific singletons (`PyO3` `FFI_BRIDGE_STATE`, MCP
+    /// registries, etc.). Per-bridge concrete structs taking over in the
+    /// follow-up commits replace most hooks with typed fields dropped in
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`].
     ///
     /// Hooks are called exactly once during `shutdown()` and then discarded.
-    /// The `Mutex` is only locked during `shutdown()` and `register_shutdown_hook()`
-    /// — no contention on the hot path.
+    /// The `Mutex` is only locked during `shutdown()` and
+    /// `register_shutdown_hook()` — no contention on the hot path.
     shutdown_hooks: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
 
     // -----------------------------------------------------------------
@@ -307,76 +338,52 @@ pub struct BridgeInstance {
     relay_url: Mutex<Option<String>>,
 
     // -----------------------------------------------------------------
-    // Type-erased bridge-specific singletons
-    //
-    // Each slot stores a bridge-specific concrete type erased to
-    // `Box<dyn Any + Send + Sync>`. The per-bridge runtime sets the
-    // value once (via the `set_*` accessor) and retrieves it via
-    // `get_*_as::<ConcreteType>()` which downcasts back.
-    //
-    // DashMap-based registries (`identity_registry`, `ucan_registry`) are
-    // stored as `Arc<DashMap<...>>` and also register an `Arc`-cloned clear
-    // closure so `shutdown()` can wipe them without knowing the concrete type.
+    // Identity + async lifecycle
     // -----------------------------------------------------------------
-    /// Identity registry: stores `Arc<DashMap<String, BridgeIdentityEntry>>`
-    ///
-    /// `PyO3` stores `Arc<DashMap<String, IdentityEntry>>`.
-    /// `NAPI` stores `Arc<DashMap<String, NapiIdentityEntry>>` (feature-gated).
-    /// Cleared on `shutdown()` via `identity_registry_clear_fn`.
-    identity_registry: OnceLock<Box<dyn Any + Send + Sync>>,
-    /// Clear function for `identity_registry`. Called once during `shutdown()`.
-    identity_registry_clear_fn: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// Monotonic per-instance identifier used for runtime handle-affinity
+    /// checks. Allocated via [`next_instance_id`] at construction time.
+    /// Never zero — [`UNSET_INSTANCE_ID`] marks "not attached to any
+    /// instance" for handles constructed independently.
+    instance_id: u64,
 
-    /// Storage provider: stores `Arc<ConcreteEncryptingStorage>`.
+    /// Shutdown signal for async tasks owned by this instance.
     ///
-    /// `PyO3` stores `Arc<EncryptingAdapter<InMemoryStorage>>`.
-    /// `NAPI`/`UniFFI` store `Arc<EncryptingAdapter<BridgeInMemoryStorage>>`.
-    ///
-    /// Released on process exit (`OnceLock` — not clearable).
-    storage_provider: OnceLock<Box<dyn Any + Send + Sync>>,
+    /// Fired by [`CoreFields::shutdown_core_async`] before draining the
+    /// `JoinSet`. Tasks that want to exit cleanly `select!` on
+    /// `cancel.cancelled()` alongside their usual work.
+    cancel: CancellationToken,
 
-    /// Protocol repository: stores `Arc<ProtocolRepository<ConcreteStorageType>>`.
-    ///
-    /// `NAPI`/`UniFFI` store `Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>`.
-    /// `PyO3` uses `storage_provider` to construct its repository on demand.
-    ///
-    /// Released on process exit (`OnceLock` — not clearable).
-    protocol_repository: OnceLock<Box<dyn Any + Send + Sync>>,
-
-    /// UCAN context state registry: stores `Arc<DashMap<String, BridgeUcanContextState>>`.
-    ///
-    /// `NAPI` stores `Arc<DashMap<String, UcanContextState>>`.
-    /// `UniFFI` stores `Arc<DashMap<String, UcanContextState>>` (different type).
-    /// `PyO3` stores UCAN state inline in `FfiBridgeState` (no separate `DashMap`).
-    ///
-    /// Cleared on `shutdown()` via `ucan_registry_clear_fn`.
-    ucan_registry: OnceLock<Box<dyn Any + Send + Sync>>,
-    /// Clear function for `ucan_registry`. Called once during `shutdown()`.
-    ucan_registry_clear_fn: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// In-flight async tasks owned by this instance. Accessed from async
+    /// contexts, so wrapped in [`tokio::sync::Mutex`] rather than
+    /// [`std::sync::Mutex`] (guards cross `.await` points during shutdown
+    /// drain).
+    tasks: AsyncMutex<JoinSet<()>>,
 }
 
-impl Default for BridgeInstance {
+impl Default for CoreFields {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl BridgeInstance {
-    /// Creates a new bridge instance without a `ContextManager`.
+impl CoreFields {
+    /// Creates a new `CoreFields` without a `ContextManager`.
     ///
     /// Initializes all shared state registries (transport, known contexts,
-    /// rate limiters) as empty. The `ContextManager` is **unbound** — call
+    /// rate limiters) as empty. Allocates a fresh [`CoreFields::instance_id`],
+    /// a fresh [`CancellationToken`], and an empty [`JoinSet`]. The
+    /// `ContextManager` is **unbound** — call
     /// [`set_context_manager`](Self::set_context_manager) once the identity
     /// has been created and the `ContextManager` constructed with its
     /// `MlsCryptoProvider` (which carries the real local DID).
     ///
-    /// This decoupling lets the FFI bridge construct a `BridgeInstance` (and
-    /// therefore initialize the DID resolver slot) BEFORE any identity is
-    /// known. This resolves the chicken-and-egg where the DID resolver lives
-    /// inside `BridgeInstance` but the DID itself is generated by
-    /// `DidDht::create()` which runs later. The `BridgeInstance` itself never
-    /// stores or tracks the DID — that is the `MlsCryptoProvider`'s job (spec
-    /// §12.2.3).
+    /// Decoupling the `ContextManager` from construction lets the FFI
+    /// bridge initialize the DID resolver slot BEFORE any identity is
+    /// known. That resolves the chicken-and-egg where the DID resolver
+    /// lives inside `CoreFields` but the DID itself is generated by
+    /// `DidDht::create()` which runs later. `CoreFields` itself never
+    /// stores or tracks the DID — that is the `MlsCryptoProvider`'s job
+    /// (spec §12.2.3).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -393,16 +400,13 @@ impl BridgeInstance {
             shutdown_hooks: Mutex::new(Vec::new()),
             persistence: None,
             relay_url: Mutex::new(None),
-            identity_registry: OnceLock::new(),
-            identity_registry_clear_fn: OnceLock::new(),
-            storage_provider: OnceLock::new(),
-            protocol_repository: OnceLock::new(),
-            ucan_registry: OnceLock::new(),
-            ucan_registry_clear_fn: OnceLock::new(),
+            instance_id: next_instance_id(),
+            cancel: CancellationToken::new(),
+            tasks: AsyncMutex::new(JoinSet::new()),
         }
     }
 
-    /// Creates a new bridge instance pre-populated with a `ContextManager`.
+    /// Creates a new `CoreFields` pre-populated with a `ContextManager`.
     ///
     /// Convenience constructor for callers that already have a `ContextManager`
     /// (e.g., test fixtures, the NAPI/UniFFI `ensure_bridge_instance` helpers
@@ -415,14 +419,16 @@ impl BridgeInstance {
         instance
     }
 
-    /// Creates a new bridge instance with a persistence provider, but no
+    /// Creates a new `CoreFields` with a persistence provider but no
     /// `ContextManager`.
     ///
-    /// Attaches a [`ContextPersistence`] provider. When provided, [`suspend`]
-    /// and [`shutdown`] will flush all context snapshots via
+    /// Attaches a [`ContextPersistence`] provider. When provided,
+    /// [`suspend`](Self::suspend) and [`shutdown`](Self::shutdown) will
+    /// flush all context snapshots via
     /// [`ContextManager::flush_all_contexts_sync`] before tearing down
-    /// transport or destroying MLS groups — but only after the `ContextManager`
-    /// itself has been set via [`set_context_manager`](Self::set_context_manager).
+    /// transport or destroying MLS groups — but only after the
+    /// `ContextManager` itself has been set via
+    /// [`set_context_manager`](Self::set_context_manager).
     ///
     /// The persistence provider should be the same one configured on the
     /// eventual [`ContextManager`] (typically constructed via
@@ -448,12 +454,71 @@ impl BridgeInstance {
             shutdown_hooks: Mutex::new(Vec::new()),
             persistence: Some(persistence),
             relay_url: Mutex::new(None),
-            identity_registry: OnceLock::new(),
-            identity_registry_clear_fn: OnceLock::new(),
-            storage_provider: OnceLock::new(),
-            protocol_repository: OnceLock::new(),
-            ucan_registry: OnceLock::new(),
-            ucan_registry_clear_fn: OnceLock::new(),
+            instance_id: next_instance_id(),
+            cancel: CancellationToken::new(),
+            tasks: AsyncMutex::new(JoinSet::new()),
+        }
+    }
+
+    /// Returns the monotonic identifier assigned to this instance at
+    /// construction time.
+    ///
+    /// Handle types (`ContextHandle`, `Identity`, `TransportManager`, etc.)
+    /// store this value and pass it to [`check_handle`](Self::check_handle)
+    /// on entry so handles from a different instance are rejected with
+    /// [`HandleAffinityError`].
+    #[must_use]
+    pub const fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    /// Returns a clone of the instance's [`CancellationToken`].
+    ///
+    /// Cheap: `CancellationToken` is an `Arc`-based cooperative signal.
+    /// Long-running tasks spawned under this instance should select on
+    /// the returned token alongside their normal work so
+    /// [`shutdown_core_async`](Self::shutdown_core_async) can wake them
+    /// before the deadline.
+    #[must_use]
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    /// Locks and returns the `JoinSet` owning this instance's async tasks.
+    ///
+    /// Callers should spawn new tasks with `set.spawn(...)`. The lock is
+    /// async because shutdown holds it across a `.await` while draining.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut tasks = core.task_handle().await;
+    /// tasks.spawn(async move { /* ... */ });
+    /// ```
+    pub async fn task_handle(&self) -> tokio::sync::MutexGuard<'_, JoinSet<()>> {
+        self.tasks.lock().await
+    }
+
+    /// Checks that the supplied handle was issued by this instance.
+    ///
+    /// Handle types carry [`CoreFields::instance_id`] of the instance they
+    /// belong to. At every FFI entry point that consumes a handle, the
+    /// bridge layer calls `check_handle(handle.instance_id)` to reject
+    /// cross-instance misuse (e.g., a handle created on `SCP` A being
+    /// passed into `SCP` B).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandleAffinityError`] if `handle_instance_id` does not
+    /// equal [`CoreFields::instance_id`].
+    pub const fn check_handle(&self, handle_instance_id: u64) -> Result<(), HandleAffinityError> {
+        if handle_instance_id == self.instance_id {
+            Ok(())
+        } else {
+            Err(HandleAffinityError::new(
+                handle_instance_id,
+                self.instance_id,
+            ))
         }
     }
 
@@ -544,17 +609,16 @@ impl BridgeInstance {
 
     /// Registers a shutdown hook for bridge-specific state cleanup.
     ///
-    /// The hook is called exactly once during [`shutdown()`] and then
-    /// discarded. Hooks run in registration order after all
-    /// `BridgeInstance`-owned state has been cleared (including the
-    /// type-erased `DashMap` registries via their clear functions).
+    /// The hook is called exactly once during [`shutdown`](Self::shutdown)
+    /// and then discarded. Hooks run in registration order after all
+    /// `CoreFields`-owned state has been cleared.
     ///
     /// Intended for bridge-specific singletons that cannot be migrated into
-    /// `BridgeInstance` due to crate dependency boundaries (e.g., `PyO3`
-    /// `FFI_BRIDGE_STATE`, MCP server/client registries). For
-    /// `DashMap`-based registries that CAN be owned here, prefer
-    /// [`set_identity_registry`] / [`set_ucan_registry`] which register
-    /// a clear closure directly.
+    /// `CoreFields` due to crate dependency boundaries (e.g., `PyO3`
+    /// `FFI_BRIDGE_STATE`, MCP server/client registries). Per-bridge
+    /// concrete structs introduced in the follow-up commits of this PR
+    /// should prefer owning those registries as typed fields and dropping
+    /// them in [`BridgeInstanceCore::bridge_specific_shutdown`].
     ///
     /// If the internal `Mutex` is poisoned (a previous hook registration
     /// panicked while holding the lock), the hook is silently dropped and
@@ -652,15 +716,21 @@ impl BridgeInstance {
     /// Idempotent: calling `shutdown()` on an already-shut-down instance is
     /// a no-op. Hooks are drained on the first call and will not run again.
     ///
+    /// Bridge-specific singleton registries (identity registry, UCAN
+    /// registry, MCP registries, custody store, etc.) are the responsibility
+    /// of the per-bridge concrete struct implementing [`BridgeInstanceCore`];
+    /// they should be cleaned up in
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`] or by calling the
+    /// async [`shutdown_core_async`](Self::shutdown_core_async) variant.
+    ///
     /// # Hook execution
     ///
     /// Shutdown hooks are called in registration order after all
-    /// `BridgeInstance`-owned state has been cleared (registries, economy
-    /// trackers, type-erased identity/UCAN `DashMap`s via their clear
-    /// functions). Hooks handle bridge-specific singletons that cannot be
-    /// owned by `BridgeInstance` (FFI bridge state, MCP registries).
-    /// Together, these steps release key material held by custody
-    /// providers (zeroized via `Drop` when `Arc` refcount reaches zero).
+    /// `CoreFields`-owned state has been cleared (registries, economy
+    /// trackers). Hooks handle bridge-specific singletons that cannot be
+    /// owned by `CoreFields` (FFI bridge state, MCP registries). Together,
+    /// these steps release key material held by custody providers
+    /// (zeroized via `Drop` when `Arc` refcount reaches zero).
     ///
     /// This function is infallible. Transport lock failures are logged and
     /// cleanup continues. Shutdown must always complete regardless of
@@ -669,78 +739,12 @@ impl BridgeInstance {
         if self.shutdown.swap(true, Ordering::SeqCst) {
             return; // Already shut down
         }
-
-        // Clear transport (disconnect relay). Best-effort: if the RwLock
-        // is poisoned, log the error and continue with remaining cleanup.
-        // Shutdown must not abort — key material zeroization and hook
-        // execution are more critical than a clean transport teardown.
-        if let Err(e) = self.clear_transport() {
-            tracing::error!("failed to clear transport during shutdown: {e} — continuing cleanup");
-        }
-        // Clear the relay URL after transport teardown. This is only done
-        // in shutdown — suspend() preserves the URL so callers can reconnect.
-        if let Ok(mut url) = self.relay_url.lock() {
-            *url = None;
-        }
-
-        // Flush all context snapshots before destroying MLS groups. This
-        // ensures durably-persisted state reflects the last known-good
-        // context state before key material is zeroized.
-        // Best-effort: errors are logged inside flush_all_contexts_sync.
-        // Skipped if the ContextManager hasn't been set yet (shutdown before
-        // any context operation).
-        if let Some(cm) = self.context_manager.get() {
-            cm.flush_all_contexts_sync();
-
-            // Remove all contexts from the ContextManager (MLS groups, sender
-            // keys, event logs). Best-effort — already-removed contexts are
-            // silently ignored.
-            cm.shutdown_all_contexts();
-        }
-
-        // Clear registries
-        self.known_contexts.clear();
-        self.rate_limiters.clear();
-        self.economy_budgets.clear();
-        self.economy_antispam.clear();
-        self.bridge_state.clear();
-
-        // Clear type-erased DashMap registries (identity + UCAN).
-        // Dropping `Arc<DashMap>` entries here releases key material held by
-        // custody providers (zeroized via `Zeroizing` fields on Drop).
-        // Wrapped in catch_unwind so a panic in one clear_fn (e.g., DashMap
-        // value Drop panics) does not skip remaining cleanup.
-        if let Some(clear_fn) = self.identity_registry_clear_fn.get()
-            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(clear_fn)).is_err()
-        {
-            tracing::error!("identity registry clear panicked during shutdown");
-        }
-        if let Some(clear_fn) = self.ucan_registry_clear_fn.get()
-            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(clear_fn)).is_err()
-        {
-            tracing::error!("UCAN registry clear panicked during shutdown");
-        }
-
-        // Run bridge-specific shutdown hooks (FFI bridge state, MCP
-        // registries, etc.). Drain the Vec so hooks are called exactly once
-        // even if the Mutex isn't dropped.
-        if let Ok(mut hooks) = self.shutdown_hooks.lock() {
-            for hook in hooks.drain(..) {
-                if let Err(_payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook))
-                {
-                    tracing::error!(
-                        "shutdown hook panicked — bridge-specific cleanup may be incomplete"
-                    );
-                }
-            }
-        } else {
-            tracing::error!("shutdown_hooks mutex poisoned — bridge-specific cleanup skipped");
-        }
-
-        // Also clear suspended flag (shutdown supersedes suspension)
-        self.suspended.store(false, Ordering::SeqCst);
-
-        tracing::debug!("bridge instance shut down");
+        // Fire the cancellation token so any tasks spawned under this
+        // instance can exit cooperatively. Pending tasks inside `self.tasks`
+        // are not drained here — the sync variant cannot await. Callers
+        // that need a bounded wait use `shutdown_core_async`.
+        self.cancel.cancel();
+        self.run_shutdown_side_effects();
     }
 
     // -----------------------------------------------------------------
@@ -1261,146 +1265,248 @@ impl BridgeInstance {
     }
 
     // -----------------------------------------------------------------
-    // Type-erased bridge-specific singleton accessors
+    // Async shutdown with deadline
     // -----------------------------------------------------------------
 
-    /// Stores the bridge's identity registry as a type-erased value and
-    /// registers a clear function called during [`shutdown`].
+    /// Shuts down the instance with a graceful deadline for in-flight tasks.
     ///
-    /// `value` should be `Arc<DashMap<String, BridgeIdentityEntry>>`.
-    /// `clear_fn` must call `.clear()` on the same map (typically a closure
-    /// holding a cloned `Arc` to the same map).
-    /// Subsequent calls are no-ops (`OnceLock`).
-    pub fn set_identity_registry<T: Any + Send + Sync>(
+    /// Behaves as follows:
+    ///
+    /// 1. Idempotency: if `shutdown` has already been called (sync or async),
+    ///    returns [`ShutdownError::AlreadyShutDown`] without side effects.
+    /// 2. Fires [`CancellationToken::cancel`] so cooperating tasks can exit.
+    /// 3. Drains the task `JoinSet` inside `tokio::time::timeout(timeout, …)`.
+    ///    Tasks that finish within the deadline report
+    ///    [`ShutdownOutcome::GracefulWithin`] with the elapsed time.
+    /// 4. On timeout, calls `JoinSet::abort_all` and returns
+    ///    [`ShutdownOutcome::TimedOut`] with the number of tasks aborted.
+    /// 5. Runs the bridge-agnostic cleanup (flush persistence, drop MLS
+    ///    groups, clear registries, run shutdown hooks, clear transport)
+    ///    regardless of graceful/timeout outcome — these side effects must
+    ///    happen on *every* shutdown.
+    ///
+    /// # Errors
+    ///
+    /// - [`ShutdownError::AlreadyShutDown`] — the instance has already been
+    ///   shut down. The caller is expected to treat this as a harmless
+    ///   lifecycle observation (no additional work to do).
+    pub async fn shutdown_core_async(
         &self,
-        value: T,
-        clear_fn: Box<dyn Fn() + Send + Sync>,
-    ) {
-        if self.identity_registry.set(Box::new(value)).is_err() {
-            tracing::warn!(
-                "set_identity_registry called but identity registry already initialized — ignoring"
-            );
-            return;
+        timeout: Duration,
+    ) -> Result<ShutdownOutcome, ShutdownError> {
+        // Idempotent terminal transition. The sync `shutdown()` path also
+        // swaps this flag; whichever call wins is the one that runs
+        // cleanup.
+        if self.shutdown.swap(true, Ordering::SeqCst) {
+            return Err(ShutdownError::AlreadyShutDown);
         }
-        let _ = self.identity_registry_clear_fn.set(clear_fn);
+
+        // Signal cooperating tasks to exit. Cheap and idempotent.
+        self.cancel.cancel();
+
+        let start = std::time::Instant::now();
+        let outcome = drain_under_deadline(&self.tasks, timeout, start).await;
+
+        // Run the sync cleanup side effects. `run_shutdown_side_effects`
+        // mirrors the body of the sync `shutdown()` path but without the
+        // AtomicBool swap (we already performed it above). Calling it is
+        // safe: it checks `is_shutdown()` for the one internal guard that
+        // matters (economy accessors), which is already true.
+        self.run_shutdown_side_effects();
+
+        Ok(outcome)
     }
 
-    /// Retrieves the bridge's identity registry, downcasting to `T`.
+    /// Shared cleanup body executed by both the sync [`shutdown`](Self::shutdown)
+    /// and the async [`shutdown_core_async`](Self::shutdown_core_async) paths.
     ///
-    /// Returns `None` if the registry has not been set or if the downcast
-    /// fails (mismatched type). A downcast failure logs an error with the
-    /// expected type name to distinguish "not initialized" from "wrong type."
-    #[must_use]
-    pub fn get_identity_registry_as<T: Any + Send + Sync>(&self) -> Option<&T> {
-        let boxed = self.identity_registry.get()?;
-        let result = boxed.downcast_ref::<T>();
-        if result.is_none() {
-            tracing::error!(
-                expected = std::any::type_name::<T>(),
-                "identity_registry downcast failed — type mismatch (not 'not initialized')"
-            );
+    /// Must only be called after `self.shutdown` has been swapped to `true`.
+    /// Clears transport, flushes persistence, drops MLS groups + sender
+    /// keys, clears bridge-owned registries, and runs any registered
+    /// shutdown hooks. Infallible: lock poisoning and hook panics are
+    /// logged and cleanup continues — shutdown must finish regardless.
+    fn run_shutdown_side_effects(&self) {
+        if let Err(e) = self.clear_transport() {
+            tracing::error!("failed to clear transport during shutdown: {e} — continuing cleanup");
         }
-        result
+        if let Ok(mut url) = self.relay_url.lock() {
+            *url = None;
+        }
+
+        if let Some(cm) = self.context_manager.get() {
+            cm.flush_all_contexts_sync();
+            cm.shutdown_all_contexts();
+        }
+
+        self.known_contexts.clear();
+        self.rate_limiters.clear();
+        self.economy_budgets.clear();
+        self.economy_antispam.clear();
+        self.bridge_state.clear();
+
+        if let Ok(mut hooks) = self.shutdown_hooks.lock() {
+            for hook in hooks.drain(..) {
+                if let Err(_payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook))
+                {
+                    tracing::error!(
+                        "shutdown hook panicked — bridge-specific cleanup may be incomplete"
+                    );
+                }
+            }
+        } else {
+            tracing::error!("shutdown_hooks mutex poisoned — bridge-specific cleanup skipped");
+        }
+
+        // Shutdown supersedes suspension.
+        self.suspended.store(false, Ordering::SeqCst);
+
+        tracing::debug!("bridge instance shut down");
+    }
+}
+
+/// Locks the `JoinSet` long enough to drain outstanding tasks with a
+/// deadline. On graceful drain, returns [`ShutdownOutcome::GracefulWithin`]
+/// with the elapsed time since `start`. On timeout, aborts the remaining
+/// tasks, counts them, and returns [`ShutdownOutcome::TimedOut`].
+///
+/// The helper exists so the lock guard's scope is obvious and clippy's
+/// `significant_drop_tightening` check is satisfied (the guard cannot be
+/// released earlier without pulling the `JoinSet` out from under the
+/// abort path).
+#[allow(clippy::significant_drop_tightening)]
+async fn drain_under_deadline(
+    tasks: &AsyncMutex<JoinSet<()>>,
+    timeout: Duration,
+    start: std::time::Instant,
+) -> ShutdownOutcome {
+    // The `JoinSet` lock is held for the full drain — `abort_all` +
+    // `join_next` below all need exclusive access to the same set.
+    // Clippy's `significant_drop_tightening` flags the wide scope, but
+    // there is no earlier release point that keeps the invariant of
+    // draining the exact set we aborted.
+    let mut guard = tasks.lock().await;
+    if tokio::time::timeout(timeout, drain_tasks(&mut guard))
+        .await
+        .is_ok()
+    {
+        return ShutdownOutcome::GracefulWithin(start.elapsed());
+    }
+    // Deadline expired: abort remaining tasks and count how many we cut.
+    // `abort_all` is a no-op for finished tasks.
+    guard.abort_all();
+    let aborted = count_and_drain_aborted(&mut guard).await;
+    ShutdownOutcome::TimedOut {
+        aborted_tasks: aborted,
+    }
+}
+
+/// Drains `set` until every task has completed. Panics inside tasks are
+/// logged; non-panic join errors (cancellation) are ignored — abort is
+/// the caller's signal.
+async fn drain_tasks(set: &mut JoinSet<()>) {
+    while let Some(joined) = set.join_next().await {
+        if let Err(e) = joined
+            && e.is_panic()
+        {
+            tracing::error!("task panicked during shutdown drain: {e}");
+        }
+    }
+}
+
+/// After `abort_all`, drains the set to completion and returns the count
+/// of tasks that were cancelled (not finished cleanly before cancellation
+/// propagated).
+async fn count_and_drain_aborted(set: &mut JoinSet<()>) -> usize {
+    let mut aborted = 0usize;
+    while let Some(joined) = set.join_next().await {
+        if let Err(e) = joined {
+            if e.is_cancelled() {
+                aborted += 1;
+            } else if e.is_panic() {
+                tracing::error!("task panicked during abort drain: {e}");
+            }
+        }
+    }
+    aborted
+}
+
+/// Transitional alias: existing bridge call sites use `BridgeInstance`.
+///
+/// Removed once `PyBridgeInstance` / `NapiBridgeInstance` /
+/// `UniffiBridgeInstance` land in follow-up commits of this PR (#1549
+/// Phase 4 remainder PR 1, commits 3–5).
+pub type BridgeInstance = CoreFields;
+
+/// Bridge-agnostic trait implemented by every per-bridge concrete struct.
+///
+/// Each `PyBridgeInstance` / `NapiBridgeInstance` / `UniffiBridgeInstance`
+/// embeds a [`CoreFields`] and returns it from [`BridgeInstanceCore::core`].
+/// Default implementations delegate common lifecycle accessors to the
+/// embedded core, so per-bridge impls only need to override
+/// [`BridgeInstanceCore::shutdown`] (to also clean up their bridge-specific
+/// typed fields) and optionally [`BridgeInstanceCore::bridge_specific_shutdown`].
+///
+/// The trait is `Send + Sync`: shared helpers may take `&dyn BridgeInstanceCore`
+/// and pass it across threads or `.await` points.
+#[async_trait::async_trait]
+pub trait BridgeInstanceCore: Send + Sync {
+    /// Returns a reference to the embedded bridge-agnostic core state.
+    fn core(&self) -> &CoreFields;
+
+    /// Returns the monotonic identifier assigned to this instance.
+    fn instance_id(&self) -> u64 {
+        self.core().instance_id()
     }
 
-    /// Stores the bridge's storage provider as a type-erased value.
+    /// Runtime handle-affinity check.
     ///
-    /// `value` should be `Arc<EncryptingAdapter<T>>`. Subsequent calls are
-    /// no-ops (`OnceLock`). The value is released on process exit.
-    pub fn set_storage_provider<T: Any + Send + Sync>(&self, value: T) {
-        if self.storage_provider.set(Box::new(value)).is_err() {
-            tracing::warn!(
-                "set_storage_provider called but storage provider already initialized — ignoring"
-            );
-        }
+    /// # Errors
+    ///
+    /// Returns [`HandleAffinityError`] if the handle was issued by a
+    /// different bridge instance.
+    fn check_handle(&self, handle_instance_id: u64) -> Result<(), HandleAffinityError> {
+        self.core().check_handle(handle_instance_id)
     }
 
-    /// Retrieves the bridge's storage provider, downcasting to `T`.
+    /// Suspends the instance — see [`CoreFields::suspend`].
     ///
-    /// Returns `None` if the provider has not been set or if the downcast
-    /// fails (mismatched type). A downcast failure logs an error with the
-    /// expected type name to distinguish "not initialized" from "wrong type."
-    #[must_use]
-    pub fn get_storage_provider_as<T: Any + Send + Sync>(&self) -> Option<&T> {
-        let boxed = self.storage_provider.get()?;
-        let result = boxed.downcast_ref::<T>();
-        if result.is_none() {
-            tracing::error!(
-                expected = std::any::type_name::<T>(),
-                "storage_provider downcast failed — type mismatch (not 'not initialized')"
-            );
-        }
-        result
+    /// # Errors
+    ///
+    /// Returns [`TransportLockError`] if the transport lock is poisoned.
+    fn suspend(&self) -> Result<(), TransportLockError> {
+        self.core().suspend()
     }
 
-    /// Stores the bridge's protocol repository as a type-erased value.
+    /// Resumes the instance — see [`CoreFields::resume`].
     ///
-    /// `value` should be `Arc<ProtocolRepository<T>>`. Subsequent calls are
-    /// no-ops (`OnceLock`). The value is released on process exit.
-    pub fn set_protocol_repository<T: Any + Send + Sync>(&self, value: T) {
-        if self.protocol_repository.set(Box::new(value)).is_err() {
-            tracing::warn!(
-                "set_protocol_repository called but protocol repository already initialized — ignoring"
-            );
-        }
+    /// # Errors
+    ///
+    /// Returns [`LifecycleError::AlreadyShutDown`] if the instance has
+    /// been permanently shut down.
+    fn resume(&self) -> Result<(), LifecycleError> {
+        self.core().resume()
     }
 
-    /// Retrieves the bridge's protocol repository, downcasting to `T`.
+    /// Async shutdown with a graceful deadline.
     ///
-    /// Returns `None` if the repository has not been set or if the downcast
-    /// fails (mismatched type). A downcast failure logs an error with the
-    /// expected type name to distinguish "not initialized" from "wrong type."
-    #[must_use]
-    pub fn get_protocol_repository_as<T: Any + Send + Sync>(&self) -> Option<&T> {
-        let boxed = self.protocol_repository.get()?;
-        let result = boxed.downcast_ref::<T>();
-        if result.is_none() {
-            tracing::error!(
-                expected = std::any::type_name::<T>(),
-                "protocol_repository downcast failed — type mismatch (not 'not initialized')"
-            );
-        }
-        result
-    }
+    /// Implementors typically delegate to
+    /// [`CoreFields::shutdown_core_async`] and then call
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`] to clean up any
+    /// bridge-specific typed fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShutdownError::AlreadyShutDown`] on a second call.
+    async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError>;
 
-    /// Stores the bridge's UCAN context state registry as a type-erased value
-    /// and registers a clear function called during [`shutdown`].
+    /// Override hook for per-bridge concrete structs to drop their
+    /// bridge-specific typed fields (MCP registries, custody store, etc.).
+    /// The default implementation is a no-op.
     ///
-    /// `value` should be `Arc<DashMap<String, BridgeUcanContextState>>`.
-    /// `clear_fn` must call `.clear()` on the same map (typically a closure
-    /// holding a cloned `Arc` to the same map).
-    /// Subsequent calls are no-ops (`OnceLock`).
-    pub fn set_ucan_registry<T: Any + Send + Sync>(
-        &self,
-        value: T,
-        clear_fn: Box<dyn Fn() + Send + Sync>,
-    ) {
-        if self.ucan_registry.set(Box::new(value)).is_err() {
-            tracing::warn!(
-                "set_ucan_registry called but UCAN registry already initialized — ignoring"
-            );
-            return;
-        }
-        let _ = self.ucan_registry_clear_fn.set(clear_fn);
-    }
-
-    /// Retrieves the bridge's UCAN registry, downcasting to `T`.
-    ///
-    /// Returns `None` if the registry has not been set or if the downcast
-    /// fails (mismatched type). A downcast failure logs an error with the
-    /// expected type name to distinguish "not initialized" from "wrong type."
-    #[must_use]
-    pub fn get_ucan_registry_as<T: Any + Send + Sync>(&self) -> Option<&T> {
-        let boxed = self.ucan_registry.get()?;
-        let result = boxed.downcast_ref::<T>();
-        if result.is_none() {
-            tracing::error!(
-                expected = std::any::type_name::<T>(),
-                "ucan_registry downcast failed — type mismatch (not 'not initialized')"
-            );
-        }
-        result
-    }
+    /// Called by [`BridgeInstanceCore::shutdown`] implementations after
+    /// the bridge-agnostic cleanup finishes, so bridge-specific state is
+    /// dropped last (after hooks run and transport is gone).
+    fn bridge_specific_shutdown(&self) {}
 }
 
 /// Error type for transport lock operations.
@@ -1471,6 +1577,89 @@ impl std::fmt::Display for LifecycleError {
 }
 
 impl std::error::Error for LifecycleError {}
+
+/// Error produced when a handle is used on the wrong bridge instance.
+///
+/// Every handle type (`ContextHandle`, `Identity`, `TransportManager`, etc.)
+/// stores the [`CoreFields::instance_id`] of the bridge instance that
+/// issued it. FFI entry points call [`CoreFields::check_handle`] before
+/// doing any work; a mismatch produces this error, which maps to error
+/// code [`crate::error_codes::PERM_3030`] at the bridge layer.
+///
+/// The error carries both ids (redacted in `Display` but preserved in
+/// `Debug`) so operators can correlate logs without exposing internals to
+/// attackers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandleAffinityError {
+    /// The instance id carried by the offending handle.
+    handle_instance_id: u64,
+    /// The instance id of the bridge instance the handle was passed to.
+    expected_instance_id: u64,
+}
+
+impl HandleAffinityError {
+    /// Constructs a new affinity error from the observed / expected pair.
+    #[must_use]
+    pub const fn new(handle_instance_id: u64, expected_instance_id: u64) -> Self {
+        Self {
+            handle_instance_id,
+            expected_instance_id,
+        }
+    }
+
+    /// The instance id carried by the offending handle.
+    #[must_use]
+    pub const fn handle_instance_id(self) -> u64 {
+        self.handle_instance_id
+    }
+
+    /// The instance id of the bridge that rejected the handle.
+    #[must_use]
+    pub const fn expected_instance_id(self) -> u64 {
+        self.expected_instance_id
+    }
+}
+
+impl std::fmt::Display for HandleAffinityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Sanitized message: internal ids are not interesting to end users
+        // but are preserved in `Debug` for operator correlation.
+        write!(
+            f,
+            "handle belongs to a different SCP instance — operation rejected"
+        )
+    }
+}
+
+impl std::error::Error for HandleAffinityError {}
+
+/// Outcome of an async bridge shutdown — see
+/// [`CoreFields::shutdown_core_async`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShutdownOutcome {
+    /// All outstanding tasks completed before the deadline. The elapsed
+    /// duration is reported so callers can log shutdown latency.
+    GracefulWithin(Duration),
+    /// The deadline expired before all tasks finished; the `JoinSet` was
+    /// aborted. `aborted_tasks` is the number of tasks that were cut short
+    /// (tasks that had already completed before the deadline are not
+    /// counted).
+    TimedOut {
+        /// Number of tasks that were aborted because the shutdown deadline
+        /// was reached.
+        aborted_tasks: usize,
+    },
+}
+
+/// Error produced by [`CoreFields::shutdown_core_async`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ShutdownError {
+    /// The instance has already been shut down; a second call is a no-op
+    /// from the caller's perspective but is surfaced so the caller can
+    /// distinguish "I did the work" from "someone else already did."
+    #[error("bridge instance has already been shut down")]
+    AlreadyShutDown,
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -2690,5 +2879,236 @@ mod tests {
             bi2.pending_relay_url().as_deref(),
             Some("wss://relay2.example.com")
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Commit 1: instance_id + handle affinity
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn instance_id_is_unique_across_instances() {
+        let a = CoreFields::new();
+        let b = CoreFields::new();
+        assert_ne!(
+            a.instance_id(),
+            b.instance_id(),
+            "two fresh instances must carry distinct instance_ids"
+        );
+    }
+
+    #[test]
+    fn instance_id_is_monotonic() {
+        let a = CoreFields::new();
+        let b = CoreFields::new();
+        let c = CoreFields::new();
+        assert!(
+            a.instance_id() < b.instance_id() && b.instance_id() < c.instance_id(),
+            "instance_id allocation must be monotonically increasing: {} < {} < {}",
+            a.instance_id(),
+            b.instance_id(),
+            c.instance_id()
+        );
+    }
+
+    #[test]
+    fn instance_id_is_never_zero() {
+        // Zero is reserved as UNSET_INSTANCE_ID — live instances must never
+        // collide with a handle whose id has not been assigned.
+        let a = CoreFields::new();
+        assert_ne!(a.instance_id(), UNSET_INSTANCE_ID);
+    }
+
+    #[test]
+    fn handle_affinity_accepts_same_instance() {
+        let instance = CoreFields::new();
+        assert!(instance.check_handle(instance.instance_id()).is_ok());
+    }
+
+    #[test]
+    fn handle_affinity_rejects_cross_instance() {
+        let a = CoreFields::new();
+        let b = CoreFields::new();
+        // Handle minted against `a`, presented to `b`.
+        let err = b.check_handle(a.instance_id()).unwrap_err();
+        assert_eq!(err.handle_instance_id(), a.instance_id());
+        assert_eq!(err.expected_instance_id(), b.instance_id());
+    }
+
+    #[test]
+    fn handle_affinity_rejects_unset_id() {
+        // A handle that forgot to attach itself to an instance carries the
+        // reserved `UNSET_INSTANCE_ID` — the live instance must reject it.
+        let instance = CoreFields::new();
+        assert!(instance.check_handle(UNSET_INSTANCE_ID).is_err());
+    }
+
+    #[test]
+    fn handle_affinity_error_display_is_sanitized() {
+        let err = HandleAffinityError::new(7, 11);
+        let msg = err.to_string();
+        // Ids must not leak into the display — operators read them from
+        // Debug/log fields, users see the sanitized message.
+        assert!(!msg.contains('7'));
+        assert!(!msg.contains("11"));
+        assert!(msg.contains("handle"));
+    }
+
+    // -----------------------------------------------------------------
+    // Commit 1: shutdown_core_async
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn shutdown_core_async_graceful_when_no_tasks() {
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        let outcome = instance
+            .shutdown_core_async(Duration::from_secs(1))
+            .await
+            .unwrap();
+        let ShutdownOutcome::GracefulWithin(elapsed) = outcome else {
+            unreachable!("expected GracefulWithin, got {outcome:?}");
+        };
+        assert!(elapsed < Duration::from_secs(1));
+        assert!(instance.is_shutdown());
+    }
+
+    #[tokio::test]
+    async fn shutdown_core_async_times_out_with_long_task() {
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        {
+            let mut tasks = instance.task_handle().await;
+            tasks.spawn(async move {
+                // Sleep far beyond the shutdown deadline below.
+                tokio::time::sleep(Duration::from_mins(1)).await;
+            });
+        }
+        let outcome = instance
+            .shutdown_core_async(Duration::from_millis(100))
+            .await
+            .unwrap();
+        let ShutdownOutcome::TimedOut { aborted_tasks } = outcome else {
+            unreachable!("expected TimedOut, got {outcome:?}");
+        };
+        assert_eq!(aborted_tasks, 1);
+        assert!(instance.is_shutdown());
+    }
+
+    #[tokio::test]
+    async fn shutdown_core_async_fires_cancellation_token() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_clone = Arc::clone(&observed);
+        let token = instance.cancel_token();
+        {
+            let mut tasks = instance.task_handle().await;
+            tasks.spawn(async move {
+                token.cancelled().await;
+                observed_clone.store(true, Ordering::SeqCst);
+            });
+        }
+        let outcome = instance
+            .shutdown_core_async(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, ShutdownOutcome::GracefulWithin(_)),
+            "task observing cancel_token should exit gracefully, got {outcome:?}"
+        );
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "spawned task must have observed the cancellation signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_core_async_runs_hooks_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+        instance.register_shutdown_hook(Box::new(move || {
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        instance
+            .shutdown_core_async(Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_core_async_is_idempotent() {
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        let first = instance
+            .shutdown_core_async(Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(matches!(first, ShutdownOutcome::GracefulWithin(_)));
+
+        let err = instance
+            .shutdown_core_async(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err, ShutdownError::AlreadyShutDown);
+    }
+
+    #[tokio::test]
+    async fn shutdown_core_async_after_sync_shutdown_errors() {
+        // The sync `shutdown()` path also flips the idempotent flag, so the
+        // async variant must report AlreadyShutDown afterwards — callers
+        // get a single source of truth for "is already terminated?"
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        instance.shutdown();
+        let err = instance
+            .shutdown_core_async(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err, ShutdownError::AlreadyShutDown);
+    }
+
+    // -----------------------------------------------------------------
+    // Commit 2: BridgeInstanceCore trait behaves via &dyn
+    // -----------------------------------------------------------------
+
+    /// Minimal trait implementation used to exercise default `BridgeInstanceCore`
+    /// methods without pulling in a concrete per-bridge struct (those land in
+    /// commits 3–5). Holds a `CoreFields` and delegates the trait.
+    struct TestBridge {
+        core: CoreFields,
+    }
+
+    #[async_trait::async_trait]
+    impl BridgeInstanceCore for TestBridge {
+        fn core(&self) -> &CoreFields {
+            &self.core
+        }
+        async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
+            let outcome = self.core.shutdown_core_async(timeout).await?;
+            self.bridge_specific_shutdown();
+            Ok(outcome)
+        }
+    }
+
+    #[test]
+    fn trait_default_check_handle_rejects_cross_instance() {
+        let a: Box<dyn BridgeInstanceCore> = Box::new(TestBridge {
+            core: CoreFields::new(),
+        });
+        let b: Box<dyn BridgeInstanceCore> = Box::new(TestBridge {
+            core: CoreFields::new(),
+        });
+        assert!(b.check_handle(a.instance_id()).is_err());
+        assert!(a.check_handle(a.instance_id()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn trait_shutdown_delegates_to_core() {
+        let bridge = TestBridge {
+            core: CoreFields::with_context_manager(test_context_manager()),
+        };
+        let outcome = bridge.shutdown(Duration::from_secs(1)).await.unwrap();
+        assert!(matches!(outcome, ShutdownOutcome::GracefulWithin(_)));
+        assert!(bridge.core().is_shutdown());
     }
 }
