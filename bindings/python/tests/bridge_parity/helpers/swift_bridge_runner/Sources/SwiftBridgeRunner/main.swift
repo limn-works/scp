@@ -271,13 +271,16 @@ func toErrResponse(_ id: Int, _ error: Error) -> ErrResponse {
     )
 }
 
-func buildContextParams() -> ContextParams {
+func buildContextParams(
+    ceiling: [String] = ["messages:read", "messages:write"]
+) -> ContextParams {
     // Matches the other runners' defaults: single-admin, ephemeral,
     // no TTL, encrypted mode. Ceiling is the minimum set needed for
-    // parity-test send/receive.
+    // parity-test send/receive. Callers override ceiling for ops that
+    // need additional capabilities (tool:register, etc.).
     return ContextParams(
         mode: .encrypted,
-        ceiling: ["messages:read", "messages:write"],
+        ceiling: ceiling,
         ceilingPolicy: .immutable,
         governance: .singleAdmin,
         memoryScope: .ephemeral,
@@ -291,6 +294,14 @@ func buildContextParams() -> ContextParams {
         consequenceRulesJson: nil,
         consequenceConfigJson: nil
     )
+}
+
+func ceilingFromArgs(
+    _ args: [String: JSONValue],
+    default def: [String]
+) -> [String] {
+    guard case let .array(arr)? = args["ceiling"] else { return def }
+    return arr.compactMap { $0.stringValue }
 }
 
 // MARK: - Op implementations
@@ -373,6 +384,146 @@ func opEventLogAppend(_ req: BridgeRequest) async throws -> [String: JSONValue] 
     ]
 }
 
+// MARK: - Ops 6-10
+
+let parityToolName = "parity_probe"
+let parityToolCeiling = [
+    "messages:read",
+    "messages:write",
+    "tool:register",
+    "tool_invoke:*"
+]
+
+func opToolRegister(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    let ceiling = ceilingFromArgs(req.args, default: parityToolCeiling)
+    let identity = try await identityCreate(custody: "in_memory")
+    let handle = try await contextCreate(
+        identity: identity, params: buildContextParams(ceiling: ceiling)
+    )
+    let inputSchema = "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}}}"
+    let outputSchema = "{\"type\":\"object\",\"properties\":{\"y\":{\"type\":\"integer\"}}}"
+    let toolId = try await toolRegister(
+        handle: handle,
+        definition: ToolDefinition(
+            name: parityToolName,
+            description: "parity harness probe tool",
+            inputSchemaJson: inputSchema,
+            outputSchemaJson: outputSchema,
+            operatorDid: identity.did(),
+            testVectorsJson: nil,
+            implementationHash: nil,
+            cost: nil
+        )
+    )
+    return ["tool_id": .string(toolId)]
+}
+
+func opUcanMint(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    let memberDid = req.args["member_did"]?.stringValue
+        ?? "did:dht:zparitymemberparitymemberparitymemberparitymember"
+    let capabilities: [String]
+    if case let .array(arr)? = req.args["capabilities"] {
+        capabilities = arr.compactMap { $0.stringValue }
+    } else {
+        capabilities = ["messages:read"]
+    }
+    let ceiling = ceilingFromArgs(req.args, default: ["messages:read", "messages:write"])
+    let identity = try await identityCreate(custody: "in_memory")
+    let handle = try await contextCreate(
+        identity: identity, params: buildContextParams(ceiling: ceiling)
+    )
+    let token = try await ucanMint(
+        handle: handle,
+        memberDid: memberDid,
+        capabilities: capabilities,
+        proofs: nil
+    )
+    return [
+        "issuer": .string(token.issuer()),
+        "audience": .string(token.audience()),
+        "capability_count": .integer(Int64(token.capabilities().count))
+    ]
+}
+
+func opUcanValidateMalformed(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    // UniFFI wraps parse_ucan with SCP-PERM-3002. Xfail'd in
+    // seed_operations.py against uniffi-swift.
+    let ceiling = ceilingFromArgs(req.args, default: ["messages:read", "messages:write"])
+    let identity = try await identityCreate(custody: "in_memory")
+    let handle = try await contextCreate(
+        identity: identity, params: buildContextParams(ceiling: ceiling)
+    )
+    do {
+        try await ucanValidate(
+            handle: handle,
+            token: "not.a.jwt",
+            capability: "scp:ctx:any/messages:read",
+            presentingAgentDid: nil,
+            proofTokens: nil
+        )
+        return [
+            "error": .object([
+                "type": .string("none"),
+                "code": .string("NONE")
+            ])
+        ]
+    } catch {
+        let message = String(describing: error)
+        let code = extractScpCode(message)
+        let errType = String(describing: type(of: error))
+        return [
+            "error": .object([
+                "type": .string(errType),
+                "code": .string(code)
+            ])
+        ]
+    }
+}
+
+func opTransportStatus(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    _ = req
+    // UniFFI's `transport_status` requires a connected TransportManager
+    // (transport_connect opens a real WebSocket). Xfail'd against
+    // uniffi-swift in OP_TRANSPORT_STATUS. We return all-null to make
+    // the xfail a real parity signal — if UniFFI grows a handleless
+    // probe, this will diverge from the WASM shape and the xfail flip
+    // will fail loudly until the runner is updated.
+    return [
+        "connected": .null,
+        "relay_url": .null,
+        "latency_ms": .null
+    ]
+}
+
+func opEventLogQueryFiltered(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    let filter: [String: JSONValue]
+    if let obj = req.args["filter"]?.objectValue {
+        filter = obj
+    } else {
+        filter = ["event_type": .string("ContextCreated")]
+    }
+    // Serialize the filter to a JSON string for the UniFFI API.
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    let filterJson: String
+    if let data = try? encoder.encode(filter),
+       let str = String(data: data, encoding: .utf8) {
+        filterJson = str
+    } else {
+        filterJson = "{\"event_type\":\"ContextCreated\"}"
+    }
+    let identity = try await identityCreate(custody: "in_memory")
+    let handle = try await contextCreate(
+        identity: identity, params: buildContextParams()
+    )
+    let events = try await eventLogQuery(handle: handle, filterJson: filterJson)
+    let first = events.first
+    return [
+        "event_count": .integer(Int64(events.count)),
+        "first_event_type": .string(first?.eventType ?? "")
+    ]
+}
+
 func opSignMessage(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     let audience = req.args["audience"]?.stringValue
         ?? "https://parity-test.example.com"
@@ -414,6 +565,16 @@ func dispatch(_ req: BridgeRequest) async -> Any {
             result = try await opEventLogAppend(req)
         case "sign_message":
             result = try await opSignMessage(req)
+        case "tool_register":
+            result = try await opToolRegister(req)
+        case "ucan_mint":
+            result = try await opUcanMint(req)
+        case "ucan_validate_malformed":
+            result = try await opUcanValidateMalformed(req)
+        case "transport_status":
+            result = try await opTransportStatus(req)
+        case "event_log_query_filtered":
+            result = try await opEventLogQueryFiltered(req)
         default:
             return ErrResponse(
                 id: req.id,

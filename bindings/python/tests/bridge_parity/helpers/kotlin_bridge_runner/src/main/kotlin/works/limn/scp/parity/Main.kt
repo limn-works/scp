@@ -201,10 +201,12 @@ private fun extractScpCode(message: String): String =
 // diverge from the other runners).
 // ---------------------------------------------------------------------------
 
-private fun buildContextParams(): uniffi.scp.ContextParams =
+private fun buildContextParams(
+    ceiling: List<String> = listOf("messages:read", "messages:write")
+): uniffi.scp.ContextParams =
     uniffi.scp.ContextParams(
         mode = uniffi.scp.ContextMode.ENCRYPTED,
-        ceiling = listOf("messages:read", "messages:write"),
+        ceiling = ceiling,
         ceilingPolicy = uniffi.scp.CeilingPolicy.IMMUTABLE,
         governance = uniffi.scp.GovernanceModel.SINGLE_ADMIN,
         memoryScope = uniffi.scp.MemoryScope.EPHEMERAL,
@@ -218,6 +220,15 @@ private fun buildContextParams(): uniffi.scp.ContextParams =
         consequenceRulesJson = null,
         consequenceConfigJson = null
     )
+
+private fun ceilingFromArgs(
+    args: JsonObject,
+    default: List<String>
+): List<String> {
+    val raw = args["ceiling"] ?: return default
+    val array = raw as? kotlinx.serialization.json.JsonArray ?: return default
+    return array.map { it.jsonPrimitive.content }
+}
 
 private suspend fun opIdentityCreate(args: JsonObject): JsonObject {
     val custody = args["custody"]?.jsonPrimitive?.content ?: "in_memory"
@@ -299,6 +310,124 @@ private suspend fun opEventLogAppend(args: JsonObject): JsonObject {
     }
 }
 
+// -- ops 6-10 ------------------------------------------------------------
+
+private const val PARITY_TOOL_NAME = "parity_probe"
+private val PARITY_TOOL_CEILING = listOf(
+    "messages:read",
+    "messages:write",
+    "tool:register",
+    "tool_invoke:*"
+)
+
+@Suppress("UnusedParameter")
+private suspend fun opToolRegister(args: JsonObject): JsonObject {
+    val ceiling = ceilingFromArgs(args, PARITY_TOOL_CEILING)
+    val identity = uniffi.scp.identityCreate("in_memory")
+    val handle = uniffi.scp.contextCreate(identity, buildContextParams(ceiling))
+    val inputSchema = """{"type":"object","properties":{"x":{"type":"integer"}}}"""
+    val outputSchema = """{"type":"object","properties":{"y":{"type":"integer"}}}"""
+    val toolId = uniffi.scp.toolRegister(
+        handle,
+        uniffi.scp.ToolDefinition(
+            name = PARITY_TOOL_NAME,
+            description = "parity harness probe tool",
+            inputSchemaJson = inputSchema,
+            outputSchemaJson = outputSchema,
+            operatorDid = identity.did(),
+            testVectorsJson = null,
+            implementationHash = null,
+            cost = null
+        )
+    )
+    return buildJsonObject { put("tool_id", JsonPrimitive(toolId)) }
+}
+
+private suspend fun opUcanMint(args: JsonObject): JsonObject {
+    val memberDid = args["member_did"]?.jsonPrimitive?.content
+        ?: "did:dht:zparitymemberparitymemberparitymemberparitymember"
+    val capabilities = (args["capabilities"] as? kotlinx.serialization.json.JsonArray)
+        ?.map { it.jsonPrimitive.content }
+        ?: listOf("messages:read")
+    val ceiling = ceilingFromArgs(args, listOf("messages:read", "messages:write"))
+    val identity = uniffi.scp.identityCreate("in_memory")
+    val handle = uniffi.scp.contextCreate(identity, buildContextParams(ceiling))
+    val token = uniffi.scp.ucanMint(handle, memberDid, capabilities, null)
+    return buildJsonObject {
+        put("issuer", JsonPrimitive(token.issuer()))
+        put("audience", JsonPrimitive(token.audience()))
+        put("capability_count", JsonPrimitive(token.capabilities().size))
+    }
+}
+
+private suspend fun opUcanValidateMalformed(args: JsonObject): JsonObject {
+    // UniFFI wraps parse_ucan errors with SCP-PERM-3002 (diverges from
+    // PyO3/NAPI SCP-PERM-3001). The seed_operations.py OpSpec xfails
+    // uniffi-kotlin for this op until the codes are aligned upstream.
+    val ceiling = ceilingFromArgs(args, listOf("messages:read", "messages:write"))
+    val identity = uniffi.scp.identityCreate("in_memory")
+    val handle = uniffi.scp.contextCreate(identity, buildContextParams(ceiling))
+    return try {
+        uniffi.scp.ucanValidate(
+            handle,
+            "not.a.jwt",
+            "scp:ctx:any/messages:read",
+            null,
+            null
+        )
+        buildJsonObject {
+            put(
+                "error",
+                buildJsonObject {
+                    put("type", JsonPrimitive("none"))
+                    put("code", JsonPrimitive("NONE"))
+                }
+            )
+        }
+    } catch (e: Throwable) {
+        val message = e.message ?: e.toString()
+        buildJsonObject {
+            put(
+                "error",
+                buildJsonObject {
+                    put("type", JsonPrimitive(e::class.simpleName ?: "Exception"))
+                    put("code", JsonPrimitive(extractScpCode(message)))
+                }
+            )
+        }
+    }
+}
+
+@Suppress("UnusedParameter")
+private suspend fun opTransportStatus(args: JsonObject): JsonObject {
+    // UniFFI's `transport_status` takes a TransportManager produced by
+    // `transport_connect`, which opens a real WebSocket. The xfail in
+    // seed_operations.py (OP_TRANSPORT_STATUS) covers this divergence.
+    // We return a deliberately-mismatching shape (all nulls) so the
+    // xfail is a true parity signal — flipping the xfail will fail
+    // loudly until the harness or bridge adds a handleless status probe.
+    return buildJsonObject {
+        put("connected", kotlinx.serialization.json.JsonNull)
+        put("relay_url", kotlinx.serialization.json.JsonNull)
+        put("latency_ms", kotlinx.serialization.json.JsonNull)
+    }
+}
+
+@Suppress("UnusedParameter")
+private suspend fun opEventLogQueryFiltered(args: JsonObject): JsonObject {
+    val filter = args["filter"]?.jsonObject ?: buildJsonObject {
+        put("event_type", JsonPrimitive("ContextCreated"))
+    }
+    val identity = uniffi.scp.identityCreate("in_memory")
+    val handle = uniffi.scp.contextCreate(identity, buildContextParams())
+    val events = uniffi.scp.eventLogQuery(handle, JSON.encodeToString(JsonElement.serializer(), filter))
+    val first = events.firstOrNull()
+    return buildJsonObject {
+        put("event_count", JsonPrimitive(events.size))
+        put("first_event_type", JsonPrimitive(first?.eventType ?: ""))
+    }
+}
+
 private suspend fun opSignMessage(args: JsonObject): JsonObject {
     val audience = args["audience"]?.jsonPrimitive?.content
         ?: "https://parity-test.example.com"
@@ -326,6 +455,11 @@ private suspend fun dispatch(req: RawRequest): String {
             "invalid_capability_rejected" -> opInvalidCapability(req.args)
             "event_log_append" -> opEventLogAppend(req.args)
             "sign_message" -> opSignMessage(req.args)
+            "tool_register" -> opToolRegister(req.args)
+            "ucan_mint" -> opUcanMint(req.args)
+            "ucan_validate_malformed" -> opUcanValidateMalformed(req.args)
+            "transport_status" -> opTransportStatus(req.args)
+            "event_log_query_filtered" -> opEventLogQueryFiltered(req.args)
             else -> return errResponse(
                 req.id,
                 type = "UnknownOp",

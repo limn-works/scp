@@ -323,6 +323,28 @@ async function dispatch(req: BridgeRequest): Promise<OkResponse | ErrResponse> {
         return { id: req.id, ok: true, result: await opEventLogAppend(req) };
       case "sign_message":
         return { id: req.id, ok: true, result: await opSignMessage(req) };
+      case "tool_register":
+        return { id: req.id, ok: true, result: await opToolRegister(req) };
+      case "ucan_mint":
+        return { id: req.id, ok: true, result: await opUcanMint(req) };
+      case "ucan_validate_malformed":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opUcanValidateMalformed(req),
+        };
+      case "transport_status":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opTransportStatus(req),
+        };
+      case "event_log_query_filtered":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opEventLogQueryFiltered(req),
+        };
       default:
         return {
           id: req.id,
@@ -488,6 +510,197 @@ async function opEventLogAppend(
     event_count: events.length,
     first_event_type: String(first.eventType ?? first.event_type ?? ""),
     first_sequence: Number(first.sequence ?? 0),
+  };
+}
+
+// -- ops 6-10 -------------------------------------------------------------
+
+// Shared tool registration body — pinned across bridges in
+// `seed_operations.py::OP_TOOL_REGISTER`. Keep the shape aligned with
+// the scp-core ToolRegistration: name, description, schema {input,
+// output}, operator_did. Schemas are trivial objects (the parity
+// assertion is on `tool_id`, not schema content).
+const PARITY_TOOL_NAME = "parity_probe";
+const PARITY_TOOL_SCHEMA = {
+  input: { type: "object", properties: { x: { type: "integer" } } },
+  output: { type: "object", properties: { y: { type: "integer" } } },
+};
+const PARITY_TOOL_CEILING = [
+  "messages:read",
+  "messages:write",
+  "tool:register",
+  "tool_invoke:*",
+];
+
+async function opToolRegister(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  const ceiling = (req.args.ceiling as string[]) ?? PARITY_TOOL_CEILING;
+  const params = { name: "parity-tools", mode: "encrypted", ceiling };
+  if (req.bridgeMode === "napi") {
+    const bridge = await loadNapi();
+    const identity = await bridge.identityCreate("in_memory");
+    const handle = await bridge.contextCreate(identity, JSON.stringify(params));
+    const toolId = await bridge.toolRegister(handle, {
+      name: PARITY_TOOL_NAME,
+      description: "parity harness probe tool",
+      inputSchema: PARITY_TOOL_SCHEMA.input,
+      outputSchema: PARITY_TOOL_SCHEMA.output,
+      operator: identity.did,
+    });
+    return { tool_id: toolId };
+  }
+  const { raw } = await loadWasm();
+  const identity = await raw.identity_create("in_memory");
+  const handle = await raw.context_create(identity.did, JSON.stringify(params));
+  // WASM tool_register takes a definition JSON with `schema` (input) and
+  // `outputSchema` fields at the top level (see scp-ffi/wasm/src/tools.rs).
+  const toolDef = {
+    name: PARITY_TOOL_NAME,
+    description: "parity harness probe tool",
+    schema: PARITY_TOOL_SCHEMA.input,
+    outputSchema: PARITY_TOOL_SCHEMA.output,
+    operatorDid: identity.did,
+  };
+  const toolId = await raw.tool_register(handle, JSON.stringify(toolDef));
+  return { tool_id: toolId };
+}
+
+async function opUcanMint(req: BridgeRequest): Promise<Record<string, unknown>> {
+  const memberDid = String(req.args.member_did);
+  const capabilities = (req.args.capabilities as string[]) ?? ["messages:read"];
+  const ceiling = (req.args.ceiling as string[]) ?? ["messages:read"];
+  const params = { name: "parity-ucan", mode: "encrypted", ceiling };
+  if (req.bridgeMode === "napi") {
+    const bridge = await loadNapi();
+    const identity = await bridge.identityCreate("in_memory");
+    const handle = await bridge.contextCreate(identity, JSON.stringify(params));
+    const token = await bridge.ucanMint(handle, memberDid, capabilities);
+    return {
+      issuer: token.issuer,
+      audience: token.audience,
+      capability_count: token.capabilities.length,
+    };
+  }
+  const { raw } = await loadWasm();
+  const identity = await raw.identity_create("in_memory");
+  const handle = await raw.context_create(identity.did, JSON.stringify(params));
+  const token = await raw.ucan_mint(
+    handle,
+    memberDid,
+    JSON.stringify(capabilities),
+  );
+  // WASM returns capabilities as a JSON-encoded string; NAPI returns an array.
+  const caps = JSON.parse(token.capabilitiesJson ?? "[]") as string[];
+  return {
+    issuer: token.issuer,
+    audience: token.audience,
+    capability_count: caps.length,
+  };
+}
+
+async function opUcanValidateMalformed(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  const ceiling = (req.args.ceiling as string[]) ?? ["messages:read"];
+  const params = { name: "parity-ucan-v", mode: "encrypted", ceiling };
+  const badToken = "not.a.jwt";
+  const capability = "scp:ctx:any/messages:read";
+  try {
+    if (req.bridgeMode === "napi") {
+      const bridge = await loadNapi();
+      const identity = await bridge.identityCreate("in_memory");
+      const handle = await bridge.contextCreate(
+        identity,
+        JSON.stringify(params),
+      );
+      await bridge.ucanValidate(handle, badToken, capability);
+    } else {
+      const { raw } = await loadWasm();
+      const identity = await raw.identity_create("in_memory");
+      const handle = await raw.context_create(
+        identity.did,
+        JSON.stringify(params),
+      );
+      await raw.ucan_validate(handle, badToken, capability, identity.did, undefined);
+    }
+  } catch (err: unknown) {
+    if (err instanceof Error) {
+      const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
+      return {
+        error: {
+          type: err.constructor.name,
+          code: codeMatch ? codeMatch[0] : "UNKNOWN",
+        },
+      };
+    }
+    return { error: { type: "unknown", code: "UNKNOWN" } };
+  }
+  return { error: { type: "none", code: "NONE" } };
+}
+
+async function opTransportStatus(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  // Only WASM exposes a stateless, handleless transport_status. NAPI
+  // requires a connected manager — see OP_TRANSPORT_STATUS in
+  // seed_operations.py for the xfail rationale. We still dispatch on
+  // napi here so the test surfaces a real error (rather than a silent
+  // skip); pytest's xfail-strict converts the mismatch into an
+  // expected failure.
+  if (req.bridgeMode === "napi") {
+    // NAPI cannot produce a disconnected status without a real
+    // transport_connect round-trip. Return a synthetic shape that
+    // deliberately diverges so the xfail is a true parity signal —
+    // flipping the xfail once NAPI grows a stateless probe will fail
+    // loudly, forcing the harness to be updated in lockstep.
+    return {
+      connected: null,
+      relay_url: null,
+      latency_ms: null,
+    };
+  }
+  const { raw } = await loadWasm();
+  const status = raw.transport_status();
+  return {
+    connected: status.connected ?? false,
+    relay_url: status.relayUrl ?? status.relay_url ?? null,
+    latency_ms: status.latencyMs ?? status.latency_ms ?? null,
+  };
+}
+
+async function opEventLogQueryFiltered(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  const filter = (req.args.filter as Record<string, unknown>) ?? {
+    event_type: "ContextCreated",
+  };
+  const params = { name: "parity-elog-f", mode: "encrypted" };
+  if (req.bridgeMode === "napi") {
+    const bridge = await loadNapi();
+    const identity = await bridge.identityCreate("in_memory");
+    const handle = await bridge.contextCreate(identity, JSON.stringify(params));
+    const events = await bridge.eventLogQuery(handle, filter);
+    const first = events[0];
+    return {
+      event_count: events.length,
+      first_event_type: first ? String(first.eventType) : "",
+    };
+  }
+  const { raw } = await loadWasm();
+  const identity = await raw.identity_create("in_memory");
+  const handle = await raw.context_create(identity.did, JSON.stringify(params));
+  const eventsJson = await raw.event_log_query(handle, JSON.stringify(filter));
+  const events = JSON.parse(eventsJson) as Array<{
+    eventType?: string;
+    event_type?: string;
+  }>;
+  const first = events[0];
+  return {
+    event_count: events.length,
+    first_event_type: first
+      ? String(first.eventType ?? first.event_type ?? "")
+      : "",
   };
 }
 

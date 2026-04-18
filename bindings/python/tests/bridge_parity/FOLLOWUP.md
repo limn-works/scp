@@ -73,15 +73,51 @@ bridges. Estimated ~40–60 LoC. Integration checklist applies.
 
 # Scope extensions (continued)
 
-## 6. Expand the op library
+## 7. Handleless `transport_status` probe on NAPI and UniFFI
 
-Current 5 ops cover identity, context, error, event log, and signing.
-Missing areas that would benefit from parity assertions:
+`OP_TRANSPORT_STATUS` in `seed_operations.py` exercises the stateless
+disconnected-status path. PyO3 and WASM support this directly
+(`transport_status()` with no arguments). NAPI and UniFFI require a
+`TransportManager` handle produced by `transport_connect`, which opens
+a real WebSocket — so the parity op cannot be exercised on those
+bridges without a running relay fixture.
 
-- UCAN mint + validate (capability URI handling differs subtly between
-  bridges per ADR-016)
-- Transport status (connection state serialization)
-- Tool register + invoke (JSON schema validation parity)
+Short-term: the op xfails `napi`, `uniffi-kotlin`, and `uniffi-swift`
+(documented in the OpSpec).
 
-Per the ADR: adding a new op is ~20 lines. Incremental coverage
-is the whole point of the harness.
+Medium-term options:
+1. Add a handleless probe to NAPI + UniFFI (e.g. a module-global
+   `current_transport_status()` that returns the empty status when no
+   manager exists). Symmetric with PyO3/WASM; trivial to parity-gate.
+2. Start an in-process loopback relay fixture inside the Python
+   harness and let NAPI/UniFFI `transport_connect` through it. More
+   realistic but materially more infrastructure.
+
+Option 1 is cheaper and sufficient for parity. Option 2 is future
+work if real-relay behavior needs harness coverage.
+
+When either lands, remove the `xfail_bridges` entry on
+`OP_TRANSPORT_STATUS` and make sure the Node / Kotlin / Swift runners
+return the real status rather than the synthetic all-null sentinel.
+
+---
+
+## 8. Align UCAN parse-error code across bridges
+
+`OP_UCAN_VALIDATE_MALFORMED` exercises the malformed-JWT rejection
+path. All four bridges reject the token (good) but with three
+different SCP codes:
+
+  - PyO3 → SCP-PERM-3001 (reference, defined in
+    `crates/scp-ffi/src/error.rs`)
+  - NAPI → SCP-PERM-3001 (matches)
+  - WASM → SCP-PERM-3000 (diverges — inline in
+    `crates/scp-ffi/wasm/src/ucan.rs::ucan_validate`)
+  - UniFFI → SCP-PERM-3002 (diverges — inline match in
+    `crates/scp-ffi/uniffi/src/bridge.rs::ucan_validate`)
+
+Fix: in each of the WASM and UniFFI ucan_validate sites, swap the
+inline error code for `codes::PERM_3001`. No scp-protocol changes
+required. When the fix lands, the same PR removes the
+`xfail_bridges=("wasm", "uniffi-kotlin", "uniffi-swift")` entry on
+`OP_UCAN_VALIDATE_MALFORMED` in `seed_operations.py`.

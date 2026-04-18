@@ -11,7 +11,10 @@ Each OpSpec describes:
 Adding a new op is ~20 lines: one `OpSpec`, one `py_call`, one case in
 the Bun runner's dispatch. The library is append-only.
 
-MVP: 5 ops per ADR-046. Crypto outputs now compare byte-exactly where
+Current op library: 10 ops. The first 5 are the MVP per ADR-046;
+ops 6-10 cover tool registration, UCAN mint/validate-error,
+transport status, and filtered event-log query. Crypto outputs
+compare byte-exactly where
 possible: `identity_create_deterministic` pins DID + identity-key
 verifying bytes under a fixed seed. `sign_message` remains shape-only
 for the signature itself because Ed25519 covers a timestamp that
@@ -440,6 +443,315 @@ OP_SIGN_MESSAGE = OpSpec(
 
 
 # ---------------------------------------------------------------------------
+# op 6: tool_register
+#
+# Register a single tool in a fresh context. The tool_id is derived
+# deterministically across all four bridges from the tool name via the
+# shared `format!("tool-{}", name.replace(' ', "-").to_lowercase())`
+# convention (see scp-ffi/src/tools.rs, scp-ffi/napi/src/tools.rs,
+# scp-ffi/wasm/src/tools.rs, scp-ffi/uniffi/src/bridge.rs — all four
+# use the same format). That makes tool_id byte-exact for parity.
+# ---------------------------------------------------------------------------
+
+
+# Ceiling must include `tool:register` to permit the registration action.
+_TOOL_CEILING = ["messages:read", "messages:write", "tool:register", "tool_invoke:*"]
+_TOOL_NAME = "parity_probe"
+_EXPECTED_TOOL_ID = f"tool-{_TOOL_NAME}"
+_TOOL_SCHEMA: dict[str, Any] = {
+    "input_schema": {"type": "object", "properties": {"x": {"type": "integer"}}},
+    "output_schema": {"type": "object", "properties": {"y": {"type": "integer"}}},
+}
+
+
+def _py_tool_register(ctx: OpContext) -> dict[str, Any]:
+    identity = ctx.scp_core.py_identity_create("in_memory")
+    handle = ctx.scp_core.py_context_create(
+        identity.did,
+        {"name": "parity-tools", "mode": "encrypted", "ceiling": _TOOL_CEILING},
+    )
+    tool_id = ctx.scp_core.tool_register(
+        handle.context_id,
+        {
+            "name": _TOOL_NAME,
+            "description": "parity harness probe tool",
+            "operator_did": identity.did,
+            "schema": _TOOL_SCHEMA,
+        },
+    )
+    return {"tool_id": tool_id}
+
+
+OP_TOOL_REGISTER = OpSpec(
+    name="tool_register",
+    py_call=_py_tool_register,
+    node_call={
+        "op": "tool_register",
+        "args": {
+            "name": _TOOL_NAME,
+            "description": "parity harness probe tool",
+            "schema": _TOOL_SCHEMA,
+            "ceiling": _TOOL_CEILING,
+        },
+    },
+    schema=OpSchema(fields=(FieldSpec("tool_id", "exact"),)),
+    # Spec-pin the derivation: `tool-{name-lowercased-spaces-to-dashes}`.
+    # Joint drift (e.g. all bridges hash instead of format) would pass
+    # parity step 3 but violate the shared convention; this locks it.
+    expected_values=(("tool_id", _EXPECTED_TOOL_ID),),
+)
+
+
+# ---------------------------------------------------------------------------
+# op 7: ucan_mint
+#
+# Mint a UCAN in a freshly created context with a pinned member DID and
+# capability set. All four bridges return metadata — issuer, audience,
+# capabilities — byte-exactly under those inputs. The encoded JWT is
+# NOT compared: PyO3's PyUcanToken intentionally does not expose the
+# JWT (see crates/scp-ffi/src/ucan.rs), and both the signature and the
+# wall-clock `exp` would diverge even if it did. Cross-bridge encoded-
+# JWT parity is a follow-up gated on two things: (1) exposing `encoded`
+# in PyO3, and (2) clock injection (FOLLOWUP.md §1) — the `exp` field
+# prevents byte-exact parity today.
+#
+# The `audience` is a fixed well-formed DID string (the bridges don't
+# require the DID to be resolvable for minting). Capabilities are
+# compared as a sorted set — bridges may differ on list ordering but
+# the set must match.
+# ---------------------------------------------------------------------------
+
+
+_UCAN_MEMBER_DID = "did:dht:zparitymemberparitymemberparitymemberparitymember"
+_UCAN_CEILING = ["messages:read", "messages:write"]
+# Capabilities are context-scoped by the bridges: passing "messages:read"
+# becomes "scp:ctx:{context_id}/messages:read" in the minted token. The
+# context_id is random per bridge, so we compare the capability COUNT
+# (shape-only) rather than literal URIs. Issuer = creator_did (random per
+# bridge), audience = _UCAN_MEMBER_DID (fixed) — issuer is regex'd, audience
+# is exact.
+_UCAN_REQUESTED_CAPS = ["messages:read"]
+
+
+def _py_ucan_mint(ctx: OpContext) -> dict[str, Any]:
+    identity = ctx.scp_core.py_identity_create("in_memory")
+    handle = ctx.scp_core.py_context_create(
+        identity.did,
+        {"name": "parity-ucan", "mode": "encrypted", "ceiling": _UCAN_CEILING},
+    )
+    token = ctx.scp_core.ucan_mint(handle.context_id, _UCAN_MEMBER_DID, _UCAN_REQUESTED_CAPS)
+    return {
+        "issuer": token.issuer,
+        "audience": token.audience,
+        "capability_count": len(token.capabilities),
+    }
+
+
+OP_UCAN_MINT = OpSpec(
+    name="ucan_mint",
+    py_call=_py_ucan_mint,
+    node_call={
+        "op": "ucan_mint",
+        "args": {
+            "member_did": _UCAN_MEMBER_DID,
+            "capabilities": _UCAN_REQUESTED_CAPS,
+            "ceiling": _UCAN_CEILING,
+        },
+    },
+    schema=OpSchema(
+        fields=(
+            # Issuer is the context creator's DID — different per bridge
+            # (random identity creation) but must match did:dht shape.
+            FieldSpec("issuer", "regex", pattern=DID_DHT_PATTERN),
+            # Audience is the fixed member DID we passed in; must round-trip.
+            FieldSpec("audience", "exact"),
+            # Count exactly matches the number of requested capabilities.
+            FieldSpec("capability_count", "exact"),
+        )
+    ),
+    expected_values=(
+        ("audience", _UCAN_MEMBER_DID),
+        ("capability_count", len(_UCAN_REQUESTED_CAPS)),
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# op 8: ucan_validate_malformed
+#
+# Validate a clearly-malformed UCAN token ("not.a.jwt"). The bridges
+# share `scp_protocol::crypto::ucan::validate::parse_ucan` but map its
+# errors through BRIDGE-LOCAL wrappers with different SCP codes. This
+# op is the harness surfacing a real divergence:
+#
+#   - PyO3 → SCP-PERM-3001 (crates/scp-ffi/src/error.rs,
+#     `From<UcanError> for ScpPyError`)
+#   - NAPI → SCP-PERM-3001 (same mapping)
+#   - WASM → SCP-PERM-3000 (crates/scp-ffi/wasm/src/ucan.rs, inline)
+#   - UniFFI → SCP-PERM-3002 (crates/scp-ffi/uniffi/src/bridge.rs,
+#     `ucan_validate` inline match on `parse_ucan` error)
+#
+# PyO3 is the reference (SCP-PERM-3001). NAPI agrees and passes. WASM
+# and UniFFI are xfail'd with a FOLLOWUP.md §8 reference — the fix is a
+# one-line change in each bridge to use the shared PERM_3001 constant.
+# When those PRs land, the fixes MUST remove these xfail entries in the
+# same PR (xfail-strict policy in the module docstring).
+# ---------------------------------------------------------------------------
+
+
+_MALFORMED_UCAN = "not.a.jwt"
+# PyO3 / NAPI reference code. WASM and UniFFI diverge — see op docstring.
+_EXPECTED_MALFORMED_UCAN_CODE = "SCP-PERM-3001"
+
+
+def _py_ucan_validate_malformed(ctx: OpContext) -> dict[str, Any]:
+    identity = ctx.scp_core.py_identity_create("in_memory")
+    handle = ctx.scp_core.py_context_create(
+        identity.did, {"name": "parity-ucan-v", "mode": "encrypted", "ceiling": _UCAN_CEILING}
+    )
+    try:
+        ctx.scp_core.ucan_validate(
+            handle.context_id,
+            _MALFORMED_UCAN,
+            # Any well-formed capability string — the malformed-JWT
+            # rejection happens before capability matching.
+            "scp:ctx:any/messages:read",
+        )
+    except Exception as err:
+        err_type = type(err).__name__
+        code = getattr(err, "code", None) or _extract_code(str(err))
+        return {"error": {"type": err_type, "code": code or "UNKNOWN"}}
+    return {"error": {"type": "none", "code": "NONE"}}
+
+
+OP_UCAN_VALIDATE_MALFORMED = OpSpec(
+    name="ucan_validate_malformed",
+    py_call=_py_ucan_validate_malformed,
+    node_call={
+        "op": "ucan_validate_malformed",
+        "args": {"ceiling": _UCAN_CEILING},
+    },
+    schema=OpSchema(
+        fields=(
+            FieldSpec("error.type", "ignore"),
+            FieldSpec("error.code", "exact"),
+        )
+    ),
+    xfail_bridges=("wasm", "uniffi-kotlin", "uniffi-swift"),
+    xfail_reason=(
+        "UCAN parse-error code divergence — PyO3/NAPI emit SCP-PERM-3001, "
+        "WASM emits SCP-PERM-3000, UniFFI emits SCP-PERM-3002. All four "
+        "should converge on the shared code. Tracked in FOLLOWUP.md §8."
+    ),
+    expected_values=(("error.code", _EXPECTED_MALFORMED_UCAN_CODE),),
+)
+
+
+# ---------------------------------------------------------------------------
+# op 9: transport_status_disconnected
+#
+# Query the transport status with no relay connected. PyO3 and WASM
+# expose a stateless global `transport_status()` that returns the
+# default disconnected shape {connected:false, relay_url:None,
+# latency_ms:None}.
+#
+# NAPI and UniFFI expose `transport_status(manager)` which requires a
+# prior `transport_connect()` that opens a real WebSocket. That means
+# the stateless-query path does not exist on those bridges — exercising
+# it on a loopback URL would require a running relay, which the parity
+# harness does not provide. Per the op-library contract, we document
+# the surface divergence as an xfail rather than silently dropping the
+# op. When NAPI / UniFFI grow a handleless status probe (or the
+# harness grows an in-process loopback relay fixture), flip the
+# `xfail_bridges` entry and the test should pass automatically.
+# ---------------------------------------------------------------------------
+
+
+def _py_transport_status(ctx: OpContext) -> dict[str, Any]:
+    status = ctx.scp_core.transport_status()
+    return {
+        "connected": status.connected,
+        "relay_url": status.relay_url,
+        "latency_ms": status.latency_ms,
+    }
+
+
+OP_TRANSPORT_STATUS = OpSpec(
+    name="transport_status_disconnected",
+    py_call=_py_transport_status,
+    node_call={"op": "transport_status", "args": {}},
+    schema=OpSchema(
+        fields=(
+            FieldSpec("connected", "exact"),
+            # relay_url and latency_ms are None when disconnected. Compare
+            # exactly — a bridge returning "" or 0.0 instead of null is a
+            # real divergence we want to catch.
+            FieldSpec("relay_url", "exact"),
+            FieldSpec("latency_ms", "exact"),
+        )
+    ),
+    xfail_bridges=("napi", "uniffi-kotlin", "uniffi-swift"),
+    xfail_reason=(
+        "NAPI and UniFFI transport_status require a connected handle "
+        "(transport_connect opens a real WebSocket). Stateless query "
+        "is only on PyO3 and WASM. Tracked in FOLLOWUP.md §7."
+    ),
+    expected_values=(
+        ("connected", False),
+        ("relay_url", None),
+        ("latency_ms", None),
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# op 10: event_log_query_filtered
+#
+# Create a context (emits ContextCreated), then query the event log
+# with an `event_type=ContextCreated` filter. All four bridges support
+# this filter key and must return exactly one event whose type matches
+# the filter. This locks in the filter semantics independently of op 4,
+# which does an unfiltered query.
+# ---------------------------------------------------------------------------
+
+
+_EVENT_LOG_FILTER = {"event_type": "ContextCreated"}
+
+
+def _py_event_log_query_filtered(ctx: OpContext) -> dict[str, Any]:
+    identity = ctx.scp_core.py_identity_create("in_memory")
+    handle = ctx.scp_core.py_context_create(
+        identity.did, {"name": "parity-elog-f", "mode": "encrypted"}
+    )
+    events = ctx.scp_core.event_log_query(handle.context_id, _EVENT_LOG_FILTER)
+    first = events[0] if events else None
+    return {
+        "event_count": len(events),
+        "first_event_type": str(first.event_type) if first is not None else "",
+    }
+
+
+OP_EVENT_LOG_FILTERED = OpSpec(
+    name="event_log_query_filtered",
+    py_call=_py_event_log_query_filtered,
+    node_call={
+        "op": "event_log_query_filtered",
+        "args": {"filter": _EVENT_LOG_FILTER},
+    },
+    schema=OpSchema(
+        fields=(
+            FieldSpec("event_count", "exact"),
+            FieldSpec("first_event_type", "exact"),
+        )
+    ),
+    expected_values=(
+        ("event_count", 1),
+        ("first_event_type", "ContextCreated"),
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
 # Library
 # ---------------------------------------------------------------------------
 
@@ -450,4 +762,9 @@ SEED_OPS: tuple[OpSpec, ...] = (
     OP_INVALID_CAPABILITY,
     OP_EVENT_LOG_APPEND,
     OP_SIGN_MESSAGE,
+    OP_TOOL_REGISTER,
+    OP_UCAN_MINT,
+    OP_UCAN_VALIDATE_MALFORMED,
+    OP_TRANSPORT_STATUS,
+    OP_EVENT_LOG_FILTERED,
 )
