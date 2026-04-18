@@ -911,8 +911,8 @@ public protocol IdentityProtocol: AnyObject, Sendable {
      * handle was loaded without live key material.
      *
      * Under a deterministic `seed`, this value is byte-identical across
-     * every bridge (ADR-046). See the `verifying_key_hex` field docs for
-     * why `#0` rather than `#active`.
+     * every bridge (ADR-046). See the `verifying_key_hex` field docs
+     * for why `#0` rather than `#active`.
      */
     func verifyingKey()  -> String?
     
@@ -1195,8 +1195,8 @@ open func rotateKey()async throws  -> Identity  {
      * handle was loaded without live key material.
      *
      * Under a deterministic `seed`, this value is byte-identical across
-     * every bridge (ADR-046). See the `verifying_key_hex` field docs for
-     * why `#0` rather than `#active`.
+     * every bridge (ADR-046). See the `verifying_key_hex` field docs
+     * for why `#0` rather than `#active`.
      */
 open func verifyingKey() -> String?  {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
@@ -12096,12 +12096,13 @@ public func scpidChallenge(audience: String, ttlSeconds: UInt64)throws  -> Strin
  * Returns `ScpError::Identity` if the identity has no agent key when
  * `#agent` is requested, or if signing fails.
  */
-public func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String)throws  -> String  {
+public func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String, signedAtOverride: UInt64?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_func_scpid_sign(
         FfiConverterTypeIdentity_lower(identity),
         FfiConverterString.lower(signingKeyId),
-        FfiConverterString.lower(challengeJson),$0
+        FfiConverterString.lower(challengeJson),
+        FfiConverterOptionUInt64.lower(signedAtOverride),$0
     )
 })
 }
@@ -12650,7 +12651,7 @@ public func transportDisconnect(manager: TransportManager)async throws   {
  * still held by the manager.
  *
  * When `manager` is `None`, returns a stateless snapshot derived from the
- * process-wide `BridgeInstance` transport state. This mirrors the PyO3 /
+ * process-wide `BridgeInstance` transport state. This mirrors the `PyO3` /
  * WASM bridges, which expose a handleless probe: callers can observe the
  * default disconnected shape (`connected: false`, `relay_url: None`,
  * `latency_ms: None`) before ever calling `transport_connect`, without
@@ -13382,7 +13383,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_scpid_challenge() != 19241) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scpid_sign() != 52365) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_scpid_sign() != 13880) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_scpid_verify() != 37844) {
@@ -13442,7 +13443,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_transport_disconnect() != 43896) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_transport_status() != 1394) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_transport_status() != 14919) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_create_challenge() != 37813) {
@@ -13511,7 +13512,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_key() != 21897) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_identity_verifying_key() != 65189) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_verifying_key() != 19807) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_commit_deploy() != 10847) {

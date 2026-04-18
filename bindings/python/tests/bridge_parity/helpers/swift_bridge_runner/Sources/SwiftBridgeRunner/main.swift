@@ -306,9 +306,39 @@ func ceilingFromArgs(
 
 // MARK: - Op implementations
 
+/// Decode a 64-char hex string into a 32-byte `Data` seed for the
+/// `identityCreate(custody:seed:)` bridge call. Matches
+/// `node_bridge_runner.ts::seedFromHex` — the parity harness passes a
+/// `seed_hex` arg so every bridge derives byte-identical key material
+/// from the same 32 bytes (ADR-046 /
+/// `seed_operations.py::PARITY_SEED_HEX`).
+///
+/// Returns `nil` on malformed input (wrong length, odd digit count,
+/// non-hex chars). Callers treat `nil` as "no seed" rather than
+/// surfacing an error — the harness always sends valid hex when the
+/// parameter is present, so malformed input is already a harness bug.
+func seedFromHex(_ hex: String) -> Data? {
+    guard hex.count == 64 else { return nil }
+    var bytes = Data(capacity: 32)
+    var index = hex.startIndex
+    while index < hex.endIndex {
+        let next = hex.index(index, offsetBy: 2)
+        guard let byte = UInt8(hex[index..<next], radix: 16) else {
+            return nil
+        }
+        bytes.append(byte)
+        index = next
+    }
+    return bytes
+}
+
 func opIdentityCreate(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     let custody = req.args["custody"]?.stringValue ?? "in_memory"
-    let identity = try await identityCreate(custody: custody)
+    // Plumb the optional `seed_hex` so UniFFI produces byte-identical
+    // DIDs under the shared `PARITY_SEED_HEX`. When absent, pass `nil`
+    // — the bridge falls back to OS entropy.
+    let seed = req.args["seed_hex"]?.stringValue.flatMap { seedFromHex($0) }
+    let identity = try await identityCreate(custody: custody, seed: seed)
     return [
         "did": .string(identity.did()),
         "custody": .string(custody)
@@ -318,7 +348,7 @@ func opIdentityCreate(_ req: BridgeRequest) async throws -> [String: JSONValue] 
 func opContextCreate(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     let paramsArg = req.args["params"]?.objectValue ?? [:]
     let mode = paramsArg["mode"]?.stringValue ?? "encrypted"
-    let identity = try await identityCreate(custody: "in_memory")
+    let identity = try await identityCreate(custody: "in_memory", seed: nil)
     let handle = try await contextCreate(identity: identity, params: buildContextParams())
     return [
         "context_id": .string(handle.contextId()),
@@ -338,11 +368,12 @@ func opInvalidCapability(_ req: BridgeRequest) async throws -> [String: JSONValu
     // shared failure mode across all bridges.
     let badChallenge = "{\"protocol\":\"scpid/1\",\"nonce\":\"00\",\"audience\":\"x\",\"issued_at\":0,\"expires_at\":0}"
     do {
-        let identity = try await identityCreate(custody: "in_memory")
+        let identity = try await identityCreate(custody: "in_memory", seed: nil)
         _ = try scpidSign(
             identity: identity,
             signingKeyId: "#active",
-            challengeJson: badChallenge
+            challengeJson: badChallenge,
+            signedAtOverride: nil
         )
         return [
             "error": .object([
@@ -367,7 +398,7 @@ func opInvalidCapability(_ req: BridgeRequest) async throws -> [String: JSONValu
 
 func opEventLogAppend(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     _ = req
-    let identity = try await identityCreate(custody: "in_memory")
+    let identity = try await identityCreate(custody: "in_memory", seed: nil)
     let handle = try await contextCreate(identity: identity, params: buildContextParams())
     let events = try await eventLogQuery(handle: handle, filterJson: nil)
     guard let first = events.first else {
@@ -396,7 +427,7 @@ let parityToolCeiling = [
 
 func opToolRegister(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     let ceiling = ceilingFromArgs(req.args, default: parityToolCeiling)
-    let identity = try await identityCreate(custody: "in_memory")
+    let identity = try await identityCreate(custody: "in_memory", seed: nil)
     let handle = try await contextCreate(
         identity: identity, params: buildContextParams(ceiling: ceiling)
     )
@@ -428,7 +459,7 @@ func opUcanMint(_ req: BridgeRequest) async throws -> [String: JSONValue] {
         capabilities = ["messages:read"]
     }
     let ceiling = ceilingFromArgs(req.args, default: ["messages:read", "messages:write"])
-    let identity = try await identityCreate(custody: "in_memory")
+    let identity = try await identityCreate(custody: "in_memory", seed: nil)
     let handle = try await contextCreate(
         identity: identity, params: buildContextParams(ceiling: ceiling)
     )
@@ -449,7 +480,7 @@ func opUcanValidateMalformed(_ req: BridgeRequest) async throws -> [String: JSON
     // UniFFI wraps parse_ucan with SCP-PERM-3002. Xfail'd in
     // seed_operations.py against uniffi-swift.
     let ceiling = ceilingFromArgs(req.args, default: ["messages:read", "messages:write"])
-    let identity = try await identityCreate(custody: "in_memory")
+    let identity = try await identityCreate(custody: "in_memory", seed: nil)
     let handle = try await contextCreate(
         identity: identity, params: buildContextParams(ceiling: ceiling)
     )
@@ -525,7 +556,7 @@ func opEventLogQueryFiltered(_ req: BridgeRequest) async throws -> [String: JSON
     } else {
         filterJson = "{\"event_type\":\"ContextCreated\"}"
     }
-    let identity = try await identityCreate(custody: "in_memory")
+    let identity = try await identityCreate(custody: "in_memory", seed: nil)
     let handle = try await contextCreate(
         identity: identity, params: buildContextParams()
     )
@@ -537,16 +568,66 @@ func opEventLogQueryFiltered(_ req: BridgeRequest) async throws -> [String: JSON
     ]
 }
 
+// Fixed 32-byte nonce used when `signed_at_override` pins the SCPID
+// response. Must match
+// `bindings/python/tests/bridge_parity/seed_operations.py::PARITY_NONCE_HEX`
+// and `node_bridge_runner.ts::PARITY_NONCE_HEX`.
+let parityNonceHex = String(repeating: "aa", count: 32)
+
+// Year-2286 timestamp — far enough in the future that wall-clock expiry
+// cannot trip the SCPID expiry check. Must match the Python harness's
+// `PARITY_CHALLENGE_EXPIRES_AT_MS`.
+let parityChallengeExpiresAtMs: Int64 = 9_999_999_999_000
+
+/// When `signed_at_override` is supplied, the challenge must match the
+/// pinned fixture used by the Python harness and the scp-runtime
+/// golden-value test. REPLACE the bridge-issued challenge with the
+/// pinned one so every bridge feeds `scpid_sign` the same canonical
+/// hash inputs. `expires_at` is set far in the future so wall-clock
+/// expiry can't trip the bridge-side expiry check. Mirrors
+/// `node_bridge_runner.ts::patchChallengeForOverride`.
+func patchChallengeForOverride(_ challengeJson: String, override: Int64?) -> String {
+    guard let override = override else { return challengeJson }
+    let obj: [String: Any] = [
+        "protocol": "scpid/1.0",
+        "nonce": parityNonceHex,
+        "audience": "https://parity-test.example.com",
+        "issued_at": override,
+        "expires_at": parityChallengeExpiresAtMs
+    ]
+    // sortedKeys keeps the canonical-hash input deterministic across
+    // bridges; the Rust canonicalizer re-sorts on its end anyway, but
+    // emitting stable output here keeps stderr diffs clean.
+    guard let data = try? JSONSerialization.data(
+        withJSONObject: obj, options: [.sortedKeys]
+    ), let str = String(data: data, encoding: .utf8) else {
+        return challengeJson
+    }
+    return str
+}
+
 func opSignMessage(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     let audience = req.args["audience"]?.stringValue
         ?? "https://parity-test.example.com"
     let ttl = UInt64(req.args["ttl_seconds"]?.intValue ?? 60)
-    let identity = try await identityCreate(custody: "in_memory")
+    // Seed the identity so `#active` derives from the same bytes used
+    // by PyO3/NAPI/WASM, giving byte-identical Ed25519 signatures when
+    // combined with `signed_at_override`. Mirrors `opSignMessage` in
+    // `node_bridge_runner.ts`.
+    let seed = req.args["seed_hex"]?.stringValue.flatMap { seedFromHex($0) }
+    // Optional `signed_at_override` (ms since epoch). When present,
+    // UniFFI's `scpidSign(..., signedAtOverride: UInt64?)` pins the
+    // `signed_at` field in the canonical hash so signatures match
+    // across bridges.
+    let signedAtOverride = req.args["signed_at_override"]?.intValue
+    let identity = try await identityCreate(custody: "in_memory", seed: seed)
     let challenge = try scpidChallenge(audience: audience, ttlSeconds: ttl)
+    let patched = patchChallengeForOverride(challenge, override: signedAtOverride)
     let responseJson = try scpidSign(
         identity: identity,
         signingKeyId: "#active",
-        challengeJson: challenge
+        challengeJson: patched,
+        signedAtOverride: signedAtOverride.map { UInt64($0) }
     )
     guard let data = responseJson.data(using: .utf8),
           let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
