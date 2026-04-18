@@ -5,6 +5,28 @@ All notable changes to SCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-04-18
+
+### Phase 4 PR 3 — Persistence + async resume + real UniFFI crypto
+
+**Breaking changes — external SDK consumers migrating from PR 1 behavior:**
+
+- **`SCP.resume()` is now async.** `BridgeInstanceCore::resume` became `async fn` (#1678) so per-bridge overrides can chain relay reconnect and persisted-context restoration on top of the suspended-flag flip. Callers must await / suspend:
+  - Python: `await scp.resume()` (was synchronous)
+  - TypeScript: `await scp.resume()` (returns `Promise<void>`)
+  - Swift: `try await scp.resume()` (was synchronous `throws`)
+  - Kotlin: `scp.resume()` inside a coroutine / suspend function (was blocking `ffiCall`)
+  - Reconnect failures surface as `LifecycleError.ReconnectFailed { url, reason }` (new variant).
+- **`StorageConfig` extended with SQLite (#1491, #1260).** New variant `Sqlite { path, key }` across PyO3, NAPI, UniFFI. WASM remains InMemory-only.
+  - Python: `SCP(storage={"type": "sqlite", "path": str, "key": bytes})` — 32-byte key as Python `bytes`.
+  - TypeScript: `SCP.withStorage({ type: "sqlite", path, key })` — `key` is hex `string` or `Uint8Array`.
+  - Swift: `SCP.withStorage(sqliteDir: URL, key: Data)` convenience; also `StorageConfig.sqlite(path:key:)` directly.
+  - Kotlin: `SCP.withSqlite(dir: File, key: ByteArray)` companion; also `StorageConfig.Sqlite(path, key)` directly.
+- **UniFFI `ContextManager` requires a local DID before context ops (#1342).** `FfiBridgeCrypto` is deleted; UniFFI now constructs `MlsCryptoProvider::new(did)` exactly as PyO3 and NAPI do. Swift and Kotlin callers must invoke `scp.registerLocalDid(...)` before `context_create` / `context_join` / `context_import`. Calling a context operation before registration returns `ScpError.Context { code: "CTX_2000", msg: "bridge not ready: no local DID registered" }`.
+- **Multi-relay reconnect via `HashSet` (#1678).** `CoreFields::relay_url: Mutex<Option<String>>` became `relay_urls: Mutex<HashSet<String>>`. Accessors replaced: `add_relay_url` / `remove_relay_url` / `pending_relay_urls` (was `set_relay_url` / `clear_relay_url` / `pending_relay_url`).
+
+Closes #1342, #1260, #1491, #1678. See `.docs/adrs/ADR-048-scp-multi-instance.md` § "PR 3 actualized" for the full design commentary.
+
 ## [Unreleased] - 2026-03-16
 
 ### Security
