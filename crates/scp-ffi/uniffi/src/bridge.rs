@@ -11130,18 +11130,8 @@ pub fn discovery_normalize_address(address: String) -> String {
 // Petname bridge functions (§22.4)
 // ---------------------------------------------------------------------------
 
+use crate::runtime::default_bridge_instance;
 use scp_ffi_common::petname_helpers;
-
-fn uniffi_petname_maps()
--> &'static std::sync::Mutex<std::collections::HashMap<String, scp_core::discovery::PetnameMap>> {
-    petname_helpers::petname_maps()
-}
-
-fn uniffi_handle_registries()
--> &'static std::sync::Mutex<std::collections::HashMap<String, scp_core::discovery::HandleRegistry>>
-{
-    petname_helpers::handle_registries()
-}
 
 /// Sets a petname for a DID.
 #[uniffi::export]
@@ -11158,7 +11148,10 @@ pub fn petname_set(owner_did: String, target_did: String, name: String) -> Resul
             code: codes::VALID_7111.to_owned(),
         });
     }
-    let mut guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11178,7 +11171,10 @@ pub fn petname_remove(owner_did: String, target_did: String) -> Result<(), ScpEr
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let mut guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11209,7 +11205,10 @@ pub fn petname_set_context(
             code: codes::VALID_7113.to_owned(),
         });
     }
-    let mut guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11229,7 +11228,10 @@ pub fn petname_remove_context(owner_did: String, context_id: String) -> Result<(
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let mut guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11250,7 +11252,10 @@ pub fn petname_resolve_did(owner_did: String, name: String) -> Result<String, Sc
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11280,7 +11285,10 @@ pub fn petname_resolve_context(owner_did: String, name: String) -> Result<String
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11308,7 +11316,10 @@ pub fn petname_get_for_did(
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11332,7 +11343,10 @@ pub fn petname_get_for_context(
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11364,7 +11378,10 @@ pub fn handle_register(
         target,
         metadata: Some(scp_core::discovery::HandleMetadata { description, tags }),
     };
-    let mut guard = uniffi_handle_registries()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .handle_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("handle registry lock poisoned: {e}"),
@@ -11402,7 +11419,10 @@ pub fn handle_lookup(
         }
         None => None,
     };
-    let guard = uniffi_handle_registries()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .handle_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("handle registry lock poisoned: {e}"),
@@ -11432,7 +11452,10 @@ pub fn handle_deregister(
     handle: String,
     did: String,
 ) -> Result<String, ScpError> {
-    let mut guard = uniffi_handle_registries()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .handle_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("handle registry lock poisoned: {e}"),
@@ -11456,12 +11479,6 @@ pub fn handle_deregister(
 // ---------------------------------------------------------------------------
 // Scope registry bridge functions (§22.3.5, ADR-043)
 // ---------------------------------------------------------------------------
-
-fn uniffi_scope_registries()
--> &'static std::sync::Mutex<std::collections::HashMap<String, scp_core::discovery::ScopeRegistry>>
-{
-    petname_helpers::scope_registries()
-}
 
 /// Registers a scope name in a scope registry. Returns JSON result.
 #[uniffi::export]
@@ -11501,7 +11518,10 @@ pub fn scope_register(
         },
     };
 
-    let mut guard = uniffi_scope_registries()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .scope_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registry lock poisoned: {e}"),
@@ -11534,7 +11554,10 @@ pub fn scope_register(
 pub fn scope_lookup(scope_context_id: String, name: String) -> Result<String, ScpError> {
     validate_context_id(&scope_context_id)?;
 
-    let guard = uniffi_scope_registries()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .scope_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registry lock poisoned: {e}"),
@@ -11569,7 +11592,10 @@ pub fn scope_deregister(
     validate_context_id(&scope_context_id)?;
     validate_did(&did)?;
 
-    let mut guard = uniffi_scope_registries()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .scope_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registry lock poisoned: {e}"),
@@ -11610,6 +11636,8 @@ pub fn address_resolve(
         });
     }
 
+    let bi = default_bridge_instance()?;
+
     let mut known_contexts: std::collections::HashMap<String, String> =
         if let Some(ref json) = known_contexts_json {
             serde_json::from_str(json).map_err(|e| ScpError::Validation {
@@ -11617,7 +11645,9 @@ pub fn address_resolve(
                 code: codes::VALID_7090.to_owned(),
             })?
         } else {
-            let guard = uniffi_handle_registries()
+            let guard = bi
+                .core
+                .handle_registries()
                 .lock()
                 .map_err(|e| ScpError::Validation {
                     msg: format!("handle registry lock poisoned: {e}"),
@@ -11627,14 +11657,16 @@ pub fn address_resolve(
         };
 
     // Merge scope registry contexts for two-hop resolution (§22.3.5).
-    let scope_contexts = petname_helpers::known_contexts_from_scope_registries();
+    let scope_contexts = petname_helpers::known_contexts_from_scope_registries(&bi.core);
     for (name, ctx_id) in scope_contexts {
         known_contexts.entry(name).or_insert(ctx_id);
     }
 
     let known_domains: Vec<&str> = Vec::new();
     let petname_map = {
-        let guard = uniffi_petname_maps()
+        let guard = bi
+            .core
+            .petname_maps()
             .lock()
             .map_err(|e| ScpError::Validation {
                 msg: format!("petname lock poisoned: {e}"),
@@ -11647,7 +11679,7 @@ pub fn address_resolve(
     let results = tokio::task::block_in_place(|| {
         handle.block_on(async {
             let mut resolver = scp_core::discovery::AddressResolver::new();
-            let querier = petname_helpers::LocalHandleQuerier;
+            let querier = petname_helpers::LocalHandleQuerier::new(&bi.core);
             resolver
                 .resolve(
                     &address,

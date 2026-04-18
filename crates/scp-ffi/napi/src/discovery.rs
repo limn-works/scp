@@ -34,11 +34,10 @@ use scp_core::discovery::handles::{
 use scp_core::discovery::{DiscoveryQuery, normalize_address, parse_address};
 use scp_identity::DID;
 
-use scp_ffi_common::petname_helpers::{
-    self, LocalHandleQuerier, address_resolution_to_json, handle_registries, petname_maps,
-};
+use scp_ffi_common::petname_helpers::{self, LocalHandleQuerier, address_resolution_to_json};
 
 use crate::error::ScpNapiError;
+use crate::runtime::default_bridge_instance;
 
 // ---------------------------------------------------------------------------
 // Test-only reset helpers
@@ -46,12 +45,16 @@ use crate::error::ScpNapiError;
 
 #[cfg(test)]
 fn reset_petname_map_for(owner_did: &str) {
-    petname_helpers::reset_petname_map_for(owner_did);
+    if let Ok(bi) = default_bridge_instance() {
+        petname_helpers::reset_petname_map_for(&bi.core, owner_did);
+    }
 }
 
 #[cfg(test)]
 fn reset_handle_registry_for(context_id: &str) {
-    petname_helpers::reset_handle_registry_for(context_id);
+    if let Ok(bi) = default_bridge_instance() {
+        petname_helpers::reset_handle_registry_for(&bi.core, context_id);
+    }
 }
 
 fn parse_handle_target(json: &str) -> napi::Result<HandleTarget> {
@@ -261,7 +264,8 @@ pub fn petname_set(owner_did: String, target_did: String, name: String) -> napi:
             code: codes::VALID_7111.to_owned(),
         }));
     }
-    let mut guard = petname_maps().lock().map_err(|e| {
+    let bi = default_bridge_instance()?;
+    let mut guard = bi.core.petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
             code: codes::VALID_7112.to_owned(),
@@ -282,7 +286,8 @@ pub fn petname_remove(owner_did: String, target_did: String) -> napi::Result<()>
             code: codes::VALID_7110.to_owned(),
         }));
     }
-    let mut guard = petname_maps().lock().map_err(|e| {
+    let bi = default_bridge_instance()?;
+    let mut guard = bi.core.petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
             code: codes::VALID_7112.to_owned(),
@@ -314,7 +319,8 @@ pub fn petname_set_context(
             code: codes::VALID_7113.to_owned(),
         }));
     }
-    let mut guard = petname_maps().lock().map_err(|e| {
+    let bi = default_bridge_instance()?;
+    let mut guard = bi.core.petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
             code: codes::VALID_7112.to_owned(),
@@ -335,7 +341,8 @@ pub fn petname_remove_context(owner_did: String, context_id: String) -> napi::Re
             code: codes::VALID_7110.to_owned(),
         }));
     }
-    let mut guard = petname_maps().lock().map_err(|e| {
+    let bi = default_bridge_instance()?;
+    let mut guard = bi.core.petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
             code: codes::VALID_7112.to_owned(),
@@ -357,7 +364,8 @@ pub fn petname_resolve_did(owner_did: String, name: String) -> napi::Result<Stri
             code: codes::VALID_7110.to_owned(),
         }));
     }
-    let guard = petname_maps().lock().map_err(|e| {
+    let bi = default_bridge_instance()?;
+    let guard = bi.core.petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
             code: codes::VALID_7112.to_owned(),
@@ -390,7 +398,8 @@ pub fn petname_resolve_context(owner_did: String, name: String) -> napi::Result<
             code: codes::VALID_7110.to_owned(),
         }));
     }
-    let guard = petname_maps().lock().map_err(|e| {
+    let bi = default_bridge_instance()?;
+    let guard = bi.core.petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
             code: codes::VALID_7112.to_owned(),
@@ -418,7 +427,8 @@ pub fn petname_get_for_did(owner_did: String, target_did: String) -> napi::Resul
             code: codes::VALID_7110.to_owned(),
         }));
     }
-    let guard = petname_maps().lock().map_err(|e| {
+    let bi = default_bridge_instance()?;
+    let guard = bi.core.petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
             code: codes::VALID_7112.to_owned(),
@@ -443,7 +453,8 @@ pub fn petname_get_for_context(
             code: codes::VALID_7110.to_owned(),
         }));
     }
-    let guard = petname_maps().lock().map_err(|e| {
+    let bi = default_bridge_instance()?;
+    let guard = bi.core.petname_maps().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("petname lock poisoned: {e}"),
             code: codes::VALID_7112.to_owned(),
@@ -475,7 +486,8 @@ pub fn handle_register(
         target,
         metadata: Some(HandleMetadata { description, tags }),
     };
-    let mut guard = handle_registries().lock().map_err(|e| {
+    let bi = default_bridge_instance()?;
+    let mut guard = bi.core.handle_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("handle registry lock poisoned: {e}"),
             code: codes::VALID_7120.to_owned(),
@@ -516,7 +528,8 @@ pub fn handle_lookup(
         }
         None => None,
     };
-    let guard = handle_registries().lock().map_err(|e| {
+    let bi = default_bridge_instance()?;
+    let guard = bi.core.handle_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("handle registry lock poisoned: {e}"),
             code: codes::VALID_7120.to_owned(),
@@ -549,7 +562,8 @@ pub fn handle_deregister(
     handle: String,
     did: String,
 ) -> napi::Result<String> {
-    let mut guard = handle_registries().lock().map_err(|e| {
+    let bi = default_bridge_instance()?;
+    let mut guard = bi.core.handle_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("handle registry lock poisoned: {e}"),
             code: codes::VALID_7120.to_owned(),
@@ -619,7 +633,8 @@ pub fn scope_register(
         },
     };
 
-    let mut guard = petname_helpers::scope_registries().lock().map_err(|e| {
+    let bi = default_bridge_instance()?;
+    let mut guard = bi.core.scope_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("scope registry lock poisoned: {e}"),
             code: codes::VALID_7130.to_owned(),
@@ -658,7 +673,8 @@ pub fn scope_lookup(scope_context_id: String, name: String) -> napi::Result<Stri
     scp_ffi_common::validate::validate_context_id(&scope_context_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    let guard = petname_helpers::scope_registries().lock().map_err(|e| {
+    let bi = default_bridge_instance()?;
+    let guard = bi.core.scope_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("scope registry lock poisoned: {e}"),
             code: codes::VALID_7130.to_owned(),
@@ -700,7 +716,8 @@ pub fn scope_deregister(
     scp_ffi_common::validate::validate_did(&did)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    let mut guard = petname_helpers::scope_registries().lock().map_err(|e| {
+    let bi = default_bridge_instance()?;
+    let mut guard = bi.core.scope_registries().lock().map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("scope registry lock poisoned: {e}"),
             code: codes::VALID_7130.to_owned(),
@@ -749,6 +766,7 @@ pub async fn address_resolve(
             code: codes::VALID_7110.to_owned(),
         }));
     }
+    let bi = default_bridge_instance()?;
     let mut known_contexts: HashMap<String, String> = if let Some(ref json) = known_contexts_json {
         serde_json::from_str(json).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
@@ -757,7 +775,7 @@ pub async fn address_resolve(
             })
         })?
     } else {
-        let guard = handle_registries().lock().map_err(|e| {
+        let guard = bi.core.handle_registries().lock().map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("handle registry lock poisoned: {e}"),
                 code: codes::VALID_7120.to_owned(),
@@ -767,13 +785,13 @@ pub async fn address_resolve(
     };
 
     // Merge scope registry contexts for two-hop resolution (§22.3.5).
-    let scope_contexts = petname_helpers::known_contexts_from_scope_registries();
+    let scope_contexts = petname_helpers::known_contexts_from_scope_registries(&bi.core);
     for (name, ctx_id) in scope_contexts {
         known_contexts.entry(name).or_insert(ctx_id);
     }
     let known_domains: Vec<&str> = Vec::new();
     let petname_map = {
-        let guard = petname_maps().lock().map_err(|e| {
+        let guard = bi.core.petname_maps().lock().map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("petname lock poisoned: {e}"),
                 code: codes::VALID_7112.to_owned(),
@@ -782,7 +800,7 @@ pub async fn address_resolve(
         guard.get(&owner_did).cloned().unwrap_or_default()
     };
     let mut resolver = scp_core::discovery::AddressResolver::new();
-    let querier = LocalHandleQuerier;
+    let querier = LocalHandleQuerier::new(&bi.core);
     let results = resolver
         .resolve(
             &address,
