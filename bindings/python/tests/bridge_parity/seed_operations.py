@@ -634,20 +634,18 @@ OP_UCAN_VALIDATE_MALFORMED = OpSpec(
 # ---------------------------------------------------------------------------
 # op 9: transport_status_disconnected
 #
-# Query the transport status with no relay connected. PyO3 and WASM
-# expose a stateless global `transport_status()` that returns the
-# default disconnected shape {connected:false, relay_url:None,
-# latency_ms:None}.
+# Query the transport status with no relay connected. All four bridges
+# expose a handleless stateless-probe path:
 #
-# NAPI and UniFFI expose `transport_status(manager)` which requires a
-# prior `transport_connect()` that opens a real WebSocket. That means
-# the stateless-query path does not exist on those bridges — exercising
-# it on a loopback URL would require a running relay, which the parity
-# harness does not provide. Per the op-library contract, we document
-# the surface divergence as an xfail rather than silently dropping the
-# op. When NAPI / UniFFI grow a handleless status probe (or the
-# harness grows an in-process loopback relay fixture), flip the
-# `xfail_bridges` entry and the test should pass automatically.
+#   - PyO3: `transport_status()` with no argument.
+#   - WASM: `transport_status()` with no argument.
+#   - NAPI: `transport_status(manager: Option<&NapiTransportManager>)` —
+#     pass `null` for the stateless probe.
+#   - UniFFI: `transport_status(manager: Option<Arc<TransportManager>>)`
+#     — pass `None`/`nil` for the stateless probe.
+#
+# Without a prior `transport_connect` call, all four return the default
+# disconnected shape `{connected: false, relay_url: None, latency_ms: None}`.
 # ---------------------------------------------------------------------------
 
 
@@ -673,12 +671,6 @@ OP_TRANSPORT_STATUS = OpSpec(
             FieldSpec("relay_url", "exact"),
             FieldSpec("latency_ms", "exact"),
         )
-    ),
-    xfail_bridges=("napi", "uniffi-kotlin", "uniffi-swift"),
-    xfail_reason=(
-        "NAPI and UniFFI transport_status require a connected handle "
-        "(transport_connect opens a real WebSocket). Stateless query "
-        "is only on PyO3 and WASM. Tracked in FOLLOWUP.md §7."
     ),
     expected_values=(
         ("connected", False),

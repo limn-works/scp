@@ -482,16 +482,29 @@ func opUcanValidateMalformed(_ req: BridgeRequest) async throws -> [String: JSON
 
 func opTransportStatus(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     _ = req
-    // UniFFI's `transport_status` requires a connected TransportManager
-    // (transport_connect opens a real WebSocket). Xfail'd against
-    // uniffi-swift in OP_TRANSPORT_STATUS. We return all-null to make
-    // the xfail a real parity signal — if UniFFI grows a handleless
-    // probe, this will diverge from the WASM shape and the xfail flip
-    // will fail loudly until the runner is updated.
+    // UniFFI's `transport_status` now accepts an optional manager; when
+    // `nil`, it returns the stateless BridgeInstance-level snapshot —
+    // the same shape PyO3 and WASM expose. The parity harness always
+    // exercises the handleless probe (no transport_connect, no relay
+    // fixture), so every bridge reports `connected: false` here.
+    let status = try await transportStatus(manager: nil)
+    let connected: JSONValue = .bool(status.connected)
+    let relayUrl: JSONValue
+    if let url = status.relayUrl {
+        relayUrl = .string(url)
+    } else {
+        relayUrl = .null
+    }
+    let latencyMs: JSONValue
+    if let latency = status.latencyMs {
+        latencyMs = .number(latency)
+    } else {
+        latencyMs = .null
+    }
     return [
-        "connected": .null,
-        "relay_url": .null,
-        "latency_ms": .null
+        "connected": connected,
+        "relay_url": relayUrl,
+        "latency_ms": latencyMs
     ]
 }
 

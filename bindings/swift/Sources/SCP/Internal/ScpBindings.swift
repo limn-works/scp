@@ -905,6 +905,18 @@ public protocol IdentityProtocol: AnyObject, Sendable {
      */
     func rotateKey() async throws  -> Identity
     
+    /**
+     * Returns the hex-encoded Ed25519 verifying-key bytes for the
+     * identity key (VM `#0`, the DID-deriving key), or `null` if this
+     * handle was loaded without live key material.
+     *
+     * Under a deterministic `seed`, this value is byte-identical across
+     * every bridge (ADR-046 / FOLLOWUP.md §1). See the
+     * `verifying_key_hex` field docs for why `#0` rather than
+     * `#active`.
+     */
+    func verifyingKey()  -> String?
+    
 }
 /**
  * Opaque handle to an SCP identity.
@@ -1176,6 +1188,23 @@ open func rotateKey()async throws  -> Identity  {
             liftFunc: FfiConverterTypeIdentity_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+    
+    /**
+     * Returns the hex-encoded Ed25519 verifying-key bytes for the
+     * identity key (VM `#0`, the DID-deriving key), or `null` if this
+     * handle was loaded without live key material.
+     *
+     * Under a deterministic `seed`, this value is byte-identical across
+     * every bridge (ADR-046 / FOLLOWUP.md §1). See the
+     * `verifying_key_hex` field docs for why `#0` rather than
+     * `#active`.
+     */
+open func verifyingKey() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_identity_verifying_key(self.uniffiClonePointer(),$0
+    )
+})
 }
     
 
@@ -1841,29 +1870,82 @@ public func FfiConverterTypeRelayHandle_lower(_ value: RelayHandle) -> UnsafeMut
 /**
  * Opaque handle to the transport layer.
  *
- * Exposes connection status and relay URL without leaking connection state.
- * The actual transport (WebSocket, multi-relay routing) is managed internally.
- *
- * Holds a reference to the underlying `NativeRelayAdapter` established by
- * `transport_connect`. The adapter represents a live WebSocket connection
- * to an SCP relay.
+ * Wraps a real [`scp_transport::TransportManager`] that is stored in the
+ * shared [`BridgeInstance`]. This handle provides Swift/Kotlin callers with
+ * the full multi-relay API: `addRelay`, `assignRelaySet`, `adapterCount`,
+ * `reliabilityScore`. All operations delegate to the `BridgeInstance`'s
+ * transport slot, so `suspend()` / `shutdown()` lifecycle events
+ * automatically clear the transport.
  *
  * Generated as `class TransportManager` in both Swift and Kotlin.
  *
- * See ADR-005 (Transport Abstraction).
+ * See ADR-005 (Transport Abstraction) and ADR-012 (Multi-transport routing).
  */
 public protocol TransportManagerProtocol: AnyObject, Sendable {
     
     /**
-     * Returns `true` if the transport is currently connected.
+     * Returns the number of adapters registered in the transport manager.
+     */
+    func adapterCount()  -> UInt32
+    
+    /**
+     * Registers an additional relay adapter with the transport manager.
+     *
+     * Connects to the specified relay URL and adds the resulting adapter to
+     * the manager. Returns the total adapter count after adding.
+     *
+     * # Arguments
+     *
+     * * `relay_url` -- The URL of the additional SCP relay to connect to.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` if the URL is invalid or the connection
+     * fails.
+     */
+    func addRelay(relayUrl: String) throws  -> UInt32
+    
+    /**
+     * Assigns a relay set for the given context.
+     *
+     * Delegates to [`scp_transport::TransportManager::assign_relay_set`]
+     * which selects adapters using round-robin spread to minimize overlap.
+     *
+     * # Arguments
+     *
+     * * `context_id` -- The context to assign relays for.
+     *
+     * # Returns
+     *
+     * A list of adapter indices assigned to this context.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` if no adapters are registered.
+     */
+    func assignRelaySet(contextId: String) throws  -> [UInt32]
+    
+    /**
+     * Returns `true` if the transport is currently connected (has adapters).
      */
     func isConnected()  -> Bool
+    
+    /**
+     * Returns the reliability score for an adapter by index.
+     *
+     * Returns `None` if no score exists for the given adapter index.
+     *
+     * # Arguments
+     *
+     * * `adapter_index` -- The adapter index (0-based) to query.
+     */
+    func reliabilityScore(adapterIndex: UInt32)  -> ReliabilityScoreRecord?
     
     /**
      * Returns the current transport connection status record.
      *
      * Reflects actual connection state: `connected` is `true` only if the
-     * underlying relay adapter is still held.
+     * inner transport manager has at least one adapter registered.
      */
     func status()  -> TransportStatus
     
@@ -1871,16 +1953,16 @@ public protocol TransportManagerProtocol: AnyObject, Sendable {
 /**
  * Opaque handle to the transport layer.
  *
- * Exposes connection status and relay URL without leaking connection state.
- * The actual transport (WebSocket, multi-relay routing) is managed internally.
- *
- * Holds a reference to the underlying `NativeRelayAdapter` established by
- * `transport_connect`. The adapter represents a live WebSocket connection
- * to an SCP relay.
+ * Wraps a real [`scp_transport::TransportManager`] that is stored in the
+ * shared [`BridgeInstance`]. This handle provides Swift/Kotlin callers with
+ * the full multi-relay API: `addRelay`, `assignRelaySet`, `adapterCount`,
+ * `reliabilityScore`. All operations delegate to the `BridgeInstance`'s
+ * transport slot, so `suspend()` / `shutdown()` lifecycle events
+ * automatically clear the transport.
  *
  * Generated as `class TransportManager` in both Swift and Kotlin.
  *
- * See ADR-005 (Transport Abstraction).
+ * See ADR-005 (Transport Abstraction) and ADR-012 (Multi-transport routing).
  */
 open class TransportManager: TransportManagerProtocol, @unchecked Sendable {
     fileprivate let pointer: UnsafeMutableRawPointer!
@@ -1935,7 +2017,66 @@ open class TransportManager: TransportManagerProtocol, @unchecked Sendable {
 
     
     /**
-     * Returns `true` if the transport is currently connected.
+     * Returns the number of adapters registered in the transport manager.
+     */
+open func adapterCount() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_transportmanager_adapter_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Registers an additional relay adapter with the transport manager.
+     *
+     * Connects to the specified relay URL and adds the resulting adapter to
+     * the manager. Returns the total adapter count after adding.
+     *
+     * # Arguments
+     *
+     * * `relay_url` -- The URL of the additional SCP relay to connect to.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` if the URL is invalid or the connection
+     * fails.
+     */
+open func addRelay(relayUrl: String)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_transportmanager_add_relay(self.uniffiClonePointer(),
+        FfiConverterString.lower(relayUrl),$0
+    )
+})
+}
+    
+    /**
+     * Assigns a relay set for the given context.
+     *
+     * Delegates to [`scp_transport::TransportManager::assign_relay_set`]
+     * which selects adapters using round-robin spread to minimize overlap.
+     *
+     * # Arguments
+     *
+     * * `context_id` -- The context to assign relays for.
+     *
+     * # Returns
+     *
+     * A list of adapter indices assigned to this context.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` if no adapters are registered.
+     */
+open func assignRelaySet(contextId: String)throws  -> [UInt32]  {
+    return try  FfiConverterSequenceUInt32.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_transportmanager_assign_relay_set(self.uniffiClonePointer(),
+        FfiConverterString.lower(contextId),$0
+    )
+})
+}
+    
+    /**
+     * Returns `true` if the transport is currently connected (has adapters).
      */
 open func isConnected() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -1945,10 +2086,27 @@ open func isConnected() -> Bool  {
 }
     
     /**
+     * Returns the reliability score for an adapter by index.
+     *
+     * Returns `None` if no score exists for the given adapter index.
+     *
+     * # Arguments
+     *
+     * * `adapter_index` -- The adapter index (0-based) to query.
+     */
+open func reliabilityScore(adapterIndex: UInt32) -> ReliabilityScoreRecord?  {
+    return try!  FfiConverterOptionTypeReliabilityScoreRecord.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_transportmanager_reliability_score(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(adapterIndex),$0
+    )
+})
+}
+    
+    /**
      * Returns the current transport connection status record.
      *
      * Reflects actual connection state: `connected` is `true` only if the
-     * underlying relay adapter is still held.
+     * inner transport manager has at least one adapter registered.
      */
 open func status() -> TransportStatus  {
     return try!  FfiConverterTypeTransportStatus_lift(try! rustCall() {
@@ -3067,7 +3225,6 @@ public struct ContextParams {
         /**
          * Optional economic policy as a JSON string (spec §19, ADR-033).
          * `None` means no economic policy (free context).
-         */economicPolicy: String?) {
          */economicPolicy: String?, 
         /**
          * Optional consequence rules as a JSON-encoded array (ADR-017, #1531).
@@ -3144,15 +3301,6 @@ extension ContextParams: Equatable, Hashable {
         if lhs.economicPolicy != rhs.economicPolicy {
             return false
         }
-        if lhs.maxNestingDepth != rhs.maxNestingDepth {
-            return false
-        }
-        if lhs.sessionCap != rhs.sessionCap {
-            return false
-        }
-        if lhs.economicPolicy != rhs.economicPolicy {
-            return false
-        }
         if lhs.consequenceRulesJson != rhs.consequenceRulesJson {
             return false
         }
@@ -3200,7 +3348,6 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
                 maxChainDepth: FfiConverterOptionUInt8.read(from: &buf), 
                 maxNestingDepth: FfiConverterOptionUInt32.read(from: &buf), 
                 sessionCap: FfiConverterOptionUInt32.read(from: &buf), 
-                economicPolicy: FfiConverterOptionString.read(from: &buf)
                 economicPolicy: FfiConverterOptionString.read(from: &buf), 
                 consequenceRulesJson: FfiConverterOptionString.read(from: &buf), 
                 consequenceConfigJson: FfiConverterOptionString.read(from: &buf)
@@ -4530,6 +4677,152 @@ public func FfiConverterTypePublishResult_lift(_ buf: RustBuffer) throws -> Publ
 #endif
 public func FfiConverterTypePublishResult_lower(_ value: PublishResult) -> RustBuffer {
     return FfiConverterTypePublishResult.lower(value)
+}
+
+
+/**
+ * Per-adapter reliability score record exposed to Swift/Kotlin.
+ *
+ * Contains the key fields from [`scp_transport::scoring::ReliabilityScore`]
+ * needed for relay health monitoring and selection decisions.
+ *
+ * See ADR-012 acceptance criterion 5.
+ */
+public struct ReliabilityScoreRecord {
+    /**
+     * The relay URL this score tracks.
+     */
+    public var relayUrl: String
+    /**
+     * Delivery success rate (0.0 to 1.0).
+     */
+    public var deliverySuccessRate: Double
+    /**
+     * Average latency in milliseconds.
+     */
+    public var averageLatencyMs: UInt64
+    /**
+     * Deletion compliance rate (0.0 to 1.0).
+     */
+    public var deletionComplianceRate: Double
+    /**
+     * Total number of send attempts.
+     */
+    public var totalSends: UInt64
+    /**
+     * Total number of send failures.
+     */
+    public var totalFailures: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The relay URL this score tracks.
+         */relayUrl: String, 
+        /**
+         * Delivery success rate (0.0 to 1.0).
+         */deliverySuccessRate: Double, 
+        /**
+         * Average latency in milliseconds.
+         */averageLatencyMs: UInt64, 
+        /**
+         * Deletion compliance rate (0.0 to 1.0).
+         */deletionComplianceRate: Double, 
+        /**
+         * Total number of send attempts.
+         */totalSends: UInt64, 
+        /**
+         * Total number of send failures.
+         */totalFailures: UInt64) {
+        self.relayUrl = relayUrl
+        self.deliverySuccessRate = deliverySuccessRate
+        self.averageLatencyMs = averageLatencyMs
+        self.deletionComplianceRate = deletionComplianceRate
+        self.totalSends = totalSends
+        self.totalFailures = totalFailures
+    }
+}
+
+#if compiler(>=6)
+extension ReliabilityScoreRecord: Sendable {}
+#endif
+
+
+extension ReliabilityScoreRecord: Equatable, Hashable {
+    public static func ==(lhs: ReliabilityScoreRecord, rhs: ReliabilityScoreRecord) -> Bool {
+        if lhs.relayUrl != rhs.relayUrl {
+            return false
+        }
+        if lhs.deliverySuccessRate != rhs.deliverySuccessRate {
+            return false
+        }
+        if lhs.averageLatencyMs != rhs.averageLatencyMs {
+            return false
+        }
+        if lhs.deletionComplianceRate != rhs.deletionComplianceRate {
+            return false
+        }
+        if lhs.totalSends != rhs.totalSends {
+            return false
+        }
+        if lhs.totalFailures != rhs.totalFailures {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(relayUrl)
+        hasher.combine(deliverySuccessRate)
+        hasher.combine(averageLatencyMs)
+        hasher.combine(deletionComplianceRate)
+        hasher.combine(totalSends)
+        hasher.combine(totalFailures)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReliabilityScoreRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReliabilityScoreRecord {
+        return
+            try ReliabilityScoreRecord(
+                relayUrl: FfiConverterString.read(from: &buf), 
+                deliverySuccessRate: FfiConverterDouble.read(from: &buf), 
+                averageLatencyMs: FfiConverterUInt64.read(from: &buf), 
+                deletionComplianceRate: FfiConverterDouble.read(from: &buf), 
+                totalSends: FfiConverterUInt64.read(from: &buf), 
+                totalFailures: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ReliabilityScoreRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.relayUrl, into: &buf)
+        FfiConverterDouble.write(value.deliverySuccessRate, into: &buf)
+        FfiConverterUInt64.write(value.averageLatencyMs, into: &buf)
+        FfiConverterDouble.write(value.deletionComplianceRate, into: &buf)
+        FfiConverterUInt64.write(value.totalSends, into: &buf)
+        FfiConverterUInt64.write(value.totalFailures, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReliabilityScoreRecord_lift(_ buf: RustBuffer) throws -> ReliabilityScoreRecord {
+    return try FfiConverterTypeReliabilityScoreRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReliabilityScoreRecord_lower(_ value: ReliabilityScoreRecord) -> RustBuffer {
+    return FfiConverterTypeReliabilityScoreRecord.lower(value)
 }
 
 
@@ -8385,6 +8678,30 @@ fileprivate struct FfiConverterOptionTypeIdentity: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeTransportManager: FfiConverterRustBuffer {
+    typealias SwiftType = TransportManager?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeTransportManager.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeTransportManager.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeDataProvenance: FfiConverterRustBuffer {
     typealias SwiftType = DataProvenance?
 
@@ -8401,6 +8718,30 @@ fileprivate struct FfiConverterOptionTypeDataProvenance: FfiConverterRustBuffer 
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeDataProvenance.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeReliabilityScoreRecord: FfiConverterRustBuffer {
+    typealias SwiftType = ReliabilityScoreRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeReliabilityScoreRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeReliabilityScoreRecord.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -8451,6 +8792,31 @@ fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
         case 1: return try FfiConverterSequenceString.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = [UInt32]
+
+    public static func write(_ value: [UInt32], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterUInt32.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt32] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [UInt32]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterUInt32.read(from: &buf))
+        }
+        return seq
     }
 }
 
@@ -9523,12 +9889,11 @@ public func contextIsMember(handle: ContextHandle, did: String)async  -> Bool  {
  * `ScpError::Context` with code `SCP-ECON-12061` if `spending_ucan_jwt` is
  * not a valid UCAN JWT.
  */
-public func contextJoin(handle: ContextHandle, identity: Identity)async throws   {
 public func contextJoin(handle: ContextHandle, identity: Identity, spendingUcanJwt: String?)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_join(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity)
+                uniffi_scp_ffi_uniffi_fn_func_context_join(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterOptionString.lower(spendingUcanJwt)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
@@ -10397,11 +10762,11 @@ public func identityAttestDevice(identity: Identity)async throws  -> String  {
  * on mobile devices — use `"platform"` (Secure Enclave / Android Keystore)
  * in production. See GitHub issue #88 and ADR-006.
  */
-public func identityCreate(custody: String)async throws  -> Identity  {
+public func identityCreate(custody: String, seed: Data?)async throws  -> Identity  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_identity_create(FfiConverterString.lower(custody)
+                uniffi_scp_ffi_uniffi_fn_func_identity_create(FfiConverterString.lower(custody),FfiConverterOptionData.lower(seed)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
@@ -12251,9 +12616,9 @@ public func transportConnect(relayUrl: String)async throws  -> TransportManager 
 /**
  * Disconnects from the current SCP relay.
  *
- * Clears the relay adapter from the `TransportManager` handle. After this
- * call, the `TransportManager` reports `connected: false` and the adapter's
- * WebSocket connection is released when the last reference is dropped.
+ * Replaces the inner `TransportManager` with an empty builder, releasing
+ * all adapter connections. After this call, the `TransportManager` reports
+ * `connected: false` and `adapter_count() == 0`.
  *
  * This is idempotent — calling it when already disconnected is a no-op.
  *
@@ -12263,7 +12628,7 @@ public func transportConnect(relayUrl: String)async throws  -> TransportManager 
  *
  * # Errors
  *
- * Returns `ScpError::Transport` if the internal mutex is poisoned.
+ * Returns `ScpError::Transport` if the internal lock is poisoned.
  */
 public func transportDisconnect(manager: TransportManager)async throws   {
     return
@@ -12282,18 +12647,26 @@ public func transportDisconnect(manager: TransportManager)async throws   {
 /**
  * Returns the current transport connection status.
  *
- * Reflects actual connection state: `connected` is `true` only if the
- * underlying relay adapter is still held by the manager.
+ * When `manager` is provided, reflects the actual connection state of that
+ * handle: `connected` is `true` only if the underlying relay adapter is
+ * still held by the manager.
+ *
+ * When `manager` is `None`, returns a stateless snapshot derived from the
+ * process-wide `BridgeInstance` transport state. This mirrors the PyO3 /
+ * WASM bridges, which expose a handleless probe: callers can observe the
+ * default disconnected shape (`connected: false`, `relay_url: None`,
+ * `latency_ms: None`) before ever calling `transport_connect`, without
+ * needing to construct a `TransportManager` handle.
  *
  * # Errors
  *
  * Returns `ScpError::Transport` if querying the transport status fails.
  */
-public func transportStatus(manager: TransportManager)async throws  -> TransportStatus  {
+public func transportStatus(manager: TransportManager?)async throws  -> TransportStatus  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_transport_status(FfiConverterTypeTransportManager_lower(manager)
+                uniffi_scp_ffi_uniffi_fn_func_transport_status(FfiConverterOptionTypeTransportManager.lower(manager)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -12813,7 +13186,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_attest_device() != 31559) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create() != 29652) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create() != 24164) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_create_link_attestation() != 17272) {
@@ -13044,7 +13417,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_tool_interface_revoke() != 31068) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke() != 40090) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke() != 24933) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke_cross_context() != 26371) {
@@ -13068,10 +13441,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_transport_connect() != 52412) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_transport_disconnect() != 29342) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_transport_disconnect() != 43896) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_transport_status() != 49151) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_transport_status() != 1394) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_create_challenge() != 37813) {
@@ -13140,6 +13513,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_key() != 21897) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_verifying_key() != 65189) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_commit_deploy() != 10847) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13185,10 +13561,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_relayhandle_shutdown() != 3484) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_is_connected() != 6252) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_adapter_count() != 31835) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_status() != 35920) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_add_relay() != 27537) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_assign_relay_set() != 25796) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_is_connected() != 58175) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_reliability_score() != 63406) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_status() != 19459) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_audience() != 59140) {

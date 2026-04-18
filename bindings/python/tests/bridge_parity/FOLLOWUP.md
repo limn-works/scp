@@ -73,33 +73,7 @@ bridges. Estimated ~40–60 LoC. Integration checklist applies.
 
 # Scope extensions (continued)
 
-## 7. Handleless `transport_status` probe on NAPI and UniFFI
-
-`OP_TRANSPORT_STATUS` in `seed_operations.py` exercises the stateless
-disconnected-status path. PyO3 and WASM support this directly
-(`transport_status()` with no arguments). NAPI and UniFFI require a
-`TransportManager` handle produced by `transport_connect`, which opens
-a real WebSocket — so the parity op cannot be exercised on those
-bridges without a running relay fixture.
-
-Short-term: the op xfails `napi`, `uniffi-kotlin`, and `uniffi-swift`
-(documented in the OpSpec).
-
-Medium-term options:
-1. Add a handleless probe to NAPI + UniFFI (e.g. a module-global
-   `current_transport_status()` that returns the empty status when no
-   manager exists). Symmetric with PyO3/WASM; trivial to parity-gate.
-2. Start an in-process loopback relay fixture inside the Python
-   harness and let NAPI/UniFFI `transport_connect` through it. More
-   realistic but materially more infrastructure.
-
-Option 1 is cheaper and sufficient for parity. Option 2 is future
-work if real-relay behavior needs harness coverage.
-
-When either lands, remove the `xfail_bridges` entry on
-`OP_TRANSPORT_STATUS` and make sure the Node / Kotlin / Swift runners
-return the real status rather than the synthetic all-null sentinel.
-
-(Section 8 — UCAN parse-error code divergence — has been fixed and
-removed. Git history carries the rationale and the PR that landed the
-fix.)
+(Sections 7 and 8 — handleless transport_status probe on NAPI and
+UniFFI, and the UCAN parse-error code divergence — have been fixed and
+removed. Git history carries the rationale and the PRs that landed
+each fix.)

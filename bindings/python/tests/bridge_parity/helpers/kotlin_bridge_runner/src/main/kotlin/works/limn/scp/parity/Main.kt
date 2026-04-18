@@ -400,16 +400,22 @@ private suspend fun opUcanValidateMalformed(args: JsonObject): JsonObject {
 
 @Suppress("UnusedParameter")
 private suspend fun opTransportStatus(args: JsonObject): JsonObject {
-    // UniFFI's `transport_status` takes a TransportManager produced by
-    // `transport_connect`, which opens a real WebSocket. The xfail in
-    // seed_operations.py (OP_TRANSPORT_STATUS) covers this divergence.
-    // We return a deliberately-mismatching shape (all nulls) so the
-    // xfail is a true parity signal — flipping the xfail will fail
-    // loudly until the harness or bridge adds a handleless status probe.
+    // UniFFI's `transport_status` now accepts an Optional<TransportManager>;
+    // when absent, it returns the stateless BridgeInstance-level snapshot —
+    // the same shape exposed by PyO3 and WASM. The parity harness always
+    // exercises the handleless probe (no transport_connect, no relay
+    // fixture), so every bridge reports `connected: false` here.
+    val status = uniffi.scp.transportStatus(null)
     return buildJsonObject {
-        put("connected", kotlinx.serialization.json.JsonNull)
-        put("relay_url", kotlinx.serialization.json.JsonNull)
-        put("latency_ms", kotlinx.serialization.json.JsonNull)
+        put("connected", JsonPrimitive(status.connected))
+        put(
+            "relay_url",
+            status.relayUrl?.let { JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull
+        )
+        put(
+            "latency_ms",
+            status.latencyMs?.let { JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull
+        )
     }
 }
 

@@ -639,25 +639,49 @@ async function opUcanValidateMalformed(
   return { error: { type: "none", code: "NONE" } };
 }
 
+// Lazy handle to the raw napi-rs native addon. The Bridge wrapper returned
+// by `createNativeBridge()` requires handles for every call, so the parity
+// runner needs direct addon access to exercise handleless probes.
+// biome-ignore lint/suspicious/noExplicitAny: raw addon has no TS typings
+let napiAddon: any = null;
+
+async function loadNapiAddon(): Promise<typeof napiAddon> {
+  if (napiAddon !== null) return napiAddon;
+  const platformMap: Record<string, string> = {
+    "linux-x64": "@limn-works/scp-ts-napi-linux-x64-gnu",
+    "linux-arm64": "@limn-works/scp-ts-napi-linux-arm64-gnu",
+    "darwin-x64": "@limn-works/scp-ts-napi-darwin-x64",
+    "darwin-arm64": "@limn-works/scp-ts-napi-darwin-arm64",
+    "win32-x64": "@limn-works/scp-ts-napi-win32-x64-msvc",
+  };
+  const key = `${process.platform}-${process.arch}`;
+  const packageName = platformMap[key];
+  if (packageName === undefined) {
+    throw new Error(`parity runner: no NAPI addon for platform ${key}`);
+  }
+  const { createRequire } = await import("node:module");
+  const req = createRequire(import.meta.url);
+  napiAddon = req(packageName);
+  return napiAddon;
+}
+
 async function opTransportStatus(
   req: BridgeRequest,
 ): Promise<Record<string, unknown>> {
-  // Only WASM exposes a stateless, handleless transport_status. NAPI
-  // requires a connected manager — see OP_TRANSPORT_STATUS in
-  // seed_operations.py for the xfail rationale. We still dispatch on
-  // napi here so the test surfaces a real error (rather than a silent
-  // skip); pytest's xfail-strict converts the mismatch into an
-  // expected failure.
+  // PyO3, WASM, NAPI, and UniFFI all expose a stateless, handleless
+  // `transport_status` call. PyO3/WASM take no argument; NAPI/UniFFI
+  // accept an optional manager and fall back to a BridgeInstance-level
+  // probe when omitted. In the parity harness we always exercise the
+  // handleless path — no transport_connect round-trip, no relay
+  // fixture — so every bridge returns the disconnected shape.
   if (req.bridgeMode === "napi") {
-    // NAPI cannot produce a disconnected status without a real
-    // transport_connect round-trip. Return a synthetic shape that
-    // deliberately diverges so the xfail is a true parity signal —
-    // flipping the xfail once NAPI grows a stateless probe will fail
-    // loudly, forcing the harness to be updated in lockstep.
+    const addon = await loadNapiAddon();
+    // Passing `null` opts into the handleless stateless probe.
+    const status = await addon.transportStatus(null);
     return {
-      connected: null,
-      relay_url: null,
-      latency_ms: null,
+      connected: status.connected ?? false,
+      relay_url: status.relayUrl ?? status.relay_url ?? null,
+      latency_ms: status.latencyMs ?? status.latency_ms ?? null,
     };
   }
   const { raw } = await loadWasm();

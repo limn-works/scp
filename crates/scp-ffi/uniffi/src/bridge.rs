@@ -5060,15 +5060,39 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
 
 /// Returns the current transport connection status.
 ///
-/// Reflects actual connection state: `connected` is `true` only if the
-/// underlying relay adapter is still held by the manager.
+/// When `manager` is provided, reflects the actual connection state of that
+/// handle: `connected` is `true` only if the underlying relay adapter is
+/// still held by the manager.
+///
+/// When `manager` is `None`, returns a stateless snapshot derived from the
+/// process-wide `BridgeInstance` transport state. This mirrors the `PyO3` /
+/// WASM bridges, which expose a handleless probe: callers can observe the
+/// default disconnected shape (`connected: false`, `relay_url: None`,
+/// `latency_ms: None`) before ever calling `transport_connect`, without
+/// needing to construct a `TransportManager` handle.
 ///
 /// # Errors
 ///
 /// Returns `ScpError::Transport` if querying the transport status fails.
 #[uniffi::export]
-pub async fn transport_status(manager: Arc<TransportManager>) -> Result<TransportStatus, ScpError> {
-    Ok(manager.status())
+pub async fn transport_status(
+    manager: Option<Arc<TransportManager>>,
+) -> Result<TransportStatus, ScpError> {
+    if let Some(mgr) = manager {
+        return Ok(mgr.status());
+    }
+    // Handleless probe — consult the BridgeInstance directly. If the
+    // bridge has not been initialized yet, or holds no transport, the
+    // result is the default disconnected snapshot. This never fails;
+    // callers use it to check state before connecting.
+    let connected = crate::runtime::bridge_instance()
+        .ok()
+        .is_some_and(|bi| bi.has_transport());
+    Ok(TransportStatus {
+        connected,
+        relay_url: None,
+        latency_ms: None,
+    })
 }
 
 /// Disconnects from the current SCP relay.
