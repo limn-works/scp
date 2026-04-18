@@ -223,7 +223,14 @@ class SCP:
         """
         # u64::MAX milliseconds — matches the Rust-side PyO3 bridge type.
         u64_max = 0xFFFFFFFF_FFFFFFFF
-        if not math.isfinite(timeout) or timeout <= 0:
+        # Order matters: isinf(+) must be caught BEFORE !isfinite, otherwise
+        # math.inf collapses to the NaN/negative abort branch. NaN is not
+        # orderable, so explicitly testing isfinite()==False is the only
+        # reliable way to trap it.
+        if math.isinf(timeout) and timeout > 0:
+            millis = u64_max
+        elif not math.isfinite(timeout) or timeout <= 0:
+            # NaN, negative, negative-infinity, or zero → immediate abort.
             millis = 0
         elif timeout * 1000 > u64_max:
             millis = u64_max

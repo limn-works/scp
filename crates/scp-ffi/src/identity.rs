@@ -808,7 +808,7 @@ fn py_identity_resolve(py: Python<'_>, did: &str) -> PyResult<PyDIDDocument> {
 /// See ADR-003 acceptance criterion 4a and SCP-214 criterion 9.
 #[pyfunction]
 fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
-    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, identity);
+    crate::pyscp_check_handle!(identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -867,7 +867,7 @@ fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyI
 /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
 #[pyfunction]
 fn py_identity_add_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
-    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, identity);
+    crate::pyscp_check_handle!(identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -925,7 +925,7 @@ fn py_identity_add_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<
 /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
 #[pyfunction]
 fn py_identity_rotate_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
-    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, identity);
+    crate::pyscp_check_handle!(identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -982,7 +982,7 @@ fn py_identity_rotate_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
 /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
 #[pyfunction]
 fn py_identity_remove_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
-    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, identity);
+    crate::pyscp_check_handle!(identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -1038,7 +1038,7 @@ fn py_identity_remove_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
 /// See ADR-003 acceptance criterion 4b and SCP-214 criterion 10.
 #[pyfunction]
 fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
-    crate::pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, identity);
+    crate::pyscp_check_handle!(identity);
     let old_did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;

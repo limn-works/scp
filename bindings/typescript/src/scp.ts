@@ -181,6 +181,37 @@ function nativeScp(): NativeScpCtor {
 }
 
 // ---------------------------------------------------------------------------
+// Internal helpers (exported for tests, not part of the public API)
+// ---------------------------------------------------------------------------
+
+/**
+ * Clamps a float-seconds timeout into a `u32`-millisecond count suitable
+ * for the NAPI `shutdown(timeoutMillis)` boundary. Exposed as an
+ * internal export so the regression tests around `Infinity` /`NaN`
+ * handling can exercise the clamp without needing a live native addon.
+ *
+ * @internal
+ */
+export function __clampShutdownMillisForTests(timeoutSecs: number): number {
+  // u32::MAX ms — matches the Rust-side NAPI bridge type.
+  const MAX_MILLIS = 0xffffffff;
+  // Order matters: +Infinity must be caught BEFORE !isFinite, otherwise
+  // Infinity collapses to the NaN/negative abort branch (Number.isFinite
+  // is false for both Infinity and NaN).
+  if (timeoutSecs === Number.POSITIVE_INFINITY) {
+    return MAX_MILLIS;
+  }
+  if (!Number.isFinite(timeoutSecs) || timeoutSecs <= 0) {
+    // NaN, negative, negative-infinity, or zero → immediate abort.
+    return 0;
+  }
+  if (timeoutSecs * 1000 > MAX_MILLIS) {
+    return MAX_MILLIS;
+  }
+  return Math.round(timeoutSecs * 1000);
+}
+
+// ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
 
@@ -339,20 +370,16 @@ export class SCP {
    * boundary, where the `u32` conversion silently yielded `0`
    * instead of erroring (round 2 api-design + bug-catcher findings).
    *
+   * Round 5 RED-2001 tightened the branch ordering: `Infinity` must be
+   * tested BEFORE `!Number.isFinite`, because `Number.isFinite(Infinity)`
+   * is `false` and the isFinite branch otherwise collapses Infinity to
+   * the abort path — which contradicts this docstring.
+   *
    * @param timeoutSecs Maximum seconds to wait. Defaults to 5.
    *   Floats are honored at 1 ms granularity.
    */
   async shutdown(timeoutSecs: number = 5): Promise<void> {
-    // u32::MAX ms — matches the Rust-side NAPI bridge type.
-    const MAX_MILLIS = 0xffffffff;
-    let millis: number;
-    if (!Number.isFinite(timeoutSecs) || timeoutSecs <= 0) {
-      millis = 0;
-    } else if (timeoutSecs * 1000 > MAX_MILLIS) {
-      millis = MAX_MILLIS;
-    } else {
-      millis = Math.round(timeoutSecs * 1000);
-    }
+    const millis = __clampShutdownMillisForTests(timeoutSecs);
     await this.#native.shutdown(millis);
   }
 }

@@ -211,7 +211,7 @@ pub async fn tool_register(
     handle: &NapiContextHandle,
     definition: NapiToolDefinition,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     validate_tool_name(&definition.name).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.state()?;
@@ -345,7 +345,7 @@ pub async fn tool_invoke(
     proof_tokens: Option<Vec<String>>,
     spending_ucan_jwt: Option<String>,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     validate_tool_id(&tool_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_ucan_token(&ucan_token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -502,7 +502,7 @@ pub async fn tool_verify(
     handle: &NapiContextHandle,
     tool_id: String,
 ) -> napi::Result<NapiToolVerificationResult> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Tool {
@@ -586,11 +586,7 @@ pub async fn tool_invoke_cross_context(
     chain_depth: u8,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(
-        crate::runtime::bridge_instance_for_affinity()?,
-        source_handle,
-        target_handle
-    );
+    crate::napi_check_handle!(source_handle, target_handle);
     // Validate both contexts are active.
     let source_state = source_handle.state()?;
     if source_state != "active" {
@@ -746,7 +742,7 @@ pub async fn tool_session_create(
     source_context_id: String,
     ttl_seconds: Option<u32>,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Tool {
@@ -820,7 +816,7 @@ pub async fn tool_session_invoke(
     ucan_token: String,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Tool {
@@ -958,7 +954,7 @@ pub async fn tool_session_close(
     handle: &NapiContextHandle,
     session_id: String,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(handle)?;
 
@@ -996,7 +992,7 @@ pub async fn tool_interface_expose(
     target_context_id: String,
     rate_limit_json: Option<String>,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     scp_ffi_common::validate::validate_tool_id(&tool_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     scp_ffi_common::validate::validate_context_id(&target_context_id)
@@ -1073,7 +1069,7 @@ pub async fn tool_interface_accept(
     handle: &NapiContextHandle,
     interface_json: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Tool {
@@ -1136,7 +1132,7 @@ pub async fn tool_interface_revoke(
     handle: &NapiContextHandle,
     interface_id_hex: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id();
 
     let interface_id_bytes = hex::decode(&interface_id_hex).map_err(|e| {

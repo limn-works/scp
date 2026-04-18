@@ -79,17 +79,12 @@ use napi_derive::napi;
 /// Runtime handle-affinity check at every `#[napi]` entry that accepts a
 /// handle.
 ///
-/// Single form, matching the `PyO3` bridge's
+/// Matches the `PyO3` bridge's
 /// [`pyscp_check_handle!`](../../scp_ffi/macro.pyscp_check_handle.html)
-/// for cross-bridge symmetry (round 2 simplifier review finding — the
-/// previous dual-form macro could silently route a per-instance
-/// `Scp::method` through the default `OnceLock` if the caller forgot
-/// the leading `&`). Every caller now spells the `CoreFields` target
-/// explicitly.
+/// for cross-bridge symmetry.
 ///
-/// `$core` must be a `CoreFields` or something that implements or
-/// auto-derefs to one (`&CoreFields`, `Arc<NapiBridgeInstance>`, etc.).
-/// Method resolution on `check_handle` handles the indirection.
+/// Resolves [`bridge_instance_for_affinity`](crate::runtime::bridge_instance_for_affinity)
+/// internally and checks each `$handle.instance_id` against the core's.
 ///
 /// `$handle` must carry an inherent `instance_id(&self) -> u64` method
 /// (`HandleInstance` in the runtime module).
@@ -97,30 +92,29 @@ use napi_derive::napi;
 /// Raises [`crate::error::ScpNapiError::Permission`] with error code
 /// `SCP-PERM-3030` on mismatch.
 ///
+/// Round 5 simplifier review dropped the explicit `$core` parameter
+/// after confirming all 175 call sites across the three bridges passed
+/// the same `bridge_instance_for_affinity()?` value. If a future
+/// per-instance `Scp::method` needs to target `&self.inner.core`, add a
+/// second macro arm rather than re-expanding the default one.
+///
 /// Usage:
 ///
 /// ```ignore
-/// // free-function (default instance)
-/// napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
-/// napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, identity, context_handle);
-///
-/// // per-instance method (PR 2+)
-/// napi_check_handle!(&self.inner.core, handle);
+/// napi_check_handle!(handle);
+/// napi_check_handle!(identity, context_handle);
 /// ```
 #[macro_export]
 macro_rules! napi_check_handle {
-    ($core:expr, $($handle:expr),+ $(,)?) => {{
+    ($($handle:expr),+ $(,)?) => {{
         // Method resolution on `check_handle` auto-derefs through `&T`,
         // `&Arc<T>`, `Arc<T>`, and `CoreFields` directly. `CoreFields`
         // has an inherent `check_handle` method, so the trait need not
-        // be in scope when `$core` resolves to `&CoreFields` (the
-        // typical free-function case). If a future caller passes
-        // `Arc<NapiBridgeInstance>` or similar, add
-        // `use scp_ffi_common::bridge_instance::BridgeInstanceCore;`
-        // at the call site. Mirrors the PyO3 bridge's
-        // `pyscp_check_handle!` pattern.
+        // be in scope. Mirrors the PyO3 bridge's `pyscp_check_handle!`
+        // pattern.
+        let __core = $crate::runtime::bridge_instance_for_affinity()?;
         $(
-            $core
+            __core
                 .check_handle($crate::runtime::HandleInstance::instance_id($handle))
                 .map_err(|e| ::napi::Error::from($crate::error::ScpNapiError::from(e)))?;
         )+

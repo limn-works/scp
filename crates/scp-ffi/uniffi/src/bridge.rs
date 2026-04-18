@@ -2634,7 +2634,7 @@ pub async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> {
 /// See §9.3, issue #362, #419.
 #[uniffi::export]
 pub async fn identity_attest_device(identity: Arc<Identity>) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, identity);
+    crate::uniffi_check_handle!(identity);
     identity_attest_device_impl(identity).await
 }
 
@@ -2830,7 +2830,7 @@ pub async fn identity_create_link_attestation(
     verification_method: String,
     platform_id: Option<String>,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, identity);
+    crate::uniffi_check_handle!(identity);
     identity_create_link_attestation_impl(
         identity,
         platform,
@@ -3084,7 +3084,7 @@ pub async fn context_create(
     identity: Arc<Identity>,
     params: ContextParams,
 ) -> Result<Arc<ContextHandle>, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, identity);
+    crate::uniffi_check_handle!(identity);
     runtime()
         .spawn(async move {
             validate_did(&identity.did)?;
@@ -3266,11 +3266,7 @@ pub async fn context_join(
     identity: Arc<Identity>,
     spending_ucan_jwt: Option<String>,
 ) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(
-        crate::runtime::bridge_instance_for_affinity()?,
-        handle,
-        identity
-    );
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             validate_did(&identity.did)?;
@@ -3433,11 +3429,7 @@ pub async fn context_leave(
     handle: Arc<ContextHandle>,
     identity: Arc<Identity>,
 ) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(
-        crate::runtime::bridge_instance_for_affinity()?,
-        handle,
-        identity
-    );
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -3500,11 +3492,7 @@ pub async fn context_close(
     handle: Arc<ContextHandle>,
     identity: Arc<Identity>,
 ) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(
-        crate::runtime::bridge_instance_for_affinity()?,
-        handle,
-        identity
-    );
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             // Authorization is enforced by the ContextManager (which delegates
@@ -3643,11 +3631,7 @@ pub async fn context_send(
     payload: Vec<u8>,
     spending_ucan_jwt: Option<String>,
 ) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(
-        crate::runtime::bridge_instance_for_affinity()?,
-        handle,
-        identity
-    );
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             validate_did(&identity.did)?;
@@ -3784,7 +3768,7 @@ pub async fn context_subscribe(
     handle: Arc<ContextHandle>,
     listener: Box<dyn crate::MessageListener>,
 ) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let state = handle.state.lock().await;
 
     if !matches!(*state, ContextState::Active) {
@@ -3830,7 +3814,7 @@ pub async fn tool_register(
     handle: Arc<ContextHandle>,
     definition: ToolDefinition,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             validate_tool_name(&definition.name)?;
@@ -4015,11 +3999,7 @@ pub async fn tool_invoke(
     proof_tokens: Option<Vec<String>>,
     spending_ucan_jwt: Option<String>,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(
-        crate::runtime::bridge_instance_for_affinity()?,
-        handle,
-        identity
-    );
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             validate_tool_id(&tool_id)?;
@@ -4260,7 +4240,7 @@ pub async fn tool_verify(
     handle: Arc<ContextHandle>,
     tool_id: String,
 ) -> Result<ToolVerificationResult, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -4329,12 +4309,7 @@ pub async fn tool_invoke_cross_context(
     chain_depth: u8,
     proof_tokens: Option<Vec<String>>,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(
-        crate::runtime::bridge_instance_for_affinity()?,
-        source_handle,
-        target_handle,
-        identity
-    );
+    crate::uniffi_check_handle!(source_handle, target_handle, identity);
     runtime()
         .spawn(async move {
             // Validate source context is active.
@@ -4477,7 +4452,7 @@ pub async fn tool_session_create(
     source_context_id: String,
     ttl_seconds: Option<u64>,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -4565,11 +4540,7 @@ pub async fn tool_session_invoke(
     ucan_token: String,
     proof_tokens: Option<Vec<String>>,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(
-        crate::runtime::bridge_instance_for_affinity()?,
-        handle,
-        identity
-    );
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -4696,7 +4667,7 @@ pub async fn tool_session_close(
     handle: Arc<ContextHandle>,
     session_id: String,
 ) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let mut store = handle.session_store.lock().await;
@@ -4746,7 +4717,7 @@ pub async fn tool_interface_expose(
     target_context_id: String,
     rate_limit_json: Option<String>,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             validate_tool_id(&tool_id)?;
@@ -4845,7 +4816,7 @@ pub async fn tool_interface_accept(
     handle: Arc<ContextHandle>,
     interface_json: String,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -4931,7 +4902,7 @@ pub async fn tool_interface_revoke(
     handle: Arc<ContextHandle>,
     interface_id_hex: String,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let interface_id_bytes =
@@ -5094,7 +5065,7 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
 /// Returns `ScpError::Transport` if querying the transport status fails.
 #[uniffi::export]
 pub async fn transport_status(manager: Arc<TransportManager>) -> Result<TransportStatus, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, manager);
+    crate::uniffi_check_handle!(manager);
     Ok(manager.status())
 }
 
@@ -5115,7 +5086,7 @@ pub async fn transport_status(manager: Arc<TransportManager>) -> Result<Transpor
 /// Returns `ScpError::Transport` if the internal lock is poisoned.
 #[uniffi::export]
 pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, manager);
+    crate::uniffi_check_handle!(manager);
     runtime()
         .spawn(async move {
             // Clear the transport from BridgeInstance, dropping all adapters.
@@ -6526,7 +6497,7 @@ pub async fn ucan_validate(
     presenting_agent_did: Option<String>,
     proof_tokens: Option<Vec<String>>,
 ) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             validate_ucan_token(&token)?;
@@ -6669,7 +6640,7 @@ pub async fn ucan_mint(
     capabilities: Vec<String>,
     proofs: Option<Vec<String>>,
 ) -> Result<Arc<UcanToken>, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     validate_did(&member_did)?;
     if let Some(ref tokens) = proofs {
         for t in tokens {
@@ -6810,7 +6781,7 @@ pub async fn ucan_revoke(
     token: String,
     revoker_did: String,
 ) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     validate_ucan_token(&token).map_err(|e| ScpError::Validation {
         msg: e.to_string(),
         code: codes::VALID_7010.to_owned(),
@@ -6916,7 +6887,7 @@ pub async fn ucan_delegate(
     parent_token: String,
     capabilities: Vec<String>,
 ) -> Result<Arc<UcanToken>, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     validate_did(&delegator_did)?;
     validate_did(&delegatee_did)?;
     validate_ucan_token(&parent_token)?;
@@ -7091,7 +7062,7 @@ pub async fn event_log_query(
     handle: Arc<ContextHandle>,
     filter_json: Option<String>,
 ) -> Result<Vec<Event>, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             // Ensure UCAN state (which contains the event log) is registered.
@@ -7278,7 +7249,7 @@ pub async fn event_log_verify(
     handle: Arc<ContextHandle>,
     claim_json: String,
 ) -> Result<Proof, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             // Parse the claim JSON.
@@ -7474,11 +7445,7 @@ pub async fn event_log_checkpoint(
     identity: Arc<Identity>,
     epoch: u64,
 ) -> Result<Checkpoint, ScpError> {
-    crate::uniffi_check_handle!(
-        crate::runtime::bridge_instance_for_affinity()?,
-        handle,
-        identity
-    );
+    crate::uniffi_check_handle!(handle, identity);
     event_log_checkpoint_impl(handle, identity, epoch).await
 }
 
@@ -7612,7 +7579,7 @@ pub async fn governance_execute(
     handle: Arc<ContextHandle>,
     proposal_json: String,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     let (result, action_name) = runtime()
@@ -7789,7 +7756,7 @@ pub async fn governance_propose(
     proposer_did: String,
     action_json: String,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let signing_key = resolve_uniffi_signing_key(&handle).await?;
     let context_id = handle.context_id.clone();
 
@@ -7853,7 +7820,7 @@ pub async fn governance_approve(
     voter_did: String,
     proposal_id_hex: String,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let signing_key = resolve_uniffi_signing_key(&handle).await?;
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
@@ -7899,7 +7866,7 @@ pub async fn governance_reject(
     voter_did: String,
     proposal_id_hex: String,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let signing_key = resolve_uniffi_signing_key(&handle).await?;
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
@@ -7946,7 +7913,7 @@ pub async fn governance_withdraw(
     voter_did: String,
     proposal_id_hex: String,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
 
@@ -7988,7 +7955,7 @@ pub async fn governance_get_proposal(
     handle: Arc<ContextHandle>,
     proposal_id_hex: String,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
 
@@ -8021,7 +7988,7 @@ pub async fn governance_get_proposal(
 /// Returns `ScpError::Context` (SCP-CTX-2046) if listing fails.
 #[uniffi::export]
 pub async fn governance_list_proposals(handle: Arc<ContextHandle>) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     runtime()
@@ -8060,7 +8027,7 @@ pub async fn apply_pending_ceiling_modification(
     handle: Arc<ContextHandle>,
     current_timestamp: u64,
 ) -> Result<bool, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     runtime()
@@ -8089,7 +8056,7 @@ pub async fn apply_pending_ceiling_modification(
 /// in `Closing` state or finalization fails.
 #[uniffi::export]
 pub async fn finalize_close(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let handle_ref = handle.clone();
 
@@ -8148,7 +8115,7 @@ pub async fn create_governance_checkpoint(
     creator_did: String,
     creator_signature_hex: String,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     let merkle_root = parse_uniffi_hex_32(&merkle_root_hex, "merkle_root")?;
@@ -8208,7 +8175,7 @@ pub async fn add_checkpoint_cosignature(
     signer_did: String,
     signature_hex: String,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     let mut checkpoint: scp_core::context::governance::ContextCheckpoint =
@@ -8345,7 +8312,7 @@ fn parse_uniffi_hex_32(hex_str: &str, field_name: &str) -> Result<[u8; 32], ScpE
 /// or the grace period has not expired.
 #[uniffi::export]
 pub async fn tombstone_migrated_context(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let handle_ref = handle.clone();
 
@@ -8375,7 +8342,7 @@ pub async fn tombstone_migrated_context(handle: Arc<ContextHandle>) -> Result<()
 /// context is not migrating.
 #[uniffi::export]
 pub async fn migration_state(handle: Arc<ContextHandle>) -> Result<Option<String>, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     runtime()
@@ -8421,7 +8388,7 @@ pub async fn broadcast_subscribe(
     handle: Arc<ContextHandle>,
     subscriber_did: String,
 ) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8464,7 +8431,7 @@ pub async fn broadcast_unsubscribe(
     subscriber_did: String,
     rotate_keys: bool,
 ) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8506,11 +8473,7 @@ pub async fn broadcast_publish(
     identity: Arc<Identity>,
     payload: Vec<u8>,
 ) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(
-        crate::runtime::bridge_instance_for_affinity()?,
-        handle,
-        identity
-    );
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8646,11 +8609,7 @@ pub async fn broadcast_publish_asset(
     asset: AssetEntry,
     deploy_id: Option<String>,
 ) -> Result<PublishResult, ScpError> {
-    crate::uniffi_check_handle!(
-        crate::runtime::bridge_instance_for_affinity()?,
-        handle,
-        identity
-    );
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8800,11 +8759,7 @@ pub async fn broadcast_publish_assets(
     assets: Vec<AssetEntry>,
     deploy_id: Option<String>,
 ) -> Result<BatchPublishResult, ScpError> {
-    crate::uniffi_check_handle!(
-        crate::runtime::bridge_instance_for_affinity()?,
-        handle,
-        identity
-    );
+    crate::uniffi_check_handle!(handle, identity);
     const MAX_BATCH_ASSETS: usize = 10_000;
     if assets.len() > MAX_BATCH_ASSETS {
         return Err(ScpError::Context {
@@ -8964,7 +8919,7 @@ pub async fn broadcast_block_subscriber(
     subscriber_did: String,
     blocker_did: String,
 ) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8999,7 +8954,7 @@ pub async fn broadcast_unblock_subscriber(
     subscriber_did: String,
     unblocker_did: String,
 ) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -9032,7 +8987,7 @@ pub async fn broadcast_handle_key_request(
     author_did: String,
     requester_did: String,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -9057,7 +9012,7 @@ pub async fn broadcast_handle_key_request(
 #[uniffi::export]
 pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u64> {
     let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+        crate::uniffi_check_handle!(handle);
         Ok(())
     })();
     if check.is_err() {
@@ -9074,7 +9029,7 @@ pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u6
 #[uniffi::export]
 pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) -> bool {
     let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+        crate::uniffi_check_handle!(handle);
         Ok(())
     })();
     if check.is_err() {
@@ -9093,7 +9048,7 @@ pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) ->
 #[uniffi::export]
 pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
     let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+        crate::uniffi_check_handle!(handle);
         Ok(())
     })();
     if check.is_err() {
@@ -9116,7 +9071,7 @@ pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
 #[uniffi::export]
 pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
     let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+        crate::uniffi_check_handle!(handle);
         Ok(())
     })();
     if check.is_err() {
@@ -9140,7 +9095,7 @@ pub async fn context_is_member(handle: Arc<ContextHandle>, did: String) -> bool 
 #[uniffi::export]
 pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
     let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+        crate::uniffi_check_handle!(handle);
         Ok(())
     })();
     if check.is_err() {
@@ -9156,7 +9111,7 @@ pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
 #[uniffi::export]
 pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Option<String> {
     let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+        crate::uniffi_check_handle!(handle);
         Ok(())
     })();
     if check.is_err() {
@@ -9213,7 +9168,7 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
 #[uniffi::export]
 pub async fn context_drain_events(handle: Arc<ContextHandle>) -> Vec<String> {
     let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+        crate::uniffi_check_handle!(handle);
         Ok(())
     })();
     if check.is_err() {
@@ -9312,7 +9267,7 @@ pub async fn access_key_restore(
 #[uniffi::export]
 #[allow(clippy::significant_drop_tightening)]
 pub async fn context_handle_ttl_expiry(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -9355,7 +9310,7 @@ pub async fn context_propose_ttl_extension(
     member_did: String,
     proposed_seconds: u64,
 ) -> Result<bool, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -9379,7 +9334,7 @@ pub async fn context_propose_ttl_extension(
 #[uniffi::export]
 pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u64) {
     let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+        crate::uniffi_check_handle!(handle);
         Ok(())
     })();
     if check.is_err() {
@@ -10072,7 +10027,7 @@ pub fn set_economic_policy(
     handle: Arc<ContextHandle>,
     policy_json: String,
 ) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let _ = (handle, policy_json);
     Err(ScpError::Permission {
         msg: "economic policy changes must go through governance \
@@ -10086,7 +10041,7 @@ pub fn set_economic_policy(
 /// Returns the economic policy for a context as a JSON string, or `None`.
 #[uniffi::export]
 pub fn get_economic_policy(handle: Arc<ContextHandle>) -> Result<Option<String>, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let guard = handle
         .economic_policy
         .lock()
@@ -10112,7 +10067,7 @@ pub fn get_economic_policy(handle: Arc<ContextHandle>) -> Result<Option<String>,
 /// or serialization fails.
 #[uniffi::export]
 pub async fn context_export(handle: Arc<ContextHandle>) -> Result<Vec<u8>, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::uniffi_check_handle!(handle);
     let ctx_id = handle.context_id.clone();
     let creator_did = handle.creator_did.clone();
     runtime()
@@ -11711,7 +11666,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
 /// See ADR-003 acceptance criterion 4b.
 #[uniffi::export]
 pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, identity);
+    crate::uniffi_check_handle!(identity);
     let core_id = identity
         .core_id
         .as_ref()
@@ -12783,7 +12738,7 @@ pub fn scpid_sign(
     signing_key_id: String,
     challenge_json: String,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, identity);
+    crate::uniffi_check_handle!(identity);
     use scp_core::identity::scpid_sign as core_sign;
 
     let key_id = parse_scpid_signing_key_id(&signing_key_id)?;

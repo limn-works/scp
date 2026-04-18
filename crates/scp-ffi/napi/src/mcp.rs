@@ -583,7 +583,7 @@ pub async fn mcp_server_create(config: NapiMcpServerConfig) -> napi::Result<Napi
 #[napi]
 #[allow(clippy::unused_async)]
 pub async fn mcp_server_stop(handle: &NapiMcpServerHandle) -> napi::Result<()> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     let mut entry = mcp_server_registry()
         .get_mut(&handle.handle_id)
         .ok_or_else(|| {
@@ -691,7 +691,7 @@ pub async fn mcp_client_connect_sse(url: String) -> napi::Result<NapiMcpClientHa
 #[napi]
 #[allow(clippy::unused_async)]
 pub async fn mcp_client_disconnect(handle: &NapiMcpClientHandle) -> napi::Result<()> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     let removed = mcp_client_registry().remove(&handle.handle_id);
     if removed.is_none() {
         return Err(ScpNapiError::Transport {
@@ -709,7 +709,7 @@ pub async fn mcp_client_disconnect(handle: &NapiMcpClientHandle) -> napi::Result
 pub async fn mcp_client_list_tools(
     handle: &NapiMcpClientHandle,
 ) -> napi::Result<Vec<NapiMcpToolInfo>> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     let entry = mcp_client_registry()
         .get(&handle.handle_id)
         .ok_or_else(|| {
@@ -755,7 +755,7 @@ pub async fn mcp_client_invoke(
     context_id: String,
     invoker_did: String,
 ) -> napi::Result<NapiMcpInvokeResult> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     let entry = mcp_client_registry()
         .get(&handle.handle_id)
         .ok_or_else(|| {

@@ -94,37 +94,40 @@ use crate::error::ScpPyError;
 /// Runtime handle-affinity enforcement at every `#[pyfunction]` entry point
 /// that accepts a handle.
 ///
-/// Resolves `$core` (a [`CoreFields`] reference) and checks that each
-/// supplied `$handle.instance_id` matches `$core.instance_id`. On
+/// Resolves [`bridge_instance_for_affinity`](crate::runtime::bridge_instance_for_affinity)
+/// internally to obtain a [`CoreFields`] reference, then checks that each
+/// supplied `$handle.instance_id` matches the core's `instance_id`. On
 /// mismatch, returns a [`ScpPyError::UcanError`] with code
 /// [`scp_ffi_common::error_codes::PERM_3030`] (mapped via the
 /// [`From<HandleAffinityError>`](scp_ffi_common::bridge_instance::HandleAffinityError)
 /// conversion).
 ///
-/// Taking an explicit `$core` target (rather than implicitly using the
-/// default instance) prevents a PR-2 regression where per-instance `SCP`
-/// methods would silently check against the default bridge instead of
-/// `self.inner.core`. For the free-function façade the caller passes
-/// [`bridge_instance_for_affinity`](crate::runtime::bridge_instance_for_affinity)
-/// — this mirrors the NAPI/UniFFI bridges so the three bridges share an
-/// identical invocation shape and the affinity check is never blocked by
-/// transient lifecycle state (e.g., a suspended bridge).
+/// Round 5 simplifier review removed the explicit `$core` parameter: all
+/// 175 call sites passed `crate::runtime::bridge_instance_for_affinity()?`
+/// identically, so YAGNI applied. If a future per-instance `SCP` method
+/// needs to target a different core (e.g. `&self.inner.core`), add a
+/// second macro arm rather than re-expanding the default one.
+///
+/// The affinity check is never blocked by transient lifecycle state
+/// (e.g., a suspended bridge) because `bridge_instance_for_affinity`
+/// intentionally bypasses the suspended guard.
 ///
 /// # Example
 ///
 /// ```ignore
 /// #[pyfunction]
 /// pub fn example(handle: &SomeHandle) -> PyResult<()> {
-///     pyscp_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+///     pyscp_check_handle!(handle);
 ///     // ... real work ...
 ///     Ok(())
 /// }
 /// ```
 #[macro_export]
 macro_rules! pyscp_check_handle {
-    ($core:expr, $($handle:expr),+ $(,)?) => {{
+    ($($handle:expr),+ $(,)?) => {{
+        let __core = $crate::runtime::bridge_instance_for_affinity()?;
         $(
-            $core
+            __core
                 .check_handle($handle.instance_id)
                 .map_err($crate::error::ScpPyError::from)?;
         )+

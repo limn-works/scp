@@ -631,7 +631,7 @@ pub async fn node_start_in_memory(
     identity: Option<Arc<Identity>>,
 ) -> Result<Arc<NodeHandle>, ScpError> {
     if let Some(ref id) = identity {
-        crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, id);
+        crate::uniffi_check_handle!(id);
     }
     let node_identity = match identity {
         Some(ref id) => Some(build_node_identity_from_uniffi(id)?),
@@ -674,7 +674,7 @@ pub async fn node_start_local(
     passphrase: Option<String>,
 ) -> Result<Arc<NodeHandle>, ScpError> {
     if let Some(ref id) = identity {
-        crate::uniffi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, id);
+        crate::uniffi_check_handle!(id);
     }
     let node_identity = match identity {
         Some(ref id) => Some(build_node_identity_from_uniffi(id)?),

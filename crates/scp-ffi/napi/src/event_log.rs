@@ -85,7 +85,7 @@ pub async fn event_log_query(
     handle: &NapiContextHandle,
     filter_json: Option<String>,
 ) -> napi::Result<Vec<NapiEvent>> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
 
     let filter: Option<serde_json::Value> = match filter_json {
@@ -224,7 +224,7 @@ pub async fn event_log_verify(
     handle: &NapiContextHandle,
     claim_json: String,
 ) -> napi::Result<NapiProof> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
 
     let claim: serde_json::Value =
@@ -463,11 +463,7 @@ pub fn event_log_checkpoint(
     identity: &crate::identity::NapiIdentity,
     epoch: f64,
 ) -> napi::Result<NapiCheckpoint> {
-    crate::napi_check_handle!(
-        crate::runtime::bridge_instance_for_affinity()?,
-        handle,
-        identity
-    );
+    crate::napi_check_handle!(handle, identity);
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
         let _ = (&handle, &identity, &epoch);
@@ -574,7 +570,7 @@ pub fn event_log_checkpoint_by_did(
     did: String,
     epoch: f64,
 ) -> napi::Result<NapiCheckpoint> {
-    crate::napi_check_handle!(crate::runtime::bridge_instance_for_affinity()?, handle);
+    crate::napi_check_handle!(handle);
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
         let _ = (&handle, &did, &epoch);
