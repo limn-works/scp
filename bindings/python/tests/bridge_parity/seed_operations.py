@@ -579,28 +579,18 @@ OP_UCAN_MINT = OpSpec(
 # ---------------------------------------------------------------------------
 # op 8: ucan_validate_malformed
 #
-# Validate a clearly-malformed UCAN token ("not.a.jwt"). The bridges
-# share `scp_protocol::crypto::ucan::validate::parse_ucan` but map its
-# errors through BRIDGE-LOCAL wrappers with different SCP codes. This
-# op is the harness surfacing a real divergence:
-#
-#   - PyO3 → SCP-PERM-3001 (crates/scp-ffi/src/error.rs,
-#     `From<UcanError> for ScpPyError`)
-#   - NAPI → SCP-PERM-3001 (same mapping)
-#   - WASM → SCP-PERM-3000 (crates/scp-ffi/wasm/src/ucan.rs, inline)
-#   - UniFFI → SCP-PERM-3002 (crates/scp-ffi/uniffi/src/bridge.rs,
-#     `ucan_validate` inline match on `parse_ucan` error)
-#
-# PyO3 is the reference (SCP-PERM-3001). NAPI agrees and passes. WASM
-# and UniFFI are xfail'd with a FOLLOWUP.md §8 reference — the fix is a
-# one-line change in each bridge to use the shared PERM_3001 constant.
-# When those PRs land, the fixes MUST remove these xfail entries in the
-# same PR (xfail-strict policy in the module docstring).
+# Validate a clearly-malformed UCAN token ("not.a.jwt"). All four bridges
+# share `scp_protocol::crypto::ucan::validate::parse_ucan` and now map its
+# `UcanError` outputs through each bridge's canonical `From<UcanError>`
+# mapping to SCP-PERM-3001 — matching the reference PyO3 behaviour. WASM
+# and UniFFI previously emitted SCP-PERM-3000 / SCP-PERM-3002 via inline
+# ad-hoc error construction; that divergence was fixed in the same PR
+# that removed the xfail on this op.
 # ---------------------------------------------------------------------------
 
 
 _MALFORMED_UCAN = "not.a.jwt"
-# PyO3 / NAPI reference code. WASM and UniFFI diverge — see op docstring.
+# Canonical PERM_3001 across all four bridges (UcanError → SCP-PERM-3001).
 _EXPECTED_MALFORMED_UCAN_CODE = "SCP-PERM-3001"
 
 
@@ -636,12 +626,6 @@ OP_UCAN_VALIDATE_MALFORMED = OpSpec(
             FieldSpec("error.type", "ignore"),
             FieldSpec("error.code", "exact"),
         )
-    ),
-    xfail_bridges=("wasm", "uniffi-kotlin", "uniffi-swift"),
-    xfail_reason=(
-        "UCAN parse-error code divergence — PyO3/NAPI emit SCP-PERM-3001, "
-        "WASM emits SCP-PERM-3000, UniFFI emits SCP-PERM-3002. All four "
-        "should converge on the shared code. Tracked in FOLLOWUP.md §8."
     ),
     expected_values=(("error.code", _EXPECTED_MALFORMED_UCAN_CODE),),
 )

@@ -6508,36 +6508,27 @@ pub async fn ucan_validate(
                 DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
             };
 
-            // Step 1: Parse the UCAN token.
-            let parsed_token = parse_ucan(&token).map_err(|e| ScpError::Permission {
-                msg: format!("malformed UCAN token: {e}"),
-                code: codes::PERM_3002.to_owned(),
-            })?;
+            // Step 1: Parse the UCAN token. All UcanError results map to
+            // SCP-PERM-3001 via the canonical `From<UcanError> for ScpError`
+            // impl, matching PyO3 and NAPI so malformed-token diagnostics
+            // share a code across bridges.
+            let parsed_token = parse_ucan(&token).map_err(ScpError::from)?;
 
-            // Parse the required capability URI.
-            let required_cap: CapabilityUri =
-                capability
-                    .parse()
-                    .map_err(
-                        |e: scp_core::crypto::ucan::UcanError| ScpError::Permission {
-                            msg: format!("invalid capability URI '{capability}': {e}"),
-                            code: codes::PERM_3002.to_owned(),
-                        },
-                    )?;
+            // Parse the required capability URI. `UcanError::parse` failures
+            // flow through the same canonical mapping as token parse errors.
+            let required_cap: CapabilityUri = capability.parse().map_err(ScpError::from)?;
 
             // Determine the presenting agent DID: explicit parameter or token audience.
             let agent_did = presenting_agent_did
                 .as_deref()
                 .unwrap_or(&parsed_token.payload.aud);
 
-            // Build proof resolver from optional proof tokens.
+            // Build proof resolver from optional proof tokens. Malformed proof
+            // tokens surface the same SCP-PERM-3001 code (canonical UcanError).
             let mut proofs = std::collections::HashMap::new();
             if let Some(ref tokens) = proof_tokens {
                 for encoded in tokens {
-                    let proof_token = parse_ucan(encoded).map_err(|e| ScpError::Permission {
-                        msg: format!("malformed proof token: {e}"),
-                        code: codes::PERM_3002.to_owned(),
-                    })?;
+                    let proof_token = parse_ucan(encoded).map_err(ScpError::from)?;
                     let cid = scp_core::crypto::ucan::mint::compute_cid(&proof_token);
                     proofs.insert(cid, proof_token);
                 }
@@ -6577,12 +6568,7 @@ pub async fn ucan_validate(
                         clock: &scp_primitives::SystemClock,
                     };
 
-                    validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(|e| {
-                        ScpError::Permission {
-                            msg: format!("UCAN validation failed: {e}"),
-                            code: codes::PERM_3002.to_owned(),
-                        }
-                    })
+                    validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpError::from)
                 })
                 .ok_or_else(|| ScpError::Permission {
                     msg: format!("context '{}' not found in UCAN registry", handle.context_id),

@@ -422,7 +422,7 @@ pub fn ucan_validate(
         let parsed = parse_ucan(&token).map_err(|e| {
             ScpWasmError::Permission {
                 message: format!("malformed token: {e}"),
-                code: codes::PERM_3000.to_owned(),
+                code: codes::PERM_3001.to_owned(),
             }
             .into_js()
         })?;

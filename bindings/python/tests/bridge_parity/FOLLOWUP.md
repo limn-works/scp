@@ -100,24 +100,6 @@ When either lands, remove the `xfail_bridges` entry on
 `OP_TRANSPORT_STATUS` and make sure the Node / Kotlin / Swift runners
 return the real status rather than the synthetic all-null sentinel.
 
----
-
-## 8. Align UCAN parse-error code across bridges
-
-`OP_UCAN_VALIDATE_MALFORMED` exercises the malformed-JWT rejection
-path. All four bridges reject the token (good) but with three
-different SCP codes:
-
-  - PyO3 → SCP-PERM-3001 (reference, defined in
-    `crates/scp-ffi/src/error.rs`)
-  - NAPI → SCP-PERM-3001 (matches)
-  - WASM → SCP-PERM-3000 (diverges — inline in
-    `crates/scp-ffi/wasm/src/ucan.rs::ucan_validate`)
-  - UniFFI → SCP-PERM-3002 (diverges — inline match in
-    `crates/scp-ffi/uniffi/src/bridge.rs::ucan_validate`)
-
-Fix: in each of the WASM and UniFFI ucan_validate sites, swap the
-inline error code for `codes::PERM_3001`. No scp-protocol changes
-required. When the fix lands, the same PR removes the
-`xfail_bridges=("wasm", "uniffi-kotlin", "uniffi-swift")` entry on
-`OP_UCAN_VALIDATE_MALFORMED` in `seed_operations.py`.
+(Section 8 — UCAN parse-error code divergence — has been fixed and
+removed. Git history carries the rationale and the PR that landed the
+fix.)
