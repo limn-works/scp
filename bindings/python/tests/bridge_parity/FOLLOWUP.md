@@ -9,7 +9,7 @@ This file has two kinds of entries, and the distinction is load-bearing:
   more is a next pass. They require the 5-point integration checklist
   (CLAUDE.md) before they can land.
 
-- **§3, §4, §5 — Discovered protocol bugs.** The harness surfaced real
+- **§4, §5 — Discovered protocol bugs.** The harness surfaced real
   cross-bridge divergences while being built. They are NOT enforcement-
   infra work. They ARE prerequisites before Layer C's parity gate can
   assert on NAPI/WASM for the affected ops. Each one is a spec or
@@ -31,7 +31,7 @@ bugs WILL be fixed, and when each fix lands, the gate upgrades from
 "visible divergence" to "byte-equality parity." Layer C's parity gate
 will assert on NAPI/WASM for these ops at that point.
 
-When fixing any divergence in §3 / §4 / §5, the same PR MUST:
+When fixing any divergence in §4 / §5, the same PR MUST:
 
 1. Remove the corresponding `xfail_bridges=(...)` and `xfail_reason=...`
    fields from the OpSpec in `seed_operations.py`.
@@ -83,36 +83,6 @@ macOS runners in CI.
 ---
 
 # Discovered protocol bugs (xfail-strict tripwires)
-
-## 3. DISCOVERED BUG — blocks full parity coverage for `context_create`
-
-**Issue**: filed alongside this PR (see inline description below). Bug is self-documented here; grep `xfail_reason` in `seed_operations.py` for the test-suite surface.
-
-Spec §18.4.1 mandates 64-char hex context IDs so they embed in
-`scp://context/<context_id_hex>` URIs. PyO3 (`generate_context_id` in
-`crates/scp-ffi/src/types.rs`) emits spec-compliant hex. NAPI
-(`crates/scp-ffi/napi/src/context.rs:427`), WASM
-(`crates/scp-ffi/wasm/src/context.rs:283`), and UniFFI
-(`crates/scp-ffi/uniffi/src/bridge.rs:2979`) all emit `ctx-<uuidv4>`.
-Three bridges violate the spec. The harness caught it.
-
-**Current tripwire**: `test_parity[napi-context_create]` and
-`test_parity[wasm-context_create]` are marked
-`@pytest.mark.xfail(strict=True)` so divergence remains visible in CI
-but does not block the suite. `CONTEXT_ID_PATTERN` in
-`seed_operations.py` is the spec-compliant `^[0-9a-f]{64}$` — PyO3
-matches; the other bridges fail the regex and the xfail catches it.
-
-**Fix**: Align three bridges on a shared ID generator (likely moving
-`generate_context_id` from `scp-ffi/src` into `scp-ffi-common` or
-`scp-protocol` and calling it from all four bridges), plus regenerating
-any stored state referencing `ctx-*` IDs. This is cross-bridge
-protocol work that spans multiple SDKs and requires protocol-level
-discussion; it is orthogonal to the enforcement-infra Layer C ships.
-
-xfail-strict enforces the "fix the bridge, same PR removes xfail"
-workflow. This bug is real. It will be fixed before Layer C's parity
-gate asserts on NAPI/WASM for `context_create`.
 
 ## 4. DISCOVERED BUG — blocks full parity coverage on valid-challenge SCPID path
 

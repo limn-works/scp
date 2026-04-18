@@ -16,10 +16,14 @@ because we do not yet have a deterministic-seed parameter wired through
 all four bridges. See FOLLOWUP.md §1 for the forward-only plan.
 
 Known divergences caught by the harness (all xfail'd — see FOLLOWUP.md):
-  - context_id format (§18.4.1): only PyO3 is compliant.
   - invalid_capability error code: three bridges, three codes.
   - event_log_append starting sequence: bridges disagree on whether a
     ContextCreated event is emitted at create time.
+
+Resolved divergences (previously xfail'd, now full parity):
+  - context_id format (§18.4.1): all four bridges emit 64-char lowercase
+    hex via `hex::encode(32 random bytes)`. PyO3's `generate_context_id`
+    (crates/scp-ffi/src/types.rs) remains the reference.
 
 ----------------------------------------------------------------------
 XFAIL-STRICT POLICY — READ BEFORE LANDING A FIX
@@ -65,12 +69,12 @@ from .normalizer import FieldSpec, OpSchema
 # zbase32 alphabet (RFC draft): ybndrfg8ejkmcpqxot1uwisza345h769
 DID_DHT_PATTERN = r"did:dht:z[ybndrfg8ejkmcpqxot1uwisza345h769]{40,200}"
 
-# Spec §18.4.1: context IDs MUST be 64-char lowercase hex. PyO3's
-# `generate_context_id` (crates/scp-ffi/src/types.rs) is the reference.
-# NAPI, WASM, and UniFFI currently emit `ctx-<uuidv4>` in violation of the
-# spec — see FOLLOWUP.md §3. The failing parity tests are xfail'd so the
-# divergence stays visible without blocking the suite.
-CONTEXT_ID_PATTERN = r"[0-9a-f]{64}"
+# Spec §18.4.1: context IDs MUST be 64-char lowercase hex. All four bridges
+# (PyO3, NAPI, WASM, UniFFI) now emit spec-compliant hex IDs via
+# `hex::encode(32 random bytes)` — regex is fully anchored to reject any
+# non-conformant format (e.g. the legacy `ctx-<uuidv4>` shape the parity
+# harness caught).
+CONTEXT_ID_PATTERN = r"^[0-9a-f]{64}$"
 
 # All three bridges reject the malformed SCPID challenge with
 # SCP-IDENT-1038 (validation error) before they ever reach the identity
@@ -172,9 +176,9 @@ OP_IDENTITY_CREATE = OpSpec(
 #
 # Random context ID per bridge, freshly-created identity per bridge.
 # Compare shapes plus the deterministic `mode` echo. The context_id
-# regex is anchored to the spec-compliant hex form per §18.4.1. NAPI
-# and WASM emit `ctx-<uuidv4>` and will fail this regex — those cases
-# are xfail'd (see FOLLOWUP.md §3).
+# regex is anchored to the spec-compliant hex form per §18.4.1 — all
+# four bridges (PyO3, NAPI, WASM, UniFFI) emit `hex::encode(32 random
+# bytes)`.
 # ---------------------------------------------------------------------------
 
 
@@ -202,16 +206,6 @@ OP_CONTEXT_CREATE = OpSpec(
             FieldSpec("creator_did", "regex", pattern=DID_DHT_PATTERN),
             FieldSpec("mode", "exact"),
         )
-    ),
-    # XFAIL (strict): see FOLLOWUP.md §3. When the bridge fix lands, REMOVE
-    # `xfail_bridges` and `xfail_reason` below in the SAME PR — xfail-strict
-    # will otherwise fail CI with XPASS once the fix unblocks this case.
-    xfail_bridges=("napi", "wasm"),
-    xfail_reason=(
-        "Context ID format diverges from spec §18.4.1 (hex) — "
-        "NAPI/WASM emit ctx-<uuidv4>. See FOLLOWUP.md §3. "
-        "Remove this xfail in the same PR that fixes the bridges. "
-        "MUST remove xfail marker in the same PR as the fix."
     ),
 )
 
