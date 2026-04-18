@@ -1647,33 +1647,24 @@ impl CoreFields {
 
         if let Some(cm) = self.context_manager.get() {
             // Persistence flush must honor the caller-supplied deadline.
-            // `flush_all_contexts_sync` is a blocking sync call — run it
-            // on `spawn_blocking` and wrap in `tokio::time::timeout` so
-            // storage latency cannot push us past the shutdown budget.
-            // Zero budget falls through to a best-effort inline flush
-            // (matches the sync shutdown path's contract).
+            // The flush is now natively async (per-context bounded
+            // `Mutex::lock` with a 250ms budget and degraded-snapshot
+            // fallback for wedged contexts); wrap in `tokio::time::timeout`
+            // so aggregate storage latency cannot push us past the caller's
+            // shutdown budget. Zero budget falls through to a best-effort
+            // inline flush (matches the sync shutdown path's contract).
             if flush_budget.is_zero() {
                 tracing::warn!(
-                    "shutdown flush budget exhausted before flush_all_contexts_sync — \
+                    "shutdown flush budget exhausted before flush_all_contexts — \
                      context state may not be persisted"
                 );
             } else {
-                let cm_for_flush = Arc::clone(cm);
-                let blocking = tokio::task::spawn_blocking(move || {
-                    cm_for_flush.flush_all_contexts_sync();
-                });
-                match tokio::time::timeout(flush_budget, blocking).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(join_err)) => {
-                        tracing::error!(
-                            "flush_all_contexts_sync task failed during shutdown: {join_err} — \
-                             continuing cleanup"
-                        );
-                    }
+                match tokio::time::timeout(flush_budget, cm.flush_all_contexts()).await {
+                    Ok(()) => {}
                     Err(_elapsed) => {
                         tracing::warn!(
                             budget_ms = flush_budget.as_millis(),
-                            "flush_all_contexts_sync exceeded shutdown budget — \
+                            "flush_all_contexts exceeded shutdown budget — \
                              context state may not be persisted"
                         );
                     }
@@ -3252,7 +3243,13 @@ mod tests {
     // AC 8: suspend/resume with persistence
     // -----------------------------------------------------------------
 
-    #[tokio::test]
+    // Must run on the multi-thread runtime: `CoreFields::suspend` synchronously
+    // invokes `ContextManager::flush_all_contexts_sync`, which uses
+    // `tokio::task::block_in_place`. `block_in_place` panics on the default
+    // single-thread `#[tokio::test]` runtime ("can call blocking only when
+    // running on the multi-threaded runtime"). Commit 12 of #1549 PR 2
+    // introduced the `block_in_place` path without updating this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn suspend_flushes_contexts_to_persistence() {
         use scp_core::context::providers::InMemoryPersistence;
         use std::sync::Arc;

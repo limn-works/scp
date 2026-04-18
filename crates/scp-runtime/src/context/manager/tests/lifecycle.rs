@@ -3991,3 +3991,191 @@ async fn event_channel_receives_member_left_on_leave() {
     }
     assert!(found, "expected MemberLeft event for bob on channel");
 }
+
+// -----------------------------------------------------------------------
+// AC3 bug 1: `flush_all_contexts` must persist a degraded snapshot for
+// contexts whose lock cannot be acquired within the flush budget, with
+// `needs_reconnect = true` set so the restore path fires the
+// reconnection pipeline rather than silently losing state.
+// -----------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flush_all_contexts_persists_degraded_snapshot_for_locked_context() {
+    let persistence = Arc::new(MockContextPersistence::default());
+    let persistence_for_cm: Box<dyn super::ContextPersistence> =
+        Box::new(MockContextPersistence::default());
+
+    let manager = Arc::new(ContextManager::with_persistence(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        persistence_for_cm,
+        noop_key_resolver(),
+    ));
+
+    // Create a context so there is something to flush.
+    let _handle = manager
+        .create_context(
+            "locked-ctx".into(),
+            ContextParams::default(),
+            "did:key:creator".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Replace the MockContextPersistence embedded in the manager at build
+    // time with our observable one by seeding the shared `persistence`
+    // handle directly from flush. We cannot swap the persistence on a live
+    // manager, so we instead verify behavior via a second manager built
+    // with the shared persistence handle.
+    //
+    // Rebuild with shared persistence (wrap clone in Box).
+    let shared_persistence: Arc<MockContextPersistence> = Arc::clone(&persistence);
+    let manager = Arc::new(ContextManager::with_persistence(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        Box::new(SharedMockPersistence(Arc::clone(&shared_persistence))),
+        noop_key_resolver(),
+    ));
+    let _handle = manager
+        .create_context(
+            "locked-ctx".into(),
+            ContextParams::default(),
+            "did:key:creator".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Acquire the per-context lock and hold it across the flush. The flush's
+    // per-context lock-acquisition budget is 250ms; we hold the lock for
+    // 750ms, guaranteeing a timeout and forcing the degraded-snapshot
+    // fallback path.
+    let arc = manager.get_context_arc("locked-ctx").unwrap();
+    let guard_task = {
+        let arc = Arc::clone(&arc);
+        tokio::spawn(async move {
+            let _guard = arc.lock().await;
+            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        })
+    };
+
+    // Give the task a chance to grab the lock.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    manager.flush_all_contexts().await;
+
+    // The degraded snapshot must be persisted with `needs_reconnect = true`
+    // and an empty crypto state blob.
+    let persisted = shared_persistence
+        .contexts
+        .lock()
+        .unwrap()
+        .get("locked-ctx")
+        .cloned()
+        .expect("degraded snapshot must be persisted for locked context");
+
+    assert!(
+        persisted.needs_reconnect,
+        "degraded snapshot must set needs_reconnect = true so restore fires the reconnection pipeline"
+    );
+    assert!(
+        persisted.mls_crypto_state.is_empty(),
+        "degraded snapshot must have empty crypto state"
+    );
+    assert_eq!(persisted.context_id, "locked-ctx");
+
+    // Let the holder release before the test exits.
+    guard_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flush_all_contexts_full_snapshot_when_lock_available() {
+    // Sanity check: when the lock is not held, flush produces the full
+    // snapshot path and `needs_reconnect` is false (the context was
+    // created cleanly).
+    let persistence: Arc<MockContextPersistence> = Arc::new(MockContextPersistence::default());
+    let manager = ContextManager::with_persistence(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        Box::new(SharedMockPersistence(Arc::clone(&persistence))),
+        noop_key_resolver(),
+    );
+    let _handle = manager
+        .create_context(
+            "unlocked-ctx".into(),
+            ContextParams::default(),
+            "did:key:creator".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    manager.flush_all_contexts().await;
+
+    let persisted = persistence
+        .contexts
+        .lock()
+        .unwrap()
+        .get("unlocked-ctx")
+        .cloned()
+        .expect("unlocked context must be flushed");
+    assert!(
+        !persisted.needs_reconnect,
+        "full snapshot path must not mark needs_reconnect"
+    );
+}
+
+/// Adapter that allows a single `MockContextPersistence` to back both the
+/// test observer (`Arc<MockContextPersistence>`) and the `ContextManager`
+/// (which takes a `Box<dyn ContextPersistence>`). All trait calls delegate
+/// to the inner Arc so the test can inspect persisted state.
+struct SharedMockPersistence(Arc<MockContextPersistence>);
+
+impl super::ContextPersistence for SharedMockPersistence {
+    fn persist_context(
+        &self,
+        context_id: &str,
+        snapshot: &super::ContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.0.persist_context(context_id, snapshot)
+    }
+
+    fn load_context(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<super::ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
+        self.0.load_context(context_id)
+    }
+
+    fn persist_broadcast(
+        &self,
+        context_id: &str,
+        snapshot: &BroadcastContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.0.persist_broadcast(context_id, snapshot)
+    }
+
+    fn load_broadcast(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<BroadcastContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
+        self.0.load_broadcast(context_id)
+    }
+
+    fn delete_context(
+        &self,
+        context_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.0.delete_context(context_id)
+    }
+
+    fn list_persisted_contexts(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        self.0.list_persisted_contexts()
+    }
+}
