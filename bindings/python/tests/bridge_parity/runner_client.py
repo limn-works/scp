@@ -35,6 +35,13 @@ from dataclasses import dataclass, field
 from time import monotonic
 from typing import Literal
 
+# Bridge modes accepted by the ADR-046 harness. Single source of truth —
+# the parametrize grid in `test_bridge_parity.py`, the runner spawner in
+# `conftest.py`, and the wire protocol in the three runners all refer
+# back to this tuple. Adding a new bridge = add one entry here + one
+# runner spawn fixture + one runner binary.
+BridgeMode = Literal["napi", "wasm", "uniffi-kotlin", "uniffi-swift"]
+
 DEFAULT_TIMEOUT_SECS = 30.0
 
 # Hard caps to prevent a misbehaving runner from OOMing the test process
@@ -89,7 +96,7 @@ class RunnerClient:
         self,
         op: str,
         args: dict[str, object],
-        mode: Literal["napi", "wasm"],
+        mode: BridgeMode,
     ) -> dict[str, object]:
         """Send one RPC call to the runner and return the parsed response.
 

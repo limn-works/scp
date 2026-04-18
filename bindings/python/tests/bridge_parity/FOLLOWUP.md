@@ -61,19 +61,6 @@ the `identity_create_deterministic` op in `seed_operations.py`. When it
 lands, flip the `signature` FieldSpec from `regex` to `bytes_from_hex`
 and add an `expected_value` for full byte parity.
 
-## 2. Add Kotlin and Swift runners
-
-Currently only PyO3, NAPI, and WASM are covered. UniFFI Swift/Kotlin
-bindings ship in production and need the same parity guarantees.
-
-**Scope**: Two additional subprocess-based runners with the same
-length-prefixed JSON-RPC wire format. Kotlin needs JVM warmup
-considerations (long-lived subprocess amortizes this); Swift needs
-macOS runners in CI.
-
-**Action**: Once one new runner lands, refactor `seed_operations.py`'s
-`node_call` dict to `runner_call: dict[str, dict]` keyed by mode.
-
 ---
 
 # Scope extensions (continued)

@@ -36,11 +36,21 @@ operation on the PyO3 bridge (in-process) and on the NAPI + WASM bridges
 (via the Bun child), normalizes both outputs to canonical JSON, and asserts
 equality.
 
-### MVP bridges
+### Covered bridges
 
-The MVP covers PyO3, NAPI, and WASM only. Each operation runs on PyO3 and
-each NAPI/WASM bridge in turn (parametrized product: N_ops × 2 alt bridges).
-UniFFI (Kotlin, Swift) is deferred — see "Future work."
+The harness covers all four production bridges against the PyO3
+reference: NAPI, WASM, UniFFI Kotlin, and UniFFI Swift. Each operation
+runs on PyO3 and each alt bridge in turn (parametrized product:
+N_ops × 4 alt bridges).
+
+NAPI and WASM are served by a shared Bun child process; UniFFI Kotlin
+is served by a JVM child; UniFFI Swift is served by a standalone
+executable on macOS runners. All three child types use the same
+length-prefixed JSON-RPC wire format and op dispatch table — adding a
+new bridge means adding an entry to `_BRIDGE_MATRIX` in
+`test_bridge_parity.py`, a fixture in `conftest.py`, and a runner that
+speaks the protocol. See `bindings/python/tests/bridge_parity/helpers/`
+for the three runner implementations.
 
 ### Harness architecture
 
@@ -230,8 +240,11 @@ endpoint. Overkill for the problem.
 - The op library is the authoritative "spec of behavior that must be
   identical across bridges" — a living artifact that is easier to audit
   than the bridge source files themselves.
-- New bridges (future UniFFI Swift/Kotlin) can be added as additional
-  `alt_bridge` modes without restructuring the harness.
+- New bridges can be added as additional `alt_bridge` modes by adding
+  one entry to `_BRIDGE_MATRIX` (test file), one runner fixture
+  (`conftest.py`), and one subprocess that speaks the JSON-RPC wire
+  protocol — without restructuring the harness. All four production
+  bridges (NAPI, WASM, UniFFI Kotlin, UniFFI Swift) are covered.
 
 ### Negative
 
@@ -239,18 +252,8 @@ endpoint. Overkill for the problem.
   CI. Mitigated: single long-lived child per test session, not per test.
 - MVP does not catch byte-exact crypto divergence. Tracked in FOLLOWUP.md.
 
-### Open questions
-
-- **JVM/Swift runners**: JVM warmup is expensive (~1–2s per process); cold
-  Swift (xcrun) even more so on macOS runners. The current design's
-  long-lived child approach generalizes — just a different child language.
-  Separate CI shape (macOS runners for Swift, JVM warmup strategy for
-  Kotlin) is a Phase 6 follow-up, not a blocker for MVP.
-
 ## Future work
 
-- Add `"kotlin"` and `"swift"` runners (separate subprocess kinds; same
-  JSON-RPC shape).
 - Add a `seed: Option<[u8; 32]>` parameter to identity creation in all
   four bridges behind `#[cfg(feature = "testing")]`, then flip
   `identity_create_deterministic` and `sign_message` comparators from
