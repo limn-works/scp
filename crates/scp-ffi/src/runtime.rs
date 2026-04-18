@@ -433,7 +433,7 @@ fn build_persistence_provider() -> Option<Box<dyn ContextPersistence>> {
 ///
 /// This replaced `NoOpEventLogProvider` so that the `PyO3` bridge emits the
 /// same initial `ContextCreated` event as the NAPI, WASM, and `UniFFI`
-/// bridges (cross-bridge parity, FOLLOWUP.md §5).
+/// bridges (cross-bridge parity, ADR-046 `OP_EVENT_LOG_APPEND`).
 fn build_event_log_provider() -> Box<dyn ContextEventLogProvider> {
     let Some(bi) = BRIDGE_INSTANCE.get() else {
         return Box::new(MerkleEventLogProvider::new());

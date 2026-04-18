@@ -119,14 +119,16 @@ pub struct PyIdentity {
     /// without a live custody.
     ///
     /// Why `#0` (`identity_key`), not `#active`: the WASM bridge uses a
-    /// simplified single-key model where the DID-deriving key *is* the
-    /// signing key, while scp-core uses three distinct keys per
-    /// [`ScpIdentity`]. Exposing the identity key gives a byte-identical
-    /// value across all four bridges under a deterministic `seed`
-    /// (ADR-046). Note that SCPID signatures use `#active`, which is a
-    /// different key in scp-core — signatures are NOT byte-equal across
-    /// bridges on the seeded path for that reason (plus the non-
-    /// deterministic `signed_at` clock; see `FOLLOWUP.md`).
+    /// simplified single-key model in production where the DID-deriving
+    /// key *is* the signing key, while scp-core uses three distinct keys
+    /// per [`ScpIdentity`]. Exposing the identity key gives a byte-
+    /// identical value across all four bridges under a deterministic
+    /// `seed` (ADR-046). SCPID signatures use `#active`; under the
+    /// `testing` feature WASM *also* derives a distinct `#active` key
+    /// from `seed[32..64]` so `#active`-signed signatures are byte-
+    /// identical across all four bridges under the `signed_at_override`
+    /// affordance. See `scp-runtime::scpid_sign` and
+    /// `bindings/python/tests/bridge_parity/seed_operations.py::OP_SIGN_MESSAGE`.
     verifying_key_hex: Option<String>,
 }
 
@@ -582,7 +584,7 @@ fn py_identity_create(py: Python<'_>, custody: &str, seed: Option<&[u8]>) -> PyR
             // Extract the verifying-key bytes for the `#active` signing key
             // BEFORE moving the custody into the registry. Under a
             // deterministic `seed`, this value is byte-identical across every
-            // bridge (ADR-046 / FOLLOWUP.md §1).
+            // bridge (ADR-046).
             let pk = key_custody
                 .public_key(&identity.identity_key)
                 .await

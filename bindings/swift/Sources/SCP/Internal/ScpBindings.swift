@@ -911,9 +911,8 @@ public protocol IdentityProtocol: AnyObject, Sendable {
      * handle was loaded without live key material.
      *
      * Under a deterministic `seed`, this value is byte-identical across
-     * every bridge (ADR-046 / FOLLOWUP.md §1). See the
-     * `verifying_key_hex` field docs for why `#0` rather than
-     * `#active`.
+     * every bridge (ADR-046). See the `verifying_key_hex` field docs for
+     * why `#0` rather than `#active`.
      */
     func verifyingKey()  -> String?
     
@@ -1196,9 +1195,8 @@ open func rotateKey()async throws  -> Identity  {
      * handle was loaded without live key material.
      *
      * Under a deterministic `seed`, this value is byte-identical across
-     * every bridge (ADR-046 / FOLLOWUP.md §1). See the
-     * `verifying_key_hex` field docs for why `#0` rather than
-     * `#active`.
+     * every bridge (ADR-046). See the `verifying_key_hex` field docs for
+     * why `#0` rather than `#active`.
      */
 open func verifyingKey() -> String?  {
     return try!  FfiConverterOptionString.lift(try! rustCall() {

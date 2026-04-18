@@ -155,8 +155,12 @@ base64 — but we do not require cross-bridge byte equality.
 This trades off a class of findings (bit-exact crypto divergence) for
 shipping the harness now. When a bridge-wide `seed` parameter lands, flip
 the comparators to `base64_bytes` in `seed_operations.py`; the rest of the
-framework is unaffected. A follow-up note is filed in
-`bindings/python/tests/bridge_parity/FOLLOWUP.md`.
+framework is unaffected. **Status:** the seed parameter has landed across
+all four bridges AND scp-core (ADR-046 round 11), and the SCPID
+`signed_at_override` testing affordance now lets `OP_SIGN_MESSAGE` pin
+byte-exact signatures under the shared seed (see
+`crates/scp-runtime/src/identity/scpid.rs::print_parity_sign_golden_value`
+for the golden-value generator).
 
 ### Seed operation library
 
@@ -250,16 +254,16 @@ endpoint. Overkill for the problem.
 
 - Requires a Bun child subprocess at test time — one more moving part in
   CI. Mitigated: single long-lived child per test session, not per test.
-- MVP does not catch byte-exact crypto divergence. Tracked in FOLLOWUP.md.
+- MVP shipped with regex-shape comparators for crypto outputs; byte-
+  exact crypto divergence was a gap until round 11 (see "Status" note
+  above). Today `OP_SIGN_MESSAGE` uses `bytes_from_hex` with an
+  `expected_values` golden-value pin; any future divergence is caught
+  byte-exactly.
 
 ## Future work
 
-- Add a `seed: Option<[u8; 32]>` parameter to identity creation in all
-  four bridges behind `#[cfg(feature = "testing")]`, then flip
-  `identity_create_deterministic` and `sign_message` comparators from
-  regex to `base64_bytes` for true crypto parity.
-- Expand the op library to cover UCAN mint/validate, transport status,
-  tool register/invoke.
+- Expand the op library to cover more surface area (broadcast publish/
+  subscribe, governance actions, attestation verification).
 
 ## References
 

@@ -278,8 +278,9 @@ pub fn py_event_log_query(
     // First, try the ContextManager's event log provider — this is the
     // authoritative source populated by `builder_create_context`
     // (`ContextCreated` at step 7) and subsequent manager operations.
-    // Mirrors the NAPI bridge. Aligned across PyO3/NAPI/WASM/UniFFI per
-    // FOLLOWUP.md §5.
+    // Mirrors the NAPI bridge. Aligned across PyO3/NAPI/WASM/UniFFI —
+    // pinned by the cross-bridge parity harness's `OP_EVENT_LOG_APPEND`
+    // and `OP_EVENT_LOG_FILTERED` (ADR-046).
     if let Some(events) = query_manager_entries(py, context_id, &query_filter)? {
         return Ok(events);
     }

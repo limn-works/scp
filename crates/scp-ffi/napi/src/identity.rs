@@ -340,8 +340,8 @@ impl NapiIdentity {
     /// handle was loaded without live key material.
     ///
     /// Under a deterministic `seed`, this value is byte-identical across
-    /// every bridge (ADR-046 / FOLLOWUP.md §1). See the
-    /// `verifying_key_hex` field docs for why `#0` rather than `#active`.
+    /// every bridge (ADR-046). See the `verifying_key_hex` field docs
+    /// for why `#0` rather than `#active`.
     #[napi(getter, js_name = "verifyingKey")]
     #[must_use]
     pub fn verifying_key(&self) -> Option<String> {
@@ -979,9 +979,8 @@ pub async fn identity_create(
     ensure_did_resolver_initialized();
 
     // Validate the optional 32-byte seed at the FFI boundary. A seed is
-    // only meaningful for the in_memory custody path (ADR-046 /
-    // FOLLOWUP.md §1); any other custody with `seed=Some(...)` is a
-    // validation error.
+    // only meaningful for the in_memory custody path (ADR-046); any
+    // other custody with `seed=Some(...)` is a validation error.
     let seed_bytes = match seed.as_ref() {
         None => None,
         Some(buf) => {

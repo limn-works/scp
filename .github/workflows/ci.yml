@@ -576,10 +576,15 @@ jobs:
       - name: Check for unresolved issue placeholders
         # Runs immediately after checkout — a 1-second grep should not wait
         # on ~10 minutes of toolchain setup and native builds below.
-        # Guards against merging bindings/python/tests/bridge_parity/FOLLOWUP.md
-        # (or any bridge_parity doc) with unresolved issue placeholders.
-        # Each xfail tracked in FOLLOWUP.md must resolve to a real #NNNN ref
-        # before merge — CLAUDE.md forbids fabricated story references.
+        # Guards the whole bridge_parity directory (all op fixtures,
+        # runners, and docstrings) against unresolved issue placeholders.
+        # Any xfail or divergence callout must resolve to a real #NNNN
+        # ref before merge — CLAUDE.md forbids fabricated story references.
+        #
+        # Historically this grep targeted a tracking file that held xfail
+        # paperwork; that file was deleted when the last xfail was resolved.
+        # The directory-wide grep kept here is a durable tripwire for any
+        # future divergence paperwork that sneaks in under a sentinel shape.
         #
         # Pattern is intentionally broad: matches angle-bracket sentinels
         # containing "issue", "TODO", "TBD", or "placeholder". This catches

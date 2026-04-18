@@ -6,12 +6,20 @@
  * to UniFFI-generated Kotlin bindings (`uniffi.scp.*`), which are
  * produced by the scp-kt composite-included project.
  *
- * The runner intentionally does NOT depend on works.limn:scp-kt (the
- * Kotlin SDK wrapper layer). It consumes the UniFFI-generated package
- * directly so the parity harness tests the bridge surface, not the
- * higher-level Kotlin ergonomics. But to get those generated bindings
- * on the classpath without re-running binding generation here, we pull
- * in scp-kt's output — the bindings live inside its `main` source set.
+ * NOTE on the `works.limn:scp-kt` dependency: the runner's ops call
+ * UniFFI bridge functions directly (`uniffi.scp.*`). Those symbols ship
+ * INSIDE the scp-kt artifact — the generated bindings live in the same
+ * main source set as the SDK wrapper layer. There is no separate
+ * bindings-only Maven coordinate today, so pulling in scp-kt is the
+ * only way to get the generated bindings on the classpath without re-
+ * running binding generation here. As a consequence, any SDK-layer
+ * wrapping that scp-kt adds is INCIDENTALLY exercised when the runner
+ * instantiates types that the wrapper intercepts. The parity gate is
+ * still scoped to the bridge surface — the runner never calls into
+ * `works.limn.scp.*` wrapper APIs — but reviewers should not read
+ * "depends on scp-kt" as "exercises the SDK wrapper on purpose."
+ * If a bindings-only publication lands (tracked as a follow-up in the
+ * Kotlin SDK build), switch this dependency over.
  *
  * Run: ./gradlew :kotlin-bridge-runner:run --args="" --quiet
  * (The harness resolves the application script directly via distTar /
