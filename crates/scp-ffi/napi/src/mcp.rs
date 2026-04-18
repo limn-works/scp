@@ -162,7 +162,7 @@ pub(crate) struct McpClientEntry {
 
 /// Fallback empty MCP server registry for when the default
 /// `NapiBridgeInstance` has not been initialized yet. Mirrors the
-/// PyO3 `EMPTY_SERVER_REGISTRY` fallback pattern.
+/// `PyO3` `EMPTY_SERVER_REGISTRY` fallback pattern.
 static EMPTY_SERVER_REGISTRY: OnceLock<DashMap<String, McpServerEntry>> = OnceLock::new();
 
 /// Fallback empty MCP client registry.

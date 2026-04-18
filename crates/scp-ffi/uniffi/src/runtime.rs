@@ -447,8 +447,13 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
-        // Identity-link-attestation and context-handle registries migrate
-        // in commit 6.
+        // Clear identity-link-attestation and context-handle registries.
+        // Migrated off module-level `OnceLock` statics in bridge.rs in
+        // #1549 Phase 4 PR 2 commit 6. Dropping `Arc<ContextHandle>`
+        // values releases any remaining handle references held past
+        // shutdown (the caller normally holds its own `Arc`).
+        self.identity_link_attestation_registry.clear();
+        self.context_handle_registry.clear();
     }
 }
 

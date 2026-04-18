@@ -2819,15 +2819,35 @@ const UNIFFI_LINK_ATTESTATION_REGISTRY_CAP: usize = 10_000;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 
-/// Global registry of identity link attestations, keyed by DID string.
+/// Fallback empty identity link attestation registry for when the default
+/// `UniffiBridgeInstance` has not been initialized yet.
+static EMPTY_IDENTITY_LINK_ATTESTATION_REGISTRY: std::sync::OnceLock<
+    dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>,
+> = std::sync::OnceLock::new();
+
+/// Returns a reference to the default bridge instance's identity link
+/// attestation registry.
+///
+/// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
+/// typed `identity_link_attestation_registry` field on
+/// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 6.
+/// Falls back to an empty registry when the default instance has not been
+/// initialized yet.
 fn identity_link_attestation_registry()
 -> &'static dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>
 {
-    static REGISTRY: std::sync::OnceLock<
-        dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>,
-    > = std::sync::OnceLock::new();
-    REGISTRY.get_or_init(dashmap::DashMap::new)
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_IDENTITY_LINK_ATTESTATION_REGISTRY.get_or_init(dashmap::DashMap::new),
+        |bi| bi.identity_link_attestation_registry().as_ref(),
+    )
 }
+
+/// Fallback empty identity custody registry for when the default
+/// `UniffiBridgeInstance` has not been initialized yet.
+#[cfg(feature = "allow_in_memory_custody")]
+static EMPTY_IDENTITY_CUSTODY_REGISTRY: std::sync::OnceLock<
+    dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)>,
+> = std::sync::OnceLock::new();
 
 /// Retained identity custody for attestation verification (keyed by DID).
 ///
@@ -2835,23 +2855,18 @@ fn identity_link_attestation_registry()
 /// created attestations, so that `identity_verify_link_attestation` can look
 /// up the issuer's public key without requiring the caller to pass the
 /// Identity object.
+///
+/// PR 1 moved the registry onto the typed `identity_custody_registry` field
+/// on the default `UniffiBridgeInstance`. Commit 6 of #1549 Phase 4 PR 2
+/// lifts the internal `EMPTY` fallback `OnceLock` out of this function onto
+/// module scope so all three `UniFFI` registries follow the uniform
+/// `EMPTY_* -> bi.field.as_ref()` resolution pattern.
 #[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn identity_custody_registry()
 -> &'static dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
-    // Phase 4 PR 1: the registry now lives as a typed field on the default
-    // `UniffiBridgeInstance`. Ensure the default instance exists, then borrow
-    // its typed field as a `&'static` — safe because the `DEFAULT_BRIDGE_INSTANCE`
-    // `OnceLock<Arc<_>>` is itself `'static`, and the `Arc<DashMap<...>>` it
-    // holds never moves.
-    //
-    // Fallback empty registry when the default instance fails to initialize
-    // (unreachable in practice; kept so the signature stays infallible).
-    static EMPTY: std::sync::OnceLock<
-        dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)>,
-    > = std::sync::OnceLock::new();
     crate::runtime::ensure_bridge_instance();
     crate::runtime::default_bridge_instance_raw().map_or_else(
-        || EMPTY.get_or_init(dashmap::DashMap::new),
+        || EMPTY_IDENTITY_CUSTODY_REGISTRY.get_or_init(dashmap::DashMap::new),
         |bi| bi.identity_custody_registry.as_ref(),
     )
 }
@@ -5317,15 +5332,29 @@ pub struct McpAllowlistState {
 // context_create and deregistered during context_close/leave.
 // ---------------------------------------------------------------------------
 
-/// Global registry mapping context IDs to their `ContextHandle` instances.
+/// Fallback empty context handle registry for when the default
+/// `UniffiBridgeInstance` has not been initialized yet.
+static EMPTY_CONTEXT_HANDLE_REGISTRY: std::sync::OnceLock<
+    dashmap::DashMap<String, Arc<ContextHandle>>,
+> = std::sync::OnceLock::new();
+
+/// Returns a reference to the default bridge instance's context handle
+/// registry.
+///
+/// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
+/// typed `context_handle_registry` field on
+/// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 6.
+/// Falls back to an empty registry when the default instance has not been
+/// initialized yet.
 ///
 /// Used by `McpUniFfiBridgeProvider` to look up per-context tool registries,
 /// handlers, and event log state. The `Arc<ContextHandle>` keeps the handle
 /// alive as long as it is in the registry (the caller also holds an Arc).
 fn context_handle_registry() -> &'static dashmap::DashMap<String, Arc<ContextHandle>> {
-    static REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, Arc<ContextHandle>>> =
-        std::sync::OnceLock::new();
-    REGISTRY.get_or_init(dashmap::DashMap::new)
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_CONTEXT_HANDLE_REGISTRY.get_or_init(dashmap::DashMap::new),
+        |bi| bi.context_handle_registry().as_ref(),
+    )
 }
 
 /// Registers a context handle in the global registry.
