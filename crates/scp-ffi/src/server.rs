@@ -158,6 +158,12 @@ fn auto_wire_context_manager(
 #[pyclass(name = "RelayHandle")]
 pub struct PyRelayHandle {
     inner: RunningRelay,
+    /// Bridge instance affinity id (Phase 4 PR 1 — #1549).
+    ///
+    /// `dead_code` allowance: future commits of this PR will add
+    /// `check_handle` at every entry point that accepts this handle.
+    #[allow(dead_code)]
+    pub(crate) instance_id: u64,
 }
 
 // PyO3 `#[getter]` methods require `&self` and cannot be `const` or `#[must_use]`.
@@ -216,6 +222,12 @@ impl Drop for PyRelayHandle {
 #[pyclass(name = "NodeHandle")]
 pub struct PyNodeHandle {
     inner: RunningNode,
+    /// Bridge instance affinity id (Phase 4 PR 1 — #1549).
+    ///
+    /// `dead_code` allowance: future commits of this PR will add
+    /// `check_handle` at every entry point that accepts this handle.
+    #[allow(dead_code)]
+    pub(crate) instance_id: u64,
 }
 
 // PyO3 `#[getter]` methods require `&self` and cannot be `const` or `#[must_use]`.
@@ -515,7 +527,14 @@ pub fn py_relay_start_in_memory(py: Python<'_>) -> PyResult<PyRelayHandle> {
         let relay = rt
             .block_on(server::start_relay_in_memory())
             .map_err(server_err)?;
-        Ok(PyRelayHandle { inner: relay })
+        let instance_id = crate::runtime::bridge_instance_raw()
+            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
+                bi.core.instance_id()
+            });
+        Ok(PyRelayHandle {
+            inner: relay,
+            instance_id,
+        })
     })
 }
 
@@ -529,7 +548,14 @@ pub fn py_relay_start_local(py: Python<'_>, data_dir: String) -> PyResult<PyRela
         let relay = rt
             .block_on(server::start_relay_local(std::path::Path::new(&data_dir)))
             .map_err(server_err)?;
-        Ok(PyRelayHandle { inner: relay })
+        let instance_id = crate::runtime::bridge_instance_raw()
+            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
+                bi.core.instance_id()
+            });
+        Ok(PyRelayHandle {
+            inner: relay,
+            instance_id,
+        })
     })
 }
 
@@ -578,8 +604,13 @@ pub fn py_node_start_in_memory(
     let bridge_token = node.bridge_token_hex();
     auto_wire_context_manager(py, rt, &did, &relay_url, bridge_token);
 
+    let instance_id = crate::runtime::bridge_instance_raw()
+        .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
+            bi.core.instance_id()
+        });
     Ok(PyNodeHandle {
         inner: RunningNode::InMemory(node),
+        instance_id,
     })
 }
 
@@ -629,8 +660,13 @@ pub fn py_node_start_local(
     let bridge_token = node.bridge_token_hex();
     auto_wire_context_manager(py, rt, &did, &relay_url, bridge_token);
 
+    let instance_id = crate::runtime::bridge_instance_raw()
+        .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
+            bi.core.instance_id()
+        });
     Ok(PyNodeHandle {
         inner: RunningNode::Filesystem(node),
+        instance_id,
     })
 }
 

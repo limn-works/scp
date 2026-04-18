@@ -335,6 +335,7 @@ pub fn py_bridge_create_shadow(
 
     let bi = crate::runtime::bridge_instance()?;
     let mut entry = bi
+        .core
         .bridge_state()
         .entry(context_id.to_owned())
         .or_insert_with(|| BridgeContextState {

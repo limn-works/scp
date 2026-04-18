@@ -65,6 +65,12 @@ pub struct PyContextHandle {
     creator_did: String,
     /// Creation-time context parameters, retained for spec §5.7 metadata visibility.
     params: PyContextParams,
+    /// Bridge instance affinity id (Phase 4 PR 1 — #1549). The
+    /// `PyBridgeInstance` that issued this handle. `#[pyfunction]` entry
+    /// points that consume this handle must invoke the
+    /// `pyscp_check_handle!` macro so cross-instance reuse is rejected
+    /// with [`scp_ffi_common::error_codes::PERM_3030`].
+    pub(crate) instance_id: u64,
 }
 
 #[pymethods]
@@ -140,13 +146,19 @@ impl PyContextHandle {
 }
 
 impl PyContextHandle {
-    /// Creates a new handle in the "creating" state with associated params.
+    /// Creates a new handle in the "creating" state with associated params,
+    /// tagged with the default bridge instance's `instance_id`.
     fn new(context_id: String, creator_did: String, params: PyContextParams) -> Self {
+        let instance_id = crate::runtime::bridge_instance_raw()
+            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
+                bi.core.instance_id()
+            });
         Self {
             context_id,
             state: Arc::new(Mutex::new("creating".to_owned())),
             creator_did,
             params,
+            instance_id,
         }
     }
 }
@@ -631,6 +643,15 @@ pub struct PyMessage {
     timestamp: f64,
     /// Context ID this message belongs to.
     context_id: String,
+    /// Bridge instance affinity id (Phase 4 PR 1 — #1549). The instance
+    /// whose receive channel produced this message. Entry points that
+    /// consume `PyMessage` (none today — `PyMessage` is read-only from
+    /// Python) should `check_handle` against this value before acting.
+    ///
+    /// `dead_code` allowance: future commits of this PR will add
+    /// `check_handle` at every entry point that accepts a `PyMessage`.
+    #[allow(dead_code)]
+    pub(crate) instance_id: u64,
 }
 
 #[pymethods]
@@ -665,20 +686,21 @@ impl PyMessage {
 }
 
 impl PyMessage {
-    /// Creates a new `PyMessage`. Used by `drain_and_deliver` and
-    /// `deliver_message` to feed messages into the receive channel.
+    /// Creates a new `PyMessage` tagged with the default bridge instance's
+    /// `instance_id`. Used by `drain_and_deliver` and `deliver_message` to
+    /// feed messages into the receive channel.
     #[must_use]
-    pub const fn new(
-        sender_did: String,
-        payload: Vec<u8>,
-        timestamp: f64,
-        context_id: String,
-    ) -> Self {
+    pub fn new(sender_did: String, payload: Vec<u8>, timestamp: f64, context_id: String) -> Self {
+        let instance_id = crate::runtime::bridge_instance_raw()
+            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
+                bi.core.instance_id()
+            });
         Self {
             sender_did,
             payload,
             timestamp,
             context_id,
+            instance_id,
         }
     }
 }
@@ -712,6 +734,12 @@ pub struct PyMessageReceiver {
     /// `FfiBridgeState::message_rx` via `Arc` so that `deliver_message` can
     /// implement oldest-drop overflow.
     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>,
+    /// Bridge instance affinity id (Phase 4 PR 1 — #1549).
+    ///
+    /// `dead_code` allowance: future commits of this PR will add
+    /// `check_handle` at entry points that consume a `PyMessageReceiver`.
+    #[allow(dead_code)]
+    pub(crate) instance_id: u64,
 }
 
 #[pymethods]
@@ -766,14 +794,19 @@ impl PyMessageReceiver {
 }
 
 impl PyMessageReceiver {
-    /// Creates a new receiver from a pre-wrapped shared receiver Arc.
+    /// Creates a new receiver from a pre-wrapped shared receiver Arc,
+    /// tagged with the default bridge instance's `instance_id`.
     ///
     /// The `Arc<tokio::sync::Mutex<Receiver>>` is shared with
     /// `FfiBridgeState::message_rx` so that `deliver_message` can access
     /// the receiver for oldest-drop overflow handling.
     #[must_use]
-    pub const fn from_shared_rx(rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>) -> Self {
-        Self { rx }
+    pub fn from_shared_rx(rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>) -> Self {
+        let instance_id = crate::runtime::bridge_instance_raw()
+            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
+                bi.core.instance_id()
+            });
+        Self { rx, instance_id }
     }
 }
 
@@ -1052,6 +1085,8 @@ fn py_context_join(
     identity_did: &str,
     spending_ucan_jwt: Option<&str>,
 ) -> PyResult<()> {
+    let bi = crate::runtime::default_bridge_instance()?;
+    crate::pyscp_check_handle!(bi, handle);
     validate::validate_did(identity_did)?;
     let state = handle
         .state
@@ -1200,6 +1235,8 @@ fn py_context_join(
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did))]
 fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
+    let bi = crate::runtime::default_bridge_instance()?;
+    crate::pyscp_check_handle!(bi, handle);
     validate::validate_did(identity_did)?;
     let state = handle
         .state
@@ -1274,6 +1311,8 @@ fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
 #[pyfunction]
 #[pyo3(signature = (handle, identity_did))]
 fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
+    let bi = crate::runtime::default_bridge_instance()?;
+    crate::pyscp_check_handle!(bi, handle);
     validate::validate_did(identity_did)?;
     let mut state = handle
         .state
@@ -1357,6 +1396,8 @@ fn py_context_send(
     payload: &Bound<'_, PyAny>,
     spending_ucan_jwt: Option<&str>,
 ) -> PyResult<()> {
+    let bi = crate::runtime::default_bridge_instance()?;
+    crate::pyscp_check_handle!(bi, handle);
     validate::validate_did(identity_did)?;
     let state = handle
         .state
@@ -1611,6 +1652,8 @@ fn drain_and_deliver(context_id: &str) {
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_context_receive(handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
+    let bi = crate::runtime::default_bridge_instance()?;
+    crate::pyscp_check_handle!(bi, handle);
     let state = handle
         .state
         .lock()

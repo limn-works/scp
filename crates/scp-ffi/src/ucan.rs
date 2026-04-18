@@ -96,6 +96,26 @@ pub struct PyUcanToken {
     /// chain. Empty for root tokens issued by the context creator.
     #[pyo3(get)]
     pub proofs: Vec<String>,
+
+    /// Bridge instance affinity id (Phase 4 PR 1 — #1549).
+    ///
+    /// `dead_code` allowance: future commits of this PR will add
+    /// `check_handle` at every entry point that accepts a `UcanToken`.
+    #[allow(dead_code)]
+    pub(crate) instance_id: u64,
+}
+
+impl PyUcanToken {
+    /// Stamps the default bridge instance's `instance_id` on this token.
+    /// Called by constructor sites so handle-affinity checks can reject
+    /// cross-instance reuse.
+    pub(crate) fn stamp_instance_id(mut self) -> Self {
+        self.instance_id = crate::runtime::bridge_instance_raw()
+            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
+                bi.core.instance_id()
+            });
+        self
+    }
 }
 
 #[pymethods]
@@ -312,7 +332,9 @@ pub fn py_ucan_mint(
         #[allow(clippy::cast_precision_loss)]
         expires_at: Some(token.payload.exp as f64),
         proofs: token.payload.prf,
-    })
+        instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
+    }
+    .stamp_instance_id())
 }
 
 /// Delegates a UCAN token to another member.
@@ -433,7 +455,9 @@ pub fn py_ucan_delegate(
         #[allow(clippy::cast_precision_loss)]
         expires_at: Some(token.payload.exp as f64),
         proofs: token.payload.prf,
-    })
+        instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
+    }
+    .stamp_instance_id())
 }
 
 /// Revokes a UCAN token using the full revocation pipeline.
