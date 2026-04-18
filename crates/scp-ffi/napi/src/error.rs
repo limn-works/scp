@@ -320,11 +320,15 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpNapiError {
 
 impl From<scp_core::crypto::ucan::UcanError> for ScpNapiError {
     fn from(e: scp_core::crypto::ucan::UcanError) -> Self {
+        // Canonical UCAN→error-code mapping — see `scp-ffi/src/error.rs`
+        // for the full rationale. All bridges route through the shared
+        // `scp_ffi_common::ucan_errors` module.
+        let code = scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned();
         Self::Permission {
             message: format!(
                 "{e} — check token format, signatures, time bounds, and capability chain"
             ),
-            code: codes::PERM_3001.to_owned(),
+            code,
         }
     }
 }

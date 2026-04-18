@@ -420,9 +420,13 @@ pub fn ucan_validate(
 
     future_to_promise(async move {
         let parsed = parse_ucan(&token).map_err(|e| {
+            // Route UCAN error classification through the shared mapping
+            // in `scp_ffi_common::ucan_errors` so all four bridges stay
+            // in lockstep (`OP_UCAN_VALIDATE_MALFORMED` pins this code).
+            let code = scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned();
             ScpWasmError::Permission {
                 message: format!("malformed token: {e}"),
-                code: codes::PERM_3001.to_owned(),
+                code,
             }
             .into_js()
         })?;
