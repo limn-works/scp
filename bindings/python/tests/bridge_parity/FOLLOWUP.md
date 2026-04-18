@@ -1,23 +1,22 @@
-# Bridge parity harness — scope extensions and discovered bugs
+# Bridge parity harness — scope extensions
 
-This file has two kinds of entries, and the distinction is load-bearing:
+This file tracks additive enforcement-infra work that extends the
+harness with new capabilities (deterministic seed plumbing, Kotlin/
+Swift runners, new ops). These are legitimately separable from
+Layer C's enforcement scope: the harness enforces what is wired;
+wiring more is a next pass. They require the 5-point integration
+checklist (CLAUDE.md) before they can land.
 
-- **§1, §2, §6 — Scope extensions.** Additive enforcement-infra work that
-  extends the harness with new capabilities (deterministic seed plumbing,
-  Kotlin/Swift runners, new ops). These are legitimately separable from
-  Layer C's enforcement scope: the harness enforces what is wired; wiring
-  more is a next pass. They require the 5-point integration checklist
-  (CLAUDE.md) before they can land.
+Discovered protocol bugs previously tracked in §3–§5 (context-ID
+format divergence, SCPID unregistered-DID error-code triple-
+divergence, event_log_append starting sequence) have been fixed and
+removed. Git history carries the rationale and the PRs that landed
+each fix.
 
-- **§5 — Discovered protocol bugs.** The harness surfaced real
-  cross-bridge divergences while being built. They are NOT enforcement-
-  infra work. They ARE prerequisites before Layer C's parity gate can
-  assert on NAPI/WASM for the affected ops. Each one is a spec or
-  semantic violation in production bridge code, currently held visible
-  by `@pytest.mark.xfail(strict=True)` so the divergence cannot
-  regress unnoticed.
+## xfail-strict is still the enforcement contract
 
-## xfail-strict is the enforcement contract
+If a future divergence is caught, follow the same workflow the §3–§5
+bugs followed:
 
 The `xfail_bridges` / `xfail_reason` fields on OpSpecs in
 `seed_operations.py` translate to `@pytest.mark.xfail(strict=True)` in
@@ -26,18 +25,13 @@ will fail CI with XPASS unless the xfail is also removed in the same
 PR. This enforces a hard workflow: **fix the bridge, same PR removes
 the xfail, same PR updates this document.**
 
-These xfails are real bugs held under a tripwire, not dismissals. The
-bugs WILL be fixed, and when each fix lands, the gate upgrades from
-"visible divergence" to "byte-equality parity." Layer C's parity gate
-will assert on NAPI/WASM for these ops at that point.
-
-When fixing any divergence in §5, the same PR MUST:
+When fixing any newly added divergence, the same PR MUST:
 
 1. Remove the corresponding `xfail_bridges=(...)` and `xfail_reason=...`
    fields from the OpSpec in `seed_operations.py`.
 2. Update the op's docstring block to drop the "xfail'd" language.
 3. Update the relevant section of THIS file (mark resolved or delete).
-4. Run the full parity suite locally — all 10 cases should pass.
+4. Run the full parity suite locally — all cases should pass.
 
 `seed_operations.py`'s module docstring repeats this policy for agents
 reading the file directly.
@@ -79,35 +73,6 @@ macOS runners in CI.
 
 **Action**: Once one new runner lands, refactor `seed_operations.py`'s
 `node_call` dict to `runner_call: dict[str, dict]` keyed by mode.
-
----
-
-# Discovered protocol bugs (xfail-strict tripwires)
-
-## 5. DISCOVERED BUG — blocks full parity coverage for `event_log_append`
-
-**Issue**: filed alongside this PR (see inline description below). Bug is self-documented here; grep `xfail_reason` in `seed_operations.py` for the test-suite surface.
-
-When a context is freshly created and the event log is immediately
-queried, bridges return different event counts and starting sequence
-numbers (PyO3 may emit `ContextCreated` at creation, others may not).
-The current schema uses `exact` comparators and expects PyO3's observed
-values; NAPI/WASM diverge.
-
-**Current tripwire**: `test_parity[napi-event_log_append]` and
-`test_parity[wasm-event_log_append]` are marked
-`@pytest.mark.xfail(strict=True)`. Divergence remains visible in CI
-but does not block the suite.
-
-**Fix**: Align which events are emitted at `context_create` time across
-all four bridges. This is cross-bridge protocol work — the ContextCreated
-event sequencing is a protocol-level semantic, not an enforcement-infra
-concern. It requires protocol-level discussion on what the canonical
-initial event sequence is.
-
-xfail-strict enforces the "fix the bridge, same PR removes xfail"
-workflow. This bug is real. It will be fixed before Layer C's parity
-gate asserts on NAPI/WASM for `event_log_append`.
 
 ---
 

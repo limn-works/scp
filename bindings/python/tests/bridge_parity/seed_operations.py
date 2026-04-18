@@ -15,15 +15,19 @@ MVP: 5 ops per ADR-046. Crypto outputs use shape-only comparators
 because we do not yet have a deterministic-seed parameter wired through
 all four bridges. See FOLLOWUP.md §1 for the forward-only plan.
 
-Known divergences caught by the harness (all xfail'd — see FOLLOWUP.md):
-  - invalid_capability error code: three bridges, three codes.
-  - event_log_append starting sequence: bridges disagree on whether a
-    ContextCreated event is emitted at create time.
-
-Resolved divergences (previously xfail'd, now full parity):
+Resolved divergences (previously xfail'd tripwires, now full parity):
   - context_id format (§18.4.1): all four bridges emit 64-char lowercase
     hex via `hex::encode(32 random bytes)`. PyO3's `generate_context_id`
     (crates/scp-ffi/src/types.rs) remains the reference.
+  - event_log_append starting sequence: all bridges emit `ContextCreated`
+    at context-create time via `builder_create_context`. PyO3 was rewired
+    from `NoOpEventLogProvider` to `MerkleEventLogProvider` matching the
+    NAPI/UniFFI bridges.
+  - invalid_capability_rejected unregistered-DID code: aligned on
+    SCP-IDENT-1001 (identity-domain, identity-not-found) across bridges.
+    The MVP op below exercises the malformed-challenge path
+    (SCP-IDENT-1038, shared); a future `unregistered_did_rejected` op
+    will lock IDENT-1001 into the parity gate.
 
 ----------------------------------------------------------------------
 XFAIL-STRICT POLICY — READ BEFORE LANDING A FIX
@@ -274,10 +278,11 @@ OP_INVALID_CAPABILITY = OpSpec(
 # Cross-bridge exposed path: create a context, then query the event log.
 # Compare event count + first event type + starting sequence exactly.
 #
-# Bridges currently disagree on whether a ContextCreated event is emitted
-# at create time, so event_count and first_sequence diverge. NAPI/WASM
-# are xfail'd (see FOLLOWUP.md §5). When aligned the xfail lifts without
-# schema changes.
+# All four bridges (PyO3, NAPI, WASM, UniFFI) emit a `ContextCreated`
+# event at context-create time via `builder_create_context` in scp-runtime.
+# The PyO3 bridge was previously wired to `NoOpEventLogProvider` and so
+# returned an empty log for this path; it now uses `MerkleEventLogProvider`
+# matching the other bridges.
 # ---------------------------------------------------------------------------
 
 
@@ -307,17 +312,6 @@ OP_EVENT_LOG_APPEND = OpSpec(
             FieldSpec("first_event_type", "exact"),
             FieldSpec("first_sequence", "exact"),
         )
-    ),
-    # XFAIL (strict): see FOLLOWUP.md §5. When the bridge fix lands, REMOVE
-    # `xfail_bridges` and `xfail_reason` below in the SAME PR — xfail-strict
-    # will otherwise fail CI with XPASS once the fix unblocks this case.
-    xfail_bridges=("napi", "wasm"),
-    xfail_reason=(
-        "Event log starting state diverges — bridges disagree on "
-        "whether ContextCreated is emitted at create time. "
-        "See FOLLOWUP.md §5. "
-        "Remove this xfail in the same PR that fixes the bridges. "
-        "MUST remove xfail marker in the same PR as the fix."
     ),
 )
 
