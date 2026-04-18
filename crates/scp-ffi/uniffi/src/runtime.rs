@@ -629,13 +629,130 @@ fn build_default_context_manager() -> (
     Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
 ) {
     let (event_log, protocol_repo) = build_event_log_provider();
-    let cm = Arc::new(ContextManager::new(
+    let cm = build_context_manager(
         Box::new(FfiBridgeCrypto),
         Box::new(scp_core::context::NotConfiguredTransportProvider),
         event_log,
-        not_configured_key_resolver(),
-    ));
+        None,
+    );
     (cm, protocol_repo)
+}
+
+/// Adapter that lets a shared `Arc<dyn ContextPersistence + Send + Sync>` be
+/// consumed by [`ContextManager::with_persistence`] which requires a `Box`.
+///
+/// `ContextManager::with_persistence` converts the `Box` back into an `Arc`
+/// internally, but the call-site signature is `Box`-only. Rather than
+/// cloning the underlying backend (which would open a second `SQLite`
+/// connection), we box a thin wrapper that delegates every trait method to
+/// the shared `Arc`. The `Arc` mirror retained on `CoreFields::persistence`
+/// and the `Arc` reconstructed inside `ContextManager` end up pointing at
+/// the same provider, so suspend/resume flush + `flush_all_contexts_sync`
+/// operate on the same underlying storage.
+struct ArcContextPersistence {
+    inner: Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>,
+}
+
+impl ArcContextPersistence {
+    fn new(inner: Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>) -> Self {
+        Self { inner }
+    }
+}
+
+impl scp_core::context::manager::ContextPersistence for ArcContextPersistence {
+    fn persist_context(
+        &self,
+        context_id: &str,
+        snapshot: &scp_core::context::manager::ContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.persist_context(context_id, snapshot)
+    }
+
+    fn load_context(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Option<scp_core::context::manager::ContextSnapshot>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.inner.load_context(context_id)
+    }
+
+    fn persist_broadcast(
+        &self,
+        context_id: &str,
+        snapshot: &scp_core::context::broadcast::BroadcastContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.persist_broadcast(context_id, snapshot)
+    }
+
+    fn load_broadcast(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Option<scp_core::context::broadcast::BroadcastContextSnapshot>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.inner.load_broadcast(context_id)
+    }
+
+    fn delete_context(
+        &self,
+        context_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.delete_context(context_id)
+    }
+
+    fn list_persisted_contexts(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_persisted_contexts()
+    }
+}
+
+/// Constructs a [`ContextManager`] with or without persistence.
+///
+/// Mirrors the `PyO3` bridge's `build_context_manager` (`crates/scp-ffi/src/runtime.rs`).
+/// When `persistence` is `Some`, wraps the shared `Arc` in
+/// [`ArcContextPersistence`] and hands it to
+/// [`ContextManager::with_persistence`]; otherwise calls
+/// [`ContextManager::new`]. Callers pull the shared persistence from the
+/// embedded `CoreFields` via
+/// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`]
+/// so the manager and the bridge mirror share the same backend — a
+/// single `SQLite` connection, not two.
+fn build_context_manager(
+    crypto: Box<dyn ContextCryptoProvider>,
+    transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
+    event_log: Box<dyn ContextEventLogProvider>,
+    persistence: Option<Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>>,
+) -> Arc<ContextManager> {
+    match persistence {
+        Some(shared) => Arc::new(ContextManager::with_persistence(
+            crypto,
+            transport,
+            event_log,
+            Box::new(ArcContextPersistence::new(shared)),
+            not_configured_key_resolver(),
+        )),
+        None => Arc::new(ContextManager::new(
+            crypto,
+            transport,
+            event_log,
+            not_configured_key_resolver(),
+        )),
+    }
+}
+
+/// Reads the shared persistence provider from the default bridge instance,
+/// if one has been attached (typically via
+/// [`UniffiBridgeInstance::with_storage_uniffi`] with a `SQLite` config).
+///
+/// Returns `None` when no persistence is configured — callers then fall
+/// back to the ephemeral `ContextManager::new` path.
+fn persistence_from_default_instance()
+-> Option<Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>> {
+    DEFAULT_BRIDGE_INSTANCE.get()?.core.persistence_arc_clone()
 }
 
 /// Builds an event log provider that reuses the already-registered
@@ -662,12 +779,13 @@ fn build_default_context_manager_reusing_repo() -> Arc<ContextManager> {
         );
         build_event_log_provider().0
     });
-    Arc::new(ContextManager::new(
+    let persistence = persistence_from_default_instance();
+    build_context_manager(
         Box::new(FfiBridgeCrypto),
         Box::new(scp_core::context::NotConfiguredTransportProvider),
         event_log,
-        not_configured_key_resolver(),
-    ))
+        persistence,
+    )
 }
 
 /// Returns a reference to the shared `ContextManager`, initializing it with
@@ -750,12 +868,13 @@ pub fn init_context_manager_with_did(local_did: &str) {
         );
         build_event_log_provider().0
     });
-    let cm_arc = Arc::new(ContextManager::new(
+    let persistence = bi.core.persistence_arc_clone();
+    let cm_arc = build_context_manager(
         crypto,
         Box::new(scp_core::context::NotConfiguredTransportProvider),
         event_log,
-        not_configured_key_resolver(),
-    ));
+        persistence,
+    );
 
     bi.core.set_context_manager(cm_arc);
 }
@@ -795,12 +914,8 @@ pub fn init_context_manager_with_relay_transport(
         );
         build_event_log_provider().0
     });
-    let cm_arc = Arc::new(ContextManager::new(
-        crypto,
-        transport,
-        event_log,
-        not_configured_key_resolver(),
-    ));
+    let persistence = bi.core.persistence_arc_clone();
+    let cm_arc = build_context_manager(crypto, transport, event_log, persistence);
 
     bi.core.set_context_manager(cm_arc);
 }

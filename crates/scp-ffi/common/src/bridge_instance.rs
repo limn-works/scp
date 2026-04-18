@@ -316,13 +316,22 @@ pub struct CoreFields {
     /// before tearing down transport or destroying MLS groups. The provider
     /// reference is retained here so the bridge layer can pass it through
     /// `with_persistence()` at construction time and expose it via the
-    /// `persistence()` accessor for bridge-specific restore logic.
+    /// [`persistence`](Self::persistence) accessor for bridge-specific
+    /// restore logic.
+    ///
+    /// `Arc<dyn ...>` (rather than `Box<dyn ...>`) so the bridge layer can
+    /// hand the same provider instance to both this mirror and the
+    /// `ContextManager::with_persistence` constructor — SQLite-backed
+    /// storage cannot open a second connection to the same database file
+    /// at the same time, so we need to clone an `Arc`, not a `Box`.
+    /// [`persistence_arc_clone`](Self::persistence_arc_clone) returns the
+    /// clone.
     ///
     /// This is logically a mirror of the persistence configured on the
     /// `ContextManager` — the `ContextManager` owns the canonical reference;
     /// this field allows the bridge layer to use the same provider for
     /// bridge-level suspend/resume coordination without separate storage.
-    persistence: Option<Box<dyn ContextPersistence + Send + Sync>>,
+    persistence: Option<Arc<dyn ContextPersistence + Send + Sync>>,
 
     // -----------------------------------------------------------------
     // Relay URL — for resume after suspend
@@ -438,9 +447,30 @@ impl CoreFields {
     /// # Arguments
     ///
     /// - `persistence` — the persistence provider for bridge-level flush on
-    ///   suspend/shutdown.
+    ///   suspend/shutdown. Accepts `Box` for ergonomic call-site parity
+    ///   with [`ContextManager::with_persistence`]; the box is upgraded to
+    ///   `Arc` internally so
+    ///   [`persistence_arc_clone`](Self::persistence_arc_clone) can hand
+    ///   the same provider to downstream consumers.
     #[must_use]
     pub fn with_persistence(persistence: Box<dyn ContextPersistence + Send + Sync>) -> Self {
+        Self::with_persistence_arc(Arc::from(persistence))
+    }
+
+    /// Creates a new `CoreFields` with a shared persistence provider.
+    ///
+    /// Variant of [`with_persistence`](Self::with_persistence) that accepts
+    /// `Arc<dyn ContextPersistence + Send + Sync>` directly. Callers that
+    /// need to hand the exact same provider to both this mirror and
+    /// [`ContextManager::with_persistence`] must use this constructor to
+    /// avoid opening two separate `SQLite` connections (one connection per
+    /// `Box`) to the same database file.
+    ///
+    /// # Arguments
+    ///
+    /// - `persistence` — shared persistence provider.
+    #[must_use]
+    pub fn with_persistence_arc(persistence: Arc<dyn ContextPersistence + Send + Sync>) -> Self {
         Self {
             context_manager: OnceLock::new(),
             shutdown: AtomicBool::new(false),
@@ -538,10 +568,27 @@ impl CoreFields {
 
     /// Returns a reference to the persistence provider, if configured.
     ///
-    /// `None` if this instance was created without persistence (via [`new`]).
+    /// `None` if this instance was created without persistence (via
+    /// [`new`](Self::new)).
     #[must_use]
     pub fn persistence(&self) -> Option<&(dyn ContextPersistence + Send + Sync)> {
+        // `Arc::as_ref` returns `&(dyn ContextPersistence + Send + Sync)`
+        // directly — no intermediate Box/Deref.
         self.persistence.as_deref()
+    }
+
+    /// Returns a clone of the persistence `Arc`, if configured.
+    ///
+    /// Used by bridge constructors that want to hand the same provider
+    /// instance to both this mirror and
+    /// [`ContextManager::with_persistence`] — critical when the underlying
+    /// backend (e.g. `SqliteStorage`) cannot tolerate multiple concurrent
+    /// connections to the same database file.
+    ///
+    /// `None` if this instance was created without persistence.
+    #[must_use]
+    pub fn persistence_arc_clone(&self) -> Option<Arc<dyn ContextPersistence + Send + Sync>> {
+        self.persistence.clone()
     }
 
     /// Returns a reference to the shared [`ContextManager`], or `None` if not
