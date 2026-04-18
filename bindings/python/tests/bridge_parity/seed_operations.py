@@ -12,14 +12,14 @@ Adding a new op is ~20 lines: one `OpSpec`, one `py_call`, one case in
 the Bun runner's dispatch. The library is append-only.
 
 Current op library: 10 ops. The first 5 are the MVP per ADR-046;
-ops 6-10 cover tool registration, UCAN mint/validate-error,
-transport status, and filtered event-log query. Crypto outputs
-compare byte-exactly where
-possible: `identity_create_deterministic` pins DID + identity-key
-verifying bytes under a fixed seed. `sign_message` remains shape-only
-for the signature itself because Ed25519 covers a timestamp that
-cannot be frozen across bridges without a testing-feature clock
-injection — see FOLLOWUP.md §1 for the follow-up.
+ops 6-10 cover tool registration, UCAN mint/validate-error, transport
+status, and filtered event-log query. Crypto outputs compare byte-
+exactly: `identity_create_deterministic` pins DID + identity-key
+verifying bytes under a fixed seed, and `sign_message` pins the SCPID
+signature byte-exactly under the `signed_at_override` testing
+affordance (see `scp-runtime::scpid_sign`). The latter also derives a
+distinct `#active` key from `seed[32..64]` on WASM under the `testing`
+feature, matching scp-core's two-key `DidDht::create` sequence.
 
 Resolved divergences (previously xfail'd tripwires, now full parity):
   - context_id format (§18.4.1): all four bridges emit 64-char lowercase
@@ -34,6 +34,13 @@ Resolved divergences (previously xfail'd tripwires, now full parity):
     The MVP op below exercises the malformed-challenge path
     (SCP-IDENT-1038, shared); a future `unregistered_did_rejected` op
     will lock IDENT-1001 into the parity gate.
+  - sign_message signature byte-exactness: previously shape-only because
+    Ed25519 covers a wall-clock `signed_at`. Now byte-exact via the
+    `signed_at_override` parameter on `scpid_sign`, wired across all
+    four bridges + scp-core under the `testing` feature. Paired with a
+    distinct `#active` key on WASM (derived from `seed[32..64]` to
+    match scp-core's two-key sequence) so the signature hashes are
+    identical across every bridge.
 
 ----------------------------------------------------------------------
 XFAIL-STRICT POLICY — READ BEFORE LANDING A FIX
@@ -44,18 +51,13 @@ means: if the divergence is fixed and the test starts PASSING, CI FAILS
 with XPASS. That is by design — silent passes would hide that the fix
 also needs a harness update.
 
-When fixing any divergence listed in FOLLOWUP.md §3 / §4 / §5, your PR
-MUST also remove the corresponding `xfail_bridges` and `xfail_reason`
-fields from the OpSpec below (and update FOLLOWUP.md's "Current state"
-/ "Action" sections to reflect the resolution). Otherwise xfail-strict
-will turn your fix into a CI failure.
-
-Each xfail'd op below carries an inline comment pointing at its
-FOLLOWUP.md section. When you land a fix:
+When fixing a newly discovered divergence:
   1. Remove `xfail_bridges=(...)` and `xfail_reason=...` from the OpSpec.
   2. Update the op's docstring block to drop the "xfail'd" language.
-  3. Update FOLLOWUP.md — mark the section resolved or delete it.
-  4. Run the full parity suite locally; all 10 cases should pass.
+  3. Run the full parity suite locally; all cases should pass.
+
+There is no separate tracking document — git history and the inline
+docstrings on each OpSpec carry the rationale.
 ----------------------------------------------------------------------
 """
 
@@ -126,8 +128,9 @@ class OpSpec:
     py_call: Callable[[OpContext], dict[str, Any]]
     node_call: dict[str, Any]
     schema: OpSchema
-    # Bridges for which this op is a known divergence (xfail'd). Tracked in
-    # FOLLOWUP.md. Empty tuple means all bridges are expected to pass.
+    # Bridges for which this op is a known divergence (xfail'd). Empty
+    # tuple means all bridges are expected to pass. Inline docstrings on
+    # each OpSpec carry the rationale when the tuple is non-empty.
     xfail_bridges: tuple[str, ...] = ()
     xfail_reason: str = ""
     # Post-normalization absolute-value assertions. Each tuple is
@@ -159,7 +162,7 @@ def _extract_code(text: str) -> str | None:
 # Each bridge creates its own identity using a FIXED 32-byte seed fed
 # through the `testing`-gated `seed` parameter on `identity_create`. The
 # seed drives `rand::rngs::StdRng::from_seed` (same KDF across every
-# bridge per ADR-046 / FOLLOWUP.md §1), so:
+# bridge per ADR-046), so:
 #   - the identity-key Ed25519 private bytes are byte-identical,
 #   - the DID derived from `z{zbase32(identity_pubkey)}` is byte-identical,
 #   - the exposed `verifying_key` hex is byte-identical.
@@ -285,9 +288,10 @@ OP_CONTEXT_CREATE = OpSpec(
 # pass a syntactically valid but never-created DID).
 #
 # Real divergence caught by the harness: three bridges, three codes.
-# PyO3 returns SCP-IDENT-1001 (reference); NAPI returns SCP-PERM-3023;
-# WASM returns SCP-IDENT-1010. See FOLLOWUP.md §4. The NAPI and WASM
-# cases are xfail'd until the codes are aligned.
+# PyO3 returned SCP-IDENT-1001 (reference); NAPI returned SCP-PERM-3023;
+# WASM returned SCP-IDENT-1010. Aligned across all three on
+# SCP-IDENT-1001 for the unregistered-DID path; the op below now
+# exercises the malformed-challenge path (SCP-IDENT-1038, shared).
 # ---------------------------------------------------------------------------
 
 
@@ -326,9 +330,9 @@ OP_INVALID_CAPABILITY = OpSpec(
         )
     ),
     # Pin the absolute value so joint drift (e.g. all bridges switching
-    # to "UNKNOWN" together) cannot pass parity silently. FOLLOWUP.md §4
-    # commits to SCP-IDENT-1038 as the shared code for the malformed-
-    # challenge path; this assertion enforces that commitment.
+    # to "UNKNOWN" together) cannot pass parity silently. SCP-IDENT-1038
+    # is the committed shared code for the malformed-challenge path;
+    # this assertion enforces that commitment.
     expected_values=(("error.code", EXPECTED_INVALID_CAPABILITY_CODE),),
 )
 
@@ -381,32 +385,72 @@ OP_EVENT_LOG_APPEND = OpSpec(
 # op 5: sign_message (via SCPID)
 #
 # Each bridge creates an identity using the shared parity seed, then
-# generates a challenge and signs it. `did`, `signing_key_id`, and
-# `protocol` are byte-exact cross-bridge. Signature bytes remain
-# shape-only — Ed25519 signatures cover the canonical hash which
-# includes `signed_at = SystemTime::now() / js_sys::Date::now()`, so
-# two bridges signing a millisecond apart produce different signatures
-# even with identical keys and challenges. A future op may freeze the
-# clock via a testing-feature override to enable byte-exact signature
-# parity; see FOLLOWUP.md §1 for the clock-injection follow-up.
+# generates a challenge and signs it via SCPID. Under the `testing`-
+# gated `signed_at_override` affordance (wired across all four bridges
+# and `scp-runtime::scpid_sign`), the harness pins `signed_at` in the
+# canonical hash to `PARITY_SIGNED_AT_MS`. Combined with:
 #
-# Additionally, `#active` in scp-core is the SECOND key generated by
-# `DidDht::create` (see crate docs). The WASM bridge uses a single-key
-# model where `#active` resolves to the identity key. So even with a
-# shared seed, `#active`-signed signatures differ between WASM and
-# scp-core-backed bridges. The seed parity contract only covers the
-# identity key (VM `#0`) at this time.
+#   - seed → identity key (`#0`) and active key (`#active`) both byte-
+#     identical across bridges (StdRng::from_seed stream consumed in the
+#     same order by every bridge),
+#   - `PARITY_NONCE_HEX` pinned in the challenge,
+#   - fixed audience string,
+#
+# every bridge's Ed25519 signature is byte-identical. This FieldSpec
+# uses `bytes_from_hex` + an `expected_values` pin so the gate catches
+# any drift in the SCPID canonical-hash construction, the key-sequence
+# contract, or the override plumbing.
 # ---------------------------------------------------------------------------
+
+
+# Pinned Unix millisecond timestamp stuffed into the SCPID canonical
+# hash. The challenge's issued_at / expires_at must straddle this value;
+# we use a far-future `expires_at` (year 2286) so wall-clock expiry
+# never trips.
+PARITY_SIGNED_AT_MS = 1_700_000_000_000
+PARITY_CHALLENGE_EXPIRES_AT_MS = 9_999_999_999_000
+# Fixed 32-byte nonce so the canonical hash is fully determined.
+PARITY_NONCE_HEX = "aa" * 32
+
+# Pinned SCPID signature under the fixture above. Ground truth is
+# produced by `scp-runtime::tests::print_parity_sign_golden_value`:
+#   cargo test -p scp-runtime --lib print_parity_sign_golden_value \
+#     -- --ignored --nocapture
+# If you change the seed, canonical-hash construction, or override
+# plumbing, rerun that test and update this literal in the same PR.
+EXPECTED_SEEDED_SIGNATURE_HEX = (
+    "b46755a5bebcfe331e9f937e9668302a4283b490752f0c4e9260b879acf2e9d7"
+    "3f4476765c4f4f11c47e61fcbe6c0611acbff84af6e3ce9ed5fa8ceaa6672d0b"
+)
+
+
+def _pinned_challenge_json(audience: str = "https://parity-test.example.com") -> str:
+    """Build the pinned SCPID challenge used by the parity sign path.
+
+    Mirrored in `node_bridge_runner.ts::patchChallengeForOverride` so
+    every bridge feeds an IDENTICAL challenge into `scpid_sign`.
+    """
+    return json.dumps(
+        {
+            "protocol": "scpid/1.0",
+            "nonce": PARITY_NONCE_HEX,
+            "audience": audience,
+            "issued_at": PARITY_SIGNED_AT_MS,
+            "expires_at": PARITY_CHALLENGE_EXPIRES_AT_MS,
+        }
+    )
 
 
 def _py_sign_message(ctx: OpContext) -> dict[str, Any]:
     seed = bytes.fromhex(PARITY_SEED_HEX)
     identity = ctx.scp_core.py_identity_create("in_memory", seed)
-    challenge_json = ctx.scp_core.scpid_challenge(
-        "https://parity-test.example.com",
-        60,
+    challenge_json = _pinned_challenge_json()
+    response_json = ctx.scp_core.scpid_sign(
+        identity.did,
+        "#active",
+        challenge_json,
+        PARITY_SIGNED_AT_MS,
     )
-    response_json = ctx.scp_core.scpid_sign(identity.did, "#active", challenge_json)
     response = json.loads(response_json)
     return {
         "protocol": response.get("protocol"),
@@ -426,6 +470,7 @@ OP_SIGN_MESSAGE = OpSpec(
             "ttl_seconds": 60,
             "payload": "parity-test-v1",
             "seed_hex": PARITY_SEED_HEX,
+            "signed_at_override": PARITY_SIGNED_AT_MS,
         },
     },
     schema=OpSchema(
@@ -434,11 +479,21 @@ OP_SIGN_MESSAGE = OpSpec(
             FieldSpec("signing_key_id", "exact"),
             # DID is byte-exact under the shared seed.
             FieldSpec("did", "exact"),
-            # Signatures remain shape-only — see module docstring above.
-            FieldSpec("signature", "regex", pattern=r"[0-9a-f]{128}"),
+            # Signatures are now byte-exact under the shared seed +
+            # pinned override. `bytes_from_hex` canonicalizes to base64
+            # in the normalizer, so the expected literal must match.
+            FieldSpec("signature", "bytes_from_hex"),
         )
     ),
-    expected_values=(("did", EXPECTED_SEEDED_DID),),
+    expected_values=(
+        ("did", EXPECTED_SEEDED_DID),
+        (
+            "signature",
+            __import__("base64")
+            .b64encode(bytes.fromhex(EXPECTED_SEEDED_SIGNATURE_HEX))
+            .decode("ascii"),
+        ),
+    ),
 )
 
 
@@ -510,10 +565,9 @@ OP_TOOL_REGISTER = OpSpec(
 # capabilities — byte-exactly under those inputs. The encoded JWT is
 # NOT compared: PyO3's PyUcanToken intentionally does not expose the
 # JWT (see crates/scp-ffi/src/ucan.rs), and both the signature and the
-# wall-clock `exp` would diverge even if it did. Cross-bridge encoded-
-# JWT parity is a follow-up gated on two things: (1) exposing `encoded`
-# in PyO3, and (2) clock injection (FOLLOWUP.md §1) — the `exp` field
-# prevents byte-exact parity today.
+# wall-clock `exp` would diverge even if it did. Extending the SCPID
+# `signed_at_override` affordance to UCAN minting is a possible future
+# op; until then the `exp` field prevents byte-exact JWT parity.
 #
 # The `audience` is a fixed well-formed DID string (the bridges don't
 # require the DID to be resolvable for minting). Capabilities are
@@ -644,8 +698,23 @@ OP_UCAN_VALIDATE_MALFORMED = OpSpec(
 #   - UniFFI: `transport_status(manager: Option<Arc<TransportManager>>)`
 #     — pass `None`/`nil` for the stateless probe.
 #
-# Without a prior `transport_connect` call, all four return the default
-# disconnected shape `{connected: false, relay_url: None, latency_ms: None}`.
+# **Bridge semantics differ for this op**:
+#   - **PyO3, NAPI, UniFFI**: `transport_status()` is a REAL probe —
+#     returns the current relay connection state. With no connect, that
+#     state is `{connected: false, relay_url: None, latency_ms: None}`
+#     (spec-committed).
+#   - **WASM**: `transport_status()` is a SHAPE ASSERTION — WASM has no
+#     network-capable transport on the `wasm32-unknown-unknown` target
+#     (ADR-034), so the bridge hardcodes the disconnected triple. The
+#     parity gate exercises the SHAPE — that WASM's return value matches
+#     the other bridges' disconnected shape exactly. Comparing WASM's
+#     "connected state" to a real probe is meaningless; comparing its
+#     shape IS meaningful, and this op pins that.
+#
+# Changing WASM to probe real transport state would require wiring a JS
+# callback injection point (see `custody.rs` / `storage.rs` for the
+# pattern), which is out of scope for ADR-046 — this gate locks in the
+# cross-bridge shape commitment until that happens.
 # ---------------------------------------------------------------------------
 
 

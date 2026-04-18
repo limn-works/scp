@@ -27,6 +27,12 @@ extension-module = ["pyo3/extension-module"]
 allow_in_memory_custody = ["scp-platform/testing", "dep:scp-testing"]
 # Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
 server = ["scp-ffi-common/server", "dep:scp-node"]
+# Enables testing-only affordances like `scpid_sign(signed_at_override=...)`
+# used by the cross-bridge parity harness (ADR-046). MUST NOT be enabled in
+# production bridge builds — the override lets callers pin `signed_at` to
+# an arbitrary value within the challenge window, which is a parity-test
+# construct, not a protocol feature.
+testing = ["scp-core/testing"]
 
 [dependencies]
 pyo3 = { version = "0.24.1", features = ["experimental-async"] }

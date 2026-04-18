@@ -13,9 +13,13 @@ crate-type = ["cdylib"]
 [features]
 # Enables the did:key:{hex} DID format in resolve_public_key. This is a
 # non-standard test convenience — production builds must resolve via did:dht:z.
-# Also enables the `seed: Option<Vec<u8>>` parameter on `identity_create` for
-# the cross-bridge parity harness (ADR-046 / FOLLOWUP.md §1). Pulls in `rand`
-# for the `StdRng::from_seed` KDF — not needed in production WASM builds.
+# Also enables the `seed: Option<Vec<u8>>` parameter on `identity_create`
+# AND the `signed_at_override: Option<u64>` parameter on `scpid_sign` for
+# the cross-bridge parity harness (ADR-046). Under the seed path, a
+# distinct `#active` key is derived from `seed[32..64]` — matching scp-
+# core's two-key `DidDht::create` sequence — so `#active`-signed SCPID
+# responses are byte-exact across every bridge. Pulls in `rand` for the
+# `StdRng::from_seed` KDF — not needed in production WASM builds.
 testing = ["dep:rand"]
 
 [dependencies]

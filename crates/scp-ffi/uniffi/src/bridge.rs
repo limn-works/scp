@@ -646,9 +646,13 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpError {
 
 impl From<scp_core::crypto::ucan::UcanError> for ScpError {
     fn from(e: scp_core::crypto::ucan::UcanError) -> Self {
+        // Canonical UCAN→error-code mapping — see `scp-ffi/src/error.rs`
+        // for the full rationale. All bridges route through the shared
+        // `scp_ffi_common::ucan_errors` module.
+        let code = scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned();
         Self::Permission {
             msg: format!("{e} — check token format, signatures, time bounds, and capability chain"),
-            code: codes::PERM_3001.to_owned(),
+            code,
         }
     }
 }
@@ -1387,9 +1391,8 @@ impl Identity {
     /// handle was loaded without live key material.
     ///
     /// Under a deterministic `seed`, this value is byte-identical across
-    /// every bridge (ADR-046 / FOLLOWUP.md §1). See the
-    /// `verifying_key_hex` field docs for why `#0` rather than
-    /// `#active`.
+    /// every bridge (ADR-046). See the `verifying_key_hex` field docs
+    /// for why `#0` rather than `#active`.
     #[must_use]
     pub fn verifying_key(&self) -> Option<String> {
         self.verifying_key_hex.clone()
@@ -2349,8 +2352,7 @@ pub async fn identity_create(
     let custody_method = parse_custody_method(&custody)?;
 
     // Validate the optional 32-byte seed at the FFI boundary. A seed is
-    // only meaningful for the in_memory custody path (ADR-046 /
-    // FOLLOWUP.md §1).
+    // only meaningful for the in_memory custody path (ADR-046).
     let seed_bytes: Option<[u8; 32]> = match seed.as_deref() {
         None => None,
         Some(bytes) => Some(
@@ -3899,7 +3901,8 @@ pub async fn tool_register(
                 })?,
             };
 
-            let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
+            // Shared with every other bridge via `scp_ffi_common::tool_id`.
+            let tool_id = scp_ffi_common::tool_id::generate_tool_id(&definition.name);
 
             let cost = definition.cost.map(|c| scp_core::context::tools::ToolCost {
                 amount: c.amount,
@@ -12671,8 +12674,21 @@ pub fn scpid_sign(
     identity: Arc<Identity>,
     signing_key_id: String,
     challenge_json: String,
+    signed_at_override: Option<u64>,
 ) -> Result<String, ScpError> {
     use scp_core::identity::scpid_sign as core_sign;
+
+    // Reject `signed_at_override` on non-testing builds: the override is a
+    // parity-harness affordance (ADR-046), not a production API.
+    #[cfg(not(feature = "testing"))]
+    if signed_at_override.is_some() {
+        return Err(ScpError::Validation {
+            msg:
+                "signed_at_override requires the scp-core `testing` feature — not available in production builds"
+                    .to_owned(),
+            code: codes::VALID_7007.to_owned(),
+        });
+    }
 
     let key_id = parse_scpid_signing_key_id(&signing_key_id)?;
 
@@ -12724,6 +12740,7 @@ pub fn scpid_sign(
         &identity.did,
         key_id,
         &challenge,
+        signed_at_override,
     ));
 
     let response = response.map_err(|e| ScpError::Identity {
@@ -14219,6 +14236,7 @@ mod tests {
             &identity.did,
             scp_identity::SigningKeyId::Active,
             &challenge,
+            None,
         )
         .await
         .unwrap();

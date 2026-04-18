@@ -144,6 +144,10 @@ struct IdentityEntry {
     /// Ed25519 signing key bytes (32 bytes). Stored to produce real Ed25519
     /// signatures for device attestation and other identity operations.
     ///
+    /// In production WASM, this is the DID-deriving "identity key" (#0) and
+    /// is ALSO used to satisfy `#active` signatures (single-key model, see
+    /// `resolve_did_document_fields`).
+    ///
     /// Wrapped in `Zeroizing` for defense-in-depth: WASM linear memory is
     /// readable by same-origin JS, so key material must be zeroed on drop.
     signing_key_bytes: zeroize::Zeroizing<[u8; 32]>,
@@ -158,12 +162,38 @@ struct IdentityEntry {
     /// Wrapped in `Zeroizing` for defense-in-depth (same rationale as
     /// `signing_key_bytes`).
     agent_signing_key_bytes: Option<zeroize::Zeroizing<[u8; 32]>>,
+    /// Distinct `#active` signing key (testing-only).
+    ///
+    /// The scp-core bridges generate the identity key (`#0`) and the
+    /// active signing key (`#active`) as two separate Ed25519 keypairs
+    /// during `DidDht::create` (see `scp-identity/src/dht.rs`). Under
+    /// `InMemoryKeyCustody::from_seed_bytes`, they consume the deterministic
+    /// seed stream in sequence: `seed[0..32]` → identity key,
+    /// `seed[32..64]` → active signing key.
+    ///
+    /// The WASM bridge historically used a **single-key model** (`#active`
+    /// == identity key). Under the cross-bridge parity harness (ADR-046
+    /// op 5, `sign_message`), every bridge signs with `#active`, so the
+    /// single-key model made WASM's signature diverge from the scp-core
+    /// bridges even under a shared seed.
+    ///
+    /// When the `testing` feature is enabled AND a 32-byte seed is passed
+    /// to `identity_create`, this field is populated by consuming the
+    /// next 32 bytes from `StdRng::from_seed(seed)` — matching the scp-
+    /// core bridges' key sequence exactly. `sign_with_identity` prefers
+    /// this key for `"#active"` when present; production callers with no
+    /// seed (and non-testing builds) continue to use `signing_key_bytes`
+    /// for both `#0` and `#active`.
+    ///
+    /// See ADR-046 for the parity harness context.
+    #[cfg(feature = "testing")]
+    active_signing_key_bytes: Option<zeroize::Zeroizing<[u8; 32]>>,
 }
 
 impl std::fmt::Debug for IdentityEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IdentityEntry")
-            .field("signing_key_bytes", &"[REDACTED]")
+        let mut ds = f.debug_struct("IdentityEntry");
+        ds.field("signing_key_bytes", &"[REDACTED]")
             .field("public_key_bytes", &self.public_key_bytes)
             .field("custody_type", &self.custody_type)
             .field(
@@ -173,8 +203,17 @@ impl std::fmt::Debug for IdentityEntry {
                 } else {
                     "[None]"
                 },
-            )
-            .finish()
+            );
+        #[cfg(feature = "testing")]
+        ds.field(
+            "active_signing_key_bytes",
+            &if self.active_signing_key_bytes.is_some() {
+                "[REDACTED]"
+            } else {
+                "[None]"
+            },
+        );
+        ds.finish()
     }
 }
 
@@ -527,7 +566,7 @@ impl WasmIdentity {
     /// string without live key material.
     ///
     /// Under a deterministic `seed`, this value is byte-identical across
-    /// every bridge (ADR-046 / FOLLOWUP.md §1).
+    /// every bridge (ADR-046).
     #[must_use]
     #[wasm_bindgen(getter, js_name = "verifyingKey")]
     pub fn verifying_key(&self) -> Option<String> {
@@ -902,15 +941,34 @@ pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
         // across all four bridges (ADR-046). The `rand` crate is pulled
         // in only by the `testing` feature so production WASM bundles
         // don't ship the extra code.
+        //
+        // Under the testing+seed path we *also* consume the next 32 seed
+        // bytes and derive a distinct `#active` signing key. This mirrors
+        // scp-core's `DidDht::create`, which generates identity_key (`#0`)
+        // and active_signing_key (`#active`) as two consecutive calls to
+        // `generate_keypair` — under `InMemoryKeyCustody::from_seed_bytes`
+        // those consume `seed[0..32]` and `seed[32..64]` respectively.
+        // Keeping the byte-identical sequence lets the parity harness
+        // pin `#active`-signed SCPID signatures across every bridge.
         #[cfg(feature = "testing")]
-        let signing_key = if let Some(s) = seed_bytes {
+        let (signing_key, active_signing_key_bytes_opt): (
+            ed25519_dalek::SigningKey,
+            Option<zeroize::Zeroizing<[u8; 32]>>,
+        ) = if let Some(s) = seed_bytes {
             use rand::{RngCore, SeedableRng};
             let mut rng = rand::rngs::StdRng::from_seed(s);
-            let mut key_bytes = zeroize::Zeroizing::new([0u8; 32]);
-            rng.fill_bytes(key_bytes.as_mut());
-            ed25519_dalek::SigningKey::from_bytes(&key_bytes)
+            let mut identity_key_bytes = zeroize::Zeroizing::new([0u8; 32]);
+            rng.fill_bytes(identity_key_bytes.as_mut());
+            let identity_key = ed25519_dalek::SigningKey::from_bytes(&identity_key_bytes);
+            // Consume the next 32 bytes for the distinct #active key.
+            let mut active_bytes = zeroize::Zeroizing::new([0u8; 32]);
+            rng.fill_bytes(active_bytes.as_mut());
+            (identity_key, Some(active_bytes))
         } else {
-            ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng)
+            (
+                ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng),
+                None,
+            )
         };
         #[cfg(not(feature = "testing"))]
         let signing_key = {
@@ -946,6 +1004,8 @@ pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
                     agent_signing_key_bytes: None,
+                    #[cfg(feature = "testing")]
+                    active_signing_key_bytes: active_signing_key_bytes_opt,
                 },
             );
             Ok::<(), JsValue>(())
@@ -992,14 +1052,28 @@ fn resolve_did_document_fields(did: &str) -> ResolvedDocumentFields {
                 let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
                 sk.verifying_key().to_bytes()
             });
-            (entry.public_key_bytes, agent_pub_bytes)
+            // Under the testing-only `#active` parity path, `#active`
+            // resolves to a distinct key (see
+            // `IdentityEntry::active_signing_key_bytes` docs). Emit the
+            // real `#active` public key in the DID document so that
+            // signatures verify. In production / non-seeded paths this
+            // stays `None` and `#active` falls back to the identity key
+            // (single-key model).
+            #[cfg(feature = "testing")]
+            let active_pub_bytes = entry.active_signing_key_bytes.as_ref().map(|sk_bytes| {
+                let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+                sk.verifying_key().to_bytes()
+            });
+            #[cfg(not(feature = "testing"))]
+            let active_pub_bytes: Option<[u8; 32]> = None;
+            (entry.public_key_bytes, active_pub_bytes, agent_pub_bytes)
         })
     });
 
     let (verification_methods_json, authentication_json, assertion_methods_json) = key_info
         .map_or_else(
             || ("[]".to_owned(), "[]".to_owned(), "[]".to_owned()),
-            |(pub_bytes, agent_pub_bytes)| {
+            |(pub_bytes, active_pub_bytes, agent_pub_bytes)| {
                 // Build verification methods for ALL keys in the identity
                 // per ADR-039: #0 (Identity Key), #active (Active Signing
                 // Key), and optionally #agent (Agent Signing Key).
@@ -1014,15 +1088,20 @@ fn resolve_did_document_fields(did: &str) -> ResolvedDocumentFields {
                 })];
 
                 // #active — Active Signing Key (Human Signing Key). In the
-                // WASM bridge's simplified key model, the active signing key
-                // uses the same keypair as the identity key. Authentication
-                // and assertionMethod reference #active (not #0), matching
-                // the scp-core DidDocument pattern.
+                // WASM bridge's production single-key model, the active
+                // signing key uses the same keypair as the identity key.
+                // Under the `testing`-gated parity path, `#active` is a
+                // distinct key derived from seed_stream[32..64] — use its
+                // real public key so that signatures verify across bridges.
+                let active_multibase = active_pub_bytes.map_or_else(
+                    || identity_multibase.clone(),
+                    |b| format!("z{}", zbase32_encode(&b)),
+                );
                 vms.push(serde_json::json!({
                     "id": format!("{did}#active"),
                     "type": "Ed25519VerificationKey2020",
                     "controller": did,
-                    "publicKeyMultibase": identity_multibase,
+                    "publicKeyMultibase": active_multibase,
                 }));
 
                 let mut auth = vec![serde_json::json!(format!("{did}#active"))];
@@ -1166,6 +1245,8 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
                     agent_signing_key_bytes: Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
+                    #[cfg(feature = "testing")]
+                    active_signing_key_bytes: None,
                 },
             );
             Ok::<(), JsValue>(())
@@ -1334,6 +1415,11 @@ pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsEr
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
                     agent_signing_key_bytes: agent_key_bytes,
+                    // After key rotation, the old `#active` parity key
+                    // (if any) no longer matches the new identity's keys.
+                    // Drop it — subsequent signs revert to single-key.
+                    #[cfg(feature = "testing")]
+                    active_signing_key_bytes: None,
                 },
             );
 
@@ -1492,6 +1578,12 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
                     agent_signing_key_bytes,
+                    // DID migration generates a fresh keypair, so any
+                    // testing-only `#active` parity key is not carried
+                    // across. Subsequent signs use the single-key model
+                    // unless a seeded `identity_create` sets it.
+                    #[cfg(feature = "testing")]
+                    active_signing_key_bytes: None,
                 },
             );
             Ok::<(), JsValue>(())
@@ -1903,7 +1995,23 @@ pub(crate) fn sign_with_identity(
             })?;
 
         let key_bytes: &[u8; 32] = match signing_key_id {
-            "#active" => &entry.signing_key_bytes,
+            // `#active` prefers the testing-only distinct active key when
+            // present (parity harness seed path, ADR-046). Falls back to
+            // the identity key in production (single-key model) — see
+            // `IdentityEntry::active_signing_key_bytes` docs.
+            "#active" => {
+                #[cfg(feature = "testing")]
+                {
+                    entry
+                        .active_signing_key_bytes
+                        .as_deref()
+                        .unwrap_or(&entry.signing_key_bytes)
+                }
+                #[cfg(not(feature = "testing"))]
+                {
+                    &entry.signing_key_bytes
+                }
+            }
             "#agent" => entry.agent_signing_key_bytes.as_deref().ok_or_else(|| {
                 crate::error::ScpWasmError::Identity {
                     message: format!(
@@ -2514,6 +2622,8 @@ pub(crate) mod test_helpers {
                     public_key_bytes: pub_bytes,
                     custody_type: "in_memory".to_owned(),
                     agent_signing_key_bytes: Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
+                    #[cfg(feature = "testing")]
+                    active_signing_key_bytes: None,
                 },
             );
         });
@@ -2550,6 +2660,8 @@ mod tests {
                     public_key_bytes: pub_bytes,
                     custody_type: "in_memory".to_owned(),
                     agent_signing_key_bytes: None,
+                    #[cfg(feature = "testing")]
+                    active_signing_key_bytes: None,
                 },
             );
         });
@@ -2574,6 +2686,8 @@ mod tests {
                     public_key_bytes: pub_bytes,
                     custody_type: "in_memory".to_owned(),
                     agent_signing_key_bytes: Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
+                    #[cfg(feature = "testing")]
+                    active_signing_key_bytes: None,
                 },
             );
         });

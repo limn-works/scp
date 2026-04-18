@@ -61,10 +61,16 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u32) -> napi::Result<Strin
 /// appropriate signing key (`#active` or `#agent`), and produces a signed
 /// SCPID response as a JSON string.
 ///
+/// The optional `signed_at_override` argument substitutes the Unix
+/// millisecond timestamp used for `signed_at` in the canonical hash.
+/// It is only accepted when scp-core is built with the `testing` feature
+/// (cross-bridge parity harness, ADR-046); production builds reject any
+/// non-`null` value.
+///
 /// # JS usage
 ///
 /// ```js
-/// const responseJson = await scpidSign(did, "#active", challengeJson);
+/// const responseJson = scpidSign(did, "#active", challengeJson, null);
 /// ```
 #[napi]
 #[cfg(feature = "allow_in_memory_custody")]
@@ -72,7 +78,40 @@ pub fn scpid_sign(
     did: String,
     signing_key_id: String,
     challenge_json: String,
+    #[napi(ts_arg_type = "bigint | null | undefined")] signed_at_override: Option<
+        napi::bindgen_prelude::BigInt,
+    >,
 ) -> napi::Result<String> {
+    // Normalise `signed_at_override` from the JS-side BigInt/null to
+    // Option<u64>. `BigInt::get_u64` returns `(signed, value, lossless)`
+    // in napi-rs 3.x — reject if the input was negative (`signed`) or
+    // could not be represented losslessly in u64.
+    let signed_at_override_u64: Option<u64> = match signed_at_override {
+        None => None,
+        Some(bi) => {
+            let (signed, val, lossless) = bi.get_u64();
+            if signed || !lossless {
+                return Err(napi::Error::from(ScpNapiError::Validation {
+                    message:
+                        "signed_at_override must fit in an unsigned 64-bit integer (non-negative, no loss)"
+                            .to_owned(),
+                    code: codes::VALID_7007.to_owned(),
+                }));
+            }
+            Some(val)
+        }
+    };
+
+    #[cfg(not(feature = "testing"))]
+    if signed_at_override_u64.is_some() {
+        return Err(napi::Error::from(ScpNapiError::Validation {
+            message:
+                "signed_at_override requires the scp-core `testing` feature — not available in production builds"
+                    .to_owned(),
+            code: codes::VALID_7007.to_owned(),
+        }));
+    }
+
     let key_id = parse_signing_key_id(&signing_key_id)?;
 
     let challenge: ScpIdChallenge =
@@ -105,6 +144,7 @@ pub fn scpid_sign(
             &did,
             key_id,
             &challenge,
+            signed_at_override_u64,
         ));
 
         let response = response.map_err(|e| ScpNapiError::Identity {
@@ -379,6 +419,7 @@ mod tests {
             &identity.did,
             SigningKeyId::Active,
             &challenge,
+            None,
         )
         .await
         .unwrap();

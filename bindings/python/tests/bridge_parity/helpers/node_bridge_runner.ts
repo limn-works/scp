@@ -735,12 +735,28 @@ async function opSignMessage(req: BridgeRequest): Promise<Record<string, unknown
   const ttl = Number(req.args.ttl_seconds ?? 60);
   const seedHex =
     typeof req.args.seed_hex === "string" ? req.args.seed_hex : undefined;
+  // Optional `signed_at_override` (ms since epoch). When present, both
+  // bridges pin `signed_at` to the same value so Ed25519 signatures are
+  // byte-exact across PyO3/NAPI/UniFFI/WASM under the shared seed.
+  const signedAtOverride =
+    typeof req.args.signed_at_override === "number"
+      ? Number(req.args.signed_at_override)
+      : undefined;
   if (req.bridgeMode === "napi") {
     const bridge = await loadNapi();
     const seed = seedFromHex(seedHex, false);
     const identity = await bridge.identityCreate("in_memory", seed);
     const challenge = bridge.scpidChallenge(audience, ttl);
-    const responseJson = bridge.scpidSign(identity.did, "#active", challenge);
+    // Rewrite challenge fields so issued_at/expires_at cover the override.
+    const patched = patchChallengeForOverride(challenge, signedAtOverride);
+    const overrideArg =
+      signedAtOverride === undefined ? null : BigInt(signedAtOverride);
+    const responseJson = bridge.scpidSign(
+      identity.did,
+      "#active",
+      patched,
+      overrideArg,
+    );
     const response = JSON.parse(responseJson);
     return {
       protocol: response.protocol,
@@ -753,7 +769,15 @@ async function opSignMessage(req: BridgeRequest): Promise<Record<string, unknown
   const seed = seedFromHex(seedHex, true);
   const identity = await raw.identity_create("in_memory", seed);
   const challenge = raw.scpid_challenge(audience, ttl);
-  const responseJson = raw.scpid_sign(identity.did, "#active", challenge);
+  const patched = patchChallengeForOverride(challenge, signedAtOverride);
+  const overrideArg =
+    signedAtOverride === undefined ? undefined : BigInt(signedAtOverride);
+  const responseJson = raw.scpid_sign(
+    identity.did,
+    "#active",
+    patched,
+    overrideArg,
+  );
   const response = JSON.parse(responseJson);
   return {
     protocol: response.protocol,
@@ -762,6 +786,37 @@ async function opSignMessage(req: BridgeRequest): Promise<Record<string, unknown
     signature: response.signature,
   };
 }
+
+/// When a `signed_at_override` is supplied, the challenge must match
+/// the pinned fixture used by the Python harness AND the scp-runtime
+/// golden-value test. We REPLACE the bridge-issued challenge with the
+/// pinned one so every bridge feeds `scpid_sign` the same canonical
+/// hash inputs. `expires_at` is set far in the future (year 2286) so
+/// wall-clock expiry can't trip the bridge-side expiry check.
+function patchChallengeForOverride(
+  _challengeJson: string,
+  override: number | undefined,
+): string {
+  if (override === undefined) {
+    return _challengeJson;
+  }
+  return JSON.stringify({
+    protocol: "scpid/1.0",
+    nonce: PARITY_NONCE_HEX,
+    audience: "https://parity-test.example.com",
+    issued_at: override,
+    expires_at: PARITY_CHALLENGE_EXPIRES_AT_MS,
+  });
+}
+
+/// Fixed 32-byte nonce used when `signed_at_override` pins the SCPID
+/// response. Must match `bindings/python/tests/bridge_parity/seed_operations.py`
+/// (PARITY_NONCE_HEX).
+const PARITY_NONCE_HEX = "aa".repeat(32);
+/// Year-2286 timestamp — far enough in the future that wall-clock
+/// expiry cannot trip the SCPID expiry check. Must match the
+/// Python harness's PARITY_CHALLENGE_EXPIRES_AT_MS.
+const PARITY_CHALLENGE_EXPIRES_AT_MS = 9_999_999_999_000;
 
 // ---------------------------------------------------------------------------
 // Main loop

@@ -71,21 +71,41 @@ pub fn py_scpid_challenge(audience: String, ttl_seconds: u64) -> PyResult<String
 /// * `did` — The signer's DID (must be registered via `py_identity_create`).
 /// * `signing_key_id` — `"#active"` or `"#agent"`.
 /// * `challenge_json` — JSON string of the challenge (from [`py_scpid_challenge`]).
+/// * `signed_at_override` — Optional Unix-millisecond timestamp used in
+///   place of the current wall clock. **Only accepted when scp-core is
+///   built with the `testing` feature**; attempts to supply a value on
+///   production builds are rejected. Drives the cross-bridge parity
+///   harness (ADR-046) so two bridges signing the same challenge under
+///   the same seed produce byte-identical signatures.
 ///
 /// # Errors
 ///
 /// Raises `IdentityError` if the DID is not registered.
-/// Raises `ValidationError` if `signing_key_id` is invalid or the challenge
-/// JSON is malformed.
+/// Raises `ValidationError` if `signing_key_id` is invalid, the challenge
+/// JSON is malformed, or `signed_at_override` is supplied on a
+/// non-testing build / outside the challenge window.
 /// Raises `IdentityError` if the signing operation fails.
 #[pyfunction]
-#[pyo3(name = "scpid_sign")]
+#[pyo3(name = "scpid_sign", signature = (did, signing_key_id, challenge_json, signed_at_override = None))]
 pub fn py_scpid_sign(
     py: Python<'_>,
     did: String,
     signing_key_id: String,
     challenge_json: String,
+    signed_at_override: Option<u64>,
 ) -> PyResult<String> {
+    // Reject `signed_at_override` on non-testing builds: the override is a
+    // parity-harness affordance, not a production API.
+    #[cfg(not(feature = "testing"))]
+    if signed_at_override.is_some() {
+        return Err(ScpPyError::ValidationError {
+            message:
+                "signed_at_override requires the scp-core `testing` feature — not available in production builds"
+                    .to_string(),
+            code: codes::VALID_7007.to_string(),
+        }
+        .into());
+    }
     let key_id = parse_signing_key_id(&signing_key_id)?;
 
     let challenge: ScpIdChallenge =
@@ -118,6 +138,7 @@ pub fn py_scpid_sign(
                 &did,
                 key_id,
                 &challenge,
+                signed_at_override,
             ));
 
             let response = response.map_err(|e| ScpPyError::IdentityError {
@@ -384,6 +405,7 @@ mod tests {
             &identity.did,
             SigningKeyId::Active,
             &challenge,
+            None,
         )
         .await
         .unwrap();
