@@ -1796,7 +1796,11 @@ pub(crate) fn sign_with_identity(
                     "identity '{did}' not found in registry — \
                  was it created with identity_create?"
                 ),
-                code: codes::IDENT_1010.to_owned(),
+                // Spec: identity-not-found in the local registry is an
+                // identity-domain error, not a DID-document resolution
+                // failure (IDENT_1010 is reserved for DID document issues).
+                // PyO3 canonical: crates/scp-ffi/src/runtime.rs::with_identity.
+                code: codes::IDENT_1001.to_owned(),
             })?;
 
         let key_bytes: &[u8; 32] = match signing_key_id {

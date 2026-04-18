@@ -875,8 +875,9 @@ pub(crate) fn remove_identity_if_present(did: &str) -> bool {
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Permission` if the DID is not found (the identity
-/// was not created via `identity_create` in this process).
+/// Returns `ScpNapiError::Identity` (SCP-IDENT-1001) if the DID is not found
+/// (the identity was not created via `identity_create` in this process).
+/// Aligned with the `PyO3` canonical bridge for cross-bridge parity.
 #[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn with_identity<T, F>(did: &str, f: F) -> Result<T, ScpNapiError>
 where
@@ -884,12 +885,12 @@ where
 {
     let entry = identity_registry()
         .get(did)
-        .ok_or_else(|| ScpNapiError::Permission {
+        .ok_or_else(|| ScpNapiError::Identity {
             message: format!(
                 "identity '{did}' not found in registry — was it created with \
                  identityCreate(\"in_memory\") in this process?"
             ),
-            code: codes::PERM_3023.to_owned(),
+            code: codes::IDENT_1001.to_owned(),
         })?;
 
     f(entry.value())
@@ -901,7 +902,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Permission` if the DID is not found.
+/// Returns `ScpNapiError::Identity` (SCP-IDENT-1001) if the DID is not found.
+/// Aligned with the `PyO3` canonical bridge for cross-bridge parity.
 #[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn with_identity_mut<T, F>(did: &str, f: F) -> Result<T, ScpNapiError>
 where
@@ -909,12 +911,12 @@ where
 {
     let mut entry = identity_registry()
         .get_mut(did)
-        .ok_or_else(|| ScpNapiError::Permission {
+        .ok_or_else(|| ScpNapiError::Identity {
             message: format!(
                 "identity '{did}' not found in registry — was it created with \
                  identityCreate(\"in_memory\") in this process?"
             ),
-            code: codes::PERM_3023.to_owned(),
+            code: codes::IDENT_1001.to_owned(),
         })?;
 
     f(entry.value_mut())

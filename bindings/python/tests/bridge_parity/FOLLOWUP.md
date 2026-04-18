@@ -9,7 +9,7 @@ This file has two kinds of entries, and the distinction is load-bearing:
   more is a next pass. They require the 5-point integration checklist
   (CLAUDE.md) before they can land.
 
-- **§4, §5 — Discovered protocol bugs.** The harness surfaced real
+- **§5 — Discovered protocol bugs.** The harness surfaced real
   cross-bridge divergences while being built. They are NOT enforcement-
   infra work. They ARE prerequisites before Layer C's parity gate can
   assert on NAPI/WASM for the affected ops. Each one is a spec or
@@ -31,7 +31,7 @@ bugs WILL be fixed, and when each fix lands, the gate upgrades from
 "visible divergence" to "byte-equality parity." Layer C's parity gate
 will assert on NAPI/WASM for these ops at that point.
 
-When fixing any divergence in §4 / §5, the same PR MUST:
+When fixing any divergence in §5, the same PR MUST:
 
 1. Remove the corresponding `xfail_bridges=(...)` and `xfail_reason=...`
    fields from the OpSpec in `seed_operations.py`.
@@ -83,41 +83,6 @@ macOS runners in CI.
 ---
 
 # Discovered protocol bugs (xfail-strict tripwires)
-
-## 4. DISCOVERED BUG — blocks full parity coverage on valid-challenge SCPID path
-
-**Issue**: filed alongside this PR (see inline description below). Bug is self-documented here; grep `xfail_reason` in `seed_operations.py` for the test-suite surface.
-
-The `invalid_capability_rejected` op in the MVP uses a malformed
-challenge (protocol=`scpid/1`, expected `scpid/1.0`). All three bridges
-correctly reject it with `SCP-IDENT-1038` (validation error) BEFORE
-the identity lookup. That path is at parity and the op verifies it.
-
-A distinct divergence exists on the valid-challenge path (unregistered
-DID): PyO3 returns `SCP-IDENT-1001` (via
-`crates/scp-ffi/src/runtime.rs::with_identity`), NAPI returns
-`SCP-PERM-3023` (via `crates/scp-ffi/napi/src/runtime.rs::with_identity`),
-WASM returns `SCP-IDENT-1010` (via
-`crates/scp-ffi/wasm/src/identity.rs::sign_with_identity`). Three
-bridges, three codes for the same condition — a real bug.
-
-**Current tripwire**: The MVP op does not yet exercise this path, so
-the harness does not surface the divergence via xfail-strict today.
-Adding an `unregistered_did_rejected` op that passes a well-formed
-challenge with an unregistered DID would expose it immediately; the
-op lands at the same time as the bridge alignment fix.
-
-**Fix**: Semantically PyO3's choice (`SCP-IDENT-1001`, a generic
-identity error) is correct — the DID is not in the local identity
-registry, which is an identity-not-found condition, not a permission
-denial (PERM-3023) and not a DID-document-missing condition (IDENT-1010
-is used for DID document resolution failures elsewhere in WASM).
-Align NAPI and WASM on `SCP-IDENT-1001`, then land the
-`unregistered_did_rejected` op without xfail — same PR.
-
-xfail-strict enforces the "fix the bridge, same PR adds the op / removes
-xfail" workflow. This bug is real. It will be fixed before Layer C's
-parity gate asserts on NAPI/WASM for SCPID sign error codes.
 
 ## 5. DISCOVERED BUG — blocks full parity coverage for `event_log_append`
 

@@ -82,10 +82,12 @@ CONTEXT_ID_PATTERN = r"^[0-9a-f]{64}$"
 # protocol/shape validation is shared via scp-protocol, so all bridges
 # agree on the code.
 #
-# Note: a valid-challenge + unregistered-DID path WOULD diverge (PyO3
-# SCP-IDENT-1001 vs NAPI SCP-PERM-3023 vs WASM SCP-IDENT-1010). That is
-# tracked in FOLLOWUP.md §4 but is not exercised by this op — the
-# malformed-challenge path is what was spec'd in ADR-046 for the MVP.
+# Note: the valid-challenge + unregistered-DID path historically diverged
+# (PyO3 SCP-IDENT-1001, NAPI SCP-PERM-3023, WASM SCP-IDENT-1010). All three
+# bridges are now aligned on SCP-IDENT-1001 (identity-domain, identity-not-
+# found). The MVP op below still exercises the malformed-challenge path per
+# ADR-046; an `unregistered_did_rejected` op added in a follow-up will lock
+# the IDENT-1001 alignment into the parity gate.
 EXPECTED_INVALID_CAPABILITY_CODE = "SCP-IDENT-1038"
 
 
