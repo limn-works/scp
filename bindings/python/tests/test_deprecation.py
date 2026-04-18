@@ -148,25 +148,61 @@ def test_scp_class_construction_emits_no_deprecation() -> None:
     )
 
 
-def test_scp_class_default_emits_no_deprecation() -> None:
-    """:meth:`SCP.default` is allowed in transitional code and is silent.
+def test_scp_class_default_emits_deprecation_on_first_call() -> None:
+    """:meth:`SCP.default` is a legacy path and emits a one-time warning.
 
-    The façade is deprecated; the explicit default-instance accessor on
-    the class is not — callers who genuinely want the shared default
-    can reach for it without warnings. The sunset target is the façade
-    itself, not the underlying default instance (see ADR-048).
+    Per the api-design review on #1549 Phase 4 PR 1, the explicit
+    default-instance accessor is equally deprecated as the free-function
+    façade — both route through the shared process-wide bridge. The
+    warning surfaces the legacy call site even when no free function is
+    exercised. See ADR-048 §Decision 3.
     """
-    _reset_emitted_for_tests()
+    # Reset the module-level sentinel so this test is deterministic
+    # regardless of whether another test in the session already called
+    # `SCP.default()`.
+    import scp_sdk.scp as scp_module
+
+    scp_module._default_deprecation_emitted = False
 
     with warnings.catch_warnings(record=True) as captured:
         warnings.simplefilter("always")
         default = scp_sdk.SCP.default()
         _ = default.instance_id
 
-    deprecation_warnings = [w for w in captured if issubclass(w.category, DeprecationWarning)]
-    assert deprecation_warnings == [], (
-        f"SCP.default() emitted DeprecationWarning(s): "
+    deprecation_warnings = [
+        w
+        for w in captured
+        if issubclass(w.category, DeprecationWarning) and "SCP.default()" in str(w.message)
+    ]
+    assert len(deprecation_warnings) == 1, (
+        "expected one DeprecationWarning naming SCP.default(), got "
         f"{[str(w.message) for w in deprecation_warnings]}"
+    )
+    assert "ADR-048" in str(deprecation_warnings[0].message)
+
+
+def test_scp_class_default_does_not_re_emit_on_second_call() -> None:
+    """The :meth:`SCP.default` warning fires at most once per interpreter."""
+    import scp_sdk.scp as scp_module
+
+    scp_module._default_deprecation_emitted = False
+
+    # Prime the warning.
+    _ = scp_sdk.SCP.default().instance_id
+
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        _ = scp_sdk.SCP.default().instance_id
+        _ = scp_sdk.SCP.default().instance_id
+
+    deprecation_warnings = [
+        w
+        for w in captured
+        if issubclass(w.category, DeprecationWarning) and "SCP.default()" in str(w.message)
+    ]
+    assert deprecation_warnings == [], (
+        "SCP.default() DeprecationWarning re-emitted after first call; "
+        f"got {[str(w.message) for w in deprecation_warnings]}"
     )
 
 

@@ -214,6 +214,11 @@ public final class McpClientHandle: Sendable {
 /// - ADR-015 (MCP) in `.docs/adrs/phase-3.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func serveMcp(
     config: McpServerConfig,
     serveFn: McpBridge.ServeFn = McpBridge.defaultServe

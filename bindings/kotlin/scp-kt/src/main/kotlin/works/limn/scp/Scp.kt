@@ -51,15 +51,16 @@ import works.limn.scp.bridge.CoroutineBridge
  * scp.shutdown(bridge, timeout = 1.seconds)
  * ```
  *
- * [SCP] implements [AutoCloseable] so it integrates with `use { }` blocks,
- * but note that `close()` is a no-op — callers must explicitly invoke
- * [shutdown] with a [CoroutineBridge] to drive the async FFI deadline.
+ * Not [AutoCloseable]: shutdown is a `suspend` function that drives an
+ * async FFI deadline and requires a [CoroutineBridge]. A synchronous
+ * `close()` cannot honor the timeout and would silently swallow it —
+ * callers must invoke [shutdown] explicitly from a coroutine scope.
  *
  * @see works.limn.scp.bridge.CoroutineBridge
  */
 class SCP internal constructor(
     internal val inner: NativeScp,
-) : AutoCloseable {
+) {
     /**
      * Constructs a fresh [SCP] with default in-memory state.
      *
@@ -113,23 +114,16 @@ class SCP internal constructor(
      * tasks, then runs typed-field cleanup. A second call is a no-op
      * (AlreadyShutDown is swallowed at the SDK surface).
      *
+     * Converted to unsigned milliseconds for the UniFFI boundary after
+     * the #1549 Phase 4 timeout unit unification — sub-millisecond
+     * precision is not preserved. Negative durations are clamped to
+     * zero.
+     *
      * @param timeout Maximum duration to wait for in-flight tasks.
-     *   Converted to whole seconds for the UniFFI boundary (sub-second
-     *   precision is not preserved).
      */
     suspend fun shutdown(bridge: CoroutineBridge, timeout: Duration) {
-        bridge.ffiCall { inner.shutdown(timeoutSecs = timeout.inWholeSeconds.toULong()) }
-    }
-
-    /**
-     * [AutoCloseable] implementation — intentionally a no-op. The real
-     * shutdown path requires a [CoroutineBridge] and must be called
-     * from a coroutine scope; a synchronous `close()` cannot drive the
-     * async FFI deadline. Callers using `use { }` blocks should invoke
-     * [shutdown] explicitly inside the block.
-     */
-    override fun close() {
-        // No-op: see KDoc above.
+        val millis = timeout.inWholeMilliseconds.coerceAtLeast(0).toULong()
+        bridge.ffiCall { inner.shutdown(timeoutMillis = millis) }
     }
 
     companion object {
@@ -142,11 +136,21 @@ class SCP internal constructor(
          *
          * This is the bridge the deprecated free-function façade uses
          * under the hood. Prefer explicit construction ([SCP]) in new
-         * code.
+         * code. Removal target: two release cycles after Phase 4 merge
+         * (ADR-048).
          *
          * @throws uniffi.scp.ScpException.Context if the default instance
          *   is currently suspended or permanently shut down.
          */
+        @Deprecated(
+            message = (
+                "SCP.default() returns the shared process-wide bridge instance. " +
+                    "Construct `SCP()` explicitly per tenant/identity instead. " +
+                    "Removal target: two release cycles after Phase 4 merge (ADR-048)."
+            ),
+            replaceWith = ReplaceWith("SCP()"),
+            level = DeprecationLevel.WARNING,
+        )
         fun default(): SCP = SCP(NativeScp.defaultInstance())
 
         /**
@@ -157,13 +161,12 @@ class SCP internal constructor(
          */
         fun withStorage(config: StorageConfig): SCP = SCP(NativeScp.withStorage(config))
 
-        /**
-         * Constructs an [SCP] with a persistence provider placeholder.
-         *
-         * Phase 4 PR 1 has no real persistence wiring; this factory
-         * currently returns a fresh in-memory instance. PR 3 threads the
-         * real `ContextPersistence` trait through.
-         */
-        fun withPersistence(): SCP = SCP(NativeScp.withPersistence())
+        // NOTE: A `withPersistence` factory is intentionally not exposed
+        // at the Kotlin SDK surface until PR 3 wires the real
+        // `scp_core::context::ContextPersistence` trait through UniFFI.
+        // Track progress via issues #1260 and #1491. The underlying
+        // UniFFI `Scp.withPersistence()` factory still exists for
+        // internal use but should not be called through the SDK layer
+        // until it has a real signature.
     }
 }

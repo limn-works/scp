@@ -3081,8 +3081,17 @@ mod tests {
                 tokio::time::sleep(Duration::from_mins(1)).await;
             });
         }
+        // Review feedback (test-quality, review-round-N): the original
+        // 100 ms budget was flaky on slow CI runners — `drain_under_deadline`
+        // uses `std::time::Instant::now()` (wall-clock), so
+        // `tokio::time::pause()` would not help here. Raising the budget
+        // to 500 ms keeps the test's intent (a sub-second deadline on a
+        // task that sleeps for a full minute) while tolerating scheduler
+        // jitter. If CI flakiness recurs, bump further — the test's
+        // correctness signal is the `TimedOut` outcome, not the wall-
+        // clock bound.
         let outcome = instance
-            .shutdown_core_async(Duration::from_millis(100))
+            .shutdown_core_async(Duration::from_millis(500))
             .await
             .unwrap();
         let ShutdownOutcome::TimedOut {

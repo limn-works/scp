@@ -22,15 +22,16 @@
  *
  * NOTE: `SCP` is a NAPI-only feature in Phase 4 PR 1. The WASM bridge
  * does not expose a multi-instance class surface; attempting to
- * construct `SCP` in a browser environment throws `TransportError`
- * with `SCP-TRANS-5001`. WASM callers continue to use the free-function
+ * construct `SCP` in a browser environment throws `ValidationError`
+ * with `SCP-VALID-7005`. WASM callers continue to use the free-function
  * façade (which is a no-op for lifecycle methods on WASM per
  * `internal/wasm.ts`).
  */
 
 import { createRequire } from "node:module";
 
-import { TransportError } from "./errors";
+import { ValidationError } from "./errors";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 
 /**
  * Shape of the native addon — a subset sufficient to describe the
@@ -44,20 +45,23 @@ type NativeAddon = {
 };
 
 /**
- * Raw NAPI `SCP` class type once resolved.
+ * Raw NAPI `SCP` class type once resolved. `withPersistence` is
+ * intentionally omitted from this interface — the native factory
+ * still exists for internal use, but the SDK surface does not expose
+ * it until PR 3 wires a real `ContextPersistence` trait through (see
+ * #1260 and #1491).
  */
 interface NativeScpCtor {
   new (): NativeScpInstance;
   default: () => NativeScpInstance;
   withStorage: (configJson: string) => NativeScpInstance;
-  withPersistence: () => NativeScpInstance;
 }
 
 interface NativeScpInstance {
   readonly instanceId: string;
   suspend(): void;
   resume(): void;
-  shutdown(timeoutSecs: number): Promise<void>;
+  shutdown(timeoutMillis: number): Promise<void>;
 }
 
 /**
@@ -83,10 +87,14 @@ function resolveNapiPackage(): string {
   const pkg = platformMap[key];
 
   if (pkg === undefined) {
-    throw new TransportError(
+    // `SCP-VALID-7005` — structural unavailability, not a transport-layer
+    // fault. Using a validation code matches the Rust bridge's treatment
+    // of unknown storage types and keeps transport error codes reserved
+    // for actual relay connectivity failures.
+    throw new ValidationError(
       `No native addon available for platform ${key}. ` +
         "Install the appropriate @limn-works/scp-ts-napi-* package or use the WASM bridge in a browser environment.",
-      "SCP-TRANS-5001",
+      "SCP-VALID-7005",
     );
   }
 
@@ -98,8 +106,8 @@ function resolveNapiPackage(): string {
  *
  * Cached on first successful load.
  *
- * @throws {TransportError} If the addon cannot be loaded or lacks the
- *   `SCP` class.
+ * @throws {ValidationError} If the addon cannot be loaded or lacks the
+ *   `SCP` class — code `SCP-VALID-7005`.
  */
 let _nativeScp: NativeScpCtor | null = null;
 
@@ -108,12 +116,15 @@ function nativeScp(): NativeScpCtor {
     return _nativeScp;
   }
 
-  // Running in a browser with no `process` / `module` APIs.
+  // Running in a browser with no `process` / `module` APIs. This is a
+  // structural incompatibility, not a transport fault — the WASM bridge
+  // does not expose a multi-instance class surface (ADR-034 / ADR-048).
+  // `SCP-VALID-7005` marks "unsupported configuration" across all bridges.
   if (typeof process === "undefined" || !process.versions?.node) {
-    throw new TransportError(
+    throw new ValidationError(
       "SCP class is not available in browser (WASM) environments. " +
         "Use the free-function façade for WASM or move the SCP() call to a Node/Bun server.",
-      "SCP-TRANS-5001",
+      "SCP-VALID-7005",
     );
   }
 
@@ -123,18 +134,21 @@ function nativeScp(): NativeScpCtor {
     const req = createRequire(import.meta.url);
     addon = req(packageName) as NativeAddon;
   } catch (cause) {
-    throw new TransportError(
+    // Installation-time failure — also structural ("package not
+    // present" is the same kind of signal as "platform not supported"),
+    // not a transport issue.
+    throw new ValidationError(
       `Failed to load native addon ${packageName}: ${(cause as Error)?.message ?? cause}. ` +
         `Ensure the package is installed: bun install ${packageName}`,
-      "SCP-TRANS-5001",
+      "SCP-VALID-7005",
     );
   }
 
   if (typeof addon.SCP !== "function") {
-    throw new TransportError(
+    throw new ValidationError(
       `${packageName} does not export the SCP class. ` +
         "Rebuild the native addon with the Phase 4 PR 1 codebase (cargo build -p scp-ffi-napi).",
-      "SCP-TRANS-5001",
+      "SCP-VALID-7005",
     );
   }
 
@@ -150,10 +164,16 @@ function nativeScp(): NativeScpCtor {
  * Storage configuration forwarded to the native `SCP.withStorage`
  * factory.
  *
- * Phase 4 PR 1 accepts only `{ type: "in_memory" }`. PR 3 adds
- * SQLite-backed storage. Unknown types raise `SCP-VALID-7005`.
+ * Phase 4 PR 1 accepts only `{ type: "in_memory" }`. Unknown types
+ * raise `SCP-VALID-7005`.
+ *
+ * Intentionally a closed union — the open `{ type: string; ... }`
+ * branch swallowed typos and drifted from the Rust-side enum. PR 3
+ * will extend this with
+ * `{ type: "sqlite"; path: string; key: string }` once the FFI
+ * boundary for encrypted filesystem storage lands.
  */
-export type StorageConfig = { type: "in_memory" } | { type: string; [k: string]: unknown };
+export type StorageConfig = { type: "in_memory" };
 
 /**
  * Constructor options for `new SCP(...)`.
@@ -161,13 +181,6 @@ export type StorageConfig = { type: "in_memory" } | { type: string; [k: string]:
 export interface ScpOptions {
   /** Storage configuration. Defaults to in-memory when omitted. */
   storage?: StorageConfig;
-  /**
-   * Opaque persistence provider placeholder. Reserved for PR 3 where
-   * the real `ContextPersistence` trait is wired through NAPI.
-   * Providing any non-null value currently constructs an in-memory
-   * instance identical to the default path.
-   */
-  persistence?: unknown;
 }
 
 // ---------------------------------------------------------------------------
@@ -200,8 +213,8 @@ export class SCP {
    * Constructs a fresh `SCP` instance.
    *
    * @param options Optional constructor options.
-   * @throws {TransportError} If no NAPI addon is available (browser
-   *   runtime or missing platform package).
+   * @throws {ValidationError} If no NAPI addon is available (browser
+   *   runtime or missing platform package) — code `SCP-VALID-7005`.
    */
   constructor(options: ScpOptions = {}) {
     // Internal fast-path used by the `default()` factory to adopt a
@@ -214,12 +227,7 @@ export class SCP {
     }
 
     const NativeScp = nativeScp();
-    if (options.persistence !== undefined && options.persistence !== null) {
-      // PR 1 placeholder — the native factory currently returns a
-      // fresh in-memory instance identical to `new NativeScp()`. PR 3
-      // wires the real persistence provider through.
-      this.#native = NativeScp.withPersistence();
-    } else if (options.storage !== undefined) {
+    if (options.storage !== undefined) {
       this.#native = NativeScp.withStorage(JSON.stringify(options.storage));
     } else {
       this.#native = new NativeScp();
@@ -235,9 +243,15 @@ export class SCP {
    * This is what the deprecated free-function façade uses under the
    * hood. Prefer explicit construction (`new SCP()`) in new code.
    *
-   * @throws {TransportError} If the NAPI addon is unavailable.
+   * Emits a one-time `console.warn` on first call per JS runtime so
+   * legacy call sites are visible even when the free-function façade
+   * isn't exercised. Removal target: two release cycles after Phase 4
+   * merge (ADR-048).
+   *
+   * @throws {ValidationError} If the NAPI addon is unavailable.
    */
   static default(): SCP {
+    deprecatedDefaultInstance("SCP.default");
     const NativeScp = nativeScp();
     const native = NativeScp.default();
     return new SCP({ [ADOPT_HANDLE]: native } as ScpOptions);
@@ -283,9 +297,16 @@ export class SCP {
    * Drains in-flight tasks within `timeoutSecs` seconds. Second and
    * subsequent calls are no-ops.
    *
+   * Fractional seconds (e.g. `0.25`) are preserved to millisecond
+   * resolution before crossing the FFI boundary — the native side
+   * takes a `u32` millisecond count. Negative values are clamped to
+   * zero.
+   *
    * @param timeoutSecs Maximum seconds to wait. Defaults to 5.
+   *   Floats are honored at 1 ms granularity.
    */
   async shutdown(timeoutSecs: number = 5): Promise<void> {
-    await this.#native.shutdown(timeoutSecs);
+    const millis = Math.max(0, Math.floor(timeoutSecs * 1000));
+    await this.#native.shutdown(millis);
   }
 }

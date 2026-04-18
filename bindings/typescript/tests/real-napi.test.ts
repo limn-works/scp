@@ -111,7 +111,10 @@ if (bridge === null || serverAddon === null) {
   // ---------------------------------------------------------------------------
 
   afterAll(() => {
-    napi.shutdown(1);
+    // Shutdown timeout is in milliseconds after #1549 Phase 4 unit
+    // unification — 1000 ms (1 second) gives pending tasks time to
+    // drain without stalling the suite.
+    napi.shutdown(1000);
     if (relayHandle && !relayHandle.isShutdown) {
       relayHandle.shutdown();
     }

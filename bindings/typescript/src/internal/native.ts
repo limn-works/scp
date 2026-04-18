@@ -230,17 +230,22 @@ export function createNativeBridge(): Bridge {
       )(handle, identityDid, payloadArray, spendingUcanJwt ?? null);
     },
 
-    contextSubscribe(
+    async contextSubscribe(
       handle: BridgeContextHandle,
       identityDid: string,
       callback: MessageCallback,
-    ): void {
-      (
+    ): Promise<void> {
+      // NAPI `context_subscribe` is `async` after coder H's #1549 Phase 4
+      // PR 1 changes — the subscription task is now registered against
+      // the bridge's `JoinSet` / cancel token so shutdown drains it
+      // deterministically. The returned Promise resolves once the
+      // subscription task is registered (not when it completes).
+      await (
         addon.contextSubscribe as (
           h: BridgeContextHandle,
           d: string,
           cb: (msg: Message | null) => void,
-        ) => void
+        ) => Promise<void>
       )(handle, identityDid, (msg) => {
         if (msg === null) {
           callback.onComplete();

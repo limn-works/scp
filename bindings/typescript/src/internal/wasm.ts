@@ -825,11 +825,15 @@ export function createWasmBridge(): Bridge {
       }
     },
 
-    contextSubscribe(
+    // WASM `context_subscribe` is still synchronous — the WASM bridge
+    // registers subscriptions inline rather than spawning runtime tasks
+    // (ADR-034). The async signature mirrors NAPI for API parity; the
+    // Promise resolves immediately once registration returns.
+    async contextSubscribe(
       handle: BridgeContextHandle,
       _identityDid: string,
       callback: MessageCallback,
-    ): void {
+    ): Promise<void> {
       const wasm = getWasm();
       wasm.context_subscribe(handle, {
         onMessage: (msg) => {

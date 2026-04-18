@@ -30,12 +30,20 @@ Example usage::
 
 from __future__ import annotations
 
+import warnings
 from types import TracebackType
 from typing import Any
 
 from scp_sdk.errors import ScpError
 
 __all__ = ["SCP"]
+
+# Sentinel tracking whether `SCP.default()` has already emitted its
+# one-time DeprecationWarning. Module-level state keyed by nothing (there
+# is exactly one default instance per process) — matches the
+# `_deprecation._emitted` one-time-per-interpreter contract for the
+# free-function façade.
+_default_deprecation_emitted = False
 
 
 def _native_cls() -> Any:
@@ -92,7 +100,6 @@ class SCP:
         self,
         *,
         storage: dict[str, Any] | None = None,
-        persistence: object | None = None,
     ) -> None:
         """Construct a fresh :class:`SCP` instance.
 
@@ -100,22 +107,19 @@ class SCP:
             only ``{"type": "in_memory"}`` is supported; PR 3 adds
             ``{"type": "sqlite", "path": "..."}``. When ``None``, defaults
             to in-memory storage.
-        :param persistence: Optional persistence provider. In PR 1 this
-            parameter is accepted for API forward-compatibility but has no
-            effect — PR 3 wires the real :class:`ContextPersistence`
-            plumbing through the FFI boundary. Passing a non-``None`` value
-            currently constructs an in-memory instance and does not raise.
         :raises ValidationError: If ``storage`` contains an unknown
             ``type``.
+
+        .. note::
+
+           A ``persistence`` parameter is reserved but not yet exposed at
+           the SDK surface. PR 3 wires the real
+           :class:`ContextPersistence` plumbing through the FFI boundary
+           and re-introduces it with a real signature — see #1260 and
+           #1491 to subscribe to progress.
         """
         cls = _native_cls()
-        if persistence is not None:
-            # PR 1: persistence provider accepted for API shape only.
-            # Delegates to the native `with_persistence` factory which
-            # currently behaves identically to `new()`. PR 3 wires the
-            # real ContextPersistence trait through.
-            self._native = cls.with_persistence()
-        elif storage is not None:
+        if storage is not None:
             self._native = cls.with_storage(storage)
         else:
             self._native = cls()
@@ -133,10 +137,28 @@ class SCP:
         default-instance path is scheduled for removal two release cycles
         after Phase 4 merge (ADR-048).
 
+        Emits a one-time :class:`DeprecationWarning` on first call per
+        interpreter so legacy call sites are visible even when the
+        free-function façade isn't exercised.
+
         :returns: An :class:`SCP` handle on the shared default instance.
         :raises ContextError: If the default instance is currently
             suspended.
         """
+        global _default_deprecation_emitted
+        if not _default_deprecation_emitted:
+            _default_deprecation_emitted = True
+            warnings.warn(
+                (
+                    "SCP.default() returns the shared process-wide bridge "
+                    "instance and is deprecated — construct an explicit "
+                    "scp_sdk.SCP() per tenant/identity instead. Removal "
+                    "target: two release cycles after Phase 4 merge "
+                    "(ADR-048)."
+                ),
+                DeprecationWarning,
+                stacklevel=2,
+            )
         native_cls = _native_cls()
         instance = cls.__new__(cls)
         instance._native = native_cls.default_instance()
@@ -185,11 +207,17 @@ class SCP:
         no-op (the underlying :class:`ShutdownError::AlreadyShutDown` is
         swallowed at the SDK surface).
 
-        :param timeout: Maximum seconds to wait for in-flight tasks.
-            Clamped to ``max(0.0, timeout)`` on the native side.
+        :param timeout: Maximum seconds to wait for in-flight tasks
+            (float — fractional seconds are preserved to millisecond
+            resolution before crossing the FFI boundary). Negative values
+            are clamped to zero.
         :raises ContextError: If the tokio runtime is unavailable.
         """
-        self._native.shutdown(float(timeout))
+        # Native shutdown accepts unsigned milliseconds; clamp negatives
+        # to zero, round down to the nearest millisecond so we never
+        # quietly extend the caller's budget, and forward as u64.
+        millis = max(0, int(float(timeout) * 1000))
+        self._native.shutdown(millis)
 
     def __enter__(self) -> SCP:
         """Enter the context-manager scope — returns ``self``."""

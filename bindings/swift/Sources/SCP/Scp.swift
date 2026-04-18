@@ -21,13 +21,17 @@ import Foundation
 // in `ScpBindings.swift`. In local dev the file is intentionally guarded
 // behind `#if canImport` checks for editor clarity, but the production
 // build path assumes the generated class is present.
+//
+// Persistence parameter: intentionally omitted at the SDK surface until
+// PR 3 wires the real `ContextPersistence` trait through — see issues
+// #1260 and #1491 for progress.
 
 /// Caller-owned SCP instance — the preferred SDK entry point.
 ///
 /// ```swift
 /// let scp = SCP()                                // fresh in-memory instance
 /// let shared = try SCP.default()                 // process-wide default
-/// try await scp.shutdown(timeoutSecs: 5)         // graceful shutdown
+/// try await scp.shutdown(timeout: 5.0)           // graceful shutdown
 /// ```
 ///
 /// Each `SCP` wraps an independent UniFFI `Scp` handle. Handles minted
@@ -69,6 +73,11 @@ public final class SCP: @unchecked Sendable {
     ///
     /// - Throws: ``ScpError/context`` if the default instance is currently
     ///   suspended or permanently shut down.
+    @available(
+        *,
+        deprecated,
+        message: "SCP.default() returns the shared process-wide bridge instance. Construct `SCP()` explicitly per tenant/identity instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+    )
     public static func `default`() throws -> SCP {
         try SCP(inner: Scp.defaultInstance())
     }
@@ -81,12 +90,13 @@ public final class SCP: @unchecked Sendable {
         SCP(inner: Scp.withStorage(config: config))
     }
 
-    /// Constructs an `SCP` with an explicit persistence provider
-    /// placeholder (Phase 4 PR 1 has no real persistence wiring; PR 3
-    /// threads the `scp_core::context::ContextPersistence` trait through).
-    public static func withPersistence() -> SCP {
-        SCP(inner: Scp.withPersistence())
-    }
+    // NOTE: A `withPersistence` factory is intentionally not exposed at
+    // the Swift SDK surface until PR 3 wires the real
+    // `scp_core::context::ContextPersistence` trait through UniFFI.
+    // Track progress via issues #1260 and #1491. The underlying UniFFI
+    // `Scp.withPersistence()` factory still exists for internal use
+    // but should not be called through the SDK layer until it has a
+    // real signature.
 
     /// The monotonic identifier for this bridge instance, unique per
     /// process. Used by the FFI handle-affinity check.
@@ -117,13 +127,26 @@ public final class SCP: @unchecked Sendable {
 
     /// Shuts down this instance with a graceful deadline.
     ///
-    /// Awaits in-flight tasks up to `timeoutSecs` seconds, aborts any
+    /// Awaits in-flight tasks up to `timeout` seconds, aborts any
     /// remaining tasks, then runs typed-field cleanup. Permanent. A
     /// second call is a no-op.
     ///
-    /// - Parameter timeoutSecs: Maximum seconds to wait for in-flight
-    ///   tasks. Defaults to 5.
-    public func shutdown(timeoutSecs: UInt64 = 5) async throws {
-        try await inner.shutdown(timeoutSecs: timeoutSecs)
+    /// Fractional seconds (e.g. `0.25`) are preserved to millisecond
+    /// resolution before crossing the UniFFI boundary — the native
+    /// side takes a `u64` millisecond count. Negative values are
+    /// clamped to zero.
+    ///
+    /// - Parameter timeout: Maximum wall-clock duration to wait for
+    ///   in-flight tasks, expressed as a ``Foundation/TimeInterval``
+    ///   (`Double` seconds). Defaults to `5.0`.
+    public func shutdown(timeout: TimeInterval = 5.0) async throws {
+        // Clamp negative durations to zero and convert to unsigned
+        // milliseconds. `TimeInterval.rounded(.down)` ensures we never
+        // silently extend the caller's budget when converting from
+        // Double-seconds to UInt64-millis.
+        let millis: UInt64 = timeout <= 0
+            ? 0
+            : UInt64((timeout * 1000).rounded(.down))
+        try await inner.shutdown(timeoutMillis: millis)
     }
 }

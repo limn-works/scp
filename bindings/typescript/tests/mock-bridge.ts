@@ -362,11 +362,11 @@ export function createMockBridge(): Bridge & {
       }
     },
 
-    contextSubscribe(
+    async contextSubscribe(
       handle: BridgeContextHandle,
       _identityDid: string,
       callback: MessageCallback,
-    ): void {
+    ): Promise<void> {
       const ctx = contexts.get(handle.contextId);
       if (ctx === undefined) {
         throw new Error(`[SCP-CTX-2001] Context not found: ${handle.contextId}`);

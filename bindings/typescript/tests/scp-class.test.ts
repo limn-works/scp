@@ -104,27 +104,24 @@ describe.skipIf(!addon)(`SCP class (Phase 4 PR 1) [${skipReason}]`, () => {
     expect(scp.instanceId).not.toBe("0");
   });
 
-  test("handle affinity is enforced: handle from SCP A cannot be used on SCP B", async () => {
-    // Both calls go through the free-function façade which always uses the
-    // default instance. A handle minted by `identityCreate` therefore
-    // carries the default `instance_id`. When we call a bridge function
-    // that checks affinity, it passes because the handle's id matches the
-    // default's id.
-    //
-    // To exercise a mismatch we would need a second `SCP` instance whose
-    // methods actually mint handles. Those methods migrate onto `SCP` in
-    // PR 2; for PR 1 we assert that handles from the default path pass the
-    // check and that the affinity infrastructure compiled correctly.
+  test("handles minted through the default bridge are stamped with the default instance id", async () => {
+    // PR 1 only mints handles through the default bridge (the free-function
+    // façade; per-instance mint methods migrate onto `SCP` in PR 2). This
+    // test therefore verifies the *stamping* invariant — every handle
+    // carries a base-10 u64 `instanceId` string that matches the default
+    // instance's id — not a cross-instance mismatch. Cross-instance
+    // rejection lives in the Rust-side affinity test suite
+    // (`bridge_instance` tests in `crates/scp-ffi/common`) and will gain
+    // a JS-level assertion once PR 2 lands per-instance mint methods.
     if (typeof addon.identityCreate !== "function") {
       // No identity API exposed — can't exercise the affinity path.
       return;
     }
-    // Instantiate SCP.default() to ensure the default bridge is initialized.
-    addon.SCP.default();
+    const defaultInstance = addon.SCP.default();
     const identity = await addon.identityCreate("in_memory");
-    // The handle should have a stringified instance id that parses > 0.
     expect(typeof identity.instanceId).toBe("string");
     expect(identity.instanceId).not.toBe("0");
+    expect(identity.instanceId).toBe(defaultInstance.instanceId);
   });
 
   test("suspend / resume round-trip succeeds", () => {
@@ -133,18 +130,19 @@ describe.skipIf(!addon)(`SCP class (Phase 4 PR 1) [${skipReason}]`, () => {
     expect(() => scp.resume()).not.toThrow();
   });
 
-  test("shutdown(timeout) resolves without error", async () => {
+  test("shutdown(timeoutMillis) resolves without error", async () => {
     const scp = new addon.SCP();
-    // Use 1 second — enough for any pending tasks, short enough to not
-    // stall the suite.
-    await expect(scp.shutdown(1)).resolves.toBeUndefined();
+    // Native `SCP.shutdown` takes unsigned milliseconds after the #1549
+    // Phase 4 unit unification — 1000 ms is enough for any pending
+    // tasks and short enough to not stall the suite.
+    await expect(scp.shutdown(1000)).resolves.toBeUndefined();
   });
 
   test("shutdown is idempotent — a second call resolves without error", async () => {
     const scp = new addon.SCP();
-    await expect(scp.shutdown(1)).resolves.toBeUndefined();
+    await expect(scp.shutdown(1000)).resolves.toBeUndefined();
     // Second call should not throw — AlreadyShutDown maps to a harmless
     // lifecycle observation on the SDK surface.
-    await expect(scp.shutdown(1)).resolves.toBeUndefined();
+    await expect(scp.shutdown(1000)).resolves.toBeUndefined();
   });
 });

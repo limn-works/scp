@@ -107,7 +107,7 @@ export interface Bridge {
     handle: BridgeContextHandle,
     identityDid: string,
     callback: MessageCallback,
-  ): void;
+  ): Promise<void>;
   contextCancelSubscription(handle: BridgeContextHandle): void;
 
   // Membership queries

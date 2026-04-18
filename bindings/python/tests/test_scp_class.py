@@ -69,14 +69,16 @@ def test_suspend_resume_shutdown_lifecycle() -> None:
     scp = SCP()
     scp.suspend()
     scp.resume()
-    scp.shutdown(1.0)
+    # Native `SCP.shutdown` takes unsigned milliseconds after the
+    # #1549 Phase 4 unit unification. 1 s = 1000 ms.
+    scp.shutdown(1000)
 
 
 def test_shutdown_is_idempotent() -> None:
     """A second `shutdown()` call is a documented no-op."""
     scp = SCP()
-    scp.shutdown(1.0)
-    scp.shutdown(1.0)  # Must not raise.
+    scp.shutdown(1000)
+    scp.shutdown(1000)  # Must not raise.
 
 
 def test_with_storage_in_memory_constructs_instance() -> None:
