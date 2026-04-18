@@ -58,10 +58,15 @@ final class ScpClassTests: XCTestCase {
 
     /// `suspend()` followed by `resume()` must succeed on a fresh
     /// instance.
-    func testSuspendResumeRoundtrip() throws {
+    ///
+    /// `resume()` is `async throws` as of #1678 — UniFFI generates an
+    /// async Swift method because the underlying Rust `Scp::resume` is
+    /// `pub async fn` (transport reconnect + persisted-context
+    /// rehydration happen inside the future).
+    func testSuspendResumeRoundtrip() async throws {
         let scp = SCP()
         try scp.suspend()
-        try scp.resume()
+        try await scp.resume()
     }
 
     /// `shutdown(timeout:)` must complete within the deadline and
@@ -77,16 +82,35 @@ final class ScpClassTests: XCTestCase {
     /// `withStorage(.inMemory)` must produce a fresh instance with a
     /// non-zero id.
     ///
-    /// NOTE: `StorageConfig.inMemory` is the Phase 4 PR 1 surface; PR 3
-    /// adds filesystem-backed variants.
+    /// PR 3 added ``StorageConfig/sqlite(path:key:)`` alongside
+    /// ``StorageConfig/inMemory``; the SQLite variant has its own
+    /// convenience test below.
     func testWithStorageInMemoryProducesFreshInstance() {
         let scp = SCP.withStorage(.inMemory)
         XCTAssertGreaterThan(scp.instanceId, 0)
     }
 
-    // NOTE: The SDK surface intentionally does not expose a
-    // `withPersistence()` factory until PR 3 wires the real
-    // `ContextPersistence` trait through UniFFI (see Scp.swift
-    // comment above the `withStorage(_:)` factory, issues #1260
-    // and #1491). A corresponding test will land with PR 3.
+    /// `withStorage(sqliteDir:key:)` must open a `SQLCipher`-encrypted
+    /// database at `{sqliteDir}/scp.db` and return a fresh bridge
+    /// instance. Written to a per-test temporary directory so the test
+    /// is hermetic.
+    ///
+    /// PR 3 (#1260 / #1491).
+    func testWithStorageSqliteProducesFreshInstance() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("scp-swift-sqlite-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // 32 random bytes — `SQLCipher` accepts any length and derives
+        // the final key via PBKDF2.
+        var keyBytes = [UInt8](repeating: 0, count: 32)
+        for idx in keyBytes.indices {
+            keyBytes[idx] = UInt8.random(in: 0 ... 255)
+        }
+        let key = Data(keyBytes)
+
+        let scp = SCP.withStorage(sqliteDir: dir, key: key)
+        XCTAssertGreaterThan(scp.instanceId, 0)
+    }
 }
