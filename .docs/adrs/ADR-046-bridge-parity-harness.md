@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-04-17
 **Phase:** Phase 6 (production readiness, enforcement)
-**Related:** ADR-022 (language bindings), ADR-034 (WASM constraints), ADR-045 (fuzzing infra)
+**Related:** ADR-022 (language bindings), ADR-034 (WASM constraints), ADR-045 (fuzzing infra), ADR-047 (bridge symmetry enforcement — static surface-area parity; complements this ADR's runtime parity)
 
 ## Context
 

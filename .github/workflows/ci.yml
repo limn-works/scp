@@ -577,11 +577,20 @@ jobs:
         # Runs immediately after checkout — a 1-second grep should not wait
         # on ~10 minutes of toolchain setup and native builds below.
         # Guards against merging bindings/python/tests/bridge_parity/FOLLOWUP.md
-        # (or any bridge_parity doc) with literal "issue to be filed" strings.
+        # (or any bridge_parity doc) with unresolved issue placeholders.
         # Each xfail tracked in FOLLOWUP.md must resolve to a real #NNNN ref
         # before merge — CLAUDE.md forbids fabricated story references.
+        #
+        # Pattern is intentionally broad: matches angle-bracket sentinels
+        # containing "issue", "TODO", "TBD", or "placeholder". This catches
+        # common rewordings a reviewer might use to bypass a literal phrase
+        # match — e.g. "<TODO: file issue>", "<issue: pending>",
+        # "<TBD: will file later>", "<placeholder issue>". Harmless angle
+        # brackets like List<str> or <em>text</em> do not match. If you hit
+        # a false positive, resolve it to a real #NNNN ref rather than
+        # weakening the pattern.
         run: |
-          if grep -rn "issue to be filed" bindings/python/tests/bridge_parity/; then
+          if grep -rnE '<[^>]*(issue|TODO|TBD|placeholder)[^>]*>' bindings/python/tests/bridge_parity/; then
             echo "ERROR: Unresolved issue placeholder in bridge_parity docs. File the GitHub issues and substitute real #NNNN refs before merging." >&2
             exit 1
           fi

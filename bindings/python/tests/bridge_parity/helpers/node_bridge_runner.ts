@@ -329,7 +329,7 @@ async function dispatch(req: BridgeRequest): Promise<OkResponse | ErrResponse> {
           ok: false,
           error: {
             type: "UnknownOp",
-            code: "SCP-PARITY-1001",
+            code: "TEST-PARITY-1001",
             message: `unknown op: ${req.op}`,
           },
         };
@@ -506,7 +506,7 @@ async function main(): Promise<void> {
         ok: false,
         error: {
           type: "FrameError",
-          code: "SCP-PARITY-1000",
+          code: "TEST-PARITY-1000",
           message: String(err),
         },
       });
@@ -526,7 +526,7 @@ async function main(): Promise<void> {
         ok: false,
         error: {
           type: "ProtocolError",
-          code: "SCP-PARITY-1002",
+          code: "TEST-PARITY-1002",
           message: "malformed request",
         },
       });
