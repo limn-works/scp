@@ -19,30 +19,42 @@ use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams, c
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
 
 use crate::error::ScpNapiError;
+use crate::runtime::default_bridge_instance;
 
 // ---------------------------------------------------------------------------
 // Shared network
 // ---------------------------------------------------------------------------
+//
+// The shared `FullStackNetwork` lives as a typed field on
+// `NapiBridgeInstance` (see `crate::runtime::NapiBridgeInstance::network`).
+// Using the per-bridge slot (instead of a process-global singleton)
+// preserves the previous behaviour — all `fullstack_create_node` calls on
+// the same instance share a `KeyExchange` — while still allowing a
+// caller-owned `SCP` to keep its test network isolated from other
+// instances in the same process.
+//
+// `Mutex<Option<...>>` (rather than `OnceLock`) is used so tests can reset
+// the network between runs, preventing cross-test state leakage via the
+// `fullstack_reset_network` entry point.
+// ---------------------------------------------------------------------------
 
-/// Guards the shared `FullStackNetwork` instance.
+/// Returns the result of calling `f` with the default bridge instance's
+/// `FullStackNetwork`.
 ///
-/// Uses `Mutex<Option<...>>` instead of `OnceLock` so tests can reset
-/// the network between runs (preventing cross-test state leakage).
-static NETWORK: std::sync::Mutex<Option<FullStackNetwork>> = std::sync::Mutex::new(None);
-
-/// Returns a reference-counted handle to the shared `FullStackNetwork`.
-///
-/// All nodes created via `fullstack_create_node` share the same `KeyExchange`
-/// so Welcome messages and sender keys can be exchanged between them.
-fn with_network<F, R>(f: F) -> R
+/// All nodes created via `fullstack_create_node` on the same instance share
+/// the same `KeyExchange` so Welcome messages and sender keys can be
+/// exchanged between them.
+fn with_network<F, R>(f: F) -> napi::Result<R>
 where
     F: FnOnce(&FullStackNetwork) -> R,
 {
-    let mut guard = NETWORK
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .network()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let network = guard.get_or_insert_with(FullStackNetwork::new);
-    f(network)
+    Ok(f(network))
 }
 
 /// Returns a permissive key resolver that always returns `None`.
@@ -98,9 +110,8 @@ impl NapiFullStackNode {
 /// All nodes created via this function share a single `FullStackNetwork`
 /// (and therefore a single [`KeyExchange`]), enabling Welcome message and
 /// sender key exchange between them.
-#[must_use]
 #[napi]
-pub fn fullstack_create_node(did: String) -> NapiFullStackNode {
+pub fn fullstack_create_node(did: String) -> napi::Result<NapiFullStackNode> {
     let instance_id = crate::runtime::default_instance_id()
         .unwrap_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID);
     with_network(|network| {
@@ -113,15 +124,19 @@ pub fn fullstack_create_node(did: String) -> NapiFullStackNode {
     })
 }
 
-/// Resets the shared `FullStackNetwork`, dropping all nodes and state.
+/// Resets the default bridge instance's `FullStackNetwork`, dropping all
+/// nodes and state.
 ///
 /// Call between test suites to prevent cross-test state leakage.
 #[napi]
-pub fn fullstack_reset_network() {
-    let mut guard = NETWORK
+pub fn fullstack_reset_network() -> napi::Result<()> {
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .network()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *guard = None;
+    Ok(())
 }
 
 /// Creates an encrypted context owned by the given node.
