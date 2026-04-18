@@ -407,7 +407,8 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
         // dropping entries (aligned with NAPI bridge SCP-VALID-7037).
         let test_vectors = validate_test_vectors(&def).map_err(ScpWasmError::into_js)?;
 
-        let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
+        // Shared with every other bridge via `scp_ffi_common::tool_id`.
+        let tool_id = scp_ffi_common::tool_id::generate_tool_id(&name);
 
         let (implementation_hash, signature, cost, registered_at) = parse_provenance_fields(&def)?;
 
