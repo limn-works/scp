@@ -4129,6 +4129,64 @@ async fn flush_all_contexts_full_snapshot_when_lock_available() {
     );
 }
 
+// -----------------------------------------------------------------------
+// AC3 bug 2: `persist_context_snapshot` must set `needs_reconnect = true`
+// when `export_crypto_state` returns an error, so the restore path sees
+// the reconnection signal rather than silently restoring with an empty
+// crypto blob.
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn persist_context_snapshot_marks_reconnect_on_export_error() {
+    let persistence: Arc<MockContextPersistence> = Arc::new(MockContextPersistence::default());
+
+    // Build a crypto that fails export_crypto_state.
+    let crypto = MockCrypto::default();
+    crypto
+        .fail_export_crypto_state
+        .store(true, Ordering::Relaxed);
+
+    let manager = ContextManager::with_persistence(
+        Box::new(crypto),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        Box::new(SharedMockPersistence(Arc::clone(&persistence))),
+        noop_key_resolver(),
+    );
+
+    let _handle = manager
+        .create_context(
+            "reconnect-ctx".into(),
+            ContextParams::default(),
+            "did:key:creator".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Force a persistence event via the async flush path. This takes the
+    // lock, builds a snapshot, and calls `persist_context_snapshot` which
+    // is the exact code path where `export_crypto_state` returns Err.
+    manager.flush_all_contexts().await;
+
+    let persisted = persistence
+        .contexts
+        .lock()
+        .unwrap()
+        .get("reconnect-ctx")
+        .cloned()
+        .expect("snapshot must be persisted even on export_crypto_state error");
+    assert!(
+        persisted.needs_reconnect,
+        "export_crypto_state error must set needs_reconnect = true so restore \
+         fires the §23.11 reconnection pipeline"
+    );
+    assert!(
+        persisted.mls_crypto_state.is_empty(),
+        "crypto state blob must be empty when export fails"
+    );
+}
+
 /// Adapter that allows a single `MockContextPersistence` to back both the
 /// test observer (`Arc<MockContextPersistence>`) and the `ContextManager`
 /// (which takes a `Box<dyn ContextPersistence>`). All trait calls delegate

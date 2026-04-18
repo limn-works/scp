@@ -2675,17 +2675,29 @@ impl ContextManager {
         if let Some(ref persistence) = self.persistence {
             // Export MLS crypto state alongside the context snapshot (#645).
             // Populate `mls_crypto_state` in-place on the owned snapshot (#711).
-            // Best-effort: if export fails, persist without crypto state (the
-            // context will need reconnection on restore, matching §23.11 fallback).
+            //
+            // AC3 bug 2 fix: on export failure, mark the snapshot
+            // `needs_reconnect = true` and persist an empty crypto blob.
+            // Previously the error branch silently persisted a snapshot with
+            // a default (empty) `mls_crypto_state` and no reconnect signal
+            // — the restore path would then load the context, attempt to
+            // resume MLS encryption against an empty state, and fail in a
+            // way that required manual operator intervention. With the
+            // flag set, the restore path fires the §23.11 reconnection
+            // pipeline exactly as it would for any other unrecoverable
+            // crypto state, so the context heals automatically.
             let ctx_id_bytes = context_id_to_bytes(context_id);
             match self.crypto.export_crypto_state(&ctx_id_bytes) {
                 Ok(state) => snapshot.mls_crypto_state = state,
                 Err(e) => {
+                    snapshot.needs_reconnect = true;
+                    snapshot.mls_crypto_state = Vec::new();
                     tracing::warn!(
                         context_id = %context_id,
                         error = %e,
                         "failed to export MLS crypto state for persistence; \
-                         context will need reconnection on restore"
+                         snapshot marked needs_reconnect=true so restore \
+                         fires the §23.11 reconnection pipeline"
                     );
                 }
             }
