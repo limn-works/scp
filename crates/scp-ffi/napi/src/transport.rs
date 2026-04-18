@@ -141,7 +141,7 @@ pub(crate) fn with_transport_manager_mut<T>(
 
 /// Returns `true` if a transport manager has been initialized.
 fn has_transport_manager() -> bool {
-    crate::runtime::bridge_instance().is_ok_and(|bi| bi.has_transport())
+    crate::runtime::bridge_instance().is_ok_and(scp_ffi_common::CoreFields::has_transport)
 }
 
 /// Returns an `Arc` clone of the current transport manager, if one exists.
@@ -208,6 +208,10 @@ pub struct NapiTransportStatus {
 pub struct NapiTransportManager {
     /// Current connection state.
     status: std::sync::Mutex<NapiTransportStatus>,
+    /// `NapiBridgeInstance` id that minted this handle — used for handle
+    /// affinity checks at every FFI entry point. Mismatches are rejected
+    /// with `SCP-PERM-3030`.
+    pub(crate) instance_id: u64,
 }
 
 #[napi]
@@ -242,6 +246,14 @@ impl NapiTransportManager {
     #[must_use]
     pub fn relay_url(&self) -> Option<String> {
         self.status.lock().ok().and_then(|s| s.relay_url.clone())
+    }
+
+    /// Returns the id of the `SCP` instance that minted this handle, as a
+    /// base-10 string (u64 serialized as string to survive JS number limits).
+    #[napi(getter, js_name = "instanceId")]
+    #[must_use]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
     }
 }
 
@@ -332,6 +344,7 @@ pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportM
                     relay_url: Some(relay_url),
                     latency_ms: Some(latency),
                 }),
+                instance_id: crate::runtime::default_instance_id()?,
             };
             increment_handle_count();
             Ok(handle)
@@ -825,6 +838,7 @@ mod tests {
                 relay_url: Some("wss://relay.example.com".to_owned()),
                 latency_ms: Some(42.0),
             }),
+            instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
         }
     }
 

@@ -98,6 +98,10 @@ pub struct NapiUcanToken {
     pub(crate) data: NapiUcanTokenData,
     /// Raw encoded JWT string — retained for validation and delegation operations.
     encoded: String,
+    /// `NapiBridgeInstance` id that minted this token — used for handle
+    /// affinity checks at every FFI entry point. Mismatches are rejected
+    /// with `SCP-PERM-3030`.
+    pub(crate) instance_id: u64,
 }
 
 #[napi]
@@ -169,6 +173,14 @@ impl NapiUcanToken {
     #[allow(clippy::missing_const_for_fn)] // napi getter cannot be const
     pub fn expires_at(&self) -> Option<f64> {
         self.data.expires_at
+    }
+
+    /// Returns the id of the `SCP` instance that minted this token, as a
+    /// base-10 string (u64 serialized as string to survive JS number limits).
+    #[napi(getter, js_name = "instanceId")]
+    #[must_use]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
     }
 }
 
@@ -420,6 +432,7 @@ pub async fn ucan_mint(
         Ok(NapiUcanToken {
             data,
             encoded: token.encoded,
+            instance_id: crate::runtime::default_instance_id()?,
         })
     }
 }
@@ -601,6 +614,7 @@ pub async fn ucan_delegate(
         Ok(NapiUcanToken {
             data,
             encoded: token.encoded,
+            instance_id: crate::runtime::default_instance_id()?,
         })
     }
 }

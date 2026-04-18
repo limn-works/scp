@@ -135,6 +135,12 @@ pub struct NapiContextHandle {
     /// the first successful call; reset to `false` when the spawned task exits,
     /// enabling re-subscription after relay disconnect or task termination.
     pub(crate) subscription_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Identifier of the `NapiBridgeInstance` that minted this handle.
+    /// Checked at every FFI entry point that accepts the handle (see
+    /// [`crate::runtime::default_instance_id`] and the
+    /// [`napi_check_handle!`](crate::napi_check_handle) macro). Rejects
+    /// cross-instance misuse with `SCP-PERM-3030`.
+    pub(crate) instance_id: u64,
 }
 
 /// Internal context lifecycle state string helper.
@@ -248,6 +254,14 @@ impl NapiContextHandle {
     pub fn economic_policy(&self) -> Option<String> {
         self.economic_policy.clone()
     }
+
+    /// Returns the id of the `SCP` instance that minted this handle, as a
+    /// base-10 string (u64 serialized as string to survive JS number limits).
+    #[napi(getter, js_name = "instanceId")]
+    #[must_use]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
+    }
 }
 
 impl NapiContextHandle {
@@ -319,6 +333,7 @@ impl NapiContextHandle {
             core_handle: None,
             subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
             subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
         }
     }
 }
@@ -391,6 +406,7 @@ pub async fn context_create(
     identity: &NapiIdentity,
     params_json: String,
 ) -> napi::Result<NapiContextHandle> {
+    crate::napi_check_handle!(identity);
     validate_did(&identity.inner.did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
@@ -581,6 +597,7 @@ pub async fn context_create(
         core_handle: Some(core_handle),
         subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
         subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        instance_id: crate::runtime::default_instance_id()?,
     };
     increment_handle_count();
     Ok(handle)
@@ -605,6 +622,7 @@ pub async fn context_join(
     identity_did: String,
     spending_ucan_jwt: Option<String>,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
@@ -728,6 +746,7 @@ pub async fn context_join(
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Context {
@@ -769,6 +788,7 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     // Authorization is enforced by the ContextManager (which delegates to
     // ttl::close_context checking the ContextClose capability). No bridge-layer
     // auth check — the ContextManager is authoritative.
@@ -829,6 +849,7 @@ pub async fn context_send(
     payload: Vec<u8>,
     spending_ucan_jwt: Option<String>,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
@@ -3640,6 +3661,7 @@ mod tests {
             core_handle: None,
             subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
             subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
         };
 
         // Initially None.

@@ -84,6 +84,8 @@ pub struct NapiMcpInvokeResult {
 #[napi]
 pub struct NapiMcpServerHandle {
     handle_id: String,
+    /// `NapiBridgeInstance` id that minted this handle.
+    pub(crate) instance_id: u64,
 }
 
 #[napi]
@@ -93,6 +95,14 @@ impl NapiMcpServerHandle {
     #[must_use]
     pub fn handle_id(&self) -> String {
         self.handle_id.clone()
+    }
+
+    /// Returns the id of the `SCP` instance that minted this handle, as a
+    /// base-10 string.
+    #[napi(getter, js_name = "instanceId")]
+    #[must_use]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
     }
 }
 
@@ -106,6 +116,8 @@ impl Drop for NapiMcpServerHandle {
 #[napi]
 pub struct NapiMcpClientHandle {
     handle_id: String,
+    /// `NapiBridgeInstance` id that minted this handle.
+    pub(crate) instance_id: u64,
 }
 
 #[napi]
@@ -115,6 +127,14 @@ impl NapiMcpClientHandle {
     #[must_use]
     pub fn handle_id(&self) -> String {
         self.handle_id.clone()
+    }
+
+    /// Returns the id of the `SCP` instance that minted this handle, as a
+    /// base-10 string.
+    #[napi(getter, js_name = "instanceId")]
+    #[must_use]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
     }
 }
 
@@ -553,7 +573,10 @@ pub async fn mcp_server_create(config: NapiMcpServerConfig) -> napi::Result<Napi
     mcp_server_registry().insert(handle_id.clone(), entry);
     crate::increment_handle_count();
 
-    Ok(NapiMcpServerHandle { handle_id })
+    Ok(NapiMcpServerHandle {
+        handle_id,
+        instance_id: crate::runtime::default_instance_id()?,
+    })
 }
 
 /// Stops a running MCP server.
@@ -629,7 +652,10 @@ pub async fn mcp_client_connect_stdio(command: Vec<String>) -> napi::Result<Napi
     mcp_client_registry().insert(handle_id.clone(), entry);
     crate::increment_handle_count();
 
-    Ok(NapiMcpClientHandle { handle_id })
+    Ok(NapiMcpClientHandle {
+        handle_id,
+        instance_id: crate::runtime::default_instance_id()?,
+    })
 }
 
 /// Connects to an external MCP server via SSE transport.
@@ -654,7 +680,10 @@ pub async fn mcp_client_connect_sse(url: String) -> napi::Result<NapiMcpClientHa
     mcp_client_registry().insert(handle_id.clone(), entry);
     crate::increment_handle_count();
 
-    Ok(NapiMcpClientHandle { handle_id })
+    Ok(NapiMcpClientHandle {
+        handle_id,
+        instance_id: crate::runtime::default_instance_id()?,
+    })
 }
 
 /// Disconnects from an external MCP server.

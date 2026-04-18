@@ -139,6 +139,8 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
 #[napi]
 pub struct NapiRelayHandle {
     inner: RunningRelay,
+    /// `NapiBridgeInstance` id that minted this handle.
+    pub(crate) instance_id: u64,
 }
 
 // napi-rs `#[napi(getter)]` generates wrappers that cannot be `const` or
@@ -173,6 +175,13 @@ impl NapiRelayHandle {
     pub fn shutdown(&self) {
         self.inner.shutdown();
     }
+
+    /// Returns the id of the `SCP` instance that minted this handle, as a
+    /// base-10 string.
+    #[napi(getter, js_name = "instanceId")]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
+    }
 }
 
 impl Drop for NapiRelayHandle {
@@ -195,6 +204,8 @@ impl Drop for NapiRelayHandle {
 #[napi]
 pub struct NapiNodeHandle {
     inner: RunningNode,
+    /// `NapiBridgeInstance` id that minted this handle.
+    pub(crate) instance_id: u64,
 }
 
 #[napi]
@@ -409,6 +420,13 @@ impl NapiNodeHandle {
     pub async fn http_url(&self) -> Option<String> {
         self.inner.http_url().await
     }
+
+    /// Returns the id of the `SCP` instance that minted this handle, as a
+    /// base-10 string.
+    #[napi(getter, js_name = "instanceId")]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
+    }
 }
 
 impl Drop for NapiNodeHandle {
@@ -515,7 +533,10 @@ fn build_node_identity(_did: &str) -> napi::Result<NodeIdentity> {
 pub async fn relay_start_in_memory() -> napi::Result<NapiRelayHandle> {
     let relay = server::start_relay_in_memory().await.map_err(server_err)?;
     increment_handle_count();
-    Ok(NapiRelayHandle { inner: relay })
+    Ok(NapiRelayHandle {
+        inner: relay,
+        instance_id: crate::runtime::default_instance_id()?,
+    })
 }
 
 /// Starts a relay with redb-backed blob storage on an OS-assigned port.
@@ -534,7 +555,10 @@ pub async fn relay_start_local(data_dir: String) -> napi::Result<NapiRelayHandle
         .await
         .map_err(server_err)?;
     increment_handle_count();
-    Ok(NapiRelayHandle { inner: relay })
+    Ok(NapiRelayHandle {
+        inner: relay,
+        instance_id: crate::runtime::default_instance_id()?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +615,7 @@ pub async fn node_start_in_memory(identity_did: Option<String>) -> napi::Result<
     increment_handle_count();
     Ok(NapiNodeHandle {
         inner: RunningNode::InMemory(node),
+        instance_id: crate::runtime::default_instance_id()?,
     })
 }
 
@@ -648,6 +673,7 @@ pub async fn node_start_local(
     increment_handle_count();
     Ok(NapiNodeHandle {
         inner: RunningNode::Filesystem(node),
+        instance_id: crate::runtime::default_instance_id()?,
     })
 }
 

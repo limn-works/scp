@@ -451,6 +451,18 @@ impl From<scp_ffi_common::validate::ValidationError> for ScpNapiError {
     }
 }
 
+impl From<scp_ffi_common::bridge_instance::HandleAffinityError> for ScpNapiError {
+    fn from(e: scp_ffi_common::bridge_instance::HandleAffinityError) -> Self {
+        // Sanitized message — never exposes the raw ids. PERM_3030 lets
+        // callers programmatically distinguish this from other permission
+        // errors.
+        Self::Permission {
+            message: format!("{e}"),
+            code: codes::PERM_3030.to_owned(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
