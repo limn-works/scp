@@ -62,15 +62,34 @@ use scp_platform::encrypting_adapter::EncryptingAdapter;
 
 /// Storage configuration for [`UniffiBridgeInstance`].
 ///
-/// Phase 4 PR 1 exposes only the in-memory variant; the `SQLite` variant lands
-/// in PR 3 alongside [`scp_platform::sqlite::SqliteStorage`]. Kept here (not
-/// in `scp-ffi-common`) because each bridge owns its own storage shape until
-/// the shared type lands.
+/// Two variants are supported:
+/// - [`StorageConfig::InMemory`] — encrypted in-memory storage (ephemeral).
+/// - [`StorageConfig::Sqlite`] — SQLCipher-encrypted storage on disk at
+///   `{path}/scp.db`, wired through [`scp_platform::sqlite::SqliteStorage`].
+///
+/// Kept here (not in `scp-ffi-common`) because each bridge owns its own
+/// storage shape until a shared type lands.
+///
+/// # `UniFFI` representation
+///
+/// `#[derive(uniffi::Enum)]` exposes this to Swift and Kotlin as an
+/// associated-value enum. Swift will see `case sqlite(path: String, key:
+/// Data)`; Kotlin `sealed class StorageConfig.Sqlite(path: String, key:
+/// ByteArray)`. The raw key is accepted as a byte array; callers should
+/// zero their copy after the call returns.
 #[derive(Debug, Clone, Default, uniffi::Enum)]
 pub enum StorageConfig {
-    /// Encrypted in-memory storage — the only variant supported in PR 1.
+    /// Encrypted in-memory storage.
     #[default]
     InMemory,
+    /// SQLCipher-encrypted on-disk storage at `{path}/scp.db`.
+    Sqlite {
+        /// Directory the database file is created in. Path is passed
+        /// through `std::path::PathBuf` on the Rust side.
+        path: String,
+        /// Raw encryption key material (typically 32 bytes).
+        key: Vec<u8>,
+    },
 }
 
 /// `UniFFI`-specific concrete bridge instance.
@@ -175,14 +194,21 @@ impl UniffiBridgeInstance {
 
     /// Constructs a new `UniffiBridgeInstance` honoring a [`StorageConfig`].
     ///
-    /// Only [`StorageConfig::InMemory`] is supported in PR 1; PR 3 adds the
-    /// `SQLite` variant once [`scp_platform::sqlite::SqliteStorage`] is wired
-    /// through the FFI boundary. The current implementation is equivalent
-    /// to [`UniffiBridgeInstance::new_uniffi`].
+    /// - [`StorageConfig::InMemory`] — equivalent to
+    ///   [`UniffiBridgeInstance::new_uniffi`]; no persistence provider is
+    ///   attached to the embedded `CoreFields`.
+    /// - [`StorageConfig::Sqlite`] — wired in a later commit inside this PR.
+    ///   For now the variant is accepted and ignored (no persistence). This
+    ///   keeps the public API change atomic without partially-wired state.
     #[must_use]
     pub fn with_storage_uniffi(config: StorageConfig) -> Self {
         match config {
             StorageConfig::InMemory => Self::new_uniffi(),
+            StorageConfig::Sqlite { path: _, key: _ } => {
+                // Wired in commit 3. The variant is accepted so the shape
+                // of the public API is stable from commit 1 on.
+                Self::new_uniffi()
+            }
         }
     }
 

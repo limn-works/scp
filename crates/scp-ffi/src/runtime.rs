@@ -78,9 +78,13 @@ use scp_ffi_common::bridge_instance::{BridgeInstanceCore, ShutdownError, Shutdow
 pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_identity::cache::SystemClock;
 use scp_identity::{DidDocument, ScpIdentity};
+use scp_platform::PlatformError;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
+use scp_platform::sqlite::SqliteStorage;
 use scp_platform::testing::InMemoryStorage;
+use scp_platform::traits::Storage;
 use scp_primitives::Clock;
+use std::path::PathBuf;
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
@@ -196,13 +200,121 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
 
 /// Storage configuration selector for [`PyBridgeInstance::with_storage_py`].
 ///
-/// PR 1 ships with only the in-memory variant; the `SQLite` variant lands in a
-/// follow-up commit. Keeping this as an enum (instead of a string parameter)
-/// means adding `SQLite` is an additional variant, not a breaking API change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Two variants are supported:
+/// - [`StorageConfig::InMemory`] — encrypted in-memory storage (ephemeral).
+/// - [`StorageConfig::Sqlite`] — persistent SQLCipher-encrypted storage on
+///   disk. The `key` is the raw encryption key material held in
+///   [`Zeroizing`] so it is wiped from memory as soon as the config is
+///   consumed.
+///
+/// Keeping this as an enum (instead of a string parameter) means adding future
+/// variants is an additional arm, not a breaking API change.
+#[derive(Debug, Clone)]
 pub enum StorageConfig {
     /// In-memory encrypted storage (default; lost on process exit).
     InMemory,
+    /// SQLCipher-encrypted storage at `{path}/scp.db`.
+    ///
+    /// Wraps [`scp_platform::sqlite::SqliteStorage`]. Persists across
+    /// process restarts. The `key` is raw encryption key material wrapped in
+    /// [`Zeroizing`] so the caller's copy is wiped after construction.
+    Sqlite {
+        /// Directory the database file is created in.
+        path: PathBuf,
+        /// Raw encryption key material (32 bytes recommended).
+        key: Zeroizing<Vec<u8>>,
+    },
+}
+
+/// Concrete storage provider backing a [`PyBridgeInstance`].
+///
+/// Wraps one of two encrypted storage backends. Implements
+/// [`scp_platform::traits::Storage`] by dispatching method calls to the
+/// inner backend inside a single `async move { match }` block, which keeps
+/// the RPITIT return type consistent across variants.
+///
+/// Both inner types also satisfy `EncryptedStorage`, but the enum itself is
+/// not `EncryptedStorage` because the sealed trait lives in `scp-platform`
+/// and cannot be implemented here. Call sites that need
+/// [`scp_core::store::ProtocolRepository`] dispatch on the variant and
+/// construct the concrete `ProtocolRepository<S>` directly (see
+/// [`build_persistence_provider`]).
+#[derive(Clone)]
+pub enum StorageProvider {
+    /// Encrypted in-memory storage.
+    InMemoryEncrypted(Arc<EncryptingAdapter<InMemoryStorage>>),
+    /// SQLCipher-encrypted on-disk storage.
+    Sqlite(Arc<SqliteStorage>),
+}
+
+impl StorageProvider {
+    /// Constructs an in-memory encrypted provider with a fresh random key.
+    #[must_use]
+    pub fn new_in_memory_encrypted() -> Self {
+        let mut key = Zeroizing::new([0u8; 32]);
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
+        Self::InMemoryEncrypted(Arc::new(EncryptingAdapter::new(
+            InMemoryStorage::new(),
+            key,
+        )))
+    }
+
+    /// Constructs a `SQLCipher`-encrypted provider at the given directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError::StorageError`] if the database cannot be
+    /// opened or the encryption key is rejected. The key material is
+    /// consumed (moved) so that the original `Zeroizing<Vec<u8>>` is
+    /// dropped — `SQLCipher` retains its own derived key internally.
+    pub fn new_sqlite(path: &std::path::Path, key: &[u8]) -> Result<Self, PlatformError> {
+        let storage = SqliteStorage::new(path, key)?;
+        Ok(Self::Sqlite(Arc::new(storage)))
+    }
+}
+
+impl Storage for StorageProvider {
+    async fn store(&self, key: &str, data: &[u8]) -> Result<(), PlatformError> {
+        match self {
+            Self::InMemoryEncrypted(s) => s.store(key, data).await,
+            Self::Sqlite(s) => s.store(key, data).await,
+        }
+    }
+
+    async fn retrieve(&self, key: &str) -> Result<Option<Vec<u8>>, PlatformError> {
+        match self {
+            Self::InMemoryEncrypted(s) => s.retrieve(key).await,
+            Self::Sqlite(s) => s.retrieve(key).await,
+        }
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), PlatformError> {
+        match self {
+            Self::InMemoryEncrypted(s) => s.delete(key).await,
+            Self::Sqlite(s) => s.delete(key).await,
+        }
+    }
+
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, PlatformError> {
+        match self {
+            Self::InMemoryEncrypted(s) => s.list_keys(prefix).await,
+            Self::Sqlite(s) => s.list_keys(prefix).await,
+        }
+    }
+
+    async fn delete_prefix(&self, prefix: &str) -> Result<u64, PlatformError> {
+        match self {
+            Self::InMemoryEncrypted(s) => s.delete_prefix(prefix).await,
+            Self::Sqlite(s) => s.delete_prefix(prefix).await,
+        }
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, PlatformError> {
+        match self {
+            Self::InMemoryEncrypted(s) => s.exists(key).await,
+            Self::Sqlite(s) => s.exists(key).await,
+        }
+    }
 }
 
 /// `PyO3`-specific concrete bridge instance owning the bridge-agnostic
@@ -227,11 +339,12 @@ pub struct PyBridgeInstance {
     /// crate concrete type that `scp-ffi-common` cannot know about.
     pub(crate) identity_registry: Arc<DashMap<String, IdentityEntry>>,
 
-    /// Encrypted storage provider (`InMemoryStorage` wrapped in
-    /// `EncryptingAdapter`). `OnceLock` because it is set once at
-    /// `py_init_storage` time. Typed because the `Storage` trait is not
-    /// dyn-compatible (RPITIT).
-    pub(crate) storage_provider: OnceLock<Arc<EncryptingAdapter<InMemoryStorage>>>,
+    /// Encrypted storage provider — [`StorageProvider`] enum dispatching
+    /// between `EncryptingAdapter<InMemoryStorage>` and `SqliteStorage`.
+    /// `OnceLock` because it is set once at `py_init_storage` (or
+    /// construction) time. Typed (not `dyn`) because the `Storage` trait is
+    /// not dyn-compatible (RPITIT).
+    pub(crate) storage_provider: OnceLock<StorageProvider>,
 }
 
 impl PyBridgeInstance {
@@ -263,21 +376,43 @@ impl PyBridgeInstance {
     /// Constructs a new `PyBridgeInstance` configured per the given
     /// [`StorageConfig`].
     ///
-    /// For `StorageConfig::InMemory` (the only variant in PR 1), a new
-    /// `EncryptingAdapter<InMemoryStorage>` is created with a random
-    /// AES-256-GCM key and stored in `storage_provider`. `SQLite` wiring lands
-    /// in PR 3 as an additional match arm.
+    /// - [`StorageConfig::InMemory`] — creates an
+    ///   `EncryptingAdapter<InMemoryStorage>` with a random AES-256-GCM key.
+    /// - [`StorageConfig::Sqlite`] — opens a SQLCipher-encrypted database at
+    ///   `{path}/scp.db`. If opening fails, the bridge instance is returned
+    ///   without storage and the caller sees an empty `storage_provider()`
+    ///   accessor, matching the existing "storage not initialized" error
+    ///   path. Errors are logged via `tracing::error!` so they are not
+    ///   silently swallowed.
+    ///
+    /// For fallible construction that surfaces the `SQLite` error, use
+    /// [`PyBridgeInstance::new_py`] + [`PyBridgeInstance::init_sqlite_storage`].
     #[must_use]
     pub fn with_storage_py(cfg: StorageConfig) -> Self {
         let instance = Self::new_py();
         match cfg {
             StorageConfig::InMemory => {
-                let mut key = Zeroizing::new([0u8; 32]);
-                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
-                let encrypted = Arc::new(EncryptingAdapter::new(InMemoryStorage::new(), key));
                 // OnceLock: first set wins. `new_py()` leaves this unset, so
                 // this set always succeeds.
-                let _ = instance.storage_provider.set(encrypted);
+                let _ = instance
+                    .storage_provider
+                    .set(StorageProvider::new_in_memory_encrypted());
+            }
+            StorageConfig::Sqlite { path, key } => {
+                match StorageProvider::new_sqlite(&path, &key) {
+                    Ok(provider) => {
+                        let _ = instance.storage_provider.set(provider);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            path = %path.display(),
+                            "with_storage_py: SqliteStorage::new failed — instance created without storage"
+                        );
+                    }
+                }
+                // `key` is `Zeroizing<Vec<u8>>`, zeroed on drop here.
+                drop(key);
             }
         }
         instance
@@ -291,7 +426,7 @@ impl PyBridgeInstance {
 
     /// Returns a reference to the storage provider if initialized.
     #[must_use]
-    pub fn storage_provider(&self) -> Option<&Arc<EncryptingAdapter<InMemoryStorage>>> {
+    pub fn storage_provider(&self) -> Option<&StorageProvider> {
         self.storage_provider.get()
     }
 
@@ -306,12 +441,36 @@ impl PyBridgeInstance {
     ///
     /// Returns `ScpPyError::ContextError` if storage was already set.
     pub fn init_in_memory_storage(&self) -> Result<(), ScpPyError> {
-        let mut key = Zeroizing::new([0u8; 32]);
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut *key);
-        let encrypted = Arc::new(EncryptingAdapter::new(InMemoryStorage::new(), key));
-        self.storage_provider.set(encrypted).map_err(|_| {
+        self.storage_provider
+            .set(StorageProvider::new_in_memory_encrypted())
+            .map_err(|_| {
+                ScpPyError::context(
+                    "storage already initialized — py_init_storage may only be called once per SCP instance"
+                        .to_owned(),
+                )
+            })
+    }
+
+    /// Initializes a SQLCipher-encrypted storage provider on this instance.
+    ///
+    /// Opens a database at `{path}/scp.db` with the given raw encryption
+    /// key. Subsequent calls return an error (`OnceLock` semantics).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpPyError::ContextError` if storage was already set or if
+    /// `SqliteStorage::new` fails (database open, schema creation, or
+    /// encryption key rejection).
+    pub fn init_sqlite_storage(
+        &self,
+        path: &std::path::Path,
+        key: &[u8],
+    ) -> Result<(), ScpPyError> {
+        let provider = StorageProvider::new_sqlite(path, key)
+            .map_err(|e| ScpPyError::context(format!("failed to open SQLite storage: {e}")))?;
+        self.storage_provider.set(provider).map_err(|_| {
             ScpPyError::context(
-                "storage already initialized — py_init_storage may only be called once per SCP instance"
+                "storage already initialized — init_sqlite_storage may only be called once per SCP instance"
                     .to_owned(),
             )
         })
@@ -639,10 +798,15 @@ fn build_persistence_provider() -> Option<Box<dyn ContextPersistence>> {
     DEFAULT_BRIDGE_INSTANCE
         .get()?
         .storage_provider()
-        .map(|storage| {
-            let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
-            Box::new(ProtocolRepositoryContextBridge::new(protocol_repository))
-                as Box<dyn ContextPersistence>
+        .map(|provider| match provider {
+            StorageProvider::InMemoryEncrypted(storage) => {
+                let repo = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+                Box::new(ProtocolRepositoryContextBridge::new(repo)) as Box<dyn ContextPersistence>
+            }
+            StorageProvider::Sqlite(storage) => {
+                let repo = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+                Box::new(ProtocolRepositoryContextBridge::new(repo)) as Box<dyn ContextPersistence>
+            }
         })
 }
 
@@ -1455,7 +1619,7 @@ pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
 /// Returns `ScpPyError::IdentityError` if storage has not been initialized
 /// via [`init_storage`], or `ScpPyError::ContextError` if the bridge has
 /// not been initialized.
-pub fn get_storage() -> Result<&'static Arc<EncryptingAdapter<InMemoryStorage>>, ScpPyError> {
+pub fn get_storage() -> Result<&'static StorageProvider, ScpPyError> {
     let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
         ScpPyError::identity(
             "bridge not initialized — call identity_create before storage operations".to_owned(),

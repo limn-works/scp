@@ -55,16 +55,30 @@ use crate::identity::OpaqueInMemoryKeyCustody;
 
 /// Storage configuration for [`NapiBridgeInstance`].
 ///
-/// During Phase 4 PR 1 only the in-memory variant is exposed; the
-/// `SQLite` variant lands in PR 3 alongside
-/// [`scp_platform::sqlite::SqliteStorage`]. Kept here (not in
-/// `scp-ffi-common`) because each bridge owns its own storage shape until
-/// the shared type lands.
+/// Two variants are supported:
+/// - [`StorageConfig::InMemory`] — encrypted in-memory storage (ephemeral).
+/// - [`StorageConfig::Sqlite`] — SQLCipher-encrypted storage on disk at
+///   `{path}/scp.db`, wired through [`scp_platform::sqlite::SqliteStorage`].
+///
+/// Kept here (not in `scp-ffi-common`) because each bridge owns its own
+/// storage shape until a shared type lands.
 #[derive(Debug, Clone, Default)]
 pub enum StorageConfig {
-    /// Encrypted in-memory storage — the only variant supported in PR 1.
+    /// Encrypted in-memory storage.
     #[default]
     InMemory,
+    /// SQLCipher-encrypted on-disk storage.
+    ///
+    /// Persists context snapshots, identity state, and the event log
+    /// across process restarts. The `key` is raw encryption key material
+    /// wrapped in [`Zeroizing`] so the caller's copy is zeroed after the
+    /// variant is consumed.
+    Sqlite {
+        /// Directory the database file is created in.
+        path: std::path::PathBuf,
+        /// Raw encryption key material (32 bytes recommended).
+        key: zeroize::Zeroizing<Vec<u8>>,
+    },
 }
 
 /// NAPI-specific concrete bridge instance.
@@ -155,14 +169,21 @@ impl NapiBridgeInstance {
 
     /// Constructs a new `NapiBridgeInstance` honoring a [`StorageConfig`].
     ///
-    /// Only [`StorageConfig::InMemory`] is supported in PR 1; PR 3 adds the
-    /// `SQLite` variant once [`scp_platform::sqlite::SqliteStorage`] is wired
-    /// through the FFI boundary. The current implementation is equivalent
-    /// to [`NapiBridgeInstance::new_napi`].
+    /// - [`StorageConfig::InMemory`] — equivalent to
+    ///   [`NapiBridgeInstance::new_napi`]; no persistence provider is
+    ///   attached to the embedded `CoreFields`.
+    /// - [`StorageConfig::Sqlite`] — wired in a later commit inside this PR.
+    ///   For now the variant is accepted and ignored (no persistence). This
+    ///   keeps the public API change atomic without partially-wired state.
     #[must_use]
     pub fn with_storage_napi(config: StorageConfig) -> Self {
         match config {
             StorageConfig::InMemory => Self::new_napi(),
+            StorageConfig::Sqlite { path: _, key: _ } => {
+                // Wired in commit 3. The variant is accepted so the shape
+                // of the public API is stable from commit 1 on.
+                Self::new_napi()
+            }
         }
     }
 

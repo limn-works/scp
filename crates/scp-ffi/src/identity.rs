@@ -40,11 +40,9 @@ use scp_identity::{
     DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, InMemoryDhtClient,
     NoOpRelayQuerier, ScpIdentity,
 };
-use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::file::FileKeyCustody;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
-use scp_platform::testing::InMemoryStorage;
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_primitives::Clock;
 
@@ -564,13 +562,12 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
             );
 
             // Persist identity state if storage is initialized (SCP-217).
-            // Bind to concrete type to resolve method ambiguity with the
-            // Arc<T>: Storage blanket impl (issue #329).
-            if let Ok(arc_storage) = crate::runtime::get_storage() {
-                let s: &EncryptingAdapter<InMemoryStorage> = arc_storage.as_ref();
+            // `storage` is `&StorageProvider` — impls `Storage` via enum
+            // dispatch (no Arc blanket-impl ambiguity).
+            if let Ok(storage) = crate::runtime::get_storage() {
                 let key = identity_state_key(&did);
                 let data = serialize_identity_state(&did, &custody_str);
-                s.store(&key, &data).await.map_err(|e| {
+                storage.store(&key, &data).await.map_err(|e| {
                     ScpPyError::identity(format!("failed to persist identity state: {e}"))
                 })?;
             }
@@ -632,13 +629,12 @@ fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<
             );
 
             // Persist identity state if storage is initialized (SCP-217).
-            // Bind to concrete type to resolve method ambiguity with the
-            // Arc<T>: Storage blanket impl (issue #329).
-            if let Ok(arc_storage) = crate::runtime::get_storage() {
-                let s: &EncryptingAdapter<InMemoryStorage> = arc_storage.as_ref();
+            // `storage` is `&StorageProvider` — impls `Storage` via enum
+            // dispatch (no Arc blanket-impl ambiguity).
+            if let Ok(storage) = crate::runtime::get_storage() {
                 let key = identity_state_key(&did);
                 let data = serialize_identity_state(&did, &custody_str);
-                s.store(&key, &data).await.map_err(|e| {
+                storage.store(&key, &data).await.map_err(|e| {
                     ScpPyError::identity(format!("failed to persist identity state: {e}"))
                 })?;
             }
@@ -698,14 +694,13 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
             ))));
         }
 
-        let arc_storage = crate::runtime::get_storage().map_err(PyErr::from)?;
+        let storage = crate::runtime::get_storage().map_err(PyErr::from)?;
 
         rt.block_on(async {
             let key = identity_state_key(&did_owned);
-            // Bind to concrete type to resolve method ambiguity with the
-            // Arc<T>: Storage blanket impl (issue #329).
-            let s: &EncryptingAdapter<InMemoryStorage> = arc_storage.as_ref();
-            let data = s
+            // `storage` is `&StorageProvider` which impls `Storage` directly
+            // via enum dispatch — no Arc blanket-impl ambiguity.
+            let data = storage
                 .retrieve(&key)
                 .await
                 .map_err(|e| {
