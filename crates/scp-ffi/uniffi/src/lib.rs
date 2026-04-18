@@ -69,11 +69,38 @@ use std::time::Duration;
 
 pub mod bridge;
 pub mod runtime;
+pub mod scp;
 
 // Server startup (relay + application node) — behind the `server` feature on
 // scp-ffi-common. Not available for WASM (ADR-034).
 #[cfg(feature = "server")]
 pub mod server;
+
+// Handle-affinity macro for every `#[uniffi::export]` entry that accepts a
+// handle with a stored `instance_id`. Expands to a call to
+// [`crate::runtime::check_handle_affinity`] which maps mismatches to
+// [`crate::ScpError::Permission`] with error code `SCP-PERM-3030`.
+//
+// Handle types must implement [`crate::runtime::HandleInstance`] so the
+// expansion `HandleInstance::instance_id(handle)` resolves regardless of
+// whether the caller passes `&T`, `&Arc<T>`, or `Arc<T>`.
+//
+// Usage:
+//
+// ```ignore
+// uniffi_check_handle!(handle);
+// uniffi_check_handle!(identity, context_handle);  // multiple in sequence
+// ```
+#[macro_export]
+macro_rules! uniffi_check_handle {
+    ($($handle:expr),+ $(,)?) => {{
+        $(
+            $crate::runtime::check_handle_affinity(
+                $crate::runtime::AsHandleInstance::as_handle_instance_id(&$handle)
+            )?;
+        )+
+    }};
+}
 
 // Re-export all bridge public items so UniFFI can find them at the crate root.
 pub use bridge::{
@@ -216,6 +243,10 @@ pub use server::{
     relay_start_local,
 };
 
+// `SCP` — caller-owned bridge instance, exposed to Swift and Kotlin.
+pub use runtime::StorageConfig;
+pub use scp::Scp;
+
 // Include the minimal UDL-generated scaffolding. The UDL file contains only
 // the namespace anchor. All types and functions are defined via proc-macros.
 uniffi::include_scaffolding!("scp");
@@ -307,30 +338,43 @@ pub(crate) fn decrement_handle_count() {
 /// scpShutdown(timeoutSecs: 5)
 /// ```
 #[uniffi::export]
-pub fn scp_shutdown(timeout_secs: u64) {
-    // Shut down the BridgeInstance first (clears registries, runs hooks,
-    // disconnects transport). Best-effort: if the instance was never
-    // initialized or is already shut down, this is a no-op.
+// `async` required so UniFFI generates Swift `async` / Kotlin `suspend`
+// bindings that await the instance shutdown. In test builds the `.await`
+// path is `#[cfg(not(test))]`-gated, so clippy sees no awaits locally.
+#[allow(clippy::unused_async)]
+pub async fn scp_shutdown(timeout_secs: u64) -> Result<(), bridge::ScpError> {
+    // Shut down the default UniffiBridgeInstance first (clears registries,
+    // runs hooks, disconnects transport). Best-effort: if the instance was
+    // never initialized or is already shut down, this is treated as a
+    // harmless lifecycle observation.
     //
     // Skip in test builds: shutdown permanently poisons the OnceLock-based
-    // BridgeInstance, destroying contexts from concurrently-running tests.
+    // default instance, destroying contexts from concurrently-running tests.
     #[cfg(not(test))]
-    if let Some(bi) = runtime::bridge_instance_raw()
-        && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bi.shutdown())).is_err()
     {
-        tracing::error!("BridgeInstance shutdown panicked — cleanup may be incomplete");
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
+        if let Some(bi) = runtime::default_bridge_instance_raw() {
+            match bi
+                .shutdown(std::time::Duration::from_secs(timeout_secs))
+                .await
+            {
+                Ok(_) => {}
+                // AlreadyShutDown is idempotent at the public surface.
+                Err(_already) => {}
+            }
+        }
     }
 
-    if timeout_secs == 0 {
-        return;
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    while HANDLE_COUNT.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    if timeout_secs > 0 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        while HANDLE_COUNT.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
     // The tokio runtime (`RUNTIME`) is a static and will be dropped on
     // process exit. This function ensures language-side cleanup completes
     // before that point.
+    Ok(())
 }
 
 /// Suspends the bridge instance for mobile app backgrounding.
@@ -360,8 +404,8 @@ pub fn scp_shutdown(timeout_secs: u64) {
 /// Returns `ScpError::Transport` if transport cleanup fails.
 #[uniffi::export]
 pub fn scp_suspend() -> Result<(), bridge::ScpError> {
-    if let Some(bi) = runtime::bridge_instance_raw() {
-        bi.suspend().map_err(|e| bridge::ScpError::Transport {
+    if let Some(bi) = runtime::default_bridge_instance_raw() {
+        bi.core.suspend().map_err(|e| bridge::ScpError::Transport {
             msg: format!("suspend failed: {e}"),
             code: codes::TRANS_5001.to_owned(),
         })?;
@@ -382,8 +426,8 @@ pub fn scp_suspend() -> Result<(), bridge::ScpError> {
 /// Returns `ScpError::Context` if the instance has been permanently shut down.
 #[uniffi::export]
 pub fn scp_resume() -> Result<(), bridge::ScpError> {
-    if let Some(bi) = runtime::bridge_instance_raw() {
-        bi.resume().map_err(|e| bridge::ScpError::Context {
+    if let Some(bi) = runtime::default_bridge_instance_raw() {
+        bi.core.resume().map_err(|e| bridge::ScpError::Context {
             msg: format!("resume failed: {e}"),
             code: codes::CTX_2000.to_owned(),
         })?;
@@ -975,7 +1019,10 @@ mod tests {
     #[test]
     fn scp_shutdown_zero_timeout_returns_immediately() {
         // Should return without hanging even if handles are live.
-        scp_shutdown(0);
+        let rt = runtime();
+        rt.block_on(async {
+            let _ = scp_shutdown(0).await;
+        });
     }
 
     // -----------------------------------------------------------------------

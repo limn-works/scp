@@ -458,6 +458,18 @@ impl From<scp_ffi_common::validate::ValidationError> for ScpError {
     }
 }
 
+impl From<scp_ffi_common::bridge_instance::HandleAffinityError> for ScpError {
+    fn from(e: scp_ffi_common::bridge_instance::HandleAffinityError) -> Self {
+        // Sanitized message — never exposes the raw ids. PERM_3030 lets
+        // callers programmatically distinguish this from other permission
+        // errors.
+        Self::Permission {
+            msg: format!("{e}"),
+            code: codes::PERM_3030.to_owned(),
+        }
+    }
+}
+
 impl From<scp_identity::IdentityError> for ScpError {
     fn from(e: scp_identity::IdentityError) -> Self {
         Self::Identity {
@@ -1349,10 +1361,24 @@ pub struct Identity {
     /// `None` for in-memory and external custody.
     #[allow(dead_code)]
     pub(crate) callback_custody: Option<Arc<CallbackKeyCustody>>,
+    /// Monotonic identifier of the bridge instance that minted this handle.
+    ///
+    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// every `#[uniffi::export]` entry that accepts an `Identity`. Mismatches
+    /// map to `ScpError::Permission` with code `SCP-PERM-3030`.
+    pub(crate) instance_id: u64,
 }
 
 #[uniffi::export]
 impl Identity {
+    /// Returns the monotonic identifier of the bridge instance that minted
+    /// this handle.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     /// Returns the DID string for this identity.
     #[must_use]
     pub fn did(&self) -> String {
@@ -1413,6 +1439,7 @@ impl Identity {
                 #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody: None,
                 callback_custody: self.callback_custody.clone(),
+                instance_id: self.instance_id,
             });
             increment_handle_count();
             return Ok(handle);
@@ -1433,6 +1460,7 @@ impl Identity {
                 core_document: Some(new_document),
                 in_memory_custody: self.in_memory_custody.clone(),
                 callback_custody: None,
+                instance_id: self.instance_id,
             });
             increment_handle_count();
             return Ok(handle);
@@ -1549,6 +1577,7 @@ impl Identity {
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             let in_memory_custody = Some(custody.clone());
+            let instance_id = self.instance_id;
             let dht = make_dht_with_signer(&custody)?;
 
             runtime()
@@ -1565,6 +1594,7 @@ impl Identity {
                         core_document: Some(updated_doc),
                         in_memory_custody,
                         callback_custody: None,
+                        instance_id,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -1637,6 +1667,7 @@ impl Identity {
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             let in_memory_custody = self.in_memory_custody.clone();
+            let instance_id = self.instance_id;
             let dht = make_dht_with_signer(custody)?;
 
             runtime()
@@ -1653,6 +1684,7 @@ impl Identity {
                         core_document: Some(updated_doc),
                         in_memory_custody,
                         callback_custody: None,
+                        instance_id,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -1723,6 +1755,7 @@ impl Identity {
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             let in_memory_custody = Some(custody.clone());
+            let instance_id = self.instance_id;
             let dht = make_dht_with_signer(&custody)?;
 
             runtime()
@@ -1739,6 +1772,7 @@ impl Identity {
                         core_document: Some(updated_doc),
                         in_memory_custody,
                         callback_custody: None,
+                        instance_id,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -1809,6 +1843,12 @@ pub struct ContextHandle {
     /// Core context parameters, retained for `finalize_close` (`memory_scope`
     /// governs key destruction) and `restore_context`.
     pub(crate) core_context_params: scp_core::context::ContextParams,
+    /// Monotonic identifier of the bridge instance that minted this handle.
+    ///
+    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// every `#[uniffi::export]` entry that accepts a `ContextHandle`.
+    /// Mismatches map to `ScpError::Permission` with code `SCP-PERM-3030`.
+    pub(crate) instance_id: u64,
 }
 
 impl std::fmt::Debug for ContextHandle {
@@ -1823,6 +1863,14 @@ impl std::fmt::Debug for ContextHandle {
 
 #[uniffi::export]
 impl ContextHandle {
+    /// Returns the monotonic identifier of the bridge instance that minted
+    /// this handle.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     /// Returns the context's unique identifier.
     pub fn context_id(&self) -> String {
         self.context_id.clone()
@@ -1883,10 +1931,23 @@ pub struct UcanToken {
     pub(crate) data: UcanTokenData,
     /// Raw encoded JWT string — used by `ucan_revoke` and `ucan_validate`.
     pub(crate) encoded: String,
+    /// Monotonic identifier of the bridge instance that minted this handle.
+    ///
+    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// every `#[uniffi::export]` entry that accepts a `UcanToken`.
+    pub(crate) instance_id: u64,
 }
 
 #[uniffi::export]
 impl UcanToken {
+    /// Returns the monotonic identifier of the bridge instance that minted
+    /// this handle.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     /// Returns the token's stable metadata record.
     #[must_use]
     pub fn token_data(&self) -> UcanTokenData {
@@ -1958,6 +2019,11 @@ impl Drop for UcanToken {
 pub struct TransportManager {
     /// Current connection state (relay URL, latency).
     pub(crate) status: std::sync::Mutex<TransportStatus>,
+    /// Monotonic identifier of the bridge instance that minted this handle.
+    ///
+    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// every `#[uniffi::export]` entry that accepts a `TransportManager`.
+    pub(crate) instance_id: u64,
 }
 
 impl fmt::Debug for TransportManager {
@@ -1965,7 +2031,8 @@ impl fmt::Debug for TransportManager {
         let adapter_count = crate::runtime::bridge_instance()
             .ok()
             .and_then(|bi| {
-                bi.with_transport(scp_transport::TransportManager::adapter_count)
+                bi.core
+                    .with_transport(scp_transport::TransportManager::adapter_count)
                     .ok()
             })
             .unwrap_or(0);
@@ -1999,6 +2066,14 @@ pub struct ReliabilityScoreRecord {
 
 #[uniffi::export]
 impl TransportManager {
+    /// Returns the monotonic identifier of the bridge instance that minted
+    /// this handle.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     /// Returns the current transport connection status record.
     ///
     /// Reflects actual connection state: `connected` is `true` only if the
@@ -2006,7 +2081,7 @@ impl TransportManager {
     pub fn status(&self) -> TransportStatus {
         let has_adapters = crate::runtime::bridge_instance()
             .ok()
-            .and_then(|bi| bi.with_transport(|mgr| mgr.adapter_count() > 0).ok())
+            .and_then(|bi| bi.core.with_transport(|mgr| mgr.adapter_count() > 0).ok())
             .unwrap_or(false);
         let status = self.status.lock().map_or(
             TransportStatus {
@@ -2027,7 +2102,7 @@ impl TransportManager {
     pub fn is_connected(&self) -> bool {
         crate::runtime::bridge_instance()
             .ok()
-            .and_then(|bi| bi.with_transport(|mgr| mgr.adapter_count() > 0).ok())
+            .and_then(|bi| bi.core.with_transport(|mgr| mgr.adapter_count() > 0).ok())
             .unwrap_or(false)
     }
 
@@ -2036,7 +2111,11 @@ impl TransportManager {
     pub fn adapter_count(&self) -> u32 {
         crate::runtime::bridge_instance()
             .ok()
-            .and_then(|bi| bi.with_transport(|mgr| mgr.adapter_count() as u32).ok())
+            .and_then(|bi| {
+                bi.core
+                    .with_transport(|mgr| mgr.adapter_count() as u32)
+                    .ok()
+            })
             .unwrap_or(0)
     }
 
@@ -2079,6 +2158,7 @@ impl TransportManager {
         let suppression_rx = adapter.take_suppression_receiver();
 
         let count = bi
+            .core
             .with_transport_mut(|mgr| {
                 let _eviction = mgr.add_adapter(Box::new(adapter));
                 #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
@@ -2119,6 +2199,7 @@ impl TransportManager {
         validate_context_id(&context_id)?;
         let bi = crate::runtime::bridge_instance()?;
         let indices = bi
+            .core
             .with_transport(|mgr| {
                 mgr.assign_relay_set(&context_id)
                     .map_err(|e| ScpError::Transport {
@@ -2144,6 +2225,7 @@ impl TransportManager {
     pub fn reliability_score(&self, adapter_index: u32) -> Option<ReliabilityScoreRecord> {
         let bi = crate::runtime::bridge_instance().ok()?;
         let score = bi
+            .core
             .with_transport(|mgr| mgr.get_reliability_score(adapter_index as usize))
             .ok()??;
         Some(ReliabilityScoreRecord {
@@ -2197,7 +2279,7 @@ fn spawn_suppression_scoring_task(
                 relay_url = %relay_url,
                 "heartbeat suppression → downgrading relay reliability score"
             );
-            let _ = bi.with_transport(|inner| {
+            let _ = bi.core.with_transport(|inner| {
                 inner.update_score(&relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
             });
         }
@@ -2331,6 +2413,7 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                             core_document: Some(document),
                             in_memory_custody: Some(key_custody),
                             callback_custody: None,
+                            instance_id: crate::runtime::default_instance_id()?,
                         });
                         increment_handle_count();
                         Ok(handle)
@@ -2422,6 +2505,7 @@ pub async fn identity_create_with_custody(
                 #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody: None,
                 callback_custody: Some(callback_custody),
+                instance_id: crate::runtime::default_instance_id()?,
             });
             increment_handle_count();
             Ok(handle)
@@ -2460,6 +2544,7 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
 
             // identity_load returns a DID-string-only handle. Key operations
             // require the KeyCustodyProvider callback interface to be wired.
+            crate::runtime::ensure_bridge_instance();
             let handle = Arc::new(Identity {
                 did,
                 custody_type: CustodyMethod::External,
@@ -2468,6 +2553,7 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
                 #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody: None,
                 callback_custody: None,
+                instance_id: crate::runtime::default_instance_id()?,
             });
             increment_handle_count();
             Ok(handle)
@@ -2547,6 +2633,7 @@ pub async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> {
 /// See §9.3, issue #362, #419.
 #[uniffi::export]
 pub async fn identity_attest_device(identity: Arc<Identity>) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(identity);
     identity_attest_device_impl(identity).await
 }
 
@@ -2711,10 +2798,22 @@ fn identity_link_attestation_registry()
 #[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn identity_custody_registry()
 -> &'static dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
-    static REGISTRY: std::sync::OnceLock<
+    // Phase 4 PR 1: the registry now lives as a typed field on the default
+    // `UniffiBridgeInstance`. Ensure the default instance exists, then borrow
+    // its typed field as a `&'static` — safe because the `DEFAULT_BRIDGE_INSTANCE`
+    // `OnceLock<Arc<_>>` is itself `'static`, and the `Arc<DashMap<...>>` it
+    // holds never moves.
+    //
+    // Fallback empty registry when the default instance fails to initialize
+    // (unreachable in practice; kept so the signature stays infallible).
+    static EMPTY: std::sync::OnceLock<
         dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)>,
     > = std::sync::OnceLock::new();
-    REGISTRY.get_or_init(dashmap::DashMap::new)
+    crate::runtime::ensure_bridge_instance();
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY.get_or_init(dashmap::DashMap::new),
+        |bi| bi.identity_custody_registry.as_ref(),
+    )
 }
 
 /// Creates an identity link attestation for an external platform identity.
@@ -2730,6 +2829,7 @@ pub async fn identity_create_link_attestation(
     verification_method: String,
     platform_id: Option<String>,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(identity);
     identity_create_link_attestation_impl(
         identity,
         platform,
@@ -2983,6 +3083,7 @@ pub async fn context_create(
     identity: Arc<Identity>,
     params: ContextParams,
 ) -> Result<Arc<ContextHandle>, ScpError> {
+    crate::uniffi_check_handle!(identity);
     runtime()
         .spawn(async move {
             validate_did(&identity.did)?;
@@ -3127,6 +3228,7 @@ pub async fn context_create(
                 ),
                 economic_policy: std::sync::Mutex::new(None),
                 core_context_params: retained_core_params,
+                instance_id: identity.instance_id,
             });
             // Register in the global context handle registry so the MCP
             // bridge provider can look up per-context state by context ID.
@@ -3163,6 +3265,7 @@ pub async fn context_join(
     identity: Arc<Identity>,
     spending_ucan_jwt: Option<String>,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             validate_did(&identity.did)?;
@@ -3325,6 +3428,7 @@ pub async fn context_leave(
     handle: Arc<ContextHandle>,
     identity: Arc<Identity>,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -3387,6 +3491,7 @@ pub async fn context_close(
     handle: Arc<ContextHandle>,
     identity: Arc<Identity>,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             // Authorization is enforced by the ContextManager (which delegates
@@ -3483,8 +3588,8 @@ pub async fn context_close(
 
             // Clean up per-context bridge connector state and economy state via BridgeInstance.
             if let Ok(bi) = crate::runtime::bridge_instance() {
-                bi.remove_bridge_state(&handle.context_id);
-                bi.remove_economy_state(&handle.context_id);
+                bi.core.remove_bridge_state(&handle.context_id);
+                bi.core.remove_economy_state(&handle.context_id);
             }
 
             // Deregister the context handle from the MCP lookup registry.
@@ -3525,6 +3630,7 @@ pub async fn context_send(
     payload: Vec<u8>,
     spending_ucan_jwt: Option<String>,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             validate_did(&identity.did)?;
@@ -3661,6 +3767,7 @@ pub async fn context_subscribe(
     handle: Arc<ContextHandle>,
     listener: Box<dyn crate::MessageListener>,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     let state = handle.state.lock().await;
 
     if !matches!(*state, ContextState::Active) {
@@ -3706,6 +3813,7 @@ pub async fn tool_register(
     handle: Arc<ContextHandle>,
     definition: ToolDefinition,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             validate_tool_name(&definition.name)?;
@@ -3890,6 +3998,7 @@ pub async fn tool_invoke(
     proof_tokens: Option<Vec<String>>,
     spending_ucan_jwt: Option<String>,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             validate_tool_id(&tool_id)?;
@@ -4130,6 +4239,7 @@ pub async fn tool_verify(
     handle: Arc<ContextHandle>,
     tool_id: String,
 ) -> Result<ToolVerificationResult, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -4198,6 +4308,7 @@ pub async fn tool_invoke_cross_context(
     chain_depth: u8,
     proof_tokens: Option<Vec<String>>,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(source_handle, target_handle, identity);
     runtime()
         .spawn(async move {
             // Validate source context is active.
@@ -4340,6 +4451,7 @@ pub async fn tool_session_create(
     source_context_id: String,
     ttl_seconds: Option<u64>,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -4427,6 +4539,7 @@ pub async fn tool_session_invoke(
     ucan_token: String,
     proof_tokens: Option<Vec<String>>,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -4553,6 +4666,7 @@ pub async fn tool_session_close(
     handle: Arc<ContextHandle>,
     session_id: String,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let mut store = handle.session_store.lock().await;
@@ -4602,6 +4716,7 @@ pub async fn tool_interface_expose(
     target_context_id: String,
     rate_limit_json: Option<String>,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             validate_tool_id(&tool_id)?;
@@ -4700,6 +4815,7 @@ pub async fn tool_interface_accept(
     handle: Arc<ContextHandle>,
     interface_json: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -4785,6 +4901,7 @@ pub async fn tool_interface_revoke(
     handle: Arc<ContextHandle>,
     interface_id_hex: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let interface_id_bytes =
@@ -4906,7 +5023,8 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
                     code: codes::CTX_2000.to_owned(),
                 })?
             };
-            bi.set_transport(std::sync::Arc::new(manager))
+            bi.core
+                .set_transport(std::sync::Arc::new(manager))
                 .map_err(|e| ScpError::Transport {
                     msg: e.to_string(),
                     code: codes::TRANS_5002.to_owned(),
@@ -4918,6 +5036,7 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
                     relay_url: Some(relay_url.clone()),
                     latency_ms: None,
                 }),
+                instance_id: bi.core.instance_id(),
             });
             increment_handle_count();
 
@@ -4945,6 +5064,7 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
 /// Returns `ScpError::Transport` if querying the transport status fails.
 #[uniffi::export]
 pub async fn transport_status(manager: Arc<TransportManager>) -> Result<TransportStatus, ScpError> {
+    crate::uniffi_check_handle!(manager);
     Ok(manager.status())
 }
 
@@ -4965,11 +5085,12 @@ pub async fn transport_status(manager: Arc<TransportManager>) -> Result<Transpor
 /// Returns `ScpError::Transport` if the internal lock is poisoned.
 #[uniffi::export]
 pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(manager);
     runtime()
         .spawn(async move {
             // Clear the transport from BridgeInstance, dropping all adapters.
             let bi = crate::runtime::bridge_instance()?;
-            bi.clear_transport().map_err(|e| ScpError::Transport {
+            bi.core.clear_transport().map_err(|e| ScpError::Transport {
                 msg: e.to_string(),
                 code: codes::TRANS_5003.to_owned(),
             })?;
@@ -6375,6 +6496,7 @@ pub async fn ucan_validate(
     presenting_agent_did: Option<String>,
     proof_tokens: Option<Vec<String>>,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             validate_ucan_token(&token)?;
@@ -6517,6 +6639,7 @@ pub async fn ucan_mint(
     capabilities: Vec<String>,
     proofs: Option<Vec<String>>,
 ) -> Result<Arc<UcanToken>, ScpError> {
+    crate::uniffi_check_handle!(handle);
     validate_did(&member_did)?;
     if let Some(ref tokens) = proofs {
         for t in tokens {
@@ -6598,6 +6721,7 @@ async fn ucan_mint_impl(
             Ok(Arc::new(UcanToken {
                 data,
                 encoded: token.encoded,
+                instance_id: handle.instance_id,
             }))
         })
         .await
@@ -6656,6 +6780,7 @@ pub async fn ucan_revoke(
     token: String,
     revoker_did: String,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     validate_ucan_token(&token).map_err(|e| ScpError::Validation {
         msg: e.to_string(),
         code: codes::VALID_7010.to_owned(),
@@ -6761,6 +6886,7 @@ pub async fn ucan_delegate(
     parent_token: String,
     capabilities: Vec<String>,
 ) -> Result<Arc<UcanToken>, ScpError> {
+    crate::uniffi_check_handle!(handle);
     validate_did(&delegator_did)?;
     validate_did(&delegatee_did)?;
     validate_ucan_token(&parent_token)?;
@@ -6878,6 +7004,7 @@ async fn ucan_delegate_impl(
             Ok(Arc::new(UcanToken {
                 data,
                 encoded: token.encoded,
+                instance_id: handle.instance_id,
             }))
         })
         .await
@@ -6934,6 +7061,7 @@ pub async fn event_log_query(
     handle: Arc<ContextHandle>,
     filter_json: Option<String>,
 ) -> Result<Vec<Event>, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             // Ensure UCAN state (which contains the event log) is registered.
@@ -7120,6 +7248,7 @@ pub async fn event_log_verify(
     handle: Arc<ContextHandle>,
     claim_json: String,
 ) -> Result<Proof, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             // Parse the claim JSON.
@@ -7315,6 +7444,7 @@ pub async fn event_log_checkpoint(
     identity: Arc<Identity>,
     epoch: u64,
 ) -> Result<Checkpoint, ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     event_log_checkpoint_impl(handle, identity, epoch).await
 }
 
@@ -7448,6 +7578,7 @@ pub async fn governance_execute(
     handle: Arc<ContextHandle>,
     proposal_json: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     let (result, action_name) = runtime()
@@ -7624,6 +7755,7 @@ pub async fn governance_propose(
     proposer_did: String,
     action_json: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let signing_key = resolve_uniffi_signing_key(&handle).await?;
     let context_id = handle.context_id.clone();
 
@@ -7687,6 +7819,7 @@ pub async fn governance_approve(
     voter_did: String,
     proposal_id_hex: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let signing_key = resolve_uniffi_signing_key(&handle).await?;
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
@@ -7732,6 +7865,7 @@ pub async fn governance_reject(
     voter_did: String,
     proposal_id_hex: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let signing_key = resolve_uniffi_signing_key(&handle).await?;
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
@@ -7778,6 +7912,7 @@ pub async fn governance_withdraw(
     voter_did: String,
     proposal_id_hex: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
 
@@ -7819,6 +7954,7 @@ pub async fn governance_get_proposal(
     handle: Arc<ContextHandle>,
     proposal_id_hex: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
 
@@ -7851,6 +7987,7 @@ pub async fn governance_get_proposal(
 /// Returns `ScpError::Context` (SCP-CTX-2046) if listing fails.
 #[uniffi::export]
 pub async fn governance_list_proposals(handle: Arc<ContextHandle>) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     runtime()
@@ -7889,6 +8026,7 @@ pub async fn apply_pending_ceiling_modification(
     handle: Arc<ContextHandle>,
     current_timestamp: u64,
 ) -> Result<bool, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     runtime()
@@ -7917,6 +8055,7 @@ pub async fn apply_pending_ceiling_modification(
 /// in `Closing` state or finalization fails.
 #[uniffi::export]
 pub async fn finalize_close(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let handle_ref = handle.clone();
 
@@ -7975,6 +8114,7 @@ pub async fn create_governance_checkpoint(
     creator_did: String,
     creator_signature_hex: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     let merkle_root = parse_uniffi_hex_32(&merkle_root_hex, "merkle_root")?;
@@ -8034,6 +8174,7 @@ pub async fn add_checkpoint_cosignature(
     signer_did: String,
     signature_hex: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     let mut checkpoint: scp_core::context::governance::ContextCheckpoint =
@@ -8170,6 +8311,7 @@ fn parse_uniffi_hex_32(hex_str: &str, field_name: &str) -> Result<[u8; 32], ScpE
 /// or the grace period has not expired.
 #[uniffi::export]
 pub async fn tombstone_migrated_context(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let handle_ref = handle.clone();
 
@@ -8199,6 +8341,7 @@ pub async fn tombstone_migrated_context(handle: Arc<ContextHandle>) -> Result<()
 /// context is not migrating.
 #[uniffi::export]
 pub async fn migration_state(handle: Arc<ContextHandle>) -> Result<Option<String>, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     runtime()
@@ -8244,6 +8387,7 @@ pub async fn broadcast_subscribe(
     handle: Arc<ContextHandle>,
     subscriber_did: String,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8286,6 +8430,7 @@ pub async fn broadcast_unsubscribe(
     subscriber_did: String,
     rotate_keys: bool,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8327,6 +8472,7 @@ pub async fn broadcast_publish(
     identity: Arc<Identity>,
     payload: Vec<u8>,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8462,6 +8608,7 @@ pub async fn broadcast_publish_asset(
     asset: AssetEntry,
     deploy_id: Option<String>,
 ) -> Result<PublishResult, ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8611,6 +8758,7 @@ pub async fn broadcast_publish_assets(
     assets: Vec<AssetEntry>,
     deploy_id: Option<String>,
 ) -> Result<BatchPublishResult, ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     const MAX_BATCH_ASSETS: usize = 10_000;
     if assets.len() > MAX_BATCH_ASSETS {
         return Err(ScpError::Context {
@@ -8770,6 +8918,7 @@ pub async fn broadcast_block_subscriber(
     subscriber_did: String,
     blocker_did: String,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8804,6 +8953,7 @@ pub async fn broadcast_unblock_subscriber(
     subscriber_did: String,
     unblocker_did: String,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8836,6 +8986,7 @@ pub async fn broadcast_handle_key_request(
     author_did: String,
     requester_did: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8859,6 +9010,13 @@ pub async fn broadcast_handle_key_request(
 /// Returns `None` if the context is not registered or not a broadcast context.
 #[uniffi::export]
 pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u64> {
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return None;
+    }
     let manager = crate::runtime::context_manager_expect();
     manager
         .broadcast_subscriber_count(&handle.context_id)
@@ -8869,6 +9027,13 @@ pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u6
 /// Returns `true` if the given DID is a broadcast subscriber.
 #[uniffi::export]
 pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) -> bool {
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return false;
+    }
     let manager = crate::runtime::context_manager_expect();
     manager
         .is_broadcast_subscriber(&handle.context_id, &did)
@@ -8881,6 +9046,13 @@ pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) ->
 /// Returns `None` if the context is not a broadcast context.
 #[uniffi::export]
 pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return None;
+    }
     let manager = crate::runtime::context_manager_expect();
     manager
         .broadcast_admission(&handle.context_id)
@@ -8897,6 +9069,13 @@ pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
 /// Returns `None` if the context is not registered.
 #[uniffi::export]
 pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return None;
+    }
     let manager = crate::runtime::context_manager_expect();
     manager
         .member_count(&handle.context_id)
@@ -8914,6 +9093,13 @@ pub async fn context_is_member(handle: Arc<ContextHandle>, did: String) -> bool 
 /// Returns all member DIDs for a context.
 #[uniffi::export]
 pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return Vec::new();
+    }
     let manager = crate::runtime::context_manager_expect();
     manager.member_dids(&handle.context_id).await
 }
@@ -8923,6 +9109,13 @@ pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
 /// Returns `None` if the member is not found or the context is not registered.
 #[uniffi::export]
 pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Option<String> {
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return None;
+    }
     let manager = crate::runtime::context_manager_expect();
     manager
         .member_role(&handle.context_id, &did)
@@ -8973,6 +9166,13 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
 /// if the context is not registered.
 #[uniffi::export]
 pub async fn context_drain_events(handle: Arc<ContextHandle>) -> Vec<String> {
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return Vec::new();
+    }
     let manager = crate::runtime::context_manager_expect();
     manager
         .drain_events(&handle.context_id)
@@ -9066,6 +9266,7 @@ pub async fn access_key_restore(
 #[uniffi::export]
 #[allow(clippy::significant_drop_tightening)]
 pub async fn context_handle_ttl_expiry(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -9108,6 +9309,7 @@ pub async fn context_propose_ttl_extension(
     member_did: String,
     proposed_seconds: u64,
 ) -> Result<bool, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -9130,6 +9332,13 @@ pub async fn context_propose_ttl_extension(
 /// Cancels the old timer and spawns a new one with the given duration.
 #[uniffi::export]
 pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u64) {
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return;
+    }
     let manager = crate::runtime::context_manager_expect();
     let core_handle = scp_core::context::ContextHandle::new(
         handle.context_id.clone(),
@@ -9817,6 +10026,7 @@ pub fn set_economic_policy(
     handle: Arc<ContextHandle>,
     policy_json: String,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     let _ = (handle, policy_json);
     Err(ScpError::Permission {
         msg: "economic policy changes must go through governance \
@@ -9830,6 +10040,7 @@ pub fn set_economic_policy(
 /// Returns the economic policy for a context as a JSON string, or `None`.
 #[uniffi::export]
 pub fn get_economic_policy(handle: Arc<ContextHandle>) -> Result<Option<String>, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let guard = handle
         .economic_policy
         .lock()
@@ -9855,6 +10066,7 @@ pub fn get_economic_policy(handle: Arc<ContextHandle>) -> Result<Option<String>,
 /// or serialization fails.
 #[uniffi::export]
 pub async fn context_export(handle: Arc<ContextHandle>) -> Result<Vec<u8>, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let ctx_id = handle.context_id.clone();
     let creator_did = handle.creator_did.clone();
     runtime()
@@ -11396,6 +11608,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
                             core_document: Some(document),
                             in_memory_custody: Some(key_custody),
                             callback_custody: None,
+                            instance_id: crate::runtime::default_instance_id()?,
                         });
                         increment_handle_count();
                         Ok(handle)
@@ -11452,6 +11665,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
 /// See ADR-003 acceptance criterion 4b.
 #[uniffi::export]
 pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, ScpError> {
+    crate::uniffi_check_handle!(identity);
     let core_id = identity
         .core_id
         .as_ref()
@@ -11478,6 +11692,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
     let old_identity = core_id.clone();
     let old_document = core_document.clone();
     let custody_type = identity.custody_type.clone();
+    let instance_id = identity.instance_id;
 
     #[cfg(feature = "allow_in_memory_custody")]
     let custody_arc = in_memory.map(Arc::clone);
@@ -11520,6 +11735,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     #[cfg(feature = "allow_in_memory_custody")]
                     in_memory_custody: custody_arc,
                     callback_custody,
+                    instance_id,
                 });
                 increment_handle_count();
                 let _ = has_agent; // suppress unused warning
@@ -11582,6 +11798,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     #[cfg(feature = "allow_in_memory_custody")]
                     in_memory_custody: None,
                     callback_custody: Some(Arc::clone(cc)),
+                    instance_id,
                 });
                 increment_handle_count();
 
@@ -11921,6 +12138,7 @@ pub fn bridge_create_shadow(
 
     let bi = crate::runtime::bridge_instance()?;
     let mut entry = bi
+        .core
         .bridge_state()
         .entry(context_id.clone())
         .or_insert_with(|| BridgeContextState {
@@ -12519,6 +12737,7 @@ pub fn scpid_sign(
     signing_key_id: String,
     challenge_json: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(identity);
     use scp_core::identity::scpid_sign as core_sign;
 
     let key_id = parse_scpid_signing_key_id(&signing_key_id)?;
@@ -12795,6 +13014,7 @@ pub fn economy_budget_remaining(context_id: String, did: String) -> Result<u64, 
     validate_did(&did)?;
     let member_did = scp_identity::DID::from(did.as_str());
     let remaining = crate::runtime::bridge_instance()?
+        .core
         .with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
     Ok(remaining.value())
 }
@@ -12804,9 +13024,11 @@ pub fn economy_budget_remaining(context_id: String, did: String) -> Result<u64, 
 pub fn economy_budget_grant(context_id: String, did: String, amount: u64) -> Result<(), ScpError> {
     validate_did(&did)?;
     let member_did = scp_identity::DID::from(did.as_str());
-    crate::runtime::bridge_instance()?.with_economy_budget_mut(&context_id, |tracker| {
-        tracker.grant(&member_did, scp_core::economy::Amount::new(amount));
-    });
+    crate::runtime::bridge_instance()?
+        .core
+        .with_economy_budget_mut(&context_id, |tracker| {
+            tracker.grant(&member_did, scp_core::economy::Amount::new(amount));
+        });
     Ok(())
 }
 
@@ -12819,14 +13041,16 @@ pub fn economy_budget_record_spend(
 ) -> Result<(), ScpError> {
     validate_did(&did)?;
     let member_did = scp_identity::DID::from(did.as_str());
-    crate::runtime::bridge_instance()?.with_economy_budget_mut(&context_id, |tracker| {
-        tracker
-            .record_spend(&member_did, scp_core::economy::Amount::new(amount))
-            .map_err(|e| ScpError::Validation {
-                msg: format!("{e}"),
-                code: codes::VALID_7052.to_owned(),
-            })
-    })
+    crate::runtime::bridge_instance()?
+        .core
+        .with_economy_budget_mut(&context_id, |tracker| {
+            tracker
+                .record_spend(&member_did, scp_core::economy::Amount::new(amount))
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("{e}"),
+                    code: codes::VALID_7052.to_owned(),
+                })
+        })
 }
 
 /// Records a message for antispam velocity tracking.
@@ -12838,9 +13062,11 @@ pub fn economy_antispam_record(
 ) -> Result<(), ScpError> {
     validate_did(&sender_did)?;
     let did = scp_identity::DID::from(sender_did.as_str());
-    crate::runtime::bridge_instance()?.with_economy_antispam(&context_id, |tracker| {
-        tracker.record_message(&did, timestamp);
-    });
+    crate::runtime::bridge_instance()?
+        .core
+        .with_economy_antispam(&context_id, |tracker| {
+            tracker.record_message(&did, timestamp);
+        });
     Ok(())
 }
 
@@ -12854,6 +13080,7 @@ pub fn economy_antispam_velocity(
     validate_did(&sender_did)?;
     let did = scp_identity::DID::from(sender_did.as_str());
     let velocity = crate::runtime::bridge_instance()?
+        .core
         .with_economy_antispam(&context_id, |tracker| tracker.get_velocity(&did, now));
     Ok(velocity)
 }
@@ -12888,16 +13115,18 @@ pub fn economy_antispam_escalated_cost(
     };
 
     let did = scp_identity::DID::from(sender_did.as_str());
-    let cost = crate::runtime::bridge_instance()?.with_economy_antispam(&context_id, |tracker| {
-        tracker.compute_escalated_cost(
-            &did,
-            now,
-            scp_core::economy::Amount::new(base_cost),
-            &config,
-            floor.map(scp_core::economy::Amount::new),
-            cap.map(scp_core::economy::Amount::new),
-        )
-    });
+    let cost = crate::runtime::bridge_instance()?
+        .core
+        .with_economy_antispam(&context_id, |tracker| {
+            tracker.compute_escalated_cost(
+                &did,
+                now,
+                scp_core::economy::Amount::new(base_cost),
+                &config,
+                floor.map(scp_core::economy::Amount::new),
+                cap.map(scp_core::economy::Amount::new),
+            )
+        });
     Ok(cost.value())
 }
 
@@ -13171,6 +13400,8 @@ mod tests {
     static ALLOWLIST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_handle() -> Arc<ContextHandle> {
+        crate::runtime::ensure_bridge_instance();
+        let instance_id = crate::runtime::default_instance_id().unwrap_or(0);
         Arc::new(ContextHandle {
             context_id: "ctx-test".to_owned(),
             state: tokio::sync::Mutex::new(ContextState::Active),
@@ -13185,10 +13416,13 @@ mod tests {
             session_store: tokio::sync::Mutex::new(scp_core::context::tools::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
             core_context_params: scp_core::context::ContextParams::default(),
+            instance_id,
         })
     }
 
     fn test_identity() -> Arc<Identity> {
+        crate::runtime::ensure_bridge_instance();
+        let instance_id = crate::runtime::default_instance_id().unwrap_or(0);
         Arc::new(Identity {
             did: "did:dht:z6MkTestUser".to_owned(),
             custody_type: CustodyMethod::InMemory,
@@ -13197,6 +13431,7 @@ mod tests {
             #[cfg(feature = "allow_in_memory_custody")]
             in_memory_custody: None,
             callback_custody: None,
+            instance_id,
         })
     }
 
