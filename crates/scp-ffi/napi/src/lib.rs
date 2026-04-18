@@ -79,27 +79,60 @@ use napi_derive::napi;
 /// Runtime handle-affinity check at every `#[napi]` entry that accepts a
 /// handle.
 ///
-/// Expands to a call to [`crate::runtime::check_handle_affinity`] which
-/// compares the handle's stored `instance_id` against the default
-/// `NapiBridgeInstance`'s id and maps mismatches to
-/// [`crate::error::ScpNapiError::Permission`] with error code
-/// `SCP-PERM-3030`.
+/// Two forms are supported; **per-instance `Scp` methods must use the
+/// two-argument form**:
 ///
-/// Handle types must implement [`$crate::runtime::HandleInstance`] (or
-/// have an `instance_id(&self) -> u64` inherent method) so the expansion
-/// `handle.instance_id()` resolves.
+/// 1. `napi_check_handle!(handle, …)` — default-instance shorthand.
+///    Delegates to [`crate::runtime::check_handle_affinity`] which looks
+///    up the default bridge's `CoreFields::instance_id` under the hood.
+///    Use this ONLY from free functions on the default façade. Do NOT
+///    use this inside per-instance `Scp::method` — that would silently
+///    check against the default instance instead of `self.inner.core`
+///    (PR 2 regression hazard).
+///
+/// 2. `napi_check_handle!(&core, handle, …)` — strict form. `&core`
+///    must be `&CoreFields`. Compares each handle against `core`
+///    directly without touching the default `OnceLock`. This is the
+///    form per-instance `Scp` methods call with `&self.inner.core`.
+///
+/// Handle types must carry an inherent `instance_id(&self) -> u64` method.
+/// The macro uses method syntax which auto-derefs through `&T`, `&Arc<T>`,
+/// and `Arc<T>`.
+///
+/// Both forms raise [`crate::error::ScpNapiError::Permission`] with error
+/// code `SCP-PERM-3030` on mismatch.
 ///
 /// Usage:
 ///
 /// ```ignore
+/// // free-function (default instance)
 /// napi_check_handle!(handle);
-/// napi_check_handle!(identity, context_handle);  // multiple in sequence
+/// napi_check_handle!(identity, context_handle);
+///
+/// // per-instance method (PR 2+)
+/// napi_check_handle!(&self.inner.core, handle);
 /// ```
 #[macro_export]
 macro_rules! napi_check_handle {
+    // Strict 2+-arg form with an explicit `&CoreFields` target. The
+    // leading `&` pattern matches callers that spell `&core` or
+    // `&self.inner.core` — that spelling reliably disambiguates from the
+    // default-instance shorthand below.
+    (& $core:expr, $($handle:expr),+ $(,)?) => {{
+        let __core: &$crate::runtime::CoreFields = &$core;
+        $(
+            __core
+                .check_handle($crate::runtime::HandleInstance::instance_id($handle))
+                .map_err(|e| ::napi::Error::from($crate::error::ScpNapiError::from(e)))?;
+        )+
+    }};
+    // Default-instance shorthand. Kept for the free-function façade only.
+    // Do not use inside per-instance `Scp::method` — use the 2-arg form.
     ($($handle:expr),+ $(,)?) => {{
         $(
-            $crate::runtime::check_handle_affinity($crate::runtime::HandleInstance::instance_id($handle))?;
+            $crate::runtime::check_handle_affinity(
+                $crate::runtime::HandleInstance::instance_id($handle),
+            )?;
         )+
     }};
 }
@@ -232,32 +265,40 @@ pub fn scp_version() -> String {
 
 /// Shuts down the default bridge instance gracefully.
 ///
-/// Awaits in-flight tasks up to `timeout_secs` seconds, aborts any
-/// remaining tasks when the deadline expires, then clears registries,
+/// Awaits in-flight tasks up to `timeout_millis` **milliseconds**, aborts
+/// any remaining tasks when the deadline expires, then clears registries,
 /// disconnects transport, and runs shutdown hooks. Finally waits up to the
 /// same deadline for outstanding opaque FFI handles
 /// (`NapiIdentity`, `NapiContextHandle`, `NapiUcanToken`,
 /// `NapiTransportManager`, …) to be released.
 ///
-/// Returns a `Promise<void>` — call `await scpShutdown(5)` from JS. Pass
-/// `0` to skip both graceful drain and handle-release polling.
+/// The unit is **milliseconds** — unified across all Rust bridges so the
+/// Python, TypeScript, Swift, and Kotlin SDKs can share a single
+/// conversion surface (`timeout_secs: number` in the SDK wrapper is
+/// multiplied by 1000 before crossing FFI). The NAPI `u32` millis range
+/// is 2^32 ms ≈ 49.7 days, which is far beyond any realistic shutdown
+/// budget.
 ///
-/// **Breaking change (Phase 4 PR 1 / AC5)**: the signature moved from sync
-/// `void` to async `Promise<void>` so the default-instance façade matches
-/// `SCP::shutdown()`'s deadline contract. Callers migrating away from the
-/// free-function façade should switch to `scp.shutdown(5)` on an owned
-/// `SCP` instance.
+/// Returns a `Promise<void>` — call `await scpShutdown(5000)` from JS.
+/// Pass `0` to skip both graceful drain and handle-release polling.
+///
+/// **Breaking change (Phase 4 PR 1 / AC5)**: the signature moved from
+/// sync `void` to async `Promise<void>`, and the unit changed from
+/// **seconds** (`u32`) to **milliseconds** (`u32`) to unify the Rust
+/// bridge signatures. Callers migrating away from the free-function
+/// façade should switch to `scp.shutdown(5000)` on an owned `SCP`
+/// instance.
 ///
 /// # JS usage
 ///
 /// ```js
 /// process.on('beforeExit', async () => {
-///   await scpShutdown(5); // wait up to 5 seconds for graceful shutdown
+///   await scpShutdown(5_000); // wait up to 5 seconds (5,000 ms)
 /// });
 /// ```
 #[napi]
-pub async fn scp_shutdown(timeout_secs: u32) -> napi::Result<()> {
-    let timeout = Duration::from_secs(u64::from(timeout_secs));
+pub async fn scp_shutdown(timeout_millis: u32) -> napi::Result<()> {
+    let timeout = Duration::from_millis(u64::from(timeout_millis));
 
     // In test builds we intentionally skip shutting down the default
     // bridge instance — the `OnceLock` is process-global and one shutdown
@@ -278,12 +319,12 @@ pub async fn scp_shutdown(timeout_secs: u32) -> napi::Result<()> {
                 tracing::debug!("bridge shutdown returned: {e}");
             }
             Err(_) => {
-                tracing::error!("BridgeInstance shutdown panicked — cleanup may be incomplete");
+                tracing::error!("NapiBridgeInstance shutdown panicked — cleanup may be incomplete");
             }
         }
     }
 
-    if timeout_secs == 0 {
+    if timeout_millis == 0 {
         return Ok(());
     }
     let deadline = std::time::Instant::now() + timeout;

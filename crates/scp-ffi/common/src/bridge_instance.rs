@@ -10,13 +10,13 @@
 //! [`BridgeInstanceCore`] trait so shared helpers can operate on
 //! `&dyn BridgeInstanceCore`.
 //!
-//! This is the Phase 4 refactor of `BridgeInstance` (see #1549 Phase 4
-//! remainder plan). The prior `Box<dyn Any>` slots for
-//! `identity_registry`/`ucan_registry`/`storage_provider`/`protocol_repository`
-//! are gone — each bridge now owns concrete typed fields. The transitional
-//! alias `pub type BridgeInstance = CoreFields;` keeps existing call sites
-//! compiling while the per-bridge structs (introduced in follow-up commits
-//! of this PR) take over.
+//! This is the Phase 4 refactor of the former `BridgeInstance` type
+//! (see #1549 Phase 4 remainder plan). The prior `Box<dyn Any>` slots
+//! for `identity_registry`/`ucan_registry`/`storage_provider`/
+//! `protocol_repository` are gone — each bridge now owns concrete typed
+//! fields. The transitional `pub type BridgeInstance = CoreFields;`
+//! alias was deleted in PR 1 post-review; callers reference
+//! [`CoreFields`] directly.
 //!
 //! # No local DID on the container
 //!
@@ -128,7 +128,7 @@ const ANTISPAM_DEFAULT_WINDOW_SECS: u64 = 60;
 
 /// Metadata about a known context's relay presence.
 ///
-/// Stored in the `BridgeInstance`'s known-contexts registry so that context
+/// Stored in the per-bridge [`CoreFields`]'s known-contexts registry so that context
 /// discovery can probe relays for context activity. The relay is a dumb blob
 /// store with no identity-to-context mapping, so the client must track which
 /// routing IDs correspond to which contexts.
@@ -155,8 +155,9 @@ pub struct KnownContext {
 /// custody registries, etc.). They implement the [`BridgeInstanceCore`]
 /// trait so shared helpers can operate on `&dyn BridgeInstanceCore`.
 ///
-/// While the Phase 4 refactor is in flight, the transitional alias
-/// [`BridgeInstance`] points at this type so existing call sites compile.
+/// The transitional `pub type BridgeInstance = CoreFields;` alias has been
+/// deleted; per-bridge code references `CoreFields` directly via the
+/// embedded `core` field on the concrete struct.
 ///
 /// # No local DID on the container
 ///
@@ -190,7 +191,7 @@ pub struct KnownContext {
 pub struct CoreFields {
     /// Shared context lifecycle manager (MLS, membership, governance, broadcast).
     ///
-    /// Stored in a `OnceLock` so that the `BridgeInstance` (and thus the DID
+    /// Stored in a `OnceLock` so that the per-bridge [`CoreFields`] (and thus the DID
     /// resolver slot it owns) can exist BEFORE the `ContextManager` is
     /// constructed. The `ContextManager`'s `MlsCryptoProvider` needs the real
     /// DID at construction time, but the DID is only known after
@@ -526,7 +527,7 @@ impl CoreFields {
     ///
     /// Called by the FFI bridge's `init_context_manager*` family once the
     /// `ContextManager` has been constructed (with the real DID passed
-    /// directly into its `MlsCryptoProvider` — the `BridgeInstance` itself
+    /// directly into its `MlsCryptoProvider` — the bridge [`CoreFields`] itself
     /// does not carry a DID). Subsequent calls are ignored with a warning
     /// (`OnceLock` guarantees single initialization).
     pub fn set_context_manager(&self, context_manager: Arc<ContextManager>) {
@@ -549,7 +550,7 @@ impl CoreFields {
     /// All callers must handle the `None` case explicitly — returning an
     /// appropriate lifecycle error at the FFI boundary (typically
     /// `CTX_2000` / "`ContextManager` not yet attached"). Callers that only
-    /// touch `BridgeInstance`-owned state (transport, DID resolver, known
+    /// touch [`CoreFields`]-owned state (transport, DID resolver, known
     /// contexts) can proceed without the CM.
     ///
     /// There is intentionally no panic-variant accessor: a missing
@@ -744,7 +745,7 @@ impl CoreFields {
         // are not drained here — the sync variant cannot await. Callers
         // that need a bounded wait use `shutdown_core_async`.
         self.cancel.cancel();
-        self.run_shutdown_side_effects();
+        self.blocking_run_shutdown_side_effects();
     }
 
     // -----------------------------------------------------------------
@@ -1275,15 +1276,20 @@ impl CoreFields {
     /// 1. Idempotency: if `shutdown` has already been called (sync or async),
     ///    returns [`ShutdownError::AlreadyShutDown`] without side effects.
     /// 2. Fires [`CancellationToken::cancel`] so cooperating tasks can exit.
-    /// 3. Drains the task `JoinSet` inside `tokio::time::timeout(timeout, …)`.
+    /// 3. Drains the task `JoinSet` inside `tokio::time::timeout(remaining, …)`.
     ///    Tasks that finish within the deadline report
     ///    [`ShutdownOutcome::GracefulWithin`] with the elapsed time.
     /// 4. On timeout, calls `JoinSet::abort_all` and returns
-    ///    [`ShutdownOutcome::TimedOut`] with the number of tasks aborted.
+    ///    [`ShutdownOutcome::TimedOut`] with the number of tasks aborted and
+    ///    the number that panicked.
     /// 5. Runs the bridge-agnostic cleanup (flush persistence, drop MLS
     ///    groups, clear registries, run shutdown hooks, clear transport)
     ///    regardless of graceful/timeout outcome — these side effects must
-    ///    happen on *every* shutdown.
+    ///    happen on *every* shutdown. The persistence flush
+    ///    ([`ContextManager::flush_all_contexts_sync`]) is executed
+    ///    inside the remaining timeout budget so the caller's deadline is
+    ///    honored end-to-end; if it exceeds the budget, flush is abandoned
+    ///    and a warning is logged.
     ///
     /// # Errors
     ///
@@ -1307,12 +1313,16 @@ impl CoreFields {
         let start = std::time::Instant::now();
         let outcome = drain_under_deadline(&self.tasks, timeout, start).await;
 
-        // Run the sync cleanup side effects. `run_shutdown_side_effects`
-        // mirrors the body of the sync `shutdown()` path but without the
-        // AtomicBool swap (we already performed it above). Calling it is
-        // safe: it checks `is_shutdown()` for the one internal guard that
-        // matters (economy accessors), which is already true.
-        self.run_shutdown_side_effects();
+        // Run the sync cleanup side effects inside the remaining budget so
+        // callers get a true end-to-end deadline on shutdown (including the
+        // synchronous flush step). `run_shutdown_side_effects` mirrors the
+        // body of the sync `shutdown()` path but without the AtomicBool
+        // swap (we already performed it above). Calling it is safe: it
+        // checks `is_shutdown()` for the one internal guard that matters
+        // (economy accessors), which is already true.
+        let elapsed = start.elapsed();
+        let remaining = timeout.saturating_sub(elapsed);
+        self.run_shutdown_side_effects(remaining).await;
 
         Ok(outcome)
     }
@@ -1321,11 +1331,69 @@ impl CoreFields {
     /// and the async [`shutdown_core_async`](Self::shutdown_core_async) paths.
     ///
     /// Must only be called after `self.shutdown` has been swapped to `true`.
-    /// Clears transport, flushes persistence, drops MLS groups + sender
-    /// keys, clears bridge-owned registries, and runs any registered
-    /// shutdown hooks. Infallible: lock poisoning and hook panics are
-    /// logged and cleanup continues — shutdown must finish regardless.
-    fn run_shutdown_side_effects(&self) {
+    /// Clears transport, flushes persistence (inside `flush_budget` when
+    /// called from the async path, or with no bound from the sync path
+    /// via [`blocking_run_shutdown_side_effects`]), drops MLS groups +
+    /// sender keys, clears bridge-owned registries, and runs any registered
+    /// shutdown hooks. Infallible: lock poisoning, hook panics, and flush
+    /// timeouts are logged and cleanup continues — shutdown must finish
+    /// regardless.
+    async fn run_shutdown_side_effects(&self, flush_budget: Duration) {
+        if let Err(e) = self.clear_transport() {
+            tracing::error!("failed to clear transport during shutdown: {e} — continuing cleanup");
+        }
+        if let Ok(mut url) = self.relay_url.lock() {
+            *url = None;
+        }
+
+        if let Some(cm) = self.context_manager.get() {
+            // Persistence flush must honor the caller-supplied deadline.
+            // `flush_all_contexts_sync` is a blocking sync call — run it
+            // on `spawn_blocking` and wrap in `tokio::time::timeout` so
+            // storage latency cannot push us past the shutdown budget.
+            // Zero budget falls through to a best-effort inline flush
+            // (matches the sync shutdown path's contract).
+            if flush_budget.is_zero() {
+                tracing::warn!(
+                    "shutdown flush budget exhausted before flush_all_contexts_sync — \
+                     context state may not be persisted"
+                );
+            } else {
+                let cm_for_flush = Arc::clone(cm);
+                let blocking = tokio::task::spawn_blocking(move || {
+                    cm_for_flush.flush_all_contexts_sync();
+                });
+                match tokio::time::timeout(flush_budget, blocking).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(join_err)) => {
+                        tracing::error!(
+                            "flush_all_contexts_sync task failed during shutdown: {join_err} — \
+                             continuing cleanup"
+                        );
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            budget_ms = flush_budget.as_millis(),
+                            "flush_all_contexts_sync exceeded shutdown budget — \
+                             context state may not be persisted"
+                        );
+                    }
+                }
+            }
+            cm.shutdown_all_contexts();
+        }
+
+        self.finish_shutdown_cleanup();
+    }
+
+    /// Non-async sibling of [`run_shutdown_side_effects`] used by the sync
+    /// [`shutdown`](Self::shutdown) path.
+    ///
+    /// The sync path has no deadline — it is a terminal, infallible
+    /// operation called from destructors and atexit hooks. It therefore
+    /// runs the flush inline without a timeout. The async variant is
+    /// preferred; callers that can `.await` should use it.
+    fn blocking_run_shutdown_side_effects(&self) {
         if let Err(e) = self.clear_transport() {
             tracing::error!("failed to clear transport during shutdown: {e} — continuing cleanup");
         }
@@ -1338,6 +1406,13 @@ impl CoreFields {
             cm.shutdown_all_contexts();
         }
 
+        self.finish_shutdown_cleanup();
+    }
+
+    /// Shared tail of both shutdown paths — registry clears, hook run,
+    /// suspension reset. Split out so the sync and async variants only
+    /// differ where they actually need to (flush handling).
+    fn finish_shutdown_cleanup(&self) {
         self.known_contexts.clear();
         self.rate_limiters.clear();
         self.economy_budgets.clear();
@@ -1366,8 +1441,9 @@ impl CoreFields {
 
 /// Locks the `JoinSet` long enough to drain outstanding tasks with a
 /// deadline. On graceful drain, returns [`ShutdownOutcome::GracefulWithin`]
-/// with the elapsed time since `start`. On timeout, aborts the remaining
-/// tasks, counts them, and returns [`ShutdownOutcome::TimedOut`].
+/// with the elapsed time since `start` and the count of tasks that
+/// panicked. On timeout, aborts the remaining tasks, counts both
+/// aborted and panicked tasks, and returns [`ShutdownOutcome::TimedOut`].
 ///
 /// The helper exists so the lock guard's scope is obvious and clippy's
 /// `significant_drop_tightening` check is satisfied (the guard cannot be
@@ -1385,57 +1461,59 @@ async fn drain_under_deadline(
     // there is no earlier release point that keeps the invariant of
     // draining the exact set we aborted.
     let mut guard = tasks.lock().await;
-    if tokio::time::timeout(timeout, drain_tasks(&mut guard))
+    let mut panicked: usize = 0;
+    if tokio::time::timeout(timeout, drain_tasks(&mut guard, &mut panicked))
         .await
         .is_ok()
     {
-        return ShutdownOutcome::GracefulWithin(start.elapsed());
+        return ShutdownOutcome::GracefulWithin {
+            elapsed: start.elapsed(),
+            panicked_tasks: panicked,
+        };
     }
-    // Deadline expired: abort remaining tasks and count how many we cut.
-    // `abort_all` is a no-op for finished tasks.
+    // Deadline expired: abort remaining tasks and count how many we cut
+    // versus how many panicked on the abort path. `abort_all` is a no-op
+    // for finished tasks.
     guard.abort_all();
-    let aborted = count_and_drain_aborted(&mut guard).await;
+    let (aborted, abort_panicked) = count_and_drain_aborted(&mut guard).await;
     ShutdownOutcome::TimedOut {
         aborted_tasks: aborted,
+        panicked_tasks: panicked + abort_panicked,
     }
 }
 
 /// Drains `set` until every task has completed. Panics inside tasks are
-/// logged; non-panic join errors (cancellation) are ignored — abort is
-/// the caller's signal.
-async fn drain_tasks(set: &mut JoinSet<()>) {
+/// logged AND counted via `panicked_out`; non-panic join errors (cancellation)
+/// are ignored — abort is the caller's signal.
+async fn drain_tasks(set: &mut JoinSet<()>, panicked_out: &mut usize) {
     while let Some(joined) = set.join_next().await {
         if let Err(e) = joined
             && e.is_panic()
         {
+            *panicked_out += 1;
             tracing::error!("task panicked during shutdown drain: {e}");
         }
     }
 }
 
-/// After `abort_all`, drains the set to completion and returns the count
-/// of tasks that were cancelled (not finished cleanly before cancellation
-/// propagated).
-async fn count_and_drain_aborted(set: &mut JoinSet<()>) -> usize {
+/// After `abort_all`, drains the set to completion and returns the pair
+/// `(aborted, panicked)`: the count of tasks cancelled on the abort path
+/// versus tasks that panicked while being aborted.
+async fn count_and_drain_aborted(set: &mut JoinSet<()>) -> (usize, usize) {
     let mut aborted = 0usize;
+    let mut panicked = 0usize;
     while let Some(joined) = set.join_next().await {
         if let Err(e) = joined {
             if e.is_cancelled() {
                 aborted += 1;
             } else if e.is_panic() {
+                panicked += 1;
                 tracing::error!("task panicked during abort drain: {e}");
             }
         }
     }
-    aborted
+    (aborted, panicked)
 }
-
-/// Transitional alias: existing bridge call sites use `BridgeInstance`.
-///
-/// Removed once `PyBridgeInstance` / `NapiBridgeInstance` /
-/// `UniffiBridgeInstance` land in follow-up commits of this PR (#1549
-/// Phase 4 remainder PR 1, commits 3–5).
-pub type BridgeInstance = CoreFields;
 
 /// Bridge-agnostic trait implemented by every per-bridge concrete struct.
 ///
@@ -1511,7 +1589,7 @@ pub trait BridgeInstanceCore: Send + Sync {
 
 /// Error type for transport lock operations.
 ///
-/// Used by [`BridgeInstance`] transport accessor methods. Bridge layers map
+/// Used by [`CoreFields`] transport accessor methods. Bridge layers map
 /// this to their own error types (`ScpPyError`, napi `Error`, etc.).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportLockError {
@@ -1550,7 +1628,7 @@ impl std::error::Error for TransportLockError {}
 
 /// Error type for lifecycle operations (`resume`, `check_ready`).
 ///
-/// Used by [`BridgeInstance::resume`] and [`BridgeInstance::check_ready`].
+/// Used by [`CoreFields::resume`] and related lifecycle accessors.
 /// Bridge layers map this to their own error types (`ScpPyError`, napi `Error`,
 /// etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1635,19 +1713,36 @@ impl std::error::Error for HandleAffinityError {}
 
 /// Outcome of an async bridge shutdown — see
 /// [`CoreFields::shutdown_core_async`].
+///
+/// Both variants surface `panicked_tasks` so callers can detect task-level
+/// panics that previously drowned in tracing errors. A nonzero count means
+/// at least one spawned task unwound during the drain — the bridge cleaned
+/// up, but there is a real bug upstream worth investigating.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShutdownOutcome {
-    /// All outstanding tasks completed before the deadline. The elapsed
-    /// duration is reported so callers can log shutdown latency.
-    GracefulWithin(Duration),
+    /// All outstanding tasks completed before the deadline.
+    GracefulWithin {
+        /// Elapsed wall-clock time from the first cancellation signal to the
+        /// last task joining (or panicking). Reported so callers can log
+        /// shutdown latency.
+        elapsed: Duration,
+        /// Number of tasks that panicked during the graceful drain.
+        /// Panics are logged at `tracing::error!` level; shutdown continues
+        /// regardless.
+        panicked_tasks: usize,
+    },
     /// The deadline expired before all tasks finished; the `JoinSet` was
-    /// aborted. `aborted_tasks` is the number of tasks that were cut short
-    /// (tasks that had already completed before the deadline are not
-    /// counted).
+    /// aborted.
     TimedOut {
         /// Number of tasks that were aborted because the shutdown deadline
-        /// was reached.
+        /// was reached (tasks that had already completed before the deadline
+        /// are not counted).
         aborted_tasks: usize,
+        /// Number of tasks that panicked during the abort drain. A nonzero
+        /// count indicates a task unwound on the abort path — typically a
+        /// secondary failure mode when the primary shutdown path races with
+        /// a panicking task.
+        panicked_tasks: usize,
     },
 }
 
@@ -1788,7 +1883,7 @@ mod tests {
     #[test]
     fn new_creates_instance_with_expected_state() {
         let cm = test_context_manager();
-        let instance = BridgeInstance::with_context_manager(Arc::clone(&cm));
+        let instance = CoreFields::with_context_manager(Arc::clone(&cm));
 
         assert!(!instance.is_shutdown());
         // Verify the ContextManager pointer is the same Arc
@@ -1803,7 +1898,7 @@ mod tests {
     fn new_creates_instance_without_context_manager() {
         // Per spec §12.2.3, BridgeInstance is infrastructure and has no DID
         // requirement — it can exist before any identity is created.
-        let instance = BridgeInstance::new();
+        let instance = CoreFields::new();
 
         assert!(!instance.has_context_manager());
         assert!(instance.try_context_manager().is_none());
@@ -1812,7 +1907,7 @@ mod tests {
 
     #[test]
     fn set_context_manager_is_idempotent_once_set() {
-        let instance = BridgeInstance::new();
+        let instance = CoreFields::new();
         let cm1 = test_context_manager();
         instance.set_context_manager(Arc::clone(&cm1));
         assert!(Arc::ptr_eq(instance.try_context_manager().unwrap(), &cm1));
@@ -1831,7 +1926,7 @@ mod tests {
         // Simulates the case where the bridge was partially initialized
         // (BridgeInstance exists but identity_create / init_context_manager
         // never ran) and then shutdown is called.
-        let instance = BridgeInstance::new();
+        let instance = CoreFields::new();
         assert!(!instance.has_context_manager());
         instance.shutdown();
         assert!(instance.is_shutdown());
@@ -1839,7 +1934,7 @@ mod tests {
 
     #[test]
     fn shutdown_transitions_flag_permanently() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
 
         assert!(!instance.is_shutdown());
         instance.shutdown();
@@ -1853,7 +1948,7 @@ mod tests {
     #[test]
     fn context_manager_returns_shared_reference() {
         let cm = test_context_manager();
-        let instance = BridgeInstance::with_context_manager(Arc::clone(&cm));
+        let instance = CoreFields::with_context_manager(Arc::clone(&cm));
 
         // Both should point to the same ContextManager allocation
         assert!(Arc::ptr_eq(instance.try_context_manager().unwrap(), &cm));
@@ -1862,7 +1957,7 @@ mod tests {
     #[test]
     fn is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<BridgeInstance>();
+        assert_send_sync::<CoreFields>();
     }
 
     // -----------------------------------------------------------------
@@ -1871,7 +1966,7 @@ mod tests {
 
     #[test]
     fn transport_starts_empty() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         assert!(!instance.has_transport());
         assert_eq!(
             instance.with_transport(|_| ()).unwrap_err(),
@@ -1881,7 +1976,7 @@ mod tests {
 
     #[test]
     fn clear_transport_when_empty_is_ok() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         assert!(instance.clear_transport().is_ok());
         assert!(!instance.has_transport());
     }
@@ -1892,7 +1987,7 @@ mod tests {
 
     #[test]
     fn register_and_retrieve_known_context() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         let known = KnownContext {
             routing_id: [42u8; 32],
             relay_url: Some("wss://relay.example.com".to_owned()),
@@ -1911,7 +2006,7 @@ mod tests {
 
     #[test]
     fn known_contexts_for_member_filters() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.register_known_context(
             "ctx-alice",
             KnownContext {
@@ -1945,7 +2040,7 @@ mod tests {
 
     #[test]
     fn remove_known_context_works() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.register_known_context(
             "ctx-1",
             KnownContext {
@@ -1966,7 +2061,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_creates_default_on_first_access() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         assert!(instance.rate_limiters().is_empty());
 
         // Accessing a non-existent tracker creates a default one
@@ -2004,7 +2099,7 @@ mod tests {
 
     #[test]
     fn suspend_clears_transport() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
@@ -2018,7 +2113,7 @@ mod tests {
 
     #[test]
     fn suspend_is_noop_when_shutdown() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.shutdown();
 
         // Suspending an already-shutdown instance is a no-op (not an error)
@@ -2029,7 +2124,7 @@ mod tests {
 
     #[test]
     fn resume_clears_suspended_flag() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
         assert!(instance.is_suspended());
 
@@ -2039,7 +2134,7 @@ mod tests {
 
     #[test]
     fn resume_fails_after_shutdown() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.shutdown();
 
         let err = instance.resume().unwrap_err();
@@ -2052,7 +2147,7 @@ mod tests {
 
     #[test]
     fn shutdown_is_idempotent() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
 
         // Register some state
         instance.register_known_context(
@@ -2078,7 +2173,7 @@ mod tests {
 
     #[test]
     fn shutdown_clears_registries() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
 
         // Populate registries
         instance.register_known_context(
@@ -2113,7 +2208,7 @@ mod tests {
 
     #[test]
     fn shutdown_clears_suspended_flag() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
         assert!(instance.is_suspended());
 
@@ -2125,7 +2220,7 @@ mod tests {
 
     #[test]
     fn new_instance_is_not_suspended() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         assert!(!instance.is_suspended());
     }
 
@@ -2143,13 +2238,13 @@ mod tests {
 
     #[test]
     fn check_ready_passes_when_active() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         assert!(instance.check_ready().is_ok());
     }
 
     #[test]
     fn check_ready_fails_when_shutdown() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.shutdown();
         let err = instance.check_ready().unwrap_err();
         assert_eq!(err, LifecycleError::AlreadyShutDown);
@@ -2157,7 +2252,7 @@ mod tests {
 
     #[test]
     fn check_ready_fails_when_suspended() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
         let err = instance.check_ready().unwrap_err();
         assert_eq!(err, LifecycleError::Suspended);
@@ -2165,7 +2260,7 @@ mod tests {
 
     #[test]
     fn check_ready_passes_after_resume() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
         assert!(instance.check_ready().is_err());
         instance.resume().unwrap();
@@ -2174,7 +2269,7 @@ mod tests {
 
     #[test]
     fn known_contexts_cap_evicts_oldest() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
 
         // Register MAX_KNOWN_CONTEXTS entries.
         for i in 0..MAX_KNOWN_CONTEXTS {
@@ -2207,7 +2302,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_cap_evicts_oldest() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
 
         // Fill up to capacity.
         for i in 0..MAX_RATE_LIMITERS {
@@ -2234,7 +2329,7 @@ mod tests {
     #[test]
     fn shutdown_hooks_are_called_on_shutdown() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
 
         let counter = Arc::new(AtomicUsize::new(0));
         let c1 = Arc::clone(&counter);
@@ -2259,7 +2354,7 @@ mod tests {
     #[test]
     fn shutdown_hooks_run_only_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
 
         let counter = Arc::new(AtomicUsize::new(0));
         let c = Arc::clone(&counter);
@@ -2279,7 +2374,7 @@ mod tests {
     #[test]
     fn register_hook_after_shutdown_runs_immediately() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
 
         instance.shutdown();
 
@@ -2305,7 +2400,7 @@ mod tests {
 
     #[test]
     fn set_transport_warns_after_shutdown() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.shutdown();
 
         // set_transport after shutdown warns but does not error — matches
@@ -2322,7 +2417,7 @@ mod tests {
 
     #[test]
     fn set_transport_rejects_when_suspended() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
 
         let err = instance
@@ -2337,7 +2432,7 @@ mod tests {
 
     #[test]
     fn set_transport_accepts_after_resume() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
         instance.resume().unwrap();
 
@@ -2356,7 +2451,7 @@ mod tests {
     #[test]
     #[allow(clippy::panic)]
     fn register_hook_after_shutdown_catches_panic() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.shutdown();
 
         // A panicking hook registered after shutdown must not propagate.
@@ -2376,7 +2471,7 @@ mod tests {
     fn shutdown_hook_modifies_external_state() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         let state = Arc::new(AtomicBool::new(false));
         let state2 = Arc::clone(&state);
 
@@ -2403,7 +2498,7 @@ mod tests {
     fn multiple_hooks_all_run_even_if_one_panics() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         let counter = Arc::new(AtomicUsize::new(0));
         let c1 = Arc::clone(&counter);
         let c3 = Arc::clone(&counter);
@@ -2437,7 +2532,7 @@ mod tests {
 
     #[test]
     fn economy_budget_creates_default_on_first_access() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         let remaining = instance.with_economy_budget("ctx-1", |tracker| {
             tracker.remaining(&scp_primitives::DID::from("did:dht:zalice"))
         });
@@ -2446,7 +2541,7 @@ mod tests {
 
     #[test]
     fn economy_budget_mut_grants_and_reads() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         let did = scp_primitives::DID::from("did:dht:zalice");
         instance.with_economy_budget_mut("ctx-eco", |tracker| {
             tracker.grant(&did, scp_protocol::economy::Amount::new(500));
@@ -2457,7 +2552,7 @@ mod tests {
 
     #[test]
     fn economy_antispam_creates_default_on_first_access() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         let did = scp_primitives::DID::from("did:dht:zbob");
         let velocity =
             instance.with_economy_antispam("ctx-spam", |tracker| tracker.get_velocity(&did, 1000));
@@ -2466,7 +2561,7 @@ mod tests {
 
     #[test]
     fn remove_economy_state_clears_both() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         let did = scp_primitives::DID::from("did:dht:zalice");
         instance.with_economy_budget_mut("ctx-rm", |tracker| {
             tracker.grant(&did, scp_protocol::economy::Amount::new(100));
@@ -2484,7 +2579,7 @@ mod tests {
 
     #[test]
     fn economy_existing_context_id_bypasses_capacity_check() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         let did = scp_primitives::DID::from("did:dht:zalice");
 
         // Create one entry.
@@ -2505,7 +2600,7 @@ mod tests {
 
     #[test]
     fn economy_accessors_use_ephemeral_after_shutdown() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         let did = scp_primitives::DID::from("did:dht:zalice");
 
         // Grant a budget before shutdown.
@@ -2554,7 +2649,7 @@ mod tests {
 
     #[test]
     fn bridge_state_starts_empty() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         assert!(instance.bridge_state().is_empty());
     }
 
@@ -2563,7 +2658,7 @@ mod tests {
         use scp_protocol::bridge::shadow::ShadowRegistry;
         use scp_protocol::crypto::sender_keys::SenderKeyStore;
 
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.bridge_state().insert(
             "ctx-bs".to_owned(),
             BridgeContextState {
@@ -2583,7 +2678,7 @@ mod tests {
 
     #[test]
     fn did_resolver_starts_none() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         assert!(instance.did_resolver().is_none());
     }
 
@@ -2596,7 +2691,7 @@ mod tests {
         use scp_protocol::bridge::shadow::ShadowRegistry;
         use scp_protocol::crypto::sender_keys::SenderKeyStore;
 
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
 
         // Populate economy
         let did = scp_primitives::DID::from("did:dht:zalice");
@@ -2628,7 +2723,7 @@ mod tests {
 
     #[test]
     fn new_instance_has_no_persistence() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         assert!(
             instance.persistence().is_none(),
             "new() must not have a persistence provider"
@@ -2640,7 +2735,7 @@ mod tests {
         use scp_core::context::providers::InMemoryPersistence;
 
         let persistence = Box::new(InMemoryPersistence::new());
-        let instance = BridgeInstance::with_persistence(persistence);
+        let instance = CoreFields::with_persistence(persistence);
         instance.set_context_manager(test_context_manager());
         assert!(
             instance.persistence().is_some(),
@@ -2654,13 +2749,13 @@ mod tests {
 
     #[test]
     fn pending_relay_url_is_none_by_default() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         assert!(instance.pending_relay_url().is_none());
     }
 
     #[test]
     fn set_relay_url_stores_url() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.set_relay_url("wss://relay.example.com".to_owned());
         assert_eq!(
             instance.pending_relay_url().as_deref(),
@@ -2670,7 +2765,7 @@ mod tests {
 
     #[test]
     fn clear_transport_preserves_relay_url() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
@@ -2687,7 +2782,7 @@ mod tests {
 
     #[test]
     fn suspend_preserves_relay_url() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
@@ -2706,7 +2801,7 @@ mod tests {
     fn relay_url_survives_suspend_resume_cycle() {
         // The relay URL is preserved across suspend/resume so callers can
         // reconnect to the same relay after resume.
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
@@ -2727,7 +2822,7 @@ mod tests {
 
     #[test]
     fn shutdown_clears_relay_url() {
-        let instance = BridgeInstance::with_context_manager(test_context_manager());
+        let instance = CoreFields::with_context_manager(test_context_manager());
         instance.set_relay_url("wss://relay.example.com".to_owned());
         assert!(instance.pending_relay_url().is_some());
 
@@ -2750,8 +2845,8 @@ mod tests {
         // independently shut-down-able.
         let cm1 = test_context_manager();
         let cm2 = test_context_manager();
-        let bi1 = BridgeInstance::with_context_manager(Arc::clone(&cm1));
-        let bi2 = BridgeInstance::with_context_manager(Arc::clone(&cm2));
+        let bi1 = CoreFields::with_context_manager(Arc::clone(&cm1));
+        let bi2 = CoreFields::with_context_manager(Arc::clone(&cm2));
 
         // Their ContextManager allocations are distinct.
         assert!(!Arc::ptr_eq(
@@ -2792,7 +2887,7 @@ mod tests {
             key_resolver,
         ));
 
-        let instance = BridgeInstance::with_persistence(persistence_for_instance);
+        let instance = CoreFields::with_persistence(persistence_for_instance);
         instance.set_context_manager(cm);
 
         // Verify the persistence accessor returns Some.
@@ -2826,8 +2921,8 @@ mod tests {
     fn two_instances_operate_concurrently() {
         let cm1 = test_context_manager();
         let cm2 = test_context_manager();
-        let bi1 = BridgeInstance::with_context_manager(Arc::clone(&cm1));
-        let bi2 = BridgeInstance::with_context_manager(Arc::clone(&cm2));
+        let bi1 = CoreFields::with_context_manager(Arc::clone(&cm1));
+        let bi2 = CoreFields::with_context_manager(Arc::clone(&cm2));
 
         // Register known contexts independently.
         bi1.register_known_context(
@@ -2964,10 +3059,15 @@ mod tests {
             .shutdown_core_async(Duration::from_secs(1))
             .await
             .unwrap();
-        let ShutdownOutcome::GracefulWithin(elapsed) = outcome else {
+        let ShutdownOutcome::GracefulWithin {
+            elapsed,
+            panicked_tasks,
+        } = outcome
+        else {
             unreachable!("expected GracefulWithin, got {outcome:?}");
         };
         assert!(elapsed < Duration::from_secs(1));
+        assert_eq!(panicked_tasks, 0);
         assert!(instance.is_shutdown());
     }
 
@@ -2985,10 +3085,15 @@ mod tests {
             .shutdown_core_async(Duration::from_millis(100))
             .await
             .unwrap();
-        let ShutdownOutcome::TimedOut { aborted_tasks } = outcome else {
+        let ShutdownOutcome::TimedOut {
+            aborted_tasks,
+            panicked_tasks,
+        } = outcome
+        else {
             unreachable!("expected TimedOut, got {outcome:?}");
         };
         assert_eq!(aborted_tasks, 1);
+        assert_eq!(panicked_tasks, 0);
         assert!(instance.is_shutdown());
     }
 
@@ -3011,12 +3116,44 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(outcome, ShutdownOutcome::GracefulWithin(_)),
+            matches!(outcome, ShutdownOutcome::GracefulWithin { .. }),
             "task observing cancel_token should exit gracefully, got {outcome:?}"
         );
         assert!(
             observed.load(Ordering::SeqCst),
             "spawned task must have observed the cancellation signal"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::panic)]
+    async fn shutdown_core_async_counts_panicked_tasks() {
+        // Spawn a task that panics quickly — the drain should observe it
+        // and surface the count in `GracefulWithin.panicked_tasks`.
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        {
+            let mut tasks = instance.task_handle().await;
+            tasks.spawn(async move {
+                panic!("intentional panic — shutdown_core_async_counts_panicked_tasks");
+            });
+            tasks.spawn(async move {
+                panic!("intentional panic #2");
+            });
+            tasks.spawn(async move {
+                // This one exits cleanly — must not be counted as panicked.
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            });
+        }
+        let outcome = instance
+            .shutdown_core_async(Duration::from_secs(2))
+            .await
+            .unwrap();
+        let ShutdownOutcome::GracefulWithin { panicked_tasks, .. } = outcome else {
+            unreachable!("expected GracefulWithin, got {outcome:?}");
+        };
+        assert_eq!(
+            panicked_tasks, 2,
+            "two panicking tasks must be counted, got {panicked_tasks}"
         );
     }
 
@@ -3044,7 +3181,7 @@ mod tests {
             .shutdown_core_async(Duration::from_secs(1))
             .await
             .unwrap();
-        assert!(matches!(first, ShutdownOutcome::GracefulWithin(_)));
+        assert!(matches!(first, ShutdownOutcome::GracefulWithin { .. }));
 
         let err = instance
             .shutdown_core_async(Duration::from_secs(1))
@@ -3108,7 +3245,7 @@ mod tests {
             core: CoreFields::with_context_manager(test_context_manager()),
         };
         let outcome = bridge.shutdown(Duration::from_secs(1)).await.unwrap();
-        assert!(matches!(outcome, ShutdownOutcome::GracefulWithin(_)));
+        assert!(matches!(outcome, ShutdownOutcome::GracefulWithin { .. }));
         assert!(bridge.core().is_shutdown());
     }
 }

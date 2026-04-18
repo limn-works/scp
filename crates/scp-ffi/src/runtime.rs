@@ -71,9 +71,11 @@ use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
 use scp_event_log::EventLog;
-use scp_ffi_common::bridge_instance::{
-    BridgeInstanceCore, CoreFields, ShutdownError, ShutdownOutcome,
-};
+use scp_ffi_common::bridge_instance::{BridgeInstanceCore, ShutdownError, ShutdownOutcome};
+// Re-export `CoreFields` at `crate::runtime::CoreFields` so the
+// `pyscp_check_handle!` macro can refer to it as
+// `$crate::runtime::CoreFields`.
+pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_identity::cache::SystemClock;
 use scp_identity::{DidDocument, ScpIdentity};
 use scp_platform::encrypting_adapter::EncryptingAdapter;
@@ -92,15 +94,19 @@ use crate::error::ScpPyError;
 /// Runtime handle-affinity enforcement at every `#[pyfunction]` entry point
 /// that accepts a handle.
 ///
-/// Resolves `$bi` (a `&PyBridgeInstance` or `&Arc<PyBridgeInstance>`) and
-/// checks that `$handle.instance_id` matches `$bi.core.instance_id`. On
+/// Resolves `$core` (a [`CoreFields`] reference) and checks that each
+/// supplied `$handle.instance_id` matches `$core.instance_id`. On
 /// mismatch, returns a [`ScpPyError::UcanError`] with code
 /// [`scp_ffi_common::error_codes::PERM_3030`] (mapped via the
 /// [`From<HandleAffinityError>`](scp_ffi_common::bridge_instance::HandleAffinityError)
 /// conversion).
 ///
-/// Prefer this macro over ad-hoc `bi.core.check_handle(...)` calls so the
-/// emitted error code is consistent across every entry point.
+/// Taking an explicit `$core` target (rather than implicitly using the
+/// default instance) prevents a PR-2 regression where per-instance `SCP`
+/// methods would silently check against the default bridge instead of
+/// `self.inner.core`. For the free-function façade the caller passes
+/// `bi.core`, where `bi` comes from
+/// [`default_bridge_instance`](crate::runtime::default_bridge_instance).
 ///
 /// # Example
 ///
@@ -108,17 +114,19 @@ use crate::error::ScpPyError;
 /// #[pyfunction]
 /// pub fn example(handle: &SomeHandle) -> PyResult<()> {
 ///     let bi = crate::runtime::default_bridge_instance()?;
-///     pyscp_check_handle!(bi, handle);
+///     pyscp_check_handle!(bi.core, handle);
 ///     // ... real work ...
 ///     Ok(())
 /// }
 /// ```
 #[macro_export]
 macro_rules! pyscp_check_handle {
-    ($bi:expr, $handle:expr) => {{
-        $bi.core
-            .check_handle($handle.instance_id)
-            .map_err($crate::error::ScpPyError::from)?
+    ($core:expr, $($handle:expr),+ $(,)?) => {{
+        $(
+            $core
+                .check_handle($handle.instance_id)
+                .map_err($crate::error::ScpPyError::from)?;
+        )+
     }};
 }
 
@@ -315,9 +323,15 @@ impl BridgeInstanceCore for PyBridgeInstance {
     async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
         // Drain async tasks first (respects timeout + cancellation token),
         // then run bridge-specific cleanup (clears typed fields).
-        let outcome = self.core.shutdown_core_async(timeout).await?;
+        //
+        // `bridge_specific_shutdown` MUST run even when
+        // `shutdown_core_async` returns `AlreadyShutDown` — that variant
+        // signals the sync shutdown path raced ahead; without the cleanup
+        // call, typed PyO3 registries (identity, MCP, FFI bridge state)
+        // leak key material past shutdown.
+        let result = self.core.shutdown_core_async(timeout).await;
         self.bridge_specific_shutdown();
-        Ok(outcome)
+        result
     }
 
     fn bridge_specific_shutdown(&self) {
@@ -495,7 +509,7 @@ pub fn init_context_manager(local_did: &str) {
     bi.core.set_context_manager(cm_arc);
 }
 
-/// Ensures the global [`BridgeInstance`] exists (without a `ContextManager`).
+/// Ensures the default [`PyBridgeInstance`] exists (without a `ContextManager`).
 ///
 /// Called by [`crate::identity::ensure_did_resolver_initialized`] before
 /// `DidDht::create()` runs, so that the DID resolver slot owned by
@@ -1427,7 +1441,7 @@ pub fn get_storage() -> Result<&'static Arc<EncryptingAdapter<InMemoryStorage>>,
 
 /// Stores a new `TransportManager` (called by `py_transport_connect`).
 ///
-/// Delegates to [`BridgeInstance::set_transport`].
+/// Delegates to [`CoreFields::set_transport`].
 ///
 /// # Errors
 ///
@@ -1446,7 +1460,7 @@ pub fn set_transport_manager(manager: scp_transport::TransportManager) -> Result
 
 /// Executes a closure with a read reference to the `TransportManager`.
 ///
-/// Delegates to [`BridgeInstance::with_transport`].
+/// Delegates to [`CoreFields::with_transport`].
 ///
 /// # Errors
 ///
@@ -1465,7 +1479,7 @@ pub fn with_transport_manager<T>(
 
 /// Executes a closure with a mutable reference to the `TransportManager`.
 ///
-/// Delegates to [`BridgeInstance::with_transport_mut`].
+/// Delegates to [`CoreFields::with_transport_mut`].
 ///
 /// # Errors
 ///

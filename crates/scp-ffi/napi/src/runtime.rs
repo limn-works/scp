@@ -19,9 +19,11 @@
 //! See issue #388 and `.docs/adrs/phase-4.md` (ADR-022).
 
 use async_trait::async_trait;
-use scp_ffi_common::bridge_instance::{
-    BridgeInstanceCore, CoreFields, ShutdownError, ShutdownOutcome,
-};
+use scp_ffi_common::bridge_instance::{BridgeInstanceCore, ShutdownError, ShutdownOutcome};
+// Re-export `CoreFields` at `crate::runtime::CoreFields` so the
+// `napi_check_handle!` macro can refer to it as `$crate::runtime::CoreFields`
+// without each caller importing the full `scp_ffi_common` path.
+pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_ffi_common::bridge_runtime::BridgeInMemoryStorage;
 use scp_ffi_common::error_codes as codes;
 use std::collections::{HashMap, HashSet};
@@ -178,9 +180,14 @@ impl BridgeInstanceCore for NapiBridgeInstance {
     }
 
     async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
-        let outcome = self.core.shutdown_core_async(timeout).await?;
+        // `bridge_specific_shutdown` MUST run even when
+        // `shutdown_core_async` returns `AlreadyShutDown` — that variant
+        // signals the sync shutdown path raced ahead; without the cleanup
+        // call, typed NAPI registries (UCAN, identity) leak key material
+        // past shutdown.
+        let result = self.core.shutdown_core_async(timeout).await;
         self.bridge_specific_shutdown();
-        Ok(outcome)
+        result
     }
 
     fn bridge_specific_shutdown(&self) {
@@ -339,22 +346,23 @@ static DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<NapiBridgeInstance>> = OnceLock::ne
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 fn init_default_bridge_instance() {
-    // Guard against duplicate hook registration — OnceLock guarantees
-    // single-init, but the hook below must only be registered once.
-    if DEFAULT_BRIDGE_INSTANCE.get().is_some() {
-        return;
-    }
-
-    let instance = Arc::new(NapiBridgeInstance::new_napi());
-    let bi = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| instance);
-
-    // Register a shutdown hook for state still living outside the
-    // `NapiBridgeInstance` during PR 1 (MCP registries — migrated onto the
-    // struct in PR 2). Identity + UCAN registries are now typed fields and
-    // are cleared by `bridge_specific_shutdown` without needing a hook.
-    bi.core.register_shutdown_hook(Box::new(|| {
-        crate::mcp::clear_registries();
-    }));
+    // Register the MCP shutdown hook INSIDE the `get_or_init` closure so it
+    // runs exactly once per process regardless of how many threads race
+    // through `init_default_bridge_instance` before the OnceLock is filled.
+    // A prior pattern registered the hook outside the closure, which caused
+    // duplicate-registration races under concurrent first-call scenarios.
+    let _ = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| {
+        let instance = Arc::new(NapiBridgeInstance::new_napi());
+        // Shutdown hook for state still living outside the
+        // `NapiBridgeInstance` during PR 1 (MCP registries — migrated onto
+        // the struct in PR 2). Identity + UCAN registries are now typed
+        // fields and are cleared by `bridge_specific_shutdown` without
+        // needing a hook.
+        instance.core.register_shutdown_hook(Box::new(|| {
+            crate::mcp::clear_registries();
+        }));
+        instance
+    });
 }
 
 /// Returns the raw default `NapiBridgeInstance`, if initialized.
@@ -1307,7 +1315,7 @@ pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
 /// Returns a mutable reference to the rate limit tracker for the given
 /// identity DID, creating one if it does not exist.
 ///
-/// Delegates to [`BridgeInstance::with_rate_limit_tracker`]. If the bridge
+/// Delegates to [`CoreFields::with_rate_limit_tracker`]. If the bridge
 /// has not been initialized (unusual — identity must be created before
 /// invitation evaluation), falls back to a thread-local default tracker
 /// to preserve the original infallible signature.

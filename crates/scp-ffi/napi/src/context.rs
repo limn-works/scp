@@ -962,7 +962,7 @@ pub async fn context_send(
 /// - Rejects with `SCP-TRANS-5010` if no relay connection is available.
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub fn context_subscribe(
+pub async fn context_subscribe(
     handle: &NapiContextHandle,
     identity_did: String,
     on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
@@ -1014,6 +1014,16 @@ pub fn context_subscribe(
         }));
     };
 
+    // Resolve the bridge instance to own the spawned task. The subscription
+    // task MUST be registered against `bi.core.task_handle()` so
+    // `shutdown_core_async` drains it under the caller's deadline — the
+    // previous implementation spawned through the shared runtime, leaving
+    // the task orphaned and making `shutdown_core_async` falsely report
+    // `GracefulWithin` while the relay listener continued in the
+    // background (Item 2 — review finding).
+    let bi_core = crate::runtime::bridge_instance()?;
+    let bridge_cancel = bi_core.cancel_token();
+
     let context_id = handle.context_id.clone();
     let is_broadcast = handle.mode() == "Broadcast";
     // §9.10.4 / §5.14: choose the correct shared routing ID based on context
@@ -1058,12 +1068,19 @@ pub fn context_subscribe(
 
     // Spawn a background task that subscribes to the relay and delivers
     // incoming messages through the JS callback. The task terminates when
-    // the stream ends OR the cancellation token is triggered.
+    // the stream ends OR either cancellation token fires — the
+    // per-subscription `cancel_token` (invoked by
+    // `context_cancel_subscription`) or the bridge-level token fired by
+    // `shutdown_core_async`.
     //
-    // Uses the shared NAPI runtime (not bare `tokio::spawn`) because this
-    // is a sync `#[napi]` function — it runs on the Node.js main thread
-    // which has no active tokio runtime context.
-    crate::runtime().spawn(async move {
+    // Registered in the bridge instance's `JoinSet` (`bi_core.task_handle()`)
+    // so `shutdown_core_async` observes and drains this task within the
+    // caller's deadline. Spawning through `crate::runtime().spawn` would
+    // orphan the task, making shutdown falsely report `GracefulWithin`
+    // while the subscription still held onto `transport_mgr`,
+    // `ContextManager`, and the cancel_token Arcs.
+    let mut tasks = bi_core.task_handle().await;
+    tasks.spawn(async move {
         use futures::StreamExt;
 
         // Collect the member's pseudonym from the ContextManager state.
@@ -1139,12 +1156,22 @@ pub fn context_subscribe(
         let mut sequence_counter: f64 = 0.0;
 
         loop {
-            // Select between the next stream event and cancellation.
+            // Select between the next stream event, the per-subscription
+            // cancel token (`context_cancel_subscription` / re-subscribe),
+            // and the bridge-level cancel token
+            // (`shutdown_core_async`). Either cancel signal exits cleanly.
             let event = tokio::select! {
                 () = cancel_token.cancelled() => {
                     tracing::info!(
                         context_id = %context_id,
                         "subscription cancelled via token"
+                    );
+                    break;
+                }
+                () = bridge_cancel.cancelled() => {
+                    tracing::info!(
+                        context_id = %context_id,
+                        "subscription cancelled via bridge shutdown"
                     );
                     break;
                 }
@@ -1230,6 +1257,9 @@ pub fn context_subscribe(
         // disconnect or task termination.
         active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
     });
+    // Drop the JoinSet guard now that spawn is done — shutdown requires
+    // exclusive access to drain.
+    drop(tasks);
 
     Ok(())
 }

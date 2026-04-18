@@ -153,12 +153,15 @@ impl Scp {
 
     /// Shuts down this bridge instance with a graceful deadline.
     ///
-    /// Awaits in-flight tasks up to `timeout_secs` seconds, aborts any
-    /// remaining tasks, then clears registries and runs shutdown hooks.
-    /// Permanent — a shut-down instance cannot be reused.
+    /// Awaits in-flight tasks up to `timeout_millis` **milliseconds**,
+    /// aborts any remaining tasks, then clears registries and runs
+    /// shutdown hooks. Permanent — a shut-down instance cannot be reused.
+    ///
+    /// The unit is **milliseconds** — unified across all Rust bridges.
+    /// 2^32 ms is ≈ 49.7 days, far beyond any realistic budget.
     #[napi]
-    pub async fn shutdown(&self, timeout_secs: u32) -> napi::Result<()> {
-        let timeout = Duration::from_secs(u64::from(timeout_secs));
+    pub async fn shutdown(&self, timeout_millis: u32) -> napi::Result<()> {
+        let timeout = Duration::from_millis(u64::from(timeout_millis));
         match self.inner.shutdown(timeout).await {
             Ok(_) => Ok(()),
             // `AlreadyShutDown` is treated as a harmless lifecycle

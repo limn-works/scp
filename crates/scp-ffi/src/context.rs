@@ -1086,7 +1086,7 @@ fn py_context_join(
     spending_ucan_jwt: Option<&str>,
 ) -> PyResult<()> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(identity_did)?;
     let state = handle
         .state
@@ -1236,7 +1236,7 @@ fn py_context_join(
 #[pyo3(signature = (handle, identity_did))]
 fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(identity_did)?;
     let state = handle
         .state
@@ -1312,7 +1312,7 @@ fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
 #[pyo3(signature = (handle, identity_did))]
 fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(identity_did)?;
     let mut state = handle
         .state
@@ -1397,7 +1397,7 @@ fn py_context_send(
     spending_ucan_jwt: Option<&str>,
 ) -> PyResult<()> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(identity_did)?;
     let state = handle
         .state
@@ -1653,7 +1653,7 @@ fn drain_and_deliver(context_id: &str) {
 #[pyo3(signature = (handle,))]
 fn py_context_receive(handle: &PyContextHandle) -> PyResult<PyMessageReceiver> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let state = handle
         .state
         .lock()
@@ -1742,7 +1742,7 @@ fn build_core_context_params(
 #[pyo3(signature = (handle, policy_json))]
 fn py_set_economic_policy(handle: &mut PyContextHandle, policy_json: &str) -> PyResult<()> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let _ = policy_json;
     Err(pyo3::exceptions::PyPermissionError::new_err(
         "economic policy changes must go through governance \
@@ -1762,7 +1762,7 @@ fn py_set_economic_policy(handle: &mut PyContextHandle, policy_json: &str) -> Py
 #[pyo3(signature = (handle,))]
 fn py_get_economic_policy(handle: &PyContextHandle) -> PyResult<Option<String>> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     Ok(handle.params.economic_policy.clone())
 }
 
@@ -1946,7 +1946,7 @@ impl scp_core::crypto::ucan::validate::ProofResolver for NoOpProofResolver {
 #[pyo3(signature = (handle, proposal_json))]
 fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyResult<String> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2081,7 +2081,7 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
 #[pyo3(signature = (handle,))]
 fn py_tombstone_migrated_context(handle: &PyContextHandle) -> PyResult<()> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2123,7 +2123,7 @@ fn py_tombstone_migrated_context(handle: &PyContextHandle) -> PyResult<()> {
 #[pyo3(signature = (handle,))]
 fn py_migration_state(handle: &PyContextHandle) -> PyResult<Option<String>> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2206,7 +2206,7 @@ fn py_governance_propose(
     action_json: &str,
 ) -> PyResult<String> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2295,7 +2295,7 @@ fn py_governance_approve(
     proposal_id_hex: &str,
 ) -> PyResult<String> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2352,7 +2352,7 @@ fn py_governance_reject(
     proposal_id_hex: &str,
 ) -> PyResult<String> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2409,7 +2409,7 @@ fn py_governance_withdraw(
     proposal_id_hex: &str,
 ) -> PyResult<String> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2466,7 +2466,7 @@ fn py_governance_get_proposal(
     proposal_id_hex: String,
 ) -> PyResult<String> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let context_id = handle.context_id.clone();
     let proposal_id = parse_proposal_id(&proposal_id_hex)?;
 
@@ -2497,7 +2497,7 @@ fn py_governance_get_proposal(
 #[pyo3(signature = (handle,))]
 fn py_governance_list_proposals(handle: &PyContextHandle) -> PyResult<String> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let context_id = handle.context_id.clone();
 
     let mgr = crate::runtime::context_manager()
@@ -2544,7 +2544,7 @@ fn py_apply_pending_ceiling_modification(
     current_timestamp: u64,
 ) -> PyResult<bool> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2580,7 +2580,7 @@ fn py_apply_pending_ceiling_modification(
 #[pyo3(signature = (handle,))]
 fn py_finalize_close(handle: &PyContextHandle) -> PyResult<()> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2649,7 +2649,7 @@ fn py_create_governance_checkpoint(
     creator_signature_hex: &str,
 ) -> PyResult<String> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2716,7 +2716,7 @@ fn py_add_checkpoint_cosignature(
     signature_hex: &str,
 ) -> PyResult<String> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -2867,7 +2867,7 @@ fn parse_hex_32(hex_str: &str, field_name: &str) -> PyResult<[u8; 32]> {
 #[pyo3(signature = (handle, subscriber_did))]
 fn py_broadcast_subscribe(handle: &PyContextHandle, subscriber_did: &str) -> PyResult<()> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(subscriber_did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -2907,7 +2907,7 @@ fn py_broadcast_unsubscribe(
     rotate_keys: bool,
 ) -> PyResult<()> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(subscriber_did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -2942,7 +2942,7 @@ fn py_broadcast_publish(
     payload: Vec<u8>,
 ) -> PyResult<()> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(author_did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -2998,7 +2998,7 @@ fn py_broadcast_publish_asset(
     deploy_id: Option<&str>,
 ) -> PyResult<HashMap<String, String>> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(author_did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -3138,7 +3138,7 @@ fn py_broadcast_publish_assets(
     deploy_id: Option<&str>,
 ) -> PyResult<PyObject> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     const MAX_BATCH_ASSETS: usize = 10_000;
     if assets.len() > MAX_BATCH_ASSETS {
         return Err(PyRuntimeError::new_err(format!(
@@ -3256,7 +3256,7 @@ fn py_broadcast_block_subscriber(
     blocker_did: &str,
 ) -> PyResult<()> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(subscriber_did)?;
     validate::validate_did(blocker_did)?;
     let rt = crate::runtime()?;
@@ -3291,7 +3291,7 @@ fn py_broadcast_unblock_subscriber(
     unblocker_did: &str,
 ) -> PyResult<()> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(subscriber_did)?;
     validate::validate_did(unblocker_did)?;
     let rt = crate::runtime()?;
@@ -3327,7 +3327,7 @@ fn py_broadcast_handle_key_request(
     requester_did: &str,
 ) -> PyResult<String> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(author_did)?;
     validate::validate_did(requester_did)?;
     let rt = crate::runtime()?;
@@ -3356,7 +3356,7 @@ fn py_broadcast_handle_key_request(
 #[pyo3(signature = (handle,))]
 fn py_broadcast_subscriber_count(handle: &PyContextHandle) -> PyResult<Option<u64>> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -3371,7 +3371,7 @@ fn py_broadcast_subscriber_count(handle: &PyContextHandle) -> PyResult<Option<u6
 #[pyo3(signature = (handle, did))]
 fn py_broadcast_is_subscriber(handle: &PyContextHandle, did: &str) -> PyResult<bool> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -3388,7 +3388,7 @@ fn py_broadcast_is_subscriber(handle: &PyContextHandle, did: &str) -> PyResult<b
 #[pyo3(signature = (handle,))]
 fn py_broadcast_admission(handle: &PyContextHandle) -> PyResult<Option<String>> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -3409,7 +3409,7 @@ fn py_broadcast_admission(handle: &PyContextHandle) -> PyResult<Option<String>> 
 #[pyo3(signature = (handle,))]
 fn py_context_member_count(handle: &PyContextHandle) -> PyResult<Option<u64>> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -3422,7 +3422,7 @@ fn py_context_member_count(handle: &PyContextHandle) -> PyResult<Option<u64>> {
 #[pyo3(signature = (handle, did))]
 fn py_context_is_member(handle: &PyContextHandle, did: &str) -> PyResult<bool> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -3436,7 +3436,7 @@ fn py_context_is_member(handle: &PyContextHandle, did: &str) -> PyResult<bool> {
 #[pyo3(signature = (handle,))]
 fn py_context_member_dids(handle: &PyContextHandle) -> PyResult<Vec<String>> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -3451,7 +3451,7 @@ fn py_context_member_dids(handle: &PyContextHandle) -> PyResult<Vec<String>> {
 #[pyo3(signature = (handle, did))]
 fn py_context_member_role(handle: &PyContextHandle, did: &str) -> PyResult<Option<String>> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -3474,7 +3474,7 @@ fn py_context_member_role(handle: &PyContextHandle, did: &str) -> PyResult<Optio
 #[pyo3(signature = (handle,))]
 fn py_context_drain_events(handle: &PyContextHandle) -> PyResult<Vec<String>> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -3502,7 +3502,7 @@ fn py_context_drain_events(handle: &PyContextHandle) -> PyResult<Vec<String>> {
 #[pyo3(signature = (handle,))]
 fn py_context_handle_ttl_expiry(handle: &PyContextHandle) -> PyResult<()> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -3547,7 +3547,7 @@ fn py_context_propose_ttl_extension(
     proposed_seconds: u64,
 ) -> PyResult<bool> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     validate::validate_did(member_did)?;
     let rt = crate::runtime()?;
     let mgr =
@@ -3571,7 +3571,7 @@ fn py_context_propose_ttl_extension(
 #[pyo3(signature = (handle, new_seconds))]
 fn py_context_reset_ttl_timer(handle: &PyContextHandle, new_seconds: u64) -> PyResult<()> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, handle);
+    crate::pyscp_check_handle!(bi.core, handle);
     let rt = crate::runtime()?;
     let mgr =
         crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;

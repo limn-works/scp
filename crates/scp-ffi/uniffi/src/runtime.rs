@@ -30,9 +30,11 @@
 //! on `BridgeInstance` (deleted as part of #1549 Phase 4 PR 1).
 
 use async_trait::async_trait;
-use scp_ffi_common::bridge_instance::{
-    BridgeInstanceCore, CoreFields, ShutdownError, ShutdownOutcome,
-};
+use scp_ffi_common::bridge_instance::{BridgeInstanceCore, ShutdownError, ShutdownOutcome};
+// Re-export `CoreFields` at `crate::runtime::CoreFields` so the
+// `uniffi_check_handle!` macro can refer to it as
+// `$crate::runtime::CoreFields`.
+pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_ffi_common::bridge_runtime::BridgeInMemoryStorage;
 use scp_ffi_common::error_codes as codes;
 use std::collections::HashSet;
@@ -238,9 +240,14 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
     }
 
     async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
-        let outcome = self.core.shutdown_core_async(timeout).await?;
+        // `bridge_specific_shutdown` MUST run even when
+        // `shutdown_core_async` returns `AlreadyShutDown` — that variant
+        // signals the sync shutdown path raced ahead; without the cleanup
+        // call, typed UniFFI registries (UCAN, identity custody) leak
+        // key material past shutdown.
+        let result = self.core.shutdown_core_async(timeout).await;
         self.bridge_specific_shutdown();
-        Ok(outcome)
+        result
     }
 
     fn bridge_specific_shutdown(&self) {
@@ -277,20 +284,23 @@ pub(crate) static DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<UniffiBridgeInstance>> =
 /// `crate::bridge` during PR 1). Subsequent calls are no-ops (`OnceLock`
 /// guarantees single initialization).
 fn init_default_bridge_instance() {
-    if DEFAULT_BRIDGE_INSTANCE.get().is_some() {
-        return;
-    }
-
-    let instance = Arc::new(UniffiBridgeInstance::new_uniffi());
-    let bi = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| instance);
-
-    // Register a shutdown hook for state still living outside
-    // `UniffiBridgeInstance` during PR 1 (MCP registries — migrated onto the
-    // struct in PR 2). Identity and UCAN registries are now typed fields and
-    // are cleared by `bridge_specific_shutdown` without needing a hook.
-    bi.core.register_shutdown_hook(Box::new(|| {
-        crate::bridge::clear_mcp_registries();
-    }));
+    // Register the MCP shutdown hook INSIDE the `get_or_init` closure so it
+    // runs exactly once per process regardless of how many threads race
+    // through `init_default_bridge_instance` before the OnceLock is filled.
+    // A prior pattern registered the hook outside the closure, which caused
+    // duplicate-registration races under concurrent first-call scenarios.
+    let _ = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| {
+        let instance = Arc::new(UniffiBridgeInstance::new_uniffi());
+        // Shutdown hook for state still living outside
+        // `UniffiBridgeInstance` during PR 1 (MCP registries — migrated
+        // onto the struct in PR 2). Identity and UCAN registries are now
+        // typed fields and are cleared by `bridge_specific_shutdown`
+        // without needing a hook.
+        instance.core.register_shutdown_hook(Box::new(|| {
+            crate::bridge::clear_mcp_registries();
+        }));
+        instance
+    });
 }
 
 /// Returns the raw default `UniffiBridgeInstance` without lifecycle checks.
@@ -461,88 +471,13 @@ pub fn check_handle_affinity(handle_instance_id: u64) -> Result<(), crate::ScpEr
     }
 }
 
-/// Uniform accessor for the instance id carried by every `#[uniffi::export]`
-/// handle type.
-///
-/// Implemented for `Identity`, `ContextHandle`, `UcanToken`,
-/// `TransportManager`, `RelayHandle`, `NodeHandle`. Consumed by the
-/// [`crate::uniffi_check_handle!`] macro so every bridge entry can run the
-/// affinity check uniformly regardless of the handle's internal field
-/// layout.
-pub trait HandleInstance {
-    /// Returns the id of the bridge instance that minted this handle.
-    fn instance_id(&self) -> u64;
-}
-
-/// Flexible wrapper trait the `uniffi_check_handle!` macro uses to resolve
-/// any of `T`, `&T`, `Arc<T>`, `&Arc<T>`, `Box<T>` for `T: HandleInstance`
-/// uniformly.
-///
-/// Blanket-implemented for any `Deref` chain that ends at a
-/// [`HandleInstance`] impl. The macro always calls
-/// `AsHandleInstance::as_handle_instance_id(&$handle)`, which picks the
-/// matching impl regardless of the caller's borrow shape.
-pub trait AsHandleInstance {
-    /// Returns the instance id by dereferencing as needed to reach the
-    /// concrete handle type.
-    fn as_handle_instance_id(&self) -> u64;
-}
-
-impl<T: HandleInstance + ?Sized> AsHandleInstance for T {
-    fn as_handle_instance_id(&self) -> u64 {
-        HandleInstance::instance_id(self)
-    }
-}
-
-impl<T: HandleInstance + ?Sized> AsHandleInstance for Arc<T> {
-    fn as_handle_instance_id(&self) -> u64 {
-        HandleInstance::instance_id(self.as_ref())
-    }
-}
-
-impl<T: HandleInstance + ?Sized> AsHandleInstance for &Arc<T> {
-    fn as_handle_instance_id(&self) -> u64 {
-        HandleInstance::instance_id(self.as_ref())
-    }
-}
-
-impl HandleInstance for crate::bridge::Identity {
-    fn instance_id(&self) -> u64 {
-        self.instance_id
-    }
-}
-
-impl HandleInstance for crate::bridge::ContextHandle {
-    fn instance_id(&self) -> u64 {
-        self.instance_id
-    }
-}
-
-impl HandleInstance for crate::bridge::UcanToken {
-    fn instance_id(&self) -> u64 {
-        self.instance_id
-    }
-}
-
-impl HandleInstance for crate::bridge::TransportManager {
-    fn instance_id(&self) -> u64 {
-        self.instance_id
-    }
-}
-
-#[cfg(feature = "server")]
-impl HandleInstance for crate::server::RelayHandle {
-    fn instance_id(&self) -> u64 {
-        self.instance_id
-    }
-}
-
-#[cfg(feature = "server")]
-impl HandleInstance for crate::server::NodeHandle {
-    fn instance_id(&self) -> u64 {
-        self.instance_id
-    }
-}
+// All UniFFI handle types (`Identity`, `ContextHandle`, `UcanToken`,
+// `TransportManager`, `RelayHandle`, `NodeHandle`) carry an inherent
+// `instance_id(&self) -> u64` method. The `uniffi_check_handle!` macro uses
+// method syntax (`handle.instance_id()`) which auto-derefs through `&T`,
+// `&Arc<T>`, and `Arc<T>` without needing the `HandleInstance` /
+// `AsHandleInstance` traits from earlier drafts. Those traits were deleted
+// in PR 1 post-review; the inherent methods alone are sufficient.
 
 // ---------------------------------------------------------------------------
 // DID resolver shims (preserved for existing callers)
@@ -551,10 +486,10 @@ impl HandleInstance for crate::server::NodeHandle {
 /// Returns the production DID resolver on the default bridge instance, if
 /// initialized.
 ///
-/// `bridge_runtime::did_resolver_from` takes `&Arc<BridgeInstance>` where
-/// `BridgeInstance = CoreFields`. Because [`UniffiBridgeInstance`] embeds
-/// `CoreFields` (not `Arc<CoreFields>`), the helper is incompatible with
-/// the new pattern. Access the resolver directly on the embedded core.
+/// `bridge_runtime::did_resolver_from` takes `&Arc<CoreFields>`. Because
+/// [`UniffiBridgeInstance`] embeds `CoreFields` (not `Arc<CoreFields>`),
+/// the helper is incompatible with the new pattern. Access the resolver
+/// directly on the embedded core.
 #[must_use]
 pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
     DEFAULT_BRIDGE_INSTANCE.get()?.core.did_resolver()

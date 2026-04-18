@@ -2006,7 +2006,8 @@ impl Drop for UcanToken {
 /// Opaque handle to the transport layer.
 ///
 /// Wraps a real [`scp_transport::TransportManager`] that is stored in the
-/// shared [`BridgeInstance`]. This handle provides Swift/Kotlin callers with
+/// shared [`UniffiBridgeInstance`](crate::runtime::UniffiBridgeInstance).
+/// This handle provides Swift/Kotlin callers with
 /// the full multi-relay API: `addRelay`, `assignRelaySet`, `adapterCount`,
 /// `reliabilityScore`. All operations delegate to the `BridgeInstance`'s
 /// transport slot, so `suspend()` / `shutdown()` lifecycle events

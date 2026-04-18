@@ -192,16 +192,17 @@ fn version() -> &'static str {
 /// shut down (or before it was initialized) is a no-op.
 ///
 /// **Breaking change (#1549 Phase 4):** previously took no arguments;
-/// now accepts `timeout_secs: float` specifying the graceful deadline for
-/// in-flight async tasks. The legacy 100ms fixed drain is retained as a
-/// fallback for the sync teardown path. Callers that passed no argument
-/// under the old API should pass `0.1` to preserve exact-old behaviour,
-/// or a larger value (e.g. `5.0`) to give background tasks real time to
-/// exit cleanly.
+/// now accepts `timeout_millis: int` specifying the graceful deadline for
+/// in-flight async tasks (unified to **milliseconds** across all Rust
+/// bridges — `PyO3`, NAPI, `UniFFI`). The legacy 100ms fixed drain is
+/// retained as a fallback for the sync teardown path. Callers that
+/// passed no argument under the old API should pass `100` to preserve
+/// exact-old behaviour, or a larger value (e.g. `5000`) to give
+/// background tasks real time to exit cleanly.
 #[pyfunction]
-fn shutdown_runtime(timeout_secs: f64) {
+fn shutdown_runtime(timeout_millis: u64) {
     // Shut down the default PyBridgeInstance first (clears registries, runs
-    // hooks, drains JoinSet within `timeout_secs`). Best-effort: if the
+    // hooks, drains JoinSet within `timeout_millis`). Best-effort: if the
     // instance was never initialized or is already shut down, this is a no-op.
     //
     // Skip in test builds: shutdown permanently poisons the OnceLock-based
@@ -211,7 +212,7 @@ fn shutdown_runtime(timeout_secs: f64) {
         && let Some(rt) = RUNTIME.get()
     {
         let bi_clone = std::sync::Arc::clone(bi);
-        let timeout = Duration::from_secs_f64(timeout_secs.max(0.0));
+        let timeout = Duration::from_millis(timeout_millis);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rt.block_on(async move {
                 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
@@ -224,7 +225,7 @@ fn shutdown_runtime(timeout_secs: f64) {
         }
     }
     #[cfg(test)]
-    let _ = timeout_secs; // timeout is consumed by the non-test path only
+    let _ = timeout_millis; // timeout is consumed by the non-test path only
 
     // Give in-flight tokio tasks that are not owned by the PyBridgeInstance
     // a brief drain window. 100ms is sufficient for cooperative tasks to
@@ -331,13 +332,14 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Python cleanup (GC, __del__, atexit handlers) completes BEFORE Rust
     // module finalization, so this ordering is safe.
     //
-    // `shutdown_runtime` now requires `timeout_secs: f64` (Phase 4 breaking
-    // change). We register via a `functools.partial` so atexit can invoke
-    // it without arguments. 0.1s matches the previous fixed drain window.
+    // `shutdown_runtime` now requires `timeout_millis: int` (Phase 4
+    // breaking change; unit unified to ms across all Rust bridges). We
+    // register via a `functools.partial` so atexit can invoke it without
+    // arguments. 100ms matches the previous fixed drain window.
     let atexit = py.import("atexit")?;
     let functools = py.import("functools")?;
     let shutdown_fn = m.getattr("shutdown_runtime")?;
-    let partial = functools.call_method1("partial", (shutdown_fn, 0.1_f64))?;
+    let partial = functools.call_method1("partial", (shutdown_fn, 100_u64))?;
     atexit.call_method1("register", (partial,))?;
 
     // Step 6: Register domain bridge modules.

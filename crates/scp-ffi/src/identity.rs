@@ -809,7 +809,7 @@ fn py_identity_resolve(py: Python<'_>, did: &str) -> PyResult<PyDIDDocument> {
 #[pyfunction]
 fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, identity);
+    crate::pyscp_check_handle!(bi.core, identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -869,7 +869,7 @@ fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyI
 #[pyfunction]
 fn py_identity_add_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, identity);
+    crate::pyscp_check_handle!(bi.core, identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -928,7 +928,7 @@ fn py_identity_add_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<
 #[pyfunction]
 fn py_identity_rotate_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, identity);
+    crate::pyscp_check_handle!(bi.core, identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -986,7 +986,7 @@ fn py_identity_rotate_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
 #[pyfunction]
 fn py_identity_remove_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, identity);
+    crate::pyscp_check_handle!(bi.core, identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -1043,7 +1043,7 @@ fn py_identity_remove_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
 #[pyfunction]
 fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
     let bi = crate::runtime::default_bridge_instance()?;
-    crate::pyscp_check_handle!(bi, identity);
+    crate::pyscp_check_handle!(bi.core, identity);
     let old_did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;

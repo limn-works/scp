@@ -153,13 +153,17 @@ impl Scp {
 
     /// Shuts down this bridge instance with a graceful deadline.
     ///
-    /// Awaits in-flight tasks up to `timeout_secs` seconds, aborts any
-    /// remaining tasks, then clears registries and runs shutdown hooks.
-    /// Permanent — a shut-down instance cannot be reused. A second call is
-    /// a no-op from the caller's perspective (the underlying
-    /// `ShutdownError::AlreadyShutDown` is swallowed).
-    pub async fn shutdown(&self, timeout_secs: u64) -> Result<(), ScpError> {
-        let timeout = Duration::from_secs(timeout_secs);
+    /// Awaits in-flight tasks up to `timeout_millis` **milliseconds**,
+    /// aborts any remaining tasks, then clears registries and runs
+    /// shutdown hooks. Permanent — a shut-down instance cannot be
+    /// reused. A second call is a no-op from the caller's perspective
+    /// (the underlying `ShutdownError::AlreadyShutDown` is swallowed).
+    ///
+    /// The unit is **milliseconds** — unified across all Rust bridges
+    /// so the Swift and Kotlin SDKs can share a single conversion
+    /// surface.
+    pub async fn shutdown(&self, timeout_millis: u64) -> Result<(), ScpError> {
+        let timeout = Duration::from_millis(timeout_millis);
         match self.inner.shutdown(timeout).await {
             Ok(_) => Ok(()),
             // AlreadyShutDown is treated as a harmless lifecycle observation —

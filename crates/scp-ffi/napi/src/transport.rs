@@ -12,7 +12,7 @@
 //!
 //! # Transport model
 //!
-//! Transport state is delegated to the global [`BridgeInstance`]'s transport
+//! Transport state is delegated to the default [`NapiBridgeInstance`]'s transport
 //! field (#1549). The `BridgeInstance` stores an `Arc<TransportManager>` behind
 //! a `RwLock` — the `Arc` allows NAPI subscription tasks to hold a reference
 //! across `.await` points without keeping the lock guard alive.
@@ -60,7 +60,7 @@ fn map_transport_lock_error(e: TransportLockError) -> ScpNapiError {
 
 /// Stores a `TransportManager` (called by [`transport_connect`]).
 ///
-/// Wraps in `Arc` and delegates to [`BridgeInstance::set_transport`].
+/// Wraps in `Arc` and delegates to [`CoreFields::set_transport`].
 /// If the `BridgeInstance` doesn't exist yet, lazily creates it from
 /// the existing `ContextManager`.
 ///
@@ -88,7 +88,7 @@ fn set_transport_manager(manager: scp_transport::TransportManager) -> napi::Resu
 /// Stores a pre-built `Arc<TransportManager>` (called by [`crate::server`]
 /// auto-wire where the caller needs to construct the manager externally).
 ///
-/// Delegates to [`BridgeInstance::set_transport`].
+/// Delegates to [`CoreFields::set_transport`].
 ///
 /// # Errors
 ///
@@ -107,7 +107,7 @@ pub(crate) fn set_transport_manager_arc(
 
 /// Executes a closure with a read reference to the `TransportManager`.
 ///
-/// Delegates to [`BridgeInstance::with_transport`].
+/// Delegates to [`CoreFields::with_transport`].
 ///
 /// # Errors
 ///
@@ -123,7 +123,7 @@ pub(crate) fn with_transport_manager<T>(
 
 /// Executes a closure with a mutable reference to the `TransportManager`.
 ///
-/// Delegates to [`BridgeInstance::with_transport_mut`]. Requires exclusive
+/// Delegates to [`CoreFields::with_transport_mut`]. Requires exclusive
 /// `Arc` ownership (refcount == 1). If subscription tasks hold cloned
 /// `Arc` references, this fails with `SCP-TRANS-5003`.
 ///
@@ -149,7 +149,7 @@ fn has_transport_manager() -> bool {
 /// Used by `context_subscribe` which needs to move the manager reference
 /// into an async task that outlives any lock guard.
 ///
-/// Delegates to [`BridgeInstance::get_transport_arc`].
+/// Delegates to [`CoreFields::get_transport_arc`].
 pub(crate) fn get_transport_manager() -> Option<Arc<scp_transport::TransportManager>> {
     crate::runtime::bridge_instance()
         .ok()
@@ -158,7 +158,7 @@ pub(crate) fn get_transport_manager() -> Option<Arc<scp_transport::TransportMana
 
 /// Clears the transport manager (called by [`transport_disconnect`]).
 ///
-/// Delegates to [`BridgeInstance::clear_transport`].
+/// Delegates to [`CoreFields::clear_transport`].
 ///
 /// # Errors
 ///

@@ -77,27 +77,53 @@ pub mod scp;
 pub mod server;
 
 // Handle-affinity macro for every `#[uniffi::export]` entry that accepts a
-// handle with a stored `instance_id`. Expands to a call to
-// [`crate::runtime::check_handle_affinity`] which maps mismatches to
-// [`crate::ScpError::Permission`] with error code `SCP-PERM-3030`.
+// handle with a stored `instance_id`.
 //
-// Handle types must implement [`crate::runtime::HandleInstance`] so the
-// expansion `HandleInstance::instance_id(handle)` resolves regardless of
-// whether the caller passes `&T`, `&Arc<T>`, or `Arc<T>`.
+// Two forms are supported; per-instance `Scp` methods MUST use the two-
+// argument form:
+//
+// 1. `uniffi_check_handle!(handle, …)` — default-instance shorthand.
+//    Delegates to [`crate::runtime::check_handle_affinity`] which looks
+//    up the default bridge's `CoreFields::instance_id`. Use this ONLY
+//    from free functions on the default façade. Do NOT use this inside
+//    per-instance `Scp::method` — that would silently check against the
+//    default instance instead of `self.inner.core` (PR-2 regression
+//    hazard).
+//
+// 2. `uniffi_check_handle!(&core, handle, …)` — strict form. `&core`
+//    must be `&CoreFields`. Compares each handle against `core` directly
+//    without touching the default `OnceLock`. Per-instance `Scp`
+//    methods call with `&self.inner.core`.
+//
+// Handle types must carry an inherent `instance_id(&self) -> u64` method.
+// The macro uses method syntax which auto-derefs through `&T`, `&Arc<T>`,
+// and `Arc<T>`. No trait lookup is required.
 //
 // Usage:
 //
 // ```ignore
+// // free-function (default instance)
 // uniffi_check_handle!(handle);
-// uniffi_check_handle!(identity, context_handle);  // multiple in sequence
+// uniffi_check_handle!(identity, context_handle);
+//
+// // per-instance method (PR 2+)
+// uniffi_check_handle!(&self.inner.core, handle);
 // ```
 #[macro_export]
 macro_rules! uniffi_check_handle {
+    // Strict 2+-arg form with an explicit `&CoreFields` target.
+    (& $core:expr, $($handle:expr),+ $(,)?) => {{
+        let __core: &$crate::runtime::CoreFields = &$core;
+        $(
+            __core
+                .check_handle($handle.instance_id())
+                .map_err($crate::ScpError::from)?;
+        )+
+    }};
+    // Default-instance shorthand. Kept for the free-function façade only.
     ($($handle:expr),+ $(,)?) => {{
         $(
-            $crate::runtime::check_handle_affinity(
-                $crate::runtime::AsHandleInstance::as_handle_instance_id(&$handle)
-            )?;
+            $crate::runtime::check_handle_affinity($handle.instance_id())?;
         )+
     }};
 }
@@ -262,7 +288,11 @@ uniffi::include_scaffolding!("scp");
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 /// Grace period for in-flight tokio tasks during library unload.
-/// 5 seconds per ADR-021 acceptance criterion 1.
+/// 5 seconds per ADR-021 acceptance criterion 1. Exposed on the public
+/// API (via `scp_shutdown(timeout_millis)`) in milliseconds for
+/// cross-bridge unit unification; the internal constant stays in seconds
+/// because the unit divides evenly and `from_secs` is clearer at the
+/// definition site.
 #[allow(dead_code)]
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
@@ -314,35 +344,42 @@ pub(crate) fn decrement_handle_count() {
 /// Waits for all outstanding FFI handles to be released, then shuts down.
 ///
 /// Call this from Swift/Kotlin before your process exits or before tearing
-/// down the SCP library. It blocks (on a background thread) until either:
+/// down the SCP library. It blocks (asynchronously) until either:
 ///
 /// - All opaque handle objects (`Identity`, `ContextHandle`, `UcanToken`,
 ///   `TransportManager`) have been garbage-collected / freed, **or**
-/// - The `timeout_secs` deadline has elapsed.
+/// - The `timeout_millis` deadline has elapsed.
 ///
 /// After this call returns, the tokio runtime may be dropped safely — no
 /// outstanding FFI handles remain that could attempt to call into it.
 ///
-/// The default timeout is 5 seconds (per ADR-021 acceptance criterion 1).
-/// Pass `0` to return immediately without waiting.
+/// The unit is **milliseconds** — unified across all Rust bridges so the
+/// Swift, Kotlin, and TypeScript SDKs can share a single conversion
+/// surface (the SDK wrappers multiply by 1000 before crossing FFI). The
+/// default is 5000 ms (per ADR-021 acceptance criterion 1). Pass `0` to
+/// return immediately without waiting.
 ///
 /// # Thread safety
 ///
 /// This function is safe to call from any thread. It polls `HANDLE_COUNT`
-/// in 10 ms intervals and does not block the tokio runtime.
+/// in 10 ms intervals on the tokio runtime (via `tokio::time::sleep`) so
+/// the worker is not blocked — critical for mobile apps that run this on
+/// the main event loop.
+///
+/// **Bug fix (PR 1 post-review):** the previous implementation polled
+/// with `std::thread::sleep`, which blocks the current tokio worker.
+/// Mobile apps invoking `scpShutdown` from the foreground ran the risk
+/// of a frozen UI while tasks drained. The new implementation yields
+/// via `tokio::time::sleep` as every other async bridge function does.
 ///
 /// # Example (Swift)
 ///
 /// ```swift
 /// // Call before application exit:
-/// scpShutdown(timeoutSecs: 5)
+/// try await scpShutdown(timeoutMillis: 5_000)
 /// ```
 #[uniffi::export]
-// `async` required so UniFFI generates Swift `async` / Kotlin `suspend`
-// bindings that await the instance shutdown. In test builds the `.await`
-// path is `#[cfg(not(test))]`-gated, so clippy sees no awaits locally.
-#[allow(clippy::unused_async)]
-pub async fn scp_shutdown(timeout_secs: u64) -> Result<(), bridge::ScpError> {
+pub async fn scp_shutdown(timeout_millis: u64) -> Result<(), bridge::ScpError> {
     // Shut down the default UniffiBridgeInstance first (clears registries,
     // runs hooks, disconnects transport). Best-effort: if the instance was
     // never initialized or is already shut down, this is treated as a
@@ -355,7 +392,7 @@ pub async fn scp_shutdown(timeout_secs: u64) -> Result<(), bridge::ScpError> {
         use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
         if let Some(bi) = runtime::default_bridge_instance_raw() {
             match bi
-                .shutdown(std::time::Duration::from_secs(timeout_secs))
+                .shutdown(std::time::Duration::from_millis(timeout_millis))
                 .await
             {
                 Ok(_) => {}
@@ -365,10 +402,13 @@ pub async fn scp_shutdown(timeout_secs: u64) -> Result<(), bridge::ScpError> {
         }
     }
 
-    if timeout_secs > 0 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    if timeout_millis > 0 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_millis);
         while HANDLE_COUNT.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            // Yield via the tokio timer — `std::thread::sleep` would park
+            // the current tokio worker and freeze the bridge (mobile apps
+            // that call this from the main runtime would appear frozen).
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
     // The tokio runtime (`RUNTIME`) is a static and will be dropped on

@@ -183,20 +183,26 @@ impl PyScp {
     ///
     /// Delegates to [`PyBridgeInstance::shutdown`] via the
     /// [`BridgeInstanceCore`] trait: fires the cancellation token, drains
-    /// the `JoinSet` inside the `timeout_secs` budget, then runs typed-field
-    /// cleanup. A second call is a no-op from the Python caller's
-    /// perspective (the underlying `ShutdownError::AlreadyShutDown` is
-    /// swallowed — idempotency is expected).
+    /// the `JoinSet` inside the `timeout_millis` budget, then runs
+    /// typed-field cleanup. A second call is a no-op from the Python
+    /// caller's perspective (the underlying `ShutdownError::AlreadyShutDown`
+    /// is swallowed — idempotency is expected).
+    ///
+    /// The timeout unit is **milliseconds** — unified across all Rust
+    /// bridges so the Python, TypeScript, Swift, and Kotlin SDKs can
+    /// share a single conversion surface. Pass 0 for a best-effort
+    /// immediate shutdown (tasks not yet cancelled are aborted without
+    /// waiting).
     ///
     /// # Errors
     ///
     /// Raises `ContextError` if the tokio runtime is unavailable.
-    pub fn shutdown(&self, py: Python<'_>, timeout_secs: f64) -> PyResult<()> {
-        let timeout = Duration::from_secs_f64(timeout_secs.max(0.0));
+    pub fn shutdown(&self, py: Python<'_>, timeout_millis: u64) -> PyResult<()> {
+        let timeout = Duration::from_millis(timeout_millis);
         let rt = crate::runtime()?;
         let inner = Arc::clone(&self.inner);
         // Release the GIL while we drive the tokio runtime — shutdown may
-        // drain tasks for up to `timeout_secs`, and we must not block the
+        // drain tasks for up to `timeout_millis`, and we must not block the
         // Python interpreter meanwhile.
         py.allow_threads(|| {
             rt.block_on(async move {
