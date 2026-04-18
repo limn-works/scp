@@ -2153,8 +2153,12 @@ export function createWasmBridge(): Bridge {
       // callers can share code.
     },
 
-    resume(): void {
-      // No-op in the WASM bridge -- see `suspend` for rationale.
+    resume(): Promise<void> {
+      // No-op in the WASM bridge -- see `suspend` for rationale. The
+      // NAPI `resume` became async after #1678 so the Bridge
+      // interface is now promise-returning; this WASM shim resolves
+      // immediately to keep the await-chain uniform across targets.
+      return Promise.resolve();
     },
   };
 }

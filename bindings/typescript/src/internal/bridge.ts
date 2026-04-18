@@ -609,7 +609,15 @@ export interface Bridge {
    */
   shutdown(timeoutMillis: number): Promise<void>;
   suspend(): void;
-  resume(): void;
+  /**
+   * Resumes the bridge. On the NAPI path this is a real async call
+   * (#1678) — the bridge reconnects transport from pending relay URLs
+   * and restores persisted context snapshots before the promise
+   * settles. The WASM path is a no-op, but still returns a resolved
+   * promise to keep the interface uniform and to let callers
+   * `await bridge.resume()` without branching on target.
+   */
+  resume(): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------

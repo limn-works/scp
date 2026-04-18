@@ -17,10 +17,25 @@
  *
  * const scp = new SCP();                 // fresh in-memory instance
  * const shared = SCP.default();          // shared process-wide default
+ * await scp.resume();                    // async — reconnects transport
  * await scp.shutdown(5);                 // graceful shutdown
+ *
+ * // PR 3: encrypted on-disk storage (closes #1260, #1491).
+ * const persistent = new SCP({
+ *   storage: { type: "sqlite", path: "/var/lib/scp", key: new Uint8Array(32) },
+ * });
  * ```
  *
- * NOTE: `SCP` is a NAPI-only feature in Phase 4 PR 1. The WASM bridge
+ * PR 3 (#1549) expanded the surface in two ways:
+ * - `StorageConfig` gained the `sqlite` variant, backed by SQLCipher
+ *   through `scp-platform`. Closes #1260 / #1491 (encrypted filesystem
+ *   storage).
+ * - `resume()` became async end-to-end (#1678) — the NAPI bridge
+ *   reconnects transport from pending relay URLs and restores any
+ *   persisted context snapshots before the promise settles, so
+ *   transport-dependent code can run immediately after `await`.
+ *
+ * NOTE: `SCP` is a NAPI-only feature. The WASM bridge
  * does not expose a multi-instance class surface; attempting to
  * construct `SCP` in a browser environment throws `ValidationError`
  * with `SCP-VALID-7005`. WASM callers continue to use the free-function
@@ -48,8 +63,13 @@ type NativeAddon = {
  * Raw NAPI `SCP` class type once resolved. `withPersistence` is
  * intentionally omitted from this interface — the native factory
  * still exists for internal use, but the SDK surface does not expose
- * it until PR 3 wires a real `ContextPersistence` trait through (see
+ * it until a real `ContextPersistence` trait is wired through (see
  * #1260 and #1491).
+ *
+ * PR 3 extends the native factory surface with SQLite-backed storage
+ * via `withStorage({ type: "sqlite", path, key })`. The NAPI layer
+ * (#1678) also turned `resume()` into a real async call backed by
+ * transport reconnect from pending relay URLs.
  */
 interface NativeScpCtor {
   new (): NativeScpInstance;
@@ -60,7 +80,13 @@ interface NativeScpCtor {
 interface NativeScpInstance {
   readonly instanceId: string;
   suspend(): void;
-  resume(): void;
+  /**
+   * Resumes the underlying bridge. Real async on NAPI — the bridge
+   * reconnects transport from pending relay URLs and restores any
+   * persisted context snapshots before the returned promise settles
+   * (#1678).
+   */
+  resume(): Promise<void>;
   shutdown(timeoutMillis: number): Promise<void>;
 }
 
@@ -211,6 +237,35 @@ export function __clampShutdownMillisForTests(timeoutSecs: number): number {
   return Math.round(timeoutSecs * 1000);
 }
 
+/**
+ * Serializes a {@link StorageConfig} into the JSON shape accepted by
+ * the NAPI `SCP.withStorage(configJson: string)` factory.
+ *
+ * - `in_memory` passes through unchanged.
+ * - `sqlite` forwards `path` verbatim and normalizes `key`:
+ *   - `Uint8Array` → JSON byte array (`number[]`) — required because
+ *     `JSON.stringify` on a `Uint8Array` produces an object-with-numeric-
+ *     keys, not an array, which the Rust side would reject.
+ *   - `string` → passed through as a hex-encoded string; the NAPI layer
+ *     accepts either shape.
+ *
+ * Exported for tests so the wire format can be asserted without a live
+ * native addon.
+ *
+ * @internal
+ */
+export function __serializeStorageConfigForTests(config: StorageConfig): string {
+  return serializeStorageConfig(config);
+}
+
+function serializeStorageConfig(config: StorageConfig): string {
+  if (config.type === "sqlite") {
+    const key = typeof config.key === "string" ? config.key : Array.from(config.key as Uint8Array);
+    return JSON.stringify({ type: "sqlite", path: config.path, key });
+  }
+  return JSON.stringify(config);
+}
+
 // ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
@@ -219,16 +274,26 @@ export function __clampShutdownMillisForTests(timeoutSecs: number): number {
  * Storage configuration forwarded to the native `SCP.withStorage`
  * factory.
  *
- * Phase 4 PR 1 accepts only `{ type: "in_memory" }`. Unknown types
- * raise `SCP-VALID-7005`.
+ * Two variants are supported today:
+ * - `{ type: "in_memory" }` — encrypted in-memory storage (ephemeral).
+ * - `{ type: "sqlite"; path; key }` — SQLCipher-encrypted storage on
+ *   disk at `{path}/scp.db`, backed by `scp-platform::sqlite::SqliteStorage`.
+ *   `key` accepts either a raw `Uint8Array` of key material or a hex-
+ *   encoded string (JSON has no native bytes type; the NAPI layer
+ *   accepts either shape). The key is consumed across the FFI boundary
+ *   and the Rust side zeroizes its internal copy on drop — callers
+ *   should zero their own copy after construction.
  *
  * Intentionally a closed union — the open `{ type: string; ... }`
- * branch swallowed typos and drifted from the Rust-side enum. PR 3
- * will extend this with
- * `{ type: "sqlite"; path: string; key: string }` once the FFI
- * boundary for encrypted filesystem storage lands.
+ * branch swallowed typos and drifted from the Rust-side enum.
+ *
+ * Closes #1260 / #1491 (encrypted filesystem storage). See also #1678
+ * for the resume() reconnect wiring that complements persistent
+ * storage.
  */
-export type StorageConfig = { type: "in_memory" };
+export type StorageConfig =
+  | { type: "in_memory" }
+  | { type: "sqlite"; path: string; key: Uint8Array | string };
 
 /**
  * Constructor options for `new SCP(...)`.
@@ -283,7 +348,7 @@ export class SCP {
 
     const NativeScp = nativeScp();
     if (options.storage !== undefined) {
-      this.#native = NativeScp.withStorage(JSON.stringify(options.storage));
+      this.#native = NativeScp.withStorage(serializeStorageConfig(options.storage));
     } else {
       this.#native = new NativeScp();
     }
@@ -339,14 +404,25 @@ export class SCP {
   /**
    * Resumes a suspended bridge instance.
    *
-   * Clears the suspended flag. Callers must re-establish the relay
-   * connection explicitly.
+   * Clears the suspended flag and chains the per-bridge async resume
+   * work: transport reconnect from pending relay URLs and restoration
+   * of any persisted context snapshots (#1678). The returned promise
+   * settles only after those steps complete, so callers can `await`
+   * resume and then safely issue transport-dependent operations.
+   *
+   * **Breaking change (#1549 Phase 4 PR 3)**: `resume()` is async now.
+   * Previous releases returned `void`; the method always performed a
+   * flag flip only and callers re-established the relay connection
+   * separately via `Transport.connect(...)`. The NAPI `Scp::resume`
+   * became `async` in the Rust layer, and this wrapper follows it so
+   * errors surfacing during reconnect / restoration are observable at
+   * the SDK boundary instead of fire-and-forget.
    *
    * @throws {ContextError} If the instance has been permanently shut
-   *   down.
+   *   down — mapped from `SCP-CTX-2000`.
    */
-  resume(): void {
-    this.#native.resume();
+  async resume(): Promise<void> {
+    await this.#native.resume();
   }
 
   /**
