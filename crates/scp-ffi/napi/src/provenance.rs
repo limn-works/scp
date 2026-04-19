@@ -49,8 +49,14 @@ pub async fn evaluate_provenance_quality(
     counterparties: Option<Vec<String>>,
 ) -> napi::Result<u32> {
     let bi = default_bridge_instance()?;
-    evaluate_provenance_quality_on(&bi, source_context, source_type, context_state, counterparties)
-        .await
+    evaluate_provenance_quality_on(
+        &bi,
+        source_context,
+        source_type,
+        context_state,
+        counterparties,
+    )
+    .await
 }
 
 /// Per-bridge-instance implementation of [`evaluate_provenance_quality`].

@@ -3859,7 +3859,7 @@ pub(crate) fn validate_capability_declaration_on(
 
 /// Checks whether a given capability is allowed for an app binding.
 #[napi]
-#[must_use] 
+#[must_use]
 pub fn check_scoped_capability(
     granted_capabilities: Vec<String>,
     required_capability: String,

@@ -1832,8 +1832,7 @@ impl Scp {
         member_did: String,
         caller_did: String,
     ) -> napi::Result<()> {
-        crate::context::access_key_restore_on(&self.inner, context_id, member_did, caller_did)
-            .await
+        crate::context::access_key_restore_on(&self.inner, context_id, member_did, caller_did).await
     }
 
     /// Per-instance equivalent of the free-function `context_broadcast_subscriber_count`.
@@ -2272,16 +2271,13 @@ impl Scp {
     /// This operation is pure — it does not touch any bridge-instance state —
     /// so the method forwards to a shared inner helper with no `bi` argument.
     #[napi(js_name = "checkScopedCapability")]
-    #[must_use] 
+    #[must_use]
     pub fn check_scoped_capability(
         &self,
         granted_capabilities: Vec<String>,
         required_capability: String,
     ) -> bool {
-        crate::context::check_scoped_capability_inner(
-            granted_capabilities,
-            required_capability,
-        )
+        crate::context::check_scoped_capability_inner(granted_capabilities, required_capability)
     }
 
     /// Per-instance equivalent of the free-function `evaluate_invitation`.
@@ -3018,10 +3014,7 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `mcp_client_connect_sse`.
     #[napi(js_name = "mcpClientConnectSse")]
-    pub async fn mcp_client_connect_sse(
-        &self,
-        url: String,
-    ) -> napi::Result<NapiMcpClientHandle> {
+    pub async fn mcp_client_connect_sse(&self, url: String) -> napi::Result<NapiMcpClientHandle> {
         crate::mcp::mcp_client_connect_sse_on(&self.inner, url).await
     }
 
@@ -3241,11 +3234,7 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `media_end_session`.
     #[napi(js_name = "mediaEndSession")]
-    pub fn media_end_session(
-        &self,
-        session_json: String,
-        timestamp: f64,
-    ) -> napi::Result<String> {
+    pub fn media_end_session(&self, session_json: String, timestamp: f64) -> napi::Result<String> {
         crate::media::media_end_session_on(&self.inner, session_json, timestamp)
     }
 
@@ -3416,11 +3405,7 @@ impl Scp {
         provenance_json: String,
         new_state: String,
     ) -> napi::Result<String> {
-        crate::provenance::provenance_update_source_type_on(
-            &self.inner,
-            provenance_json,
-            new_state,
-        )
+        crate::provenance::provenance_update_source_type_on(&self.inner, provenance_json, new_state)
     }
 
     // -------------------------------------------------------------------
@@ -3429,17 +3414,13 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `sync_classify_offline`.
     #[napi(js_name = "syncClassifyOffline")]
-    pub fn sync_classify_offline(
-        &self,
-        last_relay_contact: i64,
-        now: i64,
-    ) -> napi::Result<String> {
+    pub fn sync_classify_offline(&self, last_relay_contact: i64, now: i64) -> napi::Result<String> {
         crate::sync::sync_classify_offline_on(&self.inner, last_relay_contact, now)
     }
 
     /// Per-instance equivalent of the free-function `sync_get_policy`.
     #[napi(js_name = "syncGetPolicy")]
-    #[must_use] 
+    #[must_use]
     pub fn sync_get_policy(&self) -> NapiSyncPolicy {
         crate::sync::sync_get_policy_on(&self.inner)
     }

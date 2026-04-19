@@ -1332,11 +1332,19 @@ mod tests {
         // Cross-check: the custody Arc pointers must be different,
         // confirming different key material is returned for each DID.
         let custody_ptr_a =
-            runtime::with_identity(&bi, &did_a, |entry| Ok(Arc::as_ptr(&entry.custody) as usize))
-                .unwrap();
+            runtime::with_identity(
+                &bi,
+                &did_a,
+                |entry| Ok(Arc::as_ptr(&entry.custody) as usize),
+            )
+            .unwrap();
         let custody_ptr_b =
-            runtime::with_identity(&bi, &did_b, |entry| Ok(Arc::as_ptr(&entry.custody) as usize))
-                .unwrap();
+            runtime::with_identity(
+                &bi,
+                &did_b,
+                |entry| Ok(Arc::as_ptr(&entry.custody) as usize),
+            )
+            .unwrap();
         assert_ne!(
             custody_ptr_a, custody_ptr_b,
             "different identities in the registry must have different custody providers — \

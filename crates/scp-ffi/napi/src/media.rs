@@ -129,7 +129,14 @@ pub fn media_initiate_session(
     timestamp: f64,
 ) -> napi::Result<String> {
     let bi = default_bridge_instance()?;
-    media_initiate_session_on(&bi, context_id, ceiling, capabilities, participants, timestamp)
+    media_initiate_session_on(
+        &bi,
+        context_id,
+        ceiling,
+        capabilities,
+        participants,
+        timestamp,
+    )
 }
 
 /// Per-bridge-instance implementation of [`media_initiate_session`].
@@ -383,7 +390,14 @@ pub fn media_create_ice_candidate(
     sdp_mline_index: Option<u32>,
 ) -> napi::Result<String> {
     let bi = default_bridge_instance()?;
-    media_create_ice_candidate_on(&bi, session_id, candidate, sender_did, sdp_mid, sdp_mline_index)
+    media_create_ice_candidate_on(
+        &bi,
+        session_id,
+        candidate,
+        sender_did,
+        sdp_mid,
+        sdp_mline_index,
+    )
 }
 
 /// Per-bridge-instance implementation of [`media_create_ice_candidate`].

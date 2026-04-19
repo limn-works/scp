@@ -910,17 +910,18 @@ mod tests {
             .block_on(NativeRelayAdapter::connect_sourced(&sourced, None))
             .expect("should connect to the relay");
         let manager = scp_transport::TransportManager::new(Box::new(adapter));
-        crate::runtime::set_transport_manager(manager)
+        let bi = crate::runtime::default_bridge_instance().expect("default bridge instance");
+        crate::runtime::set_transport_manager(&bi, manager)
             .expect("should store transport manager in global");
 
         // Verify the global is populated.
         assert!(
-            crate::runtime::has_transport_manager(),
+            crate::runtime::has_transport_manager(&bi),
             "BridgeInstance transport manager should be populated after auto-wire"
         );
 
         // Clean up.
-        crate::runtime::clear_transport_manager().ok();
+        crate::runtime::clear_transport_manager(&bi).ok();
         relay.shutdown();
     }
 }

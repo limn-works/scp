@@ -128,10 +128,7 @@ pub fn fullstack_create_node(did: String) -> napi::Result<NapiFullStackNode> {
 }
 
 /// Per-bridge-instance implementation of [`fullstack_create_node`].
-pub(crate) fn fullstack_create_node_on(
-    bi: &NapiBridgeInstance,
-    did: String,
-) -> NapiFullStackNode {
+pub(crate) fn fullstack_create_node_on(bi: &NapiBridgeInstance, did: String) -> NapiFullStackNode {
     let instance_id = bi.instance_id();
     with_network_on(bi, |network| {
         let node = network.create_node(&did, permissive_key_resolver());
