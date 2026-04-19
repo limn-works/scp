@@ -1632,7 +1632,7 @@ Committing --[retry budget exhausted]--> NeedsRepair (terminal)
 Aborting   --[all participants ack Abort]--> Aborted (terminal)
 ```
 
-Each phase transition is synchronously persisted to a durable journal (§17.16) before the next phase begins. On process restart the supervisor replays unresolved journal entries.
+Each phase transition is synchronously persisted to a durable journal (§17.16) before any outbound effect of that phase — including the phase message dispatched to the next participating actor — is visible. Journal durability is the gate; the subsequent phase message and any other observer channel (§5.15.3) follow after the journal's durable acknowledgment. On process restart the supervisor replays unresolved journal entries.
 
 Concurrent sagas against the same context are serialized. A context accepts at most one pending saga at a time; a second Prepare while one is pending is rejected with a typed **saga-busy** error (surfaced consistently across bindings).
 
