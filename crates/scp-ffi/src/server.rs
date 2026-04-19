@@ -235,6 +235,11 @@ pub struct PyNodeHandle {
     /// `check_handle` at every entry point that accepts this handle.
     #[allow(dead_code)]
     pub(crate) instance_id: u64,
+    /// The bridge instance that owns this node's `ContextManager`. Stored
+    /// so methods on `PyNodeHandle` (e.g. `publish_broadcast`) can resolve
+    /// the manager without consulting any process-global default
+    /// (Phase D #1695).
+    pub(crate) bi: Arc<crate::runtime::PyBridgeInstance>,
 }
 
 // PyO3 `#[getter]` methods require `&self` and cannot be `const` or `#[must_use]`.
@@ -317,12 +322,9 @@ impl PyNodeHandle {
         let rt = crate::runtime()?;
 
         // Resolve broadcast key: explicit or auto-lookup from ContextManager.
-        // `PyNodeHandle` is owned by the Python process (not tied to a
-        // specific `PyScp` instance) so it routes through the default
-        // bridge instance. Per-instance `NodeHandle` support lands with the
-        // affinity check in a later commit of PR 4.
-        let bi_for_mgr = crate::runtime::default_bridge_instance()?;
-        let mgr = Arc::clone(crate::runtime::context_manager(&bi_for_mgr).map_err(|e| {
+        // Phase D (#1695): `PyNodeHandle` carries a reference to the bridge
+        // instance that spawned it, so we resolve the manager from there.
+        let mgr = Arc::clone(crate::runtime::context_manager(&self.bi).map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "broadcast key auto-lookup failed: {e}"
             ))
@@ -616,6 +618,7 @@ impl crate::scp::PyScp {
         Ok(PyNodeHandle {
             inner: RunningNode::InMemory(node),
             instance_id,
+            bi: Arc::clone(&self.inner),
         })
     }
 
@@ -670,6 +673,7 @@ impl crate::scp::PyScp {
         Ok(PyNodeHandle {
             inner: RunningNode::Filesystem(node),
             instance_id,
+            bi: Arc::clone(&self.inner),
         })
     }
 }
@@ -893,9 +897,8 @@ mod tests {
     fn auto_wire_populates_transport_manager_global() {
         use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
-        // BridgeInstance must exist for transport manager storage.
-        let bi_setup = crate::runtime::default_bridge_instance()
-            .expect("default bridge instance should initialize");
+        // Phase D (#1695): tests construct a fresh per-test bridge instance.
+        let bi_setup = std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py());
         crate::runtime::init_context_manager_for_test(&bi_setup);
 
         // Start a standalone relay to get a stable WebSocket endpoint.
@@ -912,7 +915,7 @@ mod tests {
             .block_on(NativeRelayAdapter::connect_sourced(&sourced, None))
             .expect("should connect to the relay");
         let manager = scp_transport::TransportManager::new(Box::new(adapter));
-        let bi = crate::runtime::default_bridge_instance().expect("default bridge instance");
+        let bi = bi_setup.clone();
         crate::runtime::set_transport_manager(&bi, manager)
             .expect("should store transport manager in global");
 
