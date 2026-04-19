@@ -2532,35 +2532,19 @@ const UNIFFI_LINK_ATTESTATION_REGISTRY_CAP: usize = 10_000;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 
-/// Fallback empty identity link attestation registry for when the default
-/// `UniffiBridgeInstance` has not been initialized yet.
-static EMPTY_IDENTITY_LINK_ATTESTATION_REGISTRY: std::sync::OnceLock<
-    dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>,
-> = std::sync::OnceLock::new();
-
-/// Returns a reference to the default bridge instance's identity link
+/// Returns a reference to this `UniffiBridgeInstance`'s identity link
 /// attestation registry.
 ///
 /// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
 /// typed `identity_link_attestation_registry` field on
 /// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 6.
-/// Falls back to an empty registry when the default instance has not been
-/// initialized yet.
-fn identity_link_attestation_registry()
--> &'static dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>
-{
-    crate::runtime::default_bridge_instance_raw().map_or_else(
-        || EMPTY_IDENTITY_LINK_ATTESTATION_REGISTRY.get_or_init(dashmap::DashMap::new),
-        |bi| bi.identity_link_attestation_registry().as_ref(),
-    )
+/// Phase D (#1695) deletes the empty-fallback branch — every caller now
+/// threads through its owning `Scp`.
+fn identity_link_attestation_registry(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+) -> &dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>> {
+    bi.identity_link_attestation_registry().as_ref()
 }
-
-/// Fallback empty identity custody registry for when the default
-/// `UniffiBridgeInstance` has not been initialized yet.
-#[cfg(feature = "allow_in_memory_custody")]
-static EMPTY_IDENTITY_CUSTODY_REGISTRY: std::sync::OnceLock<
-    dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)>,
-> = std::sync::OnceLock::new();
 
 /// Retained identity custody for attestation verification (keyed by DID).
 ///
@@ -2569,27 +2553,21 @@ static EMPTY_IDENTITY_CUSTODY_REGISTRY: std::sync::OnceLock<
 /// up the issuer's public key without requiring the caller to pass the
 /// Identity object.
 ///
-/// PR 1 moved the registry onto the typed `identity_custody_registry` field
-/// on the default `UniffiBridgeInstance`. Commit 6 of #1549 Phase 4 PR 2
-/// lifts the internal `EMPTY` fallback `OnceLock` out of this function onto
-/// module scope so all three `UniFFI` registries follow the uniform
-/// `EMPTY_* -> bi.field.as_ref()` resolution pattern.
+/// Phase D (#1695): operates directly on the caller's `Scp`'s
+/// `UniffiBridgeInstance` — there is no process-wide fallback.
 #[cfg(feature = "allow_in_memory_custody")]
-pub(crate) fn identity_custody_registry()
--> &'static dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
-    crate::runtime::ensure_bridge_instance();
-    crate::runtime::default_bridge_instance_raw().map_or_else(
-        || EMPTY_IDENTITY_CUSTODY_REGISTRY.get_or_init(dashmap::DashMap::new),
-        |bi| bi.identity_custody_registry.as_ref(),
-    )
+pub(crate) fn identity_custody_registry(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+) -> &dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
+    bi.identity_custody_registry.as_ref()
 }
 
 /// Creates an identity link attestation for an external platform identity.
 ///
 /// See spec §3.5.1, §3.5.2.
 #[cfg(feature = "allow_in_memory_custody")]
-#[cfg(feature = "allow_in_memory_custody")]
 async fn identity_create_link_attestation_impl(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     identity: Arc<Identity>,
     platform: String,
     handle: String,
@@ -2666,7 +2644,7 @@ async fn identity_create_link_attestation_impl(
     // Store custody for later verification lookups.
     // Use entry() API to avoid TOCTOU between contains_key and insert.
     {
-        let registry = identity_custody_registry();
+        let registry = identity_custody_registry(bi);
         let len = registry.len();
         match registry.entry(identity.did.clone()) {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
@@ -2694,7 +2672,7 @@ async fn identity_create_link_attestation_impl(
 
     // Use entry() API to avoid TOCTOU between contains_key and insert.
     {
-        let registry = identity_link_attestation_registry();
+        let registry = identity_link_attestation_registry(bi);
         let len = registry.len();
         match registry.entry(identity.did.clone()) {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
@@ -2938,47 +2916,43 @@ pub struct McpAllowlistState {
 // context_create and deregistered during context_close/leave.
 // ---------------------------------------------------------------------------
 
-/// Fallback empty context handle registry for when the default
-/// `UniffiBridgeInstance` has not been initialized yet.
-static EMPTY_CONTEXT_HANDLE_REGISTRY: std::sync::OnceLock<
-    dashmap::DashMap<String, Arc<ContextHandle>>,
-> = std::sync::OnceLock::new();
-
-/// Returns a reference to the default bridge instance's context handle
+/// Returns a reference to this `UniffiBridgeInstance`'s context handle
 /// registry.
 ///
 /// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
 /// typed `context_handle_registry` field on
 /// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 6.
-/// Falls back to an empty registry when the default instance has not been
-/// initialized yet.
+/// Phase D (#1695) deletes the empty-fallback branch — every caller threads
+/// through the owning `Scp`.
 ///
 /// Used by `McpUniFfiBridgeProvider` to look up per-context tool registries,
 /// handlers, and event log state. The `Arc<ContextHandle>` keeps the handle
 /// alive as long as it is in the registry (the caller also holds an Arc).
-fn context_handle_registry() -> &'static dashmap::DashMap<String, Arc<ContextHandle>> {
-    crate::runtime::default_bridge_instance_raw().map_or_else(
-        || EMPTY_CONTEXT_HANDLE_REGISTRY.get_or_init(dashmap::DashMap::new),
-        |bi| bi.context_handle_registry().as_ref(),
-    )
+fn context_handle_registry(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+) -> &dashmap::DashMap<String, Arc<ContextHandle>> {
+    bi.context_handle_registry().as_ref()
 }
 
-/// Registers a context handle in the global registry.
+/// Registers a context handle in the owning instance's registry.
 ///
 /// Called from `context_create` after the handle is constructed. If a handle
 /// with the same context ID is already registered, the old one is replaced
 /// (last-writer-wins — should not happen in practice since context IDs are
 /// UUIDs).
-fn register_context_handle(handle: &Arc<ContextHandle>) {
-    context_handle_registry().insert(handle.context_id.clone(), Arc::clone(handle));
+fn register_context_handle(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    handle: &Arc<ContextHandle>,
+) {
+    context_handle_registry(bi).insert(handle.context_id.clone(), Arc::clone(handle));
 }
 
-/// Removes a context handle from the global registry.
+/// Removes a context handle from the owning instance's registry.
 ///
 /// Called from `context_close` and `context_leave`. No-op if the context ID
 /// is not registered.
-fn deregister_context_handle(context_id: &str) {
-    context_handle_registry().remove(context_id);
+fn deregister_context_handle(bi: &Arc<crate::runtime::UniffiBridgeInstance>, context_id: &str) {
+    context_handle_registry(bi).remove(context_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -3001,36 +2975,24 @@ pub(crate) struct McpClientEntry {
     pub(crate) client: std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>,
 }
 
-/// Fallback empty MCP server registry for when the default
-/// `UniffiBridgeInstance` has not been initialized yet. Mirrors the
-/// NAPI `EMPTY_SERVER_REGISTRY` fallback pattern.
-static EMPTY_MCP_SERVER_REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpServerEntry>> =
-    std::sync::OnceLock::new();
-
-/// Fallback empty MCP client registry.
-static EMPTY_MCP_CLIENT_REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpClientEntry>> =
-    std::sync::OnceLock::new();
-
-/// Returns a reference to the default bridge instance's MCP server registry.
+/// Returns a reference to this `UniffiBridgeInstance`'s MCP server registry.
 ///
 /// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
 /// typed `mcp_server_registry` field on
 /// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 4.
-/// Falls back to an empty registry when the default instance has not been
-/// initialized yet.
-fn mcp_server_registry() -> &'static dashmap::DashMap<String, McpServerEntry> {
-    crate::runtime::default_bridge_instance_raw().map_or_else(
-        || EMPTY_MCP_SERVER_REGISTRY.get_or_init(dashmap::DashMap::new),
-        |bi| bi.mcp_server_registry().as_ref(),
-    )
+/// Phase D (#1695) deletes the empty-fallback branch — every caller threads
+/// through the owning `Scp`.
+fn mcp_server_registry(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+) -> &dashmap::DashMap<String, McpServerEntry> {
+    bi.mcp_server_registry().as_ref()
 }
 
-/// Returns a reference to the default bridge instance's MCP client registry.
-fn mcp_client_registry() -> &'static dashmap::DashMap<String, McpClientEntry> {
-    crate::runtime::default_bridge_instance_raw().map_or_else(
-        || EMPTY_MCP_CLIENT_REGISTRY.get_or_init(dashmap::DashMap::new),
-        |bi| bi.mcp_client_registry().as_ref(),
-    )
+/// Returns a reference to this `UniffiBridgeInstance`'s MCP client registry.
+fn mcp_client_registry(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+) -> &dashmap::DashMap<String, McpClientEntry> {
+    bi.mcp_client_registry().as_ref()
 }
 
 fn mcp_handle_id(prefix: &str) -> String {
@@ -3253,6 +3215,12 @@ const UNIFFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::tools::DEFAULT_TIMEOUT_MS
 /// - `context_members()` reads from `ContextManager::member_dids()` + `member_role()`
 /// - `context_events()` reads from the per-context event log (UCAN state)
 struct McpUniFfiBridgeProvider {
+    /// Owning `UniffiBridgeInstance` — source for the context handle
+    /// registry, `ContextManager`, and UCAN state lookups.
+    ///
+    /// Phase D (#1695): replaces process-wide `DEFAULT_BRIDGE_INSTANCE`
+    /// lookups with per-provider `Arc` affinity.
+    bi: Arc<crate::runtime::UniffiBridgeInstance>,
     agent_did: String,
     context_ids: Vec<String>,
     /// Maximum time (in milliseconds) to wait for a tool handler to complete.
@@ -3269,8 +3237,8 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
-        // Read the agent's role assignment from the ContextManager's role state.
-        let manager = crate::runtime::context_manager().ok()?;
+        // Read the agent's role assignment from this instance's ContextManager.
+        let manager = self.bi.context_manager_expect().ok()?;
         let role_state = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(manager.get_role_state(context_id))
         })?;
@@ -3285,9 +3253,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     fn context_tools(&self, context_id: &str) -> Vec<scp_mcp::server::ContextToolInfo> {
-        // Look up the ContextHandle from the global registry and read its
-        // tool_registry.
-        let registry = context_handle_registry();
+        // Look up the ContextHandle from this provider's instance registry
+        // and read its tool_registry.
+        let registry = context_handle_registry(&self.bi);
         let Some(handle) = registry.get(context_id) else {
             return Vec::new();
         };
@@ -3325,10 +3293,12 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             // Scope the DashMap Ref so the shard lock is released before
             // entering with_ucan_state (which uses a different DashMap).
             {
-                let handle = context_handle_registry().get(context_id).ok_or_else(|| {
-                    format!("context '{context_id}' not found in handle registry")
-                })?;
-                crate::runtime::ensure_ucan_registered(
+                let handle = context_handle_registry(&self.bi)
+                    .get(context_id)
+                    .ok_or_else(|| {
+                        format!("context '{context_id}' not found in handle registry")
+                    })?;
+                self.bi.ensure_ucan_registered(
                     context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
@@ -3336,46 +3306,46 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             }
 
             let agent_did = self.agent_did.clone();
-            crate::runtime::with_ucan_state(context_id, |ucan_state| {
-                let production_resolver = crate::runtime::did_resolver();
-                let did_resolver = scp_ffi_common::DispatchDidResolver::new(
-                    production_resolver.map(std::convert::AsRef::as_ref),
-                );
-                let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
-                    revocation_list: &ucan_state.revocation_list,
-                };
-                let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                    inner: &mut ucan_state.nonce_tracker,
-                };
+            self.bi
+                .with_ucan_state(context_id, |ucan_state| {
+                    let production_resolver = self.bi.did_resolver();
+                    let did_resolver =
+                        scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
+                    let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+                        revocation_list: &ucan_state.revocation_list,
+                    };
+                    let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+                        inner: &mut ucan_state.nonce_tracker,
+                    };
 
-                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-                    did_resolver: &did_resolver,
-                    nonce_tracker: &mut nonce_adapter,
-                    revocation_checker: &revocation_checker,
-                    proof_resolver: &proof_resolver,
-                    ceiling: &ucan_state.ceiling_strings,
-                    context_creator_did: &ucan_state.creator_did,
-                    presenting_agent_did: &agent_did,
-                    clock_skew_tolerance_secs:
-                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                    clock: &scp_primitives::SystemClock,
-                };
+                    let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                        did_resolver: &did_resolver,
+                        nonce_tracker: &mut nonce_adapter,
+                        revocation_checker: &revocation_checker,
+                        proof_resolver: &proof_resolver,
+                        ceiling: &ucan_state.ceiling_strings,
+                        context_creator_did: &ucan_state.creator_did,
+                        presenting_agent_did: &agent_did,
+                        clock_skew_tolerance_secs:
+                            scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                        clock: &scp_primitives::SystemClock,
+                    };
 
-                scp_core::context::tools::validate_tool_invocation_ucan(
-                    token, context_id, tool_name, &mut ctx,
-                )
-                .map_err(|e| {
-                    tracing::warn!(
-                        agent = %agent_did,
-                        tool = %tool_name,
-                        context = %context_id,
-                        error = %e,
-                        "UCAN validation failed for tool invocation"
-                    );
-                    format!("UCAN authorization failed for tool '{tool_name}': {e}")
+                    scp_core::context::tools::validate_tool_invocation_ucan(
+                        token, context_id, tool_name, &mut ctx,
+                    )
+                    .map_err(|e| {
+                        tracing::warn!(
+                            agent = %agent_did,
+                            tool = %tool_name,
+                            context = %context_id,
+                            error = %e,
+                            "UCAN validation failed for tool invocation"
+                        );
+                        format!("UCAN authorization failed for tool '{tool_name}': {e}")
+                    })
                 })
-            })
-            .ok_or_else(|| format!("UCAN state not found for context '{context_id}'"))??;
+                .ok_or_else(|| format!("UCAN state not found for context '{context_id}'"))??;
         } else {
             tracing::warn!(
                 agent = %self.agent_did,
@@ -3388,7 +3358,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        let manager = crate::runtime::context_manager()
+        let manager = self
+            .bi
+            .context_manager_expect()
             .map_err(|e| format!("ContextManager not initialized: {e}"))?;
         let role_state = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(manager.get_role_state(context_id))
@@ -3430,7 +3402,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         // handler execution to avoid blocking concurrent context operations.
         // The DashMap Ref (shard lock) is scoped to this block.
         let (dispatch, input_hash) = {
-            let handle = context_handle_registry()
+            let handle = context_handle_registry(&self.bi)
                 .get(context_id)
                 .ok_or_else(|| format!("context '{context_id}' not found in handle registry"))?;
 
@@ -3532,15 +3504,15 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             .map_or(0, |d| d.as_secs());
 
         // Ensure UCAN state is registered before appending the event.
-        if let Some(handle) = context_handle_registry().get(context_id) {
-            crate::runtime::ensure_ucan_registered(
+        if let Some(handle) = context_handle_registry(&self.bi).get(context_id) {
+            self.bi.ensure_ucan_registered(
                 context_id,
                 &handle.creator_did,
                 &handle.ceiling_strings,
             );
         }
 
-        let append_result = crate::runtime::with_ucan_state(context_id, |ucan_state| {
+        let append_result = self.bi.with_ucan_state(context_id, |ucan_state| {
             let sequence = scp_event_log::tree::event_count(&ucan_state.event_log);
             let prev_hash = if ucan_state.event_log.leaves().is_empty() {
                 scp_event_log::tree::GENESIS_PREV_HASH
@@ -3586,8 +3558,8 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     fn context_members(&self, context_id: &str) -> Vec<scp_mcp::server::MemberInfo> {
-        // Read member list and role assignments from the ContextManager.
-        let Ok(manager) = crate::runtime::context_manager() else {
+        // Read member list and role assignments from this instance's ContextManager.
+        let Ok(manager) = self.bi.context_manager_expect() else {
             return Vec::new();
         };
 
@@ -3613,23 +3585,24 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     fn context_events(&self, context_id: &str) -> serde_json::Value {
         // The EventLog stores Merkle tree hashes, not event payloads.
         // Return the event count and Merkle root as metadata (matching PyO3).
-        if let Some(handle) = context_handle_registry().get(context_id) {
-            crate::runtime::ensure_ucan_registered(
+        if let Some(handle) = context_handle_registry(&self.bi).get(context_id) {
+            self.bi.ensure_ucan_registered(
                 context_id,
                 &handle.creator_did,
                 &handle.ceiling_strings,
             );
         }
 
-        crate::runtime::with_ucan_state(context_id, |ucan_state| {
-            let leaf_count = ucan_state.event_log.leaves().len();
-            let root = scp_event_log::tree::root(&ucan_state.event_log);
-            serde_json::json!({
-                "event_count": leaf_count,
-                "merkle_root": hex::encode(root),
+        self.bi
+            .with_ucan_state(context_id, |ucan_state| {
+                let leaf_count = ucan_state.event_log.leaves().len();
+                let root = scp_event_log::tree::root(&ucan_state.event_log);
+                serde_json::json!({
+                    "event_count": leaf_count,
+                    "merkle_root": hex::encode(root),
+                })
             })
-        })
-        .unwrap_or_else(|| serde_json::json!({ "event_count": 0 }))
+            .unwrap_or_else(|| serde_json::json!({ "event_count": 0 }))
     }
 
     fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
@@ -5780,8 +5753,12 @@ pub fn bridge_register(
 /// `ScpError::Context` if shadow creation fails.
 ///
 /// See spec section 12 (Bridge System) and ADR-023.
-#[uniffi::export]
-pub fn bridge_create_shadow(
+///
+/// Phase D (#1695): moved from a module-level free function to a method on
+/// `Scp`. The bridge state it mutates (`CoreFields::bridge_state`) is now
+/// per-instance and can only be reached via a caller-owned `Scp` handle.
+fn bridge_create_shadow_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     bridge_id: String,
     platform_handle: String,
     bridge_mode: String,
@@ -5813,7 +5790,6 @@ pub fn bridge_create_shadow(
         timestamp: 0,
     };
 
-    let bi = crate::runtime::bridge_instance()?;
     let mut entry = bi
         .core
         .bridge_state()
@@ -6978,6 +6954,7 @@ impl Scp {
             .check_handle(identity.instance_id())
             .map_err(ScpError::from)?;
         identity_create_link_attestation_impl(
+            &self.inner,
             identity,
             platform,
             handle,
@@ -6995,10 +6972,9 @@ impl Scp {
     ///
     /// See spec §3.5.1.
     pub fn identity_link_attestations(&self, did: String) -> Result<String, ScpError> {
-        // Registry lookup currently routes through the module-level helper
-        // which reads from `DEFAULT_BRIDGE_INSTANCE`. Later sub-slices
-        // migrate the helper to operate on `&self.inner` directly.
-        let attestations = identity_link_attestation_registry()
+        // Phase D (#1695): registry lookup routes through this `Scp`'s
+        // `UniffiBridgeInstance` directly — the process-wide default is gone.
+        let attestations = identity_link_attestation_registry(&self.inner)
             .get(&did)
             .map(|v| v.value().clone())
             .unwrap_or_default();
@@ -7017,15 +6993,13 @@ impl Scp {
     #[cfg(feature = "allow_in_memory_custody")]
     #[must_use]
     pub fn identity_remove_link_attestation(&self, did: String, attestation_id: String) -> bool {
-        // Registry lookups currently route through the module-level
-        // helpers which read from `DEFAULT_BRIDGE_INSTANCE`. Later
-        // sub-slices migrate the helpers to operate on `&self.inner`.
+        // Phase D (#1695): per-`Scp` registry lookups — no default fallback.
         // Verify the caller owns the DID by checking the identity custody registry.
-        if !identity_custody_registry().contains_key(&did) {
+        if !identity_custody_registry(&self.inner).contains_key(&did) {
             return false;
         }
 
-        let Some(mut entry) = identity_link_attestation_registry().get_mut(&did) else {
+        let Some(mut entry) = identity_link_attestation_registry(&self.inner).get_mut(&did) else {
             return false;
         };
         let before = entry.len();
@@ -7243,9 +7217,10 @@ impl Scp {
                     core_context_params: retained_core_params,
                     instance_id: bi.core.instance_id(),
                 });
-                // Register in the global context handle registry so the MCP
-                // bridge provider can look up per-context state by context ID.
-                register_context_handle(&handle);
+                // Register in this instance's context handle registry so the
+                // MCP bridge provider can look up per-context state by
+                // context ID.
+                register_context_handle(&bi, &handle);
                 increment_handle_count();
                 Ok(handle)
             })
@@ -7480,7 +7455,7 @@ impl Scp {
                     .map_err(ScpError::from)?;
 
                 // Deregister the context handle from the MCP lookup registry.
-                deregister_context_handle(&handle.context_id);
+                deregister_context_handle(&bi, &handle.context_id);
 
                 Ok(())
             })
@@ -7612,15 +7587,15 @@ impl Scp {
                     }
                 }
 
-                // Clean up per-context UCAN state.
-                crate::runtime::remove_ucan_state(&handle.context_id);
+                // Clean up per-context UCAN state on this instance.
+                bi.remove_ucan_state(&handle.context_id);
 
                 // Clean up per-context bridge connector state and economy state.
                 bi.core.remove_bridge_state(&handle.context_id);
                 bi.core.remove_economy_state(&handle.context_id);
 
                 // Deregister the context handle from the MCP lookup registry.
-                deregister_context_handle(&handle.context_id);
+                deregister_context_handle(&bi, &handle.context_id);
 
                 *state = ContextState::Closed;
                 drop(state);
@@ -11328,6 +11303,7 @@ impl Scp {
         }
 
         let provider = McpUniFfiBridgeProvider {
+            bi: Arc::clone(&self.inner),
             agent_did: config.identity_did.clone(),
             context_ids: config.context_ids.clone(),
             tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
@@ -11345,6 +11321,7 @@ impl Scp {
         let sse_context_ids = config.context_ids;
         let sse_ucan_token = config.ucan_token;
         let sse_proof_tokens = config.proof_tokens;
+        let sse_bi = Arc::clone(&self.inner);
 
         let task_handle = runtime().spawn(async move {
             match transport_mode.as_str() {
@@ -11353,6 +11330,7 @@ impl Scp {
                 }
                 "sse" => {
                     let provider = McpUniFfiBridgeProvider {
+                        bi: sse_bi,
                         agent_did: sse_identity_did,
                         context_ids: sse_context_ids,
                         tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
@@ -11380,7 +11358,7 @@ impl Scp {
         });
 
         let handle_id = mcp_handle_id("mcp-server");
-        mcp_server_registry().insert(
+        mcp_server_registry(&self.inner).insert(
             handle_id.clone(),
             McpServerEntry {
                 shutdown_tx: Some(shutdown_tx),
@@ -11401,13 +11379,12 @@ impl Scp {
     pub async fn mcp_server_stop(&self, handle: String) -> Result<(), ScpError> {
         validate_mcp_handle(&handle)?;
 
-        let mut entry =
-            mcp_server_registry()
-                .get_mut(&handle)
-                .ok_or_else(|| ScpError::Transport {
-                    msg: format!("MCP server handle '{handle}' not found"),
-                    code: codes::TRANS_5012.to_owned(),
-                })?;
+        let mut entry = mcp_server_registry(&self.inner)
+            .get_mut(&handle)
+            .ok_or_else(|| ScpError::Transport {
+                msg: format!("MCP server handle '{handle}' not found"),
+                code: codes::TRANS_5012.to_owned(),
+            })?;
 
         if entry.stopped {
             return Err(ScpError::Transport {
@@ -11449,7 +11426,7 @@ impl Scp {
         })?;
 
         let handle_id = mcp_handle_id("mcp-client");
-        mcp_client_registry().insert(
+        mcp_client_registry(&self.inner).insert(
             handle_id.clone(),
             McpClientEntry {
                 client: std::sync::Mutex::new(client),
@@ -11476,7 +11453,7 @@ impl Scp {
         })?;
 
         let handle_id = mcp_handle_id("mcp-client");
-        mcp_client_registry().insert(
+        mcp_client_registry(&self.inner).insert(
             handle_id.clone(),
             McpClientEntry {
                 client: std::sync::Mutex::new(client),
@@ -11494,7 +11471,7 @@ impl Scp {
     pub async fn mcp_client_disconnect(&self, handle: String) -> Result<(), ScpError> {
         validate_mcp_handle(&handle)?;
 
-        let removed = mcp_client_registry().remove(&handle);
+        let removed = mcp_client_registry(&self.inner).remove(&handle);
         if removed.is_none() {
             return Err(ScpError::Transport {
                 msg: format!("MCP client handle '{handle}' not found"),
@@ -11515,7 +11492,7 @@ impl Scp {
     ) -> Result<Vec<McpToolInfo>, ScpError> {
         validate_mcp_handle(&handle)?;
 
-        let entry = mcp_client_registry()
+        let entry = mcp_client_registry(&self.inner)
             .get(&handle)
             .ok_or_else(|| ScpError::Transport {
                 msg: format!("MCP client handle '{handle}' not found"),
@@ -11560,7 +11537,7 @@ impl Scp {
         validate_context_id(&context_id)?;
         validate_did(&invoker_did)?;
 
-        let entry = mcp_client_registry()
+        let entry = mcp_client_registry(&self.inner)
             .get(&handle)
             .ok_or_else(|| ScpError::Transport {
                 msg: format!("MCP client handle '{handle}' not found"),
@@ -11669,6 +11646,27 @@ impl Scp {
         };
         let did_ref: scp_identity::DID = did.into();
         manager.is_local_did(&did_ref).await
+    }
+
+    /// Per-instance equivalent of the free-function [`bridge_create_shadow`].
+    ///
+    /// Mutates this instance's per-context bridge state. Rejects any
+    /// cross-instance caller (the method takes `&self` — the `bi` threaded
+    /// into `bridge_create_shadow_on` is always this instance's).
+    pub fn bridge_create_shadow(
+        &self,
+        bridge_id: String,
+        platform_handle: String,
+        bridge_mode: String,
+        context_id: String,
+    ) -> Result<ShadowIdentityResult, ScpError> {
+        bridge_create_shadow_on(
+            &self.inner,
+            bridge_id,
+            platform_handle,
+            bridge_mode,
+            context_id,
+        )
     }
 
     /// Per-instance equivalent of the free-function [`trust_query_score`].
@@ -12191,6 +12189,7 @@ impl Scp {
         #[cfg(feature = "allow_in_memory_custody")]
         let custody_arc = in_memory.map(Arc::clone);
         let callback_custody = identity.callback_custody.as_ref().map(Arc::clone);
+        let bi = Arc::clone(&self.inner);
 
         runtime()
             .spawn(async move {
@@ -12244,14 +12243,14 @@ impl Scp {
                     #[cfg(not(feature = "allow_in_memory_custody"))]
                     let attestation_did = new_did;
                     {
-                        let registry = identity_link_attestation_registry();
+                        let registry = identity_link_attestation_registry(&bi);
                         if let Some((_, attestations)) = registry.remove(&old_did) {
                             registry.insert(attestation_did, attestations);
                         }
                     }
                     #[cfg(feature = "allow_in_memory_custody")]
                     {
-                        let registry = identity_custody_registry();
+                        let registry = identity_custody_registry(&bi);
                         if let Some((_, entry)) = registry.remove(&old_did) {
                             registry.insert(new_did, entry);
                         }
@@ -12306,14 +12305,14 @@ impl Scp {
                     #[cfg(not(feature = "allow_in_memory_custody"))]
                     let attestation_did = new_did;
                     {
-                        let registry = identity_link_attestation_registry();
+                        let registry = identity_link_attestation_registry(&bi);
                         if let Some((_, attestations)) = registry.remove(&old_did) {
                             registry.insert(attestation_did, attestations);
                         }
                     }
                     #[cfg(feature = "allow_in_memory_custody")]
                     {
-                        let registry = identity_custody_registry();
+                        let registry = identity_custody_registry(&bi);
                         if let Some((_, entry)) = registry.remove(&old_did) {
                             registry.insert(new_did, entry);
                         }
