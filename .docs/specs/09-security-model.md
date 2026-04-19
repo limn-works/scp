@@ -251,28 +251,56 @@ Wherever possible, isolation boundaries SHOULD be enforced by the language's vis
 Specific isolation boundaries in the runtime:
 
 - **Per-context state ownership.** A context's state is owned by exactly one computation and is not shareable. Handler code mutates state only through the owning computation. No mechanism exposes one context's state to another context's handler.
-- **Cross-identity capability restriction.** Operations that read per-identity state (wrapping keys, KeyPackage pool, recovery state) are reachable only via a capability proof that identifies the requesting identity. The capability proof is issued at actor construction and cannot be constructed or copied by handler code. An operation executing in an actor owned by identity A can read only A's per-identity state; any read of another identity's state requires a saga (§5.15.4).
-- **Capability is unduplicable.** The capability proof is not copyable, cloneable, or serializable by any API; implementations MUST prevent all three. Unsafe escapes (e.g. via raw-pointer conversion, transmute) MUST be forbidden in the module that defines the capability.
+- **Cross-identity capability restriction.** Operations that read per-identity state (wrapping keys, KeyPackage pool, recovery state) are reachable only via a capability proof that identifies the requesting identity. The capability proof is issued at actor construction and cannot be constructed or copied by handler code. An operation executing in an actor owned by identity `A` can read only `A`'s per-identity state; any read of another identity's state requires a saga (§5.15.4).
+- **Capability is unduplicable, unforgeable, and opaque.** The capability proof MUST satisfy all of:
+  1. **Not duplicable.** No API, trait, impl, or ergonomic conversion returns a copy, clone, or alternative instance of the proof. Language-specific: Rust impls MUST NOT derive or implement `Clone`, `Copy`, `Serialize`, `Deserialize`, `Default`, `Hash`, `PartialEq`, `Eq`, `Borrow`, or `From`/`Into` for the capability type; other languages MUST apply the equivalent set of restrictions.
+  2. **Not inspectable.** No API (including any `Debug`, `Display`, `Deref`, `AsRef`, or equivalent accessor) returns the inner DID or its bytes in a form that allows reconstruction of the proof or its use as a lookup key elsewhere. The proof is opaque to handler code; only supervisor-module code consumes it.
+  3. **Not forgeable.** The proof's constructor MUST be visible only to the supervisor module that issues it. Unsafe escapes (raw-pointer conversion, transmute, reflection-based instantiation) MUST be explicitly forbidden in the module that defines the capability.
+  4. **Not leak-prone.** No reachable field on any type bound to handler code stores the proof by value, by clone, by shared reference beyond its originating call, or by serialized representation.
+  Implementations MUST enforce these properties with a mechanical check (CI lint scoped to the capability type's definition), in addition to the language-visibility constraints above.
 - **No API returns per-identity state given an arbitrary DID.** The only supervisor API that returns per-identity state takes the capability proof as a parameter. Callers cannot pass another identity's DID and receive that identity's state.
 
 ### 9.4.2 Authorization-State Persistence Invariant
 
-Any operation that transitions a member's authorization downward MUST be synchronously persisted before the operation's acknowledgment is visible to any observer (caller ack, network send, readable event log entry). A process crash between the mutation and the acknowledgment MUST NOT restore the pre-mutation authorization.
+Any operation that transitions a member's authorization **downward** MUST be synchronously persisted before the operation's acknowledgment is visible to any observer (caller acknowledgment, outgoing network message, readable event log entry, event-log subscriber notification, sync-tier replication stream, or saga phase message to another actor). A process crash between the mutation and the acknowledgment MUST NOT restore the pre-mutation authorization.
 
-Operations covered: UCAN issuance/attenuation/revocation, role assignment/demotion, blocklist updates, content-access key revocation, MLS member removal, wrapping-key rotation.
+Operations covered (downward transitions — those that reduce or remove authority):
 
-Coalesced persistence (§5.15.3) MUST NOT be used for any of these. Rollback from a coalesced crash would re-grant authority that was meant to be removed, creating a window where a revoked attacker can replay actions.
+- UCAN attenuation, expiration enforcement, revocation (NOT issuance — see note below)
+- Role demotion, role revocation, blocklist additions, broadcast author block
+- Content-access key revocation, sender-key destruction on block (all three tiers of §9.16 enforcement)
+- MLS member removal
+- Capability suspension and standing downgrades (including cooldown activation that forecloses previously-authorized action)
+- Governance timeout expiry that transitions an active proposal into a denied or lapsed terminal state
+- Wrapping-key rotation (forward-secrecy class)
+
+**UCAN issuance note.** Issuance grants authority and is therefore not itself downward. It is listed in §5.15.3 as sync-persisted for a distinct reason: a caller's acknowledgment of "the token was issued" that rolls back would leave a non-existent token that the caller believes to hold. For the §9.4.2 security invariant, only the downward transitions above are load-bearing; issuance's sync-persistence is a caller-consistency concern.
+
+Coalesced persistence (§5.15.3) MUST NOT be used for any downward transition above. Rollback from a coalesced crash would re-grant authority that was meant to be removed, creating a window where a revoked or suspended attacker can replay actions.
+
+The full list of sync-persisted operations (which is a superset of the downward-transition set above) is enumerated in §5.15.3.
 
 ### 9.4.3 Saga Journal Secret Handling
 
-The cross-context saga coordinator writes phase transitions to a durable journal (§5.15.4). Saga evidence carried in journal entries is classified as **secret-bearing** or **public**. Bearer artifacts (migration custody handovers, unrevoked proof tokens that would authorize action on their own) are secret-bearing.
+The cross-context saga coordinator writes phase transitions to a durable journal (§5.15.4, §17.16). Saga evidence carried in journal entries is classified as **secret-bearing** or **public**. Bearer artifacts (migration custody handovers; unrevoked proof tokens that would authorize action on their own) are secret-bearing; plan-level metadata and public identifiers are not.
 
-Requirements:
+**Commitment construction.** Secret-bearing sagas MUST journal only a commitment — never the bearer bytes. The commitment is constructed as:
 
-- Secret-bearing sagas MUST journal only a commitment — a hash of the bearer envelope with a nonce — never the bearer bytes. The bearer remains in actor-local state and MUST be zeroized when it leaves memory.
-- In-memory journal entries MUST be zeroized on drop.
-- Storage backends for the journal MUST declare an at-rest encryption posture. Backends without at-rest encryption MUST refuse to host secret-bearing saga types; the runtime's journal construction fails closed against mismatched backends.
-- Marking a secret-bearing saga resolved MUST synchronously overwrite the on-disk evidence bytes before the operation returns, not at next compaction.
+```
+commitment = SHA-256(domain_separator ‖ bearer_envelope ‖ nonce)
+```
+
+where:
+
+- `domain_separator` is a fixed, per-saga-type byte string of at least 16 bytes, unique across saga types and distinct from any other protocol hash domain (e.g., `"scp/saga-commit/migration/v1"`).
+- `bearer_envelope` is the canonical serialization of the bearer artifact (deterministic; two conforming implementations produce byte-identical envelopes for equivalent inputs).
+- `nonce` is a freshly sampled 32-byte value from a cryptographically secure random source (OsRng or equivalent). The nonce is distinct per saga instance; nonce reuse is a protocol violation.
+
+SHA-256 is the only approved hash for this construction. The commitment is binding (no two distinct bearers produce the same commitment within computational bounds of SHA-256) and hiding (no bearer can be recovered from the commitment alone).
+
+**Bearer handling in memory.** The bearer remains in actor-local state. Bearer bytes MUST be stored in a wrapper that zeroizes on drop, is never cloneable, never serializable, never renderable via any debug or display accessor, and never printable via any formatter. Any function that receives the bearer by value MUST zeroize it before returning, even on panic, cancellation, or early error return. Language-specific: Rust implementations MUST use `Zeroizing`-wrapped storage with no `Clone`/`Debug`/`Display`/`Serialize`/`Deserialize` on the containing type; other languages MUST apply the equivalent set of restrictions.
+
+**Journal entry handling at rest.** In-memory journal entries MUST be zeroized on drop. Storage backends for the journal MUST declare an at-rest encryption posture. Backends without at-rest encryption MUST refuse to host secret-bearing saga types; the runtime's journal construction fails closed against mismatched backends. Marking a secret-bearing saga resolved MUST synchronously overwrite the on-disk evidence bytes before the operation returns, not at next compaction.
 
 ## 9.5 Cryptographic Primitive Specification
 

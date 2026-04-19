@@ -158,7 +158,7 @@ Rejected; MLS ops and HPKE ops are independent primitives. Tests may mock one wi
 
 **Dependencies.** Adds `shuttle` (model checker, dev-only) and `tree-sitter-rust` (AST check tooling, dev-only) to the dev-dependencies.
 
-**Performance.** No baseline measured. Expected overhead sources: `Box<dyn Future>` allocation per `async_trait` call, mailbox send+recv+oneshot reply per command, journal write per saga phase transition, `spawn_blocking` hop per SQLite op. Correctness > performance for pre-1.0; measurement tools added if observed performance becomes a concern.
+**Performance.** No baseline measured and none required — correctness is the pre-1.0 priority. Expected overhead sources: `Box<dyn Future>` allocation per `async_trait` call, mailbox send+recv+oneshot reply per command, journal write per saga phase transition, `spawn_blocking` hop per SQLite op. No performance tooling is added by this ADR.
 
 ## Verification
 
@@ -196,6 +196,6 @@ Invariants to verify (documented in plan):
 ## References
 
 - Plan: `~/.claude/plans/generic-moseying-lightning.md` (execution detail, commit ladder, per-binding criteria, CI enforcement, failure modes)
-- Spec updates (commit 2): `.docs/specs/05-contexts.md`, `09-security-model.md`, `17-persistence.md`, `architecture.md`
+- Spec updates (commit 2): `.docs/specs/05-contexts.md` §5.15, `09-security-model.md` §9.4.1–3, `17-persistence-and-storage.md` §17.15–16, `architecture.md` trait contracts
 - Related ADRs: ADR-034 (WASM), ADR-046 (parity), ADR-047 (symmetry), ADR-048 (multi-instance)
 - Prior plans superseded: none (this is the first actor-per-context ADR)

@@ -818,49 +818,54 @@ These test the protocol layer's use of storage, not the storage adapters themsel
 - Performance optimization: batch writes, connection pooling
 - `ProtocolRepository` profiling and hot-path optimization
 
-## 17.8 Per-Context State Persistence
+## 17.15 Per-Context State Persistence
 
 Under the concurrency model in §5.15, each context has a single owning computation responsible for persisting its state. Persistence uses two modes.
 
-### 17.8.1 Coalesced Persist (Default)
+### 17.15.1 Coalesced Persist (Default)
 
-A context's state is marked dirty after any mutation that is not explicitly sync-persisted (§17.8.2). A coalescing timer fires at most once per 50 ms per context; when it fires with a dirty state, the full context snapshot is written via the configured persistence backend. This bounds the write rate per context and avoids persisting every incremental change.
+A context's state is marked dirty after any mutation that is not explicitly sync-persisted (§17.15.2). A coalescing timer fires at most once per 50 ms per context; when it fires with a dirty state, the full context snapshot is written via the configured persistence backend. This bounds the write rate per context and avoids persisting every incremental change.
 
-The 50 ms window is a normative upper bound. Implementations MAY persist more aggressively (shorter interval, every-mutation persist); they MUST NOT coalesce beyond 50 ms if they claim conformance to the reference runtime's caller-visible guarantees (§5.15.3).
+The 50 ms window is a normative upper bound on caller-observable rollback (§5.15.3). Implementations MAY persist more aggressively (shorter interval, every-mutation persist); they MUST NOT coalesce beyond 50 ms.
 
-### 17.8.2 Synchronous Persist (Safety-Critical)
+### 17.15.2 Synchronous Persist (Safety-Critical)
 
-Specific operations bypass coalescing and persist inline before the mutation is visible to any observer — caller acknowledgment, outgoing network message, or readable event log entry. The full list of sync-persisted operations is normative and appears in §5.15.3.
+Specific operations bypass coalescing and persist inline before the mutation is visible to any observer — caller acknowledgment, outgoing network message, readable event log entry, event-log subscriber notification, sync-tier replication stream, or saga phase message to another actor. The full list of sync-persisted operations is normative and appears in §5.15.3.
 
-Implementation-level protocol: mutate in-memory state → persist synchronously → only after persist succeeds, return success to caller. On persist failure, roll back the in-memory mutation and return an error. The caller's acknowledgment implies durable commit.
+Implementation-level protocol: mutate in-memory state → persist synchronously → only after persist succeeds, surface any outbound effect. On persist failure, roll back the in-memory mutation and return an error. The caller's acknowledgment implies durable commit.
 
-### 17.8.3 Snapshot Schema Versioning
+### 17.15.3 Snapshot Schema Versioning
 
-Every context snapshot carries a schema version identifier. The loader refuses snapshots older than the current runtime's supported minimum and returns a versioned-load error. No in-place migration; snapshots are rewritten with the current version on next persist. Pre-1.0 posture — no deployed state needs to survive schema evolution.
+Every context snapshot carries a schema version identifier. Behavior on mismatch:
 
-## 17.9 Saga Journal
+- **Older than the current runtime's supported minimum:** loader refuses and returns a versioned-load error. No in-place migration; snapshots are rewritten with the current version on next persist.
+- **Newer than the current runtime understands** (e.g., a runtime downgrade): loader refuses with the same versioned-load error. Silent data loss or partial reads are forbidden.
+
+Pre-1.0 posture: no deployed state needs to survive schema evolution; neither direction produces a migration path.
+
+## 17.16 Saga Journal
 
 The cross-context saga coordinator (§5.15.4) writes phase transitions to a durable journal, separate from per-context snapshots. The journal is the coordinator's authoritative record across process restarts; per-context saga-state is the participant's authoritative record for evidence content.
 
-### 17.9.1 Required Operations
+### 17.16.1 Required Operations
 
 The journal surface provides three operations:
 
-- **Append a journal entry.** Synchronous — the operation does not return until the entry is durably persisted (e.g., fsynced, where the backend supports it).
+- **Append a journal entry.** The operation does not return until the entry is durably persisted: any write buffers the backend maintains (OS page cache, application buffer, network replication pipeline) MUST be flushed before the call returns success. Backends that cannot flush durably MUST refuse to be used as a saga journal; construction fails closed. Partial writes MUST be detectable on reload (e.g., length prefix plus checksum).
 - **Load unresolved sagas.** Returns the latest entry per saga identifier for sagas not in a terminal state. Used at process start for crash-recovery replay.
 - **Mark a saga terminally resolved.** For sagas classified as secret-bearing (§9.4.3), the operation MUST synchronously overwrite the on-disk evidence bytes before returning; it does not wait for the backend's next compaction.
 
 Journal entries are append-only per saga identifier. Earlier entries are not rewritten.
 
-### 17.9.2 Secret-Bearing Entries
+### 17.16.2 Secret-Bearing Entries
 
 Saga classification is defined in §9.4.3. Journal implementations MUST enforce the at-rest encryption posture declared by their backing storage: a backend without at-rest encryption MUST refuse to host secret-bearing saga types. Runtime journal construction fails closed against a mismatched backend.
 
-### 17.9.3 Key Namespace
+### 17.16.3 Key Namespace
 
 Journal entries occupy a dedicated key namespace within the persistence backend. The namespace is distinct from context snapshots and from event log storage; backend operations on the journal namespace do not affect the other surfaces.
 
-### 17.9.4 Crash Recovery
+### 17.16.4 Crash Recovery
 
 On process start, the coordinator loads all unresolved sagas. For each:
 
