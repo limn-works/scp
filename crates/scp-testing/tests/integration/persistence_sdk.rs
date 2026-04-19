@@ -178,55 +178,54 @@ async fn context_create_persists_membership_to_sqlite() {
     let alice = DID::from(ALICE_DID);
     let ctx_id = "ctx-persist-create";
 
-    // Phase 1: create + flush.
-    {
-        let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
-        let manager = ContextManager::builder()
-            .crypto(Box::new(
-                scp_core::crypto::mls::provider::MlsCryptoProvider::new(ALICE_DID.to_owned()),
-            ))
-            .storage(storage)
-            .key_resolver(permissive_key_resolver())
-            .build()
-            .unwrap();
-
-        manager.register_local_did(alice.clone()).await;
-        let handle = manager
-            .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
-            .await
-            .expect("context_create must succeed with sqlite-backed persistence");
-        assert_eq!(handle.state().await, ContextState::Active);
-        // Flush snapshots before drop.
-        manager.flush_all_contexts_sync();
-    }
-
-    // Phase 2: reopen same path, inspect the persisted ContextSnapshot.
+    // Phase 1: create context + flush, then directly inspect the
+    // persisted snapshot through the same `ProtocolRepository` the
+    // manager is wired through.
     //
-    // `create_context` → `persist_context_snapshot` → `store_full_snapshot`
-    // writes to `context/{ctx}/full_snapshot`. The per-member
-    // `store_membership` / `load_membership` helpers on `ProtocolRepository`
-    // use a different key (`context/{ctx}/membership/{did}`) and are not
-    // exercised by `ContextManager`'s snapshot path — we assert against
-    // the snapshot.
-    {
-        let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
-        let repo = ProtocolRepository::new(storage);
-        let snapshot = repo
-            .load_full_snapshot(ctx_id)
-            .await
-            .expect("load_full_snapshot must succeed")
-            .expect("ContextSnapshot must be persisted for ctx-persist-create");
-        assert_eq!(snapshot.context_id, ctx_id);
-        assert_eq!(snapshot.state, ContextState::Active);
-        let alice_info = snapshot
-            .membership
-            .get(alice.as_ref())
-            .expect("alice must be in the persisted membership");
-        assert_eq!(
-            alice_info.role_name, "admin",
-            "creator must be persisted with admin role"
-        );
-    }
+    // The per-test SqliteStorage now holds an advisory lock on
+    // `scp.db.lock` (red-hat RED-1003, added in PR #1690 follow-up) to
+    // refuse concurrent opens on the same directory. This invariant
+    // holds across the manager's lifetime, so we can't open a second
+    // `SqliteStorage` in Phase 2 of this test. Instead we keep one
+    // `Arc<SqliteStorage>` alive, pass it to the manager, and read
+    // through it directly once the flush is done.
+    let storage = Arc::new(SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap());
+    let manager = ContextManager::builder()
+        .crypto(Box::new(
+            scp_core::crypto::mls::provider::MlsCryptoProvider::new(ALICE_DID.to_owned()),
+        ))
+        .storage(Arc::clone(&storage))
+        .key_resolver(permissive_key_resolver())
+        .build()
+        .unwrap();
+
+    manager.register_local_did(alice.clone()).await;
+    let handle = manager
+        .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
+        .await
+        .expect("context_create must succeed with sqlite-backed persistence");
+    assert_eq!(handle.state().await, ContextState::Active);
+    manager.flush_all_contexts_sync();
+
+    // Read back via the same storage handle — `ProtocolRepository::new`
+    // wraps `Arc::clone(&storage)` and reads through the same SQLCipher
+    // connection pool. No second advisory lock required.
+    let repo = ProtocolRepository::new(Arc::clone(&storage));
+    let snapshot = repo
+        .load_full_snapshot(ctx_id)
+        .await
+        .expect("load_full_snapshot must succeed")
+        .expect("ContextSnapshot must be persisted for ctx-persist-create");
+    assert_eq!(snapshot.context_id, ctx_id);
+    assert_eq!(snapshot.state, ContextState::Active);
+    let alice_info = snapshot
+        .membership
+        .get(alice.as_ref())
+        .expect("alice must be in the persisted membership");
+    assert_eq!(
+        alice_info.role_name, "admin",
+        "creator must be persisted with admin role"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -262,14 +261,23 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
     let bob = DID::from(BOB_DID);
     let ctx_id = "ctx-persist-lifecycle";
 
+    // The advisory lock on `{tmpdir}/scp.db.lock` (red-hat RED-1003) refuses
+    // concurrent opens on the same directory, so this test — which
+    // originally simulated a cross-process restart via two distinct
+    // `SqliteStorage::new` calls — now keeps one `Arc<SqliteStorage>`
+    // alive across all phases and passes it into both manager instances.
+    // The lock is released only when the last Arc drops, and Phase 3's
+    // manager still needs read access to the persisted snapshot to
+    // exercise `restore_all_contexts`. See PR #1690 review cleanup.
+    let storage = Arc::new(SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap());
+
     // ---- Phase 1: First "process" creates state and flushes. ----
     {
-        let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
         let manager = ContextManager::builder()
             .crypto(Box::new(
                 scp_core::crypto::mls::provider::MlsCryptoProvider::new(ALICE_DID.to_owned()),
             ))
-            .storage(storage)
+            .storage(Arc::clone(&storage))
             .key_resolver(permissive_key_resolver())
             .build()
             .unwrap();
@@ -291,13 +299,12 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         manager.flush_all_contexts_sync();
     }
 
-    // ---- Phase 2: Reopen the same database in a second "process". ----
-    let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
-
-    // Sanity: the persisted snapshot should be readable through
+    // ---- Phase 2: Inspect the persisted snapshot via the same storage. ----
+    //
+    // Sanity: the persisted snapshot must be readable through
     // `ProtocolRepository` without going through `ContextManager` first.
     {
-        let repo = ProtocolRepository::new(storage);
+        let repo = ProtocolRepository::new(Arc::clone(&storage));
         let persisted = repo.load_full_snapshot(ctx_id).await.unwrap();
         assert!(
             persisted.is_some(),
@@ -315,8 +322,7 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
     }
 
     // ---- Phase 3: Build a fresh manager + persistence + call restore. ----
-    let storage2 = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
-    let repo2 = Arc::new(ProtocolRepository::new(storage2));
+    let repo2 = Arc::new(ProtocolRepository::new(Arc::clone(&storage)));
     let persistence = Box::new(ProtocolRepositoryContextBridge::new(Arc::clone(&repo2)));
 
     let manager2 = ContextManager::with_persistence(
