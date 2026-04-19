@@ -200,7 +200,7 @@ def find_declarations() -> list[tuple[str, int, str, list[str]]]:
     out: list[tuple[str, int, str, list[str]]] = []
     if not SCAN_DIR.is_dir():
         return out
-    for root, _dirs, files in os.walk(SCAN_DIR):
+    for root, _, files in os.walk(SCAN_DIR):
         for fname in files:
             if not fname.endswith(".rs"):
                 continue
@@ -245,7 +245,7 @@ def main() -> int:
     fail = False
 
     # (A) Location check: all declarations must live at REQUIRED_PATH.
-    for rel, line, _vis, _derives in decls:
+    for rel, line, _, _ in decls:
         if rel != REQUIRED_PATH:
             sys.stderr.write(
                 f"{C_RED}FAIL{C_RESET}: {rel}:{line}: "
@@ -255,7 +255,7 @@ def main() -> int:
             fail = True
 
     # (B) Visibility check: every declaration must be pub(super).
-    for rel, line, vis, _derives in decls:
+    for rel, line, vis, _ in decls:
         if vis != "pub(super)":
             sys.stderr.write(
                 f"{C_RED}FAIL{C_RESET}: {rel}:{line}: "
@@ -267,7 +267,7 @@ def main() -> int:
             fail = True
 
     # (C) Derive check: no forbidden derives may be present.
-    for rel, line, _vis, derives in decls:
+    for rel, line, _, derives in decls:
         bad = [d for d in derives if d in FORBIDDEN_DERIVES]
         if bad:
             sys.stderr.write(

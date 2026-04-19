@@ -426,7 +426,7 @@ def in_scope_files() -> list[str]:
         src_dir = crates_dir / crate_name / "src"
         if not src_dir.is_dir():
             continue
-        for root, _dirs, files in os.walk(src_dir):
+        for root, _, files in os.walk(src_dir):
             for fname in files:
                 if not fname.endswith(".rs"):
                     continue

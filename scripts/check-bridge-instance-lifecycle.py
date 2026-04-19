@@ -184,7 +184,7 @@ def _types_found_anywhere() -> set[str]:
     for root in BRIDGE_ROOTS:
         if not root.is_dir():
             continue
-        for dirpath, _dirs, files in os.walk(root):
+        for dirpath, _, files in os.walk(root):
             for fname in files:
                 if not fname.endswith(".rs"):
                     continue
@@ -219,7 +219,7 @@ def _trait_methods_with_defaults(trait_name: str) -> set[str]:
     for root in BRIDGE_ROOTS:
         if not root.is_dir():
             continue
-        for dirpath, _dirs, files in os.walk(root):
+        for dirpath, _, files in os.walk(root):
             for fname in files:
                 if not fname.endswith(".rs"):
                     continue
@@ -256,7 +256,7 @@ def find_violations() -> list[tuple[str, int, str, str]]:
     for root in BRIDGE_ROOTS:
         if not root.is_dir():
             continue
-        for dirpath, _dirs, files in os.walk(root):
+        for dirpath, _, files in os.walk(root):
             for fname in files:
                 if not fname.endswith(".rs"):
                     continue
