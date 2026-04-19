@@ -142,7 +142,7 @@ impl ProtocolRepoVariant {
 /// [`NapiBridgeInstance::with_persistence_napi`] /
 /// [`NapiBridgeInstance::with_storage_napi`]. Each `#[napi] Scp` owns an
 /// `Arc<NapiBridgeInstance>` exclusively — there is no process-global
-/// default bridge (the legacy `DEFAULT_BRIDGE_INSTANCE` was deleted in
+/// default bridge (the legacy the legacy default bridge was deleted in
 /// Phase D, #1695).
 ///
 /// Implements [`BridgeInstanceCore`] so shared helpers can operate on
@@ -492,7 +492,7 @@ pub type ToolHandler =
 /// # Ratchet justification
 ///
 /// The #1549 Phase 4 PR 2 plan explicitly retains `SHARED_DHT_CLIENT` alongside
-/// `DEFAULT_BRIDGE_INSTANCE`, `RUNTIME`, `HANDLE_COUNT`, and `INSTANCE_ID_COUNTER`
+/// the legacy default bridge, `RUNTIME`, `HANDLE_COUNT`, and `INSTANCE_ID_COUNTER`
 /// in the enforcement allowlist. See `scripts/check-no-bridge-globals.sh`.
 ///
 /// See issue #1144 (UCAN validation tests require shared DHT state).
@@ -583,13 +583,10 @@ pub fn context_manager(bi: &NapiBridgeInstance) -> napi::Result<&Arc<ContextMana
 }
 
 // ---------------------------------------------------------------------------
-// Phase D (#1695): DEFAULT_BRIDGE_INSTANCE static and the default-lookup
-// helpers (`default_bridge_instance`, `default_bridge_instance_raw`,
-// `bridge_instance`, `bridge_instance_for_affinity`, `ensure_bridge_instance`,
-// `default_instance_id`, `check_handle_affinity`, and
-// `attach_context_manager_to_bridge`) have been deleted. Every FFI entry
-// point routes through an explicit `&NapiBridgeInstance` — typically
-// `&*self.inner` inside a `#[napi] impl Scp` block. Tests construct fresh
+// Phase D (#1695): the legacy process-global default bridge static and its
+// lookup helpers have been deleted. Every FFI entry point routes through
+// an explicit `&NapiBridgeInstance` — typically `&*self.inner` inside a
+// `#[napi] impl Scp` block. Tests construct fresh
 // `NapiBridgeInstance::new_napi()` instances directly.
 // ---------------------------------------------------------------------------
 
@@ -860,7 +857,7 @@ fn event_log_provider_from_existing_repo(
 // `bridge_lifecycle_serial` (and its backing `BRIDGE_LIFECYCLE_SERIAL`
 // `OnceLock`) were deleted in #1549 Phase 4 PR 2 commit 11. They existed
 // solely to serialize the `scp_suspend_resume_roundtrip` test — which
-// mutated the process-global `DEFAULT_BRIDGE_INSTANCE::suspended` flag —
+// mutated the process-global the legacy default suspended flag flag —
 // against every other test that touched shared bridge state. The
 // roundtrip test has been rewritten to use a caller-owned `Scp::new()`
 // instance (see `scp_class_suspend_resume_roundtrip` in `lib.rs`), so the
@@ -1584,8 +1581,8 @@ impl ContextPersistence for ArcContextPersistence {
 // Economy state registries
 // ---------------------------------------------------------------------------
 
-// Economy state is now owned by BridgeInstance. Callers access it via
-// `bridge_instance()?.with_economy_budget(...)` etc. directly.
+// Economy state is owned by NapiBridgeInstance. Callers access it via
+// `bi.core.with_economy_budget(...)` etc. on an explicit bridge.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1706,8 +1703,8 @@ mod tests {
         );
     }
 
-    // Phase D (#1695): `test_default_instance_is_same_arc` deleted —
-    // DEFAULT_BRIDGE_INSTANCE no longer exists. Each caller owns its own
+    // Phase D (#1695): `test_default_instance_is_same_arc` deleted — the
+    // legacy default bridge no longer exists. Each caller owns its own
     // `NapiBridgeInstance` and `Scp::new()` verifies uniqueness via
     // `test_napi_bridge_instance_unique_ids` above.
 }

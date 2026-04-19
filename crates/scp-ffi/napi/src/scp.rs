@@ -7,7 +7,7 @@
 //! PR 1 introduces the type and its constructors plus the lifecycle
 //! methods. Later PRs migrate the free-function façade onto methods on
 //! this class; until then free functions continue to operate on the
-//! default instance (`DEFAULT_BRIDGE_INSTANCE` in [`crate::runtime`]).
+//! default instance (the legacy default bridge in [`crate::runtime`]).
 //!
 //! See #1549 Phase 4 remainder plan (PR 1).
 
@@ -280,7 +280,7 @@ impl Scp {
     // functions are retained until the demolition slice deletes them; both
     // paths continue to share the per-bridge `NapiBridgeInstance` state —
     // method callers use their own `SCP`'s instance while free-function
-    // callers use `DEFAULT_BRIDGE_INSTANCE`.
+    // callers use the legacy default bridge.
     // ====================================================================
 
     /// Per-instance equivalent of the free-function `identity_create`.

@@ -3978,7 +3978,7 @@ mod tests {
     // Round 3 extension: the flag also had a leak on *synchronous* error
     // paths in `context_subscribe` between `swap(true)` and the
     // `tokio::spawn(...)` — if `validate_did(...)?` or
-    // `bridge_instance()?` errored, the flag stayed `true`. The fix is
+    // the legacy bridge accessor errored, the flag stayed `true`. The fix is
     // an outer `ActiveFlagGuard` covering the sync critical section,
     // disarmed immediately before spawn so the spawned task's inner
     // guard owns the reset thereafter. These tests exercise the
@@ -4081,7 +4081,7 @@ mod tests {
     }
 
     /// Regression (round 3 bug-catcher): suspend the bridge, then drive
-    /// the pre-spawn section of `context_subscribe`. `bridge_instance()?`
+    /// the pre-spawn section of `context_subscribe`. the legacy bridge accessor
     /// errors on suspend; before the outer-guard fix the flag leaked. The
     /// flag must reset so the caller can `resume()` and retry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4093,7 +4093,7 @@ mod tests {
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Mirror the production swap + outer-guard sequence. The
-        // suspended-bridge error path is the `bridge_instance()?` call,
+        // suspended-bridge error path is the the legacy bridge accessor call,
         // which we simulate here with an early `?` that triggers after
         // `outer_guard` has been armed.
         let swapped = flag.swap(true, Ordering::SeqCst);
@@ -4101,7 +4101,7 @@ mod tests {
 
         let result: Result<(), &'static str> = (|| {
             let _outer_guard = super::ActiveFlagGuard(Some(std::sync::Arc::clone(&flag)));
-            // `bridge_instance()?` returns Err on suspend — represented here.
+            // the legacy bridge accessor returns Err on suspend — represented here.
             Err("bridge is suspended — call resume() before performing operations")?;
             Ok(())
         })();
@@ -4109,8 +4109,8 @@ mod tests {
         assert!(result.is_err(), "suspend path should error");
         assert!(
             !flag.load(Ordering::SeqCst),
-            "subscription_active must reset when bridge_instance()? fails \
-             under suspend — otherwise the caller cannot retry after resume()"
+            "subscription_active must reset when the bridge suspension \
+             check fails — otherwise the caller cannot retry after resume()"
         );
     }
 

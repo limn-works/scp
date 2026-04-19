@@ -323,11 +323,11 @@ mod tests {
     //
     // Since #1549 Phase 4 PR 2 commit 11 the roundtrip exercises a fresh
     // `Scp::new()` instance rather than the free `scp_suspend` / `scp_resume`
-    // functions that mutate the process-global `DEFAULT_BRIDGE_INSTANCE`.
+    // functions that mutate the process-global the legacy default bridge.
     // That design eliminates the need for the old
     // `bridge_lifecycle_serial()` async mutex that previously had to guard
     // EVERY test in this binary that called `context_manager()` /
-    // `bridge_instance()`.
+    // the legacy bridge accessor.
     //
     // Construction pattern:
     //
@@ -338,7 +338,7 @@ mod tests {
     // Each `Scp` owns an isolated `Arc<NapiBridgeInstance>`. Two tests
     // running in parallel — even two roundtrips — cannot observe each
     // other's `suspended` flag. Other tests in the binary continue to use
-    // `DEFAULT_BRIDGE_INSTANCE` via `init_context_manager_for_test()`, and
+    // the legacy default bridge via `init_context_manager_for_test()`, and
     // because this test never touches the default they cannot race.
     // -----------------------------------------------------------------------
 
@@ -377,7 +377,7 @@ mod tests {
         scp.resume().await.expect("double resume must succeed");
         assert!(!scp.inner.core.is_suspended());
 
-        // Case 3: Phase D (#1695) — DEFAULT_BRIDGE_INSTANCE deleted, so
+        // Case 3: Phase D (#1695) — the legacy default bridge is gone, so
         // there is no "default instance" to check against. Every caller
         // owns its own NapiBridgeInstance; suspension on one cannot leak
         // into another by construction.

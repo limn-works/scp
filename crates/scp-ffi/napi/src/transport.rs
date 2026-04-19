@@ -748,7 +748,7 @@ mod tests {
     //
     // Regression: `get_transport_manager()` ignored the `bi` passed through
     // `context_subscribe_on(bi, ...)` — it always resolved the process-global
-    // `DEFAULT_BRIDGE_INSTANCE`. A subscription spawned against a non-default
+    // the legacy default bridge. A subscription spawned against a non-default
     // `bi` therefore pulled the default bridge's transport manager, leaking
     // into the wrong JoinSet and breaking multi-instance relay isolation.
     //
