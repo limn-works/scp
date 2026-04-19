@@ -38,8 +38,6 @@ use scp_ffi_uniffi::{
     // Free functions — provenance
     evaluate_provenance_quality,
     provenance_check_chain_depth,
-    // Free functions — shutdown
-    scp_shutdown,
     // Free functions — sync
     sync_classify_offline,
     sync_classify_offline_custom,
@@ -927,14 +925,12 @@ async fn register_and_check_local_did() {
 // Shutdown ordering
 // ---------------------------------------------------------------------------
 
-// scp_shutdown is async; integration tests must use multi-threaded tokio
-// runtime because the eventual shutdown path relies on `block_in_place`.
-// We only call `scp_shutdown(0)` to avoid permanently tearing down the
-// shared default UniffiBridgeInstance while other concurrent tests still
-// depend on it.
+// Phase D (#1695): `scp_shutdown` free function deleted. Per-instance
+// shutdown now goes through `SCP.shutdown(timeout_millis)`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scp_shutdown_zero_timeout_returns_immediately() {
-    let _ = scp_shutdown(0).await;
+    let scp = scp_ffi_uniffi::Scp::new();
+    scp.shutdown(0).await.expect("shutdown(0) must succeed");
 }
 
 // ---------------------------------------------------------------------------

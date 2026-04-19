@@ -30,10 +30,8 @@ use scp_ffi_uniffi::Scp;
 /// `Scp` instance through `Scp::default_instance().suspend()` / `.resume()`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scp_suspend_resume_roundtrip() {
-    // `default_instance` materialises the process-wide
-    // `DEFAULT_BRIDGE_INSTANCE` on first call. Every subsequent call
-    // returns the same underlying `Arc<UniffiBridgeInstance>`.
-    let scp = Scp::default_instance().expect("default Scp instance");
+    // Phase D (#1695): `Scp::default_instance` deleted — use `Scp::new()`.
+    let scp = Scp::new();
 
     // Case 1: suspend/resume on a freshly-initialised instance.
     scp.suspend().expect("scp.suspend must succeed");

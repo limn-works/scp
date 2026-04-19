@@ -13701,8 +13701,8 @@ mod tests {
     }
 
     fn test_handle() -> Arc<ContextHandle> {
-        crate::runtime::ensure_bridge_instance();
-        let instance_id = crate::runtime::default_instance_id().unwrap_or(0);
+        // Phase D (#1695): no default instance id; tests use UNSET_INSTANCE_ID.
+        let instance_id = scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID;
         Arc::new(ContextHandle {
             context_id: "ctx-test".to_owned(),
             state: tokio::sync::Mutex::new(ContextState::Active),
@@ -13722,8 +13722,8 @@ mod tests {
     }
 
     fn test_identity() -> Arc<Identity> {
-        crate::runtime::ensure_bridge_instance();
-        let instance_id = crate::runtime::default_instance_id().unwrap_or(0);
+        // Phase D (#1695): no default instance id; tests use UNSET_INSTANCE_ID.
+        let instance_id = scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID;
         Arc::new(Identity {
             did: "did:dht:z6MkTestUser".to_owned(),
             custody_type: CustodyMethod::InMemory,
@@ -13765,7 +13765,7 @@ mod tests {
     #[test]
     fn set_economic_policy_always_rejects_requires_governance() {
         // Use the default SCP instance so the handle's instance_id matches.
-        let scp = crate::scp::Scp::default_instance().expect("default instance");
+        let scp = crate::scp::Scp::new();
         let handle = test_handle();
 
         // Initially None.

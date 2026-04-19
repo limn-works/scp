@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::bridge::ScpError;
-use crate::runtime::{StorageConfig, UniffiBridgeInstance, default_bridge_instance};
+use crate::runtime::{StorageConfig, UniffiBridgeInstance};
 use crate::{decrement_handle_count, increment_handle_count};
 
 /// The SCP instance — a caller-owned handle that wraps a
@@ -94,23 +94,6 @@ impl Scp {
         Arc::new(Self {
             inner: Arc::new(UniffiBridgeInstance::new_uniffi()),
         })
-    }
-
-    /// Returns an `SCP` wrapping the process-wide default instance.
-    ///
-    /// Multiple calls return distinct `SCP` objects, but each wraps the
-    /// same underlying `Arc<UniffiBridgeInstance>` — their `instance_id`s
-    /// match, and changes made through one are visible to the other.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ScpError::Context` if the default instance is currently
-    /// suspended or permanently shut down.
-    #[uniffi::constructor]
-    pub fn default_instance() -> Result<Arc<Self>, ScpError> {
-        let inner = default_bridge_instance()?;
-        increment_handle_count();
-        Ok(Arc::new(Self { inner }))
     }
 
     /// Returns the monotonic identifier for this instance.

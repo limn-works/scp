@@ -295,44 +295,8 @@ pub(crate) fn decrement_handle_count() {
 /// // Call before application exit:
 /// try await scpShutdown(timeoutMillis: 5_000)
 /// ```
-#[uniffi::export(async_runtime = "tokio")]
-pub async fn scp_shutdown(timeout_millis: u64) -> Result<(), bridge::ScpError> {
-    // Shut down the default UniffiBridgeInstance first (clears registries,
-    // runs hooks, disconnects transport). Best-effort: if the instance was
-    // never initialized or is already shut down, this is treated as a
-    // harmless lifecycle observation.
-    //
-    // Skip in test builds: shutdown permanently poisons the OnceLock-based
-    // default instance, destroying contexts from concurrently-running tests.
-    #[cfg(not(test))]
-    {
-        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
-        if let Some(bi) = runtime::default_bridge_instance_raw() {
-            match bi
-                .shutdown(std::time::Duration::from_millis(timeout_millis))
-                .await
-            {
-                Ok(_) => {}
-                // AlreadyShutDown is idempotent at the public surface.
-                Err(_already) => {}
-            }
-        }
-    }
-
-    if timeout_millis > 0 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_millis);
-        while HANDLE_COUNT.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
-            // Yield via the tokio timer — `std::thread::sleep` would park
-            // the current tokio worker and freeze the bridge (mobile apps
-            // that call this from the main runtime would appear frozen).
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-    // The tokio runtime (`RUNTIME`) is a static and will be dropped on
-    // process exit. This function ensures language-side cleanup completes
-    // before that point.
-    Ok(())
-}
+// Phase D (#1695): `scp_shutdown` free function deleted. Callers must use
+// `SCP.shutdown(timeout_millis)` on their per-instance handle.
 
 /// Returns a handle to the shared tokio runtime, initializing it on first call.
 ///
@@ -920,15 +884,10 @@ mod tests {
         );
     }
 
-    /// Verifies that `scp_shutdown(0)` returns immediately (no waiting).
-    #[test]
-    fn scp_shutdown_zero_timeout_returns_immediately() {
-        // Should return without hanging even if handles are live.
-        let rt = runtime();
-        rt.block_on(async {
-            let _ = scp_shutdown(0).await;
-        });
-    }
+    // Phase D (#1695): `scp_shutdown` free function deleted; the zero-timeout
+    // fast-path test no longer applies. SCP instances are shut down via
+    // `SCP.shutdown(timeout_millis)` and tests for that path live in the
+    // per-instance lifecycle tests.
 
     // -----------------------------------------------------------------------
     // Cross-platform pseudonym derivation (SCP-214 criterion 16)
