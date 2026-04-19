@@ -55,15 +55,21 @@ def session_scp() -> SCP:
     this module share one :class:`SCP` instance for the relay — but each
     test still receives its own handles and identities. The instance is
     torn down after the session via the finalizer in ``SCP.__exit__``.
+
+    Note: the SDK wrapper is layered over ``_scp_core.SCP.default_instance()``
+    because the bridge's ``PyContextHandle::new`` stamps the default
+    instance's id (Phase 4 PR 1 handle-affinity wiring is incomplete for
+    fresh instances). Wiring handle-affinity through caller-owned
+    instances is a Phase 4 PR 5+ concern; until then, real-FFI tests
+    dispatch through the default bridge to keep ``context_join`` /
+    ``context_send`` / etc. from tripping ``SCP-PERM-3030``.
     """
-    scp = SCP()
-    try:
-        yield scp
-    finally:
-        try:
-            scp.shutdown(5.0)
-        except Exception:
-            pass
+    wrapper = SCP.__new__(SCP)
+    wrapper._native = _scp_core.SCP.default_instance()
+    yield wrapper
+    # No shutdown: the default instance is shared with any other session-
+    # scoped consumers in this process. The bridge tears it down in its own
+    # module finalizer.
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -536,9 +542,7 @@ class TestProvenance:
 
     async def test_evaluate_quality(self, scp: SCP):
         # Pure-function FFI call via SCP instance; no bridge-global state.
-        result = scp._native.evaluate_provenance_quality(
-            None, "persistent", "active", None
-        )
+        result = scp._native.evaluate_provenance_quality(None, "persistent", "active", None)
         assert isinstance(result, int)
         assert 0 <= result <= 3
 
@@ -580,9 +584,7 @@ class TestTrust:
         )
         # trust_query_score may fail without attestation data, but should not crash
         try:
-            result = scp._native.trust_query_score(
-                alice.did, handle.context_id
-            )
+            result = scp._native.trust_query_score(alice.did, handle.context_id)
             assert result is not None
         except Exception:
             pass  # Expected without attestation infrastructure

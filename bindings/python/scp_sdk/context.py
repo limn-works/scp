@@ -1158,9 +1158,7 @@ class Context:
 
     # -- Broadcast operations -----------------------------------------------
 
-    async def broadcast_subscribe(
-        self, subscriber_did: str
-    ) -> None:
+    async def broadcast_subscribe(self, subscriber_did: str) -> None:
         """Subscribe a DID to this broadcast context.
 
         For open broadcast contexts, any DID can subscribe. For gated

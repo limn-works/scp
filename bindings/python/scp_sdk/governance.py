@@ -235,9 +235,7 @@ async def approve_governance_proposal(
     """
     native = scp._native
     did = identity_did or context._creator_did
-    return await asyncio.to_thread(
-        native.governance_approve, context._handle, did, proposal_id_hex
-    )
+    return await asyncio.to_thread(native.governance_approve, context._handle, did, proposal_id_hex)
 
 
 async def reject_governance_proposal(
@@ -263,9 +261,7 @@ async def reject_governance_proposal(
     """
     native = scp._native
     did = identity_did or context._creator_did
-    return await asyncio.to_thread(
-        native.governance_reject, context._handle, did, proposal_id_hex
-    )
+    return await asyncio.to_thread(native.governance_reject, context._handle, did, proposal_id_hex)
 
 
 async def withdraw_governance_vote(
@@ -318,9 +314,7 @@ async def get_governance_proposal(
         RuntimeError: If the proposal is not found (SCP-CTX-2045).
     """
     native = scp._native
-    return await asyncio.to_thread(
-        native.governance_get_proposal, context._handle, proposal_id_hex
-    )
+    return await asyncio.to_thread(native.governance_get_proposal, context._handle, proposal_id_hex)
 
 
 async def list_governance_proposals(scp: SCP, context: Context) -> str:

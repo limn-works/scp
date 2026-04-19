@@ -348,9 +348,7 @@ class Identity:
             )
         return await asyncio.to_thread(native.identity_attest_device, self.did)
 
-    async def verify_device_attestation(
-        self, scp: SCP, token_base64: str
-    ) -> bool:
+    async def verify_device_attestation(self, scp: SCP, token_base64: str) -> bool:
         """Verify a device attestation token.
 
         Args:
@@ -547,9 +545,7 @@ class Identity:
         data = json.loads(result_json)
         return IdentityAttestation._from_dict(data)
 
-    async def list_attestations(
-        self, scp: SCP
-    ) -> list[IdentityAttestation]:
+    async def list_attestations(self, scp: SCP) -> list[IdentityAttestation]:
         """List all identity link attestations for this identity (async).
 
         Args:
@@ -577,9 +573,7 @@ class Identity:
         items = json.loads(result_json)
         return [IdentityAttestation._from_dict(item) for item in items]
 
-    async def remove_attestation(
-        self, scp: SCP, attestation_id: str
-    ) -> bool:
+    async def remove_attestation(self, scp: SCP, attestation_id: str) -> bool:
         """Remove an identity link attestation by ID.
 
         Revokes and removes the attestation from this identity's

@@ -26,13 +26,14 @@ import pytest
 # ---------------------------------------------------------------------------
 
 try:
-    from scp_sdk import _scp_core  # noqa: F401
+    from scp_sdk import _scp_core
 except (ImportError, AttributeError):
     pytest.skip(
         "Native _scp_core extension not available — run maturin develop first",
         allow_module_level=True,
     )
 
+from scp_sdk import SCP
 from scp_sdk.auth import (
     ScpIdChallenge,
     ScpIdResponse,
@@ -45,6 +46,24 @@ from scp_sdk.sync import run_sync
 from scp_sdk.types import CustodyType
 
 # ---------------------------------------------------------------------------
+# SCP fixture — overrides conftest to share the default bridge instance
+# ---------------------------------------------------------------------------
+#
+# scpid_sign dispatches on the identity's DID via the bridge's identity
+# registry; identities created via ``Identity.create*`` register into
+# that same shared registry. Until caller-owned instances fully carry
+# handle-affinity (Phase 4 PR 5+), tests wire through
+# ``_scp_core.SCP.default_instance()``.
+
+
+@pytest.fixture
+def scp() -> SCP:
+    wrapper = SCP.__new__(SCP)
+    wrapper._native = _scp_core.SCP.default_instance()
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
 # Challenge generation
 # ---------------------------------------------------------------------------
 
@@ -52,8 +71,8 @@ from scp_sdk.types import CustodyType
 class TestScpIdChallenge:
     """Tests for SCPID challenge generation."""
 
-    def test_challenge_returns_valid_structure(self) -> None:
-        challenge = scpid_challenge("https://example.com", 60)
+    def test_challenge_returns_valid_structure(self, scp: SCP) -> None:
+        challenge = scpid_challenge(scp, "https://example.com", 60)
         assert isinstance(challenge, ScpIdChallenge)
         assert challenge.protocol == "scpid/1.0"
         assert challenge.audience == "https://example.com"
@@ -63,12 +82,12 @@ class TestScpIdChallenge:
         assert isinstance(challenge.expires_at, int)
         assert challenge.expires_at > challenge.issued_at
 
-    def test_challenge_default_ttl(self) -> None:
-        challenge = scpid_challenge("https://example.com")
+    def test_challenge_default_ttl(self, scp: SCP) -> None:
+        challenge = scpid_challenge(scp, "https://example.com")
         assert isinstance(challenge, ScpIdChallenge)
 
-    def test_challenge_json_roundtrip(self) -> None:
-        challenge = scpid_challenge("https://example.com", 120)
+    def test_challenge_json_roundtrip(self, scp: SCP) -> None:
+        challenge = scpid_challenge(scp, "https://example.com", 120)
         raw = challenge.to_json()
         restored = ScpIdChallenge.from_json(raw)
         assert restored.protocol == challenge.protocol
@@ -77,17 +96,17 @@ class TestScpIdChallenge:
         assert restored.issued_at == challenge.issued_at
         assert restored.expires_at == challenge.expires_at
 
-    def test_challenge_rejects_zero_ttl(self) -> None:
+    def test_challenge_rejects_zero_ttl(self, scp: SCP) -> None:
         with pytest.raises(Exception):
-            scpid_challenge("https://example.com", 0)
+            scpid_challenge(scp, "https://example.com", 0)
 
-    def test_challenge_rejects_excessive_ttl(self) -> None:
+    def test_challenge_rejects_excessive_ttl(self, scp: SCP) -> None:
         with pytest.raises(Exception):
-            scpid_challenge("https://example.com", 301)
+            scpid_challenge(scp, "https://example.com", 301)
 
-    def test_challenge_rejects_empty_audience(self) -> None:
+    def test_challenge_rejects_empty_audience(self, scp: SCP) -> None:
         with pytest.raises(Exception):
-            scpid_challenge("", 60)
+            scpid_challenge(scp, "", 60)
 
 
 # ---------------------------------------------------------------------------
@@ -98,11 +117,11 @@ class TestScpIdChallenge:
 class TestScpIdSign:
     """Tests for SCPID challenge signing."""
 
-    def test_sign_with_active_key(self) -> None:
-        identity = Identity.create_sync(CustodyType.IN_MEMORY)
-        challenge = scpid_challenge("https://example.com", 120)
+    def test_sign_with_active_key(self, scp: SCP) -> None:
+        identity = Identity.create_sync(scp, CustodyType.IN_MEMORY)
+        challenge = scpid_challenge(scp, "https://example.com", 120)
 
-        response = scpid_sign(identity, "#active", challenge)
+        response = scpid_sign(scp, identity, "#active", challenge)
         assert isinstance(response, ScpIdResponse)
         assert response.protocol == "scpid/1.0"
         assert response.did == identity.did
@@ -112,26 +131,26 @@ class TestScpIdSign:
         assert isinstance(response.signature, str)
         assert len(response.signature) > 0
 
-    def test_sign_with_agent_key(self) -> None:
-        identity = run_sync(Identity.create_with_agent_key(CustodyType.IN_MEMORY))
-        challenge = scpid_challenge("https://agent-service.example.com", 60)
+    def test_sign_with_agent_key(self, scp: SCP) -> None:
+        identity = run_sync(Identity.create_with_agent_key(scp, CustodyType.IN_MEMORY))
+        challenge = scpid_challenge(scp, "https://agent-service.example.com", 60)
 
-        response = scpid_sign(identity, "#agent", challenge)
+        response = scpid_sign(scp, identity, "#agent", challenge)
         assert response.did == identity.did
         assert response.signing_key_id == "#agent"
 
-    def test_sign_rejects_invalid_key_id(self) -> None:
-        identity = Identity.create_sync(CustodyType.IN_MEMORY)
-        challenge = scpid_challenge("https://example.com", 60)
+    def test_sign_rejects_invalid_key_id(self, scp: SCP) -> None:
+        identity = Identity.create_sync(scp, CustodyType.IN_MEMORY)
+        challenge = scpid_challenge(scp, "https://example.com", 60)
 
         with pytest.raises(Exception):
-            scpid_sign(identity, "#owner", challenge)
+            scpid_sign(scp, identity, "#owner", challenge)
 
-    def test_response_json_roundtrip(self) -> None:
-        identity = Identity.create_sync(CustodyType.IN_MEMORY)
-        challenge = scpid_challenge("https://example.com", 120)
+    def test_response_json_roundtrip(self, scp: SCP) -> None:
+        identity = Identity.create_sync(scp, CustodyType.IN_MEMORY)
+        challenge = scpid_challenge(scp, "https://example.com", 120)
 
-        response = scpid_sign(identity, "#active", challenge)
+        response = scpid_sign(scp, identity, "#active", challenge)
         raw = response.to_json()
         restored = ScpIdResponse.from_json(raw)
         assert restored.protocol == response.protocol
@@ -159,11 +178,11 @@ class TestScpIdVerify:
     suite validates the full roundtrip with a shared InMemoryDhtClient.
     """
 
-    def test_verify_raises_did_resolution_error(self) -> None:
+    def test_verify_raises_did_resolution_error(self, scp: SCP) -> None:
         """Verify raises IdentityError when the DID is not published to DHT."""
-        identity = Identity.create_sync(CustodyType.IN_MEMORY)
-        challenge = scpid_challenge("https://example.com", 120)
-        response = scpid_sign(identity, "#active", challenge)
+        identity = Identity.create_sync(scp, CustodyType.IN_MEMORY)
+        challenge = scpid_challenge(scp, "https://example.com", 120)
+        response = scpid_sign(scp, identity, "#active", challenge)
 
         with pytest.raises(Exception, match="SCP-IDENT-1033"):
-            scpid_verify(response, challenge)
+            scpid_verify(scp, response, challenge)

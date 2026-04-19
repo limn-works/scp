@@ -64,26 +64,20 @@ class TestAliceToBobEncryptedRoundtrip:
         alice = scp._native.fullstack_create_node("did:dht:z6MkAlicePy")
         bob = scp._native.fullstack_create_node("did:dht:z6MkBobPy")
 
-        ctx_id = scp._native.fullstack_create_context(
-            alice, "py-ctx-alice-bob", CEILING_JSON
-        )
+        ctx_id = scp._native.fullstack_create_context(alice, "py-ctx-alice-bob", CEILING_JSON)
 
         scp._native.fullstack_add_member(alice, ctx_id, bob.did)
         scp._native.fullstack_join_from_welcome(bob, ctx_id)
 
         plaintext = b"Hello from Alice via Python!"
-        ciphertext = scp._native.fullstack_send_message(
-            alice, ctx_id, plaintext
-        )
+        ciphertext = scp._native.fullstack_send_message(alice, ctx_id, plaintext)
 
         # Ciphertext must differ from plaintext.
         assert ciphertext != plaintext
         assert len(ciphertext) > len(plaintext)
 
         # Bob decrypts -- THE A+ ASSERTION
-        decrypted = scp._native.fullstack_decrypt_message(
-            bob, ctx_id, ciphertext, alice.did
-        )
+        decrypted = scp._native.fullstack_decrypt_message(bob, ctx_id, ciphertext, alice.did)
         assert bytes(decrypted) == plaintext
 
 
@@ -94,9 +88,7 @@ class TestBobSendsAliceDecrypts:
         alice = scp._native.fullstack_create_node("did:dht:z6MkAliceBidirPy")
         bob = scp._native.fullstack_create_node("did:dht:z6MkBobBidirPy")
 
-        ctx_id = scp._native.fullstack_create_context(
-            alice, "py-ctx-bidir", CEILING_JSON
-        )
+        ctx_id = scp._native.fullstack_create_context(alice, "py-ctx-bidir", CEILING_JSON)
 
         scp._native.fullstack_add_member(alice, ctx_id, bob.did)
         scp._native.fullstack_join_from_welcome(bob, ctx_id)
@@ -112,9 +104,7 @@ class TestBobSendsAliceDecrypts:
         assert ciphertext != plaintext
 
         # Alice decrypts Bob's message.
-        decrypted = scp._native.fullstack_decrypt_message(
-            alice, ctx_id, ciphertext, bob.did
-        )
+        decrypted = scp._native.fullstack_decrypt_message(alice, ctx_id, ciphertext, bob.did)
         assert bytes(decrypted) == plaintext
 
 
@@ -126,9 +116,7 @@ class TestThreePartyGroup:
         bob = scp._native.fullstack_create_node("did:dht:z6MkBob3Py")
         carol = scp._native.fullstack_create_node("did:dht:z6MkCarol3Py")
 
-        ctx_id = scp._native.fullstack_create_context(
-            alice, "py-ctx-3party", CEILING_JSON
-        )
+        ctx_id = scp._native.fullstack_create_context(alice, "py-ctx-3party", CEILING_JSON)
 
         scp._native.fullstack_add_member(alice, ctx_id, bob.did)
         scp._native.fullstack_join_from_welcome(bob, ctx_id)
@@ -137,13 +125,9 @@ class TestThreePartyGroup:
         scp._native.fullstack_join_from_welcome(carol, ctx_id)
 
         plaintext = b"Hello everyone from Python!"
-        ciphertext = scp._native.fullstack_send_message(
-            alice, ctx_id, plaintext
-        )
+        ciphertext = scp._native.fullstack_send_message(alice, ctx_id, plaintext)
 
-        bob_decrypted = scp._native.fullstack_decrypt_message(
-            bob, ctx_id, ciphertext, alice.did
-        )
+        bob_decrypted = scp._native.fullstack_decrypt_message(bob, ctx_id, ciphertext, alice.did)
         assert bytes(bob_decrypted) == plaintext
 
         carol_decrypted = scp._native.fullstack_decrypt_message(
@@ -159,21 +143,15 @@ class TestMultipleMessagesRoundtrip:
         alice = scp._native.fullstack_create_node("did:dht:z6MkAliceMultiPy")
         bob = scp._native.fullstack_create_node("did:dht:z6MkBobMultiPy")
 
-        ctx_id = scp._native.fullstack_create_context(
-            alice, "py-ctx-multi", CEILING_JSON
-        )
+        ctx_id = scp._native.fullstack_create_context(alice, "py-ctx-multi", CEILING_JSON)
 
         scp._native.fullstack_add_member(alice, ctx_id, bob.did)
         scp._native.fullstack_join_from_welcome(bob, ctx_id)
 
         for i in range(5):
             plaintext = f"Message number {i}".encode()
-            ciphertext = scp._native.fullstack_send_message(
-                alice, ctx_id, plaintext
-            )
-            decrypted = scp._native.fullstack_decrypt_message(
-                bob, ctx_id, ciphertext, alice.did
-            )
+            ciphertext = scp._native.fullstack_send_message(alice, ctx_id, plaintext)
+            decrypted = scp._native.fullstack_decrypt_message(bob, ctx_id, ciphertext, alice.did)
             assert bytes(decrypted) == plaintext, f"message {i} roundtrip failed"
 
 
@@ -184,9 +162,7 @@ class TestRemovedMemberCannotDecrypt:
         alice = scp._native.fullstack_create_node("did:dht:z6MkAliceRemPy")
         bob = scp._native.fullstack_create_node("did:dht:z6MkBobRemPy")
 
-        ctx_id = scp._native.fullstack_create_context(
-            alice, "py-ctx-remove", CEILING_JSON
-        )
+        ctx_id = scp._native.fullstack_create_context(alice, "py-ctx-remove", CEILING_JSON)
 
         scp._native.fullstack_add_member(alice, ctx_id, bob.did)
         scp._native.fullstack_join_from_welcome(bob, ctx_id)
@@ -194,9 +170,7 @@ class TestRemovedMemberCannotDecrypt:
         # Bob can decrypt a pre-removal message.
         pre_msg = b"Before removal"
         pre_ct = scp._native.fullstack_send_message(alice, ctx_id, pre_msg)
-        pre_dec = scp._native.fullstack_decrypt_message(
-            bob, ctx_id, pre_ct, alice.did
-        )
+        pre_dec = scp._native.fullstack_decrypt_message(bob, ctx_id, pre_ct, alice.did)
         assert bytes(pre_dec) == pre_msg
 
         # Remove Bob.
@@ -208,9 +182,7 @@ class TestRemovedMemberCannotDecrypt:
 
         # Bob MUST NOT be able to decrypt (MLS forward secrecy).
         with pytest.raises(RuntimeError):
-            scp._native.fullstack_decrypt_message(
-                bob, ctx_id, post_ct, alice.did
-            )
+            scp._native.fullstack_decrypt_message(bob, ctx_id, post_ct, alice.did)
 
 
 class TestCiphertextNonDeterministic:
@@ -220,9 +192,7 @@ class TestCiphertextNonDeterministic:
         alice = scp._native.fullstack_create_node("did:dht:z6MkAliceINDPy")
         bob = scp._native.fullstack_create_node("did:dht:z6MkBobINDPy")
 
-        ctx_id = scp._native.fullstack_create_context(
-            alice, "py-ctx-indcpa", CEILING_JSON
-        )
+        ctx_id = scp._native.fullstack_create_context(alice, "py-ctx-indcpa", CEILING_JSON)
 
         scp._native.fullstack_add_member(alice, ctx_id, bob.did)
         scp._native.fullstack_join_from_welcome(bob, ctx_id)

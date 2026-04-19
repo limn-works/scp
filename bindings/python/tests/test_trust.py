@@ -318,6 +318,7 @@ class TestCapabilityValidationFieldIndependence:
             result = asyncio.run(
                 # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.trust._bridge
                 evaluate_trust(
+                    scp=MagicMock(),
                     subject_did="did:dht:z6MkBob",
                     context_id="ctx-test",
                     capability_tokens=["fake-token"],
@@ -334,6 +335,7 @@ class TestCapabilityValidationFieldIndependence:
             result = asyncio.run(
                 # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.trust._bridge
                 evaluate_trust(
+                    scp=MagicMock(),
                     subject_did="did:dht:z6MkBob",
                     context_id="ctx-test",
                     capability_tokens=["good-token"],
@@ -435,6 +437,7 @@ class TestCapabilityValidationFieldIndependence:
             result = asyncio.run(
                 # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.trust._bridge
                 evaluate_trust(
+                    scp=MagicMock(),
                     subject_did="did:dht:z6MkBob",
                     context_id="ctx-test",
                     capability_tokens=None,
@@ -600,6 +603,7 @@ class TestCapabilityValidationFieldIndependence:
                 asyncio.run(
                     # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.trust._bridge
                     evaluate_trust(
+                        scp=MagicMock(),
                         subject_did="did:dht:z6MkBob",
                         context_id="ctx\x00bad",
                         capability_tokens=["fake-token"],
@@ -938,6 +942,7 @@ class TestAggregateTrustInputFalsy:
         with patch("scp_sdk.trust._bridge", return_value=bridge):
             # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.trust._bridge
             aggregate_trust_input(
+                scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
                 events=[],
@@ -962,6 +967,7 @@ class TestAggregateTrustInputFalsy:
         with patch("scp_sdk.trust._bridge", return_value=bridge):
             # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.trust._bridge
             aggregate_trust_input(
+                scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
                 events=[],
@@ -978,6 +984,7 @@ class TestAggregateTrustInputFalsy:
         with patch("scp_sdk.trust._bridge", return_value=bridge):
             # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.trust._bridge
             aggregate_trust_input(
+                scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
                 events=[],
@@ -994,6 +1001,7 @@ class TestAggregateTrustInputFalsy:
         with patch("scp_sdk.trust._bridge", return_value=bridge):
             # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.trust._bridge
             aggregate_trust_input(
+                scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
                 events=[],
@@ -1010,6 +1018,7 @@ class TestAggregateTrustInputFalsy:
         with patch("scp_sdk.trust._bridge", return_value=bridge):
             # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.trust._bridge
             aggregate_trust_input(
+                scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
                 events=[],
@@ -1026,6 +1035,7 @@ class TestAggregateTrustInputFalsy:
         with patch("scp_sdk.trust._bridge", return_value=bridge):
             # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.trust._bridge
             aggregate_trust_input(
+                scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
                 events=[],
@@ -1046,6 +1056,7 @@ class TestAggregateTrustInputFalsy:
         with patch("scp_sdk.trust._bridge", return_value=bridge):
             # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.trust._bridge
             aggregate_trust_input(
+                scp=MagicMock(),
                 context_id="ctx-1",
                 subject_did="did:dht:zAlice",
                 events=[],

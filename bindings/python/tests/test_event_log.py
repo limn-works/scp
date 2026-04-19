@@ -297,13 +297,13 @@ class TestEventLogInit:
 
 
 class TestEventLogCheckpoint:
-    """Tests for EventLog.checkpoint() -- the SCP-045 root_hash fix."""
+    """Tests for EventLog.checkpoint(MagicMock()) -- the SCP-045 root_hash fix."""
 
     async def test_checkpoint_empty_log_returns_zero_root(self) -> None:
         mock_bridge = _make_bridge_module(events=[])
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-empty")
-            cp = await log.checkpoint()
+            cp = await log.checkpoint(MagicMock())
 
         assert cp.context_id == "ctx-empty"
         assert cp.sequence == 0
@@ -317,7 +317,7 @@ class TestEventLogCheckpoint:
         mock_bridge = _make_bridge_module(events=events)
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-with-events")
-            cp = await log.checkpoint()
+            cp = await log.checkpoint(MagicMock())
 
         assert cp.root_hash == expected_root
         assert cp.event_count == 5
@@ -330,7 +330,7 @@ class TestEventLogCheckpoint:
         mock_bridge = _make_bridge_module(events=events)
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-hex")
-            cp = await log.checkpoint()
+            cp = await log.checkpoint(MagicMock())
 
         assert len(cp.root_hash) == 64
         int(cp.root_hash, 16)
@@ -341,7 +341,7 @@ class TestEventLogCheckpoint:
         before = time.time()
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-ts")
-            cp = await log.checkpoint()
+            cp = await log.checkpoint(MagicMock())
         after = time.time()
 
         assert before <= cp.timestamp <= after
@@ -351,7 +351,7 @@ class TestEventLogCheckpoint:
         mock_bridge = _make_bridge_module(events=events)
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-call-check")
-            await log.checkpoint()
+            await log.checkpoint(MagicMock())
 
         mock_bridge.event_log_query.assert_called_once_with("ctx-call-check", None)
 
@@ -360,7 +360,7 @@ class TestEventLogCheckpoint:
         mock_bridge = _make_bridge_module(events=events)
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-no-root")
-            cp = await log.checkpoint()
+            cp = await log.checkpoint(MagicMock())
 
         assert cp.root_hash == _EMPTY_ROOT_HASH
         assert cp.event_count == 3
@@ -371,7 +371,7 @@ class TestEventLogCheckpoint:
         mock_bridge = _make_bridge_module(events=events)
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-no-count")
-            cp = await log.checkpoint()
+            cp = await log.checkpoint(MagicMock())
 
         assert cp.root_hash == root
         assert cp.event_count == 1
@@ -382,7 +382,7 @@ class TestEventLogCheckpoint:
         mock_bridge = _make_bridge_module(events=events)
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-regression")
-            cp = await log.checkpoint()
+            cp = await log.checkpoint(MagicMock())
 
         assert cp.root_hash != ""
         assert len(cp.root_hash) == 64
@@ -392,7 +392,7 @@ class TestEventLogCheckpoint:
         mock_bridge = _make_bridge_module(events=[])
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-empty-regression")
-            cp = await log.checkpoint()
+            cp = await log.checkpoint(MagicMock())
 
         assert cp.root_hash != ""
         assert cp.root_hash == "0" * 64
@@ -405,14 +405,14 @@ class TestEventLogCheckpoint:
         mock_bridge = _make_bridge_module(events=[])
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-rfc")
-            cp = await log.checkpoint()
+            cp = await log.checkpoint(MagicMock())
 
         expected_empty_root_hex = "00" * 32
         assert cp.root_hash == expected_empty_root_hex
 
 
 class TestEventLogQuery:
-    """Tests for EventLog.query()."""
+    """Tests for EventLog.query(MagicMock())."""
 
     async def test_query_returns_event_list(self) -> None:
         raw_events = [
@@ -428,7 +428,7 @@ class TestEventLogQuery:
         mock_bridge.event_log_query.return_value = raw_events
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-query")
-            events = await log.query()
+            events = await log.query(MagicMock())
 
         assert len(events) == 1
         assert isinstance(events[0], Event)
@@ -440,6 +440,7 @@ class TestEventLogQuery:
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-filter")
             await log.query(
+                MagicMock(),
                 event_type="ToolInvoked",
                 actor="did:dht:z6MkBob",
                 since=1_700_000_000.0,
@@ -455,7 +456,7 @@ class TestEventLogQuery:
         mock_bridge = _make_bridge_module()
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-no-filter")
-            await log.query()
+            await log.query(MagicMock())
 
         mock_bridge.event_log_query.assert_called_once_with("ctx-no-filter", None)
 
@@ -463,19 +464,19 @@ class TestEventLogQuery:
         mock_bridge = _make_bridge_module(events=[])
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-empty-q")
-            events = await log.query()
+            events = await log.query(MagicMock())
 
         assert events == []
 
 
 class TestEventLogVerify:
-    """Tests for EventLog.verify()."""
+    """Tests for EventLog.verify(MagicMock())."""
 
     async def test_verify_returns_proof(self) -> None:
         mock_bridge = _make_bridge_module()
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-verify")
-            proof = await log.verify({"type": "inclusion", "leaf_index": 0})
+            proof = await log.verify(MagicMock(), {"type": "inclusion", "leaf_index": 0})
 
         assert isinstance(proof, Proof)
         assert proof.verified is True
@@ -486,7 +487,7 @@ class TestEventLogVerify:
         with patch.dict(sys.modules, {"_scp_core": mock_bridge}):
             log = EventLog(context_id="ctx-claim")
             claim = {"type": "absence", "event_hash": "ff" * 32}
-            await log.verify(claim)
+            await log.verify(MagicMock(), claim)
 
         mock_bridge.event_log_verify.assert_called_once_with("ctx-claim", claim)
 

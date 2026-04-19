@@ -261,12 +261,11 @@ class _MockIdentity:
         self.did = did
 
 
-class _MockSCP:
-    """Test double for :class:`_scp_core.SCP` — lets us observe calls to
-    ``node_start_in_memory`` / ``node_start_local`` without monkey-patching
-    the real (frozen) PyScp class. Migration PR 4 (#1549) added an explicit
-    ``scp: SCP | None`` parameter to every SDK function precisely so tests
-    can inject a stand-in like this.
+class _MockNative:
+    """Test double for the raw bridge (exposed as ``SCP._native``).
+
+    Lets us observe calls to ``node_start_in_memory`` / ``node_start_local``
+    without monkey-patching the real (frozen) PyScp class.
     """
 
     def __init__(self) -> None:
@@ -287,13 +286,24 @@ class _MockSCP:
         return _MockNodeHandle()
 
 
+class _MockSCP:
+    """SDK-wrapper-shaped stand-in: exposes ``_native`` with the mock bridge.
+
+    After #1549 Phase 4 PR 4, every SDK function dispatches on ``scp._native``,
+    so tests pass a stand-in with the attribute wired to a _MockNative.
+    """
+
+    def __init__(self) -> None:
+        self._native = _MockNative()
+
+
 @pytest.mark.asyncio
 async def test_start_in_memory_without_identity() -> None:
     """start_in_memory() without identity calls bridge with None."""
     scp = _MockSCP()
-    node = await Node.start_in_memory(scp=scp)  # type: ignore[arg-type]
+    node = await Node.start_in_memory(scp)  # type: ignore[arg-type]
     assert isinstance(node, Node)
-    assert scp.in_memory_calls == [(None,)]
+    assert scp._native.in_memory_calls == [(None,)]
 
 
 @pytest.mark.asyncio
@@ -301,18 +311,18 @@ async def test_start_in_memory_with_identity() -> None:
     """start_in_memory(identity) passes identity.did to bridge."""
     scp = _MockSCP()
     identity = _MockIdentity("did:dht:z6MkPortable")
-    node = await Node.start_in_memory(identity=identity, scp=scp)  # type: ignore[arg-type]
+    node = await Node.start_in_memory(scp, identity=identity)  # type: ignore[arg-type]
     assert isinstance(node, Node)
-    assert scp.in_memory_calls == [("did:dht:z6MkPortable",)]
+    assert scp._native.in_memory_calls == [("did:dht:z6MkPortable",)]
 
 
 @pytest.mark.asyncio
 async def test_start_local_without_identity() -> None:
     """start_local(dir) without identity calls bridge with None."""
     scp = _MockSCP()
-    node = await Node.start_local("/tmp/test-dir", scp=scp)  # type: ignore[arg-type]
+    node = await Node.start_local(scp, "/tmp/test-dir")  # type: ignore[arg-type]
     assert isinstance(node, Node)
-    assert scp.local_calls == [("/tmp/test-dir", None, None)]
+    assert scp._native.local_calls == [("/tmp/test-dir", None, None)]
 
 
 @pytest.mark.asyncio
@@ -320,18 +330,18 @@ async def test_start_local_with_identity() -> None:
     """start_local(dir, identity) passes identity.did to bridge."""
     scp = _MockSCP()
     identity = _MockIdentity("did:dht:z6MkPersist")
-    node = await Node.start_local("/tmp/test-dir", identity=identity, scp=scp)  # type: ignore[arg-type]
+    node = await Node.start_local(scp, "/tmp/test-dir", identity=identity)  # type: ignore[arg-type]
     assert isinstance(node, Node)
-    assert scp.local_calls == [("/tmp/test-dir", "did:dht:z6MkPersist", None)]
+    assert scp._native.local_calls == [("/tmp/test-dir", "did:dht:z6MkPersist", None)]
 
 
 @pytest.mark.asyncio
 async def test_start_local_with_passphrase() -> None:
     """start_local(dir, passphrase=...) passes passphrase to bridge."""
     scp = _MockSCP()
-    node = await Node.start_local("/tmp/test-dir", passphrase="my-secret", scp=scp)  # type: ignore[arg-type]
+    node = await Node.start_local(scp, "/tmp/test-dir", passphrase="my-secret")  # type: ignore[arg-type]
     assert isinstance(node, Node)
-    assert scp.local_calls == [("/tmp/test-dir", None, "my-secret")]
+    assert scp._native.local_calls == [("/tmp/test-dir", None, "my-secret")]
 
 
 # ---------------------------------------------------------------------------

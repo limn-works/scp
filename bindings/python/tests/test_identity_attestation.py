@@ -190,6 +190,8 @@ class TestIdentityRenewAttestation:
     """Tests for Identity.renew_attestation when bridge is unavailable."""
 
     def test_raises_when_bridge_missing(self) -> None:
+        from unittest.mock import MagicMock
+
         att = IdentityAttestation(
             id="abc123",
             platform="github.com",
@@ -198,8 +200,13 @@ class TestIdentityRenewAttestation:
             verified_at=1700000000,
         )
         identity = _make_identity()
+        # Build a mock SCP whose _native omits identity_renew_attestation so
+        # the SDK's hasattr() guard fires with SCP-ATTEST-9013.
+        mock_scp = MagicMock()
+        mock_native = MagicMock(spec=[])  # spec=[] → no attributes
+        mock_scp._native = mock_native
         with pytest.raises(IdentityError, match="SCP-ATTEST-9013"):
-            asyncio.get_event_loop().run_until_complete(identity.renew_attestation(att))
+            asyncio.get_event_loop().run_until_complete(identity.renew_attestation(mock_scp, att))
 
 
 class TestIdentityAttestationVerifyRemoved:

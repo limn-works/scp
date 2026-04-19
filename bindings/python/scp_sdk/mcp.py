@@ -593,9 +593,7 @@ class McpClient:
 
     __slots__ = ("_command", "_disconnected", "_handle", "_scp", "_transport")
 
-    def __init__(
-        self, handle: Any, transport: str, command: list[str] | None, scp: SCP
-    ) -> None:
+    def __init__(self, handle: Any, transport: str, command: list[str] | None, scp: SCP) -> None:
         self._handle = handle
         self._transport = transport
         self._command = command

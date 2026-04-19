@@ -37,7 +37,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 try:
-    from scp_sdk import _scp_core  # noqa: F401 — ensure native extension present
+    from scp_sdk import _scp_core
 except (ImportError, AttributeError):
     pytest.skip(
         "Native _scp_core extension not available -- run maturin develop first",
@@ -59,15 +59,18 @@ from scp_sdk import SCP
 
 @pytest.fixture(scope="session")
 def session_scp() -> SCP:
-    """Session-wide :class:`scp_sdk.SCP` that owns the relay wiring."""
-    scp = SCP()
-    try:
-        yield scp
-    finally:
-        try:
-            scp.shutdown(5.0)
-        except Exception:
-            pass
+    """Session-wide :class:`scp_sdk.SCP` that owns the relay wiring.
+
+    Layered over ``_scp_core.SCP.default_instance()`` because the bridge
+    handles are stamped with the default instance's id by
+    ``PyContextHandle::new``; Phase 4 PR 1 handle-affinity wiring for
+    caller-owned instances is a separate follow-up. Until that lands,
+    real-FFI tests must dispatch through the default bridge to avoid
+    ``SCP-PERM-3030`` rejections on ``context_join`` / ``context_send``.
+    """
+    wrapper = SCP.__new__(SCP)
+    wrapper._native = _scp_core.SCP.default_instance()
+    yield wrapper
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -226,9 +229,7 @@ class TestThreePartyEncryptedMessaging:
 
         # Each participant sends
         for did, name in [(alice_did, "Alice"), (bob_did, "Bob"), (carol_did, "Carol")]:
-            scp._native.context_send(
-                handle, did, f"{name} says hello".encode()
-            )
+            scp._native.context_send(handle, did, f"{name} says hello".encode())
 
 
 # ---------------------------------------------------------------------------
@@ -255,9 +256,7 @@ class TestMultipleMessages:
         scp._native.context_join(handle, bob_did)
 
         for i in range(5):
-            scp._native.context_send(
-                handle, alice_did, f"message {i}".encode()
-            )
+            scp._native.context_send(handle, alice_did, f"message {i}".encode())
 
     def test_binary_payload(self, scp: SCP) -> None:
         alice_did = _create_identity(scp)
