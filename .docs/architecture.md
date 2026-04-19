@@ -788,10 +788,10 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 - `append_event` appends a named event. **Cancel-safe:** persists first, commits to in-memory chain only after durable write succeeds. Returns `Err` on persist failure; in-memory chain never advances speculatively. A cancelled `append_event` either completes durably (in-memory advances) or leaves both persisted and in-memory unchanged — never one without the other.
 - `destroy_event_log` is for rollback — idempotent.
 
-**`SagaJournal`** (scp-runtime/context/supervisor) — `Send + Sync`, async methods. See §17.16.
-- `append` — **durable** append-only per saga identifier. Does not return until any write buffer the backend maintains (OS page cache, application buffer, network replication pipeline) has been flushed. Backends that cannot guarantee durable flush MUST refuse to be used as a saga journal; construction fails closed. Partial writes MUST be detectable on reload (e.g., length prefix plus checksum). **Cancel-hostile:** a cancelled `append` leaves an implementation-defined state — either the entry is durable or it is not, but the caller cannot assume which. Callers (the supervisor saga driver) therefore do NOT cancel `append` mid-flight. If cancellation does occur (e.g., process abort), the authoritative post-cancel state is whatever `load_unresolved` returns on the next supervisor startup; callers MUST treat `load_unresolved` as the sole recovery signal and MUST NOT invent their own reconciliation.
-- `load_unresolved` — latest entry per unresolved saga for crash-recovery replay. Cancel-safe.
-- `mark_resolved` — terminal state marker; synchronously overwrites on-disk evidence for secret-bearing sagas (§9.4.3) before returning. **Cancel-hostile for secret-bearing sagas:** callers MUST NOT cancel `mark_resolved` mid-flight for a secret-bearing saga; if cancellation does occur (e.g., process abort), implementations MUST retry the overwrite on the next process start before the journal is opened for normal use, and MUST NOT leave secret bytes on disk. Non-secret-bearing `mark_resolved` is cancel-safe.
+**`SagaJournal`** (scp-runtime/context/supervisor) — `Send + Sync`, async methods. Full contract in §17.16.1 (durability, partial-write detectability, fail-closed construction, secret-bearing overwrite) and §9.4.3 (commitment + bearer discipline).
+- `append` — durable append per saga identifier. Cancel-hostile; `load_unresolved` is the sole post-cancel recovery signal.
+- `load_unresolved` — latest entry per unresolved saga. Cancel-safe.
+- `mark_resolved` — terminal marker; synchronously overwrites on-disk evidence for secret-bearing sagas. Cancel-hostile for secret-bearing sagas (overwrite MUST complete on the next process start before the journal reopens).
 
 **`ColdTierProvider`** (scp-core/event_log) — `Send + Sync`, async methods.
 - Fetches Merkle inclusion proofs for cold-tier events from relay storage.
