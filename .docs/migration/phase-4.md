@@ -396,6 +396,44 @@ Supply a reason that names the specific behavior being exercised. Reviewers
 will reject tags like `SCP-DEFAULT-INSTANCE-OK: legacy` that do not
 identify a concrete test contract.
 
+### Why the current test suite is fully tagged
+
+PR 4 of #1549 landed the gate in a **required** CI slot while the existing
+test suite is fully tagged. That combination is deliberate and load-bearing:
+
+1. The per-test `SCP` fixture is only useful once the free-function façade
+   graduates onto instance methods on the `SCP` class. As of #1549 PR 4,
+   the four FFI bridges expose the deprecated free functions (e.g.
+   `context_create`, `identity_create`) but they do **not** yet have
+   per-instance equivalents on the NAPI / PyO3 / UniFFI `SCP` class. A
+   codemod today would have nothing to migrate onto.
+2. Every call site flagged by the gate at PR-4 merge was audited and falls
+   into one of four legitimate non-migration categories:
+    - **Python `@patch`-mocked bridges** — the test swaps
+      `scp_sdk.trust._bridge` / `scp_sdk.tools._scp_core` /
+      `scp_sdk.ucan._scp_core` with a `MagicMock`, so the default-instance
+      path is never exercised.
+    - **Pure-Python validation paths** — tests that hit `ValidationError`
+      or take the early-return branch in `configure_stdio_allowlist()`
+      before any bridge call.
+    - **Pure-function FFI calls** — `_scp_core.evaluate_provenance_quality`,
+      WASM-bridge utility functions, and other FFI functions that take no
+      `ContextManager` handle and carry no bridge-side state.
+    - **Raw-bridge parity tests** — `real-napi.test.ts`, `e2e-relay.test.ts`,
+      `RealFFITest.kt`, the Swift `executeFn`-injected mocks, and the
+      cross-bridge + WASM equivalents. These tests exist specifically to
+      validate the bridge directly, below the SDK façade; they are not
+      candidates for migration.
+3. **NEW tests that route through the default instance must use the
+   per-test `SCP` fixture**, not inherit the tag. The gate is required so
+   that any new façade call lands unguarded and fails CI. Reviewers reject
+   new tags without category-matching rationale.
+4. Once the SCP class gains instance methods (follow-up work tracked
+   separately), existing tests migrate off the façade one domain at a
+   time. Each migrated test deletes its tag; the gate stays green. Until
+   then the tags document *why* each pre-existing call is not a
+   regression.
+
 ---
 
 ## CI gates
@@ -407,14 +445,16 @@ Phase 4 adds four gates that run on every PR touching `bindings/**` or
 | ---------------------------------------- | -------------------- | -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
 | `scripts/check-no-bridge-globals.sh`     | **required**         | New `static OnceLock` at module scope in FFI bridges (ratcheted, never grows up) | Move state onto the per-bridge instance, or extend the allowlist with rationale. |
 | `scripts/check-no-fallback-registry.sh`  | **required**         | Reintroduction of `EMPTY_IDENTITY_REGISTRY` / `EMPTY_UCAN_REGISTRY` in code      | Make the accessor return `Result<&T, ScpError>`; don't silently fall back.        |
-| `scripts/check-no-default-in-tests.sh`   | **staged, not yet required** | Free-function façade calls in test files without the `SCP-DEFAULT-INSTANCE-OK` tag | Rewrite the test to the per-test `SCP` fixture, or add the tag with a reason.     |
+| `scripts/check-no-default-in-tests.sh`   | **required**         | Free-function façade calls in test files without the `SCP-DEFAULT-INSTANCE-OK` tag | Rewrite the test to the per-test `SCP` fixture, or add the tag with a reason.     |
 | `scripts/check-handle-affinity.sh`       | **required**         | Handle-accepting FFI function without its bridge's affinity macro                 | Add the macro invocation in the function prologue.                                |
 
-The `check-no-default-in-tests.sh` gate is staged for a follow-up PR that
-completes the per-test `SCP` fixture codemod across all four SDKs. Running
-the gate today reports on the order of 500 pre-existing call sites that
-must migrate first. The script is ready; the wiring lights up once the
-codemod lands.
+All four gates are **required** CI checks as of #1549 Phase 4 PR 4.
+`check-no-default-in-tests.sh` passes today with every flagged call site
+carrying a `SCP-DEFAULT-INSTANCE-OK:` tag whose reason places the call in
+one of the four legitimate non-migration categories documented above. New
+tests that route through the default instance must use the per-test
+fixture — adding a new tag without category-matching rationale is a review
+block.
 
 All four gates are listed in the `NEVER modify enforcement files to bypass
 failures` block in repo-root `CLAUDE.md`. Adding NEW assertions is always

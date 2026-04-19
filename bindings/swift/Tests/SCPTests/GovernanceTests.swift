@@ -174,6 +174,7 @@ struct GovernanceTests {
             return "MemberAdded"
         }
 
+        // SCP-DEFAULT-INSTANCE-OK: injected executeFn closure; bypasses default UniFFI bridge
         let result = try await context.executeGovernanceAction(
             proposalJson: #"{"action":"add_member","did":"did:dht:z6MkAlice"}"#,
             executeFn: mockExecute
@@ -191,6 +192,7 @@ struct GovernanceTests {
             "SomeUnknownResult"
         }
 
+        // SCP-DEFAULT-INSTANCE-OK: injected executeFn closure; bypasses default UniFFI bridge
         let result = try await context.executeGovernanceAction(
             proposalJson: "{}",
             executeFn: mockExecute
@@ -234,6 +236,7 @@ struct GovernanceTests {
 
         for (rawValue, expected) in expectedPairs {
             let mockExecute: GovernanceBridge.ExecuteFn = { _, _ in rawValue }
+            // SCP-DEFAULT-INSTANCE-OK: injected executeFn closure; bypasses default UniFFI bridge
             let result = try await context.executeGovernanceAction(
                 proposalJson: "{}",
                 executeFn: mockExecute
@@ -247,6 +250,7 @@ struct GovernanceTests {
         let context = try await makeClosedContext()
 
         do {
+            // SCP-DEFAULT-INSTANCE-OK: injected executeFn closure; bypasses default UniFFI bridge
             _ = try await context.executeGovernanceAction(proposalJson: "{}")
             Issue.record("Expected executeGovernanceAction to throw on closed context")
         } catch let error as ScpError {
@@ -272,6 +276,7 @@ struct GovernanceTests {
         }
 
         do {
+            // SCP-DEFAULT-INSTANCE-OK: injected executeFn closure; bypasses default UniFFI bridge
             _ = try await context.executeGovernanceAction(
                 proposalJson: "{}",
                 executeFn: mockExecute

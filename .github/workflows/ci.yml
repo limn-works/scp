@@ -155,12 +155,19 @@ jobs:
       - uses: actions/checkout@v5
       - run: bash scripts/check-no-fallback-registry.sh
 
-  # The `default-in-tests` gate (scripts/check-no-default-in-tests.sh) is
-  # staged but NOT yet required in CI. It is wired in the follow-up PR
-  # that completes the per-test SCP fixture codemod across all four SDKs.
-  # Running it today reports ~500 pre-existing call sites that must migrate
-  # first. See .docs/migration/phase-4.md § "Per-test SCP fixture" and
-  # ADR-048 §Decision 3.
+  # ── Test-fixture hygiene (ADR-048, #1549 Phase 4) ───────────────────────
+  # Enforces the per-test `SCP` fixture invariant: SDK tests must not
+  # route through the process-wide default bridge instance unless they
+  # carry a deliberate, reviewed `SCP-DEFAULT-INSTANCE-OK:` opt-in tag.
+  # See .docs/migration/phase-4.md § "Per-test SCP fixture" and
+  # ADR-048 §Decision 3 for the rationale and migration recipe.
+  default-in-tests:
+    needs: check-draft
+    name: FFI / no-default-in-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: bash scripts/check-no-default-in-tests.sh
 
   handle-affinity:
     needs: check-draft
@@ -573,6 +580,10 @@ jobs:
       - sdk-coverage
       - protocol-sync
       - protocol-deps
+      - bridge-globals
+      - fallback-registry
+      - default-in-tests
+      - handle-affinity
       - wasm-protocol
       - rust-fmt
       - rust-clippy
@@ -598,6 +609,10 @@ jobs:
             "${{ needs.sdk-coverage.result }}" \
             "${{ needs.protocol-sync.result }}" \
             "${{ needs.protocol-deps.result }}" \
+            "${{ needs.bridge-globals.result }}" \
+            "${{ needs.fallback-registry.result }}" \
+            "${{ needs.default-in-tests.result }}" \
+            "${{ needs.handle-affinity.result }}" \
             "${{ needs.wasm-protocol.result }}" \
             "${{ needs.rust-fmt.result }}" \
             "${{ needs.rust-clippy.result }}" \
