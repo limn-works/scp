@@ -60,46 +60,75 @@ use crate::{decrement_handle_count, increment_handle_count};
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 
-/// Ensures the global production DID resolver is initialized (idempotent). #311
+/// Ensures the production DID resolver is initialized on the given bridge
+/// instance (idempotent). #311
 ///
-/// The `InMemoryDhtClient` created here is stored in a shared global so that
-/// `identity_create` can publish newly created DID documents to it. This
-/// allows UCAN validation (which resolves the issuer DID) to find the
-/// document without a real network DHT (#1144).
+/// The `InMemoryDhtClient` created here is stored in a process-wide
+/// `SHARED_DHT_CLIENT` (#1144) so every `SCP` instance in the same process
+/// reads/writes the same test DHT — cross-identity flows (Alice publishes,
+/// Bob resolves in the same process) depend on a single shared DHT. The
+/// per-instance part is only the `DualLayerResolver` slot on
+/// [`crate::runtime::NapiBridgeInstance::core`].
 ///
-/// Uses `std::sync::Once` to guard the entire initialization block atomically.
-/// Without this, two separate `OnceLock::set` calls (`SHARED_DHT_CLIENT` and
+/// Uses `std::sync::Once` to guard the initial `SHARED_DHT_CLIENT` +
+/// `DualLayerResolver` construction atomically. Without this, two separate
+/// `OnceLock::set` calls (`SHARED_DHT_CLIENT` and
 /// `BridgeInstance::did_resolver`) could race under concurrent access: thread A
 /// creates `InMemoryDhtClient` X and sets `SHARED_DHT_CLIENT`, then thread B
 /// creates `InMemoryDhtClient` Y, fails to set `SHARED_DHT_CLIENT` (already set
 /// to X), but builds a `DualLayerResolver` around Y and stores it in
 /// `BridgeInstance` — the resolver and the shared DHT client would reference
 /// different instances.
+///
+/// Subsequent calls on the same bridge instance are no-ops: once a resolver is
+/// attached (via [`crate::runtime::init_did_resolver`]) the helper short-
+/// circuits. For a fresh `SCP` instance that hasn't yet acquired a resolver,
+/// this reuses the process-wide `SHARED_DHT_CLIENT` (if already set) to build
+/// the instance-local `DualLayerResolver`.
+pub(crate) fn ensure_did_resolver_initialized_on(bi: &crate::runtime::NapiBridgeInstance) {
+    if crate::runtime::did_resolver(bi).is_some() {
+        return;
+    }
+
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return; // No runtime available; skip initialization.
+    };
+
+    // Reuse the process-wide `SHARED_DHT_CLIENT` when already set so Alice
+    // (on `SCP` A) publishes to the same DHT Bob (on `SCP` B) reads from.
+    // The client is `init`'d at most once per process regardless of how many
+    // `SCP` instances exist.
+    let dht_client = if let Some(existing) = crate::runtime::shared_dht_client() {
+        Arc::clone(existing)
+    } else {
+        let client = Arc::new(InMemoryDhtClient::new());
+        crate::runtime::init_shared_dht_client(Arc::clone(&client));
+        client
+    };
+
+    let relay_querier = Arc::new(NoOpRelayQuerier);
+    let cache = Arc::new(DidCache::new());
+    let bootstrap_relays = Vec::new();
+
+    let resolver = Arc::new(DualLayerResolver::new(
+        relay_querier,
+        dht_client,
+        cache,
+        bootstrap_relays,
+    ));
+
+    crate::runtime::init_did_resolver(bi, resolver, handle);
+}
+
+/// Default-bridge wrapper around [`ensure_did_resolver_initialized_on`].
+///
+/// Retained for the legacy free-function façade paths. Routes through
+/// [`crate::runtime::default_bridge_instance`] so the behaviour matches
+/// the prior process-global path exactly.
 fn ensure_did_resolver_initialized() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-
-    INIT.call_once(|| {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return; // No runtime available; skip initialization.
-        };
-
-        let dht_client = Arc::new(InMemoryDhtClient::new());
-        // Store the DHT client so identity_create can publish documents to it.
-        crate::runtime::init_shared_dht_client(Arc::clone(&dht_client));
-
-        let relay_querier = Arc::new(NoOpRelayQuerier);
-        let cache = Arc::new(DidCache::new());
-        let bootstrap_relays = Vec::new();
-
-        let resolver = Arc::new(DualLayerResolver::new(
-            relay_querier,
-            dht_client,
-            cache,
-            bootstrap_relays,
-        ));
-
-        crate::runtime::init_did_resolver(resolver, handle);
-    });
+    if let Ok(bi) = crate::runtime::default_bridge_instance() {
+        ensure_did_resolver_initialized_on(&bi);
+    }
 }
 
 /// Publishes a newly created DID document to the shared `InMemoryDhtClient`.
@@ -115,7 +144,7 @@ fn ensure_did_resolver_initialized() {
 ///
 /// See issue #1144.
 #[cfg(feature = "allow_in_memory_custody")]
-async fn publish_to_shared_dht(
+pub(crate) async fn publish_to_shared_dht_for(
     identity: &ScpIdentity,
     document: &DidDocument,
     custody: &OpaqueInMemoryKeyCustody,
@@ -375,8 +404,10 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("rotateKey")?;
 
+            let bi = crate::runtime::default_bridge_instance()?;
+
             // Read attestations BEFORE async operation (entry guaranteed to exist).
-            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -389,6 +420,7 @@ impl NapiIdentity {
 
             // Update the identity registry with the rotated key handles.
             crate::runtime::register_identity(
+                &bi,
                 &new_identity.did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -444,8 +476,10 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("addAgentKey")?;
 
+            let bi = crate::runtime::default_bridge_instance()?;
+
             // Read attestations BEFORE async operation (entry guaranteed to exist).
-            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -459,6 +493,7 @@ impl NapiIdentity {
             // Update the identity registry with the new key state so that
             // bridge functions (ucan_delegate, etc.) see the updated identity.
             crate::runtime::register_identity(
+                &bi,
                 &new_identity.did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -515,8 +550,10 @@ impl NapiIdentity {
             let (scp_identity, custody, document) =
                 self.extract_in_memory_state("rotateAgentKey")?;
 
+            let bi = crate::runtime::default_bridge_instance()?;
+
             // Read attestations BEFORE async operation (entry guaranteed to exist).
-            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -529,6 +566,7 @@ impl NapiIdentity {
 
             // Update the identity registry with the rotated key state.
             crate::runtime::register_identity(
+                &bi,
                 &new_identity.did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -585,8 +623,10 @@ impl NapiIdentity {
             let (scp_identity, custody, document) =
                 self.extract_in_memory_state("removeAgentKey")?;
 
+            let bi = crate::runtime::default_bridge_instance()?;
+
             // Read attestations BEFORE async operation (entry guaranteed to exist).
-            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -599,6 +639,7 @@ impl NapiIdentity {
 
             // Update the identity registry with the post-removal key state.
             crate::runtime::register_identity(
+                &bi,
                 &new_identity.did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -665,8 +706,10 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("migrate")?;
 
+            let bi = crate::runtime::default_bridge_instance()?;
+
             // Read attestations BEFORE async operation (entry guaranteed to exist now).
-            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -707,8 +750,9 @@ impl NapiIdentity {
             let new_did = new_identity.did.clone();
 
             // Remove the old identity and register the new one.
-            crate::runtime::remove_identity(&self.inner.did);
+            crate::runtime::remove_identity(&bi, &self.inner.did);
             crate::runtime::register_identity(
+                &bi,
                 &new_did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -929,10 +973,10 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
     // later (by init_context_manager) once the identity has been created.
     // Per spec §12.2.3 the BridgeInstance container carries no DID; the
     // DID lives inside the MlsCryptoProvider owned by the ContextManager.
-    crate::runtime::ensure_bridge_instance();
+    let bi = crate::runtime::default_bridge_instance()?;
 
     // Ensure the global DID resolver is initialized (idempotent). #311
-    ensure_did_resolver_initialized();
+    ensure_did_resolver_initialized_on(&bi);
 
     match custody.as_str() {
         #[cfg(feature = "allow_in_memory_custody")]
@@ -954,6 +998,7 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
             // like `ucan_delegate` can look up this identity's key material by
             // DID (matching the PyO3 bridge's identity registry pattern).
             crate::runtime::register_identity(
+                &bi,
                 &scp_identity.did,
                 crate::runtime::NapiIdentityEntry {
                     identity: scp_identity.clone(),
@@ -966,7 +1011,7 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
             // Publish the DID document to the shared InMemoryDhtClient so
             // that the DualLayerResolver can find it during UCAN validation.
             // Best-effort: errors are logged, not propagated (#1144).
-            publish_to_shared_dht(&scp_identity, &document, &key_custody).await;
+            publish_to_shared_dht_for(&scp_identity, &document, &key_custody).await;
 
             let handle = NapiIdentity {
                 inner: Arc::new(NapiIdentityInner {
@@ -975,7 +1020,7 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
                     scp_identity: Some(scp_identity),
                     in_memory_custody: Some(key_custody),
                     document: Some(document),
-                    instance_id: crate::runtime::default_instance_id()?,
+                    instance_id: bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -1039,10 +1084,10 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
 
     // Ensure the BridgeInstance exists BEFORE the DID resolver is
     // initialized. See `identity_create` for the full rationale.
-    crate::runtime::ensure_bridge_instance();
+    let bi = crate::runtime::default_bridge_instance()?;
 
     // Ensure the global DID resolver is initialized (idempotent). #311
-    ensure_did_resolver_initialized();
+    ensure_did_resolver_initialized_on(&bi);
 
     match custody.as_str() {
         #[cfg(feature = "allow_in_memory_custody")]
@@ -1056,6 +1101,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
 
             // Register identity in the global registry (same as identity_create).
             crate::runtime::register_identity(
+                &bi,
                 &scp_identity.did,
                 crate::runtime::NapiIdentityEntry {
                     identity: scp_identity.clone(),
@@ -1066,7 +1112,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
             );
 
             // Publish the DID document to the shared InMemoryDhtClient (#1144).
-            publish_to_shared_dht(&scp_identity, &document, &key_custody).await;
+            publish_to_shared_dht_for(&scp_identity, &document, &key_custody).await;
 
             let handle = NapiIdentity {
                 inner: Arc::new(NapiIdentityInner {
@@ -1075,7 +1121,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
                     scp_identity: Some(scp_identity),
                     in_memory_custody: Some(key_custody),
                     document: Some(document),
-                    instance_id: crate::runtime::default_instance_id()?,
+                    instance_id: bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -1142,11 +1188,13 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
         .into());
     }
 
+    let bi = crate::runtime::default_bridge_instance()?;
+
     // Try the local identity registry first (populated by identity_create).
     // This avoids a DHT round-trip for identities created in this process.
     #[cfg(feature = "allow_in_memory_custody")]
     {
-        let local_result = crate::runtime::with_identity(&did, |entry| {
+        let local_result = crate::runtime::with_identity(&bi, &did, |entry| {
             Ok((
                 entry.identity.clone(),
                 std::sync::Arc::clone(&entry.custody),
@@ -1162,7 +1210,7 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
                     scp_identity: Some(identity),
                     in_memory_custody: Some(custody),
                     document: Some(document),
-                    instance_id: crate::runtime::default_instance_id()?,
+                    instance_id: bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -1185,7 +1233,7 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
             #[cfg(feature = "allow_in_memory_custody")]
             in_memory_custody: None,
             document: Some(document),
-            instance_id: crate::runtime::default_instance_id()?,
+            instance_id: bi.instance_id(),
         }),
     };
     increment_handle_count();
@@ -1224,7 +1272,10 @@ pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
 
     // Try the local identity registry first (populated by identity_create).
     #[cfg(feature = "allow_in_memory_custody")]
-    let local_doc = crate::runtime::with_identity(&did, |entry| Ok(entry.document.clone())).ok();
+    let local_doc = {
+        let bi = crate::runtime::default_bridge_instance()?;
+        crate::runtime::with_identity(&bi, &did, |entry| Ok(entry.document.clone())).ok()
+    };
     #[cfg(not(feature = "allow_in_memory_custody"))]
     let local_doc: Option<DidDocument> = None;
 
@@ -1288,7 +1339,10 @@ pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
 #[napi(js_name = "identityRemove")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub fn identity_remove(did: String) {
-    crate::runtime::remove_identity(&did);
+    // Best-effort: if the bridge is shut down, skip (idempotent semantics).
+    if let Ok(bi) = crate::runtime::default_bridge_instance() {
+        crate::runtime::remove_identity(&bi, &did);
+    }
 }
 
 /// Removes an identity from the global identity registry if present.
@@ -1309,7 +1363,9 @@ pub fn identity_remove(did: String) {
 #[must_use]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub fn identity_remove_if_present(did: String) -> bool {
-    crate::runtime::remove_identity_if_present(&did)
+    crate::runtime::default_bridge_instance()
+        .map(|bi| crate::runtime::remove_identity_if_present(&bi, &did))
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1436,8 +1492,10 @@ pub async fn identity_create_link_attestation(
     scp_ffi_common::validate::validate_attestation_fields(&platform, &handle, &proof)
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+    let bi = crate::runtime::default_bridge_instance()?;
+
     // Phase 1: read custody + key handle (under DashMap lock, then drop).
-    let (custody, key_handle) = crate::runtime::with_identity(&did, |entry| {
+    let (custody, key_handle) = crate::runtime::with_identity(&bi, &did, |entry| {
         Ok((
             Arc::clone(&entry.custody),
             entry.identity.active_signing_key,
@@ -1487,7 +1545,7 @@ pub async fn identity_create_link_attestation(
     attestation.signature = sig.as_bytes().to_vec();
 
     // Phase 3: store attestation (re-acquire DashMap lock, TOCTOU guard).
-    crate::runtime::with_identity_mut(&did, |entry| {
+    crate::runtime::with_identity_mut(&bi, &did, |entry| {
         // Verify the active signing key has not been rotated between Phase 1 and Phase 3.
         if entry.identity.active_signing_key != key_handle {
             return Err(ScpNapiError::Identity {
@@ -1526,7 +1584,8 @@ pub async fn identity_create_link_attestation(
 #[cfg(feature = "allow_in_memory_custody")]
 #[napi(js_name = "identityLinkAttestations")]
 pub fn identity_link_attestations(did: String) -> napi::Result<String> {
-    crate::runtime::with_identity(&did, |entry| {
+    let bi = crate::runtime::default_bridge_instance()?;
+    crate::runtime::with_identity(&bi, &did, |entry| {
         serde_json::to_string(&entry.identity_link_attestations).map_err(|e| {
             ScpNapiError::Identity {
                 message: format!("failed to serialize attestations: {e}"),
@@ -1545,7 +1604,8 @@ pub fn identity_link_attestations(did: String) -> napi::Result<String> {
 #[cfg(feature = "allow_in_memory_custody")]
 #[napi(js_name = "identityRemoveLinkAttestation")]
 pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> napi::Result<bool> {
-    crate::runtime::with_identity_mut(&did, |entry| {
+    let bi = crate::runtime::default_bridge_instance()?;
+    crate::runtime::with_identity_mut(&bi, &did, |entry| {
         let before = entry.identity_link_attestations.len();
         entry
             .identity_link_attestations
@@ -2251,9 +2311,11 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let (identity, _) = rt.block_on(create_test_identity());
         let old_did = identity.did();
+        let bi = crate::runtime::default_bridge_instance().expect("default bridge");
 
         // Register the identity in the runtime (simulating what identity_create does).
         crate::runtime::register_identity(
+            &bi,
             &old_did,
             crate::runtime::NapiIdentityEntry {
                 identity: identity.inner.scp_identity.clone().expect("scp_identity"),
@@ -2273,14 +2335,14 @@ mod tests {
             .expect("migrate must succeed");
 
         // Old DID should be removed from the registry.
-        let old_lookup = crate::runtime::with_identity(&old_did, |_| Ok(()));
+        let old_lookup = crate::runtime::with_identity(&bi, &old_did, |_| Ok(()));
         assert!(
             old_lookup.is_err(),
             "old DID must be removed from identity registry after migration"
         );
 
         // New DID should be in the registry.
-        let new_lookup = crate::runtime::with_identity(&migrated.did(), |_| Ok(()));
+        let new_lookup = crate::runtime::with_identity(&bi, &migrated.did(), |_| Ok(()));
         assert!(
             new_lookup.is_ok(),
             "new DID must be registered in identity registry after migration"
