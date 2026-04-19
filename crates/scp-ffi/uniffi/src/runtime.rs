@@ -473,6 +473,307 @@ impl UniffiBridgeInstance {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-instance accessor methods — #1549 Phase 4 PR 4 sub-slice A
+// ---------------------------------------------------------------------------
+//
+// These methods are the per-instance equivalents of the module-level free
+// helpers further down in this file. They operate on `&self` instead of
+// looking up `DEFAULT_BRIDGE_INSTANCE`. Sub-slice A (this commit) is purely
+// additive — the module-level helpers are still present and callers have not
+// yet migrated. Sub-slices B–E migrate callers and then remove the free
+// helpers as each domain is fully switched over. The `#[allow(dead_code)]`
+// attribute on methods without any in-tree caller yet is intentional and is
+// removed incrementally as the sub-slices land.
+
+impl UniffiBridgeInstance {
+    /// Per-instance equivalent of the module-level
+    /// [`context_manager_expect`] free function.
+    ///
+    /// Returns the attached `ContextManager` if the instance is not suspended
+    /// and not shut down. A shutdown bridge is a hard error (not a warning)
+    /// so stateful exports never run against a zombie bridge
+    /// (ADR-048 §PR 2, #1646).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` (code `SCP-CTX-2000`) when no local DID has
+    /// been registered yet (no `ContextManager` attached), when the instance
+    /// is currently suspended, or when the instance has been permanently shut
+    /// down.
+    #[allow(dead_code)]
+    pub fn context_manager_expect(&self) -> Result<&Arc<ContextManager>, crate::ScpError> {
+        if self.core.is_suspended() {
+            return Err(crate::ScpError::Context {
+                msg: "bridge not ready: suspended".to_owned(),
+                code: codes::CTX_2000.to_owned(),
+            });
+        }
+        if self.core.is_shutdown() {
+            return Err(crate::ScpError::Context {
+                msg: "bridge not ready: shut down".to_owned(),
+                code: codes::CTX_2000.to_owned(),
+            });
+        }
+        self.core
+            .try_context_manager()
+            .ok_or_else(|| crate::ScpError::Context {
+                msg: "bridge not ready: no local DID registered".to_owned(),
+                code: codes::CTX_2000.to_owned(),
+            })
+    }
+
+    /// Per-instance equivalent of the module-level [`context_manager`] free
+    /// function.
+    ///
+    /// Like [`UniffiBridgeInstance::context_manager_expect`] but treats
+    /// shutdown as a logged warning rather than a hard error — this mirrors
+    /// the legacy behaviour of the free `context_manager()` helper which some
+    /// callers still rely on to let operations fail naturally at the MLS or
+    /// transport layer after shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` (code `SCP-CTX-2000`) when the instance is
+    /// currently suspended or when no `ContextManager` has been attached.
+    #[allow(dead_code)]
+    pub fn context_manager_or_error(&self) -> Result<&Arc<ContextManager>, crate::ScpError> {
+        if self.core.is_suspended() {
+            return Err(crate::ScpError::Context {
+                msg: "bridge is suspended — call resume() before performing operations".to_owned(),
+                code: codes::CTX_2000.to_owned(),
+            });
+        }
+        if self.core.is_shutdown() {
+            tracing::warn!(
+                "context_manager_or_error() called after shutdown — operations may fail"
+            );
+        }
+        self.core
+            .try_context_manager()
+            .ok_or_else(|| crate::ScpError::Context {
+                msg: "ContextManager not yet attached — call context_create, \
+                      context_join, context_import, or init_context_manager first"
+                    .to_owned(),
+                code: codes::CTX_2000.to_owned(),
+            })
+    }
+
+    /// Returns the attached `ContextManager` only when the instance is in a
+    /// ready state (not suspended, not shut down, and a manager is attached).
+    ///
+    /// Unlike [`UniffiBridgeInstance::context_manager_or_error`] this is an
+    /// infallible `Option` accessor — callers that simply want to skip work
+    /// when the bridge isn't ready use this.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn try_context_manager_ready(&self) -> Option<&Arc<ContextManager>> {
+        if self.core.is_suspended() || self.core.is_shutdown() {
+            return None;
+        }
+        self.core.try_context_manager()
+    }
+
+    /// Per-instance equivalent of the module-level
+    /// [`init_context_manager_with_did`] free function.
+    ///
+    /// Installs an `MlsCryptoProvider(local_did)` and
+    /// `NotConfiguredTransportProvider` on this instance. No-op if a
+    /// `ContextManager` is already attached.
+    #[allow(dead_code)]
+    pub fn init_context_manager_with_did(&self, local_did: &str) {
+        if self.core.has_context_manager() {
+            tracing::debug!(
+                requested_did = %local_did,
+                "init_context_manager_with_did: ContextManager already attached — using existing instance"
+            );
+            return;
+        }
+        let did = local_did.to_owned();
+        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let event_log = self.protocol_repository.event_log_provider();
+        let persistence = self.core.persistence_arc_clone();
+        let cm_arc = build_context_manager(
+            crypto,
+            Box::new(scp_core::context::NotConfiguredTransportProvider),
+            event_log,
+            persistence,
+        );
+
+        self.core.set_context_manager(cm_arc);
+    }
+
+    /// Per-instance equivalent of the module-level
+    /// [`init_context_manager_with_relay_transport`] free function.
+    ///
+    /// Installs an `MlsCryptoProvider(local_did)` and a
+    /// `RelayTransportProvider` wrapping the supplied `NativeRelayAdapter` on
+    /// this instance. No-op if a `ContextManager` is already attached.
+    #[allow(dead_code)]
+    pub fn init_context_manager_with_relay_transport(
+        &self,
+        local_did: &str,
+        adapter: scp_transport::native::adapter::NativeRelayAdapter,
+    ) {
+        if self.core.has_context_manager() {
+            tracing::warn!(
+                requested_did = %local_did,
+                "init_context_manager_with_relay_transport: ContextManager already attached — ignoring"
+            );
+            return;
+        }
+        let did = local_did.to_owned();
+        let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+        let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
+        let event_log = self.protocol_repository.event_log_provider();
+        let persistence = self.core.persistence_arc_clone();
+        let cm_arc = build_context_manager(crypto, transport, event_log, persistence);
+
+        self.core.set_context_manager(cm_arc);
+    }
+
+    /// Per-instance equivalent of the module-level
+    /// [`sync_role_state_from_manager`] free function.
+    ///
+    /// Validates that the attached `ContextManager` has role state for the
+    /// given context after a governance operation. Logs the sync for
+    /// traceability.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` (code `SCP-CTX-2040`) if the context is
+    /// not registered in the attached `ContextManager`, or any error returned
+    /// by [`UniffiBridgeInstance::context_manager_or_error`] if no manager is
+    /// attached.
+    #[allow(dead_code)]
+    pub async fn sync_role_state_from_manager(
+        &self,
+        context_id: &str,
+    ) -> Result<(), crate::ScpError> {
+        let manager = self.context_manager_or_error()?;
+        let _role_state =
+            manager
+                .get_role_state(context_id)
+                .await
+                .ok_or_else(|| crate::ScpError::Context {
+                    msg: format!(
+                        "context '{context_id}' not found in ContextManager during role state sync"
+                    ),
+                    code: codes::CTX_2040.to_owned(),
+                })?;
+        tracing::debug!(context_id = %context_id, "UniFFI: role state synced after governance operation");
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the module-level
+    /// [`with_rate_limit_tracker`] free function.
+    ///
+    /// Delegates to [`CoreFields::with_rate_limit_tracker`].
+    #[allow(dead_code)]
+    pub fn with_rate_limit_tracker<F, T>(&self, identity_did: &str, f: F) -> T
+    where
+        F: FnOnce(&mut scp_core::context::invitation::RateLimitTracker) -> T,
+    {
+        self.core.with_rate_limit_tracker(identity_did, f)
+    }
+
+    /// Per-instance equivalent of the module-level [`did_resolver`] free
+    /// function.
+    ///
+    /// Returns a cloned `Arc` to the production DID resolver, if one has been
+    /// installed via [`UniffiBridgeInstance::set_did_resolver`]. Returning an
+    /// owned `Arc` (instead of a `&'static Arc`) keeps the accessor usable
+    /// from per-instance callers that don't have `'static` lifetimes.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn did_resolver(&self) -> Option<Arc<scp_ffi_common::IdentityBackedDidResolver>> {
+        self.core.did_resolver().map(Arc::clone)
+    }
+
+    /// Per-instance equivalent of the module-level [`init_did_resolver`] free
+    /// function.
+    ///
+    /// Wraps the supplied `DidResolver` in an `IdentityBackedDidResolver` and
+    /// stores it on this instance. Subsequent calls are no-ops
+    /// (`OnceLock` guarantees single initialization — the underlying
+    /// `CoreFields::set_did_resolver` logs a warning on repeat calls).
+    #[allow(dead_code)]
+    pub fn set_did_resolver<R>(&self, resolver: Arc<R>, handle: tokio::runtime::Handle)
+    where
+        R: scp_identity::resolver::DidResolver + 'static,
+    {
+        self.core
+            .set_did_resolver(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
+                resolver, handle,
+            )));
+    }
+
+    /// Per-instance equivalent of the module-level [`ensure_ucan_registered`]
+    /// free function.
+    ///
+    /// Ensures UCAN validation state is registered for `context_id` in this
+    /// instance's UCAN registry. No-op if the context is already registered.
+    #[allow(dead_code)]
+    pub fn ensure_ucan_registered(&self, context_id: &str, creator_did: &str, ceiling: &[String]) {
+        if self.ucan_registry.contains_key(context_id) {
+            return;
+        }
+
+        let ceiling_strings = if ceiling.is_empty() {
+            scp_core::context::roles::default_ceiling()
+                .capabilities
+                .iter()
+                .map(scp_core::context::roles::Capability::ucan_capability_name)
+                .collect::<HashSet<String>>()
+        } else {
+            ceiling
+                .iter()
+                .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+                .collect::<HashSet<String>>()
+        };
+
+        let event_log = EventLog::new(context_id.to_owned());
+        let revocation_list = RevocationList::new(context_id.to_owned());
+        let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
+
+        self.ucan_registry.insert(
+            context_id.to_owned(),
+            UcanContextState {
+                revocation_list,
+                nonce_tracker,
+                ceiling_strings,
+                creator_did: creator_did.to_owned(),
+                event_log,
+            },
+        );
+    }
+
+    /// Per-instance equivalent of the module-level [`with_ucan_state`] free
+    /// function.
+    ///
+    /// Accesses per-context UCAN state on this instance via a closure.
+    /// Returns `None` if the context is not registered.
+    #[allow(dead_code)]
+    pub fn with_ucan_state<T, F>(&self, context_id: &str, f: F) -> Option<T>
+    where
+        F: FnOnce(&mut UcanContextState) -> T,
+    {
+        let mut entry = self.ucan_registry.get_mut(context_id)?;
+        Some(f(&mut entry))
+    }
+
+    /// Per-instance equivalent of the module-level [`remove_ucan_state`] free
+    /// function.
+    ///
+    /// Removes per-context UCAN state from this instance and evicts the
+    /// corresponding known-context entry from `CoreFields`.
+    #[allow(dead_code)]
+    pub fn remove_ucan_state(&self, context_id: &str) {
+        self.ucan_registry.remove(context_id);
+        self.core.remove_known_context(context_id);
+    }
+}
+
 #[async_trait]
 impl BridgeInstanceCore for UniffiBridgeInstance {
     fn core(&self) -> &CoreFields {
