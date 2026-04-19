@@ -401,12 +401,9 @@ impl crate::scp::PyScp {
         validate::validate_context_id(context_id)?;
         validate::validate_did(sender_did)?;
 
-        let thresholds: Vec<(u64, u64)> =
-            serde_json::from_str(thresholds_json).map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "failed to parse thresholds JSON: {e}"
-                ))
-            })?;
+        let thresholds: Vec<(u64, u64)> = serde_json::from_str(thresholds_json).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("failed to parse thresholds JSON: {e}"))
+        })?;
 
         let config = scp_core::economy::EscalationConfig {
             thresholds: thresholds

@@ -1803,7 +1803,7 @@ impl crate::scp::PyScp {
             });
 
             // Get the relay URL from transport status if a relay is connected.
-            let relay_url = match crate::transport::py_transport_status() {
+            let relay_url = match self.transport_status() {
                 Ok(status) => status.relay_url,
                 Err(e) => {
                     tracing::warn!(

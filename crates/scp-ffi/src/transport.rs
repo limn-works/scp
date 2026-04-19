@@ -153,8 +153,9 @@ impl crate::scp::PyScp {
             source: relay_source,
         };
         let profile = scp_transport::profile::TransportProfile::platform_default();
-        let adapter = rt
-            .block_on(async { NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await });
+        let adapter = rt.block_on(async {
+            NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await
+        });
 
         match adapter {
             Ok(mut adapter) => {
@@ -254,11 +255,7 @@ impl crate::scp::PyScp {
         // Read the currently-connected URL off the per-bridge instance. Unlike
         // `CoreFields::relay_url` (which tracks the pending URL for resume),
         // this reflects a live bound connection and is `None` when disconnected.
-        let relay_url = bi
-            .connected_relay_url()
-            .read()
-            .ok()
-            .and_then(|g| g.clone());
+        let relay_url = bi.connected_relay_url().read().ok().and_then(|g| g.clone());
 
         Ok(PyTransportStatus {
             connected: has_connection,
@@ -306,9 +303,7 @@ impl crate::scp::PyScp {
         };
         let profile = scp_transport::profile::TransportProfile::platform_default();
         let adapter = rt
-            .block_on(async {
-                NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await
-            })
+            .block_on(async { NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await })
             .map_err(|e| {
                 ScpPyError::transport(format!("failed to connect to relay '{relay_url}': {e}"))
             })?;
@@ -392,11 +387,7 @@ impl crate::scp::PyScp {
 
         // Spawn suppression → scoring bridge task.
         if let Some(suppression_rx) = suppression_rx {
-            spawn_suppression_scoring_task(
-                Arc::clone(&self.inner),
-                suppression_rx,
-                scoring_url,
-            );
+            spawn_suppression_scoring_task(Arc::clone(&self.inner), suppression_rx, scoring_url);
         }
 
         Ok(count)

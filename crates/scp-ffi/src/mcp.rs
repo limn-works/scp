@@ -823,8 +823,7 @@ impl ContextProvider for FfiBridgeProvider {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let manager =
-            crate::runtime::context_manager(&self.bi).map_err(|e| format!("{e}"))?;
+        let manager = crate::runtime::context_manager(&self.bi).map_err(|e| format!("{e}"))?;
         if !manager.try_consume_hard_rate_limit_from_any_context(
             context_id,
             &invoker_did_typed,
@@ -1153,9 +1152,7 @@ fn server_registry() -> &'static DashMap<String, McpServerState> {
 /// Returns a reference to the given bridge instance's MCP server registry.
 ///
 /// Per-instance accessor used by `PyScp` methods (Phase 4 PR 4 sub-slice D).
-fn server_registry_of(
-    bi: &crate::runtime::PyBridgeInstance,
-) -> &DashMap<String, McpServerState> {
+fn server_registry_of(bi: &crate::runtime::PyBridgeInstance) -> &DashMap<String, McpServerState> {
     bi.mcp_server_registry().as_ref()
 }
 
@@ -1170,9 +1167,7 @@ fn client_registry() -> &'static DashMap<String, McpClientState> {
 /// Returns a reference to the given bridge instance's MCP client registry.
 ///
 /// Per-instance accessor used by `PyScp` methods (Phase 4 PR 4 sub-slice D).
-fn client_registry_of(
-    bi: &crate::runtime::PyBridgeInstance,
-) -> &DashMap<String, McpClientState> {
+fn client_registry_of(bi: &crate::runtime::PyBridgeInstance) -> &DashMap<String, McpClientState> {
     bi.mcp_client_registry().as_ref()
 }
 
@@ -1582,7 +1577,9 @@ impl crate::scp::PyScp {
     pub fn py_mcp_client_connect_stdio(&self, command: Vec<String>) -> PyResult<String> {
         let bi = &*self.inner;
         if command.is_empty() {
-            return Err(ScpPyError::validation("command must be a non-empty list".to_owned()).into());
+            return Err(
+                ScpPyError::validation("command must be a non-empty list".to_owned()).into(),
+            );
         }
 
         // Spawn the subprocess and create the transport.

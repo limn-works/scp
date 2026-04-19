@@ -777,14 +777,14 @@ impl crate::scp::PyScp {
             None => None,
         };
 
-        let guard = bi
-            .core
-            .handle_registries()
-            .lock()
-            .map_err(|e| ScpPyError::ValidationError {
-                message: format!("handle registry lock poisoned: {e}"),
-                code: codes::VALID_7120.to_owned(),
-            })?;
+        let guard =
+            bi.core
+                .handle_registries()
+                .lock()
+                .map_err(|e| ScpPyError::ValidationError {
+                    message: format!("handle registry lock poisoned: {e}"),
+                    code: codes::VALID_7120.to_owned(),
+                })?;
 
         let result = guard.get(discovery_context_id).map_or_else(
             || scp_core::discovery::HandleLookupResult {
@@ -947,11 +947,9 @@ impl crate::scp::PyScp {
                     code: codes::VALID_7130.to_owned(),
                 })?;
 
-        let registry = guard
-            .entry(scope_context_id.to_owned())
-            .or_insert_with(|| {
-                scp_core::discovery::ScopeRegistry::new(scope_context_id.to_owned())
-            });
+        let registry = guard.entry(scope_context_id.to_owned()).or_insert_with(|| {
+            scp_core::discovery::ScopeRegistry::new(scope_context_id.to_owned())
+        });
 
         let result = registry
             .register(
@@ -1052,14 +1050,14 @@ impl crate::scp::PyScp {
         crate::validate::validate_context_id(scope_context_id)?;
         crate::validate::validate_did(did)?;
 
-        let mut guard = bi
-            .core
-            .scope_registries()
-            .lock()
-            .map_err(|e| ScpPyError::ValidationError {
-                message: format!("scope registry lock poisoned: {e}"),
-                code: codes::VALID_7130.to_owned(),
-            })?;
+        let mut guard =
+            bi.core
+                .scope_registries()
+                .lock()
+                .map_err(|e| ScpPyError::ValidationError {
+                    message: format!("scope registry lock poisoned: {e}"),
+                    code: codes::VALID_7130.to_owned(),
+                })?;
 
         let result = match guard.get_mut(scope_context_id) {
             Some(registry) => registry
@@ -1522,7 +1520,10 @@ mod tests {
     #[test]
     fn handle_invalid_type_filter_errors() {
         let scp = default_scp();
-        assert!(scp.handle_lookup("ctx-any", "alice", Some("invalid")).is_err());
+        assert!(
+            scp.handle_lookup("ctx-any", "alice", Some("invalid"))
+                .is_err()
+        );
     }
 
     // -- Address resolution tests --------------------------------------------

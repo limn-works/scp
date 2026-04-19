@@ -506,10 +506,7 @@ impl Drop for PyNodeHandle {
 /// # Errors
 ///
 /// Returns `PyErr` if the DID is not found in the identity registry.
-fn build_node_identity(
-    bi: &crate::runtime::PyBridgeInstance,
-    did: &str,
-) -> PyResult<NodeIdentity> {
+fn build_node_identity(bi: &crate::runtime::PyBridgeInstance, did: &str) -> PyResult<NodeIdentity> {
     crate::runtime::with_identity(bi, did, |entry| {
         let custody = Arc::clone(&entry.custody);
         let sign_fn = ConcreteDidMethod::make_sign_fn(custody);
@@ -558,11 +555,7 @@ impl crate::scp::PyScp {
     ///
     /// Opens (or creates) a redb database at ``<data_dir>/blobs.redb``.
     #[pyo3(name = "relay_start_local")]
-    pub fn relay_start_local(
-        &self,
-        py: Python<'_>,
-        data_dir: String,
-    ) -> PyResult<PyRelayHandle> {
+    pub fn relay_start_local(&self, py: Python<'_>, data_dir: String) -> PyResult<PyRelayHandle> {
         let bi = &*self.inner;
         let rt = crate::runtime()?;
         py.allow_threads(|| {
