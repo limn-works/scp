@@ -1,11 +1,15 @@
 //! `PyO3` bridge functions for UCAN token management.
 //!
-//! Exposes SCP UCAN operations to Python:
+//! Exposes SCP UCAN operations to Python as methods on the `SCP` class:
 //!
-//! - [`py_ucan_validate`] -- Validate a UCAN token using the full 11-step
+//! - [`PyScp::ucan_validate`] -- Validate a UCAN token using the full 11-step
 //!   ADR-016 pipeline with Ed25519 signature verification.
-//! - [`py_ucan_mint`] -- Mint a new UCAN token for a member.
-//! - [`py_ucan_revoke`] -- Revoke a UCAN token.
+//! - [`PyScp::ucan_mint`] -- Mint a new UCAN token for a member.
+//! - [`PyScp::ucan_delegate`] -- Delegate a UCAN token to another member.
+//! - [`PyScp::ucan_revoke`] -- Revoke a UCAN token.
+//!
+//! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
+//! methods in Phase 4 PR 4 sub-slice C (#1549).
 //!
 //! # Types
 //!
@@ -14,7 +18,7 @@
 //!
 //! # Validation pipeline
 //!
-//! `py_ucan_validate` delegates to `scp_core::crypto::ucan::validate::validate_ucan`,
+//! `ucan_validate` delegates to `scp_core::crypto::ucan::validate::validate_ucan`,
 //! which implements the full 11-step UCAN validation pipeline from ADR-016:
 //!
 //! 1. Parse JWT-format UCAN token.
@@ -134,396 +138,403 @@ impl PyUcanToken {
 }
 
 // ---------------------------------------------------------------------------
-// Bridge functions
+// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4, #1549).
 // ---------------------------------------------------------------------------
 
-/// Validates a UCAN token using the full 11-step ADR-016 pipeline.
-///
-/// Delegates to `scp_core::crypto::ucan::validate::validate_ucan` for
-/// complete UCAN validation including Ed25519 signature verification, proof
-/// chain traversal, delegation depth enforcement, audience/issuer chain
-/// validation, scope attenuation, nonce uniqueness, revocation checking,
-/// and expiry verification.
-///
-/// # Arguments
-///
-/// * `context_id` -- The ID of the context the token is presented in.
-/// * `token` -- The encoded UCAN token string (JWT format).
-/// * `capability` -- The required capability URI (e.g.,
-///   `"scp:ctx:abc123/messages:write"`).
-/// * `presenting_agent_did` -- Optional. The DID of the agent presenting
-///   the token. If not provided, the token's `aud` field is used (the
-///   presenting agent is assumed to be the token's audience).
-/// * `proof_tokens` -- Optional. List of encoded parent UCAN token strings
-///   for delegation chain verification. Required when validating delegated
-///   tokens with non-empty proof chains.
-///
-/// # Errors
-///
-/// Raises `UcanError` if validation fails at any step: malformed token,
-/// invalid Ed25519 signature, broken delegation chain, expired token,
-/// insufficient capabilities, revoked token, nonce replay, etc.
-///
-/// See ADR-016 §5 for the full 11-step validation specification.
-#[pyfunction]
-#[pyo3(name = "ucan_validate")]
-#[pyo3(signature = (context_id, token, capability, presenting_agent_did=None, proof_tokens=None))]
-#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>> for #[pyfunction] arguments.
-pub fn py_ucan_validate(
-    context_id: &str,
-    token: &str,
-    capability: &str,
-    presenting_agent_did: Option<&str>,
-    proof_tokens: Option<Vec<String>>,
-) -> PyResult<()> {
-    validate::validate_context_id(context_id)?;
-    validate::validate_ucan_token(token)?;
-    validate::validate_capability_uri(capability)?;
-    if let Some(did) = presenting_agent_did {
-        validate::validate_did(did)?;
-    }
-    if let Some(ref tokens) = proof_tokens {
-        for t in tokens {
-            validate::validate_ucan_token(t)?;
+#[pymethods]
+impl crate::scp::PyScp {
+    /// Validates a UCAN token using the full 11-step ADR-016 pipeline.
+    ///
+    /// Delegates to `scp_core::crypto::ucan::validate::validate_ucan` for
+    /// complete UCAN validation including Ed25519 signature verification, proof
+    /// chain traversal, delegation depth enforcement, audience/issuer chain
+    /// validation, scope attenuation, nonce uniqueness, revocation checking,
+    /// and expiry verification.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The ID of the context the token is presented in.
+    /// * `token` -- The encoded UCAN token string (JWT format).
+    /// * `capability` -- The required capability URI (e.g.,
+    ///   `"scp:ctx:abc123/messages:write"`).
+    /// * `presenting_agent_did` -- Optional. The DID of the agent presenting
+    ///   the token. If not provided, the token's `aud` field is used (the
+    ///   presenting agent is assumed to be the token's audience).
+    /// * `proof_tokens` -- Optional. List of encoded parent UCAN token strings
+    ///   for delegation chain verification. Required when validating delegated
+    ///   tokens with non-empty proof chains.
+    ///
+    /// # Errors
+    ///
+    /// Raises `UcanError` if validation fails at any step: malformed token,
+    /// invalid Ed25519 signature, broken delegation chain, expired token,
+    /// insufficient capabilities, revoked token, nonce replay, etc.
+    ///
+    /// See ADR-016 §5 for the full 11-step validation specification.
+    #[pyo3(signature = (context_id, token, capability, presenting_agent_did=None, proof_tokens=None))]
+    #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>> for method arguments.
+    pub fn ucan_validate(
+        &self,
+        context_id: &str,
+        token: &str,
+        capability: &str,
+        presenting_agent_did: Option<&str>,
+        proof_tokens: Option<Vec<String>>,
+    ) -> PyResult<()> {
+        let bi = &*self.inner;
+        validate::validate_context_id(context_id)?;
+        validate::validate_ucan_token(token)?;
+        validate::validate_capability_uri(capability)?;
+        if let Some(did) = presenting_agent_did {
+            validate::validate_did(did)?;
         }
-    }
-    // Step 1: Parse the UCAN token using scp-core's parser.
-    let parsed_token = parse_ucan(token).map_err(ScpPyError::from)?;
-
-    // Parse the required capability URI.
-    let required_cap: CapabilityUri = capability.parse().map_err(|e: CoreUcanError| {
-        ScpPyError::ucan(format!("invalid capability URI '{capability}': {e}"))
-    })?;
-
-    // Determine the presenting agent DID: explicit parameter or token audience.
-    let agent_did = presenting_agent_did.unwrap_or(&parsed_token.payload.aud);
-
-    // Build proof resolver from optional proof tokens.
-    let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
-
-    // Execute the full 11-step validation pipeline within the context runtime.
-    // Use production DID resolver when available (#311), fallback to string-only.
-    crate::runtime::with_context(context_id, |rt| {
-        let production_resolver = crate::runtime::did_resolver();
-        let did_resolver =
-            DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
-        let revocation_checker = BridgeRevocationChecker {
-            revocation_list: &rt.revocation_list,
-        };
-        let mut nonce_adapter = BridgeNonceTracker {
-            inner: &mut rt.nonce_tracker,
-        };
-
-        let mut ctx = ValidationContext {
-            did_resolver: &did_resolver,
-            nonce_tracker: &mut nonce_adapter,
-            revocation_checker: &revocation_checker,
-            proof_resolver: &proof_resolver,
-            ceiling: &rt.ceiling_strings,
-            context_creator_did: &rt.creator_did,
-            presenting_agent_did: agent_did,
-            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-            clock: &scp_primitives::SystemClock,
-        };
-
-        validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpPyError::from)
-    })?;
-
-    Ok(())
-}
-
-/// Mints a new UCAN token for a context member.
-///
-/// Creates a new UCAN token granting the specified capabilities to the
-/// given member DID. The token is structured with proper SCP capability
-/// URIs scoped to the context. Real Ed25519 signing requires `KeyCustody`
-/// integration (SCP-214).
-///
-/// # Arguments
-///
-/// * `context_id` -- The ID of the context to mint the token for.
-/// * `member_did` -- The DID of the member receiving the token.
-/// * `capabilities` -- List of capability strings (e.g., `"messages:write"`).
-///
-/// # Returns
-///
-/// A [`PyUcanToken`] with the minted token's metadata.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if `member_did` fails `validate_did`
-/// (empty, malformed `did:{method}:{id}` format, or control characters),
-/// if any capability URI fails `validate_capability_uri`, or if any
-/// proof token fails `validate_ucan_token`.
-///
-/// Raises `UcanError` if minting fails: capabilities outside the context
-/// ceiling, issuer not authorized, signing fails, etc.
-///
-/// See ADR-013 §6 and SCP-214 criterion 7.
-#[pyfunction]
-#[pyo3(name = "ucan_mint")]
-#[pyo3(signature = (context_id, member_did, capabilities, proofs=None))]
-#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec/Option<Vec> for #[pyfunction] arguments.
-pub fn py_ucan_mint(
-    context_id: &str,
-    member_did: &str,
-    capabilities: Vec<String>,
-    proofs: Option<Vec<String>>,
-) -> PyResult<PyUcanToken> {
-    validate::validate_context_id(context_id)?;
-    validate::validate_did(member_did)?;
-    for cap in &capabilities {
-        validate::validate_capability_uri(cap)?;
-    }
-    if let Some(ref tokens) = proofs {
-        for t in tokens {
-            validate::validate_ucan_token(t)?;
-        }
-    }
-    // Look up the context to get the creator DID (issuer).
-    let creator_did = crate::runtime::with_context(context_id, |rt| Ok(rt.creator_did.clone()))?;
-
-    let rt = crate::runtime()?;
-    let context_id_owned = context_id.to_owned();
-    let _nonce = scp_core::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock);
-
-    // Mint using real scp_core::mint_ucan with Ed25519 signing via
-    // the retained KeyCustody. See SCP-214 criterion 7.
-    let token = crate::runtime::with_identity(&creator_did, |entry| {
-        // Get the ceiling from the context runtime for mint-time enforcement (#339).
-        let ceiling_strings =
-            crate::runtime::with_context(&context_id_owned, |rt| Ok(rt.ceiling_strings.clone()))?;
-
-        let params = MintParams {
-            issuer_did: &creator_did,
-            issuer_key: &entry.identity.active_signing_key,
-            audience_did: member_did,
-            context_id: &context_id_owned,
-            capabilities: &capabilities,
-            lifetime_secs: 3600,
-            not_before: None,
-            proofs: proofs.unwrap_or_default(),
-            facts: None,
-            key_scope: None,
-            signing_key_id: None,
-            ceiling: Some(ceiling_strings),
-        };
-
-        let result = rt.block_on(async {
-            mint_ucan(
-                &params,
-                entry.custody.as_ref(),
-                &scp_primitives::SystemClock,
-            )
-            .await
-        });
-        result.map_err(ScpPyError::from)
-    })?;
-
-    // Convert capability attestations to URI strings for Python.
-    let capability_uris: Vec<String> = token.payload.att.iter().map(|a| a.with.clone()).collect();
-
-    Ok(PyUcanToken {
-        token_id: token.payload.nnc.clone(),
-        issuer: token.payload.iss.clone(),
-        audience: token.payload.aud.clone(),
-        capabilities: capability_uris,
-        // Unix timestamp seconds fit in f64 mantissa for centuries.
-        #[allow(clippy::cast_precision_loss)]
-        expires_at: Some(token.payload.exp as f64),
-        proofs: token.payload.prf,
-        instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
-    }
-    .stamp_instance_id())
-}
-
-/// Delegates a UCAN token to another member.
-///
-/// Creates a delegated UCAN from an existing parent token, signed with the
-/// delegator's Ed25519 key via the retained `KeyCustody` provider.
-/// Delegation enforces attenuation (capabilities can only narrow, never
-/// widen).
-///
-/// # Arguments
-///
-/// * `context_id` -- The ID of the context.
-/// * `delegator_did` -- The DID of the entity delegating (must match
-///   parent token's audience).
-/// * `delegatee_did` -- The DID of the entity receiving the delegation.
-/// * `parent_token` -- The encoded parent UCAN token (JWT format).
-/// * `capabilities` -- List of capability URI strings to delegate (must be
-///   subset of parent's capabilities).
-///
-/// # Returns
-///
-/// A [`PyUcanToken`] with the delegated token's metadata.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if `delegator_did` or `delegatee_did` fails
-/// `validate_did` (empty, malformed `did:{method}:{id}` format, or
-/// control characters), if `parent_token` fails `validate_ucan_token`,
-/// or if any capability URI fails `validate_capability_uri`.
-///
-/// Raises `UcanError` if delegation fails: delegator not matching parent
-/// audience, capabilities wider than parent, signing failure, etc.
-///
-/// See ADR-016 criterion 4 and SCP-214 criterion 8.
-#[pyfunction]
-// PyO3 requires owned types for #[pyfunction] arguments.
-#[pyo3(name = "ucan_delegate")]
-#[allow(clippy::needless_pass_by_value)]
-pub fn py_ucan_delegate(
-    context_id: &str,
-    delegator_did: &str,
-    delegatee_did: &str,
-    parent_token: &str,
-    capabilities: Vec<String>,
-) -> PyResult<PyUcanToken> {
-    validate::validate_context_id(context_id)?;
-    validate::validate_did(delegator_did)?;
-    validate::validate_did(delegatee_did)?;
-    validate::validate_ucan_token(parent_token)?;
-    for cap in &capabilities {
-        validate::validate_capability_uri(cap)?;
-    }
-    // Parse the parent token.
-    let parsed_parent = parse_ucan(parent_token).map_err(ScpPyError::from)?;
-
-    // Build attenuated capabilities from the capability URI strings.
-    let attenuations: Vec<Attenuation> = capabilities
-        .iter()
-        .map(|cap| {
-            let cap_uri = if cap.starts_with("scp:ctx:") {
-                cap.clone()
-            } else {
-                format!("scp:ctx:{context_id}/{cap}")
-            };
-            let action = cap_uri.rsplit_once('/').map_or_else(
-                || cap.clone(),
-                |(_, a)| {
-                    a.split_once(':')
-                        .map_or_else(|| a.to_owned(), |(_, act)| act.to_owned())
-                },
-            );
-            Attenuation {
-                with: cap_uri,
-                can: action,
+        if let Some(ref tokens) = proof_tokens {
+            for t in tokens {
+                validate::validate_ucan_token(t)?;
             }
-        })
-        .collect();
+        }
+        // Step 1: Parse the UCAN token using scp-core's parser.
+        let parsed_token = parse_ucan(token).map_err(ScpPyError::from)?;
 
-    let rt = crate::runtime()?;
+        // Parse the required capability URI.
+        let required_cap: CapabilityUri = capability.parse().map_err(|e: CoreUcanError| {
+            ScpPyError::ucan(format!("invalid capability URI '{capability}': {e}"))
+        })?;
 
-    // Get the ceiling from the context runtime for delegation-time enforcement (#339).
-    let ceiling_strings =
-        crate::runtime::with_context(context_id, |rt| Ok(rt.ceiling_strings.clone()))?;
+        // Determine the presenting agent DID: explicit parameter or token audience.
+        let agent_did = presenting_agent_did.unwrap_or(&parsed_token.payload.aud);
 
-    let token = crate::runtime::with_identity(delegator_did, |entry| {
-        let params = DelegateParams {
-            parent_token: &parsed_parent,
-            delegator_did,
-            delegator_key: &entry.identity.active_signing_key,
-            delegatee_did,
-            attenuated_capabilities: &attenuations,
-            lifetime_secs: 3600,
-            facts: None,
-            key_scope: None,
-            signing_key_id: None,
-            ceiling: Some(ceiling_strings.clone()),
-        };
+        // Build proof resolver from optional proof tokens.
+        let proof_resolver = build_proof_resolver(proof_tokens.as_deref())?;
 
-        let result = rt.block_on(async {
-            delegate_ucan(
-                &params,
-                entry.custody.as_ref(),
-                &scp_primitives::SystemClock,
-            )
-            .await
-        });
-        result.map_err(ScpPyError::from)
-    })?;
+        // Execute the full 11-step validation pipeline within the context runtime.
+        // Use production DID resolver when available (#311), fallback to string-only.
+        crate::runtime::with_context(bi, context_id, |rt| {
+            let production_resolver = crate::runtime::did_resolver(bi);
+            let did_resolver =
+                DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
+            let revocation_checker = BridgeRevocationChecker {
+                revocation_list: &rt.revocation_list,
+            };
+            let mut nonce_adapter = BridgeNonceTracker {
+                inner: &mut rt.nonce_tracker,
+            };
 
-    let capability_uris: Vec<String> = token.payload.att.iter().map(|a| a.with.clone()).collect();
+            let mut ctx = ValidationContext {
+                did_resolver: &did_resolver,
+                nonce_tracker: &mut nonce_adapter,
+                revocation_checker: &revocation_checker,
+                proof_resolver: &proof_resolver,
+                ceiling: &rt.ceiling_strings,
+                context_creator_did: &rt.creator_did,
+                presenting_agent_did: agent_did,
+                clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                clock: &scp_primitives::SystemClock,
+            };
 
-    Ok(PyUcanToken {
-        token_id: token.payload.nnc.clone(),
-        issuer: token.payload.iss.clone(),
-        audience: token.payload.aud.clone(),
-        // Unix timestamp seconds fit in f64 mantissa for centuries.
-        capabilities: capability_uris,
-        #[allow(clippy::cast_precision_loss)]
-        expires_at: Some(token.payload.exp as f64),
-        proofs: token.payload.prf,
-        instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
+            validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpPyError::from)
+        })?;
+
+        Ok(())
     }
-    .stamp_instance_id())
-}
 
-/// Revokes a UCAN token using the full revocation pipeline.
-///
-/// Performs the complete UCAN revocation flow from ADR-016:
-///
-/// 1. **Authorization** -- Verifies the revoker is the token's issuer or the
-///    context creator via `BridgeRevocationAuthorizer`.
-/// 2. **Local revocation** -- Adds the token CID to the context's
-///    `RevocationList` (fail-closed via `RevocationPending` state).
-/// 3. **Distribution** -- Logs the revocation for transport-layer broadcast
-///    (MLS distribution deferred to transport connection).
-/// 4. **Event logging** -- Appends a `TokenRevoked` event to the context's
-///    Merkle event log.
-///
-/// # Arguments
-///
-/// * `context_id` -- The ID of the context the token belongs to.
-/// * `token` -- The full encoded UCAN token string (JWT format).
-/// * `revoker_did` -- The DID of the entity requesting the revocation. Must
-///   be either the token's issuer or the context creator.
-///
-/// # Errors
-///
-/// Raises `UcanError` if revocation fails: unauthorized revoker, context not
-/// found, malformed token, or event log append failure.
-///
-/// See ADR-016 acceptance criterion 5. Closes #499.
-#[pyfunction]
-#[pyo3(name = "ucan_revoke")]
-pub fn py_ucan_revoke(context_id: &str, token: &str, revoker_did: &str) -> PyResult<()> {
-    validate::validate_context_id(context_id)?;
-    validate::validate_ucan_token(token)?;
-    validate::validate_did(revoker_did)?;
+    /// Mints a new UCAN token for a context member.
+    ///
+    /// Creates a new UCAN token granting the specified capabilities to the
+    /// given member DID. The token is structured with proper SCP capability
+    /// URIs scoped to the context. Real Ed25519 signing requires `KeyCustody`
+    /// integration (SCP-214).
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The ID of the context to mint the token for.
+    /// * `member_did` -- The DID of the member receiving the token.
+    /// * `capabilities` -- List of capability strings (e.g., `"messages:write"`).
+    ///
+    /// # Returns
+    ///
+    /// A [`PyUcanToken`] with the minted token's metadata.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if `member_did` fails `validate_did`
+    /// (empty, malformed `did:{method}:{id}` format, or control characters),
+    /// if any capability URI fails `validate_capability_uri`, or if any
+    /// proof token fails `validate_ucan_token`.
+    ///
+    /// Raises `UcanError` if minting fails: capabilities outside the context
+    /// ceiling, issuer not authorized, signing fails, etc.
+    ///
+    /// See ADR-013 §6 and SCP-214 criterion 7.
+    #[pyo3(signature = (context_id, member_did, capabilities, proofs=None))]
+    #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec/Option<Vec> for method arguments.
+    pub fn ucan_mint(
+        &self,
+        context_id: &str,
+        member_did: &str,
+        capabilities: Vec<String>,
+        proofs: Option<Vec<String>>,
+    ) -> PyResult<PyUcanToken> {
+        let bi = &*self.inner;
+        validate::validate_context_id(context_id)?;
+        validate::validate_did(member_did)?;
+        for cap in &capabilities {
+            validate::validate_capability_uri(cap)?;
+        }
+        if let Some(ref tokens) = proofs {
+            for t in tokens {
+                validate::validate_ucan_token(t)?;
+            }
+        }
+        // Look up the context to get the creator DID (issuer).
+        let creator_did =
+            crate::runtime::with_context(bi, context_id, |rt| Ok(rt.creator_did.clone()))?;
 
-    // Parse the token to extract the issuer DID for authorization.
-    let parsed = parse_ucan(token).map_err(ScpPyError::from)?;
+        let rt = crate::runtime()?;
+        let context_id_owned = context_id.to_owned();
+        let _nonce = scp_core::crypto::ucan::nonce::generate_nonce(&scp_primitives::SystemClock);
 
-    crate::runtime::with_context(context_id, |rt| {
-        use crate::bridge_adapters::{
-            BridgeRevocationAuthorizer, BridgeRevocationDistributor, BridgeRevocationEventLogger,
-        };
-        use std::cell::RefCell;
+        // Mint using real scp_core::mint_ucan with Ed25519 signing via
+        // the retained KeyCustody. See SCP-214 criterion 7.
+        let token = crate::runtime::with_identity(bi, &creator_did, |entry| {
+            // Get the ceiling from the context runtime for mint-time enforcement (#339).
+            let ceiling_strings = crate::runtime::with_context(bi, &context_id_owned, |rt| {
+                Ok(rt.ceiling_strings.clone())
+            })?;
 
-        let authorizer = BridgeRevocationAuthorizer {
-            issuer_did: parsed.payload.iss.clone(),
-            creator_did: rt.creator_did.clone(),
-        };
-        let distributor = BridgeRevocationDistributor;
-        let event_log_cell = RefCell::new(&mut rt.event_log);
-        let event_logger = BridgeRevocationEventLogger {
-            event_log: &event_log_cell,
-        };
+            let params = MintParams {
+                issuer_did: &creator_did,
+                issuer_key: &entry.identity.active_signing_key,
+                audience_did: member_did,
+                context_id: &context_id_owned,
+                capabilities: &capabilities,
+                lifetime_secs: 3600,
+                not_before: None,
+                proofs: proofs.unwrap_or_default(),
+                facts: None,
+                key_scope: None,
+                signing_key_id: None,
+                ceiling: Some(ceiling_strings),
+            };
 
-        core_revoke_ucan(
-            &mut rt.revocation_list,
-            token,
-            revoker_did,
-            &authorizer,
-            &distributor,
-            &event_logger,
-        )
-        .map_err(ScpPyError::from)
-    })?;
+            let result = rt.block_on(async {
+                mint_ucan(
+                    &params,
+                    entry.custody.as_ref(),
+                    &scp_primitives::SystemClock,
+                )
+                .await
+            });
+            result.map_err(ScpPyError::from)
+        })?;
 
-    Ok(())
+        // Convert capability attestations to URI strings for Python.
+        let capability_uris: Vec<String> =
+            token.payload.att.iter().map(|a| a.with.clone()).collect();
+
+        Ok(PyUcanToken {
+            token_id: token.payload.nnc.clone(),
+            issuer: token.payload.iss.clone(),
+            audience: token.payload.aud.clone(),
+            capabilities: capability_uris,
+            // Unix timestamp seconds fit in f64 mantissa for centuries.
+            #[allow(clippy::cast_precision_loss)]
+            expires_at: Some(token.payload.exp as f64),
+            proofs: token.payload.prf,
+            instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
+        }
+        .stamp_instance_id())
+    }
+
+    /// Delegates a UCAN token to another member.
+    ///
+    /// Creates a delegated UCAN from an existing parent token, signed with the
+    /// delegator's Ed25519 key via the retained `KeyCustody` provider.
+    /// Delegation enforces attenuation (capabilities can only narrow, never
+    /// widen).
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The ID of the context.
+    /// * `delegator_did` -- The DID of the entity delegating (must match
+    ///   parent token's audience).
+    /// * `delegatee_did` -- The DID of the entity receiving the delegation.
+    /// * `parent_token` -- The encoded parent UCAN token (JWT format).
+    /// * `capabilities` -- List of capability URI strings to delegate (must be
+    ///   subset of parent's capabilities).
+    ///
+    /// # Returns
+    ///
+    /// A [`PyUcanToken`] with the delegated token's metadata.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if `delegator_did` or `delegatee_did` fails
+    /// `validate_did` (empty, malformed `did:{method}:{id}` format, or
+    /// control characters), if `parent_token` fails `validate_ucan_token`,
+    /// or if any capability URI fails `validate_capability_uri`.
+    ///
+    /// Raises `UcanError` if delegation fails: delegator not matching parent
+    /// audience, capabilities wider than parent, signing failure, etc.
+    ///
+    /// See ADR-016 criterion 4 and SCP-214 criterion 8.
+    // PyO3 requires owned types for method arguments.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn ucan_delegate(
+        &self,
+        context_id: &str,
+        delegator_did: &str,
+        delegatee_did: &str,
+        parent_token: &str,
+        capabilities: Vec<String>,
+    ) -> PyResult<PyUcanToken> {
+        let bi = &*self.inner;
+        validate::validate_context_id(context_id)?;
+        validate::validate_did(delegator_did)?;
+        validate::validate_did(delegatee_did)?;
+        validate::validate_ucan_token(parent_token)?;
+        for cap in &capabilities {
+            validate::validate_capability_uri(cap)?;
+        }
+        // Parse the parent token.
+        let parsed_parent = parse_ucan(parent_token).map_err(ScpPyError::from)?;
+
+        // Build attenuated capabilities from the capability URI strings.
+        let attenuations: Vec<Attenuation> = capabilities
+            .iter()
+            .map(|cap| {
+                let cap_uri = if cap.starts_with("scp:ctx:") {
+                    cap.clone()
+                } else {
+                    format!("scp:ctx:{context_id}/{cap}")
+                };
+                let action = cap_uri.rsplit_once('/').map_or_else(
+                    || cap.clone(),
+                    |(_, a)| {
+                        a.split_once(':')
+                            .map_or_else(|| a.to_owned(), |(_, act)| act.to_owned())
+                    },
+                );
+                Attenuation {
+                    with: cap_uri,
+                    can: action,
+                }
+            })
+            .collect();
+
+        let rt = crate::runtime()?;
+
+        // Get the ceiling from the context runtime for delegation-time enforcement (#339).
+        let ceiling_strings =
+            crate::runtime::with_context(bi, context_id, |rt| Ok(rt.ceiling_strings.clone()))?;
+
+        let token = crate::runtime::with_identity(bi, delegator_did, |entry| {
+            let params = DelegateParams {
+                parent_token: &parsed_parent,
+                delegator_did,
+                delegator_key: &entry.identity.active_signing_key,
+                delegatee_did,
+                attenuated_capabilities: &attenuations,
+                lifetime_secs: 3600,
+                facts: None,
+                key_scope: None,
+                signing_key_id: None,
+                ceiling: Some(ceiling_strings.clone()),
+            };
+
+            let result = rt.block_on(async {
+                delegate_ucan(
+                    &params,
+                    entry.custody.as_ref(),
+                    &scp_primitives::SystemClock,
+                )
+                .await
+            });
+            result.map_err(ScpPyError::from)
+        })?;
+
+        let capability_uris: Vec<String> =
+            token.payload.att.iter().map(|a| a.with.clone()).collect();
+
+        Ok(PyUcanToken {
+            token_id: token.payload.nnc.clone(),
+            issuer: token.payload.iss.clone(),
+            audience: token.payload.aud.clone(),
+            // Unix timestamp seconds fit in f64 mantissa for centuries.
+            capabilities: capability_uris,
+            #[allow(clippy::cast_precision_loss)]
+            expires_at: Some(token.payload.exp as f64),
+            proofs: token.payload.prf,
+            instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
+        }
+        .stamp_instance_id())
+    }
+
+    /// Revokes a UCAN token using the full revocation pipeline.
+    ///
+    /// Performs the complete UCAN revocation flow from ADR-016:
+    ///
+    /// 1. **Authorization** -- Verifies the revoker is the token's issuer or the
+    ///    context creator via `BridgeRevocationAuthorizer`.
+    /// 2. **Local revocation** -- Adds the token CID to the context's
+    ///    `RevocationList` (fail-closed via `RevocationPending` state).
+    /// 3. **Distribution** -- Logs the revocation for transport-layer broadcast
+    ///    (MLS distribution deferred to transport connection).
+    /// 4. **Event logging** -- Appends a `TokenRevoked` event to the context's
+    ///    Merkle event log.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The ID of the context the token belongs to.
+    /// * `token` -- The full encoded UCAN token string (JWT format).
+    /// * `revoker_did` -- The DID of the entity requesting the revocation. Must
+    ///   be either the token's issuer or the context creator.
+    ///
+    /// # Errors
+    ///
+    /// Raises `UcanError` if revocation fails: unauthorized revoker, context not
+    /// found, malformed token, or event log append failure.
+    ///
+    /// See ADR-016 acceptance criterion 5. Closes #499.
+    pub fn ucan_revoke(&self, context_id: &str, token: &str, revoker_did: &str) -> PyResult<()> {
+        let bi = &*self.inner;
+        validate::validate_context_id(context_id)?;
+        validate::validate_ucan_token(token)?;
+        validate::validate_did(revoker_did)?;
+
+        // Parse the token to extract the issuer DID for authorization.
+        let parsed = parse_ucan(token).map_err(ScpPyError::from)?;
+
+        crate::runtime::with_context(bi, context_id, |rt| {
+            use crate::bridge_adapters::{
+                BridgeRevocationAuthorizer, BridgeRevocationDistributor,
+                BridgeRevocationEventLogger,
+            };
+            use std::cell::RefCell;
+
+            let authorizer = BridgeRevocationAuthorizer {
+                issuer_did: parsed.payload.iss.clone(),
+                creator_did: rt.creator_did.clone(),
+            };
+            let distributor = BridgeRevocationDistributor;
+            let event_log_cell = RefCell::new(&mut rt.event_log);
+            let event_logger = BridgeRevocationEventLogger {
+                event_log: &event_log_cell,
+            };
+
+            core_revoke_ucan(
+                &mut rt.revocation_list,
+                token,
+                revoker_did,
+                &authorizer,
+                &distributor,
+                &event_logger,
+            )
+            .map_err(ScpPyError::from)
+        })?;
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -563,19 +574,18 @@ pub(crate) fn build_proof_resolver_from_tokens(
 // Module registration
 // ---------------------------------------------------------------------------
 
-/// Registers UCAN bridge functions and classes on the `_scp_core` module.
+/// Registers UCAN bridge classes on the `_scp_core` module.
 ///
-/// Called from [`crate::_scp_core`] during module initialization.
+/// Post-migration (Phase 4 PR 4 sub-slice C) UCAN operations are exposed as
+/// methods on `SCP` (see the `#[pymethods]` block above) and registered
+/// automatically with the class. Only [`PyUcanToken`] still requires manual
+/// class registration here.
 ///
 /// # Errors
 ///
-/// Returns `PyErr` if registration of functions or classes fails.
+/// Returns `PyErr` if registration of classes fails.
 pub fn register_ucan(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyUcanToken>()?;
-    m.add_function(wrap_pyfunction!(py_ucan_validate, m)?)?;
-    m.add_function(wrap_pyfunction!(py_ucan_mint, m)?)?;
-    m.add_function(wrap_pyfunction!(py_ucan_delegate, m)?)?;
-    m.add_function(wrap_pyfunction!(py_ucan_revoke, m)?)?;
     Ok(())
 }
 
@@ -588,7 +598,7 @@ pub fn register_ucan(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // compiled and verified via `cargo check -p scp-ffi --tests` or through the
 // Python test infrastructure (`maturin develop` + `pytest`).
 //
-// The scp-core validation pipeline (which py_ucan_validate delegates to)
+// The scp-core validation pipeline (which `ucan_validate` delegates to)
 // has comprehensive tests in `crates/scp-core/src/crypto/ucan/validate.rs`
 // covering all 11 ADR-016 steps including:
 // - Forged UCAN (invalid signature) rejection
