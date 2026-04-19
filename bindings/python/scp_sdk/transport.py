@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import TransportError
 
 logger = logging.getLogger("scp_sdk")
@@ -123,6 +124,7 @@ class TransportConfig:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 async def connect_relay(relay_url: str) -> TransportConfig:
     """Connect to an SCP relay and return the transport configuration.
 
@@ -143,6 +145,7 @@ async def connect_relay(relay_url: str) -> TransportConfig:
     return config
 
 
+@deprecated_default_instance
 async def relay_status() -> TransportStatus:
     """Query the current transport connection status.
 

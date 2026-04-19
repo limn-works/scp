@@ -5,6 +5,39 @@ All notable changes to SCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-04-18
+
+### Phase 4 PR 3 — Persistence + async resume + real UniFFI crypto
+
+**Breaking changes — external SDK consumers migrating from PR 1 behavior:**
+
+- **`SCP.resume()` is now async.** `BridgeInstanceCore::resume` became `async fn` (#1678) so per-bridge overrides can chain relay reconnect and persisted-context restoration on top of the suspended-flag flip. Callers must await / suspend:
+  - Python: `await scp.resume()` (was synchronous)
+  - TypeScript: `await scp.resume()` (returns `Promise<void>`)
+  - Swift: `try await scp.resume()` (was synchronous `throws`)
+  - Kotlin: `scp.resume()` inside a coroutine / suspend function (was blocking `ffiCall`)
+  - Reconnect failures surface as `LifecycleError.ReconnectFailed { url, reason }` (new variant).
+- **`StorageConfig` extended with SQLite (#1491, #1260).** New variant `Sqlite { path, key }` across PyO3, NAPI, UniFFI. WASM remains InMemory-only.
+  - Python: `SCP(storage={"type": "sqlite", "path": str, "key": bytes})` — 32-byte key as Python `bytes`.
+  - TypeScript: `SCP.withStorage({ type: "sqlite", path, key })` — `key` is hex `string` or `Uint8Array`.
+  - Swift: `SCP.withStorage(sqliteDir: URL, key: Data)` convenience; also `StorageConfig.sqlite(path:key:)` directly.
+  - Kotlin: `SCP.withSqlite(dir: File, key: ByteArray)` companion; also `StorageConfig.Sqlite(path, key)` directly.
+- **UniFFI `ContextManager` requires a local DID before context ops (#1342).** `FfiBridgeCrypto` is deleted; UniFFI now constructs `MlsCryptoProvider::new(did)` exactly as PyO3 and NAPI do. Swift and Kotlin callers must invoke `scp.registerLocalDid(...)` before `context_create` / `context_join` / `context_import`. Calling a context operation before registration returns `ScpError.Context { code: "CTX_2000", msg: "bridge not ready: no local DID registered" }`.
+- **Multi-relay reconnect via `HashSet` (#1678).** `CoreFields::relay_url: Mutex<Option<String>>` became `relay_urls: Mutex<HashSet<String>>`. Accessors replaced: `add_relay_url` / `remove_relay_url` / `pending_relay_urls` (was `set_relay_url` / `clear_relay_url` / `pending_relay_url`).
+
+Closes #1342, #1260, #1491, #1678. See `.docs/adrs/ADR-048-scp-multi-instance.md` § "PR 3 actualized" for the full design commentary.
+
+### Phase 4 PR 4 — Test codemod + enforcement + docs
+
+- **Migration guide published** at `.docs/migration/phase-4.md`. Covers every breaking change landed in PR 1 → PR 3, the per-test `SCP` fixture recipe for Python / TypeScript / Swift / Kotlin, the `SCP-DEFAULT-INSTANCE-OK` opt-in tag, and the CI gate reference table.
+- **New CI gate — `scripts/check-no-default-in-tests.sh`.** Fails the build if a test file calls a free-function façade (`scp_sdk.context_create(...)`, `.contextCreate(...)`, etc.) without an explicit `SCP-DEFAULT-INSTANCE-OK: <reason>` tag on the offending line or within 2 lines above. Guards the per-test-fixture invariant from ADR-048 §Decision 3. Exempts deprecation-verifying tests by filename.
+- **New CI gate — `scripts/check-no-fallback-registry.sh`.** Greps for the `EMPTY_IDENTITY_REGISTRY` / `EMPTY_UCAN_REGISTRY` identifiers deleted in PR 2. Accepts occurrences inside comments (they remain as historical context); fails on any non-comment use. Regression guard for the silent "bridge not initialized" data-loss pattern described in ADR-048 §Context.
+- **CI wiring.** `check-no-bridge-globals.sh`, `check-no-fallback-registry.sh`, and `check-handle-affinity.sh` are now required status checks alongside the existing `cross-layer`, `protocol-sync`, and `sdk-coverage` gates. `check-no-default-in-tests.sh` is staged in-tree but NOT yet wired to CI — it fires on ~500 pre-existing call sites that the per-test SCP fixture codemod (next PR) migrates to the new fixture pattern. The gate lights up in the codemod PR once those call sites move or carry the `SCP-DEFAULT-INSTANCE-OK` opt-in tag.
+- **SDK capability matrix.** Added explicit rows for `scp_new`, `scp_default` (deprecated), `scp_with_storage_in_memory`, `scp_instance_id`, `shutdown_timeout`. The pre-existing `suspend` / `resume` / `with_storage_sqlite` / `add_relay_url` rows already documented the async / multi-relay surface.
+- **CLAUDE.md enforcement file list updated.** The four gate scripts, `ratchet/once-lock-count.json`, and `sdk-capability-matrix.json` are all flagged as "modify only to expand coverage" so future agents can't silently weaken them.
+
+No runtime or semantic changes. Closes #1549.
+
 ## [Unreleased] - 2026-03-16
 
 ### Security

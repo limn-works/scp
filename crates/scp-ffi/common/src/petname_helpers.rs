@@ -6,7 +6,12 @@
 //! - `HandleTarget` JSON parsing
 //! - `HandleEntry` → `AddressResolution` conversion
 //! - `HandleQuerier` implementation for in-memory handle registries
-//! - Global petname map and handle registry singletons
+//!
+//! The backing state for petname maps, handle registries, and scope registries
+//! is owned by [`crate::CoreFields`] — each bridge instance has its own
+//! per-identity petname map and per-context handle/scope registries. Callers
+//! pass a `&CoreFields` (via `bi.core`) into these helpers rather than
+//! reaching through a process-global singleton.
 //!
 //! WASM bridge reimplements `PetnameMap` locally per ADR-034 and builds JSON
 //! manually, so these helpers are gated behind the `resolvers` feature.
@@ -14,7 +19,7 @@
 //! See spec §22.3.1, §22.4, §22.8 and ADR-020.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use scp_core::discovery::addressing::{
     AddressResolution, AddressType, HandleQuerier, HandleTarget, ResolutionLayer, ResolutionPath,
@@ -23,79 +28,61 @@ use scp_core::discovery::addressing::{
 use scp_core::discovery::handles::{
     HandleEntry, HandleLookupParams, HandleRegistry, HandleTypeFilter,
 };
-use scp_core::discovery::petnames::PetnameMap;
-use scp_core::discovery::scope::ScopeRegistry;
 use scp_primitives::Clock;
 
+use crate::CoreFields;
+
 // ---------------------------------------------------------------------------
-// Global singletons
+// Test-only reset helpers — operate on per-instance state in CoreFields
 // ---------------------------------------------------------------------------
 
-/// Global petname map keyed by owner DID string.
-/// Each identity has its own petname map (petnames are per-identity private state §3.7).
-pub fn petname_maps() -> &'static Mutex<HashMap<String, PetnameMap>> {
-    static MAPS: OnceLock<Mutex<HashMap<String, PetnameMap>>> = OnceLock::new();
-    MAPS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Global handle registries keyed by context ID.
-/// Each context has its own handle registry (§22.3.1).
-pub fn handle_registries() -> &'static Mutex<HashMap<String, HandleRegistry>> {
-    static REGISTRIES: OnceLock<Mutex<HashMap<String, HandleRegistry>>> = OnceLock::new();
-    REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Removes a specific owner's petname map. Test-only — ensures each test starts
-/// with clean state even if a previous test panicked before manual cleanup.
+/// Removes a specific owner's petname map from the supplied `CoreFields`
+/// instance. Test-only — ensures each test starts with clean state even if a
+/// previous test panicked before manual cleanup.
 #[cfg(any(test, feature = "testing"))]
-pub fn reset_petname_map_for(owner_did: &str) {
-    if let Ok(mut guard) = petname_maps().lock() {
+pub fn reset_petname_map_for(core: &CoreFields, owner_did: &str) {
+    if let Ok(mut guard) = core.petname_maps().lock() {
         guard.remove(owner_did);
     }
 }
 
-/// Removes a specific context's handle registry. Test-only — ensures each test starts
-/// with clean state even if a previous test panicked before manual cleanup.
+/// Removes a specific context's handle registry from the supplied `CoreFields`
+/// instance. Test-only — ensures each test starts with clean state even if a
+/// previous test panicked before manual cleanup.
 #[cfg(any(test, feature = "testing"))]
-pub fn reset_handle_registry_for(context_id: &str) {
-    if let Ok(mut guard) = handle_registries().lock() {
+pub fn reset_handle_registry_for(core: &CoreFields, context_id: &str) {
+    if let Ok(mut guard) = core.handle_registries().lock() {
         guard.remove(context_id);
     }
 }
 
-/// Global scope registries keyed by context ID.
-///
-/// Each context that hosts scope tools has its own scope registry (§22.3.5, ADR-043).
-/// Separate from handle registries — scope entries and handle entries never share storage.
-pub fn scope_registries() -> &'static Mutex<HashMap<String, ScopeRegistry>> {
-    static REGISTRIES: OnceLock<Mutex<HashMap<String, ScopeRegistry>>> = OnceLock::new();
-    REGISTRIES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Removes a specific context's scope registry. Test-only — ensures each test starts
-/// with clean state even if a previous test panicked before manual cleanup.
+/// Removes a specific context's scope registry from the supplied `CoreFields`
+/// instance. Test-only — ensures each test starts with clean state even if a
+/// previous test panicked before manual cleanup.
 #[cfg(any(test, feature = "testing"))]
-pub fn reset_scope_registry_for(context_id: &str) {
-    if let Ok(mut guard) = scope_registries().lock() {
+pub fn reset_scope_registry_for(core: &CoreFields, context_id: &str) {
+    if let Ok(mut guard) = core.scope_registries().lock() {
         guard.remove(context_id);
     }
 }
 
-/// Collects scope name -> context ID mappings from all scope registries.
+/// Collects scope name -> context ID mappings from all scope registries owned
+/// by the supplied `CoreFields` instance.
 ///
-/// Iterates all scope registries, collecting `entry.name -> entry.target.context_id`
-/// for every scope entry. Used by `address_resolve` to merge scope registry
-/// output into `known_contexts` for two-hop resolution (§22.3.5).
+/// Iterates all scope registries in this bridge instance, collecting
+/// `entry.name -> entry.target.context_id` for every scope entry. Used by
+/// `address_resolve` to merge scope registry output into `known_contexts` for
+/// two-hop resolution (§22.3.5).
 ///
-/// **Cross-context note:** This merges all scope registries globally, matching
-/// how `handle_registries` merges all handle registries in `address_resolve`.
+/// **Cross-context note:** This merges all scope registries for this bridge
+/// instance, matching how handle registries are merged in `address_resolve`.
 /// Both approaches expose entries from all contexts the caller has interacted
 /// with (registered in). A future refinement could scope to a caller-provided
 /// list of trusted registry context IDs for stricter context isolation.
 #[must_use]
-pub fn known_contexts_from_scope_registries() -> HashMap<String, String> {
+pub fn known_contexts_from_scope_registries(core: &CoreFields) -> HashMap<String, String> {
     let mut result = HashMap::new();
-    if let Ok(guard) = scope_registries().lock() {
+    if let Ok(guard) = core.scope_registries().lock() {
         for registry in guard.values() {
             for entry in registry.entries() {
                 result
@@ -294,18 +281,34 @@ pub fn handle_entry_to_resolution(
 // HandleQuerier implementation
 // ---------------------------------------------------------------------------
 
-/// A [`HandleQuerier`] implementation that queries the global in-memory handle registries.
-/// Used by `address_resolve` for the context handle lookup layer.
-pub struct LocalHandleQuerier;
+/// A [`HandleQuerier`] implementation that queries the per-bridge-instance
+/// handle registries owned by [`CoreFields`].
+///
+/// Constructed with a reference into the bridge instance (`&CoreFields`) so
+/// lookups see the registries scoped to that instance. Used by
+/// `address_resolve` for the context handle lookup layer.
+pub struct LocalHandleQuerier<'a> {
+    registries: &'a Mutex<HashMap<String, HandleRegistry>>,
+}
 
-impl HandleQuerier for LocalHandleQuerier {
+impl<'a> LocalHandleQuerier<'a> {
+    /// Constructs a querier backed by the registries owned by `core`.
+    #[must_use]
+    pub const fn new(core: &'a CoreFields) -> Self {
+        Self {
+            registries: core.handle_registries(),
+        }
+    }
+}
+
+impl HandleQuerier for LocalHandleQuerier<'_> {
     async fn lookup_handle(
         &self,
         context_id: &String,
         handle: &str,
         type_filter: Option<AddressType>,
     ) -> Vec<AddressResolution> {
-        let Ok(guard) = handle_registries().lock() else {
+        let Ok(guard) = self.registries.lock() else {
             return Vec::new();
         };
         let Some(registry) = guard.get(context_id.as_str()) else {
@@ -676,45 +679,45 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Global singletons: petname_maps / handle_registries
+    // Per-instance registries: petname_maps / handle_registries
     // -----------------------------------------------------------------------
 
     #[test]
     fn petname_map_insert_retrieve_reset() {
+        let core = CoreFields::new();
         let owner = "did:dht:zsingleton-pm-test";
-        reset_petname_map_for(owner);
 
         // Insert a petname map entry.
         {
-            let mut guard = petname_maps().lock().expect("lock");
+            let mut guard = core.petname_maps().lock().expect("lock");
             let pm = guard.entry(owner.to_owned()).or_default();
             pm.set_petname(scp_identity::DID::from("did:dht:zbob"), "bob".to_owned());
         }
 
         // Retrieve and verify.
         {
-            let guard = petname_maps().lock().expect("lock");
+            let guard = core.petname_maps().lock().expect("lock");
             let pm = guard.get(owner).expect("should exist");
             let resolved = pm.resolve_petname("bob", &scp_primitives::SystemClock);
             assert!(!resolved.is_empty());
         }
 
         // Reset and verify it's gone.
-        reset_petname_map_for(owner);
+        reset_petname_map_for(&core, owner);
         {
-            let guard = petname_maps().lock().expect("lock");
+            let guard = core.petname_maps().lock().expect("lock");
             assert!(guard.get(owner).is_none());
         }
     }
 
     #[test]
     fn handle_registry_insert_retrieve_reset() {
+        let core = CoreFields::new();
         let ctx = "singleton-hr-test-ctx";
-        reset_handle_registry_for(ctx);
 
         // Insert a handle.
         {
-            let mut guard = handle_registries().lock().expect("lock");
+            let mut guard = core.handle_registries().lock().expect("lock");
             let registry = guard
                 .entry(ctx.to_owned())
                 .or_insert_with(|| HandleRegistry::new(ctx.to_owned()));
@@ -733,7 +736,7 @@ mod tests {
 
         // Lookup.
         {
-            let guard = handle_registries().lock().expect("lock");
+            let guard = core.handle_registries().lock().expect("lock");
             let registry = guard.get(ctx).expect("should exist");
             let result = registry.lookup(&HandleLookupParams {
                 handle: "charlie".to_owned(),
@@ -744,9 +747,9 @@ mod tests {
         }
 
         // Reset and verify it's gone.
-        reset_handle_registry_for(ctx);
+        reset_handle_registry_for(&core, ctx);
         {
-            let guard = handle_registries().lock().expect("lock");
+            let guard = core.handle_registries().lock().expect("lock");
             assert!(guard.get(ctx).is_none());
         }
     }
@@ -757,12 +760,12 @@ mod tests {
 
     #[tokio::test]
     async fn local_handle_querier_lookup_returns_results() {
+        let core = CoreFields::new();
         let ctx = "lhq-test-ctx-returns";
-        reset_handle_registry_for(ctx);
 
         // Register a handle.
         {
-            let mut guard = handle_registries().lock().expect("lock");
+            let mut guard = core.handle_registries().lock().expect("lock");
             let registry = guard
                 .entry(ctx.to_owned())
                 .or_insert_with(|| HandleRegistry::new(ctx.to_owned()));
@@ -775,7 +778,7 @@ mod tests {
             registry.register(&params, &did, &scp_primitives::SystemClock);
         }
 
-        let querier = LocalHandleQuerier;
+        let querier = LocalHandleQuerier::new(&core);
         let results = querier.lookup_handle(&ctx.to_owned(), "dave", None).await;
         assert_eq!(results.len(), 1);
         match &results[0] {
@@ -784,13 +787,12 @@ mod tests {
             }
             AddressResolution::Context { .. } => panic!("expected Identity"),
         }
-
-        reset_handle_registry_for(ctx);
     }
 
     #[tokio::test]
     async fn local_handle_querier_lookup_empty_when_context_not_found() {
-        let querier = LocalHandleQuerier;
+        let core = CoreFields::new();
+        let querier = LocalHandleQuerier::new(&core);
         let results = querier
             .lookup_handle(&"nonexistent-ctx-xyz".to_owned(), "anyone", None)
             .await;
@@ -799,12 +801,12 @@ mod tests {
 
     #[tokio::test]
     async fn local_handle_querier_type_filter() {
+        let core = CoreFields::new();
         let ctx = "lhq-filter-test-ctx";
-        reset_handle_registry_for(ctx);
 
         // Register an identity handle.
         {
-            let mut guard = handle_registries().lock().expect("lock");
+            let mut guard = core.handle_registries().lock().expect("lock");
             let registry = guard
                 .entry(ctx.to_owned())
                 .or_insert_with(|| HandleRegistry::new(ctx.to_owned()));
@@ -817,7 +819,7 @@ mod tests {
             registry.register(&params, &did, &scp_primitives::SystemClock);
         }
 
-        let querier = LocalHandleQuerier;
+        let querier = LocalHandleQuerier::new(&core);
 
         // Filter for Identity — should find the entry.
         let identity_results = querier
@@ -830,13 +832,12 @@ mod tests {
             .lookup_handle(&ctx.to_owned(), "eve", Some(AddressType::Context))
             .await;
         assert!(context_results.is_empty());
-
-        reset_handle_registry_for(ctx);
     }
 
     #[tokio::test]
     async fn local_handle_querier_domain_and_attestation_return_empty() {
-        let querier = LocalHandleQuerier;
+        let core = CoreFields::new();
+        let querier = LocalHandleQuerier::new(&core);
         assert!(
             querier
                 .lookup_domain_handle("example.com", "alice")

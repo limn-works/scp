@@ -107,8 +107,11 @@ If any cell is empty, the plan is incomplete — expand scope or file dependent 
 **NEVER modify enforcement files to bypass failures.**
 Files: pipeline_wiring.rs, ffi_conformance.rs, sdk-capability-matrix.json,
 check-cross-layer.sh, check-protocol-deps.sh, check-protocol-sync.py,
+check-no-bridge-globals.sh, check-no-default-in-tests.sh,
+check-no-fallback-registry.sh, check-handle-affinity.sh,
 check-bridge-symmetry.sh, bridge-aliases.json, check-call-invariants.py,
 call-invariants-baseline.json, bridge_ratchet_baseline.json,
+ratchet/once-lock-count.json,
 CLAUDE.md (enforcement sections).
 If a check fails, fix the code. The only legitimate modifications are:
 - Adding NEW assertions/operations (expanding coverage)

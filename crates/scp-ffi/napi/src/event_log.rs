@@ -85,6 +85,7 @@ pub async fn event_log_query(
     handle: &NapiContextHandle,
     filter_json: Option<String>,
 ) -> napi::Result<Vec<NapiEvent>> {
+    crate::napi_check_handle!(handle);
     crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
 
     let filter: Option<serde_json::Value> = match filter_json {
@@ -154,8 +155,8 @@ pub async fn event_log_query(
 
     // Fallback: read from the per-context UCAN state event log.
     let (event_count, merkle_root_hex) = crate::runtime::with_context(&context_id_str, |rt| {
-        let count = scp_event_log::tree::event_count(&rt.event_log);
-        let root = scp_event_log::tree::root(&rt.event_log);
+        let count = scp_event_log::tree::event_count(&rt.core.event_log);
+        let root = scp_event_log::tree::root(&rt.core.event_log);
         Ok((count, hex::encode(root)))
     })
     .map_err(napi::Error::from)?;
@@ -223,6 +224,7 @@ pub async fn event_log_verify(
     handle: &NapiContextHandle,
     claim_json: String,
 ) -> napi::Result<NapiProof> {
+    crate::napi_check_handle!(handle);
     crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
 
     let claim: serde_json::Value =
@@ -252,7 +254,7 @@ pub async fn event_log_verify(
         .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten())
     {
         crate::runtime::with_context(&context_id, |rt| {
-            let existing_leaves = rt.event_log.leaves();
+            let existing_leaves = rt.core.event_log.leaves();
             let existing_count = existing_leaves.len();
 
             // Prefix consistency check: if existing leaves diverge from the
@@ -264,15 +266,15 @@ pub async fn event_log_verify(
 
             if !prefix_matches && existing_count > 0 {
                 // Leaves diverge — rebuild from scratch.
-                let ctx_id = rt.event_log.context_id().to_owned();
-                rt.event_log = scp_event_log::EventLog::new(ctx_id);
+                let ctx_id = rt.core.event_log.context_id().to_owned();
+                rt.core.event_log = scp_event_log::EventLog::new(ctx_id);
                 for entry in &entries {
-                    rt.event_log.push_leaf_raw(entry.hash);
+                    rt.core.event_log.push_leaf_raw(entry.hash);
                 }
             } else {
                 // Append-only: push entries that haven't been synced yet.
                 for entry in entries.iter().skip(existing_count) {
-                    rt.event_log.push_leaf_raw(entry.hash);
+                    rt.core.event_log.push_leaf_raw(entry.hash);
                 }
             }
             Ok(())
@@ -292,11 +294,11 @@ pub async fn event_log_verify(
                 .map_err(napi::Error::from)?;
 
             let (verified, details_json) = crate::runtime::with_context(&context_id, |rt| {
-                let proof = scp_event_log::proof::prove_inclusion(&rt.event_log, leaf_index)
+                let proof = scp_event_log::proof::prove_inclusion(&rt.core.event_log, leaf_index)
                     .map_err(|e| ScpNapiError::Context {
-                        message: format!("inclusion proof failed: {e}"),
-                        code: codes::CTX_2025.to_owned(),
-                    })?;
+                    message: format!("inclusion proof failed: {e}"),
+                    code: codes::CTX_2025.to_owned(),
+                })?;
                 let verified = scp_event_log::proof::verify_inclusion(&proof);
 
                 let path_steps: Vec<serde_json::Value> = proof
@@ -349,47 +351,48 @@ pub async fn event_log_verify(
                 })
             })?;
 
-            let (verified, details_json) =
-                crate::runtime::with_context(&context_id, |rt| {
-                    let proof = scp_event_log::proof::prove_absence(&rt.event_log, &event_hash)
-                        .map_err(|e| ScpNapiError::Context {
-                            message: format!("absence proof failed: {e}"),
-                            code: codes::CTX_2025.to_owned(),
-                        })?;
+            let (verified, details_json) = crate::runtime::with_context(&context_id, |rt| {
+                let proof = scp_event_log::proof::prove_absence(&rt.core.event_log, &event_hash)
+                    .map_err(|e| ScpNapiError::Context {
+                        message: format!("absence proof failed: {e}"),
+                        code: codes::CTX_2025.to_owned(),
+                    })?;
 
-                    let lower = proof.lower.as_ref().map(|lwp| {
-                        serde_json::json!({
-                            "leaf_hash": hex::encode(lwp.leaf_hash),
-                            "leaf_index": lwp.leaf_index,
-                        })
-                    });
+                let lower = proof.lower.as_ref().map(|lwp| {
+                    serde_json::json!({
+                        "leaf_hash": hex::encode(lwp.leaf_hash),
+                        "leaf_index": lwp.leaf_index,
+                    })
+                });
 
-                    let upper = proof.upper.as_ref().map(|uwp| {
-                        serde_json::json!({
-                            "leaf_hash": hex::encode(uwp.leaf_hash),
-                            "leaf_index": uwp.leaf_index,
-                        })
-                    });
+                let upper = proof.upper.as_ref().map(|uwp| {
+                    serde_json::json!({
+                        "leaf_hash": hex::encode(uwp.leaf_hash),
+                        "leaf_index": uwp.leaf_index,
+                    })
+                });
 
-                    let lower_verified = proof.lower.as_ref().is_none_or(|lwp| {
-                        scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof)
-                    });
-                    let upper_verified = proof.upper.as_ref().is_none_or(|uwp| {
-                        scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof)
-                    });
-                    let verified = lower_verified && upper_verified;
+                let lower_verified = proof
+                    .lower
+                    .as_ref()
+                    .is_none_or(|lwp| scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof));
+                let upper_verified = proof
+                    .upper
+                    .as_ref()
+                    .is_none_or(|uwp| scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof));
+                let verified = lower_verified && upper_verified;
 
-                    let details = serde_json::json!({
-                        "query_hash": hex::encode(proof.query_hash),
-                        "root": hex::encode(proof.root),
-                        "leaf_count": proof.leaf_count,
-                        "lower": lower,
-                        "upper": upper,
-                    });
+                let details = serde_json::json!({
+                    "query_hash": hex::encode(proof.query_hash),
+                    "root": hex::encode(proof.root),
+                    "leaf_count": proof.leaf_count,
+                    "lower": lower,
+                    "upper": upper,
+                });
 
-                    Ok((verified, details.to_string()))
-                })
-                .map_err(napi::Error::from)?;
+                Ok((verified, details.to_string()))
+            })
+            .map_err(napi::Error::from)?;
 
             Ok(NapiProof {
                 verified,
@@ -460,6 +463,7 @@ pub fn event_log_checkpoint(
     identity: &crate::identity::NapiIdentity,
     epoch: f64,
 ) -> napi::Result<NapiCheckpoint> {
+    crate::napi_check_handle!(handle, identity);
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
         let _ = (&handle, &identity, &epoch);
@@ -508,7 +512,7 @@ pub fn event_log_checkpoint(
             // runtime to block_on the future.
             crate::runtime().block_on(async {
                 scp_event_log::checkpoint::generate_checkpoint(
-                    &rt.event_log,
+                    &rt.core.event_log,
                     &sender_did,
                     epoch_u64,
                     &signer,
@@ -566,6 +570,7 @@ pub fn event_log_checkpoint_by_did(
     did: String,
     epoch: f64,
 ) -> napi::Result<NapiCheckpoint> {
+    crate::napi_check_handle!(handle);
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
         let _ = (&handle, &did, &epoch);
@@ -602,7 +607,7 @@ pub fn event_log_checkpoint_by_did(
 
             crate::runtime().block_on(async {
                 scp_event_log::checkpoint::generate_checkpoint(
-                    &rt.event_log,
+                    &rt.core.event_log,
                     &sender_did,
                     epoch_u64,
                     &signer,

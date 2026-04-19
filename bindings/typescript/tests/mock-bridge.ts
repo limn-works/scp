@@ -362,11 +362,11 @@ export function createMockBridge(): Bridge & {
       }
     },
 
-    contextSubscribe(
+    async contextSubscribe(
       handle: BridgeContextHandle,
       _identityDid: string,
       callback: MessageCallback,
-    ): void {
+    ): Promise<void> {
       const ctx = contexts.get(handle.contextId);
       if (ctx === undefined) {
         throw new Error(`[SCP-CTX-2001] Context not found: ${handle.contextId}`);
@@ -1970,10 +1970,23 @@ export function createMockBridge(): Bridge & {
       return "0.1.0-mock";
     },
 
-    shutdown(_timeoutSecs: number): void {
+    // eslint-disable-next-line @typescript-eslint/require-await -- Signature must match the NAPI async shutdown, but the mock has no async work to drain.
+    async shutdown(_timeoutMillis: number): Promise<void> {
       identities.clear();
       contexts.clear();
       transports.clear();
+    },
+
+    suspend(): void {
+      // Mock: no-op. Real bridges call BridgeInstance::suspend.
+    },
+
+    resume(): Promise<void> {
+      // Mock: no-op. Real bridges call BridgeInstance::resume, which
+      // became async after #1678 (chains transport reconnect + persisted
+      // context restoration). The mock returns an already-resolved
+      // promise to keep the Bridge interface satisfied.
+      return Promise.resolve();
     },
   };
 

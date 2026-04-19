@@ -80,6 +80,7 @@ class RealFFITest {
                     val relayUrl = handle.relayUrl()
 
                     // Create a bootstrap identity for MLS credential init.
+                    // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                     val bootstrapIdentity = uniffi.scp.identityCreate("in_memory")
 
                     // Configure the ContextManager with relay transport.
@@ -119,6 +120,7 @@ class RealFFITest {
         fun `create identity with in-memory custody`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val identity = uniffi.scp.identityCreate("in_memory")
                 val did = identity.did()
                 assertTrue(did.startsWith("did:dht:"), "DID should start with did:dht:, got: $did")
@@ -129,7 +131,9 @@ class RealFFITest {
         fun `multiple identities have distinct DIDs`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val a = uniffi.scp.identityCreate("in_memory")
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val b = uniffi.scp.identityCreate("in_memory")
                 assertNotEquals(a.did(), b.did())
             }
@@ -138,6 +142,7 @@ class RealFFITest {
         fun `reject unknown custody type`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val result = runCatching { uniffi.scp.identityCreate("magic") }
                 assertTrue(result.isFailure, "identityCreate with unknown custody should throw")
             }
@@ -163,8 +168,10 @@ class RealFFITest {
         fun `create context returns valid handle`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val identity = uniffi.scp.identityCreate("in_memory")
                 val handle =
+                    // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                     uniffi.scp.contextCreate(
                         identity,
                         ephemeralParams(listOf("messages:read", "messages:write")),
@@ -176,9 +183,12 @@ class RealFFITest {
         fun `join and leave context`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val alice = uniffi.scp.identityCreate("in_memory")
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val bob = uniffi.scp.identityCreate("in_memory")
                 val handle =
+                    // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                     uniffi.scp.contextCreate(
                         alice,
                         ephemeralParams(
@@ -192,6 +202,7 @@ class RealFFITest {
                         ),
                     )
 
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 uniffi.scp.contextJoin(handle, bob.did())
                 assertEquals(2uL, uniffi.scp.contextMemberCount(handle), "count after join")
                 assertTrue(uniffi.scp.contextIsMember(handle, bob.did()))
@@ -199,6 +210,7 @@ class RealFFITest {
                 assertTrue(members.contains(bob.did()), "Members should include bob")
                 assertTrue(members.contains(alice.did()), "Members should include alice")
 
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 uniffi.scp.contextLeave(handle, bob.did())
                 assertEquals(1uL, uniffi.scp.contextMemberCount(handle), "count after leave")
                 assertFalse(uniffi.scp.contextIsMember(handle, bob.did()))
@@ -208,12 +220,15 @@ class RealFFITest {
         fun `close context`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val alice = uniffi.scp.identityCreate("in_memory")
                 val handle =
+                    // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                     uniffi.scp.contextCreate(
                         alice,
                         ephemeralParams(listOf("messages:read", "context:close")),
                     )
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 uniffi.scp.contextClose(handle, alice.did())
                 val state = handle.state()
                 assertTrue(
@@ -226,7 +241,9 @@ class RealFFITest {
         fun `drain events returns list`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val alice = uniffi.scp.identityCreate("in_memory")
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
                 val events = uniffi.scp.contextDrainEvents(handle)
                 assertNotNull(events)
@@ -253,7 +270,9 @@ class RealFFITest {
         fun `member count after creation is 1`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val alice = uniffi.scp.identityCreate("in_memory")
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
                 assertEquals(1uL, uniffi.scp.contextMemberCount(handle))
             }
@@ -262,7 +281,9 @@ class RealFFITest {
         fun `creator is member`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val alice = uniffi.scp.identityCreate("in_memory")
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
                 assertTrue(uniffi.scp.contextIsMember(handle, alice.did()))
             }
@@ -271,7 +292,9 @@ class RealFFITest {
         fun `creator has admin role`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val alice = uniffi.scp.identityCreate("in_memory")
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
                 val role = uniffi.scp.contextMemberRole(handle, alice.did())
                 assertNotNull(role, "Creator should have a role")
@@ -285,7 +308,9 @@ class RealFFITest {
         fun `member DIDs contains creator`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val alice = uniffi.scp.identityCreate("in_memory")
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val handle = uniffi.scp.contextCreate(alice, ephemeralParams())
                 val members = uniffi.scp.contextMemberDids(handle)
                 assertTrue(members.contains(alice.did()), "Member DIDs should contain creator")
@@ -300,6 +325,7 @@ class RealFFITest {
         fun `register and verify tool`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val alice = uniffi.scp.identityCreate("in_memory")
                 val params =
                     uniffi.scp.ContextParams(
@@ -312,6 +338,7 @@ class RealFFITest {
                         promotable = false,
                         minProtocolVersion = 0u,
                     )
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val handle = uniffi.scp.contextCreate(alice, params)
                 val toolDef =
                     uniffi.scp.ToolDefinition(
@@ -339,7 +366,9 @@ class RealFFITest {
         fun `mint UCAN token`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val alice = uniffi.scp.identityCreate("in_memory")
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val bob = uniffi.scp.identityCreate("in_memory")
                 val params =
                     uniffi.scp.ContextParams(
@@ -352,6 +381,7 @@ class RealFFITest {
                         promotable = false,
                         minProtocolVersion = 0u,
                     )
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val handle = uniffi.scp.contextCreate(alice, params)
                 val token = uniffi.scp.ucanMint(handle, bob.did(), listOf("messages:read"), null)
                 val tokenData = token.tokenData()
@@ -362,6 +392,7 @@ class RealFFITest {
         fun `revoke UCAN token`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val alice = uniffi.scp.identityCreate("in_memory")
                 val params =
                     uniffi.scp.ContextParams(
@@ -374,9 +405,11 @@ class RealFFITest {
                         promotable = false,
                         minProtocolVersion = 0u,
                     )
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val handle = uniffi.scp.contextCreate(alice, params)
 
                 // Mint a token so the UCAN state is fully initialised for this context.
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val bob = uniffi.scp.identityCreate("in_memory")
                 val token = uniffi.scp.ucanMint(handle, bob.did(), listOf("messages:read"), null)
                 assertNotNull(token.tokenData(), "Minted token should have data")
@@ -400,6 +433,7 @@ class RealFFITest {
         fun `query returns events`() =
             runTest {
                 assumeTrue(nativeAvailable, skipReason)
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val alice = uniffi.scp.identityCreate("in_memory")
                 val params =
                     uniffi.scp.ContextParams(
@@ -412,6 +446,7 @@ class RealFFITest {
                         promotable = false,
                         minProtocolVersion = 0u,
                     )
+                // SCP-DEFAULT-INSTANCE-OK: raw UniFFI binding test; bypasses SDK facade by design
                 val handle = uniffi.scp.contextCreate(alice, params)
                 val events = uniffi.scp.eventLogQuery(handle, null)
                 assertNotNull(events)

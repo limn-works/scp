@@ -495,6 +495,7 @@ class TestProvenance:
     """Provenance evaluation and attachment through real FFI."""
 
     async def test_evaluate_quality(self):
+        # SCP-DEFAULT-INSTANCE-OK: pure-function FFI call via _scp_core; no bridge state
         result = _scp_core.evaluate_provenance_quality(None, "persistent", "active", None)
         assert isinstance(result, int)
         assert 0 <= result <= 3

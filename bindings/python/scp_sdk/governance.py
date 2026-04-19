@@ -13,6 +13,7 @@ import asyncio
 import enum
 from typing import TYPE_CHECKING
 
+from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import ContextError
 
 if TYPE_CHECKING:
@@ -76,6 +77,7 @@ class GovernanceActionResult(enum.Enum):
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 async def execute_governance_action(
     context: Context,
     proposal_json: str,
@@ -108,6 +110,7 @@ async def execute_governance_action(
     return GovernanceActionResult.from_bridge(raw)
 
 
+@deprecated_default_instance
 async def propose_ttl_extension(
     context: Context,
     additional_seconds: float,
@@ -134,6 +137,7 @@ async def propose_ttl_extension(
     return await execute_governance_action(context, proposal)
 
 
+@deprecated_default_instance
 async def handle_ttl_expiry(context: Context) -> GovernanceActionResult:
     """Handle TTL expiry by executing a context close action.
 
@@ -155,6 +159,7 @@ async def handle_ttl_expiry(context: Context) -> GovernanceActionResult:
     return await execute_governance_action(context, proposal)
 
 
+@deprecated_default_instance
 async def reset_ttl_timer(
     context: Context,
     ttl_seconds: float,
@@ -183,6 +188,7 @@ async def reset_ttl_timer(
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 async def propose_governance_action(
     context: Context,
     action_json: str,
@@ -225,6 +231,7 @@ async def propose_governance_action(
     )
 
 
+@deprecated_default_instance
 async def approve_governance_proposal(
     context: Context,
     proposal_id_hex: str,
@@ -263,6 +270,7 @@ async def approve_governance_proposal(
     )
 
 
+@deprecated_default_instance
 async def reject_governance_proposal(
     context: Context,
     proposal_id_hex: str,
@@ -299,6 +307,7 @@ async def reject_governance_proposal(
     )
 
 
+@deprecated_default_instance
 async def withdraw_governance_vote(
     context: Context,
     proposal_id_hex: str,
@@ -338,6 +347,7 @@ async def withdraw_governance_vote(
     )
 
 
+@deprecated_default_instance
 async def get_governance_proposal(
     context: Context,
     proposal_id_hex: str,
@@ -370,6 +380,7 @@ async def get_governance_proposal(
     )
 
 
+@deprecated_default_instance
 async def list_governance_proposals(context: Context) -> str:
     """List all governance proposals for a context.
 
@@ -401,6 +412,7 @@ async def list_governance_proposals(context: Context) -> str:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 async def apply_pending_ceiling_modification(
     context: Context,
     current_timestamp: int,
@@ -433,6 +445,7 @@ async def apply_pending_ceiling_modification(
     )
 
 
+@deprecated_default_instance
 async def finalize_close(context: Context) -> None:
     """Finalize the cooperative close flow for a context in Closing state.
 
@@ -460,6 +473,7 @@ async def finalize_close(context: Context) -> None:
     await asyncio.to_thread(_scp_core.py_finalize_close, context._handle)
 
 
+@deprecated_default_instance
 async def create_governance_checkpoint(
     context: Context,
     *,
@@ -514,6 +528,7 @@ async def create_governance_checkpoint(
     )
 
 
+@deprecated_default_instance
 async def add_checkpoint_cosignature(
     context: Context,
     checkpoint_json: str,
@@ -555,6 +570,7 @@ async def add_checkpoint_cosignature(
     )
 
 
+@deprecated_default_instance
 async def restore_context(context_id: str) -> None:
     """Restore a single persisted context from storage.
 
@@ -578,6 +594,7 @@ async def restore_context(context_id: str) -> None:
     await asyncio.to_thread(_scp_core.py_restore_context, context_id)
 
 
+@deprecated_default_instance
 async def restore_all_contexts() -> str:
     """Restore all persisted contexts from storage.
 

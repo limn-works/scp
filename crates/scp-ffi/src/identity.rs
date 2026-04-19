@@ -40,11 +40,9 @@ use scp_identity::{
     DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, InMemoryDhtClient,
     NoOpRelayQuerier, ScpIdentity,
 };
-use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::file::FileKeyCustody;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
-use scp_platform::testing::InMemoryStorage;
 use scp_platform::traits::{KeyCustody, Storage};
 use scp_primitives::Clock;
 
@@ -130,6 +128,10 @@ pub struct PyIdentity {
     /// affordance. See `scp-runtime::scpid_sign` and
     /// `bindings/python/tests/bridge_parity/seed_operations.py::OP_SIGN_MESSAGE`.
     verifying_key_hex: Option<String>,
+    /// Bridge instance affinity id (Phase 4 PR 1 — #1549). Consumed by
+    /// [`crate::pyscp_check_handle!`] at every `#[pyfunction]` entry that
+    /// accepts this handle.
+    pub(crate) instance_id: u64,
 }
 
 #[pymethods]
@@ -198,6 +200,36 @@ impl PyIdentity {
     }
 }
 
+impl PyIdentity {
+    /// Creates a new `PyIdentity` tagged with the default bridge instance's
+    /// `instance_id`. Phase 4 PR 1 (#1549): centralises affinity-id wiring
+    /// so every construction site picks up the same monotonic counter.
+    ///
+    /// `verifying_key_hex` is the hex-encoded VM `#0` public key for
+    /// deterministic cross-bridge parity assertions (ADR-046). Pass `None`
+    /// when the handle is loaded without live key material (e.g. via
+    /// [`py_identity_load`]).
+    #[must_use]
+    pub fn new(
+        did: String,
+        custody: String,
+        has_agent_key: bool,
+        verifying_key_hex: Option<String>,
+    ) -> Self {
+        let instance_id = crate::runtime::bridge_instance_raw()
+            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
+                bi.core.instance_id()
+            });
+        Self {
+            did,
+            custody,
+            has_agent_key,
+            verifying_key_hex,
+            instance_id,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PyDIDDocument — opaque Python object for DID documents
 // ---------------------------------------------------------------------------
@@ -222,6 +254,12 @@ impl PyIdentity {
 pub struct PyDIDDocument {
     /// The underlying Rust DID document.
     inner: DidDocument,
+    /// Bridge instance affinity id (Phase 4 PR 1 — #1549).
+    ///
+    /// `dead_code` allowance: future commits of this PR will add
+    /// `check_handle` at every entry point that accepts this handle.
+    #[allow(dead_code)]
+    pub(crate) instance_id: u64,
 }
 
 #[pymethods]
@@ -320,6 +358,22 @@ impl PyDIDDocument {
 
     fn __str__(&self) -> &str {
         &self.inner.id
+    }
+}
+
+impl PyDIDDocument {
+    /// Creates a new `PyDIDDocument` tagged with the default bridge
+    /// instance's `instance_id`.
+    #[must_use]
+    pub fn new(document: DidDocument) -> Self {
+        let instance_id = crate::runtime::bridge_instance_raw()
+            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
+                bi.core.instance_id()
+            });
+        Self {
+            inner: document,
+            instance_id,
+        }
     }
 }
 
@@ -610,23 +664,17 @@ fn py_identity_create(py: Python<'_>, custody: &str, seed: Option<&[u8]>) -> PyR
             );
 
             // Persist identity state if storage is initialized (SCP-217).
-            // Bind to concrete type to resolve method ambiguity with the
-            // Arc<T>: Storage blanket impl (issue #329).
-            if let Ok(arc_storage) = crate::runtime::get_storage() {
-                let s: &EncryptingAdapter<InMemoryStorage> = arc_storage.as_ref();
+            // `storage` is `&StorageProvider` — impls `Storage` via enum
+            // dispatch (no Arc blanket-impl ambiguity).
+            if let Ok(storage) = crate::runtime::get_storage() {
                 let key = identity_state_key(&did);
                 let data = serialize_identity_state(&did, &custody_str);
-                s.store(&key, &data).await.map_err(|e| {
+                storage.store(&key, &data).await.map_err(|e| {
                     ScpPyError::identity(format!("failed to persist identity state: {e}"))
                 })?;
             }
 
-            Ok(PyIdentity {
-                did,
-                custody: custody_str,
-                has_agent_key: false,
-                verifying_key_hex,
-            })
+            Ok(PyIdentity::new(did, custody_str, false, verifying_key_hex))
         })
     })
 }
@@ -734,23 +782,17 @@ fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<
             );
 
             // Persist identity state if storage is initialized (SCP-217).
-            // Bind to concrete type to resolve method ambiguity with the
-            // Arc<T>: Storage blanket impl (issue #329).
-            if let Ok(arc_storage) = crate::runtime::get_storage() {
-                let s: &EncryptingAdapter<InMemoryStorage> = arc_storage.as_ref();
+            // `storage` is `&StorageProvider` — impls `Storage` via enum
+            // dispatch (no Arc blanket-impl ambiguity).
+            if let Ok(storage) = crate::runtime::get_storage() {
                 let key = identity_state_key(&did);
                 let data = serialize_identity_state(&did, &custody_str);
-                s.store(&key, &data).await.map_err(|e| {
+                storage.store(&key, &data).await.map_err(|e| {
                     ScpPyError::identity(format!("failed to persist identity state: {e}"))
                 })?;
             }
 
-            Ok(PyIdentity {
-                did,
-                custody: custody_str,
-                has_agent_key: true,
-                verifying_key_hex,
-            })
+            Ok(PyIdentity::new(did, custody_str, true, verifying_key_hex))
         })
     })
 }
@@ -805,14 +847,13 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
             ))));
         }
 
-        let arc_storage = crate::runtime::get_storage().map_err(PyErr::from)?;
+        let storage = crate::runtime::get_storage().map_err(PyErr::from)?;
 
         rt.block_on(async {
             let key = identity_state_key(&did_owned);
-            // Bind to concrete type to resolve method ambiguity with the
-            // Arc<T>: Storage blanket impl (issue #329).
-            let s: &EncryptingAdapter<InMemoryStorage> = arc_storage.as_ref();
-            let data = s
+            // `storage` is `&StorageProvider` which impls `Storage` directly
+            // via enum dispatch — no Arc blanket-impl ambiguity.
+            let data = storage
                 .retrieve(&key)
                 .await
                 .map_err(|e| {
@@ -848,12 +889,12 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
                 // identity is still usable, just without the parity-test
                 // verifying_key field populated.
                 let verifying_key_hex = verifying_key_hex_for_registered_did(&did_owned).await;
-                return Ok(PyIdentity {
-                    did: stored_did,
-                    custody: custody_str,
-                    has_agent_key: has_agent,
+                return Ok(PyIdentity::new(
+                    stored_did,
+                    custody_str,
+                    has_agent,
                     verifying_key_hex,
-                });
+                ));
             }
 
             Err(PyErr::from(ScpPyError::identity(format!(
@@ -898,7 +939,7 @@ fn py_identity_resolve(py: Python<'_>, did: &str) -> PyResult<PyDIDDocument> {
                 .await
                 .map_err(ScpPyError::from)?;
 
-            Ok(PyDIDDocument { inner: document })
+            Ok(PyDIDDocument::new(document))
         })
     })
 }
@@ -925,6 +966,7 @@ fn py_identity_resolve(py: Python<'_>, did: &str) -> PyResult<PyDIDDocument> {
 /// See ADR-003 acceptance criterion 4a and SCP-214 criterion 9.
 #[pyfunction]
 fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
+    crate::pyscp_check_handle!(identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -956,12 +998,12 @@ fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyI
                 .ok()
                 .map(|pk| hex::encode(pk.as_bytes()));
 
-            Ok(PyIdentity {
-                did: did.clone(),
-                custody: custody_str.clone(),
-                has_agent_key: has_agent,
+            Ok(PyIdentity::new(
+                did.clone(),
+                custody_str.clone(),
+                has_agent,
                 verifying_key_hex,
-            })
+            ))
         })
     });
     result.map_err(PyErr::from)
@@ -992,6 +1034,7 @@ fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyI
 /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
 #[pyfunction]
 fn py_identity_add_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
+    crate::pyscp_check_handle!(identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -1022,12 +1065,12 @@ fn py_identity_add_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<
                 .ok()
                 .map(|pk| hex::encode(pk.as_bytes()));
 
-            Ok(PyIdentity {
-                did: did.clone(),
-                custody: custody_str.clone(),
-                has_agent_key: true,
+            Ok(PyIdentity::new(
+                did.clone(),
+                custody_str.clone(),
+                true,
                 verifying_key_hex,
-            })
+            ))
         })
     });
     result.map_err(PyErr::from)
@@ -1058,6 +1101,7 @@ fn py_identity_add_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<
 /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
 #[pyfunction]
 fn py_identity_rotate_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
+    crate::pyscp_check_handle!(identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -1088,12 +1132,12 @@ fn py_identity_rotate_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
                 .ok()
                 .map(|pk| hex::encode(pk.as_bytes()));
 
-            Ok(PyIdentity {
-                did: did.clone(),
-                custody: custody_str.clone(),
-                has_agent_key: true,
+            Ok(PyIdentity::new(
+                did.clone(),
+                custody_str.clone(),
+                true,
                 verifying_key_hex,
-            })
+            ))
         })
     });
     result.map_err(PyErr::from)
@@ -1123,6 +1167,7 @@ fn py_identity_rotate_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
 /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
 #[pyfunction]
 fn py_identity_remove_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
+    crate::pyscp_check_handle!(identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -1153,12 +1198,12 @@ fn py_identity_remove_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
                 .ok()
                 .map(|pk| hex::encode(pk.as_bytes()));
 
-            Ok(PyIdentity {
-                did: did.clone(),
-                custody: custody_str.clone(),
-                has_agent_key: false,
+            Ok(PyIdentity::new(
+                did.clone(),
+                custody_str.clone(),
+                false,
                 verifying_key_hex,
-            })
+            ))
         })
     });
     result.map_err(PyErr::from)
@@ -1187,6 +1232,7 @@ fn py_identity_remove_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
 /// See ADR-003 acceptance criterion 4b and SCP-214 criterion 10.
 #[pyfunction]
 fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
+    crate::pyscp_check_handle!(identity);
     let old_did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -1285,12 +1331,12 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                     identity_link_attestations: existing_attestations,
                 },
             );
-            Ok(PyIdentity {
-                did: new_did,
-                custody: custody_str,
-                has_agent_key: has_agent,
+            Ok(PyIdentity::new(
+                new_did,
+                custody_str,
+                has_agent,
                 verifying_key_hex,
-            })
+            ))
         })
     })
 }

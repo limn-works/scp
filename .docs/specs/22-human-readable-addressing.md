@@ -167,6 +167,8 @@ The `did` parameter in `handle_deregister` is explicit rather than inferred from
 
 **Two-tier model.** Handle tools follow the same two-tier architecture as existing discovery tools (§6.2.2B). Writers (MLS members) process handle registrations. Readers (DID-authenticated, unbounded) perform handle lookups. Registration is a write operation processed by writers; lookup is a read operation available to all.
 
+**Instance scope.** Handle registries are **per-context within a single `SCP` instance** (ADR-048). Each `SCP` instance maintains its own in-process registry state keyed by context ID; two `SCP` instances in the same process do not share handle-registry storage. The authoritative registry lives inside each context (replicated via the context event log to all MLS members) — the `SCP`-instance-local registry is an in-memory materialized view of that context state. Cross-instance convergence happens through the context event log, not through any process-global cache. This clarification matches the existing semantics; it is not a semantic change.
+
 ### 22.3.2 Scope Naming
 
 Contexts with discovery tools have a `name` field in their metadata (§5.7). The name used as the `scope` in addresses is this metadata name, normalized: lowercased, spaces replaced with hyphens, non-alphanumeric characters (except hyphens) removed. This normalized form is the **canonical scope name**.
@@ -334,6 +336,8 @@ scope_deregister(params: ScopeDeregisterParams) → ScopeDeregisterResult
 
 **Metadata bounds.** `ScopeMetadata.description` max 1024 characters. `ScopeMetadata.tags` max 20 items, each max 64 characters.
 
+**Instance scope.** Scope registries are **per-context within a single `SCP` instance** (ADR-048), mirroring the handle-registry scoping in §22.3.1. The authoritative `ScopeRegistry` state lives inside each hosting context and is replicated via its event log; the `SCP`-instance-local `ScopeRegistry` is an in-memory materialized view. Two `SCP` instances do not share scope-registry storage. Cross-instance convergence is via the hosting context's event log, not via any process-global registry. This clarification does not change the protocol semantics defined in ADR-043 and §22.3.5; it makes the instance boundary explicit.
+
 ## 22.4 Petnames (Local Floor)
 
 Petnames are locally-assigned names for contacts and contexts. They are private, immediate, and require zero infrastructure. Petnames are the resolution floor — the addressing capability that always works regardless of what else is available.
@@ -359,6 +363,8 @@ Petnames sync across devices via the identity private state event log (§3.7). S
 **Trust level:** `LocalPetname` — maximum personal trust (the user set it), zero shareability.
 
 **Conflict within petnames.** A user can assign the same petname to multiple DIDs (e.g., two contacts both named "bob"). The resolver flags this as ambiguous and presents both. The user can differentiate by editing petnames ("work-bob", "gym-bob"). This is a local UX concern, not a protocol problem.
+
+**Instance scope.** The petname resolution cache is **per-identity within a single `SCP` instance** (ADR-048). The authoritative petname state lives in the identity's private state event log (§3.7) and is not process-global. Two `SCP` instances holding the same identity converge via the identity private state sync protocol (§3.7.2), not via a shared in-process cache. A single `SCP` instance may hold multiple identities; each identity has its own petname view keyed by owning DID. This clarification codifies existing semantics — the process-global petname cache in pre-ADR-048 implementations was an implementation detail, not a protocol requirement.
 
 ### 22.4.1 SDK Surface
 

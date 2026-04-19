@@ -10,6 +10,7 @@
 
 import { mapBridgeError } from "./errors";
 import { getBridge } from "./internal/bridge";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -56,6 +57,7 @@ export async function estimateCost(
   actionType: PaidActionType,
   metrics?: ObservableMetrics,
 ): Promise<number> {
+  deprecatedDefaultInstance("estimateCost");
   try {
     const bridge = await getBridge();
     const metricsJson = JSON.stringify({
@@ -79,6 +81,7 @@ export async function estimateCost(
  * @returns `true` if payment is required.
  */
 export async function policyRequiresPayment(policyJson: string): Promise<boolean> {
+  deprecatedDefaultInstance("policyRequiresPayment");
   try {
     const bridge = await getBridge();
     return bridge.economyPolicyRequiresPayment(policyJson);
@@ -94,6 +97,7 @@ export async function policyRequiresPayment(policyJson: string): Promise<boolean
  * @returns `true` if auto-accept is blocked.
  */
 export async function autoAcceptBlocked(policyJson: string): Promise<boolean> {
+  deprecatedDefaultInstance("autoAcceptBlocked");
   try {
     const bridge = await getBridge();
     return bridge.economyAutoAcceptBlocked(policyJson);
@@ -109,6 +113,7 @@ export async function autoAcceptBlocked(policyJson: string): Promise<boolean> {
  * @returns `true` if the policy is locked.
  */
 export async function checkPolicyLock(policyJson: string): Promise<boolean> {
+  deprecatedDefaultInstance("checkPolicyLock");
   try {
     const bridge = await getBridge();
     return bridge.economyCheckPolicyLock(policyJson);
@@ -129,6 +134,7 @@ export async function validatePolicyChange(
   currentJson: string,
   proposedJson: string,
 ): Promise<boolean> {
+  deprecatedDefaultInstance("validatePolicyChange");
   try {
     const bridge = await getBridge();
     return bridge.economyValidatePolicyChange(currentJson, proposedJson);
@@ -148,6 +154,7 @@ export async function evaluateFormula(
   formulaJson: string,
   metrics?: ObservableMetrics,
 ): Promise<number> {
+  deprecatedDefaultInstance("evaluateFormula");
   try {
     const bridge = await getBridge();
     const metricsJson = JSON.stringify({
@@ -176,6 +183,7 @@ export async function evaluateFormula(
  * @returns Remaining budget (smallest currency unit).
  */
 export async function budgetRemaining(contextId: string, did: string): Promise<number> {
+  deprecatedDefaultInstance("budgetRemaining");
   try {
     const bridge = await getBridge();
     return bridge.economyBudgetRemaining(contextId, did);
@@ -192,6 +200,7 @@ export async function budgetRemaining(contextId: string, did: string): Promise<n
  * @param amount - Budget to grant (smallest currency unit).
  */
 export async function budgetGrant(contextId: string, did: string, amount: number): Promise<void> {
+  deprecatedDefaultInstance("budgetGrant");
   try {
     const bridge = await getBridge();
     bridge.economyBudgetGrant(contextId, did, amount);
@@ -213,6 +222,7 @@ export async function budgetRecordSpend(
   did: string,
   amount: number,
 ): Promise<void> {
+  deprecatedDefaultInstance("budgetRecordSpend");
   try {
     const bridge = await getBridge();
     bridge.economyBudgetRecordSpend(contextId, did, amount);
@@ -237,6 +247,7 @@ export async function antispamRecord(
   senderDid: string,
   timestamp: number,
 ): Promise<void> {
+  deprecatedDefaultInstance("antispamRecord");
   try {
     const bridge = await getBridge();
     bridge.economyAntispamRecord(contextId, senderDid, timestamp);
@@ -258,6 +269,7 @@ export async function antispamVelocity(
   senderDid: string,
   now: number,
 ): Promise<number> {
+  deprecatedDefaultInstance("antispamVelocity");
   try {
     const bridge = await getBridge();
     return bridge.economyAntispamVelocity(contextId, senderDid, now);
@@ -287,6 +299,7 @@ export async function antispamEscalatedCost(
   floor?: number,
   cap?: number,
 ): Promise<number> {
+  deprecatedDefaultInstance("antispamEscalatedCost");
   try {
     const bridge = await getBridge();
     const thresholdsJson = JSON.stringify(thresholds);

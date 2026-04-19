@@ -4662,3 +4662,117 @@ async fn forged_pseudonym_announcement_rejected() {
         );
     }
 }
+
+// -----------------------------------------------------------------------
+// Event channel tests (#1539 AC3)
+// -----------------------------------------------------------------------
+
+/// Verify that `with_event_channel` + `subscribe_events` yields a working
+/// broadcast receiver and that `send_message` fires `MessageSent` on it.
+#[tokio::test]
+async fn event_channel_receives_message_sent() {
+    let mut manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    manager.with_event_channel(1024);
+    let mut rx = manager.subscribe_events().expect("channel configured");
+
+    let params = ContextParams {
+        ceiling: vec![
+            Capability::new("messages:read"),
+            Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+    let handle = manager
+        .create_context("evt-ctx".into(), params, "did:key:creator".into(), None)
+        .await
+        .unwrap();
+
+    let sk = signing_key_for_did(&"did:key:creator".into());
+    manager
+        .send_message(
+            &handle,
+            &"did:key:creator".into(),
+            b"event channel test",
+            Some(&sk),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (ctx_id, event) = rx.try_recv().expect("should receive event");
+    assert_eq!(ctx_id, "evt-ctx");
+    match event {
+        ContextEvent::MessageSent {
+            sender_did,
+            sequence_number,
+            payload,
+        } => {
+            assert_eq!(sender_did.as_ref(), "did:key:creator");
+            assert_eq!(sequence_number, 1);
+            assert!(
+                payload.is_empty(),
+                "broadcast channel must strip plaintext from MessageSent"
+            );
+        }
+        other => panic!("expected MessageSent, got: {other:?}"),
+    }
+}
+
+/// Verify that `subscribe_events` returns `None` when no channel is configured.
+#[tokio::test]
+async fn event_channel_none_when_not_configured() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    assert!(manager.subscribe_events().is_none(), "no channel => None");
+}
+
+/// Verify that leaving a context fires `MemberLeft` on the event channel.
+#[tokio::test]
+async fn event_channel_receives_member_left_on_leave() {
+    let mut manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    manager.with_event_channel(1024);
+    let mut rx = manager.subscribe_events().expect("channel configured");
+
+    let params = ContextParams {
+        ceiling: vec![
+            Capability::new("messages:read"),
+            Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+    manager.register_local_did("did:key:alice".into()).await;
+    let handle = manager
+        .create_context("leave-evt-ctx".into(), params, "did:key:alice".into(), None)
+        .await
+        .unwrap();
+
+    let alice_did: DID = "did:key:alice".into();
+    let _ = manager.leave_context(&handle, &alice_did, &alice_did).await;
+
+    let mut found_left = false;
+    while let Ok((_ctx_id, event)) = rx.try_recv() {
+        if matches!(event, ContextEvent::MemberLeft { .. }) {
+            found_left = true;
+            break;
+        }
+    }
+    assert!(
+        found_left,
+        "MemberLeft must appear on channel after leave_context"
+    );
+}

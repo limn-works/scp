@@ -9,6 +9,7 @@
 
 import { mapBridgeError } from "./errors";
 import { getBridge } from "./internal/bridge";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 import { safeJsonParse } from "./internal/json-utils";
 
 // ---------------------------------------------------------------------------
@@ -66,6 +67,7 @@ export async function evaluateProvenanceQuality(options: {
   contextState?: string;
   counterparties?: string[];
 }): Promise<number> {
+  deprecatedDefaultInstance("evaluateProvenanceQuality");
   try {
     const bridge = await getBridge();
     return await bridge.evaluateProvenanceQuality(
@@ -111,6 +113,7 @@ export async function provenanceAttach(
     counterpartyPolicy?: string;
   },
 ): Promise<ProvenanceRecord> {
+  deprecatedDefaultInstance("provenanceAttach");
   try {
     const bridge = await getBridge();
     const raw = bridge.provenanceAttach(
@@ -158,6 +161,7 @@ export async function provenanceCheckChainDepth(
   chainDepth: number,
   maxDepth?: number,
 ): Promise<boolean> {
+  deprecatedDefaultInstance("provenanceCheckChainDepth");
   try {
     const bridge = await getBridge();
     return bridge.provenanceCheckChainDepth(chainDepth, maxDepth);

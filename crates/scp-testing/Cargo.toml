@@ -45,6 +45,7 @@ scp-event-log = { path = "../scp-event-log" }
 scp-identity = { path = "../scp-identity" }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 scp-transport = { path = "../scp-transport" }
+scp-ffi-common = { path = "../scp-ffi/common" }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
@@ -88,6 +89,14 @@ path = "tests/integration/persistence.rs"
 [[test]]
 name = "persistence_advanced"
 path = "tests/integration/persistence_advanced.rs"
+
+[[test]]
+name = "persistence_sdk"
+path = "tests/integration/persistence_sdk.rs"
+
+[[test]]
+name = "multi_relay"
+path = "tests/integration/multi_relay.rs"
 
 [[test]]
 name = "protocol_repository"

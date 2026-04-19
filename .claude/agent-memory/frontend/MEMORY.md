@@ -1,0 +1,2 @@
+- [SCP Phase 4 PR 1 SDK wrappers](project_scp_phase4_pr1_sdk_wrappers.md) — `SCP` class shipped in 4 SDKs + default-instance deprecation scaffold (commit 0040d67d9, ADR-048)
+- [SCP Phase 4 PR 1 SDK review fixes](project_scp_phase4_pr1_sdk_fixes.md) — shutdown ms unification across 4 SDKs, Kotlin AutoCloseable removal, Swift deprecation annotations completed, persistence parameter removed from SDK surfaces until PR 3

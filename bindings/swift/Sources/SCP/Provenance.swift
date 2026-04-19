@@ -87,6 +87,11 @@ public enum ProvenanceBridge {
 ///
 /// - Spec section 24 (Provenance System)
 /// - ADR-019 (Provenance)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func evaluateProvenanceQuality(
     sourceContext: String? = nil,
     sourceType: String,
@@ -117,6 +122,11 @@ public func evaluateProvenanceQuality(
 ///
 /// - Spec section 24 (Provenance System)
 /// - ADR-019 (Provenance)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func attachProvenance(
     sourceContextId: String,
     sourceType: String,
@@ -147,6 +157,11 @@ public func attachProvenance(
 ///
 /// - Spec section 24 (Provenance System)
 /// - ADR-019 (Provenance)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func checkProvenanceChainDepth(
     chainDepth: UInt8,
     maxDepth: UInt8? = nil,

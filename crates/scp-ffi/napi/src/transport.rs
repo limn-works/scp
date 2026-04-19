@@ -12,7 +12,7 @@
 //!
 //! # Transport model
 //!
-//! Transport state is delegated to the global [`BridgeInstance`]'s transport
+//! Transport state is delegated to the default [`NapiBridgeInstance`]'s transport
 //! field (#1549). The `BridgeInstance` stores an `Arc<TransportManager>` behind
 //! a `RwLock` — the `Arc` allows NAPI subscription tasks to hold a reference
 //! across `.await` points without keeping the lock guard alive.
@@ -60,7 +60,7 @@ fn map_transport_lock_error(e: TransportLockError) -> ScpNapiError {
 
 /// Stores a `TransportManager` (called by [`transport_connect`]).
 ///
-/// Wraps in `Arc` and delegates to [`BridgeInstance::set_transport`].
+/// Wraps in `Arc` and delegates to [`CoreFields::set_transport`].
 /// If the `BridgeInstance` doesn't exist yet, lazily creates it from
 /// the existing `ContextManager`.
 ///
@@ -88,7 +88,7 @@ fn set_transport_manager(manager: scp_transport::TransportManager) -> napi::Resu
 /// Stores a pre-built `Arc<TransportManager>` (called by [`crate::server`]
 /// auto-wire where the caller needs to construct the manager externally).
 ///
-/// Delegates to [`BridgeInstance::set_transport`].
+/// Delegates to [`CoreFields::set_transport`].
 ///
 /// # Errors
 ///
@@ -107,7 +107,7 @@ pub(crate) fn set_transport_manager_arc(
 
 /// Executes a closure with a read reference to the `TransportManager`.
 ///
-/// Delegates to [`BridgeInstance::with_transport`].
+/// Delegates to [`CoreFields::with_transport`].
 ///
 /// # Errors
 ///
@@ -123,7 +123,7 @@ pub(crate) fn with_transport_manager<T>(
 
 /// Executes a closure with a mutable reference to the `TransportManager`.
 ///
-/// Delegates to [`BridgeInstance::with_transport_mut`]. Requires exclusive
+/// Delegates to [`CoreFields::with_transport_mut`]. Requires exclusive
 /// `Arc` ownership (refcount == 1). If subscription tasks hold cloned
 /// `Arc` references, this fails with `SCP-TRANS-5003`.
 ///
@@ -141,7 +141,7 @@ pub(crate) fn with_transport_manager_mut<T>(
 
 /// Returns `true` if a transport manager has been initialized.
 fn has_transport_manager() -> bool {
-    crate::runtime::bridge_instance().is_ok_and(|bi| bi.has_transport())
+    crate::runtime::bridge_instance().is_ok_and(scp_ffi_common::CoreFields::has_transport)
 }
 
 /// Returns an `Arc` clone of the current transport manager, if one exists.
@@ -149,7 +149,7 @@ fn has_transport_manager() -> bool {
 /// Used by `context_subscribe` which needs to move the manager reference
 /// into an async task that outlives any lock guard.
 ///
-/// Delegates to [`BridgeInstance::get_transport_arc`].
+/// Delegates to [`CoreFields::get_transport_arc`].
 pub(crate) fn get_transport_manager() -> Option<Arc<scp_transport::TransportManager>> {
     crate::runtime::bridge_instance()
         .ok()
@@ -158,7 +158,7 @@ pub(crate) fn get_transport_manager() -> Option<Arc<scp_transport::TransportMana
 
 /// Clears the transport manager (called by [`transport_disconnect`]).
 ///
-/// Delegates to [`BridgeInstance::clear_transport`].
+/// Delegates to [`CoreFields::clear_transport`].
 ///
 /// # Errors
 ///
@@ -208,6 +208,10 @@ pub struct NapiTransportStatus {
 pub struct NapiTransportManager {
     /// Current connection state.
     status: std::sync::Mutex<NapiTransportStatus>,
+    /// `NapiBridgeInstance` id that minted this handle — used for handle
+    /// affinity checks at every FFI entry point. Mismatches are rejected
+    /// with `SCP-PERM-3030`.
+    pub(crate) instance_id: u64,
 }
 
 #[napi]
@@ -242,6 +246,14 @@ impl NapiTransportManager {
     #[must_use]
     pub fn relay_url(&self) -> Option<String> {
         self.status.lock().ok().and_then(|s| s.relay_url.clone())
+    }
+
+    /// Returns the id of the `SCP` instance that minted this handle, as a
+    /// base-10 string (u64 serialized as string to survive JS number limits).
+    #[napi(getter, js_name = "instanceId")]
+    #[must_use]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
     }
 }
 
@@ -321,6 +333,14 @@ pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportM
             let manager = scp_transport::TransportManager::new(Box::new(adapter));
             set_transport_manager(manager)?;
 
+            // Register the URL on the bridge's pending-reconnect set so
+            // `BridgeInstanceCore::resume` can rebuild the transport after
+            // suspend/resume cycles (#1678). NAPI's `bridge_instance()`
+            // already returns `&'static CoreFields`.
+            if let Ok(core) = crate::runtime::bridge_instance() {
+                core.add_relay_url(relay_url.clone());
+            }
+
             // Spawn suppression → scoring bridge task.
             if let Some(rx) = suppression_rx {
                 spawn_suppression_scoring_task(rx, relay_url.clone());
@@ -332,6 +352,7 @@ pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportM
                     relay_url: Some(relay_url),
                     latency_ms: Some(latency),
                 }),
+                instance_id: crate::runtime::default_instance_id()?,
             };
             increment_handle_count();
             Ok(handle)
@@ -377,6 +398,7 @@ pub async fn transport_status(
     manager: Option<&NapiTransportManager>,
 ) -> napi::Result<NapiTransportStatus> {
     if let Some(mgr) = manager {
+        crate::napi_check_handle!(mgr);
         let mut status = mgr.status();
         // Defense-in-depth: verify the transport manager is actually alive,
         // not just what the manager's local status believes. If the transport
@@ -414,6 +436,7 @@ pub async fn transport_status(
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Result<()> {
+    crate::napi_check_handle!(manager);
     let mut s = manager.status.lock().map_err(|_| ScpNapiError::Transport {
         message: "transport status lock is poisoned".to_owned(),
         code: codes::TRANS_5002.to_owned(),
@@ -427,6 +450,10 @@ pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Resul
         .into());
     }
 
+    // Capture the URL we were connected to before clearing it so the
+    // bridge's pending-reconnect set can drop it too (#1678).
+    let disconnecting_url = s.relay_url.clone();
+
     s.connected = false;
     s.relay_url = None;
     s.latency_ms = None;
@@ -434,6 +461,12 @@ pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Resul
 
     // Drop the transport manager, closing all WebSocket connections.
     clear_transport_manager()?;
+
+    if let Some(ref url) = disconnecting_url
+        && let Ok(core) = crate::runtime::bridge_instance()
+    {
+        core.remove_relay_url(url);
+    }
 
     Ok(())
 }
@@ -851,6 +884,7 @@ mod tests {
                 relay_url: Some("wss://relay.example.com".to_owned()),
                 latency_ms: Some(42.0),
             }),
+            instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
         }
     }
 

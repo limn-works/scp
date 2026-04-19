@@ -5063,6 +5063,7 @@ dependencies = [
 name = "scp-ffi"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
  "dashmap",
  "ed25519-dalek 2.2.0",
@@ -5097,8 +5098,11 @@ dependencies = [
 name = "scp-ffi-common"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "dashmap",
+ "ed25519-dalek 2.2.0",
  "hex",
+ "rand 0.8.5",
  "scp-core",
  "scp-event-log",
  "scp-identity",
@@ -5111,6 +5115,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "z-base-32",
  "zeroize",
@@ -5120,6 +5125,7 @@ dependencies = [
 name = "scp-ffi-napi"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
  "cc",
  "dashmap",
@@ -5144,6 +5150,7 @@ dependencies = [
  "scp-transport",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "tls_codec",
  "tokio",
@@ -5177,7 +5184,9 @@ dependencies = [
  "scp-transport",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
+ "tls_codec",
  "tokio",
  "tracing",
  "uniffi",
@@ -5483,6 +5492,7 @@ dependencies = [
  "rmp-serde",
  "scp-core",
  "scp-event-log",
+ "scp-ffi-common",
  "scp-identity",
  "scp-node",
  "scp-platform",

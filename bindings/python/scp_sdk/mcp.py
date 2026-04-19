@@ -21,6 +21,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import TransportError, ValidationError
 
 if TYPE_CHECKING:
@@ -252,6 +253,7 @@ class McpServer:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 async def serve_mcp(
     identity: Identity,
     contexts: list[Context],
@@ -333,6 +335,7 @@ async def serve_mcp(
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 def configure_stdio_allowlist(
     *,
     additional_binaries: list[str] | None = None,
@@ -368,6 +371,7 @@ def configure_stdio_allowlist(
     bridge.py_mcp_configure_stdio_allowlist(additional_binaries)
 
 
+@deprecated_default_instance
 def disable_stdio_allowlist(
     *,
     i_trust_all_commands: bool = False,
@@ -407,6 +411,7 @@ def disable_stdio_allowlist(
     bridge.py_mcp_disable_stdio_allowlist()
 
 
+@deprecated_default_instance
 def reset_stdio_allowlist() -> None:
     """Reset the stdio allowlist to its default state.
 
@@ -424,6 +429,7 @@ def reset_stdio_allowlist() -> None:
     logger.info("MCP stdio allowlist reset to defaults")
 
 
+@deprecated_default_instance
 def get_stdio_allowlist() -> dict[str, Any]:
     """Return the current stdio allowlist state.
 
@@ -445,6 +451,7 @@ def get_stdio_allowlist() -> dict[str, Any]:
     return bridge.py_mcp_get_stdio_allowlist()
 
 
+@deprecated_default_instance
 def register_tool_handler(
     context: Context,
     tool_name: str,
@@ -492,6 +499,7 @@ def register_tool_handler(
     )
 
 
+@deprecated_default_instance
 def registry_stats() -> dict[str, Any]:
     """Return current entry counts for all FFI registries.
 
@@ -519,6 +527,7 @@ def registry_stats() -> dict[str, Any]:
     return bridge.py_registry_stats()
 
 
+@deprecated_default_instance
 def registry_cleanup() -> dict[str, Any]:
     """Remove stale entries from all FFI registries.
 

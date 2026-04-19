@@ -6,7 +6,7 @@
 //! would create ephemeral registries that are dropped when the function returns.
 //!
 //! This module provides the shared type definitions. The per-context state
-//! is owned by [`BridgeInstance::bridge_state`](crate::bridge_instance::BridgeInstance)
+//! is owned by [`CoreFields::bridge_state`](crate::bridge_instance::CoreFields)
 //! and accessed via `bridge_instance().bridge_state()`.
 //!
 //! Gated behind the `resolvers` feature (not available for WASM — ADR-034).
@@ -26,7 +26,7 @@ use scp_protocol::crypto::sender_keys::SenderKeyStore;
 /// `ShadowRegistry` and `SenderKeyStore` instances that are dropped when the
 /// function returns, losing all shadow identity and sender key state.
 ///
-/// Keyed by context ID in [`BridgeInstance::bridge_state`].
+/// Keyed by context ID in [`CoreFields::bridge_state`](crate::bridge_instance::CoreFields).
 pub struct BridgeContextState {
     /// Shadow identity registry for this context.
     pub shadow_registry: ShadowRegistry,

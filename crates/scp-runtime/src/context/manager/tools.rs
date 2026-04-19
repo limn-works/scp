@@ -850,6 +850,7 @@ impl ContextManager {
                     rules: &consequence_rules,
                     clock: &*self.clock,
                     event_log: self.event_log.as_ref(),
+                    event_tx: self.event_tx.as_ref(),
                 },
             );
 

@@ -105,6 +105,7 @@ from scp_sdk.governance import (
     withdraw_governance_vote,
 )
 from scp_sdk.identity import DIDDocument, Identity, IdentityAttestation, RevocationStatus
+from scp_sdk.lifecycle import resume, suspend
 from scp_sdk.mcp import (
     McpClient,
     McpProvenance,
@@ -160,6 +161,7 @@ from scp_sdk.provenance import (
     check_chain_depth,
     evaluate_provenance_quality,
 )
+from scp_sdk.scp import SCP
 from scp_sdk.server import Node, Relay
 from scp_sdk.sync import classify_offline, get_policy, run_sync
 from scp_sdk.tools import (
@@ -216,6 +218,7 @@ __all__ = [
     "BRIDGE_ERROR_MAP",
     "PARTICIPATION_FACT_VARIANTS",
     "PARTICIPATION_THRESHOLD_OPERATORS",
+    "SCP",
     "AssetEntry",
     "Attestation",
     "BatchPublishResult",
@@ -346,6 +349,7 @@ __all__ = [
     "reset_ttl_timer",
     "restore_all_contexts",
     "restore_context",
+    "resume",
     "revoke",
     "run_sync",
     "scpid_challenge",
@@ -355,6 +359,7 @@ __all__ = [
     "session_close",
     "session_create",
     "session_invoke",
+    "suspend",
     "validate",
     "validate_admission",
     "validate_broadcast_key_hex",

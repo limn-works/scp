@@ -260,6 +260,10 @@ pub(crate) struct NapiIdentityInner {
     /// byte-exact cross-bridge parity under a deterministic `seed`
     /// (ADR-046).
     pub(crate) verifying_key_hex: Option<String>,
+    /// `NapiBridgeInstance` id that minted this handle — used for runtime
+    /// handle-affinity checks at every FFI entry point that accepts a
+    /// `NapiIdentity`. Mismatches are rejected with `SCP-PERM-3030`.
+    pub(crate) instance_id: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +352,14 @@ impl NapiIdentity {
         self.inner.verifying_key_hex.clone()
     }
 
+    /// Returns the id of the `SCP` instance that minted this handle, as a
+    /// base-10 string (u64 serialized as string to survive JS number limits).
+    #[napi(getter, js_name = "instanceId")]
+    #[must_use]
+    pub fn instance_id_js(&self) -> String {
+        self.inner.instance_id.to_string()
+    }
+
     /// Rotates the active signing key for this identity.
     ///
     /// Generates a new Active Signing Key, updates the DID document on the
@@ -420,6 +432,7 @@ impl NapiIdentity {
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
                     verifying_key_hex,
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -493,6 +506,7 @@ impl NapiIdentity {
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
                     verifying_key_hex,
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -566,6 +580,7 @@ impl NapiIdentity {
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
                     verifying_key_hex,
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -639,6 +654,7 @@ impl NapiIdentity {
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
                     verifying_key_hex,
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -752,6 +768,7 @@ impl NapiIdentity {
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
                     verifying_key_hex,
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -783,6 +800,13 @@ async fn identity_verifying_key_hex(
 }
 
 impl NapiIdentity {
+    /// Returns the raw instance id carried by this handle (used by the
+    /// [`crate::napi_check_handle!`] macro for handle-affinity checks).
+    #[must_use]
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.inner.instance_id
+    }
+
     /// Returns the retained `InMemoryKeyCustody` if this identity uses in-memory
     /// custody. Used by context creation for routing ID derivation (SCP-214).
     #[cfg(feature = "allow_in_memory_custody")]
@@ -1061,6 +1085,7 @@ pub async fn identity_create(
                     in_memory_custody: Some(key_custody),
                     document: Some(document),
                     verifying_key_hex,
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -1172,6 +1197,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
                     in_memory_custody: Some(key_custody),
                     document: Some(document),
                     verifying_key_hex,
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -1261,6 +1287,7 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
                     in_memory_custody: Some(custody),
                     document: Some(document),
                     verifying_key_hex,
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -1288,6 +1315,7 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
             // string. Parity-test consumers only need `verifying_key` for
             // locally-created identities anyway.
             verifying_key_hex: None,
+            instance_id: crate::runtime::default_instance_id()?,
         }),
     };
     increment_handle_count();
@@ -1968,6 +1996,7 @@ mod tests {
                 in_memory_custody: Some(key_custody),
                 document: Some(document),
                 verifying_key_hex,
+                instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
             }),
         };
         increment_handle_count();
@@ -2111,6 +2140,7 @@ mod tests {
                 in_memory_custody: None,
                 document: None,
                 verifying_key_hex: None,
+                instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
             }),
         };
         increment_handle_count();
@@ -2403,6 +2433,7 @@ mod tests {
                 in_memory_custody: None,
                 document: None,
                 verifying_key_hex: None,
+                instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
             }),
         };
         increment_handle_count();

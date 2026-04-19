@@ -38,11 +38,10 @@ use scp_core::discovery::handles::{
 use scp_core::discovery::{DiscoveryQuery, normalize_address, parse_address};
 use scp_identity::DID;
 
-use scp_ffi_common::petname_helpers::{
-    self, LocalHandleQuerier, address_resolution_to_json, handle_registries, petname_maps,
-};
+use scp_ffi_common::petname_helpers::{self, LocalHandleQuerier, address_resolution_to_json};
 
 use crate::error::ScpPyError;
+use crate::runtime::default_bridge_instance;
 
 // ---------------------------------------------------------------------------
 // Test-only reset helpers
@@ -50,12 +49,16 @@ use crate::error::ScpPyError;
 
 #[cfg(test)]
 fn reset_petname_map_for(owner_did: &str) {
-    petname_helpers::reset_petname_map_for(owner_did);
+    if let Ok(bi) = default_bridge_instance() {
+        petname_helpers::reset_petname_map_for(&bi.core, owner_did);
+    }
 }
 
 #[cfg(test)]
 fn reset_handle_registry_for(context_id: &str) {
-    petname_helpers::reset_handle_registry_for(context_id);
+    if let Ok(bi) = default_bridge_instance() {
+        petname_helpers::reset_handle_registry_for(&bi.core, context_id);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +354,10 @@ pub fn py_petname_set(owner_did: &str, target_did: &str, name: &str) -> PyResult
         }
         .into());
     }
-    let mut guard = petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
@@ -382,7 +388,10 @@ pub fn py_petname_remove(owner_did: &str, target_did: &str) -> PyResult<()> {
         }
         .into());
     }
-    let mut guard = petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
@@ -422,7 +431,10 @@ pub fn py_petname_set_context(owner_did: &str, context_id: &str, name: &str) -> 
         }
         .into());
     }
-    let mut guard = petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
@@ -453,7 +465,10 @@ pub fn py_petname_remove_context(owner_did: &str, context_id: &str) -> PyResult<
         }
         .into());
     }
-    let mut guard = petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
@@ -492,7 +507,10 @@ pub fn py_petname_resolve_did(owner_did: &str, name: &str) -> PyResult<Vec<Strin
         }
         .into());
     }
-    let guard = petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
@@ -536,7 +554,10 @@ pub fn py_petname_resolve_context(owner_did: &str, name: &str) -> PyResult<Vec<S
         }
         .into());
     }
-    let guard = petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
@@ -573,7 +594,10 @@ pub fn py_petname_get_for_did(owner_did: &str, target_did: &str) -> PyResult<Opt
         }
         .into());
     }
-    let guard = petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
@@ -610,7 +634,10 @@ pub fn py_petname_get_for_context(owner_did: &str, context_id: &str) -> PyResult
         }
         .into());
     }
-    let guard = petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("petname lock poisoned: {e}"),
@@ -667,12 +694,15 @@ pub fn py_handle_register(
         metadata: Some(HandleMetadata { description, tags }),
     };
 
-    let mut guard = handle_registries()
-        .lock()
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("handle registry lock poisoned: {e}"),
-            code: codes::VALID_7120.to_owned(),
-        })?;
+    let bi = default_bridge_instance()?;
+    let mut guard =
+        bi.core
+            .handle_registries()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("handle registry lock poisoned: {e}"),
+                code: codes::VALID_7120.to_owned(),
+            })?;
 
     let registry = guard
         .entry(discovery_context_id.to_owned())
@@ -729,7 +759,10 @@ pub fn py_handle_lookup(
         None => None,
     };
 
-    let guard = handle_registries()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .handle_registries()
         .lock()
         .map_err(|e| ScpPyError::ValidationError {
             message: format!("handle registry lock poisoned: {e}"),
@@ -781,12 +814,15 @@ pub fn py_handle_deregister(
     handle: &str,
     did: &str,
 ) -> PyResult<String> {
-    let mut guard = handle_registries()
-        .lock()
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("handle registry lock poisoned: {e}"),
-            code: codes::VALID_7120.to_owned(),
-        })?;
+    let bi = default_bridge_instance()?;
+    let mut guard =
+        bi.core
+            .handle_registries()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("handle registry lock poisoned: {e}"),
+                code: codes::VALID_7120.to_owned(),
+            })?;
 
     let result = guard.get_mut(discovery_context_id).map_or_else(
         || scp_core::discovery::HandleDeregisterResult { removed: false },
@@ -881,13 +917,15 @@ pub fn py_scope_register(
         },
     };
 
-    let mut guard =
-        petname_helpers::scope_registries()
-            .lock()
-            .map_err(|e| ScpPyError::ValidationError {
-                message: format!("scope registry lock poisoned: {e}"),
-                code: codes::VALID_7130.to_owned(),
-            })?;
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .scope_registries()
+        .lock()
+        .map_err(|e| ScpPyError::ValidationError {
+            message: format!("scope registry lock poisoned: {e}"),
+            code: codes::VALID_7130.to_owned(),
+        })?;
 
     let registry = guard
         .entry(scope_context_id.to_owned())
@@ -932,13 +970,15 @@ pub fn py_scope_register(
 pub fn py_scope_lookup(scope_context_id: &str, name: &str) -> PyResult<String> {
     crate::validate::validate_context_id(scope_context_id)?;
 
-    let guard =
-        petname_helpers::scope_registries()
-            .lock()
-            .map_err(|e| ScpPyError::ValidationError {
-                message: format!("scope registry lock poisoned: {e}"),
-                code: codes::VALID_7130.to_owned(),
-            })?;
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .scope_registries()
+        .lock()
+        .map_err(|e| ScpPyError::ValidationError {
+            message: format!("scope registry lock poisoned: {e}"),
+            code: codes::VALID_7130.to_owned(),
+        })?;
 
     let result = match guard.get(scope_context_id) {
         Some(registry) => registry
@@ -986,13 +1026,15 @@ pub fn py_scope_deregister(scope_context_id: &str, name: &str, did: &str) -> PyR
     crate::validate::validate_context_id(scope_context_id)?;
     crate::validate::validate_did(did)?;
 
-    let mut guard =
-        petname_helpers::scope_registries()
-            .lock()
-            .map_err(|e| ScpPyError::ValidationError {
-                message: format!("scope registry lock poisoned: {e}"),
-                code: codes::VALID_7130.to_owned(),
-            })?;
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .scope_registries()
+        .lock()
+        .map_err(|e| ScpPyError::ValidationError {
+            message: format!("scope registry lock poisoned: {e}"),
+            code: codes::VALID_7130.to_owned(),
+        })?;
 
     let result = match guard.get_mut(scope_context_id) {
         Some(registry) => registry
@@ -1057,6 +1099,8 @@ pub fn py_address_resolve(
         .into());
     }
 
+    let bi = default_bridge_instance()?;
+
     let mut known_contexts: HashMap<String, String> = if let Some(json) = known_contexts_json {
         serde_json::from_str(json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid known_contexts_json: {e}"),
@@ -1064,17 +1108,19 @@ pub fn py_address_resolve(
         })?
     } else {
         // Use all known handle registries with context IDs as scope names.
-        let guard = handle_registries()
-            .lock()
-            .map_err(|e| ScpPyError::ValidationError {
-                message: format!("handle registry lock poisoned: {e}"),
-                code: codes::VALID_7120.to_owned(),
-            })?;
+        let guard =
+            bi.core
+                .handle_registries()
+                .lock()
+                .map_err(|e| ScpPyError::ValidationError {
+                    message: format!("handle registry lock poisoned: {e}"),
+                    code: codes::VALID_7120.to_owned(),
+                })?;
         guard.keys().map(|k| (k.clone(), k.clone())).collect()
     };
 
     // Merge scope registry contexts into known_contexts for two-hop resolution (§22.3.5).
-    let scope_contexts = petname_helpers::known_contexts_from_scope_registries();
+    let scope_contexts = petname_helpers::known_contexts_from_scope_registries(&bi.core);
     for (name, ctx_id) in scope_contexts {
         known_contexts.entry(name).or_insert(ctx_id);
     }
@@ -1085,7 +1131,9 @@ pub fn py_address_resolve(
     // AddressResolver.resolve() takes a reference, and we can't hold
     // the mutex across the async boundary.
     let petname_map = {
-        let guard = petname_maps()
+        let guard = bi
+            .core
+            .petname_maps()
             .lock()
             .map_err(|e| ScpPyError::ValidationError {
                 message: format!("petname lock poisoned: {e}"),
@@ -1097,7 +1145,7 @@ pub fn py_address_resolve(
     let rt = crate::runtime()?;
     let results = rt.block_on(async {
         let mut resolver = scp_core::discovery::AddressResolver::new();
-        let querier = LocalHandleQuerier;
+        let querier = LocalHandleQuerier::new(&bi.core);
         resolver
             .resolve(
                 address,

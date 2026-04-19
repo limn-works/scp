@@ -151,9 +151,11 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
                 "auto_wire_context_manager: failed to connect to node relay — \
                  context operations may fail until transport is configured manually"
             );
-            // Fall back to initializing with MLS crypto (not FfiBridgeCrypto
-            // no-op) so that at least the ContextManager exists with real
-            // crypto for the identity's DID, matching PyO3/NAPI behavior.
+            // Fall back to initializing with MLS crypto so that the
+            // ContextManager exists with real crypto bound to the identity's
+            // DID, matching PyO3/NAPI behavior. (The bridge no longer has a
+            // DID-less stub crypto path — see commit 4 of the phase 4
+            // persistence refactor.)
             crate::runtime::init_context_manager_with_did(did);
         }
     }
@@ -175,10 +177,23 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
 #[derive(uniffi::Object)]
 pub struct RelayHandle {
     inner: server::RunningRelay,
+    /// Monotonic identifier of the bridge instance that minted this handle.
+    ///
+    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// every `#[uniffi::export]` entry that accepts a `RelayHandle`.
+    pub(crate) instance_id: u64,
 }
 
 #[uniffi::export]
 impl RelayHandle {
+    /// Returns the monotonic identifier of the bridge instance that minted
+    /// this handle.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     /// Returns the WebSocket URL clients should connect to
     /// (e.g., `ws://127.0.0.1:12345/scp/v1`).
     #[must_use]
@@ -228,10 +243,23 @@ impl Drop for RelayHandle {
 #[derive(uniffi::Object)]
 pub struct NodeHandle {
     inner: RunningNode,
+    /// Monotonic identifier of the bridge instance that minted this handle.
+    ///
+    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// every `#[uniffi::export]` entry that accepts a `NodeHandle`.
+    pub(crate) instance_id: u64,
 }
 
 #[uniffi::export]
 impl NodeHandle {
+    /// Returns the monotonic identifier of the bridge instance that minted
+    /// this handle.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     /// Returns the WebSocket URL clients should connect to for this node's
     /// relay (e.g., `ws://127.0.0.1:12345/scp/v1`).
     #[must_use]
@@ -457,8 +485,12 @@ impl Drop for NodeHandle {
 #[uniffi::export]
 pub async fn relay_start_in_memory() -> Result<Arc<RelayHandle>, ScpError> {
     let relay = server::start_relay_in_memory().await?;
+    let instance_id = crate::runtime::default_instance_id()?;
     increment_handle_count();
-    Ok(Arc::new(RelayHandle { inner: relay }))
+    Ok(Arc::new(RelayHandle {
+        inner: relay,
+        instance_id,
+    }))
 }
 
 /// Starts a relay with redb-backed blob storage on an OS-assigned port.
@@ -467,8 +499,12 @@ pub async fn relay_start_in_memory() -> Result<Arc<RelayHandle>, ScpError> {
 #[uniffi::export]
 pub async fn relay_start_local(data_dir: String) -> Result<Arc<RelayHandle>, ScpError> {
     let relay = server::start_relay_local(std::path::Path::new(&data_dir)).await?;
+    let instance_id = crate::runtime::default_instance_id()?;
     increment_handle_count();
-    Ok(Arc::new(RelayHandle { inner: relay }))
+    Ok(Arc::new(RelayHandle {
+        inner: relay,
+        instance_id,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +632,9 @@ fn build_node_identity_from_uniffi(_id: &Identity) -> Result<server::NodeIdentit
 pub async fn node_start_in_memory(
     identity: Option<Arc<Identity>>,
 ) -> Result<Arc<NodeHandle>, ScpError> {
+    if let Some(ref id) = identity {
+        crate::uniffi_check_handle!(id);
+    }
     let node_identity = match identity {
         Some(ref id) => Some(build_node_identity_from_uniffi(id)?),
         None => None,
@@ -614,9 +653,11 @@ pub async fn node_start_in_memory(
     let bridge_token = node.bridge_token_hex();
     auto_wire_context_manager(&did, &relay_url, bridge_token).await;
 
+    let instance_id = crate::runtime::default_instance_id()?;
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
         inner: RunningNode::InMemory(node),
+        instance_id,
     }))
 }
 
@@ -634,6 +675,9 @@ pub async fn node_start_local(
     identity: Option<Arc<Identity>>,
     passphrase: Option<String>,
 ) -> Result<Arc<NodeHandle>, ScpError> {
+    if let Some(ref id) = identity {
+        crate::uniffi_check_handle!(id);
+    }
     let node_identity = match identity {
         Some(ref id) => Some(build_node_identity_from_uniffi(id)?),
         None => None,
@@ -653,9 +697,11 @@ pub async fn node_start_local(
     let bridge_token = node.bridge_token_hex();
     auto_wire_context_manager(&did, &relay_url, bridge_token).await;
 
+    let instance_id = crate::runtime::default_instance_id()?;
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
         inner: RunningNode::Filesystem(node),
+        instance_id,
     }))
 }
 

@@ -111,8 +111,11 @@ describe("toolInvokeCrossContext", () => {
   });
 
   it("invokes a tool across contexts and returns result", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const sourceHandle = await mockBridge.contextCreate(identity, "{}");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const targetHandle = await mockBridge.contextCreate(identity, "{}");
 
     // Register a tool in the target context
@@ -146,8 +149,11 @@ describe("toolInvokeCrossContext", () => {
   });
 
   it("rejects chainDepth > 255 (u8 range per ADR-043)", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const sourceHandle = await mockBridge.contextCreate(identity, "{}");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const targetHandle = await mockBridge.contextCreate(identity, "{}");
 
     await expect(
@@ -164,8 +170,11 @@ describe("toolInvokeCrossContext", () => {
   });
 
   it("accepts chainDepth at u8 max (255)", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const sourceHandle = await mockBridge.contextCreate(identity, "{}");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const targetHandle = await mockBridge.contextCreate(identity, "{}");
 
     const toolId = await mockBridge.toolRegister(targetHandle, {
@@ -190,8 +199,11 @@ describe("toolInvokeCrossContext", () => {
   });
 
   it("rejects negative chainDepth", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const sourceHandle = await mockBridge.contextCreate(identity, "{}");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const targetHandle = await mockBridge.contextCreate(identity, "{}");
 
     await expect(
@@ -208,8 +220,11 @@ describe("toolInvokeCrossContext", () => {
   });
 
   it("rejects non-integer chainDepth", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const sourceHandle = await mockBridge.contextCreate(identity, "{}");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const targetHandle = await mockBridge.contextCreate(identity, "{}");
 
     await expect(
@@ -226,11 +241,15 @@ describe("toolInvokeCrossContext", () => {
   });
 
   it("throws ToolError SCP-TOOL-6010 when source context is not active", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const sourceHandle = await mockBridge.contextCreate(identity, "{}");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const targetHandle = await mockBridge.contextCreate(identity, "{}");
 
     // Close the source context to make it inactive
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextClose(sourceHandle, identity.did);
 
     await expect(
@@ -262,11 +281,15 @@ describe("toolInvokeCrossContext", () => {
   });
 
   it("throws ToolError SCP-TOOL-6011 when target context is not active", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const sourceHandle = await mockBridge.contextCreate(identity, "{}");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const targetHandle = await mockBridge.contextCreate(identity, "{}");
 
     // Close the target context to make it inactive
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextClose(targetHandle, identity.did);
 
     await expect(
@@ -315,7 +338,9 @@ describe("toolSessionCreate", () => {
   });
 
   it("creates a session and returns a session ID", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, "{}");
 
     const toolId = await mockBridge.toolRegister(handle, {
@@ -333,7 +358,9 @@ describe("toolSessionCreate", () => {
   });
 
   it("creates a session with TTL", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, "{}");
 
     const toolId = await mockBridge.toolRegister(handle, {
@@ -349,7 +376,9 @@ describe("toolSessionCreate", () => {
   });
 
   it("rejects negative ttlSeconds", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, "{}");
 
     await expect(toolSessionCreate(handle, "tool-test", "source-ctx-1", -1)).rejects.toThrow(
@@ -358,7 +387,9 @@ describe("toolSessionCreate", () => {
   });
 
   it("rejects non-integer ttlSeconds", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, "{}");
 
     await expect(toolSessionCreate(handle, "tool-test", "source-ctx-1", 1.5)).rejects.toThrow(
@@ -380,7 +411,9 @@ describe("toolSessionInvoke", () => {
   });
 
   it("invokes a tool within a session and returns typed result with provenance", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, "{}");
 
     const toolId = await mockBridge.toolRegister(handle, {
@@ -415,7 +448,9 @@ describe("toolSessionInvoke", () => {
   });
 
   it("increments call count across invocations", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, "{}");
 
     const toolId = await mockBridge.toolRegister(handle, {
@@ -449,7 +484,9 @@ describe("toolSessionClose", () => {
   });
 
   it("closes a session successfully", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, "{}");
 
     const toolId = await mockBridge.toolRegister(handle, {
@@ -470,7 +507,9 @@ describe("toolSessionClose", () => {
   });
 
   it("rejects closing a non-existent session", async () => {
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
+    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, "{}");
 
     await expect(toolSessionClose(handle, "nonexistent-session")).rejects.toThrow(/SCP-TOOL-6021/);

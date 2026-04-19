@@ -17,6 +17,7 @@
 import { mapBridgeError, ValidationError } from "./errors";
 import type { BridgeContextHandle } from "./internal/bridge";
 import { getBridge } from "./internal/bridge";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 import type {
   CrossContextInvocationResult,
   TestVector,
@@ -120,6 +121,7 @@ export async function toolInvokeCrossContext(
   chainDepth = 0,
   proofTokens?: readonly string[],
 ): Promise<CrossContextInvocationResult> {
+  deprecatedDefaultInstance("toolInvokeCrossContext");
   // Chain depth is context-configurable (ADR-043). The u8 type in core bounds
   // the range to [0, 255]. Values above 255 are always rejected by core, so
   // we catch them early with a clear SDK-level message.
@@ -180,6 +182,7 @@ export async function toolSessionCreate(
   sourceContextId: string,
   ttlSeconds?: number,
 ): Promise<ToolSessionResult> {
+  deprecatedDefaultInstance("toolSessionCreate");
   if (ttlSeconds !== undefined) {
     if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0) {
       throw new ValidationError(
@@ -223,6 +226,7 @@ export async function toolSessionInvoke(
   ucanToken: string,
   proofTokens?: readonly string[],
 ): Promise<ToolSessionInvokeResult> {
+  deprecatedDefaultInstance("toolSessionInvoke");
   const bridge = await getBridge();
   try {
     const output = await bridge.toolSessionInvoke(
@@ -259,6 +263,7 @@ export async function toolSessionClose(
   handle: BridgeContextHandle,
   sessionId: string,
 ): Promise<void> {
+  deprecatedDefaultInstance("toolSessionClose");
   const bridge = await getBridge();
   try {
     await bridge.toolSessionClose(handle, sessionId);

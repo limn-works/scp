@@ -309,6 +309,9 @@ fn deliver_plaintext_or_announcement(
     sender_did: &str,
     plaintext: &[u8],
     context_id: &str,
+    event_tx: Option<
+        &tokio::sync::broadcast::Sender<(String, scp_protocol::context::membership::ContextEvent)>,
+    >,
 ) -> Option<&'static str> {
     // KNOWN LIMITATION (§9.10.4 vs §9.10.4.A): Spec says receivers should verify
     // the pseudonym-to-DID mapping, but the privacy model (pseudonym_secret from
@@ -330,10 +333,11 @@ fn deliver_plaintext_or_announcement(
         let did = DID(announcement.member_did.clone());
         ctx.pseudonym_registry
             .insert(did.clone(), announcement.pseudonym);
-        ctx.receive_buffer.push(ContextEvent::PseudonymAnnounced {
+        let event = ContextEvent::PseudonymAnnounced {
             member_did: did,
             pseudonym: announcement.pseudonym,
-        });
+        };
+        ctx.emit_event(event, context_id, event_tx);
         tracing::debug!(
             context_id,
             sender_did,
@@ -341,10 +345,11 @@ fn deliver_plaintext_or_announcement(
         );
         return Some("PseudonymAnnounced");
     }
-    ctx.receive_buffer.push(ContextEvent::MessageReceived {
+    let event = ContextEvent::MessageReceived {
         sender_did: DID(sender_did.to_owned()),
         payload: plaintext.to_vec(),
-    });
+    };
+    ctx.emit_event(event, context_id, event_tx);
     Some("MessageReceived")
 }
 
@@ -358,6 +363,7 @@ fn deliver_plaintext_or_announcement(
 /// Bug fix (#1534): previously, all buffered delivery paths skipped these
 /// steps, allowing a malicious sender to evade rate limiting and consequence
 /// enforcement by exploiting out-of-order delivery.
+#[allow(clippy::too_many_arguments)] // FFI threading of event_tx
 fn run_buffered_post_delivery(
     ctx: &mut PerContextState,
     context_id: &str,
@@ -366,6 +372,9 @@ fn run_buffered_post_delivery(
     event_name: &str,
     clock: &dyn scp_primitives::Clock,
     event_log: &dyn super::ContextEventLogProvider,
+    event_tx: Option<
+        &tokio::sync::broadcast::Sender<(String, scp_protocol::context::membership::ContextEvent)>,
+    >,
 ) {
     let now = clock.now_secs();
 
@@ -405,6 +414,7 @@ fn run_buffered_post_delivery(
                 rules: &consequence_rules,
                 clock,
                 event_log,
+                event_tx,
             },
         );
     }
@@ -863,11 +873,12 @@ impl ContextManager {
                     ctx.membership.rollback_sequence_number(sender_did);
                     return Ok(());
                 }
-                ctx.receive_buffer.push(ContextEvent::MessageSent {
+                let sent_event = ContextEvent::MessageSent {
                     sender_did: sender_did.clone(),
                     sequence_number: sequence,
                     payload: payload.to_vec(),
-                });
+                };
+                ctx.emit_event(sent_event, context_id, self.event_tx.as_ref());
 
                 // Velocity already recorded in send_message Phase 1 (M4: before
                 // economy enforcement). No duplicate record_message here.
@@ -904,6 +915,7 @@ impl ContextManager {
                         rules: &consequence_rules,
                         clock: &*self.clock,
                         event_log: &*self.event_log,
+                        event_tx: self.event_tx.as_ref(),
                     },
                 );
 
@@ -1180,12 +1192,13 @@ impl ContextManager {
             .reorder_buffer
             .drain_timed_out(now_ms, &ctx.sequence_tracker);
         for (gap_info, messages) in timed_out {
-            ctx.receive_buffer.push(ContextEvent::SequenceGapDetected {
+            let gap_event = ContextEvent::SequenceGapDetected {
                 sender_did: DID(gap_info.sender_did.clone()),
                 expected_sequence: gap_info.expected_sequence,
                 first_delivered_sequence: gap_info.first_buffered_sequence,
                 reason: format!("{:?}", gap_info.reason),
-            });
+            };
+            ctx.emit_event(gap_event, context_id, self.event_tx.as_ref());
             for msg in &messages {
                 // Re-check membership and capability — sender may have been
                 // removed or had capability revoked while the message was
@@ -1208,6 +1221,7 @@ impl ContextManager {
                     &msg.sender_did,
                     &msg.plaintext,
                     context_id,
+                    self.event_tx.as_ref(),
                 ) {
                     // Bug fix (#1534): buffered messages now receive the same
                     // post-delivery governance treatment as directly delivered
@@ -1220,6 +1234,7 @@ impl ContextManager {
                         event_name,
                         &*self.clock,
                         &*self.event_log,
+                        self.event_tx.as_ref(),
                     );
                 }
             }
@@ -1261,12 +1276,13 @@ impl ContextManager {
                 .unwrap_or(1);
             gap_info.expected_sequence = expected;
 
-            ctx.receive_buffer.push(ContextEvent::SequenceGapDetected {
+            let gap_event = ContextEvent::SequenceGapDetected {
                 sender_did: DID(gap_info.sender_did.clone()),
                 expected_sequence: gap_info.expected_sequence,
                 first_delivered_sequence: gap_info.first_buffered_sequence,
                 reason: format!("{:?}", gap_info.reason),
-            });
+            };
+            ctx.emit_event(gap_event, context_id, self.event_tx.as_ref());
 
             for msg in &messages {
                 // Re-check membership and capability — sender may have been
@@ -1290,6 +1306,7 @@ impl ContextManager {
                     &msg.sender_did,
                     &msg.plaintext,
                     context_id,
+                    self.event_tx.as_ref(),
                 ) {
                     // Bug fix (#1534): overflow-forced delivery now runs
                     // consequence evaluation, matching the direct path.
@@ -1301,6 +1318,7 @@ impl ContextManager {
                         event_name,
                         &*self.clock,
                         &*self.event_log,
+                        self.event_tx.as_ref(),
                     );
                 }
             }
@@ -1393,10 +1411,11 @@ impl ContextManager {
             let announced_did = DID(announcement.member_did.clone());
             ctx.pseudonym_registry
                 .insert(announced_did.clone(), announcement.pseudonym);
-            ctx.receive_buffer.push(ContextEvent::PseudonymAnnounced {
+            let announce_event = ContextEvent::PseudonymAnnounced {
                 member_did: announced_did,
                 pseudonym: announcement.pseudonym,
-            });
+            };
+            ctx.emit_event(announce_event, context_id, self.event_tx.as_ref());
             // Advance sequence tracker for the announcement message.
             ctx.sequence_tracker
                 .advance(context_id, sender_did, inner.sequence, inner.timestamp);
@@ -1426,6 +1445,7 @@ impl ContextManager {
                     &msg.sender_did,
                     &msg.plaintext,
                     context_id,
+                    self.event_tx.as_ref(),
                 ) {
                     // Bug fix (#1534): drain_consecutive within announcement
                     // path now runs consequence evaluation per message.
@@ -1437,6 +1457,7 @@ impl ContextManager {
                         event_name,
                         &*self.clock,
                         &*self.event_log,
+                        self.event_tx.as_ref(),
                     );
                 }
             }
@@ -1485,6 +1506,7 @@ impl ContextManager {
                         rules: &consequence_rules,
                         clock: &*self.clock,
                         event_log: &*self.event_log,
+                        event_tx: self.event_tx.as_ref(),
                     },
                 );
             }
@@ -1496,10 +1518,11 @@ impl ContextManager {
         // Advance sequence tracker and deliver the in-order message.
         ctx.sequence_tracker
             .advance(context_id, sender_did, inner.sequence, inner.timestamp);
-        ctx.receive_buffer.push(ContextEvent::MessageReceived {
+        let recv_event = ContextEvent::MessageReceived {
             sender_did: sender_did_obj,
             payload: plaintext.to_vec(),
-        });
+        };
+        ctx.emit_event(recv_event, context_id, self.event_tx.as_ref());
 
         // Drain consecutive buffered messages that are now unblocked (§9.8.5).
         let next_expected = inner.sequence.saturating_add(1);
@@ -1523,9 +1546,13 @@ impl ContextManager {
                 msg.inner.sequence,
                 msg.inner.timestamp,
             );
-            if let Some(event_name) =
-                deliver_plaintext_or_announcement(ctx, &msg.sender_did, &msg.plaintext, context_id)
-            {
+            if let Some(event_name) = deliver_plaintext_or_announcement(
+                ctx,
+                &msg.sender_did,
+                &msg.plaintext,
+                context_id,
+                self.event_tx.as_ref(),
+            ) {
                 // Bug fix (#1534): drain_consecutive within normal message
                 // path now runs consequence evaluation per message.
                 run_buffered_post_delivery(
@@ -1536,6 +1563,7 @@ impl ContextManager {
                     event_name,
                     &*self.clock,
                     &*self.event_log,
+                    self.event_tx.as_ref(),
                 );
             }
         }
@@ -1612,6 +1640,7 @@ impl ContextManager {
                     rules: &consequence_rules,
                     clock: &*self.clock,
                     event_log: &*self.event_log,
+                    event_tx: self.event_tx.as_ref(),
                 },
             );
         }

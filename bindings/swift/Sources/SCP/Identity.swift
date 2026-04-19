@@ -217,6 +217,11 @@ public enum IdentityBridge {
 ///
 /// - ADR-039 (Agent Key Binding)
 /// - Spec section 9
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func identityHasAgentKey(
     _ identity: Identity,
     hasAgentKeyFn: IdentityBridge.HasAgentKeyFn = IdentityBridge.defaultHasAgentKey
@@ -238,6 +243,11 @@ public func identityHasAgentKey(
 ///
 /// - ADR-039 (Agent Key Binding)
 /// - Spec section 9
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func identityGetAgentPublicKey(
     _ identity: Identity,
     getAgentPublicKeyFn: IdentityBridge.GetAgentPublicKeyFn = IdentityBridge.defaultGetAgentPublicKey
@@ -261,6 +271,11 @@ public func identityGetAgentPublicKey(
 ///
 /// - ADR-039 (Agent Key Binding)
 /// - Spec section 9
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func addAgentKeyToIdentity(
     _ identity: Identity,
     addAgentKeyFn: IdentityBridge.AddAgentKeyFn = IdentityBridge.defaultAddAgentKey
@@ -283,6 +298,11 @@ public func addAgentKeyToIdentity(
 ///
 /// - ADR-039 (Agent Key Binding)
 /// - Spec section 9
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func removeAgentKeyFromIdentity(
     _ identity: Identity,
     removeAgentKeyFn: IdentityBridge.RemoveAgentKeyFn = IdentityBridge.defaultRemoveAgentKey
@@ -305,6 +325,11 @@ public func removeAgentKeyFromIdentity(
 ///
 /// - ADR-039 (Agent Key Binding)
 /// - Spec section 9
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func rotateAgentKeyForIdentity(
     _ identity: Identity,
     rotateAgentKeyFn: IdentityBridge.RotateAgentKeyFn = IdentityBridge.defaultRotateAgentKey
@@ -329,6 +354,11 @@ public func rotateAgentKeyForIdentity(
 /// ## Provenance
 ///
 /// - Spec section 9.3 (Sybil Resistance and Identity Uniqueness)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func identityAttestDevice(
     _ identity: Identity,
     attestDeviceFn: IdentityBridge.AttestDeviceFn = IdentityBridge.defaultAttestDevice
@@ -353,6 +383,11 @@ public func identityAttestDevice(
 /// ## Provenance
 ///
 /// - Spec section 9.3 (Sybil Resistance and Identity Uniqueness)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func identityVerifyDeviceAttestation(
     did: String,
     tokenBase64: String,
@@ -389,6 +424,11 @@ public func identityVerifyDeviceAttestation(
 /// - ADR-006 (Platform Abstraction)
 /// - ADR-046 (Deterministic parity harness)
 /// - Spec section 9 (Identity)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func createIdentity(
     custody: String,
     seed: Data? = nil,
@@ -414,6 +454,11 @@ public func createIdentity(
 ///
 /// - ADR-006 (Platform Abstraction)
 /// - Spec section 9 (Identity)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func loadIdentity(
     did: String,
     loadFn: IdentityBridge.LoadFn = IdentityBridge.defaultLoad
@@ -437,6 +482,11 @@ public func loadIdentity(
 ///
 /// - ADR-002 (DID)
 /// - Spec section 3 (Identity)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func resolveIdentity(
     did: String,
     resolveFn: IdentityBridge.ResolveFn = IdentityBridge.defaultResolve
@@ -460,6 +510,11 @@ public func resolveIdentity(
 ///
 /// - ADR-039 (Agent Key Binding)
 /// - Spec section 9 (Identity)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func createIdentityWithAgentKey(
     custody: String,
     createWithAgentKeyFn: IdentityBridge.CreateWithAgentKeyFn = IdentityBridge.defaultCreateWithAgentKey
@@ -483,6 +538,11 @@ public func createIdentityWithAgentKey(
 /// ## Provenance
 ///
 /// - Spec section 3 (Identity), section 9.2 (Key Rotation)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func migrateIdentity(
     _ identity: Identity,
     migrateFn: IdentityBridge.MigrateFn = IdentityBridge.defaultMigrate
@@ -507,6 +567,11 @@ public func migrateIdentity(
 /// ## Provenance
 ///
 /// - Spec section 9.12 (Compromise Recovery)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func executeRecovery(
     did: String,
     tier: String,
@@ -532,6 +597,11 @@ public func executeRecovery(
 /// ## Provenance
 ///
 /// - Spec section 3.2.1 (Key Custody Migration Protocol)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func executeCustodyMigration(
     did: String,
     target: String,
@@ -947,6 +1017,11 @@ private struct AttestationWire: Codable {
 /// ## Provenance
 ///
 /// - Spec section 3.5 (Identity Link Attestations)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func createIdentityAttestation(
     did: String,
     platform: String,
@@ -970,6 +1045,11 @@ public func createIdentityAttestation(
 /// ## Provenance
 ///
 /// - Spec section 3.5 (Identity Link Attestations)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func listIdentityAttestations(
     did: String,
     listFn: IdentityAttestationBridge.ListFn = IdentityAttestationBridge.defaultList
@@ -989,6 +1069,11 @@ public func listIdentityAttestations(
 /// ## Provenance
 ///
 /// - Spec section 3.5 (Identity Link Attestations)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func removeIdentityAttestation(
     did: String,
     attestationId: String,

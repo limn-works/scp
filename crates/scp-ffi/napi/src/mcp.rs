@@ -84,6 +84,8 @@ pub struct NapiMcpInvokeResult {
 #[napi]
 pub struct NapiMcpServerHandle {
     handle_id: String,
+    /// `NapiBridgeInstance` id that minted this handle.
+    pub(crate) instance_id: u64,
 }
 
 #[napi]
@@ -93,6 +95,14 @@ impl NapiMcpServerHandle {
     #[must_use]
     pub fn handle_id(&self) -> String {
         self.handle_id.clone()
+    }
+
+    /// Returns the id of the `SCP` instance that minted this handle, as a
+    /// base-10 string.
+    #[napi(getter, js_name = "instanceId")]
+    #[must_use]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
     }
 }
 
@@ -106,6 +116,8 @@ impl Drop for NapiMcpServerHandle {
 #[napi]
 pub struct NapiMcpClientHandle {
     handle_id: String,
+    /// `NapiBridgeInstance` id that minted this handle.
+    pub(crate) instance_id: u64,
 }
 
 #[napi]
@@ -115,6 +127,14 @@ impl NapiMcpClientHandle {
     #[must_use]
     pub fn handle_id(&self) -> String {
         self.handle_id.clone()
+    }
+
+    /// Returns the id of the `SCP` instance that minted this handle, as a
+    /// base-10 string.
+    #[napi(getter, js_name = "instanceId")]
+    #[must_use]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
     }
 }
 
@@ -129,39 +149,48 @@ impl Drop for NapiMcpClientHandle {
 // ---------------------------------------------------------------------------
 
 /// Internal state for a running MCP server.
-struct McpServerEntry {
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    _task_handle: tokio::task::JoinHandle<()>,
-    stopped: bool,
+pub(crate) struct McpServerEntry {
+    pub(crate) shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) _task_handle: tokio::task::JoinHandle<()>,
+    pub(crate) stopped: bool,
 }
 
 /// Internal state for an active MCP client connection.
-struct McpClientEntry {
-    client: Mutex<McpClient<McpClientTransportWrapper>>,
+pub(crate) struct McpClientEntry {
+    pub(crate) client: Mutex<McpClient<McpClientTransportWrapper>>,
 }
 
+/// Fallback empty MCP server registry for when the default
+/// `NapiBridgeInstance` has not been initialized yet. Mirrors the
+/// `PyO3` `EMPTY_SERVER_REGISTRY` fallback pattern.
+static EMPTY_SERVER_REGISTRY: OnceLock<DashMap<String, McpServerEntry>> = OnceLock::new();
+
+/// Fallback empty MCP client registry.
+static EMPTY_CLIENT_REGISTRY: OnceLock<DashMap<String, McpClientEntry>> = OnceLock::new();
+
+/// Returns a reference to the default bridge instance's MCP server registry.
+///
+/// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
+/// typed `mcp_server_registry` field on [`crate::runtime::NapiBridgeInstance`]
+/// in #1549 Phase 4 PR 2 commit 4. Falls back to an empty registry when the
+/// default instance has not been initialized yet.
 fn mcp_server_registry() -> &'static DashMap<String, McpServerEntry> {
-    static REGISTRY: OnceLock<DashMap<String, McpServerEntry>> = OnceLock::new();
-    REGISTRY.get_or_init(DashMap::new)
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_SERVER_REGISTRY.get_or_init(DashMap::new),
+        |bi| bi.mcp_server_registry().as_ref(),
+    )
 }
 
+/// Returns a reference to the default bridge instance's MCP client registry.
 fn mcp_client_registry() -> &'static DashMap<String, McpClientEntry> {
-    static REGISTRY: OnceLock<DashMap<String, McpClientEntry>> = OnceLock::new();
-    REGISTRY.get_or_init(DashMap::new)
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_CLIENT_REGISTRY.get_or_init(DashMap::new),
+        |bi| bi.mcp_client_registry().as_ref(),
+    )
 }
 
 fn mcp_handle_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
-}
-
-/// Clears both MCP server and client registries during shutdown.
-///
-/// Called by the shutdown hook registered in `crate::runtime::init_bridge_instance_empty`.
-/// This ensures server shutdown senders and client connections are dropped,
-/// allowing background tasks to terminate cleanly.
-pub(crate) fn clear_registries() {
-    mcp_server_registry().clear();
-    mcp_client_registry().clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +198,7 @@ pub(crate) fn clear_registries() {
 // ---------------------------------------------------------------------------
 
 /// Transport wrapper that delegates to either stdio or SSE.
-enum McpClientTransportWrapper {
+pub(crate) enum McpClientTransportWrapper {
     Stdio(StdioMcpTransport),
     Sse(SseMcpTransport),
 }
@@ -191,7 +220,7 @@ impl McpTransport for McpClientTransportWrapper {
 }
 
 /// Stdio MCP transport: communicates with a subprocess via stdin/stdout.
-struct StdioMcpTransport {
+pub(crate) struct StdioMcpTransport {
     inner: Mutex<StdioTransportInner>,
 }
 
@@ -308,7 +337,7 @@ impl Drop for StdioMcpTransport {
 }
 
 /// SSE MCP transport: communicates via HTTP with Server-Sent Events.
-struct SseMcpTransport {
+pub(crate) struct SseMcpTransport {
     _url: String,
 }
 
@@ -553,13 +582,17 @@ pub async fn mcp_server_create(config: NapiMcpServerConfig) -> napi::Result<Napi
     mcp_server_registry().insert(handle_id.clone(), entry);
     crate::increment_handle_count();
 
-    Ok(NapiMcpServerHandle { handle_id })
+    Ok(NapiMcpServerHandle {
+        handle_id,
+        instance_id: crate::runtime::default_instance_id()?,
+    })
 }
 
 /// Stops a running MCP server.
 #[napi]
 #[allow(clippy::unused_async)]
 pub async fn mcp_server_stop(handle: &NapiMcpServerHandle) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     let mut entry = mcp_server_registry()
         .get_mut(&handle.handle_id)
         .ok_or_else(|| {
@@ -629,7 +662,10 @@ pub async fn mcp_client_connect_stdio(command: Vec<String>) -> napi::Result<Napi
     mcp_client_registry().insert(handle_id.clone(), entry);
     crate::increment_handle_count();
 
-    Ok(NapiMcpClientHandle { handle_id })
+    Ok(NapiMcpClientHandle {
+        handle_id,
+        instance_id: crate::runtime::default_instance_id()?,
+    })
 }
 
 /// Connects to an external MCP server via SSE transport.
@@ -654,13 +690,17 @@ pub async fn mcp_client_connect_sse(url: String) -> napi::Result<NapiMcpClientHa
     mcp_client_registry().insert(handle_id.clone(), entry);
     crate::increment_handle_count();
 
-    Ok(NapiMcpClientHandle { handle_id })
+    Ok(NapiMcpClientHandle {
+        handle_id,
+        instance_id: crate::runtime::default_instance_id()?,
+    })
 }
 
 /// Disconnects from an external MCP server.
 #[napi]
 #[allow(clippy::unused_async)]
 pub async fn mcp_client_disconnect(handle: &NapiMcpClientHandle) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     let removed = mcp_client_registry().remove(&handle.handle_id);
     if removed.is_none() {
         return Err(ScpNapiError::Transport {
@@ -678,6 +718,7 @@ pub async fn mcp_client_disconnect(handle: &NapiMcpClientHandle) -> napi::Result
 pub async fn mcp_client_list_tools(
     handle: &NapiMcpClientHandle,
 ) -> napi::Result<Vec<NapiMcpToolInfo>> {
+    crate::napi_check_handle!(handle);
     let entry = mcp_client_registry()
         .get(&handle.handle_id)
         .ok_or_else(|| {
@@ -723,6 +764,7 @@ pub async fn mcp_client_invoke(
     context_id: String,
     invoker_did: String,
 ) -> napi::Result<NapiMcpInvokeResult> {
+    crate::napi_check_handle!(handle);
     let entry = mcp_client_registry()
         .get(&handle.handle_id)
         .ok_or_else(|| {

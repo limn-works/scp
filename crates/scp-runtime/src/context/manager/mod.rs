@@ -267,22 +267,29 @@ pub struct CommitFaultMarker {
 /// Used by both `join_context` and `execute_add_member` to avoid
 /// duplicating the emission logic.
 fn push_welcome_event(
-    buffer: &mut ReceiveBuffer,
+    ctx: &mut PerContextState,
     context_id: &str,
     creator_did: &DID,
     member_did: &DID,
     add_output: scp_protocol::context::builder::AddMemberOutput,
+    event_tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
 ) {
     if !add_output.welcome_bytes.is_empty() {
-        buffer.push(ContextEvent::WelcomeGenerated {
-            context_id: context_id.to_owned(),
-            creator_did: creator_did.clone(),
-            member_did: member_did.clone(),
-            welcome_bytes: scp_protocol::context::membership::RedactedBytes(
-                add_output.welcome_bytes,
-            ),
-            commit_bytes: scp_protocol::context::membership::RedactedBytes(add_output.commit_bytes),
-        });
+        ctx.emit_event(
+            ContextEvent::WelcomeGenerated {
+                context_id: context_id.to_owned(),
+                creator_did: creator_did.clone(),
+                member_did: member_did.clone(),
+                welcome_bytes: scp_protocol::context::membership::RedactedBytes(
+                    add_output.welcome_bytes,
+                ),
+                commit_bytes: scp_protocol::context::membership::RedactedBytes(
+                    add_output.commit_bytes,
+                ),
+            },
+            context_id,
+            event_tx,
+        );
     }
 }
 
@@ -1221,6 +1228,111 @@ pub(super) struct PerContextState {
     merkle_tree: scp_event_log::EventLog,
 }
 
+impl PerContextState {
+    /// Pushes an event to the receive buffer and, if a broadcast channel is
+    /// provided, sends a sanitized copy there too. Consolidates the two-step
+    /// `receive_buffer.push` + `tx.send` pattern into a single call site to
+    /// prevent future omissions.
+    ///
+    /// **Security invariants:**
+    /// - `WelcomeGenerated` events carry MLS key material and are NEVER sent
+    ///   on the broadcast channel (receive buffer only).
+    /// - `MessageReceived` / `MessageSent` payloads contain decrypted plaintext
+    ///   and are stripped (replaced with empty `Vec`) before broadcast to
+    ///   preserve encryption-as-access-control.
+    pub(super) fn emit_event(
+        &mut self,
+        event: ContextEvent,
+        context_id: &str,
+        tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+    ) {
+        // WelcomeGenerated carries MLS tree secrets and epoch keys.
+        // It must NEVER reach the broadcast channel.
+        if matches!(event, ContextEvent::WelcomeGenerated { .. }) {
+            self.receive_buffer.push(event);
+            return;
+        }
+
+        self.receive_buffer.push(event.clone());
+        if let Some(tx) = tx {
+            let sanitized = strip_event_payload(&event);
+            let _ = tx.send((context_id.to_owned(), sanitized));
+        }
+    }
+}
+
+/// Strips decrypted plaintext from event variants that carry message payloads.
+///
+/// The broadcast channel is observable by any subscriber (e.g., webhook
+/// consumers, SDK event listeners). Sending decrypted content on it would
+/// defeat MLS encryption-as-access-control. This function replaces payload
+/// bytes with an empty `Vec` for `MessageReceived` and `MessageSent`, and
+/// passes all other variants through unchanged.
+///
+/// The match is exhaustive (no wildcard catch-all) so that adding a new
+/// `ContextEvent` variant with sensitive data causes a compile error,
+/// forcing the developer to decide whether the variant needs stripping.
+pub(super) fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
+    match event {
+        ContextEvent::MessageReceived { sender_did, .. } => ContextEvent::MessageReceived {
+            sender_did: sender_did.clone(),
+            payload: vec![],
+        },
+        ContextEvent::MessageSent {
+            sender_did,
+            sequence_number,
+            ..
+        } => ContextEvent::MessageSent {
+            sender_did: sender_did.clone(),
+            sequence_number: *sequence_number,
+            payload: vec![],
+        },
+        // All remaining variants carry no message plaintext or key material.
+        // Listed exhaustively so new variants cause a compile error.
+        ContextEvent::MemberJoined { .. }
+        | ContextEvent::MemberLeft { .. }
+        | ContextEvent::SystemClose { .. }
+        | ContextEvent::MemberBlocked { .. }
+        | ContextEvent::MemberUnblocked { .. }
+        | ContextEvent::AuthorBlocked { .. }
+        | ContextEvent::ReadAccessRevoked { .. }
+        | ContextEvent::ReadAccessRestored { .. }
+        | ContextEvent::WriteAccessRevoked { .. }
+        | ContextEvent::CapabilitiesSuspended { .. }
+        | ContextEvent::WriteAccessRestored { .. }
+        | ContextEvent::AccessKeyRevoked { .. }
+        | ContextEvent::AccessKeyRestored { .. }
+        | ContextEvent::ContentKeysRotated { .. }
+        | ContextEvent::GovernanceActionExecuted { .. }
+        | ContextEvent::CeilingChangeNotification { .. }
+        | ContextEvent::EconomicPolicyChangeNotification { .. }
+        | ContextEvent::Expired
+        | ContextEvent::ExpiryFailed { .. }
+        | ContextEvent::VoteWithdrawn { .. }
+        | ContextEvent::ProposalTimedOut { .. }
+        | ContextEvent::DeadlockDetected { .. }
+        | ContextEvent::AppBound { .. }
+        | ContextEvent::AppUnbound { .. }
+        | ContextEvent::DegradedMode { .. }
+        | ContextEvent::WelcomeGenerated { .. }
+        | ContextEvent::BufferOverflow { .. }
+        | ContextEvent::SequenceGapDetected { .. }
+        | ContextEvent::CheckpointCosignatureRequired { .. }
+        | ContextEvent::ContextMigrationProposed { .. }
+        | ContextEvent::ContextMigrationStarted { .. }
+        | ContextEvent::ContextMigrationCancelled { .. }
+        | ContextEvent::ContextTombstoned { .. }
+        | ContextEvent::ConsequenceTriggered { .. }
+        | ContextEvent::ConsequenceEnforced { .. }
+        | ContextEvent::PaymentCaptureFailed { .. }
+        | ContextEvent::CommitBroadcastPending { .. }
+        | ContextEvent::CommitBroadcastSucceeded { .. }
+        | ContextEvent::EquivocationDetected { .. }
+        | ContextEvent::CommitBroadcastFailed { .. }
+        | ContextEvent::PseudonymAnnounced { .. } => event.clone(),
+    }
+}
+
 /// Helper type for generation tokens captured during Phase 1 lock acquisition.
 ///
 /// Captures the `context_id` and the `generation` counter at the time the
@@ -1948,6 +2060,14 @@ pub struct ContextManager {
     /// `Relaxed` ordering — uniqueness is guaranteed by the `fetch_add`
     /// atomicity, and no other memory accesses depend on the ordering.
     next_generation: std::sync::atomic::AtomicU64,
+    /// Optional broadcast channel for notifying external consumers of context
+    /// events (e.g., webhook dispatchers in scp-node). When `Some`, every event
+    /// pushed to a per-context `ReceiveBuffer` is also sent on this channel as
+    /// `(context_id, ContextEvent)`. Lagging receivers lose events (bounded
+    /// channel) — this is acceptable because webhook delivery is best-effort.
+    ///
+    /// Created via [`with_event_channel`](Self::with_event_channel).
+    event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
 }
 
 // Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
@@ -1985,6 +2105,7 @@ impl ContextManager {
             payment_adapter: None,
             task_set: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
             next_generation: std::sync::atomic::AtomicU64::new(1),
+            event_tx: None,
         }
     }
 
@@ -2023,6 +2144,7 @@ impl ContextManager {
             payment_adapter: None,
             task_set: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
             next_generation: std::sync::atomic::AtomicU64::new(1),
+            event_tx: None,
         }
     }
 
@@ -2122,30 +2244,40 @@ impl ContextManager {
     // Persistence flush (sync, best-effort)
     // -----------------------------------------------------------------
 
-    /// Persists all currently-unlocked contexts as a best-effort snapshot flush.
+    /// Per-context lock-acquisition budget used by
+    /// [`Self::flush_all_contexts`]. Kept intentionally short: the flush
+    /// happens on the shutdown / suspend path and must complete even when
+    /// some contexts are wedged. Contexts that cannot be locked within this
+    /// window receive a degraded snapshot with `needs_reconnect = true`
+    /// so the restore path sees the reconnect signal rather than a missing
+    /// context.
+    const FLUSH_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// Persists all contexts as a best-effort snapshot flush. Async variant.
     ///
-    /// Iterates the context map and, for each context that can be locked
-    /// without blocking (via [`Mutex::try_lock`]), takes a snapshot and calls
-    /// [`ContextPersistence::persist_context`]. Contexts held by other tasks
-    /// are silently skipped — this is deliberate; their in-progress mutations
-    /// will be persisted by the normal per-operation persistence path.
+    /// Iterates the context map and, for each context, attempts to acquire
+    /// its `Mutex` with a bounded timeout (see [`Self::FLUSH_LOCK_BUDGET`]).
+    /// On successful acquisition, takes a full snapshot and persists it.
+    /// On lock timeout, persists a **degraded** snapshot with
+    /// `needs_reconnect = true` and an empty `mls_crypto_state` so the
+    /// restore path fires the reconnection pipeline (AC3 bug fix).
     ///
     /// Intended for use by [`BridgeInstance::suspend`] and
-    /// [`BridgeInstance::shutdown`] to flush state before transport is
-    /// torn down or MLS groups are destroyed. Errors from individual
-    /// contexts are logged and do not abort the flush.
+    /// [`BridgeInstance::shutdown_core_async`] to flush state before
+    /// transport is torn down or MLS groups are destroyed. Errors from
+    /// individual contexts are logged and do not abort the flush.
     ///
     /// No-op if no persistence provider is configured.
-    pub fn flush_all_contexts_sync(&self) {
+    pub async fn flush_all_contexts(&self) {
         if !self.has_persistence() {
             return;
         }
         // Collect Arcs first to avoid holding DashMap shard locks.
         let arcs = self.collect_context_arcs();
         let mut flushed = 0usize;
-        let mut skipped = 0usize;
+        let mut degraded = 0usize;
         for (context_id, arc) in arcs {
-            match arc.try_lock() {
+            match tokio::time::timeout(Self::FLUSH_LOCK_BUDGET, arc.lock()).await {
                 Ok(ctx) => {
                     let snapshot = Self::snapshot_context(&ctx);
                     let bc_snapshot = ctx
@@ -2159,21 +2291,195 @@ impl ContextManager {
                     }
                     flushed += 1;
                 }
-                Err(_) => {
-                    // Context is locked by an in-progress operation — skip it.
-                    // That operation's normal completion path will persist the
-                    // final state.
-                    skipped += 1;
+                Err(_elapsed) => {
+                    // Lock was held past the budget — a task is holding the
+                    // context mutex for longer than the flush is willing to
+                    // wait. Persist a degraded snapshot that marks the
+                    // context as needing reconnection on restore (§23.11).
+                    self.persist_degraded_snapshot(&context_id);
+                    degraded += 1;
                 }
             }
         }
         tracing::debug!(
             flushed,
-            skipped,
-            "flush_all_contexts_sync: flushed {} context(s), skipped {} locked",
+            degraded,
+            "flush_all_contexts: flushed {} context(s), {} degraded (lock timeout)",
             flushed,
-            skipped,
+            degraded,
         );
+    }
+
+    /// Sync wrapper for [`Self::flush_all_contexts`].
+    ///
+    /// Required by `Drop` and other terminal sync callers that cannot
+    /// `.await`. Uses [`tokio::runtime::Handle::current`] to block on the
+    /// async flush. **Callers MUST be inside a tokio runtime** — this is
+    /// the invariant for every sync shutdown path in the codebase.
+    pub fn flush_all_contexts_sync(&self) {
+        if !self.has_persistence() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // `block_on` from inside a runtime worker thread would
+                // deadlock; `block_in_place` + `block_on` is the idiomatic
+                // way to bridge sync → async from a multi-thread runtime.
+                tokio::task::block_in_place(|| {
+                    handle.block_on(self.flush_all_contexts());
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "flush_all_contexts_sync called outside tokio runtime; \
+                     skipping flush — context state may not be persisted"
+                );
+            }
+        }
+    }
+
+    /// Persists a degraded `ContextSnapshot` for a context whose lock
+    /// could not be acquired within the flush budget. The snapshot carries
+    /// `needs_reconnect = true` and empty `mls_crypto_state` so the
+    /// restore path triggers the §23.11 reconnection pipeline.
+    ///
+    /// A degraded snapshot is strictly better than no snapshot: callers of
+    /// `restore_context` that find no entry for a known context have no
+    /// reconnect signal and will silently drop the context. With this
+    /// snapshot, the reconnection pipeline fires on the next resume.
+    fn persist_degraded_snapshot(&self, context_id: &str) {
+        let Some(ref persistence) = self.persistence else {
+            return;
+        };
+        // Try to pull the context's current params and membership from
+        // the contexts map without locking the mutex (we already know
+        // the lock is held). Fall back to minimal fields if the context
+        // has been removed concurrently.
+        let snapshot = Self::build_degraded_snapshot(context_id);
+        if let Err(e) = persistence.persist_context(context_id, &snapshot) {
+            crate::metrics::record_persistence_failure();
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to persist degraded context snapshot"
+            );
+        } else {
+            tracing::warn!(
+                context_id = %context_id,
+                "persisted degraded snapshot (needs_reconnect=true) — \
+                 context lock could not be acquired within flush budget"
+            );
+        }
+    }
+
+    /// Builds a minimal `ContextSnapshot` marked for reconnection.
+    ///
+    /// The payload is intentionally empty beyond the `context_id` and
+    /// `needs_reconnect = true` flag — the restore path re-derives the
+    /// rest from the reconnection pipeline. Uses `Default` values for
+    /// every field that is not observable externally.
+    fn build_degraded_snapshot(context_id: &str) -> ContextSnapshot {
+        let role_state = scp_protocol::context::roles::ContextRoleState {
+            context_id: context_id.to_owned(),
+            creator_did: String::new(),
+            ceiling: scp_protocol::context::roles::CapabilityCeiling::new(std::iter::empty::<
+                scp_protocol::context::roles::Capability,
+            >()),
+            role_definitions: std::collections::HashMap::new(),
+            assignments: std::collections::HashMap::new(),
+            members: std::collections::HashSet::new(),
+            member_capabilities: std::collections::HashMap::new(),
+            suspended_capabilities: std::collections::HashMap::new(),
+        };
+        ContextSnapshot {
+            context_id: context_id.to_owned(),
+            state: ContextState::Active,
+            context_params: ContextParams::default(),
+            membership: MembershipState::new(),
+            role_state,
+            executed_proposals: std::collections::HashSet::new(),
+            ttl_remaining_secs: None,
+            registered_tools: Vec::new(),
+            read_exclusion_list: std::collections::HashSet::new(),
+            tool_interfaces: Vec::new(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            pruning_policy: None,
+            governance_model_config: None,
+            economic_policy: None,
+            budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
+            approved_proposals: std::collections::HashMap::new(),
+            next_proposal_seq: 0,
+            governance_freeze: None,
+            pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
+            mls_epoch: 0,
+            epoch_coordination_records: Vec::new(),
+            grace_entries: Vec::new(),
+            needs_reconnect: true,
+            mls_crypto_state: Vec::new(),
+            migration_state: None,
+            access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+            consequence_rules: Vec::new(),
+            participation_cache: std::collections::HashMap::new(),
+            velocity_tracker: None,
+            velocity_tracker_state: None,
+            cooldown_until: std::collections::HashMap::new(),
+            proposal_timestamps: std::collections::HashMap::new(),
+            message_pricing: None,
+            hard_rate_limit_config: None,
+            hard_rate_limit_state: std::collections::HashMap::new(),
+            spending_nonce_tracker_state: std::collections::HashMap::new(),
+            pending_commits: std::collections::VecDeque::new(),
+            commit_fault: None,
+            checkpoint_events_since: 0,
+            checkpoint_last_time_secs: 0,
+            generation: 0,
+            local_pseudonym: None,
+            pseudonym_registry: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Attaches a bounded broadcast channel for external event consumers.
+    ///
+    /// After calling this, every event pushed to a per-context
+    /// `ReceiveBuffer` is also sent on the channel as
+    /// `(context_id, ContextEvent)`. Lagging receivers lose events —
+    /// this is acceptable because external consumers (e.g., webhook
+    /// dispatchers) treat delivery as best-effort.
+    ///
+    /// Returns `&mut Self` for chaining.
+    ///
+    /// # Arguments
+    ///
+    /// * `capacity` — bounded channel capacity. `1024` is a sensible
+    ///   default for most deployments. Values are clamped to
+    ///   `[1, MAX_EVENT_CHANNEL_CAPACITY]` to prevent resource exhaustion.
+    pub fn with_event_channel(&mut self, capacity: usize) -> &mut Self {
+        /// Maximum broadcast channel capacity to prevent unbounded memory
+        /// allocation from untrusted callers.
+        const MAX_EVENT_CHANNEL_CAPACITY: usize = 8192;
+
+        let clamped = capacity.clamp(1, MAX_EVENT_CHANNEL_CAPACITY);
+        let (tx, _rx) = tokio::sync::broadcast::channel(clamped);
+        self.event_tx = Some(tx);
+        self
+    }
+
+    /// Returns a new [`tokio::sync::broadcast::Receiver`] for the event
+    /// channel, if one was configured via [`with_event_channel`](Self::with_event_channel).
+    ///
+    /// Each call returns an independent receiver. Multiple consumers
+    /// (e.g., webhook dispatcher, metrics collector) can subscribe
+    /// concurrently.
+    #[must_use]
+    pub fn subscribe_events(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<(String, ContextEvent)>> {
+        self.event_tx
+            .as_ref()
+            .map(tokio::sync::broadcast::Sender::subscribe)
     }
 
     // -----------------------------------------------------------------
@@ -2369,17 +2675,29 @@ impl ContextManager {
         if let Some(ref persistence) = self.persistence {
             // Export MLS crypto state alongside the context snapshot (#645).
             // Populate `mls_crypto_state` in-place on the owned snapshot (#711).
-            // Best-effort: if export fails, persist without crypto state (the
-            // context will need reconnection on restore, matching §23.11 fallback).
+            //
+            // AC3 bug 2 fix: on export failure, mark the snapshot
+            // `needs_reconnect = true` and persist an empty crypto blob.
+            // Previously the error branch silently persisted a snapshot with
+            // a default (empty) `mls_crypto_state` and no reconnect signal
+            // — the restore path would then load the context, attempt to
+            // resume MLS encryption against an empty state, and fail in a
+            // way that required manual operator intervention. With the
+            // flag set, the restore path fires the §23.11 reconnection
+            // pipeline exactly as it would for any other unrecoverable
+            // crypto state, so the context heals automatically.
             let ctx_id_bytes = context_id_to_bytes(context_id);
             match self.crypto.export_crypto_state(&ctx_id_bytes) {
                 Ok(state) => snapshot.mls_crypto_state = state,
                 Err(e) => {
+                    snapshot.needs_reconnect = true;
+                    snapshot.mls_crypto_state = Vec::new();
                     tracing::warn!(
                         context_id = %context_id,
                         error = %e,
                         "failed to export MLS crypto state for persistence; \
-                         context will need reconnection on restore"
+                         snapshot marked needs_reconnect=true so restore \
+                         fires the §23.11 reconnection pipeline"
                     );
                 }
             }
@@ -2574,12 +2892,13 @@ impl ContextManager {
         if let Ok(arc) = self.get_context_arc(context_id) {
             let mut ctx = arc.lock().await;
             ctx.checkpoint_events_since += 1;
-            ctx.receive_buffer.push(ContextEvent::PaymentCaptureFailed {
+            let event = ContextEvent::PaymentCaptureFailed {
                 action: action.to_owned(),
                 actor_did: actor_did.clone(),
                 error: error_msg.to_owned(),
                 cost: cost.map(scp_protocol::economy::types::Amount::value),
-            });
+            };
+            ctx.emit_event(event, context_id, self.event_tx.as_ref());
         }
     }
 }

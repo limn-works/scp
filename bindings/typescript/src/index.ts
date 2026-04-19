@@ -228,6 +228,19 @@ export { classifyOffline, classifyOfflineCustom, getSyncPolicy } from "./sync";
 export { connectLocalTransport, Node, Relay } from "./server";
 
 // ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+export { scpResume, scpSuspend } from "./lifecycle";
+
+// ---------------------------------------------------------------------------
+// SCP multi-instance handle (ADR-048)
+// ---------------------------------------------------------------------------
+
+export type { ScpOptions, StorageConfig } from "./scp";
+export { SCP } from "./scp";
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 

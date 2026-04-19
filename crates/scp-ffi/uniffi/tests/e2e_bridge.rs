@@ -926,7 +926,9 @@ async fn bridge_evaluate_trust_rejects_invalid_status() {
 #[tokio::test]
 async fn register_and_check_local_did() {
     let did = "did:dht:z6MkLocalTest123".to_owned();
-    register_local_did(did.clone()).await;
+    register_local_did(did.clone())
+        .await
+        .expect("register_local_did must succeed for a valid DID");
     assert!(is_local_did(did).await, "Registered DID should be local");
     assert!(
         !is_local_did("did:dht:z6MkNonExistent".to_owned()).await,
@@ -938,14 +940,14 @@ async fn register_and_check_local_did() {
 // Shutdown ordering
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+// scp_shutdown is async; integration tests must use multi-threaded tokio
+// runtime because the eventual shutdown path relies on `block_in_place`.
+// We only call `scp_shutdown(0)` to avoid permanently tearing down the
+// shared default UniffiBridgeInstance while other concurrent tests still
+// depend on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scp_shutdown_zero_timeout_returns_immediately() {
-    scp_shutdown(0);
-}
-
-#[tokio::test]
-async fn scp_shutdown_with_no_handles_returns_immediately() {
-    scp_shutdown(1);
+    let _ = scp_shutdown(0).await;
 }
 
 // ---------------------------------------------------------------------------

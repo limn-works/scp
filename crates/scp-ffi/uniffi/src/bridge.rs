@@ -94,6 +94,45 @@ use scp_ffi_common::validate::{
 
 use crate::{decrement_handle_count, increment_handle_count, runtime};
 
+/// Generates a real MLS key package for a joining member.
+///
+/// Mirrors the NAPI bridge's `generate_mls_key_package_bytes`: builds an
+/// [`ScpCredential`] from the joiner's DID and TLS-serializes a fresh
+/// `KeyPackage` bundle produced by `generate_key_package`. The output bytes
+/// are what `MlsCryptoProvider::validate_key_package` and
+/// `MlsCryptoProvider::add_member` require — the old `FfiBridgeCrypto` stub
+/// used to accept `None`, but real MLS rejects it.
+///
+/// # Errors
+///
+/// Returns `ScpError::Crypto` if the DID format is invalid (must be
+/// `did:dht:z…`), key package generation fails, or TLS serialization fails.
+fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpError> {
+    use scp_core::crypto::mls::credential::ScpCredential;
+    use scp_core::crypto::mls::group::generate_key_package;
+    use tls_codec::Serialize as TlsSerializeTrait;
+
+    let cred = ScpCredential::new(did.to_owned(), None, scp_identity::SigningKeyId::Active)
+        .map_err(|e| ScpError::Crypto {
+            msg: format!("failed to create SCP credential for MLS key package: {e}"),
+            code: codes::CRYPTO_4010.to_owned(),
+        })?;
+
+    let (kp_bundle, _signer, _provider) =
+        generate_key_package(&cred).map_err(|e| ScpError::Crypto {
+            msg: format!("MLS key package generation failed: {e}"),
+            code: codes::CRYPTO_4011.to_owned(),
+        })?;
+
+    kp_bundle
+        .key_package()
+        .tls_serialize_detached()
+        .map_err(|e| ScpError::Crypto {
+            msg: format!("MLS key package TLS serialization failed: {e}"),
+            code: codes::CRYPTO_4012.to_owned(),
+        })
+}
+
 /// Tool handler function type: maps JSON input to JSON output (or error string).
 type ToolHandlerMap = std::collections::HashMap<
     String,
@@ -454,6 +493,18 @@ impl From<scp_ffi_common::validate::ValidationError> for ScpError {
         Self::Validation {
             msg: e.message,
             code: codes::VALID_7000.to_owned(),
+        }
+    }
+}
+
+impl From<scp_ffi_common::bridge_instance::HandleAffinityError> for ScpError {
+    fn from(e: scp_ffi_common::bridge_instance::HandleAffinityError) -> Self {
+        // Sanitized message — never exposes the raw ids. PERM_3030 lets
+        // callers programmatically distinguish this from other permission
+        // errors.
+        Self::Permission {
+            msg: format!("{e}"),
+            code: codes::PERM_3030.to_owned(),
         }
     }
 }
@@ -1363,10 +1414,24 @@ pub struct Identity {
     /// byte-exact cross-bridge parity under a deterministic `seed`
     /// (ADR-046).
     pub(crate) verifying_key_hex: Option<String>,
+    /// Monotonic identifier of the bridge instance that minted this handle.
+    ///
+    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// every `#[uniffi::export]` entry that accepts an `Identity`. Mismatches
+    /// map to `ScpError::Permission` with code `SCP-PERM-3030`.
+    pub(crate) instance_id: u64,
 }
 
 #[uniffi::export]
 impl Identity {
+    /// Returns the monotonic identifier of the bridge instance that minted
+    /// this handle.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     /// Returns the DID string for this identity.
     #[must_use]
     pub fn did(&self) -> String {
@@ -1414,6 +1479,12 @@ impl Identity {
     ///
     /// See SCP-214 acceptance criterion 9.
     pub async fn rotate_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        // #1646: every Category B (CoreFields-touching) UniFFI method must
+        // route through `default_bridge_instance()?` so `check_ready()`
+        // rejects operations against a suspended or shut-down bridge.
+        // `rotate_key` writes DID resolver state on `CoreFields` via the
+        // DHT signer path, so the gate is mandatory.
+        let _bi = crate::runtime::default_bridge_instance()?;
         let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
             msg: "key rotation requires retained crypto state — this identity \
                       was loaded without key material (use identity_create or \
@@ -1446,6 +1517,7 @@ impl Identity {
                 in_memory_custody: None,
                 callback_custody: self.callback_custody.clone(),
                 verifying_key_hex,
+                instance_id: self.instance_id,
             });
             increment_handle_count();
             return Ok(handle);
@@ -1474,6 +1546,7 @@ impl Identity {
                 in_memory_custody: self.in_memory_custody.clone(),
                 callback_custody: None,
                 verifying_key_hex,
+                instance_id: self.instance_id,
             });
             increment_handle_count();
             return Ok(handle);
@@ -1549,6 +1622,9 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn add_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        // #1646: Category B gate — writes DID resolver / DHT state through
+        // `CoreFields`, must not run on a suspended or shut-down bridge.
+        let _bi = crate::runtime::default_bridge_instance()?;
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -1590,6 +1666,7 @@ impl Identity {
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             let in_memory_custody = Some(custody.clone());
+            let instance_id = self.instance_id;
             let dht = make_dht_with_signer(&custody)?;
 
             runtime()
@@ -1614,6 +1691,7 @@ impl Identity {
                         in_memory_custody,
                         callback_custody: None,
                         verifying_key_hex,
+                        instance_id,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -1643,6 +1721,9 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn remove_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        // #1646: Category B gate — writes DID resolver / DHT state through
+        // `CoreFields`, must not run on a suspended or shut-down bridge.
+        let _bi = crate::runtime::default_bridge_instance()?;
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -1686,6 +1767,7 @@ impl Identity {
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             let in_memory_custody = self.in_memory_custody.clone();
+            let instance_id = self.instance_id;
             let dht = make_dht_with_signer(custody)?;
 
             let custody_for_key = custody.clone();
@@ -1711,6 +1793,7 @@ impl Identity {
                         in_memory_custody,
                         callback_custody: None,
                         verifying_key_hex,
+                        instance_id,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -1740,6 +1823,9 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn rotate_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        // #1646: Category B gate — writes DID resolver / DHT state through
+        // `CoreFields`, must not run on a suspended or shut-down bridge.
+        let _bi = crate::runtime::default_bridge_instance()?;
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -1781,6 +1867,7 @@ impl Identity {
             let did = self.did.clone();
             let custody_type = self.custody_type.clone();
             let in_memory_custody = Some(custody.clone());
+            let instance_id = self.instance_id;
             let dht = make_dht_with_signer(&custody)?;
 
             runtime()
@@ -1805,6 +1892,7 @@ impl Identity {
                         in_memory_custody,
                         callback_custody: None,
                         verifying_key_hex,
+                        instance_id,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -1875,6 +1963,12 @@ pub struct ContextHandle {
     /// Core context parameters, retained for `finalize_close` (`memory_scope`
     /// governs key destruction) and `restore_context`.
     pub(crate) core_context_params: scp_core::context::ContextParams,
+    /// Monotonic identifier of the bridge instance that minted this handle.
+    ///
+    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// every `#[uniffi::export]` entry that accepts a `ContextHandle`.
+    /// Mismatches map to `ScpError::Permission` with code `SCP-PERM-3030`.
+    pub(crate) instance_id: u64,
 }
 
 impl std::fmt::Debug for ContextHandle {
@@ -1889,6 +1983,14 @@ impl std::fmt::Debug for ContextHandle {
 
 #[uniffi::export]
 impl ContextHandle {
+    /// Returns the monotonic identifier of the bridge instance that minted
+    /// this handle.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     /// Returns the context's unique identifier.
     pub fn context_id(&self) -> String {
         self.context_id.clone()
@@ -1949,10 +2051,23 @@ pub struct UcanToken {
     pub(crate) data: UcanTokenData,
     /// Raw encoded JWT string — used by `ucan_revoke` and `ucan_validate`.
     pub(crate) encoded: String,
+    /// Monotonic identifier of the bridge instance that minted this handle.
+    ///
+    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// every `#[uniffi::export]` entry that accepts a `UcanToken`.
+    pub(crate) instance_id: u64,
 }
 
 #[uniffi::export]
 impl UcanToken {
+    /// Returns the monotonic identifier of the bridge instance that minted
+    /// this handle.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     /// Returns the token's stable metadata record.
     #[must_use]
     pub fn token_data(&self) -> UcanTokenData {
@@ -2011,7 +2126,8 @@ impl Drop for UcanToken {
 /// Opaque handle to the transport layer.
 ///
 /// Wraps a real [`scp_transport::TransportManager`] that is stored in the
-/// shared [`BridgeInstance`]. This handle provides Swift/Kotlin callers with
+/// shared [`UniffiBridgeInstance`](crate::runtime::UniffiBridgeInstance).
+/// This handle provides Swift/Kotlin callers with
 /// the full multi-relay API: `addRelay`, `assignRelaySet`, `adapterCount`,
 /// `reliabilityScore`. All operations delegate to the `BridgeInstance`'s
 /// transport slot, so `suspend()` / `shutdown()` lifecycle events
@@ -2024,6 +2140,11 @@ impl Drop for UcanToken {
 pub struct TransportManager {
     /// Current connection state (relay URL, latency).
     pub(crate) status: std::sync::Mutex<TransportStatus>,
+    /// Monotonic identifier of the bridge instance that minted this handle.
+    ///
+    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
+    /// every `#[uniffi::export]` entry that accepts a `TransportManager`.
+    pub(crate) instance_id: u64,
 }
 
 impl fmt::Debug for TransportManager {
@@ -2031,7 +2152,8 @@ impl fmt::Debug for TransportManager {
         let adapter_count = crate::runtime::bridge_instance()
             .ok()
             .and_then(|bi| {
-                bi.with_transport(scp_transport::TransportManager::adapter_count)
+                bi.core
+                    .with_transport(scp_transport::TransportManager::adapter_count)
                     .ok()
             })
             .unwrap_or(0);
@@ -2065,6 +2187,14 @@ pub struct ReliabilityScoreRecord {
 
 #[uniffi::export]
 impl TransportManager {
+    /// Returns the monotonic identifier of the bridge instance that minted
+    /// this handle.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     /// Returns the current transport connection status record.
     ///
     /// Reflects actual connection state: `connected` is `true` only if the
@@ -2072,7 +2202,7 @@ impl TransportManager {
     pub fn status(&self) -> TransportStatus {
         let has_adapters = crate::runtime::bridge_instance()
             .ok()
-            .and_then(|bi| bi.with_transport(|mgr| mgr.adapter_count() > 0).ok())
+            .and_then(|bi| bi.core.with_transport(|mgr| mgr.adapter_count() > 0).ok())
             .unwrap_or(false);
         let status = self.status.lock().map_or(
             TransportStatus {
@@ -2093,7 +2223,7 @@ impl TransportManager {
     pub fn is_connected(&self) -> bool {
         crate::runtime::bridge_instance()
             .ok()
-            .and_then(|bi| bi.with_transport(|mgr| mgr.adapter_count() > 0).ok())
+            .and_then(|bi| bi.core.with_transport(|mgr| mgr.adapter_count() > 0).ok())
             .unwrap_or(false)
     }
 
@@ -2102,7 +2232,11 @@ impl TransportManager {
     pub fn adapter_count(&self) -> u32 {
         crate::runtime::bridge_instance()
             .ok()
-            .and_then(|bi| bi.with_transport(|mgr| mgr.adapter_count() as u32).ok())
+            .and_then(|bi| {
+                bi.core
+                    .with_transport(|mgr| mgr.adapter_count() as u32)
+                    .ok()
+            })
             .unwrap_or(0)
     }
 
@@ -2125,7 +2259,11 @@ impl TransportManager {
 
         validate_relay_url(&relay_url)?;
 
-        let bi = crate::runtime::bridge_instance()?;
+        // #1646: Category B gate — mutates `CoreFields::transport` state,
+        // must not run on a suspended or shut-down bridge.
+        // `default_bridge_instance()` errors on shutdown; `bridge_instance()`
+        // only warns, which is too permissive for a mutation.
+        let bi = crate::runtime::default_bridge_instance()?;
         let rt = runtime();
         let sourced = SourcedRelayUrl {
             url: relay_url.clone(),
@@ -2145,6 +2283,7 @@ impl TransportManager {
         let suppression_rx = adapter.take_suppression_receiver();
 
         let count = bi
+            .core
             .with_transport_mut(|mgr| {
                 let _eviction = mgr.add_adapter(Box::new(adapter));
                 #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
@@ -2183,8 +2322,11 @@ impl TransportManager {
     /// Returns `ScpError::Transport` if no adapters are registered.
     pub fn assign_relay_set(&self, context_id: String) -> Result<Vec<u32>, ScpError> {
         validate_context_id(&context_id)?;
-        let bi = crate::runtime::bridge_instance()?;
+        // #1646: Category B gate — mutates `CoreFields::transport` state,
+        // must not run on a suspended or shut-down bridge.
+        let bi = crate::runtime::default_bridge_instance()?;
         let indices = bi
+            .core
             .with_transport(|mgr| {
                 mgr.assign_relay_set(&context_id)
                     .map_err(|e| ScpError::Transport {
@@ -2210,6 +2352,7 @@ impl TransportManager {
     pub fn reliability_score(&self, adapter_index: u32) -> Option<ReliabilityScoreRecord> {
         let bi = crate::runtime::bridge_instance().ok()?;
         let score = bi
+            .core
             .with_transport(|mgr| mgr.get_reliability_score(adapter_index as usize))
             .ok()??;
         Some(ReliabilityScoreRecord {
@@ -2263,7 +2406,7 @@ fn spawn_suppression_scoring_task(
                 relay_url = %relay_url,
                 "heartbeat suppression → downgrading relay reliability score"
             );
-            let _ = bi.with_transport(|inner| {
+            let _ = bi.core.with_transport(|inner| {
                 inner.update_score(&relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
             });
         }
@@ -2430,6 +2573,7 @@ pub async fn identity_create(
                             in_memory_custody: Some(key_custody),
                             callback_custody: None,
                             verifying_key_hex,
+                            instance_id: crate::runtime::default_instance_id()?,
                         });
                         increment_handle_count();
                         Ok(handle)
@@ -2535,6 +2679,7 @@ pub async fn identity_create_with_custody(
                 in_memory_custody: None,
                 callback_custody: Some(callback_custody),
                 verifying_key_hex,
+                instance_id: crate::runtime::default_instance_id()?,
             });
             increment_handle_count();
             Ok(handle)
@@ -2573,6 +2718,7 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
 
             // identity_load returns a DID-string-only handle. Key operations
             // require the KeyCustodyProvider callback interface to be wired.
+            crate::runtime::ensure_bridge_instance();
             let handle = Arc::new(Identity {
                 did,
                 custody_type: CustodyMethod::External,
@@ -2585,6 +2731,7 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
                 // parity-test consumers only need `verifying_key` for
                 // locally-created identities.
                 verifying_key_hex: None,
+                instance_id: crate::runtime::default_instance_id()?,
             });
             increment_handle_count();
             Ok(handle)
@@ -2664,6 +2811,7 @@ pub async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> {
 /// See §9.3, issue #362, #419.
 #[uniffi::export]
 pub async fn identity_attest_device(identity: Arc<Identity>) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(identity);
     identity_attest_device_impl(identity).await
 }
 
@@ -2809,15 +2957,35 @@ const UNIFFI_LINK_ATTESTATION_REGISTRY_CAP: usize = 10_000;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 
-/// Global registry of identity link attestations, keyed by DID string.
+/// Fallback empty identity link attestation registry for when the default
+/// `UniffiBridgeInstance` has not been initialized yet.
+static EMPTY_IDENTITY_LINK_ATTESTATION_REGISTRY: std::sync::OnceLock<
+    dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>,
+> = std::sync::OnceLock::new();
+
+/// Returns a reference to the default bridge instance's identity link
+/// attestation registry.
+///
+/// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
+/// typed `identity_link_attestation_registry` field on
+/// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 6.
+/// Falls back to an empty registry when the default instance has not been
+/// initialized yet.
 fn identity_link_attestation_registry()
 -> &'static dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>
 {
-    static REGISTRY: std::sync::OnceLock<
-        dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>,
-    > = std::sync::OnceLock::new();
-    REGISTRY.get_or_init(dashmap::DashMap::new)
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_IDENTITY_LINK_ATTESTATION_REGISTRY.get_or_init(dashmap::DashMap::new),
+        |bi| bi.identity_link_attestation_registry().as_ref(),
+    )
 }
+
+/// Fallback empty identity custody registry for when the default
+/// `UniffiBridgeInstance` has not been initialized yet.
+#[cfg(feature = "allow_in_memory_custody")]
+static EMPTY_IDENTITY_CUSTODY_REGISTRY: std::sync::OnceLock<
+    dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)>,
+> = std::sync::OnceLock::new();
 
 /// Retained identity custody for attestation verification (keyed by DID).
 ///
@@ -2825,13 +2993,20 @@ fn identity_link_attestation_registry()
 /// created attestations, so that `identity_verify_link_attestation` can look
 /// up the issuer's public key without requiring the caller to pass the
 /// Identity object.
+///
+/// PR 1 moved the registry onto the typed `identity_custody_registry` field
+/// on the default `UniffiBridgeInstance`. Commit 6 of #1549 Phase 4 PR 2
+/// lifts the internal `EMPTY` fallback `OnceLock` out of this function onto
+/// module scope so all three `UniFFI` registries follow the uniform
+/// `EMPTY_* -> bi.field.as_ref()` resolution pattern.
 #[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn identity_custody_registry()
 -> &'static dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
-    static REGISTRY: std::sync::OnceLock<
-        dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)>,
-    > = std::sync::OnceLock::new();
-    REGISTRY.get_or_init(dashmap::DashMap::new)
+    crate::runtime::ensure_bridge_instance();
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_IDENTITY_CUSTODY_REGISTRY.get_or_init(dashmap::DashMap::new),
+        |bi| bi.identity_custody_registry.as_ref(),
+    )
 }
 
 /// Creates an identity link attestation for an external platform identity.
@@ -2847,6 +3022,7 @@ pub async fn identity_create_link_attestation(
     verification_method: String,
     platform_id: Option<String>,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(identity);
     identity_create_link_attestation_impl(
         identity,
         platform,
@@ -3100,6 +3276,7 @@ pub async fn context_create(
     identity: Arc<Identity>,
     params: ContextParams,
 ) -> Result<Arc<ContextHandle>, ScpError> {
+    crate::uniffi_check_handle!(identity);
     runtime()
         .spawn(async move {
             validate_did(&identity.did)?;
@@ -3120,8 +3297,12 @@ pub async fn context_create(
             // memory_scope to decide key destruction behavior.
             let retained_core_params = core_params.clone();
 
-            // Initialize the ContextManager if not already done (first context_create call).
-            crate::runtime::init_context_manager();
+            // Initialize the ContextManager with the creator's DID if not
+            // already done. `init_context_manager_with_did` is idempotent
+            // (`OnceLock` — first call wins). The bridge no longer supports
+            // a DID-less stub crypto path; the creator DID becomes the
+            // process-wide MLS credential identity.
+            crate::runtime::init_context_manager_with_did(&identity.did);
 
             // Extract key custody and signing key from the identity.
             #[cfg(feature = "allow_in_memory_custody")]
@@ -3252,6 +3433,7 @@ pub async fn context_create(
                 ),
                 economic_policy: std::sync::Mutex::new(None),
                 core_context_params: retained_core_params,
+                instance_id: identity.instance_id,
             });
             // Register in the global context handle registry so the MCP
             // bridge provider can look up per-context state by context ID.
@@ -3288,6 +3470,7 @@ pub async fn context_join(
     identity: Arc<Identity>,
     spending_ucan_jwt: Option<String>,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             validate_did(&identity.did)?;
@@ -3320,10 +3503,11 @@ pub async fn context_join(
                 })
                 .transpose()?;
 
-            // Ensure the ContextManager is initialized — context_join is a valid
-            // first operation (e.g. a device joining a context without creating
-            // one). init_context_manager is idempotent (OnceLock). #1073
-            crate::runtime::init_context_manager();
+            // Ensure the ContextManager is initialized with the joining
+            // identity's DID — context_join is a valid first operation
+            // (e.g. a device joining a context without creating one).
+            // `init_context_manager_with_did` is idempotent (`OnceLock`). #1073
+            crate::runtime::init_context_manager_with_did(&identity.did);
 
             // Delegate to the shared ContextManager. Build a core ContextHandle
             // to pass the context_id, then join via the manager.
@@ -3341,9 +3525,14 @@ pub async fn context_join(
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
 
+            // Generate a real MLS key package for the joining member. The
+            // `MlsCryptoProvider` requires `Some(bytes)` — the old DID-less
+            // `FfiBridgeCrypto` stub accepted `None`, but commit 4 replaced
+            // it with real MLS crypto across every bridge entry point.
+            let kp_bytes = generate_mls_key_package_bytes(&identity.did)?;
             let key_package = KeyPackage {
                 owner_did: identity.did.clone().into(),
-                mls_key_package_bytes: None,
+                mls_key_package_bytes: Some(kp_bytes),
             };
 
             // §9.10.4: Derive pseudonym for per-member routing. Uses the
@@ -3450,6 +3639,7 @@ pub async fn context_leave(
     handle: Arc<ContextHandle>,
     identity: Arc<Identity>,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -3512,6 +3702,7 @@ pub async fn context_close(
     handle: Arc<ContextHandle>,
     identity: Arc<Identity>,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             // Authorization is enforced by the ContextManager (which delegates
@@ -3540,7 +3731,7 @@ pub async fn context_close(
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
 
-            let initiator_did: scp_identity::DID = identity_did.into();
+            let initiator_did: scp_identity::DID = identity_did.clone().into();
             manager
                 .close_context(&core_handle, &initiator_did)
                 .await
@@ -3553,8 +3744,15 @@ pub async fn context_close(
             let memory_scope = core_handle.params().memory_scope;
             let now = scp_primitives::SystemClock.now_secs();
 
-            let crypto_provider = crate::runtime::context_manager_crypto();
-            let orchestrator = scp_core::context::close::CloseOrchestrator::new(crypto_provider);
+            // Build a fresh `MlsCryptoProvider` for key-destruction scoped to
+            // the initiator's DID. The bridge no longer caches a global stub
+            // crypto provider (commit 4 removed `FfiBridgeCrypto`). The
+            // `CloseOrchestrator` only uses this provider to destroy MLS group
+            // and sender-key material for the context being closed; a fresh
+            // per-call instance is correct.
+            let crypto_provider =
+                scp_core::crypto::mls::provider::MlsCryptoProvider::new(identity_did);
+            let orchestrator = scp_core::context::close::CloseOrchestrator::new(&crypto_provider);
 
             let close_action = orchestrator
                 .initiate_close(
@@ -3608,8 +3806,8 @@ pub async fn context_close(
 
             // Clean up per-context bridge connector state and economy state via BridgeInstance.
             if let Ok(bi) = crate::runtime::bridge_instance() {
-                bi.remove_bridge_state(&handle.context_id);
-                bi.remove_economy_state(&handle.context_id);
+                bi.core.remove_bridge_state(&handle.context_id);
+                bi.core.remove_economy_state(&handle.context_id);
             }
 
             // Deregister the context handle from the MCP lookup registry.
@@ -3650,6 +3848,7 @@ pub async fn context_send(
     payload: Vec<u8>,
     spending_ucan_jwt: Option<String>,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             validate_did(&identity.did)?;
@@ -3786,6 +3985,7 @@ pub async fn context_subscribe(
     handle: Arc<ContextHandle>,
     listener: Box<dyn crate::MessageListener>,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     let state = handle.state.lock().await;
 
     if !matches!(*state, ContextState::Active) {
@@ -3831,6 +4031,7 @@ pub async fn tool_register(
     handle: Arc<ContextHandle>,
     definition: ToolDefinition,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             validate_tool_name(&definition.name)?;
@@ -4016,6 +4217,7 @@ pub async fn tool_invoke(
     proof_tokens: Option<Vec<String>>,
     spending_ucan_jwt: Option<String>,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             validate_tool_id(&tool_id)?;
@@ -4130,7 +4332,7 @@ pub async fn tool_invoke(
                 }
             };
 
-            let manager = crate::runtime::context_manager_expect();
+            let manager = crate::runtime::context_manager_expect()?;
             let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
             let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
             let outcome = manager
@@ -4256,6 +4458,7 @@ pub async fn tool_verify(
     handle: Arc<ContextHandle>,
     tool_id: String,
 ) -> Result<ToolVerificationResult, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -4324,6 +4527,7 @@ pub async fn tool_invoke_cross_context(
     chain_depth: u8,
     proof_tokens: Option<Vec<String>>,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(source_handle, target_handle, identity);
     runtime()
         .spawn(async move {
             // Validate source context is active.
@@ -4466,6 +4670,7 @@ pub async fn tool_session_create(
     source_context_id: String,
     ttl_seconds: Option<u64>,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -4553,6 +4758,7 @@ pub async fn tool_session_invoke(
     ucan_token: String,
     proof_tokens: Option<Vec<String>>,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -4679,6 +4885,7 @@ pub async fn tool_session_close(
     handle: Arc<ContextHandle>,
     session_id: String,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let mut store = handle.session_store.lock().await;
@@ -4728,6 +4935,7 @@ pub async fn tool_interface_expose(
     target_context_id: String,
     rate_limit_json: Option<String>,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             validate_tool_id(&tool_id)?;
@@ -4826,6 +5034,7 @@ pub async fn tool_interface_accept(
     handle: Arc<ContextHandle>,
     interface_json: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let state = handle.state.lock().await;
@@ -4911,6 +5120,7 @@ pub async fn tool_interface_revoke(
     handle: Arc<ContextHandle>,
     interface_id_hex: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let interface_id_bytes =
@@ -5032,11 +5242,17 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
                     code: codes::CTX_2000.to_owned(),
                 })?
             };
-            bi.set_transport(std::sync::Arc::new(manager))
+            bi.core
+                .set_transport(std::sync::Arc::new(manager))
                 .map_err(|e| ScpError::Transport {
                     msg: e.to_string(),
                     code: codes::TRANS_5002.to_owned(),
                 })?;
+
+            // Register the URL on the bridge's pending-reconnect set so
+            // `BridgeInstanceCore::resume` can rebuild the transport after
+            // suspend/resume cycles (#1678).
+            bi.core.add_relay_url(relay_url.clone());
 
             let handle = Arc::new(TransportManager {
                 status: std::sync::Mutex::new(TransportStatus {
@@ -5044,6 +5260,7 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
                     relay_url: Some(relay_url.clone()),
                     latency_ms: None,
                 }),
+                instance_id: bi.core.instance_id(),
             });
             increment_handle_count();
 
@@ -5082,6 +5299,7 @@ pub async fn transport_status(
     manager: Option<Arc<TransportManager>>,
 ) -> Result<TransportStatus, ScpError> {
     if let Some(mgr) = manager {
+        crate::uniffi_check_handle!(mgr);
         return Ok(mgr.status());
     }
     // Handleless probe — consult the BridgeInstance directly. If the
@@ -5090,7 +5308,7 @@ pub async fn transport_status(
     // callers use it to check state before connecting.
     let connected = crate::runtime::bridge_instance()
         .ok()
-        .is_some_and(|bi| bi.has_transport());
+        .is_some_and(|bi| bi.core.has_transport());
     Ok(TransportStatus {
         connected,
         relay_url: None,
@@ -5115,24 +5333,35 @@ pub async fn transport_status(
 /// Returns `ScpError::Transport` if the internal lock is poisoned.
 #[uniffi::export]
 pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(manager);
     runtime()
         .spawn(async move {
             // Clear the transport from BridgeInstance, dropping all adapters.
             let bi = crate::runtime::bridge_instance()?;
-            bi.clear_transport().map_err(|e| ScpError::Transport {
+            bi.core.clear_transport().map_err(|e| ScpError::Transport {
                 msg: e.to_string(),
                 code: codes::TRANS_5003.to_owned(),
             })?;
 
-            // Update the handle's status to disconnected.
-            {
+            // Update the handle's status to disconnected and capture the
+            // URL we were connected to before clearing it.
+            let disconnecting_url = {
                 let mut status_guard = manager.status.lock().map_err(|_| ScpError::Transport {
                     msg: "status mutex is poisoned — cannot update transport status".to_owned(),
                     code: codes::TRANS_5003.to_owned(),
                 })?;
+                let url = status_guard.relay_url.clone();
                 status_guard.connected = false;
                 status_guard.relay_url = None;
                 status_guard.latency_ms = None;
+                url
+            };
+
+            // Remove the URL from the bridge's pending-reconnect set so a
+            // subsequent `resume()` does not re-open a URL the caller
+            // explicitly disconnected (#1678).
+            if let Some(ref url) = disconnecting_url {
+                bi.core.remove_relay_url(url);
             }
 
             Ok(())
@@ -5274,15 +5503,29 @@ pub struct McpAllowlistState {
 // context_create and deregistered during context_close/leave.
 // ---------------------------------------------------------------------------
 
-/// Global registry mapping context IDs to their `ContextHandle` instances.
+/// Fallback empty context handle registry for when the default
+/// `UniffiBridgeInstance` has not been initialized yet.
+static EMPTY_CONTEXT_HANDLE_REGISTRY: std::sync::OnceLock<
+    dashmap::DashMap<String, Arc<ContextHandle>>,
+> = std::sync::OnceLock::new();
+
+/// Returns a reference to the default bridge instance's context handle
+/// registry.
+///
+/// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
+/// typed `context_handle_registry` field on
+/// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 6.
+/// Falls back to an empty registry when the default instance has not been
+/// initialized yet.
 ///
 /// Used by `McpUniFfiBridgeProvider` to look up per-context tool registries,
 /// handlers, and event log state. The `Arc<ContextHandle>` keeps the handle
 /// alive as long as it is in the registry (the caller also holds an Arc).
 fn context_handle_registry() -> &'static dashmap::DashMap<String, Arc<ContextHandle>> {
-    static REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, Arc<ContextHandle>>> =
-        std::sync::OnceLock::new();
-    REGISTRY.get_or_init(dashmap::DashMap::new)
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_CONTEXT_HANDLE_REGISTRY.get_or_init(dashmap::DashMap::new),
+        |bi| bi.context_handle_registry().as_ref(),
+    )
 }
 
 /// Registers a context handle in the global registry.
@@ -5308,45 +5551,55 @@ fn deregister_context_handle(context_id: &str) {
 // ---------------------------------------------------------------------------
 
 /// Internal state for a running MCP server.
-struct McpServerEntry {
+pub(crate) struct McpServerEntry {
     /// Shutdown signal sender. Dropping this signals the transport task to stop.
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Handle to the tokio task running the transport.
-    _task_handle: tokio::task::JoinHandle<()>,
+    pub(crate) _task_handle: tokio::task::JoinHandle<()>,
     /// Whether the server has been stopped.
-    stopped: bool,
+    pub(crate) stopped: bool,
 }
 
 /// Internal state for an active MCP client connection.
-struct McpClientEntry {
+pub(crate) struct McpClientEntry {
     /// The real MCP client, connected and initialized.
-    client: std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>,
+    pub(crate) client: std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>,
 }
 
+/// Fallback empty MCP server registry for when the default
+/// `UniffiBridgeInstance` has not been initialized yet. Mirrors the
+/// NAPI `EMPTY_SERVER_REGISTRY` fallback pattern.
+static EMPTY_MCP_SERVER_REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpServerEntry>> =
+    std::sync::OnceLock::new();
+
+/// Fallback empty MCP client registry.
+static EMPTY_MCP_CLIENT_REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpClientEntry>> =
+    std::sync::OnceLock::new();
+
+/// Returns a reference to the default bridge instance's MCP server registry.
+///
+/// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
+/// typed `mcp_server_registry` field on
+/// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 4.
+/// Falls back to an empty registry when the default instance has not been
+/// initialized yet.
 fn mcp_server_registry() -> &'static dashmap::DashMap<String, McpServerEntry> {
-    static REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpServerEntry>> =
-        std::sync::OnceLock::new();
-    REGISTRY.get_or_init(dashmap::DashMap::new)
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_MCP_SERVER_REGISTRY.get_or_init(dashmap::DashMap::new),
+        |bi| bi.mcp_server_registry().as_ref(),
+    )
 }
 
+/// Returns a reference to the default bridge instance's MCP client registry.
 fn mcp_client_registry() -> &'static dashmap::DashMap<String, McpClientEntry> {
-    static REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpClientEntry>> =
-        std::sync::OnceLock::new();
-    REGISTRY.get_or_init(dashmap::DashMap::new)
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_MCP_CLIENT_REGISTRY.get_or_init(dashmap::DashMap::new),
+        |bi| bi.mcp_client_registry().as_ref(),
+    )
 }
 
 fn mcp_handle_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
-}
-
-/// Clears both MCP server and client registries during shutdown.
-///
-/// Called by the shutdown hook registered in `crate::runtime::init_bridge_instance_empty`.
-/// This ensures server shutdown senders and client connections are dropped,
-/// allowing background tasks to terminate cleanly.
-pub(crate) fn clear_mcp_registries() {
-    mcp_server_registry().clear();
-    mcp_client_registry().clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -5358,7 +5611,7 @@ pub(crate) fn clear_mcp_registries() {
 const MCP_MAX_LINE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Transport wrapper that delegates to either stdio or SSE.
-enum McpUniFFITransportWrapper {
+pub(crate) enum McpUniFFITransportWrapper {
     Stdio(McpStdioTransport),
     Sse(McpSseTransport),
 }
@@ -5388,7 +5641,7 @@ impl scp_mcp::client::McpTransport for McpUniFFITransportWrapper {
 }
 
 /// Stdio MCP transport: communicates with a subprocess via stdin/stdout.
-struct McpStdioTransport {
+pub(crate) struct McpStdioTransport {
     inner: std::sync::Mutex<McpStdioTransportInner>,
 }
 
@@ -5518,7 +5771,7 @@ impl Drop for McpStdioTransport {
 ///
 /// SSE transport is a placeholder — stdio is the primary transport for
 /// mobile clients. SSE methods return descriptive errors.
-struct McpSseTransport {
+pub(crate) struct McpSseTransport {
     _url: String,
 }
 
@@ -6525,6 +6778,7 @@ pub async fn ucan_validate(
     presenting_agent_did: Option<String>,
     proof_tokens: Option<Vec<String>>,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             validate_ucan_token(&token)?;
@@ -6653,6 +6907,7 @@ pub async fn ucan_mint(
     capabilities: Vec<String>,
     proofs: Option<Vec<String>>,
 ) -> Result<Arc<UcanToken>, ScpError> {
+    crate::uniffi_check_handle!(handle);
     validate_did(&member_did)?;
     if let Some(ref tokens) = proofs {
         for t in tokens {
@@ -6734,6 +6989,7 @@ async fn ucan_mint_impl(
             Ok(Arc::new(UcanToken {
                 data,
                 encoded: token.encoded,
+                instance_id: handle.instance_id,
             }))
         })
         .await
@@ -6792,6 +7048,7 @@ pub async fn ucan_revoke(
     token: String,
     revoker_did: String,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     validate_ucan_token(&token).map_err(|e| ScpError::Validation {
         msg: e.to_string(),
         code: codes::VALID_7010.to_owned(),
@@ -6897,6 +7154,7 @@ pub async fn ucan_delegate(
     parent_token: String,
     capabilities: Vec<String>,
 ) -> Result<Arc<UcanToken>, ScpError> {
+    crate::uniffi_check_handle!(handle);
     validate_did(&delegator_did)?;
     validate_did(&delegatee_did)?;
     validate_ucan_token(&parent_token)?;
@@ -7014,6 +7272,7 @@ async fn ucan_delegate_impl(
             Ok(Arc::new(UcanToken {
                 data,
                 encoded: token.encoded,
+                instance_id: handle.instance_id,
             }))
         })
         .await
@@ -7070,6 +7329,7 @@ pub async fn event_log_query(
     handle: Arc<ContextHandle>,
     filter_json: Option<String>,
 ) -> Result<Vec<Event>, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             // Ensure UCAN state (which contains the event log) is registered.
@@ -7256,6 +7516,7 @@ pub async fn event_log_verify(
     handle: Arc<ContextHandle>,
     claim_json: String,
 ) -> Result<Proof, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             // Parse the claim JSON.
@@ -7451,6 +7712,7 @@ pub async fn event_log_checkpoint(
     identity: Arc<Identity>,
     epoch: u64,
 ) -> Result<Checkpoint, ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     event_log_checkpoint_impl(handle, identity, epoch).await
 }
 
@@ -7584,6 +7846,7 @@ pub async fn governance_execute(
     handle: Arc<ContextHandle>,
     proposal_json: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     let (result, action_name) = runtime()
@@ -7760,6 +8023,7 @@ pub async fn governance_propose(
     proposer_did: String,
     action_json: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let signing_key = resolve_uniffi_signing_key(&handle).await?;
     let context_id = handle.context_id.clone();
 
@@ -7823,6 +8087,7 @@ pub async fn governance_approve(
     voter_did: String,
     proposal_id_hex: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let signing_key = resolve_uniffi_signing_key(&handle).await?;
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
@@ -7868,6 +8133,7 @@ pub async fn governance_reject(
     voter_did: String,
     proposal_id_hex: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let signing_key = resolve_uniffi_signing_key(&handle).await?;
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
@@ -7914,6 +8180,7 @@ pub async fn governance_withdraw(
     voter_did: String,
     proposal_id_hex: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
 
@@ -7955,6 +8222,7 @@ pub async fn governance_get_proposal(
     handle: Arc<ContextHandle>,
     proposal_id_hex: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
 
@@ -7987,6 +8255,7 @@ pub async fn governance_get_proposal(
 /// Returns `ScpError::Context` (SCP-CTX-2046) if listing fails.
 #[uniffi::export]
 pub async fn governance_list_proposals(handle: Arc<ContextHandle>) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     runtime()
@@ -8025,6 +8294,7 @@ pub async fn apply_pending_ceiling_modification(
     handle: Arc<ContextHandle>,
     current_timestamp: u64,
 ) -> Result<bool, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     runtime()
@@ -8053,6 +8323,7 @@ pub async fn apply_pending_ceiling_modification(
 /// in `Closing` state or finalization fails.
 #[uniffi::export]
 pub async fn finalize_close(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let handle_ref = handle.clone();
 
@@ -8111,6 +8382,7 @@ pub async fn create_governance_checkpoint(
     creator_did: String,
     creator_signature_hex: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     let merkle_root = parse_uniffi_hex_32(&merkle_root_hex, "merkle_root")?;
@@ -8170,6 +8442,7 @@ pub async fn add_checkpoint_cosignature(
     signer_did: String,
     signature_hex: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     let mut checkpoint: scp_core::context::governance::ContextCheckpoint =
@@ -8306,6 +8579,7 @@ fn parse_uniffi_hex_32(hex_str: &str, field_name: &str) -> Result<[u8; 32], ScpE
 /// or the grace period has not expired.
 #[uniffi::export]
 pub async fn tombstone_migrated_context(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let handle_ref = handle.clone();
 
@@ -8335,6 +8609,7 @@ pub async fn tombstone_migrated_context(handle: Arc<ContextHandle>) -> Result<()
 /// context is not migrating.
 #[uniffi::export]
 pub async fn migration_state(handle: Arc<ContextHandle>) -> Result<Option<String>, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
     runtime()
@@ -8380,6 +8655,7 @@ pub async fn broadcast_subscribe(
     handle: Arc<ContextHandle>,
     subscriber_did: String,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8422,6 +8698,7 @@ pub async fn broadcast_unsubscribe(
     subscriber_did: String,
     rotate_keys: bool,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8463,6 +8740,7 @@ pub async fn broadcast_publish(
     identity: Arc<Identity>,
     payload: Vec<u8>,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8598,6 +8876,7 @@ pub async fn broadcast_publish_asset(
     asset: AssetEntry,
     deploy_id: Option<String>,
 ) -> Result<PublishResult, ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8747,6 +9026,7 @@ pub async fn broadcast_publish_assets(
     assets: Vec<AssetEntry>,
     deploy_id: Option<String>,
 ) -> Result<BatchPublishResult, ScpError> {
+    crate::uniffi_check_handle!(handle, identity);
     const MAX_BATCH_ASSETS: usize = 10_000;
     if assets.len() > MAX_BATCH_ASSETS {
         return Err(ScpError::Context {
@@ -8906,6 +9186,7 @@ pub async fn broadcast_block_subscriber(
     subscriber_did: String,
     blocker_did: String,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8940,6 +9221,7 @@ pub async fn broadcast_unblock_subscriber(
     subscriber_did: String,
     unblocker_did: String,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8972,6 +9254,7 @@ pub async fn broadcast_handle_key_request(
     author_did: String,
     requester_did: String,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -8995,7 +9278,16 @@ pub async fn broadcast_handle_key_request(
 /// Returns `None` if the context is not registered or not a broadcast context.
 #[uniffi::export]
 pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u64> {
-    let manager = crate::runtime::context_manager_expect();
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return None;
+    }
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return None;
+    };
     manager
         .broadcast_subscriber_count(&handle.context_id)
         .await
@@ -9005,7 +9297,16 @@ pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u6
 /// Returns `true` if the given DID is a broadcast subscriber.
 #[uniffi::export]
 pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) -> bool {
-    let manager = crate::runtime::context_manager_expect();
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return false;
+    }
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return false;
+    };
     manager
         .is_broadcast_subscriber(&handle.context_id, &did)
         .await
@@ -9017,7 +9318,16 @@ pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) ->
 /// Returns `None` if the context is not a broadcast context.
 #[uniffi::export]
 pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
-    let manager = crate::runtime::context_manager_expect();
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return None;
+    }
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return None;
+    };
     manager
         .broadcast_admission(&handle.context_id)
         .await
@@ -9033,7 +9343,16 @@ pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
 /// Returns `None` if the context is not registered.
 #[uniffi::export]
 pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
-    let manager = crate::runtime::context_manager_expect();
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return None;
+    }
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return None;
+    };
     manager
         .member_count(&handle.context_id)
         .await
@@ -9043,14 +9362,32 @@ pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
 /// Returns `true` if the given DID is a member of the context.
 #[uniffi::export]
 pub async fn context_is_member(handle: Arc<ContextHandle>, did: String) -> bool {
-    let manager = crate::runtime::context_manager_expect();
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return false;
+    }
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return false;
+    };
     manager.is_member(&handle.context_id, &did).await
 }
 
 /// Returns all member DIDs for a context.
 #[uniffi::export]
 pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
-    let manager = crate::runtime::context_manager_expect();
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return Vec::new();
+    }
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return Vec::new();
+    };
     manager.member_dids(&handle.context_id).await
 }
 
@@ -9059,7 +9396,16 @@ pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
 /// Returns `None` if the member is not found or the context is not registered.
 #[uniffi::export]
 pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Option<String> {
-    let manager = crate::runtime::context_manager_expect();
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return None;
+    }
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return None;
+    };
     manager
         .member_role(&handle.context_id, &did)
         .await
@@ -9109,7 +9455,16 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
 /// if the context is not registered.
 #[uniffi::export]
 pub async fn context_drain_events(handle: Arc<ContextHandle>) -> Vec<String> {
-    let manager = crate::runtime::context_manager_expect();
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return Vec::new();
+    }
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return Vec::new();
+    };
     manager
         .drain_events(&handle.context_id)
         .await
@@ -9137,7 +9492,7 @@ pub async fn access_key_generate(
     member_did: String,
     caller_did: String,
 ) -> Result<(), ScpError> {
-    let manager = crate::runtime::context_manager_expect();
+    let manager = crate::runtime::context_manager_expect()?;
     manager
         .generate_context_access_key(&context_id, &member_did, &caller_did)
         .await
@@ -9159,7 +9514,7 @@ pub async fn access_key_revoke(
     member_did: String,
     caller_did: String,
 ) -> Result<(), ScpError> {
-    let manager = crate::runtime::context_manager_expect();
+    let manager = crate::runtime::context_manager_expect()?;
     manager
         .revoke_context_access_key(&context_id, &member_did, &caller_did)
         .await
@@ -9181,7 +9536,7 @@ pub async fn access_key_restore(
     member_did: String,
     caller_did: String,
 ) -> Result<(), ScpError> {
-    let manager = crate::runtime::context_manager_expect();
+    let manager = crate::runtime::context_manager_expect()?;
     manager
         .restore_context_access_key(&context_id, &member_did, &caller_did)
         .await
@@ -9202,6 +9557,7 @@ pub async fn access_key_restore(
 #[uniffi::export]
 #[allow(clippy::significant_drop_tightening)]
 pub async fn context_handle_ttl_expiry(handle: Arc<ContextHandle>) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -9244,6 +9600,7 @@ pub async fn context_propose_ttl_extension(
     member_did: String,
     proposed_seconds: u64,
 ) -> Result<bool, ScpError> {
+    crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             let manager = crate::runtime::context_manager()?;
@@ -9266,7 +9623,16 @@ pub async fn context_propose_ttl_extension(
 /// Cancels the old timer and spawns a new one with the given duration.
 #[uniffi::export]
 pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u64) {
-    let manager = crate::runtime::context_manager_expect();
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return;
+    }
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return;
+    };
     let core_handle = scp_core::context::ContextHandle::new(
         handle.context_id.clone(),
         scp_core::context::ContextParams::default(),
@@ -9290,10 +9656,12 @@ pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u6
 /// Ensures the `ContextManager` is initialized (idempotent) since local DID
 /// registration is valid before any context exists.
 #[uniffi::export]
-pub async fn register_local_did(did: String) {
-    crate::runtime::init_context_manager();
-    let manager = crate::runtime::context_manager_expect();
+pub async fn register_local_did(did: String) -> Result<(), ScpError> {
+    validate_did(&did)?;
+    crate::runtime::init_context_manager_with_did(&did);
+    let manager = crate::runtime::context_manager_expect()?;
     manager.register_local_did(did.into()).await;
+    Ok(())
 }
 
 /// Returns `true` if the given DID is registered as locally controlled.
@@ -9302,8 +9670,17 @@ pub async fn register_local_did(did: String) {
 /// queries are valid before any context exists.
 #[uniffi::export]
 pub async fn is_local_did(did: String) -> bool {
-    crate::runtime::init_context_manager();
-    let manager = crate::runtime::context_manager_expect();
+    if validate_did(&did).is_err() {
+        return false;
+    }
+    // Initialize the bridge with this DID as the local identity. This allows
+    // `is_local_did` to be a valid first operation — matching the old
+    // DID-less `init_context_manager` path's permissiveness but now with a
+    // real MLS credential identity.
+    crate::runtime::init_context_manager_with_did(&did);
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return false;
+    };
     let did_ref: scp_identity::DID = did.into();
     manager.is_local_did(&did_ref).await
 }
@@ -9889,30 +10266,57 @@ pub fn aggregate_trust_input(
 
     // Use persistent storage if the global ProtocolRepository is initialized,
     // otherwise fall back to an ephemeral in-memory store. See issue #502.
-    if let Some(repo) = crate::runtime::protocol_repository() {
-        let handle = crate::runtime().handle().clone();
-        let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
-            std::sync::Arc::clone(repo),
-            handle,
-        );
-        scp_ffi_common::trust_store::populate_and_aggregate(
-            bridge,
-            &context_id,
-            &subject_did,
-            cached_attestations,
-            &challenge_results,
-            &events,
-            merkle_root,
-            &consequence_rules,
-            &threshold_requirements,
-            &attestor_sets,
-        )
-        .map_err(|e| ScpError::Validation {
-            msg: e.to_string(),
-            code: codes::VALID_7052.to_owned(),
-        })
-    } else {
-        scp_ffi_common::trust_store::populate_and_aggregate(
+    // Dispatches over `ProtocolRepoVariant` so SQLite-backed bridges route
+    // trust attestations into the same SQLCipher database as context
+    // snapshots and event log entries.
+    match crate::runtime::protocol_repository() {
+        Some(crate::runtime::ProtocolRepoVariant::InMemory(repo)) => {
+            let handle = crate::runtime().handle().clone();
+            let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
+                std::sync::Arc::clone(repo),
+                handle,
+            );
+            scp_ffi_common::trust_store::populate_and_aggregate(
+                bridge,
+                &context_id,
+                &subject_did,
+                cached_attestations,
+                &challenge_results,
+                &events,
+                merkle_root,
+                &consequence_rules,
+                &threshold_requirements,
+                &attestor_sets,
+            )
+            .map_err(|e| ScpError::Validation {
+                msg: e.to_string(),
+                code: codes::VALID_7052.to_owned(),
+            })
+        }
+        Some(crate::runtime::ProtocolRepoVariant::Sqlite(repo)) => {
+            let handle = crate::runtime().handle().clone();
+            let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
+                std::sync::Arc::clone(repo),
+                handle,
+            );
+            scp_ffi_common::trust_store::populate_and_aggregate(
+                bridge,
+                &context_id,
+                &subject_did,
+                cached_attestations,
+                &challenge_results,
+                &events,
+                merkle_root,
+                &consequence_rules,
+                &threshold_requirements,
+                &attestor_sets,
+            )
+            .map_err(|e| ScpError::Validation {
+                msg: e.to_string(),
+                code: codes::VALID_7052.to_owned(),
+            })
+        }
+        None => scp_ffi_common::trust_store::populate_and_aggregate(
             InMemoryFfiTrustStore::new(),
             &context_id,
             &subject_did,
@@ -9927,7 +10331,7 @@ pub fn aggregate_trust_input(
         .map_err(|e| ScpError::Validation {
             msg: e.to_string(),
             code: codes::VALID_7052.to_owned(),
-        })
+        }),
     }
 }
 
@@ -9953,6 +10357,7 @@ pub fn set_economic_policy(
     handle: Arc<ContextHandle>,
     policy_json: String,
 ) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
     let _ = (handle, policy_json);
     Err(ScpError::Permission {
         msg: "economic policy changes must go through governance \
@@ -9966,6 +10371,7 @@ pub fn set_economic_policy(
 /// Returns the economic policy for a context as a JSON string, or `None`.
 #[uniffi::export]
 pub fn get_economic_policy(handle: Arc<ContextHandle>) -> Result<Option<String>, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let guard = handle
         .economic_policy
         .lock()
@@ -9991,6 +10397,7 @@ pub fn get_economic_policy(handle: Arc<ContextHandle>) -> Result<Option<String>,
 /// or serialization fails.
 #[uniffi::export]
 pub async fn context_export(handle: Arc<ContextHandle>) -> Result<Vec<u8>, ScpError> {
+    crate::uniffi_check_handle!(handle);
     let ctx_id = handle.context_id.clone();
     let creator_did = handle.creator_did.clone();
     runtime()
@@ -10038,10 +10445,13 @@ pub async fn context_import(data: Vec<u8>) -> Result<String, ScpError> {
                 })?;
             let context_id = export.snapshot.context_id.clone();
 
-            // Ensure the ContextManager is initialized — context_import is a
-            // valid first operation (e.g. a device receiving exported context
-            // data). init_context_manager is idempotent (OnceLock). #1073
-            crate::runtime::init_context_manager();
+            // Ensure the ContextManager is initialized using the exporter's
+            // DID (carried on the envelope) — context_import is a valid
+            // first operation (e.g. a device receiving exported context
+            // data). `init_context_manager_with_did` is idempotent
+            // (`OnceLock`). #1073
+            validate_did(&export.exporter_did.0)?;
+            crate::runtime::init_context_manager_with_did(&export.exporter_did.0);
 
             let manager = crate::runtime::context_manager()?;
             manager
@@ -10912,18 +11322,8 @@ pub fn discovery_normalize_address(address: String) -> String {
 // Petname bridge functions (§22.4)
 // ---------------------------------------------------------------------------
 
+use crate::runtime::default_bridge_instance;
 use scp_ffi_common::petname_helpers;
-
-fn uniffi_petname_maps()
--> &'static std::sync::Mutex<std::collections::HashMap<String, scp_core::discovery::PetnameMap>> {
-    petname_helpers::petname_maps()
-}
-
-fn uniffi_handle_registries()
--> &'static std::sync::Mutex<std::collections::HashMap<String, scp_core::discovery::HandleRegistry>>
-{
-    petname_helpers::handle_registries()
-}
 
 /// Sets a petname for a DID.
 #[uniffi::export]
@@ -10940,7 +11340,10 @@ pub fn petname_set(owner_did: String, target_did: String, name: String) -> Resul
             code: codes::VALID_7111.to_owned(),
         });
     }
-    let mut guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -10960,7 +11363,10 @@ pub fn petname_remove(owner_did: String, target_did: String) -> Result<(), ScpEr
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let mut guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -10991,7 +11397,10 @@ pub fn petname_set_context(
             code: codes::VALID_7113.to_owned(),
         });
     }
-    let mut guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11011,7 +11420,10 @@ pub fn petname_remove_context(owner_did: String, context_id: String) -> Result<(
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let mut guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11032,7 +11444,10 @@ pub fn petname_resolve_did(owner_did: String, name: String) -> Result<String, Sc
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11062,7 +11477,10 @@ pub fn petname_resolve_context(owner_did: String, name: String) -> Result<String
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11090,7 +11508,10 @@ pub fn petname_get_for_did(
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11114,7 +11535,10 @@ pub fn petname_get_for_context(
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11146,7 +11570,10 @@ pub fn handle_register(
         target,
         metadata: Some(scp_core::discovery::HandleMetadata { description, tags }),
     };
-    let mut guard = uniffi_handle_registries()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .handle_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("handle registry lock poisoned: {e}"),
@@ -11184,7 +11611,10 @@ pub fn handle_lookup(
         }
         None => None,
     };
-    let guard = uniffi_handle_registries()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .handle_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("handle registry lock poisoned: {e}"),
@@ -11214,7 +11644,10 @@ pub fn handle_deregister(
     handle: String,
     did: String,
 ) -> Result<String, ScpError> {
-    let mut guard = uniffi_handle_registries()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .handle_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("handle registry lock poisoned: {e}"),
@@ -11238,12 +11671,6 @@ pub fn handle_deregister(
 // ---------------------------------------------------------------------------
 // Scope registry bridge functions (§22.3.5, ADR-043)
 // ---------------------------------------------------------------------------
-
-fn uniffi_scope_registries()
--> &'static std::sync::Mutex<std::collections::HashMap<String, scp_core::discovery::ScopeRegistry>>
-{
-    petname_helpers::scope_registries()
-}
 
 /// Registers a scope name in a scope registry. Returns JSON result.
 #[uniffi::export]
@@ -11283,7 +11710,10 @@ pub fn scope_register(
         },
     };
 
-    let mut guard = uniffi_scope_registries()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .scope_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registry lock poisoned: {e}"),
@@ -11316,7 +11746,10 @@ pub fn scope_register(
 pub fn scope_lookup(scope_context_id: String, name: String) -> Result<String, ScpError> {
     validate_context_id(&scope_context_id)?;
 
-    let guard = uniffi_scope_registries()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .scope_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registry lock poisoned: {e}"),
@@ -11351,7 +11784,10 @@ pub fn scope_deregister(
     validate_context_id(&scope_context_id)?;
     validate_did(&did)?;
 
-    let mut guard = uniffi_scope_registries()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .scope_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registry lock poisoned: {e}"),
@@ -11392,6 +11828,8 @@ pub fn address_resolve(
         });
     }
 
+    let bi = default_bridge_instance()?;
+
     let mut known_contexts: std::collections::HashMap<String, String> =
         if let Some(ref json) = known_contexts_json {
             serde_json::from_str(json).map_err(|e| ScpError::Validation {
@@ -11399,7 +11837,9 @@ pub fn address_resolve(
                 code: codes::VALID_7090.to_owned(),
             })?
         } else {
-            let guard = uniffi_handle_registries()
+            let guard = bi
+                .core
+                .handle_registries()
                 .lock()
                 .map_err(|e| ScpError::Validation {
                     msg: format!("handle registry lock poisoned: {e}"),
@@ -11409,14 +11849,16 @@ pub fn address_resolve(
         };
 
     // Merge scope registry contexts for two-hop resolution (§22.3.5).
-    let scope_contexts = petname_helpers::known_contexts_from_scope_registries();
+    let scope_contexts = petname_helpers::known_contexts_from_scope_registries(&bi.core);
     for (name, ctx_id) in scope_contexts {
         known_contexts.entry(name).or_insert(ctx_id);
     }
 
     let known_domains: Vec<&str> = Vec::new();
     let petname_map = {
-        let guard = uniffi_petname_maps()
+        let guard = bi
+            .core
+            .petname_maps()
             .lock()
             .map_err(|e| ScpError::Validation {
                 msg: format!("petname lock poisoned: {e}"),
@@ -11429,7 +11871,7 @@ pub fn address_resolve(
     let results = tokio::task::block_in_place(|| {
         handle.block_on(async {
             let mut resolver = scp_core::discovery::AddressResolver::new();
-            let querier = petname_helpers::LocalHandleQuerier;
+            let querier = petname_helpers::LocalHandleQuerier::new(&bi.core);
             resolver
                 .resolve(
                     &address,
@@ -11540,6 +11982,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
                             in_memory_custody: Some(key_custody),
                             callback_custody: None,
                             verifying_key_hex,
+                            instance_id: crate::runtime::default_instance_id()?,
                         });
                         increment_handle_count();
                         Ok(handle)
@@ -11596,6 +12039,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
 /// See ADR-003 acceptance criterion 4b.
 #[uniffi::export]
 pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, ScpError> {
+    crate::uniffi_check_handle!(identity);
     let core_id = identity
         .core_id
         .as_ref()
@@ -11622,6 +12066,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
     let old_identity = core_id.clone();
     let old_document = core_document.clone();
     let custody_type = identity.custody_type.clone();
+    let instance_id = identity.instance_id;
 
     #[cfg(feature = "allow_in_memory_custody")]
     let custody_arc = in_memory.map(Arc::clone);
@@ -11670,6 +12115,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     in_memory_custody: custody_arc,
                     callback_custody,
                     verifying_key_hex,
+                    instance_id,
                 });
                 increment_handle_count();
                 let _ = has_agent; // suppress unused warning
@@ -11738,6 +12184,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     in_memory_custody: None,
                     callback_custody: Some(Arc::clone(cc)),
                     verifying_key_hex,
+                    instance_id,
                 });
                 increment_handle_count();
 
@@ -12077,6 +12524,7 @@ pub fn bridge_create_shadow(
 
     let bi = crate::runtime::bridge_instance()?;
     let mut entry = bi
+        .core
         .bridge_state()
         .entry(context_id.clone())
         .or_insert_with(|| BridgeContextState {
@@ -12676,6 +13124,7 @@ pub fn scpid_sign(
     challenge_json: String,
     signed_at_override: Option<u64>,
 ) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(identity);
     use scp_core::identity::scpid_sign as core_sign;
 
     // Reject `signed_at_override` on non-testing builds: the override is a
@@ -12965,6 +13414,7 @@ pub fn economy_budget_remaining(context_id: String, did: String) -> Result<u64, 
     validate_did(&did)?;
     let member_did = scp_identity::DID::from(did.as_str());
     let remaining = crate::runtime::bridge_instance()?
+        .core
         .with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
     Ok(remaining.value())
 }
@@ -12974,9 +13424,11 @@ pub fn economy_budget_remaining(context_id: String, did: String) -> Result<u64, 
 pub fn economy_budget_grant(context_id: String, did: String, amount: u64) -> Result<(), ScpError> {
     validate_did(&did)?;
     let member_did = scp_identity::DID::from(did.as_str());
-    crate::runtime::bridge_instance()?.with_economy_budget_mut(&context_id, |tracker| {
-        tracker.grant(&member_did, scp_core::economy::Amount::new(amount));
-    });
+    crate::runtime::bridge_instance()?
+        .core
+        .with_economy_budget_mut(&context_id, |tracker| {
+            tracker.grant(&member_did, scp_core::economy::Amount::new(amount));
+        });
     Ok(())
 }
 
@@ -12989,14 +13441,16 @@ pub fn economy_budget_record_spend(
 ) -> Result<(), ScpError> {
     validate_did(&did)?;
     let member_did = scp_identity::DID::from(did.as_str());
-    crate::runtime::bridge_instance()?.with_economy_budget_mut(&context_id, |tracker| {
-        tracker
-            .record_spend(&member_did, scp_core::economy::Amount::new(amount))
-            .map_err(|e| ScpError::Validation {
-                msg: format!("{e}"),
-                code: codes::VALID_7052.to_owned(),
-            })
-    })
+    crate::runtime::bridge_instance()?
+        .core
+        .with_economy_budget_mut(&context_id, |tracker| {
+            tracker
+                .record_spend(&member_did, scp_core::economy::Amount::new(amount))
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("{e}"),
+                    code: codes::VALID_7052.to_owned(),
+                })
+        })
 }
 
 /// Records a message for antispam velocity tracking.
@@ -13008,9 +13462,11 @@ pub fn economy_antispam_record(
 ) -> Result<(), ScpError> {
     validate_did(&sender_did)?;
     let did = scp_identity::DID::from(sender_did.as_str());
-    crate::runtime::bridge_instance()?.with_economy_antispam(&context_id, |tracker| {
-        tracker.record_message(&did, timestamp);
-    });
+    crate::runtime::bridge_instance()?
+        .core
+        .with_economy_antispam(&context_id, |tracker| {
+            tracker.record_message(&did, timestamp);
+        });
     Ok(())
 }
 
@@ -13024,6 +13480,7 @@ pub fn economy_antispam_velocity(
     validate_did(&sender_did)?;
     let did = scp_identity::DID::from(sender_did.as_str());
     let velocity = crate::runtime::bridge_instance()?
+        .core
         .with_economy_antispam(&context_id, |tracker| tracker.get_velocity(&did, now));
     Ok(velocity)
 }
@@ -13058,16 +13515,18 @@ pub fn economy_antispam_escalated_cost(
     };
 
     let did = scp_identity::DID::from(sender_did.as_str());
-    let cost = crate::runtime::bridge_instance()?.with_economy_antispam(&context_id, |tracker| {
-        tracker.compute_escalated_cost(
-            &did,
-            now,
-            scp_core::economy::Amount::new(base_cost),
-            &config,
-            floor.map(scp_core::economy::Amount::new),
-            cap.map(scp_core::economy::Amount::new),
-        )
-    });
+    let cost = crate::runtime::bridge_instance()?
+        .core
+        .with_economy_antispam(&context_id, |tracker| {
+            tracker.compute_escalated_cost(
+                &did,
+                now,
+                scp_core::economy::Amount::new(base_cost),
+                &config,
+                floor.map(scp_core::economy::Amount::new),
+                cap.map(scp_core::economy::Amount::new),
+            )
+        });
     Ok(cost.value())
 }
 
@@ -13341,6 +13800,8 @@ mod tests {
     static ALLOWLIST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_handle() -> Arc<ContextHandle> {
+        crate::runtime::ensure_bridge_instance();
+        let instance_id = crate::runtime::default_instance_id().unwrap_or(0);
         Arc::new(ContextHandle {
             context_id: "ctx-test".to_owned(),
             state: tokio::sync::Mutex::new(ContextState::Active),
@@ -13355,10 +13816,13 @@ mod tests {
             session_store: tokio::sync::Mutex::new(scp_core::context::tools::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
             core_context_params: scp_core::context::ContextParams::default(),
+            instance_id,
         })
     }
 
     fn test_identity() -> Arc<Identity> {
+        crate::runtime::ensure_bridge_instance();
+        let instance_id = crate::runtime::default_instance_id().unwrap_or(0);
         Arc::new(Identity {
             did: "did:dht:z6MkTestUser".to_owned(),
             custody_type: CustodyMethod::InMemory,
@@ -13368,6 +13832,7 @@ mod tests {
             in_memory_custody: None,
             callback_custody: None,
             verifying_key_hex: None,
+            instance_id,
         })
     }
 

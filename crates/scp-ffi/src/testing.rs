@@ -17,29 +17,41 @@ use scp_core::context::governance::KeyResolver;
 use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams, context_id_bytes};
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
 
+use crate::runtime::default_bridge_instance;
+
 // ---------------------------------------------------------------------------
 // Shared network
 // ---------------------------------------------------------------------------
+//
+// The shared `FullStackNetwork` lives as a typed field on `PyBridgeInstance`
+// (see `crate::runtime::PyBridgeInstance::network`). Using the per-bridge
+// slot (instead of a process-global singleton) preserves the previous
+// behaviour — all `py_fullstack_create_node` calls on the same instance
+// share a `KeyExchange` — while still allowing a caller-owned `PyScp` to
+// keep its test network isolated from other instances in the same process.
+//
+// `Mutex<Option<...>>` (rather than `OnceLock`) is used so tests can reset
+// the network between runs, preventing cross-test state leakage via the
+// `py_fullstack_reset_network` entry point.
+// ---------------------------------------------------------------------------
 
-/// Guards the shared `FullStackNetwork` instance.
+/// Returns the result of calling `f` with the default bridge instance's
+/// shared `FullStackNetwork`.
 ///
-/// Uses `Mutex<Option<...>>` instead of `OnceLock` so tests can reset
-/// the network between runs (preventing cross-test state leakage).
-static NETWORK: std::sync::Mutex<Option<FullStackNetwork>> = std::sync::Mutex::new(None);
-
-/// Returns the result of calling `f` with the shared `FullStackNetwork`.
-///
-/// All nodes created via `py_fullstack_create_node` share the same
-/// `KeyExchange` so Welcome messages and sender keys can be exchanged.
-fn with_network<F, R>(f: F) -> R
+/// All nodes created via `py_fullstack_create_node` on the same instance
+/// share the same `KeyExchange` so Welcome messages and sender keys can be
+/// exchanged.
+fn with_network<F, R>(f: F) -> PyResult<R>
 where
     F: FnOnce(&FullStackNetwork) -> R,
 {
-    let mut guard = NETWORK
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .network()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let network = guard.get_or_insert_with(FullStackNetwork::new);
-    f(network)
+    Ok(f(network))
 }
 
 /// Returns a permissive key resolver that always returns `None`.
@@ -78,9 +90,8 @@ impl PyFullStackNode {
 // ---------------------------------------------------------------------------
 
 /// Creates a full-stack test node with real MLS crypto.
-#[must_use]
 #[pyfunction]
-pub fn py_fullstack_create_node(did: String) -> PyFullStackNode {
+pub fn py_fullstack_create_node(did: String) -> PyResult<PyFullStackNode> {
     with_network(|network| {
         let node = network.create_node(&did, permissive_key_resolver());
         PyFullStackNode {
@@ -90,15 +101,19 @@ pub fn py_fullstack_create_node(did: String) -> PyFullStackNode {
     })
 }
 
-/// Resets the shared `FullStackNetwork`, dropping all nodes and state.
+/// Resets the default bridge instance's `FullStackNetwork`, dropping all
+/// nodes and state.
 ///
 /// Call between test suites to prevent cross-test state leakage.
 #[pyfunction]
-pub fn py_fullstack_reset_network() {
-    let mut guard = NETWORK
+pub fn py_fullstack_reset_network() -> PyResult<()> {
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .network()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *guard = None;
+    Ok(())
 }
 
 /// Creates an encrypted context owned by the given node.

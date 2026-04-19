@@ -360,11 +360,11 @@ fn append_provenance_event(
         .map_or(0, |d| d.as_secs());
 
     crate::runtime::with_context(context_id, |state| {
-        let sequence = scp_event_log::tree::event_count(&state.event_log);
-        let prev_hash = if state.event_log.leaves().is_empty() {
+        let sequence = scp_event_log::tree::event_count(&state.core.event_log);
+        let prev_hash = if state.core.event_log.leaves().is_empty() {
             scp_event_log::tree::GENESIS_PREV_HASH
         } else {
-            state.event_log.leaves()[state.event_log.leaves().len() - 1]
+            state.core.event_log.leaves()[state.core.event_log.leaves().len() - 1]
         };
 
         let event = scp_event_log::Event {
@@ -379,12 +379,12 @@ fn append_provenance_event(
             signature: Vec::new(),
         };
 
-        scp_event_log::tree::append_unsigned_event(&mut state.event_log, &event).map_err(|e| {
-            ScpNapiError::Context {
+        scp_event_log::tree::append_unsigned_event(&mut state.core.event_log, &event).map_err(
+            |e| ScpNapiError::Context {
                 message: format!("failed to append provenance event: {e}"),
                 code: codes::CTX_2060.to_owned(),
-            }
-        })?;
+            },
+        )?;
 
         Ok(())
     })?;

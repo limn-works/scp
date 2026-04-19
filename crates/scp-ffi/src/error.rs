@@ -636,6 +636,22 @@ impl From<serde_json::Error> for ScpPyError {
     }
 }
 
+// Handle affinity errors → ScpPyError::UcanError (permission class, SCP-PERM-3030)
+//
+// A handle issued by one PyBridgeInstance cannot be used on another — this
+// is the multi-instance security boundary enforced by `CoreFields::check_handle`.
+// The check fires at every `#[pyfunction]` entry point that accepts a
+// handle (see `pyscp_check_handle!` macro in `runtime` module).
+
+impl From<scp_ffi_common::bridge_instance::HandleAffinityError> for ScpPyError {
+    fn from(e: scp_ffi_common::bridge_instance::HandleAffinityError) -> Self {
+        Self::UcanError {
+            message: e.to_string(),
+            code: codes::PERM_3030.to_owned(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Module registration helper
 // ---------------------------------------------------------------------------

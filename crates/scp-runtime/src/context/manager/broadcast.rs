@@ -79,7 +79,7 @@ impl ContextManager {
                 .add_member(subscriber_did.clone(), "subscriber".into(), vec![]);
 
             // Push event to receive buffer.
-            ctx.receive_buffer.push(result.event.clone());
+            ctx.emit_event(result.event.clone(), context_id, self.event_tx.as_ref());
 
             (result, snapshot)
         };
@@ -165,9 +165,10 @@ impl ContextManager {
             ctx.membership.remove_member(subscriber_did);
 
             // Emit MemberLeft event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::MemberLeft {
+            let left_event = ContextEvent::MemberLeft {
                 member_did: subscriber_did.clone(),
-            });
+            };
+            ctx.emit_event(left_event, context_id, self.event_tx.as_ref());
 
             (result, snapshot)
         };
@@ -306,11 +307,12 @@ impl ContextManager {
                 .next_sequence_number(author_did)
                 .ok_or_else(|| ContextError::MemberNotFound(author_did.to_string()))?;
 
-            ctx.receive_buffer.push(ContextEvent::MessageSent {
+            let sent_event = ContextEvent::MessageSent {
                 sender_did: author_did.clone(),
                 sequence_number: seq,
                 payload: payload.to_vec(),
-            });
+            };
+            ctx.emit_event(sent_event, context_id, self.event_tx.as_ref());
 
             envelope
         };
@@ -425,10 +427,11 @@ impl ContextManager {
             };
 
             // Emit block event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::MemberBlocked {
+            let block_event = ContextEvent::MemberBlocked {
                 blocked_did: subscriber_did.clone(),
                 author_did: author_did.clone(),
-            });
+            };
+            ctx.emit_event(block_event, context_id, self.event_tx.as_ref());
 
             (result, snapshot)
         };
@@ -503,10 +506,11 @@ impl ContextManager {
             };
 
             // Emit unblock event to receive buffer.
-            ctx.receive_buffer.push(ContextEvent::MemberUnblocked {
+            let unblock_event = ContextEvent::MemberUnblocked {
                 unblocked_did: subscriber_did.clone(),
                 author_did: author_did.clone(),
-            });
+            };
+            ctx.emit_event(unblock_event, context_id, self.event_tx.as_ref());
 
             snapshot
         };

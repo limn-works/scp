@@ -1399,6 +1399,27 @@ class CoroutineBridge(
         }
 
     /**
+     * Execute a `suspend` FFI call on [Dispatchers.IO] with cancellation checks.
+     *
+     * The companion of [ffiCall] for UniFFI-generated async methods. UniFFI
+     * compiles `async fn` Rust functions into Kotlin `suspend fun` bindings
+     * (e.g., `Scp.shutdown(timeoutMillis)`, `Scp.resume()`), which cannot be
+     * invoked from the non-suspend `() -> T` lambda accepted by [ffiCall].
+     *
+     * @param block The suspend FFI operation.
+     * @return The FFI call result.
+     * @throws CancellationException if the coroutine was cancelled.
+     * @throws BridgeException if the FFI call fails.
+     */
+    internal suspend fun <T> ffiCallSuspend(block: suspend () -> T): T =
+        withContext(ioDispatcher) {
+            ensureActive()
+            val result = block()
+            ensureActive()
+            result
+        }
+
+    /**
      * Execute a long-running FFI call with a [CancellationHandle] linked to the
      * coroutine's lifecycle.
      *

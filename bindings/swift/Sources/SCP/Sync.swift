@@ -68,6 +68,11 @@ public enum SyncBridge {
 /// ## Provenance
 ///
 /// - ADR-029 in `.docs/adrs/phase-6.md`
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func classifyOffline(
     lastRelayContact: UInt64,
     now: UInt64,
@@ -89,6 +94,11 @@ public func classifyOffline(
 /// ## Provenance
 ///
 /// - ADR-029 in `.docs/adrs/phase-6.md`
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func classifyOfflineCustom(
     lastRelayContact: UInt64,
     now: UInt64,
@@ -111,6 +121,11 @@ public func classifyOfflineCustom(
 /// ## Provenance
 ///
 /// - ADR-029 in `.docs/adrs/phase-6.md`
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func getSyncPolicy(
     getPolicyFn: SyncBridge.GetPolicyFn = SyncBridge.defaultGetPolicy
 ) -> SyncPolicyResult {

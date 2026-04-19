@@ -21,6 +21,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import BRIDGE_ERROR_MAP, ContextError, ValidationError
 
 if TYPE_CHECKING:
@@ -133,6 +134,7 @@ class ToolDefinition:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 async def invoke_cross_context(
     source_context_id: str,
     target_context_id: str,
@@ -216,6 +218,7 @@ async def invoke_cross_context(
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 async def session_create(
     context_id: str,
     tool_id: str,
@@ -274,6 +277,7 @@ async def session_create(
         raise _translate_bridge_error(exc) from exc
 
 
+@deprecated_default_instance
 async def session_invoke(
     context_id: str,
     session_id: str,
@@ -334,6 +338,7 @@ async def session_invoke(
     return result
 
 
+@deprecated_default_instance
 async def session_close(context_id: str, session_id: str) -> None:
     """Close a stateful tool session.
 
@@ -371,6 +376,7 @@ async def session_close(context_id: str, session_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 async def interface_expose(
     context_id: str,
     tool_id: str,
@@ -422,6 +428,7 @@ async def interface_expose(
     return json.loads(result_json)
 
 
+@deprecated_default_instance
 async def interface_accept(
     context_id: str,
     interface_json: str,
@@ -466,6 +473,7 @@ async def interface_accept(
     return json.loads(result_json)
 
 
+@deprecated_default_instance
 async def interface_revoke(
     context_id: str,
     interface_id_hex: str,

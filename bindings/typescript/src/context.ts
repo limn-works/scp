@@ -15,6 +15,7 @@ import { ContextError, mapBridgeError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import type { BridgeContextHandle } from "./internal/bridge";
 import { getBridge, getBridgeSync } from "./internal/bridge";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 import { safeJsonParse } from "./internal/json-utils";
 import type {
   AssetEntry,
@@ -452,7 +453,11 @@ export class Context implements AsyncDisposable {
 
     const bridge = await getBridge();
     try {
-      bridge.contextSubscribe(this._handle, this._identityDid, {
+      // `contextSubscribe` is async after #1549 Phase 4 PR 1 — the NAPI
+      // task is registered against the bridge's JoinSet so shutdown can
+      // drain it. Awaiting here ensures registration completes before
+      // the yield loop starts listening.
+      await bridge.contextSubscribe(this._handle, this._identityDid, {
         onMessage: (msg: Message) => {
           if (!done) {
             queue.push(msg);
@@ -1530,6 +1535,7 @@ export class Context implements AsyncDisposable {
  * @throws {ContextError} If restoration fails (SCP-CTX-2064).
  */
 export async function restoreContext(contextId: string): Promise<void> {
+  deprecatedDefaultInstance("restoreContext");
   try {
     const bridge = await getBridge();
     await bridge.contextRestore(contextId);
@@ -1548,6 +1554,7 @@ export async function restoreContext(contextId: string): Promise<void> {
  * @throws {ContextError} If restoration fails (SCP-CTX-2065).
  */
 export async function restoreAllContexts(): Promise<string> {
+  deprecatedDefaultInstance("restoreAllContexts");
   try {
     const bridge = await getBridge();
     return await bridge.contextRestoreAll();
@@ -1618,6 +1625,7 @@ export function validateCapabilityDeclaration(
   ceilingCapabilities: string[],
   roleCapabilities: string[],
 ): DeclarationValidationResult {
+  deprecatedDefaultInstance("validateCapabilityDeclaration");
   const bridge = getBridgeSync();
   const resultJson = bridge.validateCapabilityDeclaration(
     declarationJson,
@@ -1666,6 +1674,7 @@ export async function evaluateInvitation(
   spendingJson?: string,
   trustedDids?: readonly string[],
 ): Promise<InvitationEvaluationResult> {
+  deprecatedDefaultInstance("evaluateInvitation");
   try {
     const bridge = await getBridge();
     const trustedDidsJson = trustedDids ? JSON.stringify(trustedDids) : undefined;
@@ -1750,6 +1759,7 @@ export function metadataRecordToJson(
   operational: OperationalMetadata,
   signatureHex: string,
 ): string {
+  deprecatedDefaultInstance("metadataRecordToJson");
   const bridge = getBridgeSync();
   return bridge.metadataRecordToJson(
     contextId,
@@ -1769,6 +1779,7 @@ export function metadataRecordToJson(
  * @returns Parsed MetadataRecord object.
  */
 export function metadataRecordFromJson(jsonStr: string): MetadataRecord {
+  deprecatedDefaultInstance("metadataRecordFromJson");
   const bridge = getBridgeSync();
   const validated = bridge.metadataRecordFromJson(jsonStr);
   return JSON.parse(validated) as MetadataRecord;
@@ -1788,6 +1799,7 @@ export function metadataRecordFromJson(jsonStr: string): MetadataRecord {
  * @returns ContextParams object.
  */
 export function templateGetParams(templateId: string): ContextParams {
+  deprecatedDefaultInstance("templateGetParams");
   const bridge = getBridgeSync();
   const result = bridge.templateGetParams(templateId);
   return JSON.parse(result) as ContextParams;
@@ -1803,6 +1815,7 @@ export function templateGetParams(templateId: string): ContextParams {
  * @returns `null` on success, or a string error message on failure.
  */
 export function validateAgainstTemplate(params: ContextParams): string | null {
+  deprecatedDefaultInstance("validateAgainstTemplate");
   const bridge = getBridgeSync();
   return bridge.validateAgainstTemplate(JSON.stringify(params));
 }
@@ -1816,6 +1829,7 @@ export function validateAgainstTemplate(params: ContextParams): string | null {
  * @returns `null` on success, or a string error message on failure.
  */
 export function validateContextParams(params: ContextParams): string | null {
+  deprecatedDefaultInstance("validateContextParams");
   const bridge = getBridgeSync();
   return bridge.validateContextParams(JSON.stringify(params));
 }

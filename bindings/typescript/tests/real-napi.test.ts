@@ -90,6 +90,7 @@ if (bridge === null || serverAddon === null) {
     // Bootstrap identity first to get a DID for MLS credential identity.
     // This must happen BEFORE configureRelayTransport because the
     // ContextManager OnceLock is set by whichever call wins the race.
+    // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
     const bootstrap = await napi.identityCreate("in_memory");
 
     // Configure the ContextManager with a relay-backed transport provider.
@@ -110,8 +111,13 @@ if (bridge === null || serverAddon === null) {
   // Lifecycle hooks
   // ---------------------------------------------------------------------------
 
-  afterAll(() => {
-    napi.shutdown(1);
+  afterAll(async () => {
+    // Shutdown timeout is in milliseconds after #1549 Phase 4 unit
+    // unification — 1000 ms (1 second) gives pending tasks time to
+    // drain without stalling the suite. `napi.shutdown` is now async
+    // (returns `Promise<void>`); previously sync — fire-and-forget
+    // would clear bridge state mid-test in later tests.
+    await napi.shutdown(1000);
     if (relayHandle && !relayHandle.isShutdown) {
       relayHandle.shutdown();
     }
@@ -123,13 +129,16 @@ if (bridge === null || serverAddon === null) {
 
   describe("Identity (real NAPI)", () => {
     test("creates an in-memory identity with a valid did:dht DID", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const handle = await napi.identityCreate("in_memory");
       expect(handle.did).toMatch(/^did:dht:/);
       expect(handle.custodyType).toBe("in_memory");
     });
 
     test("creates two identities with distinct DIDs", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const a = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const b = await napi.identityCreate("in_memory");
       expect(a.did).not.toBe(b.did);
     });
@@ -137,13 +146,17 @@ if (bridge === null || serverAddon === null) {
     // identityLoad and identityResolve now use the local identity registry
     // as a fallback when DHT is unavailable. See #1144 (C6).
     test("loads an identity by DID (local registry fallback)", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const created = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const loaded = await napi.identityLoad(created.did);
       expect(loaded.did).toBe(created.did);
     });
 
     test("resolves a DID to a DID document (no agent key)", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const handle = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const doc = await napi.identityResolve(handle.did);
       expect(doc.id).toBe(handle.did);
       // The document should have at least one authentication method.
@@ -159,6 +172,7 @@ if (bridge === null || serverAddon === null) {
 
     test("resolves a DID to a DID document (with agent key, ADR-039)", async () => {
       const handle = await napi.identityCreateWithAgentKey("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const doc = await napi.identityResolve(handle.did);
       expect(doc.id).toBe(handle.did);
       // Identity created with agent key: hasAgentKey must be true.
@@ -170,7 +184,9 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("rotates an identity key and preserves the DID", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const handle = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const rotated = await napi.identityRotateKey(handle);
       expect(rotated.did).toBe(handle.did);
     });
@@ -181,6 +197,7 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("adds an agent key to an existing identity", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const handle = await napi.identityCreate("in_memory");
       const withAgent = await napi.identityAddAgentKey(handle);
       expect(withAgent.did).toBe(handle.did);
@@ -199,6 +216,7 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("migrates an identity to a new DID", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const handle = await napi.identityCreate("in_memory");
       const migrated = await napi.identityMigrate(handle);
       // Migration creates a new DID.
@@ -207,6 +225,7 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("generates and verifies a device attestation", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const handle = await napi.identityCreate("in_memory");
       const token = await napi.identityAttestDevice(handle.did);
       expect(typeof token).toBe("string");
@@ -223,7 +242,9 @@ if (bridge === null || serverAddon === null) {
 
   describe("Context lifecycle (real NAPI)", () => {
     test("creates a context and returns a context ID", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -236,47 +257,62 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("a second identity can join the context", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const creator = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const joiner = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         creator,
         JSON.stringify({ ceiling: ["messages:read", "role:assign"] }),
       );
       // Should not throw.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, joiner.did);
     });
 
     test("sends a message without error (relay transport)", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
       );
       const payload = new TextEncoder().encode("hello from NAPI");
       // Should not throw — RelayTransportProvider publishes through the relay.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextSend(ctx, identity.did, payload);
     });
 
     test("leaves a context without error", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
       );
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextLeave(ctx, identity.did);
     });
 
     test("closes a context without error", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read", "context:close"] }),
       );
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextClose(ctx, identity.did);
     });
 
     test("creates a context with broadcast mode", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -289,8 +325,10 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("rejects unsupported governance model", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
       await expect(
+        // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
         napi.contextCreate(
           identity,
           JSON.stringify({
@@ -305,7 +343,9 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("creates a context with single_admin governance and TTL", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -325,7 +365,9 @@ if (bridge === null || serverAddon === null) {
 
   describe("Membership (real NAPI)", () => {
     test("member count after creation is 1", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -335,7 +377,9 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("creator is a member", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -345,8 +389,11 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("non-member is not a member", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const other = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -356,7 +403,9 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("member DIDs includes the creator", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -366,19 +415,25 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("member count increases after join", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const creator = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const joiner = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         creator,
         JSON.stringify({ ceiling: ["messages:read", "role:assign"] }),
       );
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, joiner.did);
       const count = await napi.contextMemberCount(ctx);
       expect(count).toBe(2);
     });
 
     test("creator role is Admin", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -395,7 +450,9 @@ if (bridge === null || serverAddon === null) {
 
   describe("Tools (real NAPI)", () => {
     test("registers a tool and returns a tool ID", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["tool:register"] }),
@@ -420,13 +477,17 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("invokes a registered tool", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const admin = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const member = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["tool:register", "tool:invoke:*"] }),
       );
       // Join member to context so they have role-based capabilities.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, member.did);
       const toolId = await napi.toolRegister(ctx, {
         name: "test-tool",
@@ -453,7 +514,9 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("verifies a tool and returns a verification result", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["tool:register"] }),
@@ -485,8 +548,11 @@ if (bridge === null || serverAddon === null) {
 
   describe("UCAN (real NAPI)", () => {
     test("mints a UCAN token with capabilities", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const admin = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const member = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
@@ -504,29 +570,40 @@ if (bridge === null || serverAddon === null) {
     // identity_create now publishes to the shared InMemoryDhtClient so that
     // the DualLayerResolver can find the issuer's DID document (#1144).
     test("validates a minted token for a granted capability", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const admin = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const member = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
       // NAPI bridge requires full capability URI with scp:ctx:{contextId}/ prefix.
       const fullUri = token.capabilities[0];
       expect(fullUri).toBeDefined();
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.ucanValidate(ctx, token.encoded, fullUri as string);
     });
 
     test("rejects validation for an ungranted capability", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const admin = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const member = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await expect(napi.ucanValidate(ctx, token.encoded, "messages:write")).rejects.toThrow();
     });
 
     test("revokes a token", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const admin = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const member = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
@@ -541,7 +618,9 @@ if (bridge === null || serverAddon === null) {
 
   describe("Event log (real NAPI)", () => {
     test("queries events after context creation (ContextManager Merkle entries)", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -554,11 +633,14 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("queries events with a MessageSent filter after send (relay transport)", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
       );
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextSend(ctx, identity.did, new TextEncoder().encode("msg"));
 
       const events = await napi.eventLogQuery(ctx, { eventType: "MessageSent" });
@@ -570,7 +652,9 @@ if (bridge === null || serverAddon === null) {
     // event_log_verify now syncs ContextManager Merkle entries into the
     // UCAN-state EventLog via push_leaf_raw before calling prove_inclusion.
     test("verifies an inclusion proof against ContextManager event log", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -582,7 +666,9 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("creates a checkpoint (via DID registry lookup)", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({ ceiling: ["messages:read"] }),
@@ -928,10 +1014,12 @@ if (bridge === null || serverAddon === null) {
       expect(v.length).toBeGreaterThan(0);
     });
 
-    test("shutdown with 0 timeout returns immediately", () => {
-      // Should not hang.
-      napi.shutdown(0);
-    });
+    // NOTE: There is no `shutdown(0)` test here because the bridge is
+    // process-global and once shut down it cannot be revived for
+    // subsequent tests. A shutdown test belongs in a dedicated test
+    // file that runs in a process of its own (see `lifecycle.test.ts`
+    // for suspend/resume coverage). `shutdown(timeoutMillis)` is
+    // exercised end-to-end via the `afterAll` hook above.
   });
 
   // ---------------------------------------------------------------------------
@@ -940,9 +1028,12 @@ if (bridge === null || serverAddon === null) {
 
   describe("E2E context lifecycle (real NAPI)", () => {
     test("create -> join -> send -> membership check -> leave -> close (relay transport)", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const alice = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const bob = await napi.identityCreate("in_memory");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
@@ -956,10 +1047,12 @@ if (bridge === null || serverAddon === null) {
       expect(await napi.contextIsMember(ctx, alice.did)).toBe(true);
       expect(await napi.contextIsMember(ctx, bob.did)).toBe(false);
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, bob.did);
       expect(await napi.contextMemberCount(ctx)).toBe(2);
       expect(await napi.contextIsMember(ctx, bob.did)).toBe(true);
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextSend(ctx, alice.did, new TextEncoder().encode("hello bob"));
 
       const events = await napi.eventLogQuery(ctx, undefined);
@@ -972,7 +1065,9 @@ if (bridge === null || serverAddon === null) {
       const checkpoint = await napi.eventLogCheckpoint(ctx, alice.did, 0);
       expect(typeof checkpoint.eventCount).toBe("number");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextLeave(ctx, bob.did);
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextClose(ctx, alice.did);
     });
   });
@@ -984,8 +1079,11 @@ if (bridge === null || serverAddon === null) {
   describe("E2E UCAN lifecycle (real NAPI)", () => {
     // identity_create now publishes to the shared InMemoryDhtClient (#1144).
     test("mint -> validate -> revoke lifecycle", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const admin = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const member = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
@@ -1005,13 +1103,16 @@ if (bridge === null || serverAddon === null) {
       expect(writeCap).toBeDefined();
 
       // Validate both capabilities (separate tokens, separate nonces).
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.ucanValidate(ctx, readToken.encoded, readCap);
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.ucanValidate(ctx, writeToken.encoded, writeCap);
 
       // Revoke the read token (revoker is the admin/context creator).
       await napi.ucanRevoke(ctx, readToken.encoded, admin.did);
 
       // Verify the revoked token is rejected.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await expect(napi.ucanValidate(ctx, readToken.encoded, readCap)).rejects.toThrow();
 
       // Mint a fresh write token to verify non-revoked capabilities still work.
@@ -1020,6 +1121,7 @@ if (bridge === null || serverAddon === null) {
       // the revocation check is reached.
       const freshWriteToken = await napi.ucanMint(ctx, member.did, ["messages:write"]);
       const freshWriteCap = freshWriteToken.capabilities[0] as string;
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.ucanValidate(ctx, freshWriteToken.encoded, freshWriteCap);
     });
   });
@@ -1030,8 +1132,11 @@ if (bridge === null || serverAddon === null) {
 
   describe("E2E tool lifecycle (real NAPI)", () => {
     test("register -> invoke -> verify", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const admin = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const member = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({
@@ -1039,6 +1144,7 @@ if (bridge === null || serverAddon === null) {
         }),
       );
       // Join member so they have role-based capabilities.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, member.did);
 
       // Register.
@@ -1117,7 +1223,9 @@ if (bridge === null || serverAddon === null) {
 
   describe("Broadcast operations (real NAPI)", () => {
     test("subscriber count is 0 on a fresh broadcast context", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1132,8 +1240,11 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("subscribe adds a subscriber", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const subscriber = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1156,8 +1267,11 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("non-subscriber is not a subscriber", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const other = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1171,8 +1285,11 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("unsubscribe removes a subscriber", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const subscriber = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1190,7 +1307,9 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("broadcast admission returns a policy", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1205,7 +1324,9 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("publish sends a broadcast message (relay transport)", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1224,8 +1345,11 @@ if (bridge === null || serverAddon === null) {
     // content only, not to other authors'. Only governance_ban_subscriber
     // removes from the roster.
     test("block subscriber adds to block list without removing from roster", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const subscriber = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1247,8 +1371,11 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("unblock after block does not throw and subscriber remains in roster", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const subscriber = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1272,8 +1399,11 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("unblock non-blocked subscriber throws", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const subscriber = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1291,8 +1421,11 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("handle key request returns a decision", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const subscriber = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1316,8 +1449,11 @@ if (bridge === null || serverAddon === null) {
 
   describe("Governance (real NAPI)", () => {
     test("executes a ChangeRole governance action", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const admin = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const member = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({
@@ -1327,6 +1463,7 @@ if (bridge === null || serverAddon === null) {
       );
 
       // Add the member first.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, member.did);
 
       // Execute a ChangeRole governance action using a role that exists
@@ -1343,7 +1480,9 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("rejects invalid governance action JSON", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const admin = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({
@@ -1364,7 +1503,9 @@ if (bridge === null || serverAddon === null) {
 
   describe("TTL operations (real NAPI)", () => {
     test("handle TTL expiry on a context with TTL", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1377,7 +1518,9 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("propose TTL extension returns a boolean", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1391,7 +1534,9 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("reset TTL timer does not throw", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1410,7 +1555,9 @@ if (bridge === null || serverAddon === null) {
 
   describe("Context export/import (real NAPI)", () => {
     test("exports a context to bytes", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1428,7 +1575,9 @@ if (bridge === null || serverAddon === null) {
     // terminal state (Closed/Expired/Tombstoned). Test the create → export →
     // close → import round-trip.
     test("exports and imports a context round-trip (close before reimport)", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1442,8 +1591,10 @@ if (bridge === null || serverAddon === null) {
 
       // Close the context so import_context sees a terminal state and
       // allows reimport.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextClose(ctx, identity.did);
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const importedContextId = await napi.contextImport(data);
       expect(typeof importedContextId).toBe("string");
       expect(importedContextId.length).toBeGreaterThan(0);
@@ -1451,6 +1602,7 @@ if (bridge === null || serverAddon === null) {
 
     test("import rejects invalid data", async () => {
       const invalidData = new Uint8Array([0, 1, 2, 3]);
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await expect(napi.contextImport(invalidData)).rejects.toThrow();
     });
   });
@@ -1461,7 +1613,9 @@ if (bridge === null || serverAddon === null) {
 
   describe("Drain events (real NAPI)", () => {
     test("drain events returns an array after context creation", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1474,7 +1628,9 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("drain events is idempotent (second drain returns empty)", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1491,8 +1647,11 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("drain events captures events from join", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const creator = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const joiner = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         creator,
         JSON.stringify({ ceiling: ["messages:read", "role:assign"] }),
@@ -1502,6 +1661,7 @@ if (bridge === null || serverAddon === null) {
       await napi.contextDrainEvents(ctx);
 
       // Join triggers an event.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, joiner.did);
       const events = await napi.contextDrainEvents(ctx);
       expect(events.length).toBeGreaterThanOrEqual(1);
@@ -1514,9 +1674,13 @@ if (bridge === null || serverAddon === null) {
 
   describe("UCAN delegation (real NAPI)", () => {
     test("delegates a minted token to a third party", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const admin = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const member = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const delegate = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         admin,
         JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
@@ -1527,6 +1691,7 @@ if (bridge === null || serverAddon === null) {
       expect(parentToken.encoded).toBeTruthy();
 
       // Delegate a subset of capabilities from member to delegate.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const delegated = await napi.ucanDelegate(
         ctx,
         member.did,
@@ -1539,22 +1704,30 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("delegation rejects invalid delegator DID", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const admin = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const member = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       const token = await napi.ucanMint(ctx, member.did, ["messages:read"]);
 
       // Use an invalid DID as delegator.
       await expect(
+        // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
         napi.ucanDelegate(ctx, "not-a-did", member.did, token.encoded, ["messages:read"]),
       ).rejects.toThrow();
     });
 
     test("delegation rejects mismatched delegator (not token audience)", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const admin = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const member = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const other = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(admin, JSON.stringify({ ceiling: ["messages:read"] }));
 
       // Mint token for member (audience = member.did).
@@ -1562,6 +1735,7 @@ if (bridge === null || serverAddon === null) {
 
       // Try to delegate as "other" who is NOT the token audience.
       await expect(
+        // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
         napi.ucanDelegate(ctx, other.did, admin.did, token.encoded, ["messages:read"]),
       ).rejects.toThrow();
     });
@@ -1573,9 +1747,12 @@ if (bridge === null || serverAddon === null) {
 
   describe("E2E broadcast lifecycle (real NAPI)", () => {
     test("create -> subscribe -> publish -> check subscriber -> unsubscribe (relay transport)", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const author = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const subscriber = await napi.identityCreate("in_memory");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         author,
         JSON.stringify({
@@ -1606,7 +1783,9 @@ if (bridge === null || serverAddon === null) {
 
   describe("Broadcast content delivery (real NAPI)", () => {
     test("broadcastPublishAsset returns blobId and etag", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({
@@ -1633,7 +1812,9 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("broadcastPublishAssets batch returns correct count", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const identity = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         identity,
         JSON.stringify({

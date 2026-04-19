@@ -11,6 +11,7 @@
 import type { Context } from "./context";
 import { mapBridgeError } from "./errors";
 import { getBridge } from "./internal/bridge";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 import type { UcanToken } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -30,6 +31,7 @@ import type { UcanToken } from "./types";
  * @throws {UcanPermissionError} If validation fails.
  */
 export async function validateUcan(ctx: Context, token: string, capability: string): Promise<void> {
+  deprecatedDefaultInstance("validateUcan");
   try {
     const bridge = await getBridge();
     await bridge.ucanValidate(ctx._handle, token, capability);
@@ -57,6 +59,7 @@ export async function mintUcan(
   capabilities: readonly string[],
   proofs?: readonly string[],
 ): Promise<UcanToken> {
+  deprecatedDefaultInstance("mintUcan");
   try {
     const bridge = await getBridge();
     return await bridge.ucanMint(ctx._handle, memberDid, capabilities, proofs);
@@ -79,6 +82,7 @@ export async function mintUcan(
  * @throws {UcanPermissionError} If revocation fails (unauthorized, malformed, etc.).
  */
 export async function revokeUcan(ctx: Context, token: string, revokerDid: string): Promise<void> {
+  deprecatedDefaultInstance("revokeUcan");
   try {
     const bridge = await getBridge();
     await bridge.ucanRevoke(ctx._handle, token, revokerDid);
@@ -114,6 +118,7 @@ export async function delegateUcan(
   targetDid: string,
   capabilities: readonly string[],
 ): Promise<UcanToken> {
+  deprecatedDefaultInstance("delegateUcan");
   try {
     const bridge = await getBridge();
     return await bridge.ucanDelegate(

@@ -268,6 +268,10 @@ pub(super) struct MockCrypto {
     /// Used to assert that `join_context` rolls back MLS + economy state
     /// when sender key drain fails catastrophically.
     pub(super) fail_drain_pending_sender_key_messages: AtomicBool,
+    /// AC3 bug 2: when set, `export_crypto_state` returns an error so the
+    /// `persist_context_snapshot` error branch is exercised and verified
+    /// to mark the persisted snapshot with `needs_reconnect = true`.
+    pub(super) fail_export_crypto_state: AtomicBool,
     pub(super) mls_created: std::sync::Mutex<Vec<[u8; 32]>>,
     pub(super) sender_keys_created: std::sync::Mutex<Vec<[u8; 32]>>,
     pub(super) broadcast_created: std::sync::Mutex<Vec<[u8; 32]>>,
@@ -521,6 +525,18 @@ impl ContextCryptoProvider for MockCrypto {
             self.epoch_floors.lock().unwrap().insert(ctx_key, epochs);
         }
         Ok(())
+    }
+
+    fn export_crypto_state(&self, _context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
+        // AC3 bug 2: return a typed error when the test flag is set, so the
+        // `persist_context_snapshot` error branch is exercised. Default path
+        // returns an empty blob (matches the trait default).
+        if self.fail_export_crypto_state.load(Ordering::Relaxed) {
+            return Err(ContextError::CryptoFailed(
+                "mock export_crypto_state failure".into(),
+            ));
+        }
+        Ok(Vec::new())
     }
 
     fn validate_and_merge_epoch_floors(

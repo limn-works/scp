@@ -1,7 +1,11 @@
 build:
   maxIssues: 0
-  excludes:
-    - "**/internal/uniffi/**"
+
+# UniFFI-generated bindings in `src/main/kotlin/works/limn/scp/internal/uniffi/`
+# are excluded via the Gradle `tasks.withType<Detekt>().configureEach`
+# block in each module's build.gradle.kts. detekt 1.23 removed the
+# `build.excludes` YAML key that used to live here; the Gradle-side
+# exclusion is the supported replacement.
 
 complexity:
   CyclomaticComplexMethod:

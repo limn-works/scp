@@ -16,6 +16,7 @@
 import type { Context } from "./context";
 import { mapBridgeError, TransportError } from "./errors";
 import { BRIDGE_TARGET } from "./internal/bridge";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 import { safeJsonParse } from "./internal/json-utils";
 import type { McpClientConfig, McpServerConfig, ToolDefinition } from "./types";
 
@@ -147,6 +148,7 @@ export interface McpServer extends AsyncDisposable {
  * @throws {TransportError} If the server cannot be started.
  */
 export async function serveMcp(ctx: Context, config: McpServerConfig): Promise<McpServer> {
+  deprecatedDefaultInstance("serveMcp");
   try {
     const host = config.host ?? "127.0.0.1";
     const port = config.port ?? 0;
@@ -231,6 +233,7 @@ export interface McpClient extends AsyncDisposable {
  * @throws {TransportError} If the connection fails.
  */
 export async function connectMcp(config: McpClientConfig): Promise<McpClient> {
+  deprecatedDefaultInstance("connectMcp");
   try {
     if (BRIDGE_TARGET === "native") {
       const addon = await getMcpAddon();
@@ -330,6 +333,7 @@ export async function connectMcpStdio(
   command: string,
   args: readonly string[] = [],
 ): Promise<McpClient> {
+  deprecatedDefaultInstance("connectMcpStdio");
   try {
     if (BRIDGE_TARGET !== "native") {
       throw new TransportError(

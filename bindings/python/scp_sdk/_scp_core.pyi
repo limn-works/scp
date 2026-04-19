@@ -382,6 +382,31 @@ def shutdown_runtime() -> None:
     """
     ...
 
+def scp_suspend() -> None:
+    """Suspends the bridge instance for mobile/desktop backgrounding.
+
+    Disconnects transport (clears the relay connection) and marks the
+    instance as suspended.  Context state is preserved.  No-op when the
+    bridge is not initialized or has already shut down.
+
+    Raises:
+        ScpTransportError: If transport cleanup fails.
+    """
+    ...
+
+def scp_resume() -> None:
+    """Resumes a suspended bridge instance.
+
+    Clears the suspended flag so bridge operations can proceed.  The
+    caller must re-establish the relay connection via
+    ``transport_connect`` — resume does not reconnect automatically.
+    No-op when the bridge is not initialized.
+
+    Raises:
+        ScpContextError: If the bridge has been permanently shut down.
+    """
+    ...
+
 # ---------------------------------------------------------------------------
 # Identity bridge functions (crates/scp-ffi/src/identity.rs)
 # ---------------------------------------------------------------------------
