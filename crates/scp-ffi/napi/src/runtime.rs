@@ -55,16 +55,30 @@ use crate::identity::OpaqueInMemoryKeyCustody;
 
 /// Storage configuration for [`NapiBridgeInstance`].
 ///
-/// During Phase 4 PR 1 only the in-memory variant is exposed; the
-/// `SQLite` variant lands in PR 3 alongside
-/// [`scp_platform::sqlite::SqliteStorage`]. Kept here (not in
-/// `scp-ffi-common`) because each bridge owns its own storage shape until
-/// the shared type lands.
+/// Two variants are supported:
+/// - [`StorageConfig::InMemory`] — encrypted in-memory storage (ephemeral).
+/// - [`StorageConfig::Sqlite`] — SQLCipher-encrypted storage on disk at
+///   `{path}/scp.db`, wired through [`scp_platform::sqlite::SqliteStorage`].
+///
+/// Kept here (not in `scp-ffi-common`) because each bridge owns its own
+/// storage shape until a shared type lands.
 #[derive(Debug, Clone, Default)]
 pub enum StorageConfig {
-    /// Encrypted in-memory storage — the only variant supported in PR 1.
+    /// Encrypted in-memory storage.
     #[default]
     InMemory,
+    /// SQLCipher-encrypted on-disk storage.
+    ///
+    /// Persists context snapshots, identity state, and the event log
+    /// across process restarts. The `key` is raw encryption key material
+    /// wrapped in [`Zeroizing`] so the caller's copy is zeroed after the
+    /// variant is consumed.
+    Sqlite {
+        /// Directory the database file is created in.
+        path: std::path::PathBuf,
+        /// Raw encryption key material (32 bytes recommended).
+        key: zeroize::Zeroizing<Vec<u8>>,
+    },
 }
 
 /// NAPI-specific concrete bridge instance.
@@ -155,14 +169,74 @@ impl NapiBridgeInstance {
 
     /// Constructs a new `NapiBridgeInstance` honoring a [`StorageConfig`].
     ///
-    /// Only [`StorageConfig::InMemory`] is supported in PR 1; PR 3 adds the
-    /// `SQLite` variant once [`scp_platform::sqlite::SqliteStorage`] is wired
-    /// through the FFI boundary. The current implementation is equivalent
-    /// to [`NapiBridgeInstance::new_napi`].
+    /// - [`StorageConfig::InMemory`] — equivalent to
+    ///   [`NapiBridgeInstance::new_napi`]; no persistence provider is
+    ///   attached to the embedded `CoreFields` (the legacy
+    ///   `NapiBridgePersistence` `DashMap` is still wired into the
+    ///   `ContextManager` by `init_context_manager*`).
+    /// - [`StorageConfig::Sqlite`] — opens a `SQLCipher`-encrypted
+    ///   database at `{path}/scp.db` and attaches a
+    ///   `ProtocolRepositoryContextBridge<Arc<SqliteStorage>>` to
+    ///   `CoreFields::persistence`. Downstream
+    ///   `init_context_manager*` picks the shared `Arc` up via
+    ///   `persistence_arc_clone()` so the `ContextManager` and the
+    ///   `CoreFields` mirror share a single `SqliteStorage` instance. If
+    ///   opening fails, the error is logged via `tracing::error!` and the
+    ///   instance is returned without persistence (matching the `PyO3`
+    ///   bridge's behaviour).
     #[must_use]
     pub fn with_storage_napi(config: StorageConfig) -> Self {
         match config {
             StorageConfig::InMemory => Self::new_napi(),
+            StorageConfig::Sqlite { path, key } => {
+                match scp_platform::sqlite::SqliteStorage::new(&path, &key) {
+                    Ok(storage) => {
+                        let arc_storage = Arc::new(storage);
+                        let repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                        let persistence: Arc<dyn ContextPersistence + Send + Sync> = Arc::new(
+                            scp_core::store::context::ProtocolRepositoryContextBridge::new(repo),
+                        );
+                        // `arc_storage` itself is not retained beyond the
+                        // persistence bridge — NAPI does not have a
+                        // storage_provider slot on NapiBridgeInstance
+                        // today. Extending it is a later commit; the
+                        // persistence path is the load-bearing one.
+                        drop(arc_storage);
+                        drop(key);
+                        Self::with_persistence_napi_arc(persistence)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            path = %path.display(),
+                            "with_storage_napi: SqliteStorage::new failed — instance created without persistence"
+                        );
+                        drop(key);
+                        Self::new_napi()
+                    }
+                }
+            }
+        }
+    }
+
+    /// Internal helper: constructs a new `NapiBridgeInstance` pre-populated
+    /// with a shared [`ContextPersistence`] provider.
+    ///
+    /// Accepts an `Arc<dyn ContextPersistence + Send + Sync>` so the same
+    /// persistence provider is later picked up by
+    /// `init_context_manager*` via
+    /// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`],
+    /// avoiding duplicate `SqliteStorage` connections to the same database.
+    #[must_use]
+    fn with_persistence_napi_arc(persistence: Arc<dyn ContextPersistence + Send + Sync>) -> Self {
+        let (_event_log, protocol_repository) =
+            scp_ffi_common::bridge_runtime::build_event_log_provider();
+        Self {
+            core: CoreFields::with_persistence_arc(persistence),
+            ucan_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "allow_in_memory_custody")]
+            identity_registry: Arc::new(DashMap::new()),
+            protocol_repository,
         }
     }
 
@@ -177,6 +251,20 @@ impl NapiBridgeInstance {
 impl BridgeInstanceCore for NapiBridgeInstance {
     fn core(&self) -> &CoreFields {
         &self.core
+    }
+
+    /// NAPI-specific resume: flag flip, then transport reconnect, then
+    /// persisted-context restore.
+    ///
+    /// Mirrors the `PyO3` / `UniFFI` overrides so TypeScript callers see
+    /// the same semantics as Python, Swift, and Kotlin.
+    async fn resume(&self) -> Result<(), scp_ffi_common::bridge_instance::LifecycleError> {
+        self.core.resume().await?;
+        // Reconnect transport BEFORE rehydrating persisted contexts so
+        // restored subscriptions can attach to a live relay connection.
+        self.core.reconnect_transport_if_pending().await?;
+        self.core.restore_all_persisted_contexts().await;
+        Ok(())
     }
 
     async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
@@ -650,7 +738,7 @@ pub fn init_context_manager(local_did: &str) {
         );
         build_event_log_provider().0
     });
-    let persistence = Box::new(NapiBridgePersistence::new());
+    let persistence = persistence_box_for_init(bi);
     let cm_arc = Arc::new(ContextManager::with_persistence(
         crypto,
         transport,
@@ -660,6 +748,21 @@ pub fn init_context_manager(local_did: &str) {
     ));
 
     bi.core.set_context_manager(cm_arc);
+}
+
+/// Returns a `Box<dyn ContextPersistence>` for `ContextManager::with_persistence`.
+///
+/// Prefers the shared provider attached to `CoreFields::persistence` (the
+/// path taken by `with_storage_napi(StorageConfig::Sqlite)`) so the
+/// manager and the `CoreFields` mirror share a single backend. Falls
+/// back to the legacy in-memory [`NapiBridgePersistence`] when no shared
+/// provider is configured.
+fn persistence_box_for_init(bi: &NapiBridgeInstance) -> Box<dyn ContextPersistence> {
+    if let Some(shared) = bi.core.persistence_arc_clone() {
+        Box::new(ArcContextPersistence::new(shared))
+    } else {
+        Box::new(NapiBridgePersistence::new())
+    }
 }
 
 /// Initializes the global [`ContextManager`] with [`LocalTransportProvider`].
@@ -702,7 +805,7 @@ pub fn init_context_manager_with_local_transport(local_did: &str) {
         );
         build_event_log_provider().0
     });
-    let persistence = Box::new(NapiBridgePersistence::new());
+    let persistence = persistence_box_for_init(bi);
     let cm_arc = Arc::new(ContextManager::with_persistence(
         crypto,
         transport,
@@ -764,7 +867,7 @@ pub fn init_context_manager_with_relay_transport(
         );
         build_event_log_provider().0
     });
-    let persistence = Box::new(NapiBridgePersistence::new());
+    let persistence = persistence_box_for_init(bi);
     let cm_arc = Arc::new(ContextManager::with_persistence(
         crypto,
         transport,
@@ -1506,6 +1609,79 @@ impl ContextPersistence for NapiBridgePersistence {
             .iter()
             .map(|entry| entry.key().clone())
             .collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ArcContextPersistence — shared-Arc adapter
+// ---------------------------------------------------------------------------
+
+/// Adapter that lets a shared `Arc<dyn ContextPersistence + Send + Sync>` be
+/// consumed by [`ContextManager::with_persistence`] which requires a `Box`.
+///
+/// Mirrors the `UniFFI` and `PyO3` bridges' `ArcContextPersistence`.
+/// `ContextManager::with_persistence` converts the `Box` back into an
+/// `Arc` internally, but the call-site signature is `Box`-only. Rather
+/// than cloning the underlying backend (which would open a second
+/// `SQLite` connection), we box a thin wrapper that delegates every
+/// trait method to the shared `Arc`. The manager's internal `Arc` and
+/// the `CoreFields::persistence` mirror end up pointing at the same
+/// provider instance.
+struct ArcContextPersistence {
+    inner: Arc<dyn ContextPersistence + Send + Sync>,
+}
+
+impl ArcContextPersistence {
+    const fn new(inner: Arc<dyn ContextPersistence + Send + Sync>) -> Self {
+        Self { inner }
+    }
+}
+
+impl ContextPersistence for ArcContextPersistence {
+    fn persist_context(
+        &self,
+        context_id: &str,
+        snapshot: &ContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.persist_context(context_id, snapshot)
+    }
+
+    fn load_context(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<ContextSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.load_context(context_id)
+    }
+
+    fn persist_broadcast(
+        &self,
+        context_id: &str,
+        snapshot: &scp_core::context::broadcast::BroadcastContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.persist_broadcast(context_id, snapshot)
+    }
+
+    fn load_broadcast(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Option<scp_core::context::broadcast::BroadcastContextSnapshot>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.inner.load_broadcast(context_id)
+    }
+
+    fn delete_context(
+        &self,
+        context_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.delete_context(context_id)
+    }
+
+    fn list_persisted_contexts(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_persisted_contexts()
     }
 }
 

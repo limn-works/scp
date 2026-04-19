@@ -42,7 +42,7 @@ struct LifecycleTests {
     // MARK: - resume
 
     @Test("resume delegates to injected closure and succeeds")
-    func resumeCallsInjectedClosure() throws {
+    func resumeCallsInjectedClosure() async throws {
         final class Counter: @unchecked Sendable {
             var value = 0
         }
@@ -51,26 +51,26 @@ struct LifecycleTests {
             counter.value += 1
         }
 
-        try Lifecycle.resume(resumeFn: resumeFn)
+        try await Lifecycle.resume(resumeFn: resumeFn)
         #expect(counter.value == 1)
     }
 
     @Test("resume propagates thrown errors")
-    func resumePropagatesErrors() {
+    func resumePropagatesErrors() async {
         struct InjectedError: Error, Equatable {}
         let resumeFn: Lifecycle.ResumeFn = {
             throw InjectedError()
         }
 
-        #expect(throws: InjectedError.self) {
-            try Lifecycle.resume(resumeFn: resumeFn)
+        await #expect(throws: InjectedError.self) {
+            try await Lifecycle.resume(resumeFn: resumeFn)
         }
     }
 
     // MARK: - Roundtrip
 
     @Test("suspend then resume invokes both closures in order")
-    func suspendThenResumeRoundtrip() throws {
+    func suspendThenResumeRoundtrip() async throws {
         final class Log: @unchecked Sendable {
             var entries: [String] = []
         }
@@ -79,7 +79,7 @@ struct LifecycleTests {
         let resumeFn: Lifecycle.ResumeFn = { log.entries.append("resume") }
 
         try Lifecycle.suspend(suspendFn: suspendFn)
-        try Lifecycle.resume(resumeFn: resumeFn)
+        try await Lifecycle.resume(resumeFn: resumeFn)
 
         #expect(log.entries == ["suspend", "resume"])
     }

@@ -42,10 +42,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
-use scp_core::context::ContextError;
-use scp_core::context::builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
-};
+use scp_core::context::builder::{ContextCryptoProvider, ContextEventLogProvider};
 use scp_core::context::manager::ContextManager;
 use scp_core::context::providers::MerkleEventLogProvider;
 use scp_core::crypto::ucan::nonce::NonceTracker;
@@ -62,15 +59,34 @@ use scp_platform::encrypting_adapter::EncryptingAdapter;
 
 /// Storage configuration for [`UniffiBridgeInstance`].
 ///
-/// Phase 4 PR 1 exposes only the in-memory variant; the `SQLite` variant lands
-/// in PR 3 alongside [`scp_platform::sqlite::SqliteStorage`]. Kept here (not
-/// in `scp-ffi-common`) because each bridge owns its own storage shape until
-/// the shared type lands.
+/// Two variants are supported:
+/// - [`StorageConfig::InMemory`] — encrypted in-memory storage (ephemeral).
+/// - [`StorageConfig::Sqlite`] — SQLCipher-encrypted storage on disk at
+///   `{path}/scp.db`, wired through [`scp_platform::sqlite::SqliteStorage`].
+///
+/// Kept here (not in `scp-ffi-common`) because each bridge owns its own
+/// storage shape until a shared type lands.
+///
+/// # `UniFFI` representation
+///
+/// `#[derive(uniffi::Enum)]` exposes this to Swift and Kotlin as an
+/// associated-value enum. Swift will see `case sqlite(path: String, key:
+/// Data)`; Kotlin `sealed class StorageConfig.Sqlite(path: String, key:
+/// ByteArray)`. The raw key is accepted as a byte array; callers should
+/// zero their copy after the call returns.
 #[derive(Debug, Clone, Default, uniffi::Enum)]
 pub enum StorageConfig {
-    /// Encrypted in-memory storage — the only variant supported in PR 1.
+    /// Encrypted in-memory storage.
     #[default]
     InMemory,
+    /// SQLCipher-encrypted on-disk storage at `{path}/scp.db`.
+    Sqlite {
+        /// Directory the database file is created in. Path is passed
+        /// through `std::path::PathBuf` on the Rust side.
+        path: String,
+        /// Raw encryption key material (typically 32 bytes).
+        key: Vec<u8>,
+    },
 }
 
 /// `UniFFI`-specific concrete bridge instance.
@@ -175,14 +191,83 @@ impl UniffiBridgeInstance {
 
     /// Constructs a new `UniffiBridgeInstance` honoring a [`StorageConfig`].
     ///
-    /// Only [`StorageConfig::InMemory`] is supported in PR 1; PR 3 adds the
-    /// `SQLite` variant once [`scp_platform::sqlite::SqliteStorage`] is wired
-    /// through the FFI boundary. The current implementation is equivalent
-    /// to [`UniffiBridgeInstance::new_uniffi`].
+    /// - [`StorageConfig::InMemory`] — equivalent to
+    ///   [`UniffiBridgeInstance::new_uniffi`]; no persistence provider is
+    ///   attached to the embedded `CoreFields`.
+    /// - [`StorageConfig::Sqlite`] — opens a `SQLCipher`-encrypted
+    ///   database at `{path}/scp.db` and attaches a
+    ///   `ProtocolRepositoryContextBridge<Arc<SqliteStorage>>` to
+    ///   `CoreFields::persistence`. The subsequent
+    ///   `init_context_manager*` call picks the shared `Arc` up via
+    ///   [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`]
+    ///   so the `ContextManager` and the `CoreFields` mirror share a
+    ///   single `SqliteStorage` instance. If opening fails, the error is
+    ///   logged via `tracing::error!` and the instance is returned
+    ///   without persistence (matching the `PyO3` / NAPI bridges).
     #[must_use]
     pub fn with_storage_uniffi(config: StorageConfig) -> Self {
         match config {
             StorageConfig::InMemory => Self::new_uniffi(),
+            StorageConfig::Sqlite { path, key } => {
+                let path_buf = std::path::PathBuf::from(&path);
+                match scp_platform::sqlite::SqliteStorage::new(&path_buf, &key) {
+                    Ok(storage) => {
+                        let arc_storage = Arc::new(storage);
+                        let repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                        let persistence: Arc<
+                            dyn scp_core::context::manager::ContextPersistence + Send + Sync,
+                        > = Arc::new(
+                            scp_core::store::context::ProtocolRepositoryContextBridge::new(repo),
+                        );
+                        // `arc_storage` is already held by the bridge via
+                        // the repo clone above; dropping it here just
+                        // decrements the local reference count.
+                        drop(arc_storage);
+                        // `key` is a `Vec<u8>` crossing the UniFFI
+                        // boundary — we cannot zero the caller's copy,
+                        // but we zero ours after SQLCipher has consumed
+                        // it internally.
+                        let mut key_owned = key;
+                        zeroize::Zeroize::zeroize(&mut key_owned);
+                        drop(key_owned);
+                        Self::with_persistence_uniffi_arc(persistence)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            path = %path,
+                            "with_storage_uniffi: SqliteStorage::new failed — instance created without persistence"
+                        );
+                        let mut key_owned = key;
+                        zeroize::Zeroize::zeroize(&mut key_owned);
+                        drop(key_owned);
+                        Self::new_uniffi()
+                    }
+                }
+            }
+        }
+    }
+
+    /// Internal helper: constructs a new `UniffiBridgeInstance`
+    /// pre-populated with a shared [`ContextPersistence`] provider.
+    ///
+    /// Accepts an `Arc<dyn ContextPersistence + Send + Sync>` so the same
+    /// persistence provider is later picked up by
+    /// `init_context_manager*` via
+    /// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`],
+    /// avoiding duplicate `SqliteStorage` connections to the same database.
+    #[must_use]
+    fn with_persistence_uniffi_arc(
+        persistence: Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>,
+    ) -> Self {
+        let (_event_log, protocol_repository) =
+            scp_ffi_common::bridge_runtime::build_event_log_provider();
+        Self {
+            core: CoreFields::with_persistence_arc(persistence),
+            ucan_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "allow_in_memory_custody")]
+            identity_custody_registry: Arc::new(DashMap::new()),
+            protocol_repository,
         }
     }
 
@@ -237,6 +322,20 @@ impl UniffiBridgeInstance {
 impl BridgeInstanceCore for UniffiBridgeInstance {
     fn core(&self) -> &CoreFields {
         &self.core
+    }
+
+    /// `UniFFI`-specific resume: flag flip, then transport reconnect, then
+    /// persisted-context restore.
+    ///
+    /// Mirrors the `PyO3` / NAPI overrides so Swift and Kotlin callers get
+    /// the same resume semantics as Python and TypeScript.
+    async fn resume(&self) -> Result<(), scp_ffi_common::bridge_instance::LifecycleError> {
+        self.core.resume().await?;
+        // Reconnect transport BEFORE rehydrating persisted contexts so
+        // restored subscriptions can attach to a live relay connection.
+        self.core.reconnect_transport_if_pending().await?;
+        self.core.restore_all_persisted_contexts().await;
+        Ok(())
     }
 
     async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
@@ -592,24 +691,110 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, crate::ScpError
         })
 }
 
-/// Builds a default `ContextManager` with bridge-local providers, and returns
-/// both the manager and the underlying `ProtocolRepository`.
+/// Adapter that lets a shared `Arc<dyn ContextPersistence + Send + Sync>` be
+/// consumed by [`ContextManager::with_persistence`] which requires a `Box`.
 ///
-/// Used only in tests that construct isolated bridge instances. The production
-/// path reuses the repository registered on the default instance so keys are
-/// consistent across restarts.
-fn build_default_context_manager() -> (
-    Arc<ContextManager>,
-    Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
-) {
-    let (event_log, protocol_repo) = build_event_log_provider();
-    let cm = Arc::new(ContextManager::new(
-        Box::new(FfiBridgeCrypto),
-        Box::new(scp_core::context::NotConfiguredTransportProvider),
-        event_log,
-        not_configured_key_resolver(),
-    ));
-    (cm, protocol_repo)
+/// `ContextManager::with_persistence` converts the `Box` back into an `Arc`
+/// internally, but the call-site signature is `Box`-only. Rather than
+/// cloning the underlying backend (which would open a second `SQLite`
+/// connection), we box a thin wrapper that delegates every trait method to
+/// the shared `Arc`. The `Arc` mirror retained on `CoreFields::persistence`
+/// and the `Arc` reconstructed inside `ContextManager` end up pointing at
+/// the same provider, so suspend/resume flush + `flush_all_contexts_sync`
+/// operate on the same underlying storage.
+struct ArcContextPersistence {
+    inner: Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>,
+}
+
+impl ArcContextPersistence {
+    fn new(inner: Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>) -> Self {
+        Self { inner }
+    }
+}
+
+impl scp_core::context::manager::ContextPersistence for ArcContextPersistence {
+    fn persist_context(
+        &self,
+        context_id: &str,
+        snapshot: &scp_core::context::manager::ContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.persist_context(context_id, snapshot)
+    }
+
+    fn load_context(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Option<scp_core::context::manager::ContextSnapshot>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.inner.load_context(context_id)
+    }
+
+    fn persist_broadcast(
+        &self,
+        context_id: &str,
+        snapshot: &scp_core::context::broadcast::BroadcastContextSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.persist_broadcast(context_id, snapshot)
+    }
+
+    fn load_broadcast(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Option<scp_core::context::broadcast::BroadcastContextSnapshot>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        self.inner.load_broadcast(context_id)
+    }
+
+    fn delete_context(
+        &self,
+        context_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.delete_context(context_id)
+    }
+
+    fn list_persisted_contexts(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.list_persisted_contexts()
+    }
+}
+
+/// Constructs a [`ContextManager`] with or without persistence.
+///
+/// Mirrors the `PyO3` bridge's `build_context_manager` (`crates/scp-ffi/src/runtime.rs`).
+/// When `persistence` is `Some`, wraps the shared `Arc` in
+/// [`ArcContextPersistence`] and hands it to
+/// [`ContextManager::with_persistence`]; otherwise calls
+/// [`ContextManager::new`]. Callers pull the shared persistence from the
+/// embedded `CoreFields` via
+/// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`]
+/// so the manager and the bridge mirror share the same backend — a
+/// single `SQLite` connection, not two.
+fn build_context_manager(
+    crypto: Box<dyn ContextCryptoProvider>,
+    transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
+    event_log: Box<dyn ContextEventLogProvider>,
+    persistence: Option<Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>>,
+) -> Arc<ContextManager> {
+    match persistence {
+        Some(shared) => Arc::new(ContextManager::with_persistence(
+            crypto,
+            transport,
+            event_log,
+            Box::new(ArcContextPersistence::new(shared)),
+            not_configured_key_resolver(),
+        )),
+        None => Arc::new(ContextManager::new(
+            crypto,
+            transport,
+            event_log,
+            not_configured_key_resolver(),
+        )),
+    }
 }
 
 /// Builds an event log provider that reuses the already-registered
@@ -626,80 +811,53 @@ fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProv
     )))
 }
 
-/// Builds a default `ContextManager` reusing the protocol repository already
-/// registered on the default instance.
-fn build_default_context_manager_reusing_repo() -> Arc<ContextManager> {
-    let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
-        tracing::error!(
-            "build_default_context_manager_reusing_repo: missing ProtocolRepository — \
-             falling back to a fresh event log provider (persistence will be lost)"
-        );
-        build_event_log_provider().0
-    });
-    Arc::new(ContextManager::new(
-        Box::new(FfiBridgeCrypto),
-        Box::new(scp_core::context::NotConfiguredTransportProvider),
-        event_log,
-        not_configured_key_resolver(),
-    ))
+/// Returns a reference to the shared `ContextManager` on the default bridge
+/// instance.
+///
+/// Unlike [`context_manager`], this variant does not initialize the bridge
+/// instance lazily — callers must have already registered a local DID via
+/// [`init_context_manager_with_did`] (typically indirectly through
+/// `context_create`, `context_join`, `context_import`, `register_local_did`,
+/// or `identity_create`). This matches the `PyO3` / `NAPI` `context_manager()`
+/// semantics where no DID-less construction path exists.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` (code `SCP-CTX-2000`) when the bridge has not
+/// been initialized, when no local DID has been registered yet, or when the
+/// bridge is currently suspended.
+pub fn context_manager_expect() -> Result<&'static Arc<ContextManager>, crate::ScpError> {
+    let bi = DEFAULT_BRIDGE_INSTANCE
+        .get()
+        .ok_or_else(|| crate::ScpError::Context {
+            msg: "bridge not ready: no local DID registered".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })?;
+    if bi.core.is_suspended() {
+        return Err(crate::ScpError::Context {
+            msg: "bridge is suspended — call resume() before performing operations".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        });
+    }
+    if bi.core.is_shutdown() {
+        tracing::warn!("context_manager_expect() called after shutdown — operations may fail");
+    }
+    bi.core
+        .try_context_manager()
+        .ok_or_else(|| crate::ScpError::Context {
+            msg: "bridge not ready: no local DID registered".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })
 }
 
-/// Returns a reference to the shared `ContextManager`, initializing it with
-/// defaults if necessary.
+/// Initializes the global [`ContextManager`] with [`MlsCryptoProvider`] and
+/// [`scp_core::context::NotConfiguredTransportProvider`].
 ///
-/// For `#[uniffi::export]` functions that return non-Result types (bool, Vec,
-/// Option, ()), this provides access to the manager without requiring a
-/// `Result` return type. Callers should prefer [`context_manager`] when the
-/// return type supports `Result`.
-pub fn context_manager_expect() -> &'static Arc<ContextManager> {
-    if let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get()
-        && let Some(cm) = bi.core.try_context_manager()
-    {
-        return cm;
-    }
-    ensure_bridge_instance();
-    if let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() {
-        if !bi.core.has_context_manager() {
-            bi.core
-                .set_context_manager(build_default_context_manager_reusing_repo());
-        }
-        if let Some(cm) = bi.core.try_context_manager() {
-            return cm;
-        }
-        tracing::error!(
-            "context_manager_expect: default instance had no CM after set_context_manager — \
-             falling back to a leaked default CM"
-        );
-    }
-    // Defensive fallback — should not happen (ensure_bridge_instance just set it).
-    let (cm, _protocol_repo) = build_default_context_manager();
-    Box::leak(Box::new(cm))
-}
-
-/// Initializes the global [`ContextManager`] with bridge-local providers.
-///
-/// Called during `context_create` to ensure the manager is ready before any
-/// context operations. Creates the default instance (without a DID) and
-/// attaches a default `ContextManager` so shared registries are available.
-///
-/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-pub fn init_context_manager() {
-    ensure_bridge_instance();
-    if let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get()
-        && !bi.core.has_context_manager()
-    {
-        bi.core
-            .set_context_manager(build_default_context_manager_reusing_repo());
-    }
-}
-
-/// Initializes the global [`ContextManager`] with [`MlsCryptoProvider`]
-/// and `NotConfiguredTransportProvider`.
-///
-/// Unlike [`init_context_manager`] (which uses `FfiBridgeCrypto` no-op),
-/// this variant initializes real MLS crypto backed by the given DID. Used
-/// by `auto_wire_context_manager`'s fallback path when relay connection
-/// fails.
+/// Must be called before any context lifecycle operation — the bridge no
+/// longer supports a DID-less stub crypto path. Callers that have a local
+/// DID (for example `context_create`, `context_join`, `context_import`,
+/// `register_local_did`, or `identity_create`) invoke this to attach a real
+/// `MlsCryptoProvider::new(local_did)` to the default bridge instance.
 ///
 /// Subsequent calls are no-ops (`OnceLock`).
 pub fn init_context_manager_with_did(local_did: &str) {
@@ -724,12 +882,13 @@ pub fn init_context_manager_with_did(local_did: &str) {
         );
         build_event_log_provider().0
     });
-    let cm_arc = Arc::new(ContextManager::new(
+    let persistence = bi.core.persistence_arc_clone();
+    let cm_arc = build_context_manager(
         crypto,
         Box::new(scp_core::context::NotConfiguredTransportProvider),
         event_log,
-        not_configured_key_resolver(),
-    ));
+        persistence,
+    );
 
     bi.core.set_context_manager(cm_arc);
 }
@@ -769,12 +928,8 @@ pub fn init_context_manager_with_relay_transport(
         );
         build_event_log_provider().0
     });
-    let cm_arc = Arc::new(ContextManager::new(
-        crypto,
-        transport,
-        event_log,
-        not_configured_key_resolver(),
-    ));
+    let persistence = bi.core.persistence_arc_clone();
+    let cm_arc = build_context_manager(crypto, transport, event_log, persistence);
 
     bi.core.set_context_manager(cm_arc);
 }
@@ -801,15 +956,6 @@ pub fn build_event_log_provider() -> (
     Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
 ) {
     scp_ffi_common::bridge_runtime::build_event_log_provider()
-}
-
-/// Global stub crypto provider shared with the `CloseOrchestrator`.
-static FFI_CRYPTO: FfiBridgeCrypto = FfiBridgeCrypto;
-
-/// Returns a reference to the bridge crypto provider for `CloseOrchestrator`.
-#[must_use]
-pub fn context_manager_crypto() -> &'static dyn ContextCryptoProvider {
-    &FFI_CRYPTO
 }
 
 // ---------------------------------------------------------------------------
@@ -915,83 +1061,6 @@ pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), crate:
             })?;
     tracing::debug!(context_id = %context_id, "UniFFI: role state synced after governance operation");
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Provider implementations for the FFI bridge
-// ---------------------------------------------------------------------------
-
-/// Stub crypto provider for the FFI bridge `ContextManager`.
-///
-/// All operations succeed (no-op). Real MLS and sender key operations are
-/// performed by the platform-injected `KeyCustodyProvider`.
-struct FfiBridgeCrypto;
-
-impl ContextCryptoProvider for FfiBridgeCrypto {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn create_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn generate_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn init_broadcast_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn destroy_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn destroy_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-
-    fn validate_key_package(
-        &self,
-        _owner_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-
-    fn add_member(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
-        Ok(scp_core::context::AddMemberOutput::default())
-    }
-
-    fn remove_member(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<scp_core::context::RemoveMemberOutput, ContextError> {
-        Ok(scp_core::context::RemoveMemberOutput::default())
-    }
-
-    fn distribute_sender_key(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-
-    fn remove_member_sender_key(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------

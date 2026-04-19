@@ -22,9 +22,12 @@ import Foundation
 // behind `#if canImport` checks for editor clarity, but the production
 // build path assumes the generated class is present.
 //
-// Persistence parameter: intentionally omitted at the SDK surface until
-// PR 3 wires the real `ContextPersistence` trait through — see issues
-// #1260 and #1491 for progress.
+// Persistence: Phase 4 PR 3 wired the real `ContextPersistence` trait
+// through UniFFI via `StorageConfig.sqlite(path:, key:)`. The
+// ``SCP/withStorage(sqliteDir:key:)`` convenience constructor exposes
+// that variant with Swift-native `URL` and `Data` types. Closes #1260
+// and #1491; the Phase 4 auto-reconnect-on-resume transport fix closes
+// #1678.
 
 /// Caller-owned SCP instance — the preferred SDK entry point.
 ///
@@ -84,19 +87,48 @@ public final class SCP: @unchecked Sendable {
 
     /// Constructs an `SCP` with an explicit storage configuration.
     ///
-    /// In Phase 4 PR 1 only the UniFFI-default ``StorageConfig.inMemory``
-    /// variant is meaningful; PR 3 adds a filesystem-backed variant.
+    /// Phase 4 PR 3 (closes #1260 / #1491) added
+    /// ``StorageConfig/sqlite(path:key:)`` alongside the default
+    /// ``StorageConfig/inMemory`` variant; callers who want a Swift-native
+    /// `URL` + `Data` surface over the SQLite variant should prefer
+    /// ``SCP/withStorage(sqliteDir:key:)``.
     public static func withStorage(_ config: StorageConfig) -> SCP {
         SCP(inner: Scp.withStorage(config: config))
     }
 
-    // NOTE: A `withPersistence` factory is intentionally not exposed at
-    // the Swift SDK surface until PR 3 wires the real
-    // `scp_core::context::ContextPersistence` trait through UniFFI.
-    // Track progress via issues #1260 and #1491. The underlying UniFFI
-    // `Scp.withPersistence()` factory still exists for internal use
-    // but should not be called through the SDK layer until it has a
-    // real signature.
+    /// Constructs an `SCP` backed by a `SQLCipher`-encrypted database at
+    /// `{sqliteDir}/scp.db`.
+    ///
+    /// Convenience façade over ``withStorage(_:)`` with the
+    /// ``StorageConfig/sqlite(path:key:)`` variant. Accepts Swift-native
+    /// `URL` and `Data` and forwards to the UniFFI-generated
+    /// `Scp.withStorage(config:)` constructor.
+    ///
+    /// The raw key material is copied once to cross the UniFFI boundary as
+    /// `Vec<u8>`. The Rust side zeroes its copy after `SQLCipher` has
+    /// consumed it; callers should zero their own `key` copy after this
+    /// call returns — Foundation's `Data` does not guarantee zeroization
+    /// on deallocation.
+    ///
+    /// If the underlying database cannot be opened (bad key, unreadable
+    /// directory) the Rust layer logs via `tracing::error!` and returns
+    /// an in-memory-only instance — matching the PyO3 / NAPI fallback
+    /// behavior documented in PR 3.
+    ///
+    /// - Parameters:
+    ///   - sqliteDir: Directory the `scp.db` file lives in. The path is
+    ///     passed through `std::path::PathBuf` on the Rust side, so
+    ///     percent-encoded / non-UTF-8 paths must be converted before
+    ///     calling.
+    ///   - key: Raw encryption key material. Typically 32 bytes
+    ///     (`SQLCipher` derives the final key via PBKDF2). Callers should
+    ///     zero their copy after this call returns.
+    /// - Returns: A fresh `SCP` wrapping a persistent bridge instance.
+    ///
+    /// Closes #1260, #1491 (Swift SDK surface).
+    public static func withStorage(sqliteDir: URL, key: Data) -> SCP {
+        SCP(inner: Scp.withStorage(config: .sqlite(path: sqliteDir.path, key: key)))
+    }
 
     /// The monotonic identifier for this bridge instance, unique per
     /// process. Used by the FFI handle-affinity check.
@@ -116,13 +148,24 @@ public final class SCP: @unchecked Sendable {
 
     /// Resumes a suspended bridge instance.
     ///
-    /// Clears the suspended flag; the caller re-establishes the relay
-    /// connection explicitly.
+    /// Clears the suspended flag, then performs any per-bridge async work
+    /// chained by the UniFFI `BridgeInstanceCore::resume` override:
+    ///
+    /// - Reconnects every relay URL captured in the pending-URL set at
+    ///   suspend time (see #1678).
+    /// - Rehydrates any persisted contexts written by the PR 3 SQLite
+    ///   persistence path (see #1260 / #1491).
+    ///
+    /// The method is `async throws` because the underlying Rust
+    /// `Scp::resume` is `pub async fn`; UniFFI generates a Swift
+    /// `async throws` method that awaits the Rust future on the shared
+    /// tokio runtime.
     ///
     /// - Throws: ``ScpError/context`` if the instance has been permanently
-    ///   shut down.
-    public func resume() throws {
-        try inner.resume()
+    ///   shut down, or ``ScpError/transport`` if a pending relay URL
+    ///   could not be reconnected.
+    public func resume() async throws {
+        try await inner.resume()
     }
 
     /// Shuts down this instance with a graceful deadline.

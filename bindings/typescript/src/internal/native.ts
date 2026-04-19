@@ -1805,8 +1805,12 @@ export function createNativeBridge(): Bridge {
       (addon.scpSuspend as () => void)();
     },
 
-    resume(): void {
-      (addon.scpResume as () => void)();
+    resume(): Promise<void> {
+      // NAPI `scp_resume` is `async fn` since #1678 — forwarding the
+      // promise preserves the await chain so transport-reconnect and
+      // persisted-context-restoration failures surface at the SDK
+      // boundary instead of fire-and-forget.
+      return (addon.scpResume as () => Promise<void>)();
     },
   };
 }

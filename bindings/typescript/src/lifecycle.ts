@@ -50,5 +50,9 @@ export async function scpSuspend(): Promise<void> {
 export async function scpResume(): Promise<void> {
   deprecatedDefaultInstance("scpResume");
   const bridge = await getBridge();
-  bridge.resume();
+  // `bridge.resume()` is async since #1678 — on NAPI it chains
+  // transport reconnect from pending relay URLs and restoration of
+  // persisted context snapshots. Awaiting propagates any
+  // `SCP-CTX-2000` (shut-down) rejection to the caller.
+  await bridge.resume();
 }

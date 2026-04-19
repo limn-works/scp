@@ -1485,10 +1485,10 @@ struct RealFFITrustTests {
 
         let testDid = "did:dht:z6MkLocalTest\(UUID().uuidString.prefix(8))"
 
-        // Register as local (async, not throws)
-        await registerLocalDid(did: testDid)
+        // Register as local (async throws — Rust entry returns Result).
+        try await registerLocalDid(did: testDid)
 
-        // Verify it's local (async, not throws)
+        // Verify it's local (async, not throws — Rust entry returns bool).
         let isLocal = await isLocalDid(did: testDid)
         #expect(isLocal == true)
 

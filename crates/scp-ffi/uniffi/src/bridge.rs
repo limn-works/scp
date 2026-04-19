@@ -94,6 +94,45 @@ use scp_ffi_common::validate::{
 
 use crate::{decrement_handle_count, increment_handle_count, runtime};
 
+/// Generates a real MLS key package for a joining member.
+///
+/// Mirrors the NAPI bridge's `generate_mls_key_package_bytes`: builds an
+/// [`ScpCredential`] from the joiner's DID and TLS-serializes a fresh
+/// `KeyPackage` bundle produced by `generate_key_package`. The output bytes
+/// are what `MlsCryptoProvider::validate_key_package` and
+/// `MlsCryptoProvider::add_member` require — the old `FfiBridgeCrypto` stub
+/// used to accept `None`, but real MLS rejects it.
+///
+/// # Errors
+///
+/// Returns `ScpError::Crypto` if the DID format is invalid (must be
+/// `did:dht:z…`), key package generation fails, or TLS serialization fails.
+fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpError> {
+    use scp_core::crypto::mls::credential::ScpCredential;
+    use scp_core::crypto::mls::group::generate_key_package;
+    use tls_codec::Serialize as TlsSerializeTrait;
+
+    let cred = ScpCredential::new(did.to_owned(), None, scp_identity::SigningKeyId::Active)
+        .map_err(|e| ScpError::Crypto {
+            msg: format!("failed to create SCP credential for MLS key package: {e}"),
+            code: codes::CRYPTO_4010.to_owned(),
+        })?;
+
+    let (kp_bundle, _signer, _provider) =
+        generate_key_package(&cred).map_err(|e| ScpError::Crypto {
+            msg: format!("MLS key package generation failed: {e}"),
+            code: codes::CRYPTO_4011.to_owned(),
+        })?;
+
+    kp_bundle
+        .key_package()
+        .tls_serialize_detached()
+        .map_err(|e| ScpError::Crypto {
+            msg: format!("MLS key package TLS serialization failed: {e}"),
+            code: codes::CRYPTO_4012.to_owned(),
+        })
+}
+
 /// Tool handler function type: maps JSON input to JSON output (or error string).
 type ToolHandlerMap = std::collections::HashMap<
     String,
@@ -3097,8 +3136,12 @@ pub async fn context_create(
             // memory_scope to decide key destruction behavior.
             let retained_core_params = core_params.clone();
 
-            // Initialize the ContextManager if not already done (first context_create call).
-            crate::runtime::init_context_manager();
+            // Initialize the ContextManager with the creator's DID if not
+            // already done. `init_context_manager_with_did` is idempotent
+            // (`OnceLock` — first call wins). The bridge no longer supports
+            // a DID-less stub crypto path; the creator DID becomes the
+            // process-wide MLS credential identity.
+            crate::runtime::init_context_manager_with_did(&identity.did);
 
             // Extract key custody and signing key from the identity.
             #[cfg(feature = "allow_in_memory_custody")]
@@ -3299,10 +3342,11 @@ pub async fn context_join(
                 })
                 .transpose()?;
 
-            // Ensure the ContextManager is initialized — context_join is a valid
-            // first operation (e.g. a device joining a context without creating
-            // one). init_context_manager is idempotent (OnceLock). #1073
-            crate::runtime::init_context_manager();
+            // Ensure the ContextManager is initialized with the joining
+            // identity's DID — context_join is a valid first operation
+            // (e.g. a device joining a context without creating one).
+            // `init_context_manager_with_did` is idempotent (`OnceLock`). #1073
+            crate::runtime::init_context_manager_with_did(&identity.did);
 
             // Delegate to the shared ContextManager. Build a core ContextHandle
             // to pass the context_id, then join via the manager.
@@ -3320,9 +3364,14 @@ pub async fn context_join(
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
 
+            // Generate a real MLS key package for the joining member. The
+            // `MlsCryptoProvider` requires `Some(bytes)` — the old DID-less
+            // `FfiBridgeCrypto` stub accepted `None`, but commit 4 replaced
+            // it with real MLS crypto across every bridge entry point.
+            let kp_bytes = generate_mls_key_package_bytes(&identity.did)?;
             let key_package = KeyPackage {
                 owner_did: identity.did.clone().into(),
-                mls_key_package_bytes: None,
+                mls_key_package_bytes: Some(kp_bytes),
             };
 
             // §9.10.4: Derive pseudonym for per-member routing. Uses the
@@ -3521,7 +3570,7 @@ pub async fn context_close(
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
 
-            let initiator_did: scp_identity::DID = identity_did.into();
+            let initiator_did: scp_identity::DID = identity_did.clone().into();
             manager
                 .close_context(&core_handle, &initiator_did)
                 .await
@@ -3534,8 +3583,15 @@ pub async fn context_close(
             let memory_scope = core_handle.params().memory_scope;
             let now = scp_primitives::SystemClock.now_secs();
 
-            let crypto_provider = crate::runtime::context_manager_crypto();
-            let orchestrator = scp_core::context::close::CloseOrchestrator::new(crypto_provider);
+            // Build a fresh `MlsCryptoProvider` for key-destruction scoped to
+            // the initiator's DID. The bridge no longer caches a global stub
+            // crypto provider (commit 4 removed `FfiBridgeCrypto`). The
+            // `CloseOrchestrator` only uses this provider to destroy MLS group
+            // and sender-key material for the context being closed; a fresh
+            // per-call instance is correct.
+            let crypto_provider =
+                scp_core::crypto::mls::provider::MlsCryptoProvider::new(identity_did);
+            let orchestrator = scp_core::context::close::CloseOrchestrator::new(&crypto_provider);
 
             let close_action = orchestrator
                 .initiate_close(
@@ -4114,7 +4170,7 @@ pub async fn tool_invoke(
                 }
             };
 
-            let manager = crate::runtime::context_manager_expect();
+            let manager = crate::runtime::context_manager_expect()?;
             let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
             let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
             let outcome = manager
@@ -5031,6 +5087,11 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
                     code: codes::TRANS_5002.to_owned(),
                 })?;
 
+            // Register the URL on the bridge's pending-reconnect set so
+            // `BridgeInstanceCore::resume` can rebuild the transport after
+            // suspend/resume cycles (#1678).
+            bi.core.add_relay_url(relay_url.clone());
+
             let handle = Arc::new(TransportManager {
                 status: std::sync::Mutex::new(TransportStatus {
                     connected: true,
@@ -5096,15 +5157,25 @@ pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), 
                 code: codes::TRANS_5003.to_owned(),
             })?;
 
-            // Update the handle's status to disconnected.
-            {
+            // Update the handle's status to disconnected and capture the
+            // URL we were connected to before clearing it.
+            let disconnecting_url = {
                 let mut status_guard = manager.status.lock().map_err(|_| ScpError::Transport {
                     msg: "status mutex is poisoned — cannot update transport status".to_owned(),
                     code: codes::TRANS_5003.to_owned(),
                 })?;
+                let url = status_guard.relay_url.clone();
                 status_guard.connected = false;
                 status_guard.relay_url = None;
                 status_guard.latency_ms = None;
+                url
+            };
+
+            // Remove the URL from the bridge's pending-reconnect set so a
+            // subsequent `resume()` does not re-open a URL the caller
+            // explicitly disconnected (#1678).
+            if let Some(ref url) = disconnecting_url {
+                bi.core.remove_relay_url(url);
             }
 
             Ok(())
@@ -9018,7 +9089,7 @@ pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u6
     if check.is_err() {
         return None;
     }
-    let manager = crate::runtime::context_manager_expect();
+    let manager = crate::runtime::context_manager_expect().ok()?;
     manager
         .broadcast_subscriber_count(&handle.context_id)
         .await
@@ -9035,7 +9106,9 @@ pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) ->
     if check.is_err() {
         return false;
     }
-    let manager = crate::runtime::context_manager_expect();
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return false;
+    };
     manager
         .is_broadcast_subscriber(&handle.context_id, &did)
         .await
@@ -9054,7 +9127,7 @@ pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
     if check.is_err() {
         return None;
     }
-    let manager = crate::runtime::context_manager_expect();
+    let manager = crate::runtime::context_manager_expect().ok()?;
     manager
         .broadcast_admission(&handle.context_id)
         .await
@@ -9077,7 +9150,7 @@ pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
     if check.is_err() {
         return None;
     }
-    let manager = crate::runtime::context_manager_expect();
+    let manager = crate::runtime::context_manager_expect().ok()?;
     manager
         .member_count(&handle.context_id)
         .await
@@ -9087,7 +9160,16 @@ pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
 /// Returns `true` if the given DID is a member of the context.
 #[uniffi::export]
 pub async fn context_is_member(handle: Arc<ContextHandle>, did: String) -> bool {
-    let manager = crate::runtime::context_manager_expect();
+    let check: Result<(), ScpError> = (|| {
+        crate::uniffi_check_handle!(handle);
+        Ok(())
+    })();
+    if check.is_err() {
+        return false;
+    }
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return false;
+    };
     manager.is_member(&handle.context_id, &did).await
 }
 
@@ -9101,7 +9183,9 @@ pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
     if check.is_err() {
         return Vec::new();
     }
-    let manager = crate::runtime::context_manager_expect();
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return Vec::new();
+    };
     manager.member_dids(&handle.context_id).await
 }
 
@@ -9117,7 +9201,7 @@ pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Opt
     if check.is_err() {
         return None;
     }
-    let manager = crate::runtime::context_manager_expect();
+    let manager = crate::runtime::context_manager_expect().ok()?;
     manager
         .member_role(&handle.context_id, &did)
         .await
@@ -9174,7 +9258,9 @@ pub async fn context_drain_events(handle: Arc<ContextHandle>) -> Vec<String> {
     if check.is_err() {
         return Vec::new();
     }
-    let manager = crate::runtime::context_manager_expect();
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return Vec::new();
+    };
     manager
         .drain_events(&handle.context_id)
         .await
@@ -9202,7 +9288,7 @@ pub async fn access_key_generate(
     member_did: String,
     caller_did: String,
 ) -> Result<(), ScpError> {
-    let manager = crate::runtime::context_manager_expect();
+    let manager = crate::runtime::context_manager_expect()?;
     manager
         .generate_context_access_key(&context_id, &member_did, &caller_did)
         .await
@@ -9224,7 +9310,7 @@ pub async fn access_key_revoke(
     member_did: String,
     caller_did: String,
 ) -> Result<(), ScpError> {
-    let manager = crate::runtime::context_manager_expect();
+    let manager = crate::runtime::context_manager_expect()?;
     manager
         .revoke_context_access_key(&context_id, &member_did, &caller_did)
         .await
@@ -9246,7 +9332,7 @@ pub async fn access_key_restore(
     member_did: String,
     caller_did: String,
 ) -> Result<(), ScpError> {
-    let manager = crate::runtime::context_manager_expect();
+    let manager = crate::runtime::context_manager_expect()?;
     manager
         .restore_context_access_key(&context_id, &member_did, &caller_did)
         .await
@@ -9340,7 +9426,9 @@ pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u6
     if check.is_err() {
         return;
     }
-    let manager = crate::runtime::context_manager_expect();
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return;
+    };
     let core_handle = scp_core::context::ContextHandle::new(
         handle.context_id.clone(),
         scp_core::context::ContextParams::default(),
@@ -9364,10 +9452,12 @@ pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u6
 /// Ensures the `ContextManager` is initialized (idempotent) since local DID
 /// registration is valid before any context exists.
 #[uniffi::export]
-pub async fn register_local_did(did: String) {
-    crate::runtime::init_context_manager();
-    let manager = crate::runtime::context_manager_expect();
+pub async fn register_local_did(did: String) -> Result<(), ScpError> {
+    validate_did(&did)?;
+    crate::runtime::init_context_manager_with_did(&did);
+    let manager = crate::runtime::context_manager_expect()?;
     manager.register_local_did(did.into()).await;
+    Ok(())
 }
 
 /// Returns `true` if the given DID is registered as locally controlled.
@@ -9376,8 +9466,17 @@ pub async fn register_local_did(did: String) {
 /// queries are valid before any context exists.
 #[uniffi::export]
 pub async fn is_local_did(did: String) -> bool {
-    crate::runtime::init_context_manager();
-    let manager = crate::runtime::context_manager_expect();
+    if validate_did(&did).is_err() {
+        return false;
+    }
+    // Initialize the bridge with this DID as the local identity. This allows
+    // `is_local_did` to be a valid first operation — matching the old
+    // DID-less `init_context_manager` path's permissiveness but now with a
+    // real MLS credential identity.
+    crate::runtime::init_context_manager_with_did(&did);
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return false;
+    };
     let did_ref: scp_identity::DID = did.into();
     manager.is_local_did(&did_ref).await
 }
@@ -10115,10 +10214,13 @@ pub async fn context_import(data: Vec<u8>) -> Result<String, ScpError> {
                 })?;
             let context_id = export.snapshot.context_id.clone();
 
-            // Ensure the ContextManager is initialized — context_import is a
-            // valid first operation (e.g. a device receiving exported context
-            // data). init_context_manager is idempotent (OnceLock). #1073
-            crate::runtime::init_context_manager();
+            // Ensure the ContextManager is initialized using the exporter's
+            // DID (carried on the envelope) — context_import is a valid
+            // first operation (e.g. a device receiving exported context
+            // data). `init_context_manager_with_did` is idempotent
+            // (`OnceLock`). #1073
+            validate_did(&export.exporter_did.0)?;
+            crate::runtime::init_context_manager_with_did(&export.exporter_did.0);
 
             let manager = crate::runtime::context_manager()?;
             manager

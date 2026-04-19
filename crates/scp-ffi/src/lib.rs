@@ -48,7 +48,7 @@
 pub mod context;
 pub mod economy;
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use pyo3::prelude::*;
@@ -279,19 +279,25 @@ pub fn scp_suspend() -> PyResult<()> {
 /// `CTX_2000` code matches the NAPI and `UniFFI` bridges exactly so the
 /// Python SDK wrapper can surface a consistent identifier across runtimes.
 #[pyfunction]
-pub fn scp_resume() -> PyResult<()> {
+pub fn scp_resume(py: Python<'_>) -> PyResult<()> {
     if let Some(bi) = runtime::bridge_instance_raw() {
-        // Construct ContextError with explicit CTX_2000 (not the `context()`
-        // helper, which defaults to CTX_2001). Matches NAPI
-        // (`scp-ffi/napi/src/lib.rs::scp_resume`) and UniFFI
-        // (`scp-ffi/uniffi/src/lib.rs::scp_resume`) behaviour so all three
-        // bridges emit the same code on shutdown.
-        bi.core
-            .resume()
-            .map_err(|e| crate::error::ScpPyError::ContextError {
-                message: format!("resume failed: {e}"),
-                code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
-            })?;
+        let rt = crate::runtime()?;
+        let bi = Arc::clone(bi);
+        // Release the GIL — `resume` chains async transport reconnect and
+        // persisted-context restoration. Construct ContextError with
+        // explicit CTX_2000 (not the `context()` helper, which defaults to
+        // CTX_2001). Matches NAPI (`scp-ffi/napi/src/lib.rs::scp_resume`)
+        // and UniFFI (`scp-ffi/uniffi/src/lib.rs::scp_resume`) behaviour so
+        // all three bridges emit the same code on shutdown.
+        py.allow_threads(|| {
+            rt.block_on(async move {
+                scp_ffi_common::bridge_instance::BridgeInstanceCore::resume(&*bi).await
+            })
+        })
+        .map_err(|e| crate::error::ScpPyError::ContextError {
+            message: format!("resume failed: {e}"),
+            code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
+        })?;
     }
     Ok(())
 }

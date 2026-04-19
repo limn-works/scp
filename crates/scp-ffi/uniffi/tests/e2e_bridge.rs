@@ -915,7 +915,9 @@ async fn bridge_evaluate_trust_rejects_invalid_status() {
 #[tokio::test]
 async fn register_and_check_local_did() {
     let did = "did:dht:z6MkLocalTest123".to_owned();
-    register_local_did(did.clone()).await;
+    register_local_did(did.clone())
+        .await
+        .expect("register_local_did must succeed for a valid DID");
     assert!(is_local_did(did).await, "Registered DID should be local");
     assert!(
         !is_local_did("did:dht:z6MkNonExistent".to_owned()).await,

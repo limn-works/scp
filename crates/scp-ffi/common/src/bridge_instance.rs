@@ -53,6 +53,7 @@
 //! is wrapped in `tokio::sync::Mutex` because accesses happen across
 //! `.await` points.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -316,27 +317,40 @@ pub struct CoreFields {
     /// before tearing down transport or destroying MLS groups. The provider
     /// reference is retained here so the bridge layer can pass it through
     /// `with_persistence()` at construction time and expose it via the
-    /// `persistence()` accessor for bridge-specific restore logic.
+    /// [`persistence`](Self::persistence) accessor for bridge-specific
+    /// restore logic.
+    ///
+    /// `Arc<dyn ...>` (rather than `Box<dyn ...>`) so the bridge layer can
+    /// hand the same provider instance to both this mirror and the
+    /// `ContextManager::with_persistence` constructor — SQLite-backed
+    /// storage cannot open a second connection to the same database file
+    /// at the same time, so we need to clone an `Arc`, not a `Box`.
+    /// [`persistence_arc_clone`](Self::persistence_arc_clone) returns the
+    /// clone.
     ///
     /// This is logically a mirror of the persistence configured on the
     /// `ContextManager` — the `ContextManager` owns the canonical reference;
     /// this field allows the bridge layer to use the same provider for
     /// bridge-level suspend/resume coordination without separate storage.
-    persistence: Option<Box<dyn ContextPersistence + Send + Sync>>,
+    persistence: Option<Arc<dyn ContextPersistence + Send + Sync>>,
 
     // -----------------------------------------------------------------
-    // Relay URL — for resume after suspend
+    // Relay URLs — for resume after suspend (multi-URL since #1678)
     // -----------------------------------------------------------------
-    /// The relay URL most recently connected via `set_transport`.
+    /// Every relay URL currently registered for reconnection after resume.
     ///
-    /// Stored so that callers can retrieve it after `resume()` and
-    /// reconnect to the same relay. Full auto-reconnect is the caller's
-    /// responsibility — `resume()` only clears the suspended flag.
+    /// Bridges may connect to more than one relay simultaneously
+    /// (`TransportManager` already supports multi-adapter routing). The
+    /// per-bridge `resume()` override walks this set and reconnects each
+    /// URL individually, so the set is the source of truth for "which
+    /// relays does this bridge intend to be connected to".
     ///
-    /// Set via [`set_relay_url`]. Retrieved via [`pending_relay_url`].
-    /// Preserved across `suspend()` / `resume()` cycles so callers can
-    /// reconnect. Only cleared during `shutdown()`.
-    relay_url: Mutex<Option<String>>,
+    /// Populated via [`add_relay_url`]. Entries removed via
+    /// [`remove_relay_url`] (explicit disconnect). Retrieved as a
+    /// deduplicated snapshot via [`pending_relay_urls`]. Preserved across
+    /// `suspend()` / `resume()` cycles so callers can reconnect.
+    /// Cleared in full by [`shutdown()`] and [`clear_relay_urls`].
+    relay_urls: Mutex<HashSet<String>>,
 
     // -----------------------------------------------------------------
     // Identity + async lifecycle
@@ -400,7 +414,7 @@ impl CoreFields {
             did_resolver: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
             persistence: None,
-            relay_url: Mutex::new(None),
+            relay_urls: Mutex::new(HashSet::new()),
             instance_id: next_instance_id(),
             cancel: CancellationToken::new(),
             tasks: AsyncMutex::new(JoinSet::new()),
@@ -438,9 +452,30 @@ impl CoreFields {
     /// # Arguments
     ///
     /// - `persistence` — the persistence provider for bridge-level flush on
-    ///   suspend/shutdown.
+    ///   suspend/shutdown. Accepts `Box` for ergonomic call-site parity
+    ///   with [`ContextManager::with_persistence`]; the box is upgraded to
+    ///   `Arc` internally so
+    ///   [`persistence_arc_clone`](Self::persistence_arc_clone) can hand
+    ///   the same provider to downstream consumers.
     #[must_use]
     pub fn with_persistence(persistence: Box<dyn ContextPersistence + Send + Sync>) -> Self {
+        Self::with_persistence_arc(Arc::from(persistence))
+    }
+
+    /// Creates a new `CoreFields` with a shared persistence provider.
+    ///
+    /// Variant of [`with_persistence`](Self::with_persistence) that accepts
+    /// `Arc<dyn ContextPersistence + Send + Sync>` directly. Callers that
+    /// need to hand the exact same provider to both this mirror and
+    /// [`ContextManager::with_persistence`] must use this constructor to
+    /// avoid opening two separate `SQLite` connections (one connection per
+    /// `Box`) to the same database file.
+    ///
+    /// # Arguments
+    ///
+    /// - `persistence` — shared persistence provider.
+    #[must_use]
+    pub fn with_persistence_arc(persistence: Arc<dyn ContextPersistence + Send + Sync>) -> Self {
         Self {
             context_manager: OnceLock::new(),
             shutdown: AtomicBool::new(false),
@@ -454,7 +489,7 @@ impl CoreFields {
             did_resolver: OnceLock::new(),
             shutdown_hooks: Mutex::new(Vec::new()),
             persistence: Some(persistence),
-            relay_url: Mutex::new(None),
+            relay_urls: Mutex::new(HashSet::new()),
             instance_id: next_instance_id(),
             cancel: CancellationToken::new(),
             tasks: AsyncMutex::new(JoinSet::new()),
@@ -538,10 +573,27 @@ impl CoreFields {
 
     /// Returns a reference to the persistence provider, if configured.
     ///
-    /// `None` if this instance was created without persistence (via [`new`]).
+    /// `None` if this instance was created without persistence (via
+    /// [`new`](Self::new)).
     #[must_use]
     pub fn persistence(&self) -> Option<&(dyn ContextPersistence + Send + Sync)> {
+        // `Arc::as_ref` returns `&(dyn ContextPersistence + Send + Sync)`
+        // directly — no intermediate Box/Deref.
         self.persistence.as_deref()
+    }
+
+    /// Returns a clone of the persistence `Arc`, if configured.
+    ///
+    /// Used by bridge constructors that want to hand the same provider
+    /// instance to both this mirror and
+    /// [`ContextManager::with_persistence`] — critical when the underlying
+    /// backend (e.g. `SqliteStorage`) cannot tolerate multiple concurrent
+    /// connections to the same database file.
+    ///
+    /// `None` if this instance was created without persistence.
+    #[must_use]
+    pub fn persistence_arc_clone(&self) -> Option<Arc<dyn ContextPersistence + Send + Sync>> {
+        self.persistence.clone()
     }
 
     /// Returns a reference to the shared [`ContextManager`], or `None` if not
@@ -690,15 +742,26 @@ impl CoreFields {
 
     /// Resumes a suspended bridge instance.
     ///
-    /// Clears the suspended flag so bridge operations can proceed. The caller
-    /// must re-establish the relay connection via `set_transport` — resume
-    /// does not reconnect automatically. Use [`pending_relay_url`] to
-    /// retrieve the URL that was active before suspension.
+    /// Clears the suspended flag so bridge operations can proceed.
+    ///
+    /// `resume` is `async` so per-bridge overrides (see
+    /// [`BridgeInstanceCore::resume`]) can chain async work — reconnecting
+    /// transport from pending relay URLs, rehydrating persisted context
+    /// state — after the core flag flip. The core-only body below is `.await`-
+    /// free and remains cheap.
     ///
     /// # Errors
     ///
     /// Returns `Err` if the instance has been permanently shut down.
-    pub fn resume(&self) -> Result<(), LifecycleError> {
+    //
+    // The body is currently `.await`-free, but the `async` keyword is the
+    // contract — the `BridgeInstanceCore::resume` trait method is async
+    // (default impl delegates to this method), and per-bridge overrides
+    // chain async transport reconnect and persisted-context restoration on
+    // top. Making the core method sync would force awkward `.await`ing of
+    // a non-future in every override.
+    #[allow(clippy::unused_async)]
+    pub async fn resume(&self) -> Result<(), LifecycleError> {
         if self.is_shutdown() {
             return Err(LifecycleError::AlreadyShutDown);
         }
@@ -829,35 +892,205 @@ impl CoreFields {
             .is_some_and(|guard| guard.is_some())
     }
 
-    /// Stores the relay URL for the current transport connection.
+    /// Registers `url` as a relay that this bridge intends to stay
+    /// connected to.
     ///
-    /// Callers (bridge `transport_connect` functions) should call this
-    /// immediately after [`set_transport`] so that [`pending_relay_url`]
-    /// can return the URL for reconnection after [`resume`].
+    /// Callers (bridge `transport_connect` functions) call this immediately
+    /// after [`set_transport`] so that [`pending_relay_urls`] returns the
+    /// URL in subsequent reconnect attempts after [`resume`]. Duplicate
+    /// calls are idempotent because the underlying set deduplicates.
     ///
-    /// If the `relay_url` mutex is poisoned (a previous caller panicked
+    /// If the `relay_urls` mutex is poisoned (a previous caller panicked
     /// while holding it), the URL is silently dropped and a warning is
     /// logged — a lost relay URL on resume is recoverable by the caller.
-    pub fn set_relay_url(&self, url: String) {
-        match self.relay_url.lock() {
-            Ok(mut guard) => *guard = Some(url),
+    pub fn add_relay_url(&self, url: String) {
+        match self.relay_urls.lock() {
+            Ok(mut guard) => {
+                guard.insert(url);
+            }
             Err(_) => {
-                tracing::warn!("relay_url mutex poisoned — relay URL not stored");
+                tracing::warn!("relay_urls mutex poisoned — relay URL not stored");
             }
         }
     }
 
-    /// Returns the relay URL stored by the most recent [`set_relay_url`] call.
+    /// Removes a single relay URL from the pending-reconnect set.
     ///
-    /// After [`suspend`], this returns `Some` — the URL is preserved so
-    /// callers can reconnect after [`resume`]. After [`shutdown`], this
-    /// returns `None` (the URL is cleared during shutdown cleanup).
+    /// Called by explicit transport disconnect paths (`transport_disconnect`)
+    /// so that a subsequent `resume()` does not re-open a URL the caller
+    /// intentionally walked away from.
     ///
-    /// Returns `None` if no URL has been stored, if the instance has been
-    /// shut down, or if the internal mutex is poisoned.
+    /// Silently no-ops if the URL is not registered or if the mutex is
+    /// poisoned.
+    pub fn remove_relay_url(&self, url: &str) {
+        match self.relay_urls.lock() {
+            Ok(mut guard) => {
+                guard.remove(url);
+            }
+            Err(_) => {
+                tracing::warn!("relay_urls mutex poisoned — relay URL not removed");
+            }
+        }
+    }
+
+    /// Returns a snapshot of every relay URL registered via
+    /// [`add_relay_url`] and not yet removed.
+    ///
+    /// After [`suspend`] the set is preserved so `resume()` overrides can
+    /// reconnect each relay. After [`shutdown`] the set is empty.
+    ///
+    /// Returns an empty set if no URLs have been stored, if the instance
+    /// has been shut down, or if the internal mutex is poisoned.
     #[must_use]
-    pub fn pending_relay_url(&self) -> Option<String> {
-        self.relay_url.lock().ok().and_then(|guard| guard.clone())
+    pub fn pending_relay_urls(&self) -> HashSet<String> {
+        self.relay_urls
+            .lock()
+            .ok()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns `true` if any relay URL is currently registered.
+    #[must_use]
+    pub fn has_pending_relay_urls(&self) -> bool {
+        self.relay_urls
+            .lock()
+            .ok()
+            .is_some_and(|guard| !guard.is_empty())
+    }
+
+    /// Reconnects every pending relay URL registered via [`add_relay_url`].
+    ///
+    /// Iterates the deduplicated snapshot from [`pending_relay_urls`], calls
+    /// `NativeRelayAdapter::connect_sourced` (source = `Explicit`) for each
+    /// URL, wraps the adapter in a [`scp_transport::TransportManager`], and
+    /// stores it via [`set_transport`]. Called from per-bridge
+    /// [`BridgeInstanceCore::resume`] overrides after the core flag flip.
+    ///
+    /// Collects every failure and returns the first as
+    /// [`LifecycleError::ReconnectFailed`] so the caller sees a real error.
+    /// Successfully-reconnected URLs remain in the pending set — the caller
+    /// is free to retry a failing URL directly via `transport_connect`.
+    ///
+    /// No-ops when the pending set is empty (e.g. a bridge that never
+    /// connected a relay in the first place, or a test-only resume cycle).
+    /// No-ops when the instance is shut down.
+    ///
+    /// Each reconnect uses the platform-default transport profile so that
+    /// cover traffic, heartbeat, and suppression monitoring auto-start with
+    /// matching behaviour to the original `transport_connect` call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LifecycleError::ReconnectFailed`] carrying the first URL
+    /// that failed plus a redacted reason. Shutdown state short-circuits
+    /// with [`LifecycleError::AlreadyShutDown`] rather than attempting
+    /// reconnects against a torn-down instance.
+    pub async fn reconnect_transport_if_pending(&self) -> Result<(), LifecycleError> {
+        if self.is_shutdown() {
+            return Err(LifecycleError::AlreadyShutDown);
+        }
+        let urls = self.pending_relay_urls();
+        if urls.is_empty() {
+            return Ok(());
+        }
+        let profile = scp_transport::profile::TransportProfile::platform_default();
+        // Build ONE TransportManager and register every successful adapter
+        // in it. `TransportManager::new(adapter)` creates a manager with a
+        // single adapter, so calling it in a loop and set_transport'ing each
+        // time would keep only the last URL's adapter. Using `builder()` +
+        // `add_adapter` preserves multi-relay semantics.
+        let mut manager = scp_transport::TransportManager::builder();
+        let mut first_failure: Option<LifecycleError> = None;
+        let mut connected_count = 0_usize;
+        for url in urls {
+            let sourced = scp_transport::relay::connection::SourcedRelayUrl {
+                url: url.clone(),
+                source: scp_transport::relay::connection::RelayUrlSource::Explicit,
+            };
+            let adapter = match scp_transport::native::adapter::NativeRelayAdapter::connect_sourced(
+                &sourced,
+                Some(&profile),
+            )
+            .await
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(
+                        url = %url,
+                        error = %e,
+                        "reconnect_transport_if_pending: relay reconnect failed — leaving URL in pending set for retry"
+                    );
+                    if first_failure.is_none() {
+                        first_failure = Some(LifecycleError::ReconnectFailed {
+                            url: url.clone(),
+                            reason: e.to_string(),
+                        });
+                    }
+                    continue;
+                }
+            };
+            // `add_adapter` may return an `EvictionOutcome` if we hit the
+            // connection budget; we don't surface it here because the
+            // caller's reconnect intent is best-effort multi-relay.
+            let _eviction = manager.add_adapter(Box::new(adapter));
+            connected_count += 1;
+        }
+        // Only install the manager if at least one adapter is registered —
+        // installing an empty manager would make later relay operations fail
+        // with a confusing "no adapters" error instead of the clearer
+        // "reconnect failed" we surface below.
+        if connected_count > 0
+            && let Err(e) = self.set_transport(Arc::new(manager))
+        {
+            tracing::warn!(
+                error = %e,
+                "reconnect_transport_if_pending: set_transport failed after successful reconnects"
+            );
+            if first_failure.is_none() {
+                first_failure = Some(LifecycleError::ReconnectFailed {
+                    url: String::new(),
+                    reason: e.to_string(),
+                });
+            }
+        }
+        first_failure.map_or(Ok(()), Err)
+    }
+
+    /// Rehydrates every context that was persisted before the most recent
+    /// `suspend()`/`shutdown()` cycle — see
+    /// [`ContextManager::restore_all_contexts`].
+    ///
+    /// Called from per-bridge [`BridgeInstanceCore::resume`] overrides after
+    /// [`reconnect_transport_if_pending`]. No-ops silently when:
+    /// - No `ContextManager` is attached yet (the bridge hasn't seen its
+    ///   first `identity_create` / `context_create`).
+    /// - The attached `ContextManager` was built without persistence
+    ///   (ephemeral test / in-memory path).
+    ///
+    /// Errors from the manager itself are logged but not propagated —
+    /// restore is a best-effort rehydration. A caller that needs failure
+    /// visibility calls `ContextManager::restore_all_contexts` directly.
+    pub async fn restore_all_persisted_contexts(&self) {
+        let Some(cm) = self.context_manager.get() else {
+            return;
+        };
+        match cm.restore_all_contexts().await {
+            Ok(restored) => {
+                tracing::debug!(
+                    count = restored.len(),
+                    "restore_all_persisted_contexts: rehydrated contexts after resume"
+                );
+            }
+            Err(e) => {
+                // `no persistence provider configured` is the expected path
+                // for ephemeral bridges; log at debug rather than warn.
+                tracing::debug!(
+                    error = %e,
+                    "restore_all_persisted_contexts: skipped (no-op is expected when persistence is not configured)"
+                );
+            }
+        }
     }
 
     /// Returns an `Arc` clone of the current transport manager, if one exists.
@@ -1342,8 +1575,8 @@ impl CoreFields {
         if let Err(e) = self.clear_transport() {
             tracing::error!("failed to clear transport during shutdown: {e} — continuing cleanup");
         }
-        if let Ok(mut url) = self.relay_url.lock() {
-            *url = None;
+        if let Ok(mut urls) = self.relay_urls.lock() {
+            urls.clear();
         }
 
         if let Some(cm) = self.context_manager.get() {
@@ -1397,8 +1630,8 @@ impl CoreFields {
         if let Err(e) = self.clear_transport() {
             tracing::error!("failed to clear transport during shutdown: {e} — continuing cleanup");
         }
-        if let Ok(mut url) = self.relay_url.lock() {
-            *url = None;
+        if let Ok(mut urls) = self.relay_urls.lock() {
+            urls.clear();
         }
 
         if let Some(cm) = self.context_manager.get() {
@@ -1557,12 +1790,16 @@ pub trait BridgeInstanceCore: Send + Sync {
 
     /// Resumes the instance — see [`CoreFields::resume`].
     ///
+    /// Default implementation delegates to `CoreFields::resume` (flag flip
+    /// only). Per-bridge implementations override this to chain async work
+    /// such as transport reconnect and persisted-context restoration.
+    ///
     /// # Errors
     ///
     /// Returns [`LifecycleError::AlreadyShutDown`] if the instance has
     /// been permanently shut down.
-    fn resume(&self) -> Result<(), LifecycleError> {
-        self.core().resume()
+    async fn resume(&self) -> Result<(), LifecycleError> {
+        self.core().resume().await
     }
 
     /// Async shutdown with a graceful deadline.
@@ -1631,13 +1868,26 @@ impl std::error::Error for TransportLockError {}
 /// Used by [`CoreFields::resume`] and related lifecycle accessors.
 /// Bridge layers map this to their own error types (`ScpPyError`, napi `Error`,
 /// etc.).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleError {
     /// The instance has been permanently shut down and cannot be resumed.
     AlreadyShutDown,
     /// The instance is currently suspended (backgrounded). Transport-dependent
     /// operations are unavailable. Call `resume()` to re-activate.
     Suspended,
+    /// Transport reconnect failed during `resume()`.
+    ///
+    /// Carries the URL that failed to reconnect and a redacted reason
+    /// suitable for logging / surfacing to SDK callers. The suspended flag
+    /// has already been cleared by the time this error is produced — the
+    /// caller can retry the connect (e.g. via `transport_connect`) without
+    /// having to call `suspend()` + `resume()` again.
+    ReconnectFailed {
+        /// The relay URL that failed to reconnect.
+        url: String,
+        /// Redacted failure reason (no internal architecture leaks).
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for LifecycleError {
@@ -1650,6 +1900,9 @@ impl std::fmt::Display for LifecycleError {
                 f,
                 "bridge is suspended — call resume() before performing operations"
             ),
+            Self::ReconnectFailed { url, reason } => {
+                write!(f, "resume transport reconnect failed for {url}: {reason}")
+            }
         }
     }
 }
@@ -2122,22 +2375,22 @@ mod tests {
         assert!(!instance.is_suspended());
     }
 
-    #[test]
-    fn resume_clears_suspended_flag() {
+    #[tokio::test]
+    async fn resume_clears_suspended_flag() {
         let instance = CoreFields::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
         assert!(instance.is_suspended());
 
-        instance.resume().unwrap();
+        instance.resume().await.unwrap();
         assert!(!instance.is_suspended());
     }
 
-    #[test]
-    fn resume_fails_after_shutdown() {
+    #[tokio::test]
+    async fn resume_fails_after_shutdown() {
         let instance = CoreFields::with_context_manager(test_context_manager());
         instance.shutdown();
 
-        let err = instance.resume().unwrap_err();
+        let err = instance.resume().await.unwrap_err();
         assert_eq!(err, LifecycleError::AlreadyShutDown);
         assert_eq!(
             err.to_string(),
@@ -2258,12 +2511,12 @@ mod tests {
         assert_eq!(err, LifecycleError::Suspended);
     }
 
-    #[test]
-    fn check_ready_passes_after_resume() {
+    #[tokio::test]
+    async fn check_ready_passes_after_resume() {
         let instance = CoreFields::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
         assert!(instance.check_ready().is_err());
-        instance.resume().unwrap();
+        instance.resume().await.unwrap();
         assert!(instance.check_ready().is_ok());
     }
 
@@ -2430,11 +2683,11 @@ mod tests {
         assert!(err.to_string().contains("suspended"));
     }
 
-    #[test]
-    fn set_transport_accepts_after_resume() {
+    #[tokio::test]
+    async fn set_transport_accepts_after_resume() {
         let instance = CoreFields::with_context_manager(test_context_manager());
         instance.suspend().unwrap();
-        instance.resume().unwrap();
+        instance.resume().await.unwrap();
 
         assert!(
             instance
@@ -2744,92 +2997,158 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // AC 4: relay URL tracking
+    // AC 4: relay URL tracking (multi-URL since #1678)
     // -----------------------------------------------------------------
 
     #[test]
-    fn pending_relay_url_is_none_by_default() {
+    fn pending_relay_urls_is_empty_by_default() {
         let instance = CoreFields::with_context_manager(test_context_manager());
-        assert!(instance.pending_relay_url().is_none());
+        assert!(instance.pending_relay_urls().is_empty());
+        assert!(!instance.has_pending_relay_urls());
     }
 
     #[test]
-    fn set_relay_url_stores_url() {
+    fn add_relay_url_stores_urls() {
         let instance = CoreFields::with_context_manager(test_context_manager());
-        instance.set_relay_url("wss://relay.example.com".to_owned());
-        assert_eq!(
-            instance.pending_relay_url().as_deref(),
-            Some("wss://relay.example.com")
-        );
+        instance.add_relay_url("wss://relay1.example.com".to_owned());
+        instance.add_relay_url("wss://relay2.example.com".to_owned());
+        let urls = instance.pending_relay_urls();
+        assert_eq!(urls.len(), 2);
+        assert!(urls.contains("wss://relay1.example.com"));
+        assert!(urls.contains("wss://relay2.example.com"));
     }
 
     #[test]
-    fn clear_transport_preserves_relay_url() {
+    fn add_relay_url_deduplicates() {
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        instance.add_relay_url("wss://relay.example.com".to_owned());
+        instance.add_relay_url("wss://relay.example.com".to_owned());
+        assert_eq!(instance.pending_relay_urls().len(), 1);
+    }
+
+    #[test]
+    fn remove_relay_url_drops_entry() {
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        instance.add_relay_url("wss://relay1.example.com".to_owned());
+        instance.add_relay_url("wss://relay2.example.com".to_owned());
+        instance.remove_relay_url("wss://relay1.example.com");
+        let urls = instance.pending_relay_urls();
+        assert_eq!(urls.len(), 1);
+        assert!(urls.contains("wss://relay2.example.com"));
+    }
+
+    #[test]
+    fn clear_transport_preserves_relay_urls() {
         let instance = CoreFields::with_context_manager(test_context_manager());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
-        instance.set_relay_url("wss://relay.example.com".to_owned());
-        assert!(instance.pending_relay_url().is_some());
+        instance.add_relay_url("wss://relay.example.com".to_owned());
+        assert!(instance.has_pending_relay_urls());
 
         instance.clear_transport().unwrap();
-        assert_eq!(
-            instance.pending_relay_url().as_deref(),
-            Some("wss://relay.example.com"),
-            "clear_transport must preserve relay URL so callers can reconnect"
+        assert!(
+            instance
+                .pending_relay_urls()
+                .contains("wss://relay.example.com"),
+            "clear_transport must preserve relay URLs so callers can reconnect"
         );
     }
 
     #[test]
-    fn suspend_preserves_relay_url() {
+    fn suspend_preserves_relay_urls() {
         let instance = CoreFields::with_context_manager(test_context_manager());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
-        instance.set_relay_url("wss://relay.example.com".to_owned());
-        assert!(instance.pending_relay_url().is_some());
+        instance.add_relay_url("wss://relay.example.com".to_owned());
 
         instance.suspend().unwrap();
-        assert_eq!(
-            instance.pending_relay_url().as_deref(),
-            Some("wss://relay.example.com"),
-            "suspend must preserve relay URL so callers can reconnect after resume"
+        assert!(
+            instance
+                .pending_relay_urls()
+                .contains("wss://relay.example.com"),
+            "suspend must preserve relay URLs so callers can reconnect after resume"
         );
     }
 
-    #[test]
-    fn relay_url_survives_suspend_resume_cycle() {
-        // The relay URL is preserved across suspend/resume so callers can
-        // reconnect to the same relay after resume.
+    #[tokio::test]
+    async fn reconnect_transport_if_pending_is_noop_when_empty() {
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        // No URLs registered — should return Ok(()) without touching
+        // the transport.
+        assert!(
+            instance.reconnect_transport_if_pending().await.is_ok(),
+            "reconnect must succeed when no URLs are pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_transport_if_pending_rejects_after_shutdown() {
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        instance.add_relay_url("wss://relay.example.com".to_owned());
+        instance.shutdown();
+        let result = instance.reconnect_transport_if_pending().await;
+        assert!(
+            matches!(result, Err(LifecycleError::AlreadyShutDown)),
+            "shutdown must short-circuit with AlreadyShutDown, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_transport_if_pending_reports_unreachable_urls() {
+        // All pending URLs point at unreachable hosts. The function must
+        // return a ReconnectFailed error (not panic, not silently succeed)
+        // and the URL must remain in the pending set so callers can retry.
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        // Reserved TEST-NET-1 address (RFC 5737) with a closed port.
+        let unreachable = "ws://192.0.2.1:1/".to_owned();
+        instance.add_relay_url(unreachable.clone());
+        let result = instance.reconnect_transport_if_pending().await;
+        assert!(
+            matches!(result, Err(LifecycleError::ReconnectFailed { .. })),
+            "unreachable URL must surface as ReconnectFailed, got {result:?}"
+        );
+        assert!(
+            instance.pending_relay_urls().contains(&unreachable),
+            "failing URL must remain in pending set for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_urls_survive_suspend_resume_cycle() {
+        // Multiple relay URLs must survive suspend/resume so callers can
+        // reconnect to every one of them after resume.
         let instance = CoreFields::with_context_manager(test_context_manager());
         instance
             .set_transport(Arc::new(test_transport_manager()))
             .unwrap();
-        instance.set_relay_url("wss://relay.example.com".to_owned());
+        instance.add_relay_url("wss://relay1.example.com".to_owned());
+        instance.add_relay_url("wss://relay2.example.com".to_owned());
         instance.suspend().unwrap();
         assert_eq!(
-            instance.pending_relay_url().as_deref(),
-            Some("wss://relay.example.com"),
-            "relay URL must survive suspend"
+            instance.pending_relay_urls().len(),
+            2,
+            "relay URLs must survive suspend"
         );
-        instance.resume().unwrap();
+        instance.resume().await.unwrap();
         assert_eq!(
-            instance.pending_relay_url().as_deref(),
-            Some("wss://relay.example.com"),
-            "relay URL must survive resume — caller uses it to reconnect"
+            instance.pending_relay_urls().len(),
+            2,
+            "relay URLs must survive resume — caller uses them to reconnect"
         );
     }
 
     #[test]
-    fn shutdown_clears_relay_url() {
+    fn shutdown_clears_relay_urls() {
         let instance = CoreFields::with_context_manager(test_context_manager());
-        instance.set_relay_url("wss://relay.example.com".to_owned());
-        assert!(instance.pending_relay_url().is_some());
+        instance.add_relay_url("wss://relay.example.com".to_owned());
+        assert!(instance.has_pending_relay_urls());
 
         instance.shutdown();
         assert!(
-            instance.pending_relay_url().is_none(),
-            "shutdown must clear relay URL"
+            instance.pending_relay_urls().is_empty(),
+            "shutdown must clear relay URLs"
         );
     }
 
@@ -2867,8 +3186,8 @@ mod tests {
     // AC 8: suspend/resume with persistence
     // -----------------------------------------------------------------
 
-    #[test]
-    fn suspend_flushes_contexts_to_persistence() {
+    #[tokio::test]
+    async fn suspend_flushes_contexts_to_persistence() {
         use scp_core::context::providers::InMemoryPersistence;
         use std::sync::Arc;
 
@@ -2897,11 +3216,11 @@ mod tests {
         instance.suspend().unwrap();
         assert!(instance.is_suspended());
 
-        // The relay URL was not set, so pending_relay_url is None.
-        assert!(instance.pending_relay_url().is_none());
+        // No relay URLs were registered, so pending_relay_urls is empty.
+        assert!(instance.pending_relay_urls().is_empty());
 
         // Resume clears the suspended flag.
-        instance.resume().unwrap();
+        instance.resume().await.unwrap();
         assert!(!instance.is_suspended());
 
         // Instance is ready again.
@@ -2954,15 +3273,15 @@ mod tests {
         assert!(!bi2.has_known_context("ctx-1"));
 
         // Set relay URLs independently.
-        bi1.set_relay_url("wss://relay1.example.com".to_owned());
-        bi2.set_relay_url("wss://relay2.example.com".to_owned());
-        assert_eq!(
-            bi1.pending_relay_url().as_deref(),
-            Some("wss://relay1.example.com")
+        bi1.add_relay_url("wss://relay1.example.com".to_owned());
+        bi2.add_relay_url("wss://relay2.example.com".to_owned());
+        assert!(
+            bi1.pending_relay_urls()
+                .contains("wss://relay1.example.com")
         );
-        assert_eq!(
-            bi2.pending_relay_url().as_deref(),
-            Some("wss://relay2.example.com")
+        assert!(
+            bi2.pending_relay_urls()
+                .contains("wss://relay2.example.com")
         );
 
         // Shutdown of bi1 does not affect bi2's state.
@@ -2970,9 +3289,9 @@ mod tests {
         assert!(bi1.is_shutdown());
         assert!(!bi2.is_shutdown());
         assert_eq!(bi2.known_context_count(), 1);
-        assert_eq!(
-            bi2.pending_relay_url().as_deref(),
-            Some("wss://relay2.example.com")
+        assert!(
+            bi2.pending_relay_urls()
+                .contains("wss://relay2.example.com")
         );
     }
 

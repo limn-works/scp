@@ -20,7 +20,7 @@
 import { describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
 
-import { __clampShutdownMillisForTests } from "../src/scp";
+import { __clampShutdownMillisForTests, __serializeStorageConfigForTests } from "../src/scp";
 
 // ---------------------------------------------------------------------------
 // Load the raw native addon — `SCP` is exposed directly on the addon, not
@@ -126,10 +126,45 @@ describe.skipIf(!addon)(`SCP class (Phase 4 PR 1) [${skipReason}]`, () => {
     expect(identity.instanceId).toBe(defaultInstance.instanceId);
   });
 
-  test("suspend / resume round-trip succeeds", () => {
+  test("suspend / resume round-trip succeeds", async () => {
     const scp = new addon.SCP();
     expect(() => scp.suspend()).not.toThrow();
-    expect(() => scp.resume()).not.toThrow();
+    // `resume()` is async since #1678 — the NAPI bridge chains
+    // transport reconnect from pending relay URLs and persisted
+    // context restoration before the promise settles.
+    await expect(scp.resume()).resolves.toBeUndefined();
+  });
+
+  test("SCP.withStorage accepts a sqlite config with Uint8Array key", () => {
+    // PR 3 extension — SQLCipher-encrypted filesystem storage
+    // (closes #1260, #1491). We only assert the factory accepts the
+    // config shape and produces a live instance; the durability
+    // round-trip is covered by the Rust-side integration tests.
+    const { mkdtempSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const { join } = require("node:path") as typeof import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "scp-sqlite-"));
+    const key = new Uint8Array(32);
+    // Deterministic key so the test is reproducible.
+    for (let i = 0; i < key.length; i += 1) {
+      key[i] = i;
+    }
+    const keyArray = Array.from(key);
+    const scp = addon.SCP.withStorage(JSON.stringify({ type: "sqlite", path: dir, key: keyArray }));
+    expect(typeof scp.instanceId).toBe("string");
+    expect(scp.instanceId).not.toBe("0");
+  });
+
+  test("SCP.withStorage accepts a sqlite config with a hex-encoded key", () => {
+    const { mkdtempSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const { join } = require("node:path") as typeof import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "scp-sqlite-hex-"));
+    // 32 zero bytes as hex.
+    const hexKey = "00".repeat(32);
+    const scp = addon.SCP.withStorage(JSON.stringify({ type: "sqlite", path: dir, key: hexKey }));
+    expect(typeof scp.instanceId).toBe("string");
+    expect(scp.instanceId).not.toBe("0");
   });
 
   test("shutdown(timeoutMillis) resolves without error", async () => {
@@ -198,5 +233,53 @@ describe("SCP.shutdown timeout clamp (round 5 RED-2001)", () => {
 
   test("default 5-second timeout resolves to 5000 ms", () => {
     expect(__clampShutdownMillisForTests(5)).toBe(5000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// StorageConfig wire-format — pure-function tests exercising the
+// `serializeStorageConfig` helper used by `new SCP({ storage })`.
+//
+// No native addon required; these tests assert the JSON that crosses
+// the FFI boundary matches what the NAPI `SCP.withStorage` parser
+// accepts (hex string OR number[] for `key`). See
+// `crates/scp-ffi/napi/src/scp.rs::with_storage` for the accept shape.
+// ---------------------------------------------------------------------------
+
+describe("serializeStorageConfig (PR 3 SQLite wire format)", () => {
+  test("in_memory passes through unchanged", () => {
+    expect(__serializeStorageConfigForTests({ type: "in_memory" })).toBe(
+      JSON.stringify({ type: "in_memory" }),
+    );
+  });
+
+  test("sqlite + Uint8Array key serializes key as a JSON number array", () => {
+    // Regression guard — `JSON.stringify` on a `Uint8Array` produces
+    // an object shape (`{"0":1,"1":2,...}`) that the NAPI accept
+    // path rejects. The serializer must normalize to `number[]`.
+    const bytes = new Uint8Array([1, 2, 3, 255]);
+    const wire = __serializeStorageConfigForTests({
+      type: "sqlite",
+      path: "/tmp/scp-db",
+      key: bytes,
+    });
+    const parsed = JSON.parse(wire);
+    expect(parsed.type).toBe("sqlite");
+    expect(parsed.path).toBe("/tmp/scp-db");
+    expect(Array.isArray(parsed.key)).toBe(true);
+    expect(parsed.key).toEqual([1, 2, 3, 255]);
+  });
+
+  test("sqlite + string key passes through as-is (hex form)", () => {
+    const wire = __serializeStorageConfigForTests({
+      type: "sqlite",
+      path: "/tmp/scp-db-hex",
+      key: "deadbeef",
+    });
+    expect(JSON.parse(wire)).toEqual({
+      type: "sqlite",
+      path: "/tmp/scp-db-hex",
+      key: "deadbeef",
+    });
   });
 });

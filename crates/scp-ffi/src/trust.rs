@@ -383,44 +383,100 @@ pub fn py_aggregate_trust_input(
             ))
         })?;
 
-    // Use persistent storage if the BridgeInstance storage provider is
-    // initialized, otherwise fall back to an ephemeral in-memory store. With
-    // persistent storage, previously cached attestations, revocation states,
-    // and challenge results are retained across calls — this is the correct
-    // production behavior (trust data survives restarts). See issue #502.
-    if let Ok(storage) = crate::runtime::get_storage() {
-        let handle = crate::runtime()?.handle().clone();
-        let repo = Arc::new(scp_core::store::ProtocolRepository::new(Arc::clone(
-            storage,
-        )));
-        let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
-        scp_ffi_common::trust_store::populate_and_aggregate(
-            bridge,
-            context_id,
-            subject_did,
-            cached_attestations,
-            &challenge_results,
-            &events,
-            merkle_root,
-            &consequence_rules,
-            &threshold_requirements,
-            &attestor_sets,
-        )
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-    } else {
-        scp_ffi_common::trust_store::populate_and_aggregate(
+    aggregate_with_storage(
+        context_id,
+        subject_did,
+        cached_attestations,
+        &challenge_results,
+        &events,
+        merkle_root,
+        &consequence_rules,
+        &threshold_requirements,
+        &attestor_sets,
+    )
+}
+
+/// Dispatches `populate_and_aggregate` to the active storage backend.
+///
+/// If the `BridgeInstance` storage provider is initialized, builds a
+/// `ProtocolRepositoryTrustBridge` over the concrete storage backend
+/// (`InMemoryEncrypted` or `Sqlite`) so cached attestations, revocation
+/// states, and challenge results survive process restarts (issue #502).
+/// Otherwise falls back to an ephemeral in-memory store.
+#[allow(clippy::too_many_arguments)]
+fn aggregate_with_storage(
+    context_id: &str,
+    subject_did: &str,
+    cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
+    challenge_results: &[scp_core::trust::ChallengeVerification],
+    events: &[scp_event_log::Event],
+    merkle_root: [u8; 32],
+    consequence_rules: &[scp_core::trust::ConsequenceRule],
+    threshold_requirements: &std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        scp_core::trust::ThresholdRequirement,
+    >,
+    attestor_sets: &std::collections::HashMap<
+        scp_core::trust::AttestationType,
+        Vec<scp_core::trust::AttestorInfo>,
+    >,
+) -> PyResult<String> {
+    use crate::runtime::StorageProvider;
+    let Ok(provider) = crate::runtime::get_storage() else {
+        return scp_ffi_common::trust_store::populate_and_aggregate(
             InMemoryFfiTrustStore::new(),
             context_id,
             subject_did,
             cached_attestations,
-            &challenge_results,
-            &events,
+            challenge_results,
+            events,
             merkle_root,
-            &consequence_rules,
-            &threshold_requirements,
-            &attestor_sets,
+            consequence_rules,
+            threshold_requirements,
+            attestor_sets,
         )
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()));
+    };
+    let handle = crate::runtime()?.handle().clone();
+    match provider {
+        StorageProvider::InMemoryEncrypted(storage) => {
+            let repo = Arc::new(scp_core::store::ProtocolRepository::new(Arc::clone(
+                storage,
+            )));
+            let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
+            scp_ffi_common::trust_store::populate_and_aggregate(
+                bridge,
+                context_id,
+                subject_did,
+                cached_attestations,
+                challenge_results,
+                events,
+                merkle_root,
+                consequence_rules,
+                threshold_requirements,
+                attestor_sets,
+            )
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        }
+        StorageProvider::Sqlite(storage) => {
+            let repo = Arc::new(scp_core::store::ProtocolRepository::new(Arc::clone(
+                storage,
+            )));
+            let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(repo, handle);
+            scp_ffi_common::trust_store::populate_and_aggregate(
+                bridge,
+                context_id,
+                subject_did,
+                cached_attestations,
+                challenge_results,
+                events,
+                merkle_root,
+                consequence_rules,
+                threshold_requirements,
+                attestor_sets,
+            )
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        }
     }
 }
 

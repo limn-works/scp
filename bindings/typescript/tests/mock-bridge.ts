@@ -1981,8 +1981,12 @@ export function createMockBridge(): Bridge & {
       // Mock: no-op. Real bridges call BridgeInstance::suspend.
     },
 
-    resume(): void {
-      // Mock: no-op. Real bridges call BridgeInstance::resume.
+    resume(): Promise<void> {
+      // Mock: no-op. Real bridges call BridgeInstance::resume, which
+      // became async after #1678 (chains transport reconnect + persisted
+      // context restoration). The mock returns an already-resolved
+      // promise to keep the Bridge interface satisfied.
+      return Promise.resolve();
     },
   };
 

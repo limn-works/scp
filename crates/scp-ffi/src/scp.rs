@@ -63,21 +63,27 @@ impl PyScp {
 
     /// Constructs a new `SCP` instance configured by a storage-config dict.
     ///
-    /// PR 1 accepts `{"type": "in_memory"}`; PR 3 will add
-    /// `{"type": "sqlite", "path": "..."}`. Unknown types raise
-    /// `ValidationError`.
+    /// Accepted shapes:
+    /// - `{"type": "in_memory"}` — encrypted in-memory storage (ephemeral).
+    /// - `{"type": "sqlite", "path": "/path/to/dir", "key": b"\x00..."}`
+    ///   — SQLCipher-encrypted storage at `{path}/scp.db`. `key` must be a
+    ///   `bytes` object holding raw encryption key material (32 bytes
+    ///   recommended).
+    ///
+    /// Unknown types or malformed shapes raise `ValidationError`.
     ///
     /// # Errors
     ///
     /// Raises `ValidationError` if `config["type"]` is missing or not a
-    /// recognised storage variant.
+    /// recognised storage variant, or if required fields for the selected
+    /// variant are missing or wrongly typed.
     #[staticmethod]
     pub fn with_storage(_py: Python<'_>, config: &Bound<'_, PyDict>) -> PyResult<Self> {
         let storage_type: String = match config.get_item("type")? {
             Some(v) => v.extract()?,
             None => {
                 return Err(ScpPyError::validation(
-                    "SCP.with_storage: missing required key 'type' — expected \"in_memory\""
+                    "SCP.with_storage: missing required key 'type' — expected \"in_memory\" or \"sqlite\""
                         .to_owned(),
                 )
                 .into());
@@ -85,9 +91,39 @@ impl PyScp {
         };
         let cfg = match storage_type.as_str() {
             "in_memory" => StorageConfig::InMemory,
+            "sqlite" => {
+                let path_str: String = match config.get_item("path")? {
+                    Some(v) => v.extract()?,
+                    None => {
+                        return Err(ScpPyError::validation(
+                            "SCP.with_storage(sqlite): missing required key 'path' (directory for scp.db)"
+                                .to_owned(),
+                        )
+                        .into());
+                    }
+                };
+                let key_bytes: Vec<u8> = match config.get_item("key")? {
+                    Some(v) => v.extract().map_err(|e| {
+                        ScpPyError::validation(format!(
+                            "SCP.with_storage(sqlite): 'key' must be bytes — {e}"
+                        ))
+                    })?,
+                    None => {
+                        return Err(ScpPyError::validation(
+                            "SCP.with_storage(sqlite): missing required key 'key' (raw encryption key bytes)"
+                                .to_owned(),
+                        )
+                        .into());
+                    }
+                };
+                StorageConfig::Sqlite {
+                    path: std::path::PathBuf::from(path_str),
+                    key: zeroize::Zeroizing::new(key_bytes),
+                }
+            }
             other => {
                 return Err(ScpPyError::validation(format!(
-                    "SCP.with_storage: unknown storage type {other:?} — expected \"in_memory\""
+                    "SCP.with_storage: unknown storage type {other:?} — expected \"in_memory\" or \"sqlite\""
                 ))
                 .into());
             }
@@ -168,14 +204,22 @@ impl PyScp {
     ///
     /// Raises `ContextError` (code `SCP-CTX-2000`) if the instance has
     /// been permanently shut down.
-    pub fn resume(&self) -> PyResult<()> {
-        self.inner
-            .core
-            .resume()
-            .map_err(|e| ScpPyError::ContextError {
-                message: format!("resume failed: {e}"),
-                code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
-            })?;
+    pub fn resume(&self, py: Python<'_>) -> PyResult<()> {
+        let rt = crate::runtime()?;
+        let inner = Arc::clone(&self.inner);
+        // Release the GIL while we drive the tokio runtime. The
+        // `BridgeInstanceCore::resume` override performs async work
+        // (transport reconnect, context restore) that must not block the
+        // Python interpreter.
+        py.allow_threads(|| {
+            rt.block_on(async move {
+                scp_ffi_common::bridge_instance::BridgeInstanceCore::resume(&*inner).await
+            })
+        })
+        .map_err(|e| ScpPyError::ContextError {
+            message: format!("resume failed: {e}"),
+            code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
+        })?;
         Ok(())
     }
 

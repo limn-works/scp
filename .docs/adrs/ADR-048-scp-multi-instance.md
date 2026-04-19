@@ -154,7 +154,7 @@ Phase 4 remainder is four sequential PRs:
 
 1. **PR 1 — Foundation.** This ADR, the `SCP` class scaffold in all three bridges, `BridgeInstanceCore` trait + per-bridge concrete struct refactor, rename `BRIDGE_INSTANCE` → `DEFAULT_BRIDGE_INSTANCE`, deprecation scaffold on the free-function façade, `instance_id`-backed handle affinity, `shutdown(timeout)` signature change and plumbing. No singletons migrated yet — free functions still forward to the default instance.
 2. **PR 2 — Migrations + deletions + #1646.** Move every remaining per-identity singleton into typed fields on its per-bridge struct. Delete `EMPTY_IDENTITY_REGISTRY`, `EMPTY_UCAN_REGISTRY`, `BRIDGE_LIFECYCLE_SERIAL`. Fix `flush_all_contexts_sync` (AC3 bugs). Exhaustive security-reviewer audit of every path reaching ContextManager state.
-3. **PR 3 — Persistence + multi-relay + real UniFFI crypto.** Expose `SqliteStorage` via `SCP::with_storage`. Thread persistence provider through UniFFI `ContextManager::new()` (#1260). Make `resume()` async; restore contexts + reconnect transport using stored `pending_relay_url` (#1678). Wire real `MlsCryptoProvider` through UniFFI (#1342). Integration tests for multi-relay + suspend-kill-resume-restore.
+3. **PR 3 — Persistence + multi-relay + real UniFFI crypto.** [LANDED 2026-04-18.] Expose `SqliteStorage` via `SCP::with_storage`. Thread persistence provider through UniFFI `ContextManager::new()` (#1260). Make `resume()` async; restore contexts + reconnect transport using stored `pending_relay_url` (#1678). Wire real `MlsCryptoProvider` through UniFFI (#1342). Integration tests for multi-relay + suspend-kill-resume-restore. See **PR 3 actualized** section below for the final shape.
 4. **PR 4 — Tests + docs + enforcement.** Per-test `SCP` fixture codemod across all four SDKs. Spec clarifications for §3.7, §22.3.1, §22.3.5 (clarifications, not semantic changes — the spec just becomes explicit about "per-identity/per-context within an `SCP` instance"). CI gates (`check-no-bridge-globals.sh`, `check-once-lock-ratchet.sh`, `check-no-default-in-tests.sh`, `check-handle-affinity.sh`). SDK capability matrix updates. Migration guide for external SDK consumers.
 
 PR 2 and PR 3 touch independent axes and may run concurrently after PR 1. PR 4 depends on all prior.
@@ -171,3 +171,85 @@ None of these are breaking changes. They are disambiguations that were globally 
 
 - **ADR-021 (UniFFI Bridge).** Note that `SCP` is a first-class `uniffi::Object`; the 172 `#[uniffi::export]` functions that touch instance state become methods on `Scp`.
 - **ADR-028 (Kotlin SDK).** Note that `NativeBindings` methods move onto `SCP`; `CoroutineBridge` refactors to own the `SCP` instance directly rather than wrapping sub-bridges.
+
+## PR 3 actualized (2026-04-18)
+
+PR 3 of the Phase 4 remainder — **Persistence + multi-relay reconnect + real UniFFI crypto** — has landed on branch `refactor/scp-phase4-persistence`. The decisions captured above remain binding; this section records how PR 3 was actually shaped, the breaking changes it introduced, and the issues it closed.
+
+### Async `resume()` semantics (BREAKING CHANGE)
+
+`BridgeInstanceCore::resume` is now `async fn` across the trait, the `CoreFields::resume` helper, and every per-bridge override. The lifecycle contract previously flipped only the `suspended` flag; it now chains real work on top of that flip: reconnect every URL in the pending set, then restore persisted contexts.
+
+- `CoreFields::resume` — `pub async fn`; body still flag-only, with `reconnect_transport_if_pending` and `restore_all_persisted_contexts` invoked by per-bridge overrides.
+- `PyScp::resume(&self, py)` / `scp_resume(py)` — PyO3 releases the GIL via `py.allow_threads(|| rt.block_on(async { ... }))`, matching the existing `shutdown` pattern.
+- `Scp::resume` on NAPI — native `async fn`, driven by the Tokio worker pool.
+- `Scp::resume` on UniFFI — `pub async fn`, surfacing as Kotlin `suspend fun` and Swift `async throws` on the generated bindings.
+
+SDK wrappers match:
+
+- Python: `async def resume(self)` — awaits the PyO3 async path.
+- TypeScript: `resume(): Promise<void>` — both NAPI-native and WASM-mock bridges.
+- Swift: `func resume() async throws` — forwards `try await`.
+- Kotlin: `suspend fun resume()` — routed through `CoroutineBridge.ffiCallSuspend` (promoted from fire-and-forget `ffiCall`). `shutdown()` moved to the same path for the same reason.
+
+**Error contract.** Reconnect failures surface as a new `LifecycleError::ReconnectFailed { url, reason }` variant. The first failure is returned; successfully-connected URLs stay in the pending set so callers may retry individually.
+
+Lifecycle tests across all four SDKs converted to `#[tokio::test]` / the idiomatic async test form in each language.
+
+### Multi-URL reconnect via `HashSet`
+
+`CoreFields::relay_url: Mutex<Option<String>>` is replaced with `relay_urls: Mutex<HashSet<String>>`. `TransportManager` already supports multi-adapter routing; the single-URL state was artificially narrow.
+
+New accessors on `CoreFields`:
+
+- `add_relay_url(url)` — inserts into the pending set.
+- `remove_relay_url(url)` — removes on explicit disconnect.
+- `pending_relay_urls()` — snapshot for resume iteration.
+
+The old `set_relay_url` / `clear_relay_url` / `pending_relay_url` trio is deleted. Each per-bridge `resume()` override iterates the set, reconnects each URL via `reconnect_transport_if_pending`, and returns `LifecycleError::ReconnectFailed { url, reason }` on the first failure.
+
+`reconnect_transport_if_pending` builds a single `TransportManager::builder()` outside the loop, `add_adapter`s every successful reconnect, and calls `set_transport` once — preserving every reconnected adapter. An earlier draft constructed one `TransportManager::new(adapter)` per iteration and `set_transport`'d each; because `set_transport` replaces (not appends), only the last adapter survived. The corrected single-manager wiring matches the pre-suspend multi-relay invariant: if `TransportManager` carried N adapters before suspend, it carries N adapters after resume.
+
+### Removal of `FfiBridgeCrypto` (closes #1342)
+
+The UniFFI bridge no longer constructs a DID-less `ContextManager` with a no-op `FfiBridgeCrypto` stub. Every entry point that attaches a manager — `context_create`, `context_join`, `context_import`, `register_local_did`, `is_local_did` — now carries a local DID into `init_context_manager_with_did`, which wires `MlsCryptoProvider::new(did)`. UniFFI now matches the PyO3 and NAPI bridges.
+
+Concrete deletions:
+
+- `FfiBridgeCrypto` struct, `FFI_CRYPTO` static, `context_manager_crypto()` accessor — gone.
+- `build_default_context_manager` / `build_default_context_manager_reusing_repo` and the DID-less `init_context_manager()` — gone.
+- `context_manager_expect()` now returns `Result<&'static Arc<ContextManager>, ScpError>`; with no DID registered it fails with `ScpError::Context { code: CTX_2000, msg: "bridge not ready: no local DID registered" }`. Callers MUST invoke `register_local_did()` first. `register_local_did` itself now returns `Result<(), ScpError>` so validation failures surface directly.
+- `context_close`'s `CloseOrchestrator` constructs a fresh `MlsCryptoProvider` scoped to the initiator's DID.
+- `context_join` generates a real MLS key package via `generate_mls_key_package_bytes` (mirrors NAPI) — the stub used to accept `None`; real MLS rejects it.
+
+Platform-specific key custody continues to flow through the existing `KeyCustodyProvider` callback — nothing new was wired there.
+
+### `SqliteStorage` FFI exposure (closes #1491, closes #1260)
+
+`StorageConfig` gains a `Sqlite { path: String, key: Vec<u8> }` variant across all three non-WASM bridges. The 32-byte SQLCipher key is validated at the boundary; length mismatches return `ScpError::Validation`.
+
+- **UniFFI.** `#[derive(uniffi::Enum)]` generates a Swift enum and a Kotlin sealed class. Swift: `StorageConfig.sqlite(path:key:)`. Kotlin: `StorageConfig.Sqlite(path, key)`.
+- **NAPI.** Accepts `{ type: "sqlite", path: string, key: string | Uint8Array }` — the `key` field is hex-decoded when a string is supplied, used raw when a `Uint8Array`.
+- **PyO3.** `SCP.with_storage({"type": "sqlite", "path": str, "key": bytes})` — Python `bytes` for the key.
+
+Wiring: `with_storage_py` / `with_storage_napi` / `with_storage_uniffi` open a `SqliteStorage`, wrap it in a `ProtocolRepositoryContextBridge`, and attach the resulting `Arc<dyn ContextPersistence + Send + Sync>` to `CoreFields::persistence` via the new `with_persistence_arc` constructor. The `init_context_manager*` family picks up the same shared `Arc` via `persistence_arc_clone()` and hands it to `ContextManager::with_persistence` wrapped in a bridge-local `ArcContextPersistence` adapter — so the `ContextManager`'s internal `Arc` and the `CoreFields` mirror point at the same `rusqlite::Connection`. One connection backs both the suspend/resume flush path and per-request persistence.
+
+PyO3 additionally routes the same `Arc<SqliteStorage>` into the existing `StorageProvider` enum so identity, trust, MCP, and event log reads/writes share that connection instead of opening a second one.
+
+NAPI falls back to the legacy in-memory `NapiBridgePersistence` when no shared provider is configured, preserving behaviour for callers that built their instance via `withStorage({type: "in_memory"})` or the default-instance path.
+
+SDK convenience constructors:
+
+- Swift: `SCP.withStorage(sqliteDir: URL, key: Data)` — forwards to `.sqlite(path:key:)`.
+- Kotlin: `SCP.withSqlite(dir: File, key: ByteArray)` — companion factory on `SCP`.
+- Python: `SCP(storage={"type": "sqlite", ...})` accepted directly.
+- TypeScript: `SCP.withStorage({ type: "sqlite", path, key })` on both NAPI and WASM backends.
+
+### Reference closures
+
+PR 3 closes the following issues:
+
+- **#1491** — `SqliteStorage` FFI exposure.
+- **#1260** — UniFFI `ContextManager` persistence threading.
+- **#1678** — Async `resume` + multi-relay reconnect.
+- **#1342** — UniFFI real crypto; `FfiBridgeCrypto` deleted.

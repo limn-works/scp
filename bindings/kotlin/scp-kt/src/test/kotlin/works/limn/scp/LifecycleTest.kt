@@ -28,7 +28,9 @@ class LifecycleTest {
             throwFromSuspend?.let { throw it }
         }
 
-        override fun scpResume() {
+        // `suspend` to match LifecycleBindings after #1549 PR 3B made
+        // UniFFI `scpResume()` async.
+        override suspend fun scpResume() {
             resumeCalls += 1
             throwFromResume?.let { throw it }
         }

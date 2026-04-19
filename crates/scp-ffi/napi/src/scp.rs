@@ -82,10 +82,59 @@ impl Scp {
             .unwrap_or("in_memory");
         let storage = match ty {
             "in_memory" => StorageConfig::InMemory,
+            "sqlite" => {
+                let path_str = config_obj
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        napi::Error::from(ScpNapiError::Validation {
+                            message:
+                                "withStorage(sqlite): missing required field 'path' (directory for scp.db)"
+                                    .to_owned(),
+                            code: codes::VALID_7005.to_owned(),
+                        })
+                    })?
+                    .to_owned();
+                // `key` is accepted either as a hex-encoded string (most
+                // common from JS/TS where JSON has no native bytes type)
+                // or as a JSON array of byte values.
+                let key_bytes: Vec<u8> = match config_obj.get("key") {
+                    Some(serde_json::Value::String(hex_str)) => hex::decode(hex_str)
+                        .map_err(|e| {
+                            napi::Error::from(ScpNapiError::Validation {
+                                message: format!(
+                                    "withStorage(sqlite): 'key' is not valid hex: {e}"
+                                ),
+                                code: codes::VALID_7005.to_owned(),
+                            })
+                        })?,
+                    Some(serde_json::Value::Array(arr)) => arr
+                        .iter()
+                        .map(|v| {
+                            v.as_u64().and_then(|n| u8::try_from(n).ok()).ok_or_else(|| {
+                                napi::Error::from(ScpNapiError::Validation {
+                                    message: "withStorage(sqlite): 'key' array must contain byte values (0-255)".to_owned(),
+                                    code: codes::VALID_7005.to_owned(),
+                                })
+                            })
+                        })
+                        .collect::<Result<Vec<u8>, _>>()?,
+                    Some(_) | None => {
+                        return Err(napi::Error::from(ScpNapiError::Validation {
+                            message: "withStorage(sqlite): missing or wrongly-typed 'key' (expected hex string or byte array)".to_owned(),
+                            code: codes::VALID_7005.to_owned(),
+                        }));
+                    }
+                };
+                StorageConfig::Sqlite {
+                    path: std::path::PathBuf::from(path_str),
+                    key: zeroize::Zeroizing::new(key_bytes),
+                }
+            }
             other => {
                 return Err(napi::Error::from(ScpNapiError::Validation {
                     message: format!(
-                        "unsupported storage type: {other:?} — expected \"in_memory\" (SQLite lands in Phase 4 PR 3)"
+                        "unsupported storage type: {other:?} — expected \"in_memory\" or \"sqlite\""
                     ),
                     code: codes::VALID_7005.to_owned(),
                 }));
@@ -139,11 +188,13 @@ impl Scp {
 
     /// Resumes a suspended bridge instance.
     ///
-    /// Clears the suspended flag. Caller reconnects transport via
-    /// `transportConnect`.
+    /// Clears the suspended flag, then runs any per-bridge async work chained
+    /// by the [`BridgeInstanceCore::resume`] override (transport reconnect
+    /// from pending relay URLs, persisted-context restoration).
     #[napi]
-    pub fn resume(&self) -> napi::Result<()> {
-        self.inner.core.resume().map_err(|e| {
+    pub async fn resume(&self) -> napi::Result<()> {
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
+        self.inner.resume().await.map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("resume failed: {e}"),
                 code: codes::CTX_2000.to_owned(),

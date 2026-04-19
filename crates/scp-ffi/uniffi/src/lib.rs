@@ -447,9 +447,10 @@ pub fn scp_suspend() -> Result<(), bridge::ScpError> {
 ///
 /// Returns `ScpError::Context` if the instance has been permanently shut down.
 #[uniffi::export]
-pub fn scp_resume() -> Result<(), bridge::ScpError> {
+pub async fn scp_resume() -> Result<(), bridge::ScpError> {
     if let Some(bi) = runtime::default_bridge_instance_raw() {
-        bi.core.resume().map_err(|e| bridge::ScpError::Context {
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
+        bi.resume().await.map_err(|e| bridge::ScpError::Context {
             msg: format!("resume failed: {e}"),
             code: codes::CTX_2000.to_owned(),
         })?;

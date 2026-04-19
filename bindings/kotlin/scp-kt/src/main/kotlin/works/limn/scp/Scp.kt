@@ -27,6 +27,7 @@
 
 package works.limn.scp
 
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.logging.Level
 import java.util.logging.Logger
@@ -81,9 +82,10 @@ class SCP internal constructor(
      * with the process-wide default instance.
      *
      * @param storage Storage configuration. Defaults to
-     *   [StorageConfig.IN_MEMORY]; filesystem variants land in Phase 4 PR 3.
+     *   [StorageConfig.InMemory]; [StorageConfig.Sqlite] is also supported
+     *   (use [withSqlite] for the common on-disk case).
      */
-    constructor(storage: StorageConfig = StorageConfig.IN_MEMORY) : this(NativeScp.withStorage(storage))
+    constructor(storage: StorageConfig = StorageConfig.InMemory) : this(NativeScp.withStorage(storage))
 
     /**
      * The monotonic identifier for this bridge instance, unique per
@@ -110,14 +112,18 @@ class SCP internal constructor(
     /**
      * Resumes a suspended bridge instance.
      *
-     * Clears the suspended flag; the caller re-establishes the relay
-     * connection explicitly.
+     * Clears the suspended flag, then reconnects transport against pending
+     * relay URLs and restores persisted contexts via the
+     * [`BridgeInstanceCore::resume`](https://docs.rs/scp-ffi-common) override.
+     * Routed through [CoroutineBridge.ffiCallSuspend] because UniFFI generates
+     * `Scp.resume()` as a Kotlin `suspend fun` — the non-suspend [ffiCall]
+     * lambda would reject the call.
      *
      * @throws uniffi.scp.ScpException.Context if the instance has been
      *   permanently shut down.
      */
     suspend fun resume(bridge: CoroutineBridge) {
-        bridge.ffiCall { inner.resume() }
+        bridge.ffiCallSuspend { inner.resume() }
     }
 
     /**
@@ -212,17 +218,43 @@ class SCP internal constructor(
         /**
          * Constructs an [SCP] with an explicit storage configuration.
          *
-         * Phase 4 PR 1 honors only [StorageConfig.InMemory]; PR 3 adds
-         * filesystem-backed variants.
+         * Honors both [StorageConfig.InMemory] (encrypted in-memory,
+         * ephemeral) and [StorageConfig.Sqlite] (SQLCipher-encrypted
+         * on-disk, persistent). Prefer [withSqlite] when callers have a
+         * directory and a raw key handy — it constructs the enum variant
+         * for you.
          */
         fun withStorage(config: StorageConfig): SCP = SCP(NativeScp.withStorage(config))
 
-        // NOTE: A `withPersistence` factory is intentionally not exposed
-        // at the Kotlin SDK surface until PR 3 wires the real
-        // `scp_core::context::ContextPersistence` trait through UniFFI.
-        // Track progress via issues #1260 and #1491. The underlying
-        // UniFFI `Scp.withPersistence()` factory still exists for
-        // internal use but should not be called through the SDK layer
-        // until it has a real signature.
+        /**
+         * Constructs an [SCP] backed by SQLCipher-encrypted on-disk storage.
+         *
+         * Convenience wrapper over [withStorage] for the common case:
+         * given a directory and a raw encryption key, returns an [SCP]
+         * whose underlying `UniffiBridgeInstance` persists context
+         * snapshots and event log entries under `{dir}/scp.db`.
+         *
+         * The Rust bridge zeroizes its own copy of [key] after SQLCipher
+         * consumes it internally; callers should zero their copy too
+         * once the call returns. The directory is created implicitly
+         * when SQLCipher opens the database file.
+         *
+         * @param dir Directory the database file is created in. Passed
+         *   to the Rust side as `dir.absolutePath`.
+         * @param key Raw encryption key material (typically 32 bytes).
+         *   Callers are responsible for zeroizing their reference.
+         */
+        fun withSqlite(dir: File, key: ByteArray): SCP =
+            SCP(
+                NativeScp.withStorage(
+                    StorageConfig.Sqlite(path = dir.absolutePath, key = key),
+                ),
+            )
+
+        // NOTE: The bare UniFFI `Scp.withPersistence()` factory still
+        // exists for internal use; it constructs a fresh instance with
+        // no persistence attached and is not a useful entry point for
+        // SDK callers. Production persistence flows through
+        // [withStorage] / [withSqlite] and the `StorageConfig` enum.
     }
 }

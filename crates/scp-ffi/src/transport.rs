@@ -166,6 +166,13 @@ pub fn py_transport_connect(relay_url: &str, source: &str) -> PyResult<()> {
             let manager = scp_transport::TransportManager::new(Box::new(adapter));
             crate::runtime::set_transport_manager(manager)?;
 
+            // Register the URL on the bridge's pending-reconnect set so
+            // `BridgeInstanceCore::resume` can rebuild the transport after
+            // suspend/resume cycles (#1678).
+            if let Ok(bi) = crate::runtime::bridge_instance() {
+                bi.core.add_relay_url(url.clone());
+            }
+
             // Spawn suppression → scoring bridge task.
             if let Some(suppression_rx) = suppression_rx {
                 spawn_suppression_scoring_task(suppression_rx, url.clone());
@@ -195,7 +202,20 @@ pub fn py_transport_connect(relay_url: &str, source: &str) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(name = "transport_disconnect")]
 pub fn py_transport_disconnect() -> PyResult<()> {
+    // Read the URL we'll be disconnecting before clearing the state so we
+    // can remove it from the bridge's pending-reconnect set (#1678).
+    let disconnecting_url = connected_url_state()
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone());
+
     crate::runtime::clear_transport_manager()?;
+
+    if let Some(ref url) = disconnecting_url
+        && let Ok(bi) = crate::runtime::bridge_instance()
+    {
+        bi.core.remove_relay_url(url);
+    }
 
     *connected_url_state()
         .write()

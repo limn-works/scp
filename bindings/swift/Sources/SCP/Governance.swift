@@ -151,7 +151,7 @@ public enum ContextLifecycleBridge {
     }
 
     public static let defaultRegisterLocalDid: RegisterLocalDidFn = { did in
-        await registerLocalDid(did: did)
+        try await registerLocalDid(did: did)
     }
 
     public static let defaultIsLocalDid: IsLocalDidFn = { did in
