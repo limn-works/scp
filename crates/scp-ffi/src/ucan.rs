@@ -110,14 +110,11 @@ pub struct PyUcanToken {
 }
 
 impl PyUcanToken {
-    /// Stamps the default bridge instance's `instance_id` on this token.
+    /// Stamps the given bridge instance's `instance_id` on this token.
     /// Called by constructor sites so handle-affinity checks can reject
     /// cross-instance reuse.
-    pub(crate) fn stamp_instance_id(mut self) -> Self {
-        self.instance_id = crate::runtime::bridge_instance_raw()
-            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
-                bi.core.instance_id()
-            });
+    pub(crate) fn stamp_instance_id(mut self, bi: &crate::runtime::PyBridgeInstance) -> Self {
+        self.instance_id = bi.core.instance_id();
         self
     }
 }
@@ -343,7 +340,7 @@ impl crate::scp::PyScp {
             proofs: token.payload.prf,
             instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
         }
-        .stamp_instance_id())
+        .stamp_instance_id(bi))
     }
 
     /// Delegates a UCAN token to another member.
@@ -467,7 +464,7 @@ impl crate::scp::PyScp {
             proofs: token.payload.prf,
             instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
         }
-        .stamp_instance_id())
+        .stamp_instance_id(bi))
     }
 
     /// Revokes a UCAN token using the full revocation pipeline.

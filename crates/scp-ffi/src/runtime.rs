@@ -1440,6 +1440,7 @@ pub fn deliver_message(
             #[allow(clippy::cast_precision_loss)]
             // Unix timestamp seconds fit in f64 mantissa for centuries.
             let overflow_warning = PyMessage::new(
+                bi,
                 "scp:system".to_owned(),
                 b"BufferOverflow: oldest event dropped due to full receive buffer".to_vec(),
                 scp_primitives::SystemClock.now_secs() as f64,

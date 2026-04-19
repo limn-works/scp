@@ -1124,49 +1124,17 @@ pub(crate) struct McpClientState {
     client: Arc<Mutex<McpClient<ClientTransport, SystemTimestamp>>>,
 }
 
-/// Fallback empty MCP server registry for when the default
-/// `PyBridgeInstance` has not been initialized yet. Mirrors the
-/// `EMPTY_FFI_BRIDGE_STATE` / `EMPTY_IDENTITY_REGISTRY` fallback pattern.
-static EMPTY_SERVER_REGISTRY: OnceLock<DashMap<String, McpServerState>> = OnceLock::new();
-
-/// Fallback empty MCP client registry.
-static EMPTY_CLIENT_REGISTRY: OnceLock<DashMap<String, McpClientState>> = OnceLock::new();
-
-/// Returns a reference to the default bridge instance's MCP server registry.
-///
-/// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
-/// typed `mcp_server_registry` field on [`crate::runtime::PyBridgeInstance`]
-/// in #1549 Phase 4 PR 2 commit 4. Falls back to an empty registry when the
-/// default instance has not been initialized yet.
-///
-/// Uses the default bridge instance. Prefer [`server_registry_of`] when the
-/// caller already has a `&PyBridgeInstance` reference (Phase 4 PR 4 sub-slice
-/// D methods pass the per-instance reference directly).
-fn server_registry() -> &'static DashMap<String, McpServerState> {
-    crate::runtime::bridge_instance_raw().map_or_else(
-        || EMPTY_SERVER_REGISTRY.get_or_init(DashMap::new),
-        |bi| bi.mcp_server_registry().as_ref(),
-    )
-}
+// Phase D (#1695): `server_registry()` / `client_registry()` default-bridge
+// shims and their `EMPTY_*_REGISTRY` fallback statics have been deleted.
+// Callers must use the per-instance `server_registry_of(bi)` /
+// `client_registry_of(bi)` accessors.
 
 /// Returns a reference to the given bridge instance's MCP server registry.
-///
-/// Per-instance accessor used by `PyScp` methods (Phase 4 PR 4 sub-slice D).
 fn server_registry_of(bi: &crate::runtime::PyBridgeInstance) -> &DashMap<String, McpServerState> {
     bi.mcp_server_registry().as_ref()
 }
 
-/// Returns a reference to the default bridge instance's MCP client registry.
-fn client_registry() -> &'static DashMap<String, McpClientState> {
-    crate::runtime::bridge_instance_raw().map_or_else(
-        || EMPTY_CLIENT_REGISTRY.get_or_init(DashMap::new),
-        |bi| bi.mcp_client_registry().as_ref(),
-    )
-}
-
 /// Returns a reference to the given bridge instance's MCP client registry.
-///
-/// Per-instance accessor used by `PyScp` methods (Phase 4 PR 4 sub-slice D).
 fn client_registry_of(bi: &crate::runtime::PyBridgeInstance) -> &DashMap<String, McpClientState> {
     bi.mcp_client_registry().as_ref()
 }

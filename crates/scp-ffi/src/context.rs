@@ -147,18 +147,19 @@ impl PyContextHandle {
 
 impl PyContextHandle {
     /// Creates a new handle in the "creating" state with associated params,
-    /// tagged with the default bridge instance's `instance_id`.
-    fn new(context_id: String, creator_did: String, params: PyContextParams) -> Self {
-        let instance_id = crate::runtime::bridge_instance_raw()
-            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
-                bi.core.instance_id()
-            });
+    /// tagged with the given bridge instance's `instance_id`.
+    fn new(
+        bi: &crate::runtime::PyBridgeInstance,
+        context_id: String,
+        creator_did: String,
+        params: PyContextParams,
+    ) -> Self {
         Self {
             context_id,
             state: Arc::new(Mutex::new("creating".to_owned())),
             creator_did,
             params,
-            instance_id,
+            instance_id: bi.core.instance_id(),
         }
     }
 }
@@ -686,21 +687,23 @@ impl PyMessage {
 }
 
 impl PyMessage {
-    /// Creates a new `PyMessage` tagged with the default bridge instance's
+    /// Creates a new `PyMessage` tagged with the given bridge instance's
     /// `instance_id`. Used by `drain_and_deliver` and `deliver_message` to
     /// feed messages into the receive channel.
     #[must_use]
-    pub fn new(sender_did: String, payload: Vec<u8>, timestamp: f64, context_id: String) -> Self {
-        let instance_id = crate::runtime::bridge_instance_raw()
-            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
-                bi.core.instance_id()
-            });
+    pub fn new(
+        bi: &crate::runtime::PyBridgeInstance,
+        sender_did: String,
+        payload: Vec<u8>,
+        timestamp: f64,
+        context_id: String,
+    ) -> Self {
         Self {
             sender_did,
             payload,
             timestamp,
             context_id,
-            instance_id,
+            instance_id: bi.core.instance_id(),
         }
     }
 }
@@ -795,18 +798,20 @@ impl PyMessageReceiver {
 
 impl PyMessageReceiver {
     /// Creates a new receiver from a pre-wrapped shared receiver Arc,
-    /// tagged with the default bridge instance's `instance_id`.
+    /// tagged with the given bridge instance's `instance_id`.
     ///
     /// The `Arc<tokio::sync::Mutex<Receiver>>` is shared with
     /// `FfiBridgeState::message_rx` so that `deliver_message` can access
     /// the receiver for oldest-drop overflow handling.
     #[must_use]
-    pub fn from_shared_rx(rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>) -> Self {
-        let instance_id = crate::runtime::bridge_instance_raw()
-            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
-                bi.core.instance_id()
-            });
-        Self { rx, instance_id }
+    pub fn from_shared_rx(
+        bi: &crate::runtime::PyBridgeInstance,
+        rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>,
+    ) -> Self {
+        Self {
+            rx,
+            instance_id: bi.core.instance_id(),
+        }
     }
 }
 
@@ -1058,7 +1063,7 @@ fn drain_and_deliver(bi: &crate::runtime::PyBridgeInstance, context_id: &str) {
     for event in events {
         let (sender_did, payload, timestamp) = convert_context_event(event);
 
-        let msg = PyMessage::new(sender_did, payload, timestamp, context_id.to_owned());
+        let msg = PyMessage::new(bi, sender_did, payload, timestamp, context_id.to_owned());
         // Best-effort: if no channel is open or the channel is full, the
         // event is dropped. This matches the subscription model where
         // events before subscribe are lost.
@@ -1699,7 +1704,7 @@ impl crate::scp::PyScp {
         let context_id = crate::types::generate_context_id();
 
         let handle =
-            PyContextHandle::new(context_id.clone(), identity_did.to_owned(), parsed.clone());
+            PyContextHandle::new(bi, context_id.clone(), identity_did.to_owned(), parsed.clone());
 
         // Register FFI-specific state (ToolRegistry, EventLog, RoleState, RevocationList)
         // in the global FFI state registry so that tools/UCAN/event_log bridge functions
@@ -2291,7 +2296,7 @@ impl crate::scp::PyScp {
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
-        Ok(PyMessageReceiver::from_shared_rx(rx_arc))
+        Ok(PyMessageReceiver::from_shared_rx(bi, rx_arc))
     }
 
     /// Rejects direct economic policy mutation — use governance flow instead
@@ -4267,13 +4272,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn __bi() -> std::sync::Arc<crate::runtime::PyBridgeInstance> {
-        crate::runtime::default_bridge_instance()
-            .expect("default bridge instance (ensure ensure_bridge_instance() has been called)")
+        std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py())
     }
 
-    /// Test helper that invokes `PyScp::evaluate_invitation` via the default
-    /// bridge instance. Phase 4 PR 4 (#1549) migrated `py_evaluate_invitation`
-    /// to a `PyScp` method; the tests retain the flat call shape.
+    /// Test helper that invokes `PyScp::evaluate_invitation` on a fresh
+    /// SCP instance. Phase 4 PR 4 (#1549) migrated `py_evaluate_invitation`
+    /// to a `PyScp` method; Phase D deleted the default-instance factory, so
+    /// tests construct a per-call SCP.
     fn eval_invitation(
         params_json: &str,
         inviter_did: &str,
@@ -4282,7 +4287,7 @@ mod tests {
         spending_json: Option<&str>,
         trusted_dids_json: Option<&str>,
     ) -> PyResult<String> {
-        let scp = crate::scp::PyScp::default_instance()?;
+        let scp = crate::scp::PyScp::new();
         scp.evaluate_invitation(
             params_json,
             inviter_did,
@@ -4297,6 +4302,7 @@ mod tests {
         #[allow(clippy::cast_precision_loss)]
         let ts = i as f64;
         PyMessage::new(
+            &*__bi(),
             format!("did:test:sender-{i}"),
             format!("payload-{i}").into_bytes(),
             ts,
@@ -4308,7 +4314,7 @@ mod tests {
     async fn empty_then_message_delivery() {
         let (tx, rx) = mpsc::channel::<PyMessage>(RECEIVE_BUFFER_CAPACITY);
         let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
-        let msg_receiver = PyMessageReceiver::from_shared_rx(Arc::clone(&rx_arc));
+        let msg_receiver = PyMessageReceiver::from_shared_rx(&*__bi(), Arc::clone(&rx_arc));
 
         let rx_clone = Arc::clone(&msg_receiver.rx);
         let handle = tokio::spawn(async move {
@@ -4381,6 +4387,7 @@ mod tests {
             .unwrap();
 
         let overflow_warning = PyMessage::new(
+            &*__bi(),
             "scp:system".to_owned(),
             b"BufferOverflow: oldest event dropped due to full receive buffer".to_vec(),
             0.0,
@@ -4695,6 +4702,7 @@ mod tests {
     #[test]
     fn handle_exposes_mode() {
         let handle = PyContextHandle::new(
+            &*__bi(),
             "ctx-1".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
@@ -4708,6 +4716,7 @@ mod tests {
     #[test]
     fn handle_exposes_ceiling_policy() {
         let handle = PyContextHandle::new(
+            &*__bi(),
             "ctx-2".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
@@ -4721,6 +4730,7 @@ mod tests {
     #[test]
     fn handle_exposes_promotion_policy() {
         let handle = PyContextHandle::new(
+            &*__bi(),
             "ctx-3".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
@@ -4734,6 +4744,7 @@ mod tests {
     #[test]
     fn handle_exposes_template_id_none() {
         let handle = PyContextHandle::new(
+            &*__bi(),
             "ctx-4".to_owned(),
             "did:test:creator".to_owned(),
             default_params(),
@@ -4744,6 +4755,7 @@ mod tests {
     #[test]
     fn handle_exposes_template_id_some() {
         let handle = PyContextHandle::new(
+            &*__bi(),
             "ctx-5".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
@@ -4757,6 +4769,7 @@ mod tests {
     #[test]
     fn handle_exposes_economic_policy_none() {
         let handle = PyContextHandle::new(
+            &*__bi(),
             "ctx-6".to_owned(),
             "did:test:creator".to_owned(),
             default_params(),
@@ -4768,6 +4781,7 @@ mod tests {
     fn handle_exposes_economic_policy_some() {
         let json = r#"{"locked":true}"#;
         let handle = PyContextHandle::new(
+            &*__bi(),
             "ctx-7".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
@@ -4781,6 +4795,7 @@ mod tests {
     #[test]
     fn handle_repr_includes_mode() {
         let handle = PyContextHandle::new(
+            &*__bi(),
             "ctx-repr".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
@@ -4795,6 +4810,7 @@ mod tests {
     #[test]
     fn handle_defaults_encrypted_immutable_no_promotion() {
         let handle = PyContextHandle::new(
+            &*__bi(),
             "ctx-defaults".to_owned(),
             "did:test:creator".to_owned(),
             default_params(),
@@ -4817,6 +4833,7 @@ mod tests {
         // `SCP-PERM-3030`).
         crate::runtime::ensure_bridge_instance();
         let mut handle = PyContextHandle::new(
+            &*__bi(),
             "ctx-econ-1".to_owned(),
             "did:test:creator".to_owned(),
             default_params(),
@@ -4840,6 +4857,7 @@ mod tests {
         // would reject the handle with `SCP-PERM-3030`.
         crate::runtime::ensure_bridge_instance();
         let handle = PyContextHandle::new(
+            &*__bi(),
             "ctx-econ-3".to_owned(),
             "did:test:creator".to_owned(),
             default_params(),
@@ -4856,6 +4874,7 @@ mod tests {
         crate::runtime::ensure_bridge_instance();
         let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
         let handle = PyContextHandle::new(
+            &*__bi(),
             "ctx-econ-4".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
