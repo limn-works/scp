@@ -852,10 +852,9 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn node_in_memory_with_identity_uses_provided_did() {
-        use crate::bridge::identity_create;
-
+        let scp = crate::scp::Scp::new();
         let identity = rt()
-            .block_on(identity_create("in_memory".to_owned()))
+            .block_on(scp.identity_create("in_memory".to_owned()))
             .unwrap();
         let expected_did = identity.did();
 
@@ -879,10 +878,9 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn node_local_with_identity_uses_provided_did() {
-        use crate::bridge::identity_create;
-
+        let scp = crate::scp::Scp::new();
         let identity = rt()
-            .block_on(identity_create("in_memory".to_owned()))
+            .block_on(scp.identity_create("in_memory".to_owned()))
             .unwrap();
         let expected_did = identity.did();
 

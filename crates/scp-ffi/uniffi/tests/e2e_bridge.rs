@@ -21,6 +21,7 @@
 )]
 
 use scp_ffi_uniffi::{
+    Scp,
     // Types
     CeilingPolicy,
     ContextMode,
@@ -30,58 +31,21 @@ use scp_ffi_uniffi::{
     ToolDefinition,
     // Free functions — bridge trust
     bridge_evaluate_trust,
-    // Free functions — broadcast
-    broadcast_admission,
-    broadcast_is_subscriber,
-    broadcast_subscriber_count,
-    // Free functions — context lifecycle
-    context_close,
-    context_create,
-    context_drain_events,
-    // Free functions — TTL
-    context_handle_ttl_expiry,
-    context_is_member,
-    context_join,
-    context_leave,
-    context_member_count,
-    context_member_dids,
-    context_member_role,
-    context_propose_ttl_extension,
-    context_reset_ttl_timer,
-    context_send,
     // Free functions — discovery
     discovery_create_query,
     discovery_normalize_address,
     discovery_parse_address,
+    // Free functions — identity (stateful, not yet migrated to Scp methods)
+    identity_migrate,
     // Free functions — provenance
     evaluate_provenance_quality,
-    // Free functions — event log
-    event_log_query,
-    // Free functions — governance
-    governance_execute,
-    // Free functions — identity
-    identity_create,
-    identity_create_link_attestation,
-    identity_link_attestations,
-    identity_migrate,
-    // Free functions — local DID management
-    is_local_did,
     provenance_attach,
     provenance_check_chain_depth,
-    register_local_did,
     // Free functions — shutdown
     scp_shutdown,
     // Free functions — sync
     sync_classify_offline,
     sync_classify_offline_custom,
-    // Free functions — tools
-    tool_register,
-    tool_verify,
-    // Free functions — transport
-    transport_connect,
-    // Free functions — UCAN
-    ucan_mint,
-    ucan_revoke,
 };
 
 // ---------------------------------------------------------------------------
@@ -145,7 +109,8 @@ fn default_encrypted_params() -> ContextParams {
 
 #[tokio::test]
 async fn identity_create_in_memory_produces_valid_did() {
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let scp = Scp::new();
+    let identity = scp.identity_create("in_memory".to_owned()).await.unwrap();
     let did = identity.did();
     assert!(
         did.starts_with("did:dht:"),
@@ -157,7 +122,8 @@ async fn identity_create_in_memory_produces_valid_did() {
 
 #[tokio::test]
 async fn identity_create_rejects_unknown_custody() {
-    let result = identity_create("magic".to_owned()).await;
+    let scp = Scp::new();
+    let result = scp.identity_create("magic".to_owned()).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     let msg = err.to_string();
@@ -169,7 +135,8 @@ async fn identity_create_rejects_unknown_custody() {
 
 #[tokio::test]
 async fn identity_rotate_key() {
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let scp = Scp::new();
+    let identity = scp.identity_create("in_memory".to_owned()).await.unwrap();
     let original_did = identity.did();
 
     // rotate_key may fail with InMemoryDhtClient since each DidDht instance
@@ -197,8 +164,9 @@ async fn identity_rotate_key() {
 
 #[tokio::test]
 async fn identity_agent_key_lifecycle() {
+    let scp = Scp::new();
     // Create without agent key
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let identity = scp.identity_create("in_memory".to_owned()).await.unwrap();
     assert!(
         !identity.has_agent_key(),
         "New identity should not have agent key by default"
@@ -233,12 +201,13 @@ async fn identity_agent_key_lifecycle() {
 
 #[tokio::test]
 async fn identity_migrate_preserves_attestations() {
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let scp = Scp::new();
+    let identity = scp.identity_create("in_memory".to_owned()).await.unwrap();
     let original_did = identity.did();
 
     // Create an attestation on the original DID.
     let proof_json = r#"{"type":"signed_post_verified","post_url":"https://x.com/alice/status/123","nonce":"abc123","posted_at":1700000200}"#;
-    let result = identity_create_link_attestation(
+    let result = scp.identity_create_link_attestation(
         identity.clone(),
         "x.com".to_owned(),
         "@alice".to_owned(),
@@ -256,7 +225,7 @@ async fn identity_migrate_preserves_attestations() {
     );
 
     // Verify the attestation is listed under the original DID.
-    let before = identity_link_attestations(original_did.clone()).unwrap();
+    let before = scp.identity_link_attestations(original_did.clone()).unwrap();
     let before_vec: Vec<serde_json::Value> = serde_json::from_str(&before).unwrap();
     assert_eq!(
         before_vec.len(),
@@ -275,7 +244,7 @@ async fn identity_migrate_preserves_attestations() {
             assert_ne!(new_did, original_did, "Migration should produce a new DID");
 
             // Attestations should have migrated to the new DID.
-            let after = identity_link_attestations(new_did).unwrap();
+            let after = scp.identity_link_attestations(new_did).unwrap();
             let after_vec: Vec<serde_json::Value> = serde_json::from_str(&after).unwrap();
             assert_eq!(
                 after_vec.len(),
@@ -284,7 +253,7 @@ async fn identity_migrate_preserves_attestations() {
             );
 
             // Old DID should have no attestations.
-            let old = identity_link_attestations(original_did).unwrap();
+            let old = scp.identity_link_attestations(original_did).unwrap();
             let old_vec: Vec<serde_json::Value> = serde_json::from_str(&old).unwrap();
             assert!(
                 old_vec.is_empty(),
@@ -307,8 +276,9 @@ async fn identity_migrate_preserves_attestations() {
 
 #[tokio::test]
 async fn context_create_returns_active_context() {
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
-    let handle = context_create(identity.clone(), default_encrypted_params())
+    let scp = Scp::new();
+    let identity = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let handle = scp.context_create(identity.clone(), default_encrypted_params())
         .await
         .unwrap();
 
@@ -326,25 +296,26 @@ async fn context_create_returns_active_context() {
 
 #[tokio::test]
 async fn context_join_and_leave() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let bob = identity_create("in_memory".to_owned()).await.unwrap();
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let bob = scp.identity_create("in_memory".to_owned()).await.unwrap();
 
     // Use full capabilities so Alice can assign roles
-    let handle = context_create(alice.clone(), full_capability_params())
+    let handle = scp.context_create(alice.clone(), full_capability_params())
         .await
         .unwrap();
 
     // Bob joins
-    context_join(handle.clone(), bob.clone(), None)
+    scp.context_join(handle.clone(), bob.clone(), None)
         .await
         .unwrap();
 
     // Check membership
-    let count = context_member_count(handle.clone()).await;
+    let count = scp.context_member_count(handle.clone()).await;
     assert_eq!(count, Some(2), "Should have 2 members after join");
-    assert!(context_is_member(handle.clone(), bob.did()).await);
+    assert!(scp.context_is_member(handle.clone(), bob.did()).await);
 
-    let dids = context_member_dids(handle.clone()).await;
+    let dids = scp.context_member_dids(handle.clone()).await;
     assert!(dids.contains(&bob.did()), "Member list should contain Bob");
     assert!(
         dids.contains(&alice.did()),
@@ -352,10 +323,10 @@ async fn context_join_and_leave() {
     );
 
     // Bob leaves
-    context_leave(handle.clone(), bob.clone()).await.unwrap();
-    let count_after = context_member_count(handle.clone()).await;
+    scp.context_leave(handle.clone(), bob.clone()).await.unwrap();
+    let count_after = scp.context_member_count(handle.clone()).await;
     assert_eq!(count_after, Some(1), "Should have 1 member after leave");
-    assert!(!context_is_member(handle.clone(), bob.did()).await);
+    assert!(!scp.context_is_member(handle.clone(), bob.did()).await);
 }
 
 /// C5 parity: `context_join` must accept the optional `spending_ucan_jwt`
@@ -363,14 +334,15 @@ async fn context_join_and_leave() {
 /// SCP-ECON-12061 code (mirrors PyO3/NAPI/WASM bridges).
 #[tokio::test]
 async fn context_join_rejects_malformed_spending_ucan_jwt() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let bob = identity_create("in_memory".to_owned()).await.unwrap();
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let bob = scp.identity_create("in_memory".to_owned()).await.unwrap();
 
-    let handle = context_create(alice.clone(), full_capability_params())
+    let handle = scp.context_create(alice.clone(), full_capability_params())
         .await
         .unwrap();
 
-    let result = context_join(handle, bob, Some("not.a.jwt".to_owned())).await;
+    let result = scp.context_join(handle, bob, Some("not.a.jwt".to_owned())).await;
     assert!(
         result.is_err(),
         "malformed spending UCAN JWT must be rejected at the bridge boundary"
@@ -388,19 +360,20 @@ async fn context_join_rejects_malformed_spending_ucan_jwt() {
 /// manager.
 #[tokio::test]
 async fn context_join_accepts_none_spending_ucan_jwt() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let bob = identity_create("in_memory".to_owned()).await.unwrap();
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let bob = scp.identity_create("in_memory".to_owned()).await.unwrap();
 
-    let handle = context_create(alice.clone(), full_capability_params())
+    let handle = scp.context_create(alice.clone(), full_capability_params())
         .await
         .unwrap();
 
     // None must reach the manager — assert by joining successfully and
     // observing membership growth from 1 to 2.
-    context_join(handle.clone(), bob.clone(), None)
+    scp.context_join(handle.clone(), bob.clone(), None)
         .await
         .unwrap();
-    let count = context_member_count(handle).await;
+    let count = scp.context_member_count(handle).await;
     assert_eq!(count, Some(2), "join with None spending UCAN must succeed");
 }
 
@@ -410,7 +383,8 @@ async fn context_join_accepts_none_spending_ucan_jwt() {
 /// is declared without the matching opt-in flag.
 #[tokio::test]
 async fn context_create_rejects_revoke_access_when_config_disallows() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
 
     let bad_rules = serde_json::json!([
         {
@@ -429,7 +403,7 @@ async fn context_create_rejects_revoke_access_when_config_disallows() {
     params.consequence_rules_json = Some(bad_rules);
     // consequence_config_json left None -> default disallows RevokeAccess.
 
-    let result = context_create(alice, params).await;
+    let result = scp.context_create(alice, params).await;
     assert!(
         result.is_err(),
         "RevokeAccess rule must be rejected when config.allow_automatic_access_revocation is false"
@@ -441,7 +415,8 @@ async fn context_create_rejects_revoke_access_when_config_disallows() {
 /// the context creation must succeed.
 #[tokio::test]
 async fn context_create_threads_consequence_rules_and_config() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
 
     let rules = serde_json::json!([
         {
@@ -464,7 +439,7 @@ async fn context_create_threads_consequence_rules_and_config() {
     params.consequence_rules_json = Some(rules);
     params.consequence_config_json = Some(config);
 
-    let handle = context_create(alice, params)
+    let handle = scp.context_create(alice, params)
         .await
         .expect("context_create should succeed when config opts into RevokeAccess");
     assert_eq!(handle.state().unwrap(), "active");
@@ -472,13 +447,14 @@ async fn context_create_threads_consequence_rules_and_config() {
 
 #[tokio::test]
 async fn context_send_message() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let handle = context_create(alice.clone(), default_encrypted_params())
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let handle = scp.context_create(alice.clone(), default_encrypted_params())
         .await
         .unwrap();
 
     // Send a message (no real recipient, just validates the API path)
-    let result = context_send(handle, alice, b"Hello, world!".to_vec(), None).await;
+    let result = scp.context_send(handle, alice, b"Hello, world!".to_vec(), None).await;
     // Send may succeed or fail depending on crypto provider wiring.
     // The important thing is it doesn't panic.
     let _ = result;
@@ -486,14 +462,15 @@ async fn context_send_message() {
 
 #[tokio::test]
 async fn context_close_lifecycle() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
     // Must include context:close capability
-    let handle = context_create(alice.clone(), full_capability_params())
+    let handle = scp.context_create(alice.clone(), full_capability_params())
         .await
         .unwrap();
     assert_eq!(handle.state().unwrap(), "active");
 
-    context_close(handle.clone(), alice).await.unwrap();
+    scp.context_close(handle.clone(), alice).await.unwrap();
     // After close, state should be closed
     let state = handle.state().unwrap();
     assert!(
@@ -504,11 +481,12 @@ async fn context_close_lifecycle() {
 
 #[tokio::test]
 async fn context_drain_events_returns_vec() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let handle = context_create(alice, default_encrypted_params())
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let handle = scp.context_create(alice, default_encrypted_params())
         .await
         .unwrap();
-    let events = context_drain_events(handle).await;
+    let events = scp.context_drain_events(handle).await;
     // Events may be empty but should not panic
     assert!(events.is_empty() || !events.is_empty());
 }
@@ -519,12 +497,13 @@ async fn context_drain_events_returns_vec() {
 
 #[tokio::test]
 async fn context_member_role_returns_role_for_creator() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let handle = context_create(alice.clone(), default_encrypted_params())
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let handle = scp.context_create(alice.clone(), default_encrypted_params())
         .await
         .unwrap();
 
-    let role = context_member_role(handle, alice.did()).await;
+    let role = scp.context_member_role(handle, alice.did()).await;
     assert!(role.is_some(), "Creator should have a role");
     let role_str = role.unwrap();
     // The role may be returned as a string name or as a debug representation.
@@ -541,20 +520,21 @@ async fn context_member_role_returns_role_for_creator() {
 
 #[tokio::test]
 async fn context_ttl_operations() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
     let alice_did = alice.did();
-    let handle = context_create(alice, default_encrypted_params())
+    let handle = scp.context_create(alice, default_encrypted_params())
         .await
         .unwrap();
 
     // Reset TTL timer (should not panic)
-    context_reset_ttl_timer(handle.clone(), 7200).await;
+    scp.context_reset_ttl_timer(handle.clone(), 7200).await;
 
     // Propose TTL extension (may fail if governance requires it, that's OK)
-    let _ = context_propose_ttl_extension(handle.clone(), alice_did, 14400).await;
+    let _ = scp.context_propose_ttl_extension(handle.clone(), alice_did, 14400).await;
 
     // Handle TTL expiry
-    let _ = context_handle_ttl_expiry(handle).await;
+    let _ = scp.context_handle_ttl_expiry(handle).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -563,9 +543,10 @@ async fn context_ttl_operations() {
 
 #[tokio::test]
 async fn governance_execute_add_member() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let bob = identity_create("in_memory".to_owned()).await.unwrap();
-    let handle = context_create(alice, full_capability_params())
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let bob = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let handle = scp.context_create(alice, full_capability_params())
         .await
         .unwrap();
 
@@ -578,7 +559,7 @@ async fn governance_execute_add_member() {
     })
     .to_string();
 
-    let result = governance_execute(handle, action_json).await;
+    let result = scp.governance_execute(handle, action_json).await;
     // May succeed or fail depending on governance model, but should not panic
     let _ = result;
 }
@@ -589,21 +570,22 @@ async fn governance_execute_add_member() {
 
 #[tokio::test]
 async fn broadcast_lifecycle() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let handle = context_create(alice, default_encrypted_params())
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let handle = scp.context_create(alice, default_encrypted_params())
         .await
         .unwrap();
 
     // Check admission mode
-    let admission = broadcast_admission(handle.clone()).await;
+    let admission = scp.broadcast_admission(handle.clone()).await;
     let _ = admission;
 
     // Check subscriber count
-    let count = broadcast_subscriber_count(handle.clone()).await;
+    let count = scp.broadcast_subscriber_count(handle.clone()).await;
     let _ = count;
 
     // Check is_subscriber
-    let is_sub = broadcast_is_subscriber(handle.clone(), "did:dht:zFake".to_owned()).await;
+    let is_sub = scp.broadcast_is_subscriber(handle.clone(), "did:dht:zFake".to_owned()).await;
     assert!(!is_sub, "Non-existent DID should not be subscriber");
 }
 
@@ -613,8 +595,9 @@ async fn broadcast_lifecycle() {
 
 #[tokio::test]
 async fn tool_register_and_verify() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let handle = context_create(alice.clone(), default_encrypted_params())
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let handle = scp.context_create(alice.clone(), default_encrypted_params())
         .await
         .unwrap();
 
@@ -632,11 +615,11 @@ async fn tool_register_and_verify() {
         cost: None,
     };
 
-    let tool_id = tool_register(handle.clone(), definition).await.unwrap();
+    let tool_id = scp.tool_register(handle.clone(), definition).await.unwrap();
     assert!(!tool_id.is_empty(), "Tool ID should be non-empty");
 
     // Verify the registered tool
-    let verification = tool_verify(handle, tool_id).await.unwrap();
+    let verification = scp.tool_verify(handle, tool_id).await.unwrap();
     assert!(verification.passed, "Tool verification should pass");
 }
 
@@ -646,14 +629,15 @@ async fn tool_register_and_verify() {
 
 #[tokio::test]
 async fn ucan_mint_and_revoke() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let bob = identity_create("in_memory".to_owned()).await.unwrap();
-    let handle = context_create(alice.clone(), default_encrypted_params())
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let bob = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let handle = scp.context_create(alice.clone(), default_encrypted_params())
         .await
         .unwrap();
 
     // Capabilities must be in "resource:action" format
-    let token = ucan_mint(
+    let token = scp.ucan_mint(
         handle.clone(),
         bob.did(),
         vec!["messages:read".to_owned(), "messages:write".to_owned()],
@@ -671,7 +655,7 @@ async fn ucan_mint_and_revoke() {
     assert!(!caps.is_empty(), "Capabilities should be non-empty");
 
     // Revoke the token (revoker is the context creator).
-    let revoke_result = ucan_revoke(handle, token.encoded(), alice.did()).await;
+    let revoke_result = scp.ucan_revoke(handle, token.encoded(), alice.did()).await;
     // Revocation may succeed or fail based on implementation, but should not panic.
     let _ = revoke_result;
 }
@@ -682,12 +666,13 @@ async fn ucan_mint_and_revoke() {
 
 #[tokio::test]
 async fn event_log_query_returns_events() {
-    let alice = identity_create("in_memory".to_owned()).await.unwrap();
-    let handle = context_create(alice, default_encrypted_params())
+    let scp = Scp::new();
+    let alice = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let handle = scp.context_create(alice, default_encrypted_params())
         .await
         .unwrap();
 
-    let events = event_log_query(handle, None).await.unwrap();
+    let events = scp.event_log_query(handle, None).await.unwrap();
     // May return empty vec for a fresh context
     assert!(events.is_empty() || !events.is_empty());
 }
@@ -698,6 +683,7 @@ async fn event_log_query_returns_events() {
 
 #[tokio::test]
 async fn discovery_parse_various_address_types() {
+    let scp = Scp::new();
     // Unscoped name (petname)
     let result = discovery_parse_address("alice".to_owned()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -736,6 +722,7 @@ async fn discovery_parse_various_address_types() {
 
 #[tokio::test]
 async fn discovery_normalize_trims_whitespace() {
+    let scp = Scp::new();
     let result = discovery_normalize_address("  alice  ".to_owned());
     assert!(!result.starts_with(' '), "Should trim leading whitespace");
     assert!(!result.ends_with(' '), "Should trim trailing whitespace");
@@ -743,6 +730,7 @@ async fn discovery_normalize_trims_whitespace() {
 
 #[tokio::test]
 async fn discovery_create_query_produces_json() {
+    let scp = Scp::new();
     let result = discovery_create_query(
         Some(vec!["tool:search".to_owned()]),
         Some(vec!["rust".to_owned()]),
@@ -760,6 +748,7 @@ async fn discovery_create_query_produces_json() {
 
 #[tokio::test]
 async fn sync_classify_offline_tiers() {
+    let scp = Scp::new();
     let now = 1_700_000_000u64;
 
     // Short offline (< TIER_1 = 14,400s)
@@ -777,6 +766,7 @@ async fn sync_classify_offline_tiers() {
 
 #[tokio::test]
 async fn sync_classify_offline_custom_thresholds() {
+    let scp = Scp::new();
     let now = 1_700_000_000u64;
 
     // Custom thresholds: tier1 = 120s, tier2 = 600s
@@ -799,6 +789,7 @@ async fn sync_classify_offline_custom_thresholds() {
 
 #[tokio::test]
 async fn provenance_attach_produces_json() {
+    let scp = Scp::new();
     let result = provenance_attach(
         "ctx-source".to_owned(),
         "persistent".to_owned(),
@@ -817,6 +808,7 @@ async fn provenance_attach_produces_json() {
 
 #[tokio::test]
 async fn provenance_attach_increments_chain_depth() {
+    let scp = Scp::new();
     let result = provenance_attach(
         "ctx-source".to_owned(),
         "persistent".to_owned(),
@@ -835,6 +827,7 @@ async fn provenance_attach_increments_chain_depth() {
 
 #[tokio::test]
 async fn provenance_check_chain_depth_within_limit() {
+    let scp = Scp::new();
     assert!(
         provenance_check_chain_depth(0, None),
         "Depth 0 should be within default limit"
@@ -856,6 +849,7 @@ async fn provenance_check_chain_depth_within_limit() {
 
 #[tokio::test]
 async fn evaluate_provenance_quality_returns_score() {
+    let scp = Scp::new();
     let score = evaluate_provenance_quality(
         Some("ctx-001".to_owned()),
         "persistent".to_owned(),
@@ -873,6 +867,7 @@ async fn evaluate_provenance_quality_returns_score() {
 
 #[tokio::test]
 async fn evaluate_provenance_quality_rejects_invalid_source_type() {
+    let scp = Scp::new();
     let result =
         evaluate_provenance_quality(None, "invalid_type".to_owned(), "active".to_owned(), vec![]);
     assert!(result.is_err(), "Invalid source type should be rejected");
@@ -884,6 +879,7 @@ async fn evaluate_provenance_quality_rejects_invalid_source_type() {
 
 #[tokio::test]
 async fn bridge_evaluate_trust_native() {
+    let scp = Scp::new();
     // Non-bridged, native transport → highest trust
     let level = bridge_evaluate_trust(false, true, "shadow".to_owned()).unwrap();
     assert!(level > 0, "Native trust level should be positive");
@@ -891,6 +887,7 @@ async fn bridge_evaluate_trust_native() {
 
 #[tokio::test]
 async fn bridge_evaluate_trust_shadow_vs_claimed() {
+    let scp = Scp::new();
     // Shadow bridged
     let shadow = bridge_evaluate_trust(true, false, "shadow".to_owned()).unwrap();
     // Claimed bridged
@@ -904,6 +901,7 @@ async fn bridge_evaluate_trust_shadow_vs_claimed() {
 
 #[tokio::test]
 async fn bridge_evaluate_trust_rejects_invalid_status() {
+    let scp = Scp::new();
     let result = bridge_evaluate_trust(true, false, "invalid".to_owned());
     assert!(result.is_err(), "Invalid shadow status should be rejected");
 }
@@ -914,13 +912,14 @@ async fn bridge_evaluate_trust_rejects_invalid_status() {
 
 #[tokio::test]
 async fn register_and_check_local_did() {
+    let scp = Scp::new();
     let did = "did:dht:z6MkLocalTest123".to_owned();
-    register_local_did(did.clone())
+    scp.register_local_did(did.clone())
         .await
         .expect("register_local_did must succeed for a valid DID");
-    assert!(is_local_did(did).await, "Registered DID should be local");
+    assert!(scp.is_local_did(did).await, "Registered DID should be local");
     assert!(
-        !is_local_did("did:dht:z6MkNonExistent".to_owned()).await,
+        !scp.is_local_did("did:dht:z6MkNonExistent".to_owned()).await,
         "Unregistered DID should not be local"
     );
 }
@@ -945,9 +944,10 @@ async fn scp_shutdown_zero_timeout_returns_immediately() {
 
 #[tokio::test]
 async fn multiple_identities_produce_distinct_dids() {
-    let id1 = identity_create("in_memory".to_owned()).await.unwrap();
-    let id2 = identity_create("in_memory".to_owned()).await.unwrap();
-    let id3 = identity_create("in_memory".to_owned()).await.unwrap();
+    let scp = Scp::new();
+    let id1 = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let id2 = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let id3 = scp.identity_create("in_memory".to_owned()).await.unwrap();
 
     assert_ne!(id1.did(), id2.did());
     assert_ne!(id2.did(), id3.did());
@@ -960,7 +960,8 @@ async fn multiple_identities_produce_distinct_dids() {
 
 #[tokio::test]
 async fn context_create_with_all_governance_models() {
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let scp = Scp::new();
+    let identity = scp.identity_create("in_memory".to_owned()).await.unwrap();
 
     for model in [
         GovernanceModel::SingleAdmin,
@@ -983,14 +984,15 @@ async fn context_create_with_all_governance_models() {
             consequence_rules_json: None,
             consequence_config_json: None,
         };
-        let handle = context_create(identity.clone(), params).await.unwrap();
+        let handle = scp.context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");
     }
 }
 
 #[tokio::test]
 async fn context_create_with_all_memory_scopes() {
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
+    let scp = Scp::new();
+    let identity = scp.identity_create("in_memory".to_owned()).await.unwrap();
 
     for scope in [
         MemoryScope::Ephemeral,
@@ -1013,7 +1015,7 @@ async fn context_create_with_all_memory_scopes() {
             consequence_rules_json: None,
             consequence_config_json: None,
         };
-        let handle = context_create(identity.clone(), params).await.unwrap();
+        let handle = scp.context_create(identity.clone(), params).await.unwrap();
         assert_eq!(handle.state().unwrap(), "active");
     }
 }
@@ -1024,13 +1026,14 @@ async fn context_create_with_all_memory_scopes() {
 
 #[tokio::test]
 async fn invalid_did_rejected_at_bridge_boundary() {
-    let identity = identity_create("in_memory".to_owned()).await.unwrap();
-    let handle = context_create(identity, default_encrypted_params())
+    let scp = Scp::new();
+    let identity = scp.identity_create("in_memory".to_owned()).await.unwrap();
+    let handle = scp.context_create(identity, default_encrypted_params())
         .await
         .unwrap();
 
     // Empty DID should fail validation or return false
-    let result = context_is_member(handle, String::new()).await;
+    let result = scp.context_is_member(handle, String::new()).await;
     let _ = result;
 }
 
@@ -1047,8 +1050,9 @@ async fn invalid_did_rejected_at_bridge_boundary() {
 
 #[tokio::test]
 async fn transport_connect_rejects_plaintext_ws() {
+    let scp = Scp::new();
     // ws:// is not permitted from explicit source — only wss://
-    let result = transport_connect("ws://relay.example.com/scp/v1".to_owned()).await;
+    let result = scp.transport_connect("ws://relay.example.com/scp/v1".to_owned()).await;
     assert!(
         result.is_err(),
         "ws:// should be rejected for explicit connections"
@@ -1057,18 +1061,20 @@ async fn transport_connect_rejects_plaintext_ws() {
 
 #[tokio::test]
 async fn transport_connect_rejects_invalid_url() {
+    let scp = Scp::new();
     // Empty URL should fail validation
-    let result = transport_connect(String::new()).await;
+    let result = scp.transport_connect(String::new()).await;
     assert!(result.is_err(), "Empty URL should be rejected");
 }
 
 #[tokio::test]
 async fn transport_connect_returns_error_on_unreachable_relay() {
+    let scp = Scp::new();
     // Before #620, transport_connect returned connected=true without
     // establishing any WebSocket connection. Now it calls
     // NativeRelayAdapter::connect_sourced() and propagates connection
     // failures as ScpError::Transport.
-    let result = transport_connect("wss://127.0.0.1:1/nonexistent-scp-relay".to_owned()).await;
+    let result = scp.transport_connect("wss://127.0.0.1:1/nonexistent-scp-relay".to_owned()).await;
     assert!(
         result.is_err(),
         "Connecting to an unreachable relay must return an error, not a fictional success"

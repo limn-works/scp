@@ -140,35 +140,11 @@ pub use bridge::{
     UcanTokenData,
     // Free functions — bridge connector (#370)
     bridge_evaluate_trust,
-    broadcast_admission,
-    broadcast_block_subscriber,
-    broadcast_handle_key_request,
-    broadcast_is_subscriber,
-    broadcast_publish,
     // Free functions — broadcast (#387)
-    broadcast_subscribe,
-    broadcast_subscriber_count,
-    broadcast_unblock_subscriber,
-    broadcast_unsubscribe,
     // Free functions — transport
-    configure_relay_transport,
     // Free functions — context lifecycle
-    context_close,
-    context_create,
-    context_drain_events,
     // Free functions — TTL (#387)
-    context_handle_ttl_expiry,
-    context_is_member,
-    context_join,
-    context_leave,
     // Free functions — membership queries (#387)
-    context_member_count,
-    context_member_dids,
-    context_member_role,
-    context_propose_ttl_extension,
-    context_reset_ttl_timer,
-    context_send,
-    context_subscribe,
     // Free functions — discovery (#370)
     discovery_create_query,
     discovery_normalize_address,
@@ -176,44 +152,21 @@ pub use bridge::{
     evaluate_invitation,
     evaluate_provenance_quality,
     // Free functions — event log
-    event_log_query,
-    event_log_verify,
-    governance_approve,
     // Free functions — governance (#387)
-    governance_execute,
     // Free functions — governance proposal lifecycle (#621)
-    governance_get_proposal,
-    governance_list_proposals,
-    governance_propose,
-    governance_reject,
-    governance_withdraw,
     // Free functions — identity
-    identity_create,
-    identity_create_with_custody,
     identity_execute_custody_migration,
     identity_execute_recovery,
-    identity_link_attestations,
-    identity_load,
     identity_migrate,
-    identity_resolve,
-    is_local_did,
     // Free functions — MCP (#591)
-    mcp_client_connect_sse,
-    mcp_client_connect_stdio,
-    mcp_client_disconnect,
-    mcp_client_invoke,
-    mcp_client_list_tools,
     mcp_configure_stdio_allowlist,
     mcp_disable_stdio_allowlist,
     mcp_get_stdio_allowlist,
     mcp_reset_stdio_allowlist,
-    mcp_server_create,
-    mcp_server_stop,
     // Free functions — provenance (#370)
     provenance_attach,
     provenance_check_chain_depth,
     // Free functions — local DID management (#387)
-    register_local_did,
     // Free functions — app sandboxing (#595)
     sandbox_check_capability,
     sandbox_validate_declaration,
@@ -223,24 +176,11 @@ pub use bridge::{
     sync_classify_offline,
     sync_classify_offline_custom,
     // Free functions — tools
-    tool_invoke,
-    tool_invoke_cross_context,
-    tool_register,
-    tool_session_close,
-    tool_session_create,
-    tool_session_invoke,
-    tool_verify,
-    transport_connect,
-    transport_disconnect,
-    transport_status,
     // Free functions — UCAN
-    ucan_mint,
-    ucan_revoke,
-    ucan_validate,
 };
 // Feature-gated re-exports — only available with allow_in_memory_custody.
 #[cfg(feature = "allow_in_memory_custody")]
-pub use bridge::{identity_create_link_attestation, identity_remove_link_attestation, scpid_sign};
+pub use bridge::{scpid_sign};
 // Re-export shutdown function defined in this module.
 // (scp_shutdown is defined here and exported via #[uniffi::export] above.)
 
@@ -396,65 +336,6 @@ pub async fn scp_shutdown(timeout_millis: u64) -> Result<(), bridge::ScpError> {
     // The tokio runtime (`RUNTIME`) is a static and will be dropped on
     // process exit. This function ensures language-side cleanup completes
     // before that point.
-    Ok(())
-}
-
-/// Suspends the bridge instance for mobile app backgrounding.
-///
-/// Disconnects transport (clears the relay connection) and marks the instance
-/// as suspended. Context state is preserved — the instance remains alive but
-/// inactive. Transport-dependent operations will fail until [`scp_resume`]
-/// is called.
-///
-/// After suspension, callers should call `scpResume()` to re-activate, then
-/// re-establish the relay connection via `transportConnect()`.
-///
-/// No-op if the instance is already shut down or not initialized.
-///
-/// # Example (Swift)
-///
-/// ```swift
-/// // When the app enters background:
-/// scpSuspend()
-/// // When returning to foreground:
-/// try await scpResume()
-/// try await transportConnect(relayUrl: savedUrl)
-/// ```
-///
-/// # Errors
-///
-/// Returns `ScpError::Transport` if transport cleanup fails.
-#[uniffi::export]
-pub fn scp_suspend() -> Result<(), bridge::ScpError> {
-    if let Some(bi) = runtime::default_bridge_instance_raw() {
-        bi.core.suspend().map_err(|e| bridge::ScpError::Transport {
-            msg: format!("suspend failed: {e}"),
-            code: codes::TRANS_5001.to_owned(),
-        })?;
-    }
-    Ok(())
-}
-
-/// Resumes a suspended bridge instance.
-///
-/// Clears the suspended flag so bridge operations can proceed. The caller
-/// must re-establish the relay connection via `transportConnect()` — resume
-/// does not reconnect automatically.
-///
-/// No-op if the instance is not initialized.
-///
-/// # Errors
-///
-/// Returns `ScpError::Context` if the instance has been permanently shut down.
-#[uniffi::export]
-pub async fn scp_resume() -> Result<(), bridge::ScpError> {
-    if let Some(bi) = runtime::default_bridge_instance_raw() {
-        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
-        bi.resume().await.map_err(|e| bridge::ScpError::Context {
-            msg: format!("resume failed: {e}"),
-            code: codes::CTX_2000.to_owned(),
-        })?;
-    }
     Ok(())
 }
 
@@ -748,6 +629,12 @@ mod tests {
     use super::*;
     use scp_ffi_common::error_codes as codes;
 
+    /// Returns a fresh `Scp` instance for tests. Phase 4 PR 4 demolition
+    /// (#1549) deleted the free-function façade.
+    fn scp_test() -> std::sync::Arc<crate::scp::Scp> {
+        crate::scp::Scp::new()
+    }
+
     #[test]
     fn runtime_is_lazy_initialized_on_first_call() {
         // First call to runtime() should initialize it.
@@ -850,7 +737,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     fn identity_create_in_memory_produces_did_dht_prefix() {
         let rt = runtime();
-        let result = rt.block_on(identity_create("in_memory".to_owned()));
+        let result = rt.block_on(scp_test().identity_create("in_memory".to_owned()));
         let identity = result.expect("identity_create should succeed for in_memory custody");
         assert!(
             identity.did().starts_with("did:dht:"),
@@ -868,7 +755,7 @@ mod tests {
     #[cfg(not(feature = "allow_in_memory_custody"))]
     fn identity_create_in_memory_rejected_without_feature() {
         let rt = runtime();
-        let result = rt.block_on(identity_create("in_memory".to_owned()));
+        let result = rt.block_on(scp_test().identity_create("in_memory".to_owned()));
         match result {
             Err(ScpError::Identity { code, .. }) => {
                 assert_eq!(
@@ -900,7 +787,7 @@ mod tests {
 
         // First create an identity to pass as the context creator.
         let identity = rt
-            .block_on(identity_create("in_memory".to_owned()))
+            .block_on(scp_test().identity_create("in_memory".to_owned()))
             .expect("identity_create failed");
 
         let params = bridge::ContextParams {
@@ -921,7 +808,7 @@ mod tests {
         };
 
         let handle = rt
-            .block_on(context_create(identity, params))
+            .block_on(scp_test().context_create(identity, params))
             .expect("context_create should succeed");
 
         assert_eq!(
@@ -962,7 +849,7 @@ mod tests {
         let rt = runtime();
 
         let identity = rt
-            .block_on(identity_create("in_memory".to_owned()))
+            .block_on(scp_test().identity_create("in_memory".to_owned()))
             .expect("identity_create failed");
 
         let params = bridge::ContextParams {
@@ -983,7 +870,7 @@ mod tests {
         };
 
         let handle = rt
-            .block_on(context_create(identity, params))
+            .block_on(scp_test().context_create(identity, params))
             .expect("context_create failed");
 
         let completed = Arc::new(AtomicBool::new(false));
@@ -991,7 +878,7 @@ mod tests {
             completed: Arc::clone(&completed),
         });
 
-        rt.block_on(context_subscribe(handle, listener))
+        rt.block_on(scp_test().context_subscribe(handle, listener))
             .expect("context_subscribe should succeed");
 
         assert!(
@@ -1018,7 +905,7 @@ mod tests {
         // create/drop is guaranteed regardless of concurrent test activity.
         let before_create = HANDLE_COUNT.load(Ordering::SeqCst);
         let id = rt
-            .block_on(identity_create("in_memory".to_owned()))
+            .block_on(scp_test().identity_create("in_memory".to_owned()))
             .expect("identity_create failed");
         let after_create = HANDLE_COUNT.load(Ordering::SeqCst);
 

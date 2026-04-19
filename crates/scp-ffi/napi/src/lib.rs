@@ -343,64 +343,6 @@ where
     }
 }
 
-/// Suspends the bridge instance for mobile app backgrounding.
-///
-/// Disconnects transport (clears the relay connection) and marks the instance
-/// as suspended. Context state is preserved — the instance remains alive but
-/// inactive. Transport-dependent operations will fail until [`scp_resume`]
-/// is called.
-///
-/// After suspension, callers should call `scpResume()` to re-activate, then
-/// re-establish the relay connection via `transportConnect()`.
-///
-/// No-op if the instance is already shut down or not initialized.
-///
-/// # JS usage
-///
-/// ```js
-/// // When the app goes to background:
-/// scpSuspend();
-/// // When returning to foreground:
-/// scpResume();
-/// await transportConnect(relayUrl);
-/// ```
-#[napi]
-pub fn scp_suspend() -> napi::Result<()> {
-    if let Some(bi) = runtime::default_bridge_instance_raw() {
-        bi.core.suspend().map_err(|e| {
-            napi::Error::from(crate::error::ScpNapiError::Transport {
-                message: format!("suspend failed: {e}"),
-                code: scp_ffi_common::error_codes::TRANS_5001.to_owned(),
-            })
-        })?;
-    }
-    Ok(())
-}
-
-/// Resumes a suspended bridge instance.
-///
-/// Clears the suspended flag so bridge operations can proceed. The caller
-/// must re-establish the relay connection via `transportConnect()` — resume
-/// does not reconnect automatically.
-///
-/// No-op if the instance is not initialized.
-///
-/// # Errors
-///
-/// Throws `ScpContextError` if the instance has been permanently shut down.
-#[napi]
-pub async fn scp_resume() -> napi::Result<()> {
-    if let Some(bi) = runtime::default_bridge_instance_raw() {
-        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
-        bi.resume().await.map_err(|e| {
-            napi::Error::from(crate::error::ScpNapiError::Context {
-                message: format!("resume failed: {e}"),
-                code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
-            })
-        })?;
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Tests
