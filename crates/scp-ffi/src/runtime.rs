@@ -98,38 +98,38 @@ use crate::error::ScpPyError;
 /// Runtime handle-affinity enforcement at every `#[pyfunction]` entry point
 /// that accepts a handle.
 ///
-/// Resolves [`bridge_instance_for_affinity`](crate::runtime::bridge_instance_for_affinity)
-/// internally to obtain a [`CoreFields`] reference, then checks that each
+/// The caller passes a [`CoreFields`] reference as the first argument (typically
+/// `&self.inner.core` on a `PyScp` method, or `&bi.core` where `bi` is a
+/// `&PyBridgeInstance` already in scope). The macro then checks that each
 /// supplied `$handle.instance_id` matches the core's `instance_id`. On
 /// mismatch, returns a [`ScpPyError::UcanError`] with code
 /// [`scp_ffi_common::error_codes::PERM_3030`] (mapped via the
 /// [`From<HandleAffinityError>`](scp_ffi_common::bridge_instance::HandleAffinityError)
 /// conversion).
 ///
-/// Round 5 simplifier review removed the explicit `$core` parameter: all
-/// 175 call sites passed `crate::runtime::bridge_instance_for_affinity()?`
-/// identically, so YAGNI applied. If a future per-instance `SCP` method
-/// needs to target a different core (e.g. `&self.inner.core`), add a
-/// second macro arm rather than re-expanding the default one.
+/// Sub-slice A of #1549 Phase 4 PR 4 reintroduced the explicit `$core`
+/// parameter so per-`PyBridgeInstance` call paths can flow their own core
+/// through without routing via the process-global default. Sub-slices B-E
+/// update every call site.
 ///
 /// The affinity check is never blocked by transient lifecycle state
-/// (e.g., a suspended bridge) because `bridge_instance_for_affinity`
-/// intentionally bypasses the suspended guard.
+/// (e.g., a suspended bridge) because it is a pure `u64` comparison that
+/// does not touch transport or `ContextManager` state.
 ///
 /// # Example
 ///
 /// ```ignore
 /// #[pyfunction]
-/// pub fn example(handle: &SomeHandle) -> PyResult<()> {
-///     pyscp_check_handle!(handle);
+/// pub fn example(scp: &PyScp, handle: &SomeHandle) -> PyResult<()> {
+///     pyscp_check_handle!(&scp.inner.core, handle);
 ///     // ... real work ...
 ///     Ok(())
 /// }
 /// ```
 #[macro_export]
 macro_rules! pyscp_check_handle {
-    ($($handle:expr),+ $(,)?) => {{
-        let __core = $crate::runtime::bridge_instance_for_affinity()?;
+    ($core:expr, $($handle:expr),+ $(,)?) => {{
+        let __core: &$crate::runtime::CoreFields = $core;
         $(
             __core
                 .check_handle($handle.instance_id)
@@ -152,26 +152,17 @@ pub type ToolHandler =
 // ContextManager (shared, process-global)
 // ---------------------------------------------------------------------------
 
-/// Returns a reference to the shared [`ContextManager`] from the default
+/// Returns a reference to the shared [`ContextManager`] from the given
 /// bridge instance.
 ///
 /// Delegates to [`PyBridgeInstance::core`] → [`CoreFields::try_context_manager`].
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::ContextError` if the bridge has not been
-/// initialized via [`init_context_manager`], if the `ContextManager` has
-/// not been attached to the instance yet (i.e.,
-/// `ensure_bridge_instance` ran but `init_context_manager` has not), or if
-/// the bridge is currently suspended.
-pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
-    let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
-        ScpPyError::context(
-            "ContextManager not initialized — call py_context_create, \
-             py_context_join, py_context_import, or init_context_manager first"
-                .to_owned(),
-        )
-    })?;
+/// Returns `ScpPyError::ContextError` if the `ContextManager` has not been
+/// attached to the instance yet (i.e., `init_context_manager` has not been
+/// called), or if the bridge is currently suspended.
+pub fn context_manager(bi: &PyBridgeInstance) -> Result<&Arc<ContextManager>, ScpPyError> {
     // Suspended: return error (recoverable — caller should call resume()).
     // AlreadyShutDown: warn only. Shutdown already destroyed MLS groups,
     // cleared registries, and disconnected transport — operations will fail
@@ -540,6 +531,16 @@ impl PyBridgeInstance {
     #[must_use]
     pub const fn identity_registry(&self) -> &Arc<DashMap<String, IdentityEntry>> {
         &self.identity_registry
+    }
+
+    /// Returns a reference to the attached [`ContextManager`], if any.
+    ///
+    /// Convenience accessor that delegates to
+    /// [`CoreFields::try_context_manager`]. Returns `None` until
+    /// `init_context_manager` (or one of its variants) has been called.
+    #[must_use]
+    pub fn try_context_manager(&self) -> Option<&Arc<ContextManager>> {
+        self.core.try_context_manager()
     }
 
     /// Returns a reference to the storage provider if initialized.
@@ -1105,43 +1106,31 @@ fn build_context_manager(
 // DID resolver (global, production)
 // ---------------------------------------------------------------------------
 
-/// Returns the production DID resolver on the default bridge instance, if
+/// Returns the production DID resolver on the given bridge instance, if
 /// initialized.
 ///
-/// Reads the DID resolver slot on [`DEFAULT_BRIDGE_INSTANCE`]'s `CoreFields`.
-/// Returns `None` when the bridge has not been initialized or no resolver
-/// has been set.
+/// Reads the DID resolver slot on the [`PyBridgeInstance`]'s `CoreFields`.
+/// Returns `None` when no resolver has been set.
 #[must_use]
-pub fn did_resolver() -> Option<&'static Arc<scp_ffi_common::IdentityBackedDidResolver>> {
-    // SAFETY: DEFAULT_BRIDGE_INSTANCE is in a OnceLock<Arc<...>> which is
-    // 'static. The DID resolver inside CoreFields is in a OnceLock<Arc<...>>
-    // which is also 'static. The returned reference has 'static lifetime
-    // because both OnceLocks are static.
-    DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .and_then(|bi| bi.core.did_resolver())
+pub fn did_resolver(
+    bi: &PyBridgeInstance,
+) -> Option<&Arc<scp_ffi_common::IdentityBackedDidResolver>> {
+    bi.core.did_resolver()
 }
 
-/// Initializes the production DID resolver on the default bridge instance.
+/// Initializes the production DID resolver on the given bridge instance.
 ///
 /// Wraps any `scp_identity::resolver::DidResolver` implementation (typically
 /// `DualLayerResolver`) in an `IdentityBackedDidResolver` and stores it in
-/// the default `PyBridgeInstance`'s `CoreFields`.
-pub fn init_did_resolver<R>(resolver: Arc<R>, handle: tokio::runtime::Handle)
+/// the bridge instance's `CoreFields`.
+pub fn init_did_resolver<R>(bi: &PyBridgeInstance, resolver: Arc<R>, handle: tokio::runtime::Handle)
 where
     R: scp_identity::resolver::DidResolver + 'static,
 {
-    ensure_bridge_instance();
-    if let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() {
-        bi.core
-            .set_did_resolver(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
-                resolver, handle,
-            )));
-    } else {
-        tracing::error!(
-            "init_did_resolver called before PyBridgeInstance initialized — resolver not stored"
-        );
-    }
+    bi.core
+        .set_did_resolver(Arc::new(scp_ffi_common::IdentityBackedDidResolver::new(
+            resolver, handle,
+        )));
 }
 
 // ---------------------------------------------------------------------------
@@ -1253,38 +1242,18 @@ impl ContextEventLogProvider for NoOpEventLogProvider {
 // FfiBridgeState -- per-context FFI-specific state
 // ---------------------------------------------------------------------------
 
-/// Fallback empty FFI bridge state registry for when the default
-/// `PyBridgeInstance` has not been initialized yet.
-///
-/// Mirrors the `EMPTY_IDENTITY_REGISTRY` pattern introduced for the
-/// identity-registry migration. Used by [`ffi_state_registry`] to keep the
-/// existing free-function signatures infallible even when callers touch
-/// bridge state before `ensure_bridge_instance` runs.
-static EMPTY_FFI_BRIDGE_STATE: OnceLock<DashMap<String, FfiBridgeState>> = OnceLock::new();
-
-/// Returns a reference to the default bridge instance's FFI bridge state
+/// Returns a reference to the given bridge instance's FFI bridge state
 /// registry.
 ///
 /// Resolves the registry via the typed `ffi_bridge_state` field on the
-/// default [`PyBridgeInstance`]. Falls back to an empty registry when the
-/// default instance has not been initialized yet — matching the behaviour of
-/// the removed standalone `OnceLock<DashMap<...>>` (callers previously saw
-/// an empty registry on first touch; they still do).
+/// passed [`PyBridgeInstance`].
 ///
 /// Stores state that is NOT managed by [`ContextManager`]: tool registries,
 /// event logs, UCAN revocation/nonce tracking, tool handlers, and message
 /// channels. Context lifecycle state (membership, roles, governance,
 /// broadcast, TTL) lives in the `ContextManager`.
-///
-/// # Safety: Single-Tenant Only
-///
-/// The default instance's registry is process-global. See module-level
-/// documentation.
-fn ffi_state_registry() -> &'static DashMap<String, FfiBridgeState> {
-    DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
-        || EMPTY_FFI_BRIDGE_STATE.get_or_init(DashMap::new),
-        |bi| bi.ffi_bridge_state.as_ref(),
-    )
+pub(crate) fn ffi_state_registry(bi: &PyBridgeInstance) -> &DashMap<String, FfiBridgeState> {
+    bi.ffi_bridge_state.as_ref()
 }
 
 /// Per-context FFI-specific state that does NOT duplicate [`ContextManager`].
@@ -1368,13 +1337,14 @@ pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
 /// Returns `ScpPyError::ContextError` if the context ID is already registered
 /// or if role state creation fails.
 pub fn register_ffi_state(
+    bi: &PyBridgeInstance,
     context_id: &str,
     creator_did: &str,
     user_ceiling: &[String],
 ) -> Result<(), ScpPyError> {
     use dashmap::mapref::entry::Entry;
 
-    let map = ffi_state_registry();
+    let map = ffi_state_registry(bi);
 
     match map.entry(context_id.to_owned()) {
         Entry::Occupied(_) => {
@@ -1437,11 +1407,11 @@ pub fn register_ffi_state(
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found.
-pub fn with_ffi_state<T, F>(context_id: &str, f: F) -> Result<T, ScpPyError>
+pub fn with_ffi_state<T, F>(bi: &PyBridgeInstance, context_id: &str, f: F) -> Result<T, ScpPyError>
 where
     F: FnOnce(&mut FfiBridgeState) -> Result<T, ScpPyError>,
 {
-    let map = ffi_state_registry();
+    let map = ffi_state_registry(bi);
 
     let mut entry = map.get_mut(context_id).ok_or_else(|| {
         ScpPyError::context(format!(
@@ -1459,8 +1429,8 @@ where
 /// relay transport is not yet wired. Returns an empty Vec if no contexts
 /// match.
 #[must_use]
-pub fn context_ids_for_member(member_did: &str) -> Vec<String> {
-    ffi_state_registry()
+pub fn context_ids_for_member(bi: &PyBridgeInstance, member_did: &str) -> Vec<String> {
+    ffi_state_registry(bi)
         .iter()
         .filter(|entry| entry.value().role_state.members.contains(member_did))
         .map(|entry| entry.key().clone())
@@ -1480,11 +1450,12 @@ pub fn context_ids_for_member(member_did: &str) -> Vec<String> {
 /// Returns `ScpPyError::ContextError` if the context is not found or the
 /// tool is not registered in the context's `ToolRegistry`.
 pub fn register_tool_handler(
+    bi: &PyBridgeInstance,
     context_id: &str,
     tool_id: &str,
     handler: ToolHandler,
 ) -> Result<(), ScpPyError> {
-    with_ffi_state(context_id, |st| {
+    with_ffi_state(bi, context_id, |st| {
         // Verify the tool exists in the registry before accepting a handler.
         if st.tool_registry.get(tool_id).is_none() {
             return Err(ScpPyError::context(format!(
@@ -1504,17 +1475,13 @@ pub fn register_tool_handler(
 /// closes the receive channel and causes `__anext__` to raise
 /// `StopAsyncIteration`. Does not error if the context was not found
 /// (idempotent).
-pub fn remove_ffi_state(context_id: &str) {
-    ffi_state_registry().remove(context_id);
+pub fn remove_ffi_state(bi: &PyBridgeInstance, context_id: &str) {
+    ffi_state_registry(bi).remove(context_id);
     // Clean up known-context discovery entry via CoreFields.
-    if let Ok(bi) = bridge_instance() {
-        bi.core.remove_known_context(context_id);
-    }
+    bi.core.remove_known_context(context_id);
     // Clean up per-context bridge connector state and economy state via CoreFields.
-    if let Ok(bi) = bridge_instance() {
-        bi.core.remove_bridge_state(context_id);
-        bi.core.remove_economy_state(context_id);
-    }
+    bi.core.remove_bridge_state(context_id);
+    bi.core.remove_economy_state(context_id);
 }
 
 /// Re-syncs the `FfiBridgeState.role_state` for a context from the shared
@@ -1529,8 +1496,11 @@ pub fn remove_ffi_state(context_id: &str) {
 /// Returns `ScpPyError` if the context manager is not initialized, the
 /// context is not registered in either the manager or the FFI state registry,
 /// or the tokio runtime is unavailable.
-pub fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpPyError> {
-    let mgr = context_manager()?;
+pub fn sync_role_state_from_manager(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+) -> Result<(), ScpPyError> {
+    let mgr = context_manager(bi)?;
     let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
     let new_role_state = rt.block_on(mgr.get_role_state(context_id)).ok_or_else(|| {
         ScpPyError::context(format!(
@@ -1538,7 +1508,7 @@ pub fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpPyError> 
         ))
     })?;
 
-    with_ffi_state(context_id, |st| {
+    with_ffi_state(bi, context_id, |st| {
         st.role_state = new_role_state;
         Ok(())
     })
@@ -1556,8 +1526,8 @@ pub fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpPyError> 
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found.
-pub fn close_receive_channel(context_id: &str) -> Result<(), ScpPyError> {
-    with_ffi_state(context_id, |st| {
+pub fn close_receive_channel(bi: &PyBridgeInstance, context_id: &str) -> Result<(), ScpPyError> {
+    with_ffi_state(bi, context_id, |st| {
         st.message_tx.take();
         st.message_rx.take();
         Ok(())
@@ -1581,8 +1551,12 @@ pub fn close_receive_channel(context_id: &str) -> Result<(), ScpPyError> {
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found, has no
 /// active receive channel, or if the channel is closed.
-pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPyError> {
-    let (tx, rx_arc) = with_ffi_state(context_id, |st| {
+pub fn deliver_message(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    message: PyMessage,
+) -> Result<(), ScpPyError> {
+    let (tx, rx_arc) = with_ffi_state(bi, context_id, |st| {
         let tx = st.message_tx.clone().ok_or_else(|| {
             ScpPyError::context(format!(
                 "context '{context_id}' has no active receive channel \
@@ -1725,28 +1699,15 @@ where
 // Identity registry (SCP-214: KeyCustody wiring)
 // ---------------------------------------------------------------------------
 
-/// Returns the default bridge instance's identity registry.
+/// Returns the given bridge instance's identity registry.
 ///
 /// The registry is a typed `Arc<DashMap<String, IdentityEntry>>` field on
-/// [`PyBridgeInstance`]. `ensure_bridge_instance()` initializes
-/// `DEFAULT_BRIDGE_INSTANCE` if it is not yet set, so the registry is
-/// always real — there is no fallback empty map that writers could land in
-/// before a reader sees the instance registry (the H1 bug fixed in commit
-/// 10 of #1549 Phase 4 PR 2).
+/// [`PyBridgeInstance`] — always real, no fallback.
 ///
 /// The `DashMap` provides lock-free concurrent access matching the context
 /// registry pattern (ADR-006).
-fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
-    ensure_bridge_instance();
-    // `ensure_bridge_instance()` returns early if the instance is already
-    // set, otherwise it runs `OnceLock::get_or_init` to allocate one. The
-    // only `None` path left is a compiler-level `OnceLock` bug — treat that
-    // as unreachable. A panicking fallback matches the previous behavior
-    // on instance-poisoned paths (e.g. `context_manager()` after shutdown).
-    DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
-        || unreachable!("DEFAULT_BRIDGE_INSTANCE set by ensure_bridge_instance()"),
-        |bi| bi.identity_registry.as_ref(),
-    )
+pub(crate) fn identity_registry(bi: &PyBridgeInstance) -> &DashMap<String, IdentityEntry> {
+    bi.identity_registry.as_ref()
 }
 
 /// Retained identity state for a single DID.
@@ -1782,8 +1743,8 @@ pub struct IdentityEntry {
 /// provider and key handles.
 ///
 /// Overwrites any existing entry for the same DID (idempotent).
-pub fn register_identity(did: &str, entry: IdentityEntry) {
-    identity_registry().insert(did.to_owned(), entry);
+pub fn register_identity(bi: &PyBridgeInstance, did: &str, entry: IdentityEntry) {
+    identity_registry(bi).insert(did.to_owned(), entry);
 }
 
 /// Executes a closure with a reference to an identity's retained state.
@@ -1795,11 +1756,11 @@ pub fn register_identity(did: &str, entry: IdentityEntry) {
 /// # Errors
 ///
 /// Returns `ScpPyError::IdentityError` if the DID is not found.
-pub fn with_identity<T, F>(did: &str, f: F) -> Result<T, ScpPyError>
+pub fn with_identity<T, F>(bi: &PyBridgeInstance, did: &str, f: F) -> Result<T, ScpPyError>
 where
     F: FnOnce(&IdentityEntry) -> Result<T, ScpPyError>,
 {
-    let entry = identity_registry().get(did).ok_or_else(|| {
+    let entry = identity_registry(bi).get(did).ok_or_else(|| {
         ScpPyError::identity(format!(
             "identity '{did}' not found in registry \
              -- was it created with py_identity_create?"
@@ -1814,11 +1775,11 @@ where
 /// # Errors
 ///
 /// Returns `ScpPyError::IdentityError` if the DID is not found.
-pub fn with_identity_mut<T, F>(did: &str, f: F) -> Result<T, ScpPyError>
+pub fn with_identity_mut<T, F>(bi: &PyBridgeInstance, did: &str, f: F) -> Result<T, ScpPyError>
 where
     F: FnOnce(&mut IdentityEntry) -> Result<T, ScpPyError>,
 {
-    let mut entry = identity_registry().get_mut(did).ok_or_else(|| {
+    let mut entry = identity_registry(bi).get_mut(did).ok_or_else(|| {
         ScpPyError::identity(format!(
             "identity '{did}' not found in registry \
              -- was it created with py_identity_create?"
@@ -1834,16 +1795,16 @@ where
 /// crypto state before returning it. Without registry presence, a loaded
 /// identity would be a dangling handle (SCP-IDENT-1010).
 #[must_use]
-pub fn identity_registry_contains(did: &str) -> bool {
-    identity_registry().contains_key(did)
+pub fn identity_registry_contains(bi: &PyBridgeInstance, did: &str) -> bool {
+    identity_registry(bi).contains_key(did)
 }
 
 /// Removes an identity from the global registry.
 ///
 /// Called when an identity is migrated to a new DID. The old entry is
 /// removed and the new entry is registered under the new DID.
-pub fn remove_identity(did: &str) {
-    identity_registry().remove(did);
+pub fn remove_identity(bi: &PyBridgeInstance, did: &str) {
+    identity_registry(bi).remove(did);
 }
 
 // ---------------------------------------------------------------------------
@@ -1872,16 +1833,15 @@ pub fn remove_identity(did: &str) {
 /// Returns `ScpPyError::ValidationError` if the storage type is not
 /// recognized, or `ScpPyError::ContextError` if the bridge has not been
 /// initialized.
-pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
+pub fn init_storage(bi: &PyBridgeInstance, storage_type: &str) -> Result<(), ScpPyError> {
     match storage_type {
         "in_memory" => {
-            let bi = bridge_instance()?;
             // `init_in_memory_storage` returns an error if already set; match
             // the previous silent-no-op behaviour by converting already-set
             // to Ok (OnceLock semantics: first wins, subsequent silent).
             if bi.init_in_memory_storage().is_err() {
                 tracing::debug!(
-                    "init_storage: storage already initialized on default instance — reusing existing provider"
+                    "init_storage: storage already initialized on this instance — reusing existing provider"
                 );
             }
             Ok(())
@@ -1899,12 +1859,7 @@ pub fn init_storage(storage_type: &str) -> Result<(), ScpPyError> {
 /// Returns `ScpPyError::IdentityError` if storage has not been initialized
 /// via [`init_storage`], or `ScpPyError::ContextError` if the bridge has
 /// not been initialized.
-pub fn get_storage() -> Result<&'static StorageProvider, ScpPyError> {
-    let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
-        ScpPyError::identity(
-            "bridge not initialized — call identity_create before storage operations".to_owned(),
-        )
-    })?;
+pub fn get_storage(bi: &PyBridgeInstance) -> Result<&StorageProvider, ScpPyError> {
     bi.storage_provider().ok_or_else(|| {
         ScpPyError::identity(
             "storage not initialized — call py_init_storage(\"in_memory\") first".to_owned(),
@@ -1927,12 +1882,10 @@ pub fn get_storage() -> Result<&'static StorageProvider, ScpPyError> {
 ///
 /// Returns `ScpPyError::TransportError` if the transport manager lock is
 /// poisoned or the bridge is not initialized.
-pub fn set_transport_manager(manager: scp_transport::TransportManager) -> Result<(), ScpPyError> {
-    let bi = bridge_instance().map_err(|_| {
-        ScpPyError::transport(
-            "bridge not initialized — call identity_create before transport_connect".to_owned(),
-        )
-    })?;
+pub fn set_transport_manager(
+    bi: &PyBridgeInstance,
+    manager: scp_transport::TransportManager,
+) -> Result<(), ScpPyError> {
     bi.core
         .set_transport(Arc::new(manager))
         .map_err(|e| ScpPyError::transport(e.to_string()))
@@ -1947,11 +1900,9 @@ pub fn set_transport_manager(manager: scp_transport::TransportManager) -> Result
 /// Returns `ScpPyError::TransportError` if the lock is poisoned, no
 /// transport manager has been initialized, or the bridge is not initialized.
 pub fn with_transport_manager<T>(
+    bi: &PyBridgeInstance,
     f: impl FnOnce(&scp_transport::TransportManager) -> Result<T, ScpPyError>,
 ) -> Result<T, ScpPyError> {
-    let bi = bridge_instance().map_err(|_| {
-        ScpPyError::transport("no transport manager — call transport_connect first".to_owned())
-    })?;
     bi.core
         .with_transport(f)
         .map_err(|e| ScpPyError::transport(e.to_string()))?
@@ -1966,11 +1917,9 @@ pub fn with_transport_manager<T>(
 /// Returns `ScpPyError::TransportError` if the lock is poisoned, no
 /// transport manager has been initialized, or the bridge is not initialized.
 pub fn with_transport_manager_mut<T>(
+    bi: &PyBridgeInstance,
     f: impl FnOnce(&mut scp_transport::TransportManager) -> Result<T, ScpPyError>,
 ) -> Result<T, ScpPyError> {
-    let bi = bridge_instance().map_err(|_| {
-        ScpPyError::transport("no transport manager — call transport_connect first".to_owned())
-    })?;
     bi.core
         .with_transport_mut(f)
         .map_err(|e| ScpPyError::transport(e.to_string()))?
@@ -1978,8 +1927,8 @@ pub fn with_transport_manager_mut<T>(
 
 /// Returns `true` if a transport manager has been initialized.
 #[must_use]
-pub fn has_transport_manager() -> bool {
-    bridge_instance().is_ok_and(|bi| bi.core.has_transport())
+pub fn has_transport_manager(bi: &PyBridgeInstance) -> bool {
+    bi.core.has_transport()
 }
 
 /// Records a heartbeat suppression event for a relay, downgrading its
@@ -1989,10 +1938,7 @@ pub fn has_transport_manager() -> bool {
 /// `transport_connect` that drains the per-adapter suppression receiver
 /// (#1533 AC5). Silently no-ops if the bridge or transport manager has
 /// been cleared (e.g., after disconnect).
-pub fn record_suppression(relay_url: &str) {
-    let Ok(bi) = bridge_instance() else {
-        return;
-    };
+pub fn record_suppression(bi: &PyBridgeInstance, relay_url: &str) {
     let _ = bi.core.with_transport(|manager| {
         manager.update_score(relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
         Ok::<(), ScpPyError>(())
@@ -2008,12 +1954,7 @@ pub fn record_suppression(relay_url: &str) {
 ///
 /// Returns `ScpPyError::TransportError` if the transport manager lock is
 /// poisoned or the bridge is not initialized.
-pub fn clear_transport_manager() -> Result<(), ScpPyError> {
-    let bi = bridge_instance().map_err(|_| {
-        ScpPyError::transport(
-            "bridge not initialized — call identity_create before transport_disconnect".to_owned(),
-        )
-    })?;
+pub fn clear_transport_manager(bi: &PyBridgeInstance) -> Result<(), ScpPyError> {
     bi.core
         .clear_transport()
         .map_err(|e| ScpPyError::transport(e.to_string()))
@@ -2035,6 +1976,7 @@ pub fn clear_transport_manager() -> Result<(), ScpPyError> {
 ///
 /// Returns `ScpPyError::ContextError` if registration fails.
 pub fn register_context(
+    bi: &PyBridgeInstance,
     context_id: &str,
     creator_did: &str,
     user_ceiling: &[String],
@@ -2051,7 +1993,7 @@ pub fn register_context(
     init_context_manager(creator_did);
 
     // Register FFI-specific state.
-    register_ffi_state(context_id, creator_did, user_ceiling)
+    register_ffi_state(bi, context_id, creator_did, user_ceiling)
 }
 
 /// Backward-compatible alias for [`with_ffi_state`].
@@ -2064,16 +2006,20 @@ pub fn register_context(
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found, or
 /// propagates any error returned by the closure `f`.
-pub fn with_context<T, F>(context_id: &str, f: F) -> Result<T, ScpPyError>
+pub fn with_context<T, F>(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    f: F,
+) -> Result<T, ScpPyError>
 where
     F: FnOnce(&mut FfiBridgeState) -> Result<T, ScpPyError>,
 {
-    with_ffi_state(context_id, f)
+    with_ffi_state(bi, context_id, f)
 }
 
 /// Backward-compatible alias for [`remove_ffi_state`].
-pub fn remove_context(context_id: &str) {
-    remove_ffi_state(context_id);
+pub fn remove_context(bi: &PyBridgeInstance, context_id: &str) {
+    remove_ffi_state(bi, context_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -2104,15 +2050,12 @@ pub struct RegistryStats {
 /// state). Known contexts and transport status are read from the
 /// `BridgeInstance` (returns 0/false if the bridge is not initialized).
 #[must_use]
-pub fn registry_stats() -> RegistryStats {
-    let (known_count, relay_connected) = bridge_instance().map_or((0, false), |bi| {
-        (bi.core.known_context_count(), bi.core.has_transport())
-    });
+pub fn registry_stats(bi: &PyBridgeInstance) -> RegistryStats {
     RegistryStats {
-        contexts: ffi_state_registry().len(),
-        known_contexts: known_count,
-        identities: identity_registry().len(),
-        relay_connected,
+        contexts: ffi_state_registry(bi).len(),
+        known_contexts: bi.core.known_context_count(),
+        identities: identity_registry(bi).len(),
+        relay_connected: bi.core.has_transport(),
     }
 }
 
@@ -2133,8 +2076,12 @@ pub fn registry_stats() -> RegistryStats {
 ///
 /// Returns `(0, 0)` if the context is not registered.
 #[must_use]
-pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
-    let map = ffi_state_registry();
+pub fn query_trust_event_counts(
+    bi: &PyBridgeInstance,
+    context_id: &str,
+    _did: &str,
+) -> (u64, u64) {
+    let map = ffi_state_registry(bi);
     match map.get(context_id) {
         Some(entry) => {
             let total = entry.event_log.leaves().len() as u64;
@@ -2155,8 +2102,8 @@ pub fn query_trust_event_counts(context_id: &str, _did: &str) -> (u64, u64) {
 /// Provided as a cleanup mechanism for long-running processes alongside
 /// [`remove_identity`] which is unconditional.
 #[must_use]
-pub fn remove_identity_if_present(did: &str) -> bool {
-    identity_registry().remove(did).is_some()
+pub fn remove_identity_if_present(bi: &PyBridgeInstance, did: &str) -> bool {
+    identity_registry(bi).remove(did).is_some()
 }
 
 // Economy state is now owned by BridgeInstance. Callers access it via
@@ -2194,11 +2141,12 @@ mod tests {
     #[test]
     fn registry_stats_reflects_context_registration() {
         init_context_manager_for_test();
+        let bi = bridge_instance().unwrap();
         let ctx_id = unique_ctx_id("stats-ctx");
         let creator = "did:dht:z6MkStatsTest";
 
-        register_context(&ctx_id, creator, &[]).unwrap();
-        let stats = registry_stats();
+        register_context(bi, &ctx_id, creator, &[]).unwrap();
+        let stats = registry_stats(bi);
 
         // Verify that stats reports at least 1 context (our registered one).
         // Cannot assert exact counts due to parallel test interference.
@@ -2210,13 +2158,13 @@ mod tests {
 
         // Verify the specific entry exists via direct registry access.
         assert!(
-            ffi_state_registry().contains_key(&ctx_id),
+            ffi_state_registry(bi).contains_key(&ctx_id),
             "registered context should be in registry"
         );
 
-        remove_context(&ctx_id);
+        remove_context(bi, &ctx_id);
         assert!(
-            !ffi_state_registry().contains_key(&ctx_id),
+            !ffi_state_registry(bi).contains_key(&ctx_id),
             "removed context should not be in registry"
         );
     }
@@ -2225,6 +2173,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     fn registry_stats_reflects_identity_registration() {
         init_context_manager_for_test();
+        let bi = bridge_instance().unwrap();
         let did = "did:dht:z6MkStatsIdentityUnique9988";
 
         let entry = IdentityEntry {
@@ -2241,8 +2190,8 @@ mod tests {
             document: test_did_document(did),
             identity_link_attestations: Vec::new(),
         };
-        register_identity(did, entry);
-        let stats = registry_stats();
+        register_identity(bi, did, entry);
+        let stats = registry_stats(bi);
 
         assert!(
             stats.identities >= 1,
@@ -2250,13 +2199,13 @@ mod tests {
             stats.identities,
         );
         assert!(
-            identity_registry().contains_key(did),
+            identity_registry(bi).contains_key(did),
             "registered identity should be in registry"
         );
 
-        remove_identity(did);
+        remove_identity(bi, did);
         assert!(
-            !identity_registry().contains_key(did),
+            !identity_registry(bi).contains_key(did),
             "removed identity should not be in registry"
         );
     }
@@ -2276,7 +2225,7 @@ mod tests {
         };
 
         register_known_context(&ctx_id, known);
-        let stats = registry_stats();
+        let stats = registry_stats(bi);
 
         assert!(
             stats.known_contexts >= 1,
@@ -2290,8 +2239,8 @@ mod tests {
 
         // remove_ffi_state clears both registries (FFI state + known contexts).
         // Register FFI state first so remove_ffi_state has something to remove.
-        let _ = register_ffi_state(&ctx_id, "did:dht:z6MkStatsKnown", &[]);
-        remove_ffi_state(&ctx_id);
+        let _ = register_ffi_state(bi, &ctx_id, "did:dht:z6MkStatsKnown", &[]);
+        remove_ffi_state(bi, &ctx_id);
         assert!(
             !bi.core.has_known_context(&ctx_id),
             "removed known context should not be in BridgeInstance"
@@ -2302,6 +2251,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     fn remove_identity_if_present_returns_true_when_found() {
         init_context_manager_for_test();
+        let bi = bridge_instance().unwrap();
         let did = "did:dht:z6MkRemoveIfPresent";
         let entry = IdentityEntry {
             identity: ScpIdentity {
@@ -2317,21 +2267,23 @@ mod tests {
             document: test_did_document(did),
             identity_link_attestations: Vec::new(),
         };
-        register_identity(did, entry);
-        assert!(remove_identity_if_present(did));
+        register_identity(bi, did, entry);
+        assert!(remove_identity_if_present(bi, did));
     }
 
     #[test]
     fn remove_identity_if_present_returns_false_when_not_found() {
         init_context_manager_for_test();
-        assert!(!remove_identity_if_present("did:dht:z6MkNotPresent9999"));
+        let bi = bridge_instance().unwrap();
+        assert!(!remove_identity_if_present(bi, "did:dht:z6MkNotPresent9999"));
     }
 
     #[test]
     fn registry_stats_returns_all_fields() {
         init_context_manager_for_test();
+        let bi = bridge_instance().unwrap();
         // Verifies the struct shape and that registry_stats() doesn't panic.
-        let stats = registry_stats();
+        let stats = registry_stats(bi);
         // Destructure to catch struct changes at compile time. If a field is
         // added or removed, this will fail to compile.
         let RegistryStats {
@@ -2350,28 +2302,34 @@ mod tests {
     #[test]
     fn context_manager_initializes_once() {
         init_context_manager_for_test();
-        let mgr1 = context_manager().unwrap();
+        let bi = bridge_instance().unwrap();
+        let mgr1 = context_manager(bi).unwrap();
         init_context_manager_for_test();
-        let mgr2 = context_manager().unwrap();
+        let mgr2 = context_manager(bi).unwrap();
         // Same Arc (same pointer).
         assert!(Arc::ptr_eq(mgr1, mgr2));
     }
 
     #[test]
     fn with_ffi_state_finds_registered_context() {
+        init_context_manager_for_test();
+        let bi = bridge_instance().unwrap();
         let ctx_id = unique_ctx_id("ffi-find");
         let creator = "did:dht:z6MkFfiFind";
-        register_context(&ctx_id, creator, &[]).unwrap();
+        register_context(bi, &ctx_id, creator, &[]).unwrap();
 
-        let creator_did = with_ffi_state(&ctx_id, |st| Ok(st.creator_did.clone())).unwrap();
+        let creator_did =
+            with_ffi_state(bi, &ctx_id, |st| Ok(st.creator_did.clone())).unwrap();
         assert_eq!(creator_did, creator);
 
-        remove_context(&ctx_id);
+        remove_context(bi, &ctx_id);
     }
 
     #[test]
     fn with_ffi_state_errors_on_missing_context() {
-        let result = with_ffi_state("nonexistent-ctx-id", |_| Ok(()));
+        init_context_manager_for_test();
+        let bi = bridge_instance().unwrap();
+        let result = with_ffi_state(bi, "nonexistent-ctx-id", |_| Ok(()));
         assert!(result.is_err());
     }
 
@@ -2383,6 +2341,8 @@ mod tests {
     /// raw string.
     #[test]
     fn user_ceiling_strings_converted_to_ucan_format() {
+        init_context_manager_for_test();
+        let bi = bridge_instance().unwrap();
         let ctx_id = unique_ctx_id("ceiling-conv");
         let creator = "did:dht:z6MkCeilingConv";
 
@@ -2393,9 +2353,10 @@ mod tests {
             "tool:invoke:calculator".to_owned(),
         ];
 
-        register_context(&ctx_id, creator, &user_ceiling).unwrap();
+        register_context(bi, &ctx_id, creator, &user_ceiling).unwrap();
 
-        let ceiling = with_ffi_state(&ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
+        let ceiling =
+            with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
 
         // Compound resources must have underscores joining their segments.
         assert!(
@@ -2425,19 +2386,22 @@ mod tests {
             "raw 'context:child:create' should not be in ceiling: {ceiling:?}"
         );
 
-        remove_context(&ctx_id);
+        remove_context(bi, &ctx_id);
     }
 
     /// When no user ceiling is provided (empty slice), the default ceiling
     /// should be used with proper UCAN underscore format.
     #[test]
     fn empty_user_ceiling_uses_default_in_ucan_format() {
+        init_context_manager_for_test();
+        let bi = bridge_instance().unwrap();
         let ctx_id = unique_ctx_id("ceiling-default");
         let creator = "did:dht:z6MkCeilingDefault";
 
-        register_context(&ctx_id, creator, &[]).unwrap();
+        register_context(bi, &ctx_id, creator, &[]).unwrap();
 
-        let ceiling = with_ffi_state(&ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
+        let ceiling =
+            with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
 
         // Default ceiling must include tool_invoke:* (not tool:invoke:*).
         assert!(
@@ -2449,7 +2413,7 @@ mod tests {
             "default ceiling should not contain raw 'tool:invoke:*': {ceiling:?}"
         );
 
-        remove_context(&ctx_id);
+        remove_context(bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2464,8 +2428,8 @@ mod tests {
         // being called (possibly by other tests) before asserting.
         init_context_manager_for_test();
 
-        let cm = context_manager().expect("context_manager should be initialized");
         let bi = bridge_instance().expect("bridge_instance should be initialized");
+        let cm = context_manager(bi).expect("context_manager should be initialized");
 
         // Both should point to the same ContextManager allocation.
         assert!(
