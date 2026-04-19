@@ -317,7 +317,9 @@ pub struct CostSchedule {
 }
 ```
 
-**Tool-level costs**: declared in tool registration (§5.4), additive with context costs. A tool calling an external API can pass through its cost. Tool costs carry their own payee DID (may differ from context payee).
+**Outlet-level costs**: declared in outlet registration (§5.4), additive with context costs. An outlet calling an external API can pass through its cost. Outlet costs carry their own payee DID (may differ from context payee).
+
+**Query outlet cost contract (§5.4.2).** A Query outlet's registered cost MUST be absent or zero. This is a structural floor enforced at registration time. Separately, the runtime guarantees that any Query invocation incurs at most one charge per `(invoker_did, SHA-256(canonical_jcs(input)), epoch_window)` via the shared operator-signed cache (§5.4.3). When the floor is combined with the at-most-once guarantee, the practical contract is "Query outlets are free"; the at-most-once statement is stated explicitly so that future evolution cannot smuggle paid reads in without breaking the invariant. Action outlets (§5.4.2) have no such contract — each invocation may be charged independently subject to the normal cost schedule.
 
 **Relay-level costs**: declared in `.well-known/scp` `relay_config` (§18.3.3 extension). Separate economic relationship from in-context pricing — relay charges for transport, context charges for participation.
 

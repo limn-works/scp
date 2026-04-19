@@ -182,3 +182,30 @@ Context tools:             Admin's agent MCP surface:    Member's agent MCP surf
 **MCP provides the local wiring. SCP provides the social infrastructure.** MCP solves "how does an AI model connect to tools on this machine." SCP solves "how do those tools exist in a multi-party, trust-evaluated, persistent, access-controlled social space." MCP has no identity, trust, multi-party coordination, or persistence. SCP provides all of these. Together, they give any MCP-speaking model access to SCP's social infrastructure without either protocol needing to change.
 
 **BYOA benefit.** "Bring your own agent" (§4.4) means users choose their own AI model. MCP compatibility means any MCP-speaking model works — Claude, GPT, Gemini, open-source local models, or anything future. The SCP agent handles protocol mechanics. The model handles reasoning. The user chooses both independently.
+
+### 8.5.1 MCP ↔ SCP Boundary Translation
+
+SCP uses **outlet** (§5.4) where MCP uses **tool**. The two words describe the same wire shape — stateless input→output functions gated by schema and capability — but SCP's context-centric vocabulary conflicts with MCP's agent-centric vocabulary when they meet at the boundary. The `scp-mcp` crate (`crates/scp-mcp/`) is a purely lexical translator: it rewrites identifiers and JSON Schema field names in one direction on each hop, preserving structure, semantics, and wire order. No state is kept across translations. No semantics are changed. Translation is mechanical and bidirectional by construction.
+
+```
+MCP side                                SCP side
+───────────────────────────────────     ─────────────────────────────────
+tools/list            →  outlet list        (ctx.outlets.list)
+tools/call            →  outlet invoke      (ctx.outlets.invoke)
+tool.name             →  outlet_id
+tool.description      →  description
+tool.inputSchema      →  schema.input
+tool.outputSchema     →  schema.output
+tools/list_changed    →  OutletUpdated / OutletRegistered / OutletDeregistered
+CallToolRequest       →  OutletStreamOpen (non-streaming: single-chunk collapse)
+CallToolResult        →  collected stream  (Data + End chunks flattened)
+isError               →  OutletError envelope (§5.4.4)
+```
+
+**Kind projection (§5.4.2).** MCP has no concept of Query/Action. When SCP outlets are exposed over MCP, the translator prefixes `outlet_id` with `query/` or `call/` in the MCP-facing view so MCP-consuming models can tell them apart lexically (e.g., the SCP outlet `current_weather` with `kind: Query` surfaces as MCP tool `query/current_weather`). When MCP tools are exposed into SCP, the translator defaults `kind: Action` unless the upstream MCP server advertises the SCP-specific `x-scp-kind` JSON Schema extension.
+
+**Streaming projection (§5.4.5).** MCP today uses synchronous call/result. The translator collects chunks on the SCP side before responding to MCP. Streaming-aware MCP extensions (if standardized) can be mapped to SCP's `OutletStreamChunk` at a later revision; the wire types (`OutletStreamOpen/Chunk/Credit`) are already defined to accommodate direct mapping.
+
+**Error projection (§5.4.4).** SCP `OutletError` envelopes are surfaced to MCP clients as `CallToolResult { isError: true, content: [...] }` with the SCP error code encoded in a `meta.scp_error_code` field so that MCP clients aware of SCP can recover structured data. The `source_chain` is preserved as `meta.scp_source_chain` — lossy for MCP-only clients, round-trippable for SCP-aware ones.
+
+**Why a lexical translator and not protocol unification.** MCP is an ecosystem with upstream that SCP does not control. Forcing MCP clients to adopt SCP's vocabulary would mean no MCP-speaking agent could talk to SCP without SCP-specific code. Forcing SCP to use MCP's vocabulary would pin SCP's semantics to an external spec's naming decisions. The lexical translator at the boundary lets both vocabularies stay stable and lets the SCP core use the context-centric word that matches its security model.

@@ -726,6 +726,74 @@ Consequence mechanisms transform "do I trust this agent to behave?" into "are th
 
 **Economic consequences** compose with participation consequences. Contexts with economic policy (§19.3) add a cost tier: escalating pricing via `SenderVelocity` (§19.7) makes high-velocity behavior increasingly expensive before participation consequences trigger. Economic and participation tiers operate independently — an agent might exhaust its spending UCAN before participation suspension, or vice versa.
 
+### 7.3.8 Invocation Caveats
+
+UCAN delegations for outlet invocation (§5.4) carry **invocation caveats** — structured, typed constraints on how a delegated capability may be exercised. Caveats live in the UCAN `nb` (not-before / attestation) field and attenuate the raw `outlet_query:*` / `outlet_call:*` capability with call-site-specific limits.
+
+**Design constraint: no DSL.** Caveats are a fixed set of typed fields, not an expression language. A DSL on delegated tokens is a parser-differential attack surface, a complexity multiplier for every SDK, and a future-compat hazard (every new operator must roll out to every SDK before the token can be honored). The fixed-field design keeps the caveat verifier small enough to fuzz to saturation and keeps delegation semantics legible to auditors.
+
+**Caveat fields.**
+
+```
+InvocationCaveats {
+  amount_max_per_call:     Option<Amount>,           // per-invocation economic ceiling (§19)
+  amount_max_cumulative:   Option<Amount>,           // cumulative ceiling across invocations
+  valid_from:              Option<u64>,              // Unix seconds; tighter than UCAN nbf
+  valid_until:             Option<u64>,              // Unix seconds; tighter than UCAN exp
+  hours_of_day:            Option<u32>,              // UTC hour bitmask; bit i = hour i allowed
+  days_of_week:            Option<u8>,               // bitmask; bit 0 = Sunday, bit 6 = Saturday
+  max_calls:               Option<u64>,              // absolute invocation cap
+  rate_window:             Option<RateWindow>,       // sliding-window rate cap
+  input_schema:            Option<JSONSchema>,       // partial schema narrowing the parent's
+                                                     // input_schema; see narrowing rules below
+  allowed_adapters:        Option<Vec<PaymentAdapterId>>,  // restrict adapters; (§19.2)
+  allowed_target_dids:     Option<Vec<DID>>,         // restrict which peer DIDs may be
+                                                     // invoked via cross-context outlets (§6.2)
+}
+
+RateWindow {
+  max:         u32,   // maximum calls within the window
+  window_secs: u32,   // sliding window length in seconds; range [1, 86400]
+}
+```
+
+**Absent field = unconstrained.** An `Option::None` field means "parent's setting applies." Attenuation narrows by transitioning absent → present or by tightening a present bound. Widening is rejected.
+
+**Attenuation (`narrow`).** At each delegation step, the child's caveat set is validated against the parent's. The child is admissible iff, for every field:
+
+- `amount_max_per_call`, `amount_max_cumulative`, `max_calls`, `rate_window.max`: child value MUST be `<=` parent value (or child MAY introduce a bound where parent had none).
+- `valid_from`: child MUST be `>=` parent.
+- `valid_until`: child MUST be `<=` parent.
+- `hours_of_day`, `days_of_week`: child MUST be a subset (`child & parent == child`).
+- `rate_window.window_secs`: child MUST be `<=` parent (shorter window = stricter).
+- `allowed_adapters`, `allowed_target_dids`: child list MUST be a subset of parent's list; child MAY introduce a list where parent had none.
+- `input_schema`: conservative syntactic narrowing only (see below).
+
+**Conservative JSON Schema narrowing.** The only admissible narrowing keywords are: `enum`, `const`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `required`, and `additionalProperties: false`. Any other keyword appearing newly in the child's `input_schema` triggers `OutletErrorClass::Authorization::AttenuationViolation`. Semantic schema subsumption is undecidable in general; conservative syntactic subsetting is what delegating SDKs can implement correctly and auditors can check by eye.
+
+**Mint limits.** At token mint time, the issuing SDK MUST enforce the following structural bounds:
+
+| Limit | Bound |
+|-------|-------|
+| Caveats per attestation | ≤ 8 |
+| `input_schema` serialized size | ≤ 4 KiB |
+| `input_schema` nesting depth | ≤ 8 |
+| List-typed field length (`allowed_adapters`, `allowed_target_dids`, `enum`) | ≤ 16 entries |
+
+Mints that exceed these limits are rejected at the SDK boundary with `SCP-TOOL-6114` (`caveat-mint-limit-exceeded`). The limits exist so that caveat parsing has predictable cost and cannot be turned into a DoS vector via pathologically large attestations.
+
+**Runtime enforcement pipeline.** Caveats are enforced at three points in the UCAN validation pipeline:
+
+- **Step 7b (attenuation), inside `verify_attenuation`.** Each delegation step checks the caveat narrowing rules above in addition to the capability subset check. Adds no new validator; extends the existing attenuation pass.
+- **Step 11b (time-box), inside `validate_ucan`.** After `exp > now` and `nbf <= now`, the validator checks `valid_from <= now <= valid_until`, `hours_of_day & (1 << current_utc_hour) != 0`, `days_of_week & (1 << current_utc_weekday) != 0`. Failure returns `OutletErrorClass::Authorization::TimeBoxViolation`.
+- **Post-input checks, inside `invoke_outlet`.** After input schema validation, the runtime checks `input_schema` conformance, `amount_max_per_call` against the computed invocation cost, `allowed_adapters` against the negotiated adapter, `allowed_target_dids` against the cross-context target, and consults `CaveatCounterStore` for `max_calls`, `amount_max_cumulative`, and `rate_window`.
+
+**`CaveatCounterStore`.** A sibling of `NonceTracker` (§9.5). Keyed by `(ucan_cid, caveat_kind)`, holds `u64` counters for `max_calls`, `amount_max_cumulative`, and sliding-window rate counters. Atomic compare-and-swap semantics prevent racing invocations from double-spending a capacity. The counter store is durable (survives restarts) and is persisted under `context/{id}/caveat_counters/{ucan_cid}` per §17.3.
+
+**Interaction with other access-control layers.** Caveats are an additive deny-surface. They never widen: they compose with `SpendingCapability` (§19.5), `MemberBudgetTracker` (§19.3), `InboundPolicy`, and `OutboundPolicy` (§6.2) under logical AND. An invocation proceeds iff every layer admits it. For cross-context calls, the effective guard is `OutboundPolicy ∧ InboundPolicy ∧ caveat`. A widened caveat cannot open a capability that any other layer closes.
+
+**Revocation granularity.** Revocation is whole-token: a `UcanRevocation` event (per §7.2.1 step 10) invalidates the entire token, including all its caveats. There is NO per-caveat revocation. The rationale is simplicity — per-caveat revocation would require a second-class revocation ledger keyed by `(ucan_cid, caveat_index)` that nothing else in the protocol uses. If an operator needs to narrow a capability, they revoke and re-issue.
+
 ## 7.4 Layer 3: Attestation Authenticity
 
 Attestations are signed claims by identities about something. The protocol verifies their authenticity — that the claim was really made by the stated issuer — but not their truth.

@@ -113,41 +113,55 @@ When a context uses the `governed` ceiling policy and a ceiling change is approv
 4. **Activation.** After the notification period expires, the new ceiling takes effect. A `CeilingChanged` event is recorded with the old ceiling hash, new ceiling, and the governance proposal ID.
 5. **Retroactive UCAN validation.** After ceiling change activation, UCANs that reference capabilities no longer in the ceiling are automatically invalidated. The SDK MUST re-validate all cached UCANs against the new ceiling on the next action attempt.
 
-## 5.4 Tools
+## 5.4 Outlets
 
-Contexts provide tools: stateless functions that agents invoke. Tools have no identity, no agency, no ability to initiate. They take input and return output. They are scoped to their context and cannot span contexts.
+Contexts provide **outlets**: stateless functions that agents invoke. Outlets have no identity, no agency, no ability to initiate. They take input and return output. They are scoped to their context and cannot span contexts.
 
-Tools are the protocol's answer to "what about bots?" — anything that would have been a bot in a traditional system is a tool in SCP. The critical difference: tools cannot act, only respond. All agency flows through accountable agents.
+Outlets are the protocol's answer to "what about bots?" — anything that would have been a bot in a traditional system is an outlet in SCP. The critical difference: outlets cannot act, only respond. All agency flows through accountable agents.
 
-Tool registrations include:
+**Terminology rationale.** The protocol uses "outlet" where ecosystems such as MCP and function-calling LLMs use "tool". The two words describe the same wire shape (stateless input→output functions gated by schema and capability) but carry different connotations. "Tool" is agent-centric — an instrument an agent wields. "Outlet" is context-centric — a socket the context exposes, which the context governs. SCP's security boundary is the context, not the agent, so the context-centric word is the one that matches the protocol's invariants. The rename is a hard break: there are no deprecation aliases, no migration period. External interop surfaces that use the MCP vocabulary (§8.5) translate lexically at the boundary in `scp-mcp`; inside SCP everything is an outlet.
 
+Outlet registrations include:
+
+- **Kind.** `OutletKind::Query` (read-only, idempotent, cacheable) or `OutletKind::Action` (may mutate, never cached). See §5.4.2. The default is `Action` — fail-safe.
 - **Schema.** Input and output types (MCP-compatible JSON Schema — see §8.5). Machine-readable, self-documenting.
-- **Implementation hash.** Content-addressable reference to the tool's implementation. Any change to the implementation produces a new hash.
-- **Test vectors.** Known input-output pairs that define correct behavior. Any agent can call the tool with test inputs and verify outputs match. This enables continuous integrity verification (§7.3.3).
-- **Operator DID.** The identity accountable for the tool. Tool misbehavior traces to this DID.
-- **Cost metadata (optional).** Per-invocation cost declared by the tool via a `ToolCost` struct (§5.4.1), additive with context-level costs (§19.3). A tool calling an external API can pass through its cost. Tool costs carry their own payee DID, which may differ from the context payee. Tools without cost metadata are free.
+- **Implementation hash.** Content-addressable reference to the outlet's implementation. Any change to the implementation produces a new hash.
+- **Test vectors.** Known input-output pairs that define correct behavior. Any agent can call the outlet with test inputs and verify outputs match. This enables continuous integrity verification (§7.3.3).
+- **Operator DID.** The identity accountable for the outlet. Outlet misbehavior traces to this DID.
+- **Cost metadata (optional).** Per-invocation cost declared by the outlet via an `OutletCost` struct (§5.4.1), additive with context-level costs (§19.3). An outlet calling an external API can pass through its cost. Outlet costs carry their own payee DID, which may differ from the context payee. Outlets without cost metadata are free. Query outlets MUST declare either no cost or a zero-amount cost (§5.4.2 structural floor).
 
-Tool mutations (implementation hash change, schema modification, test vector update) are recorded in the context's verifiable event log (§7.3.1). Silent tool modification is not possible — any change is visible to all context members.
+Outlet mutations (implementation hash change, schema modification, test vector update, kind change) are recorded in the context's verifiable event log (§7.3.1). Silent outlet modification is not possible — any change is visible to all context members.
 
-### 5.4.1 Tool Registration Wire Format
+### 5.4.1 Outlet Registration Wire Format
 
-Tool registrations are serialized as MessagePack (§17.5) and stored in the context's tool registry. The canonical structure:
+Outlet registrations are serialized as MessagePack (§17.5) and stored in the context's outlet registry. The canonical structure:
 
 ```
-ToolRegistration {
-  tool_id:          String,          // Unique within the context. Format: [a-z0-9_-], max 128 chars.
+OutletRegistration {
+  outlet_id:        String,          // Unique within the context. Format: [a-z0-9_-], max 128 chars.
+  kind:             OutletKind,      // Query or Action. See §5.4.2.
   name:             String,          // Human-readable name. Max 256 UTF-8 bytes.
-  description:      String,          // Tool description. Max 4096 UTF-8 bytes.
-  operator_did:     DID,             // The identity accountable for this tool.
+  description:      String,          // Outlet description. Max 4096 UTF-8 bytes.
+  operator_did:     DID,             // The identity accountable for this outlet.
   schema: {
     input:          JSONSchema,      // MCP-compatible JSON Schema for input. Max 64 KiB serialized.
     output:         JSONSchema,      // MCP-compatible JSON Schema for output. Max 64 KiB serialized.
+                                     // MAY carry an `x-scp-query-ttl-secs` integer extension for
+                                     // Query outlets (§5.4.2 cache TTL).
+    aggregate_schema: Option<JSONSchema>, // Schema for the final aggregate value produced by a
+                                     // streamed invocation (§5.4.5). Max 64 KiB serialized.
+                                     // Absent = aggregate defaults to the final Data chunk.
   },
-  implementation_hash: [u8; 32],    // SHA-256 of the tool's implementation artifact (see below).
+  implementation_hash: [u8; 32],    // SHA-256 of the outlet's implementation artifact (see below).
   test_vectors:     Vec<TestVector>, // Known input-output pairs. Min 0, max 100.
-  cost:             Option<ToolCost>, // Per-invocation cost (§19.3).
+  cost:             Option<OutletCost>, // Per-invocation cost (§19.3). Query outlets: amount == 0.
   registered_at:    u64,             // Unix timestamp (seconds) of registration.
   signature:        Ed25519Signature, // Operator DID signs all fields except signature.
+}
+
+OutletKind {
+  Query,   // Read-only, idempotent, cacheable. ReadOnlyInvocation guard applies (§5.4.2).
+  Action,  // May mutate context state. Never cached.
 }
 
 TestVector {
@@ -157,7 +171,7 @@ TestVector {
   description:      String,          // Human-readable description of what this tests. Max 4096 UTF-8 bytes.
 }
 
-ToolCost {
+OutletCost {
   amount:           Amount,          // Cost per invocation in smallest currency unit.
   currency:         CurrencyCode,    // ISO 4217 or protocol-defined.
   payee:            DID,             // Who receives payment. May differ from operator_did.
@@ -165,18 +179,230 @@ ToolCost {
 }
 ```
 
-**Implementation hash target.** The `implementation_hash` is `SHA-256(canonical_artifact)` where `canonical_artifact` depends on the tool type:
+**Implementation hash target.** The `implementation_hash` is `SHA-256(canonical_artifact)` where `canonical_artifact` depends on the outlet type:
 
-| Tool type | Hash target | Description |
+| Outlet type | Hash target | Description |
 |-----------|-------------|-------------|
 | Statically deployed (WASM, container) | SHA-256 of the binary artifact | The compiled WASM module or container image digest. Deterministic builds ensure the hash is reproducible. |
 | Source-available | SHA-256 of the source archive | A tar.gz of the source tree, files sorted lexicographically, normalized line endings (LF). |
-| Remote service (API-backed) | SHA-256 of the OpenAPI/JSON Schema spec | The canonical JSON serialization (RFC 8785) of the tool's API specification. |
+| Remote service (API-backed) | SHA-256 of the OpenAPI/JSON Schema spec | The canonical JSON serialization (RFC 8785) of the outlet's API specification. |
 | LLM-backed (non-deterministic) | SHA-256 of the system prompt + model identifier | `SHA-256(model_id || ":" || system_prompt_utf8)`. Changes to the model or system prompt change the hash. |
 
 The hash target type is NOT stored in the registration — the operator chooses what constitutes their implementation artifact. The hash provides a change-detection mechanism, not a verification mechanism. Verifiers detect changes (hash differs from registration); they do not verify what the hash covers.
 
-**Signature scope.** The operator signs `SHA-256("SCP-TOOL-REGISTRATION-V1:" || tool_id || name || operator_did || schema_hash || implementation_hash || test_vectors_hash || cost_hash || registered_at)` where `schema_hash = SHA-256(MessagePack(schema))`, `test_vectors_hash = SHA-256(MessagePack(test_vectors))`, and `cost_hash = SHA-256(MessagePack(cost))` (or `SHA-256(0x00)` if absent).
+**Signature scope.** The operator signs `SHA-256("SCP-OUTLET-REGISTRATION-V2:" || outlet_id || kind_byte || name || operator_did || schema_hash || implementation_hash || test_vectors_hash || cost_hash || registered_at)` where `kind_byte` is `0x00` for Query and `0x01` for Action, `schema_hash = SHA-256(MessagePack(schema))`, `test_vectors_hash = SHA-256(MessagePack(test_vectors))`, and `cost_hash = SHA-256(MessagePack(cost))` (or `SHA-256(0x00)` if absent). The `V2` suffix and `kind_byte` inclusion together constitute the break from the prior `SCP-TOOL-REGISTRATION-V1` domain; pre-migration signatures are not honored.
+
+### 5.4.2 Outlet Classification (Query vs Action)
+
+Outlets declare their semantic class at registration time. Classification is structural, not advisory — the runtime enforces it.
+
+**`OutletKind::Query`** — read-only, idempotent, cacheable.
+
+- **Structural floor at registration.** `cost == None || cost.amount == 0`. A Query outlet MUST NOT declare a positive per-invocation cost. Declaring a positive cost at registration is a validation failure (`OutletErrorClass::Protocol::QueryCostViolation`). Registrations that fail this check are rejected before they reach the event log.
+- **ReadOnlyInvocation guard at invocation.** The runtime invokes Query outlets through a `ReadOnlyInvocation` handle that denies writes to context state (messages, roles, registry, event log, governance, economic ledgers). Any attempt by an executor to mutate through this handle returns `OutletErrorClass::Protocol::QueryViolation`.
+- **Cacheable.** Query results are stored in a shared per-context operator-signed cache (§5.4.3). Cache invalidation is automatic on `OutletUpdated` (via `implementation_hash`) and on `OutletVerified { integrity_ok: false }`.
+- **Query-with-declared-cost is permitted but capped.** An outlet registered with cost amount `> 0` MUST be `Action`. Operators who want a paid read-only interface (e.g., a metered data lookup) declare it as `Action` and rely on the application layer to advertise semantics. The protocol contract is: a Query invocation incurs at most one charge per `(invoker_did, SHA-256(canonical_jcs(input)), epoch_window)`. Because Query outlets register with zero cost, this contract degenerates to "no charge"; it is stated as a general rule so that future evolution cannot smuggle metered reads in without breaking the invariant.
+- **UCAN stem.** `outlet_query:{outlet_id}` or `outlet_query:*`.
+- **Chain depth (§6.2).** Query cross-context calls use the full `ContextParams::max_chain_depth` budget (default 8, range [1, 255]).
+- **Rate tiers (§6.2.0.2).** Query per-interface default 600/min, per-caller default 100/min.
+
+**`OutletKind::Action`** — may mutate, never cached.
+
+- No structural cost floor; Action outlets may declare any cost.
+- No ReadOnlyInvocation guard; Action executors may mutate context state through SDK-provided handles subject to role and capability checks.
+- Never cached. Each invocation runs fresh.
+- **UCAN stem.** `outlet_call:{outlet_id}` or `outlet_call:*`.
+- **Chain depth.** Action cross-context calls use `max(1, max_chain_depth / 2)` as their budget. Default 4 when `max_chain_depth` is default 8.
+- **Rate tiers.** Action per-interface default 60/min, per-caller default 10/min (identical to the pre-classification baseline).
+
+**Default.** `OutletKind::Action` is the default when `kind` is absent in an otherwise-valid registration (fail-safe). SDKs SHOULD surface `kind` as a required field in application APIs even though the wire format tolerates absence.
+
+**Chain amplification rule (§6.2).** A Query outlet invocation MUST NOT transitively invoke any Action outlet through cross-context hops. The reverse is permitted — an Action invocation MAY transitively invoke Query outlets. The runtime enforces this at the cross-context consent gate (§6.2.0.1): on every hop, the runtime checks `hop.kind` against the originating request's `kind` and rejects Query→Action amplification with `OutletErrorClass::Authorization::AmplificationViolation`. This prevents a "free" read from being laundered into a paid write.
+
+**Misdeclaration signal.** Any invocation that trips `QueryViolation` at runtime (an executor attempted a write inside a ReadOnlyInvocation) is recorded as an operator-attributable signal: the `OutletVerified` event for that outlet carries `integrity_ok: false` with reason `query_misdeclaration`, the cache for that outlet is purged, and participation records (§7.3.2) attribute the failure to the outlet's `operator_did`.
+
+### 5.4.3 Query Result Cache
+
+Query outlets are cached by a shared, operator-signed, relay-hosted cache. The cache is a membership-gated optimization — relays serve it to subscribers of the context routing ID, and members verify every hit cryptographically.
+
+**Cache key.**
+
+```
+cache_key = SHA-256(
+  "SCP-OUTLET-QUERY-CACHE-V1:"
+  || outlet_id
+  || canonical_jcs(input)
+  || implementation_hash
+)
+```
+
+The invoker DID is NOT in the key: Query results are context-governed and invoker-independent. Including the invoker would partition the cache and defeat its purpose.
+
+**Cache entry.**
+
+```
+QueryCacheEntry {
+  cache_key:          [u8; 32],
+  output_value:       Value,            // MessagePack value matching output_schema
+  expires_at:         u64,              // Unix timestamp (seconds)
+  operator_signature: Ed25519Signature, // operator_did signs
+                                        //   SHA-256("SCP-OUTLET-QUERY-CACHE-SIG-V1:"
+                                        //           || cache_key
+                                        //           || canonical_jcs(output_value)
+                                        //           || expires_at_be)
+}
+```
+
+**Verification on cache hit.** The requesting SDK MUST verify `operator_signature` against the current `operator_did` resolved from the outlet registry BEFORE returning the cached value to the application. A verification failure returns `OutletErrorClass::Protocol::CacheIntegrityFailure` and causes the SDK to fall back to a live invocation. The relay cannot forge cache entries — the operator is the only signer.
+
+**TTL.** Per-outlet via the `x-scp-query-ttl-secs` JSON Schema extension on `output_schema`. Default 60 seconds. Range `[0, 86400]` — 0 means uncached, 86400 (24h) is the ceiling to bound divergence. Entries past `expires_at` are purged lazily on read.
+
+**Invalidation.**
+
+- `OutletUpdated` — changes the outlet's `implementation_hash`, which is part of the cache key; entries become unreachable and are garbage-collected.
+- `OutletVerified { integrity_ok: false }` — explicit purge of all entries for the outlet.
+- `OutletDeregistered` — explicit purge.
+- `EpochBoundary` — entries do NOT automatically expire at epoch boundaries; TTL drives expiry. Epoch advances do not alter Query semantics because Query outlets do not access mutable context state.
+
+**Event log shape for cache hits.** A cache hit emits an `OutletQueried` event with `cache_hit: true` and omits `output_hash` (the output is not re-hashed; provenance traces to the underlying cached entry's `cache_key`). A cache miss emits a standard `OutletInvokedEvent` per §5.4.5.
+
+**Amplification considerations.** Because the cache is shared across all members who hold the required UCAN, a single operator signature can serve many members. This is intentional — the cache is an efficiency tool, not an access-control tool. Capability checks still gate who may request the cached value from the relay.
+
+### 5.4.4 Outlet Error Taxonomy
+
+Outlet invocations return a structured error envelope. The envelope is MessagePack-serialized with numeric field tags for forward compatibility.
+
+```
+OutletError {
+  code:          String,          // tag 1; format "SCP-TOOL-{6100..6199}" — shares the
+                                  // SCP-TOOL- prefix registered in sdk-common.md; outlets
+                                  // carve out the 6100-6199 sub-block. Bridge linters
+                                  // require the prefix and the sub-block.
+  slug:          String,          // tag 2; stable kebab-case identifier,
+                                  // e.g. "query-violation", "handler-panic"
+  class:         OutletErrorClass,// tag 3; one of eight root classes (below)
+  message:       String,          // tag 4; human-readable, non-localized; max 1 KiB UTF-8
+  retry:         RetryPolicy,     // tag 5; see below
+  detail:        Option<Value>,   // tag 6; structured additional data, max 4 KiB
+                                  // canonical-JSON encoded
+  related_code:  Option<String>,  // tag 7; cross-reference to another SCP error code
+                                  // when this error wraps or supersedes another
+  source_chain:  Vec<ContextHop>, // tag 8; ordered list of cross-context hops the
+                                  // error traversed (§6.2)
+  i18n_key:      Option<String>,  // tag 9; reverse-DNS key for SDK-side translation
+  trace_id:      Option<[u8; 16]>,// tag 10; OpenTelemetry trace id (§9.11)
+}
+
+OutletErrorClass {
+  Protocol,       // registration/validation/classification violations
+  Authorization, // UCAN, caveat, role, capability, amplification
+  Input,          // schema, size, type, enum, range
+  Execution,     // timeout, panic, resource-exhaustion, non-determinism
+  Output,         // schema violation, size, non-serializable, redaction
+  Economic,       // budget, insufficient funds, adapter failure, pricing (§19)
+  Transport,     // relay unavailable, cross-context bridge failure
+  Governance,    // deregistered, suspended, revoked, ceiling exceeded
+}
+
+RetryPolicy {
+  Never,                                    // permanent; do not retry
+  Immediate,                                // safe to retry immediately (idempotent)
+  After(Duration),                          // retry after fixed delay
+  WithBackoff { min: Duration, max: Duration }, // exponential within bounds
+}
+
+ContextHop {
+  context_id:   ContextId,
+  hop_index:    u16,       // 0 = origin, increments per cross-context boundary
+  wrapped_code: String,    // code as it was before wrapping at this hop
+}
+```
+
+**Code range.** `6100..=6199` within the `SCP-TOOL-` prefix, sub-allocated as:
+
+- `6100-6109` — Protocol class (query-violation, kind-mismatch, amplification, etc.)
+- `6110-6119` — Authorization class (caveat-violation, amplification, outlet-not-found, etc.)
+- `6120-6129` — Input class
+- `6130-6139` — Execution class (handler-panic, execution-timeout, credit-exhausted, stream-gap)
+- `6140-6149` — Output class
+- `6150-6159` — Economic class
+- `6160-6169` — Transport class
+- `6170-6179` — Governance class
+- `6180-6199` — reserved
+
+The `SCP-TOOL-` prefix is preserved (not renamed to `SCP-OUTLET-`) because the CI enforcement script `scripts/check-error-codes.sh` indexes prefixes in a closed set — adding a new top-level prefix requires coordinated changes across every language SDK's error surface. Sub-block allocation within the existing prefix is the forward-compatible path.
+
+**Cross-context wrapping.** A cross-context error is not translated — the original `code` is preserved and the wrapping hop appends to `source_chain` with its own `wrapped_code`. The outermost caller sees the innermost reason and the trail of boundaries it crossed. This is the opposite of HTTP-style gateway remapping, which loses causal information.
+
+**Sealed SDK hierarchies.** Each SDK renders `OutletErrorClass` as a sealed type: Python subclass tree under `OutletError`, TypeScript tagged-union class, Swift enum with associated values, Kotlin sealed class. The wire form is the source of truth; SDK types are generated from a shared fixture set round-tripped through all four FFI bridges.
+
+### 5.4.5 Progressive Output (Streaming)
+
+Outlet invocations are streams by construction. A non-streaming invocation is the degenerate single-chunk case; there is no separate `OutletResponse` wire type.
+
+**Wire types.**
+
+```
+OutletStreamOpen {
+  request_id:       [u8; 16],      // per-stream UUIDv7; monotonic time-sortable
+  outlet_id:        String,
+  input:            Value,          // MessagePack value matching input_schema
+  invoker_did:      DID,
+  ucan:             Vec<u8>,        // UCAN JWT bytes; checked ONCE at open
+  caveats_binding:  [u8; 32],       // SHA-256 of the caveat set used at check time
+  chain_depth:      u16,            // inherited from opening call on cross-context hops
+  credit_window:    u32,            // initial credit; see backpressure below
+  timeout_ms:       u32,            // absolute stream timeout; 0 = use context default
+}
+
+OutletStreamChunk {
+  request_id:   [u8; 16],
+  sequence:     u64,              // strictly monotonic per request_id, starting at 0
+  payload:      ChunkPayload,
+}
+
+ChunkPayload {
+  Data  { value: Value },                                          // matches output_schema
+  Progress { pct: u16, note: Option<String> },                   // pct in [0, 10000] basis points
+  End   { aggregate: Value, provenance: Provenance,
+          execution_time_ms: u64 },                                // matches aggregate_schema or
+                                                                   // defaults to last Data value
+  Error { code: String, message: String, terminal: bool },        // terminal=true = stream over
+}
+
+OutletStreamCredit {
+  request_id: [u8; 16],
+  grant:      u32,                // additional chunks the executor may send
+}
+```
+
+**Credit-based backpressure.** Each stream opens with `credit_window` chunks of headroom. The executor may emit up to that many Data/Progress chunks before it must wait for an `OutletStreamCredit` grant. End and Error are terminal and do NOT consume credit — an executor can always close a stream. The default window is `ContextParams::stream_window_default` (default 32). Consumers grant credit as they process chunks. A stream whose credit reaches zero and is not replenished within `stream_credit_stall_secs` (default 30) is cancelled with `OutletErrorClass::Execution::CreditStall`.
+
+**Ordering and gaps.** `sequence` values are strictly monotonic per `request_id`. A receiver that observes a gap (missing sequence) MUST cancel the stream with `OutletErrorClass::Execution::StreamGap` and SHOULD rerun. MLS has no primitive for per-message retransmit and adding one at the SCP layer would require reintroducing a per-recipient unicast channel that MLS deliberately eliminates — so the mitigation is cancel-and-rerun, not retry.
+
+**UCAN check locus.** The UCAN presented in `OutletStreamOpen` is validated exactly once, at open. Every chunk carries the `request_id`; the receiver correlates to the open and does not re-present or re-validate. This prevents UCAN revocation races mid-stream from splitting a stream into authorized and unauthorized halves — a revocation observed during the stream terminates the stream at the next executor checkpoint with `OutletErrorClass::Authorization::RevokedMidStream`, but already-emitted chunks remain authorized.
+
+**Cancellation.** The existing `OutletCancel` message cancels a stream by `request_id`. After a cancel, the executor MUST emit exactly one terminal chunk (`End` or `Error { terminal: true }`) and then stop. A receiver MAY ignore chunks with sequence greater than the terminal chunk's sequence.
+
+**Cross-context streaming.** Streams span the §6.2 tool-interface boundary. A shared-member bridge re-encrypts each chunk per-recipient as it crosses. `chain_depth` is set at open and inherited by every chunk (chunks do not recompute or check it). Credit is end-to-end: the originating invoker grants credit that propagates across the bridge.
+
+**Event log shape.** A stream produces ONE `OutletInvokedEvent` at close, not one per chunk. The event carries:
+
+```
+OutletInvokedEvent {
+  // Existing fields retained (invoker_did, outlet_id, input_hash, ...)
+  stream_chunk_count:    u32,        // number of chunks including terminal
+  stream_manifest_hash:  [u8; 32],   // Merkle root over chunk leaves
+                                     //   leaf_i = SHA-256(canonical_json(chunk_i))
+  stream_terminal_status: StreamTerminalStatus, // Ok | Error(code) | Cancelled
+}
+```
+
+The SDK retains the chunk leaves and tree shape so that later inclusion proofs (§7.3.1) can prove a specific chunk was part of the recorded stream without replaying all chunks. This is the same primitive as Certificate Transparency's SCT and Bitcoin SPV — a Merkle commitment recorded once, with proofs generated on demand.
+
+**Classification orthogonality.** Both Query and Action outlets stream. A Query stream is still cacheable — the cache entry's `output_value` is the final `End.aggregate`, not the chunk sequence; a cache hit produces a synthetic one-chunk stream (`Data(aggregate)` + `End(aggregate)`).
+
+**Non-streaming invocation.** A non-streaming invocation is a stream that emits exactly two chunks: `Data(output)` followed by `End(output)`. SDKs MAY present a synchronous `invoke()` surface that collects the stream, but the wire contract is always the streaming form.
 
 ## 5.5 Roles
 

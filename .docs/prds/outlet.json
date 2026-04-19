@@ -1,0 +1,2556 @@
+{
+  "project": "scp",
+  "description": "The largest terminology + feature overhaul in SCP to date: (1) rename every 'tool' to 'outlet' across the Rust core, 4 FFI bridges, 4 SDKs, event log, UCAN stems, canonical hash domain separators, enforcement files, and specs — hard break, no migrations, no aliases (MCP wire boundary keeps 'tool' via a lexical translator in scp-mcp); (2) introduce OutletKind { Query, Action } with structural floor at registration, ReadOnlyInvocation guard at runtime, split UCAN stems (outlet_query:*, outlet_call:*), per-kind chain depth and rate tiers, chain amplification rule (Query→Action forbidden), and a shared operator-signed relay-hosted Query cache; (3) add scoped UCAN invocation caveats — structured typed fields in `nb`, `narrow()` attenuation, conservative JSON Schema narrowing, CaveatCounterStore for rate/cumulative accounting, mint limits, whole-token revocation; (4) replace the lossy boolean/string error path with a structured OutletError envelope carrying 8 root classes, RetryPolicy enum, MessagePack wire tags for forward compat, sealed SDK hierarchies, and cross-context source_chain wrapping — reusing SCP-TOOL-6100-6199 rather than inventing a new prefix that would break check-error-codes.sh; (5) make invocation streaming-native — every call is an OutletStreamOpen + OutletStreamChunk + OutletStreamCredit sequence, ToolResponse eliminated, one MLS message per chunk, credit-based backpressure, Merkle chunk manifest in the event log, SDK idioms per language (AsyncIterator, AsyncIterable, AsyncThrowingStream, Flow). Scope: ~2,300 occurrences across ~172 files.",
+  "gates": [
+    {
+      "id": "gate-rename",
+      "name": "Terminology Rename (tool → outlet)",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-OUT-001",
+        "SCP-OUT-002",
+        "SCP-OUT-003",
+        "SCP-OUT-004",
+        "SCP-OUT-005",
+        "SCP-OUT-006",
+        "SCP-OUT-007",
+        "SCP-OUT-008",
+        "SCP-OUT-009",
+        "SCP-OUT-010",
+        "SCP-OUT-011",
+        "SCP-OUT-012",
+        "SCP-OUT-013",
+        "SCP-OUT-014",
+        "SCP-OUT-015"
+      ]
+    },
+    {
+      "id": "gate-classification",
+      "name": "Semantic Classification (Query vs Action)",
+      "priority": "P0",
+      "status": "pending",
+      "stories": [
+        "SCP-OUT-016",
+        "SCP-OUT-017",
+        "SCP-OUT-018",
+        "SCP-OUT-019",
+        "SCP-OUT-020",
+        "SCP-OUT-021",
+        "SCP-OUT-022",
+        "SCP-OUT-023",
+        "SCP-OUT-024",
+        "SCP-OUT-025",
+        "SCP-OUT-026"
+      ]
+    },
+    {
+      "id": "gate-caveats",
+      "name": "Scoped UCAN Invocation Caveats",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-OUT-027",
+        "SCP-OUT-028",
+        "SCP-OUT-029",
+        "SCP-OUT-030",
+        "SCP-OUT-031",
+        "SCP-OUT-032",
+        "SCP-OUT-033"
+      ]
+    },
+    {
+      "id": "gate-errors",
+      "name": "Structured Outlet Error Taxonomy",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-OUT-034",
+        "SCP-OUT-035",
+        "SCP-OUT-036",
+        "SCP-OUT-037",
+        "SCP-OUT-038",
+        "SCP-OUT-039",
+        "SCP-OUT-040",
+        "SCP-OUT-041",
+        "SCP-OUT-042"
+      ]
+    },
+    {
+      "id": "gate-streaming",
+      "name": "Progressive Output (Streaming)",
+      "priority": "P1",
+      "status": "pending",
+      "stories": [
+        "SCP-OUT-043",
+        "SCP-OUT-044",
+        "SCP-OUT-045",
+        "SCP-OUT-046",
+        "SCP-OUT-047",
+        "SCP-OUT-048",
+        "SCP-OUT-049",
+        "SCP-OUT-050",
+        "SCP-OUT-051",
+        "SCP-OUT-052"
+      ]
+    }
+  ],
+  "stories": [
+    {
+      "id": "SCP-OUT-001",
+      "title": "Rename tool → outlet across spec prose (bulk spec text pass)",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        ".docs/specs/05-contexts.md",
+        ".docs/specs/06-cross-context-communication.md",
+        ".docs/specs/07-trust-validation-and-capabilities.md",
+        ".docs/specs/08-products-and-apps-in-the-graph.md",
+        ".docs/specs/09-security-model.md",
+        ".docs/specs/19-economic-governance.md",
+        ".docs/specs/17-persistence-and-storage.md"
+      ],
+      "description": "Bulk rename of every prose and wire-format reference from 'tool' to 'outlet' in the seven affected spec files, following the artifact-flow invariant — specs first, code later. Scope: section headings (except §6.2 'Tool Interface' which remains for continuity of the interface concept, but §6.2.0 prose, §6.2.1 'Stateful Outlet Sessions', and code-facing identifiers are renamed), wire-format type names (ToolRegistration → OutletRegistration, ToolCost → OutletCost, ToolInvoked → OutletInvoked, etc.), UCAN capability stems (tool:invoke → outlet:invoke in prose; split into outlet_query/outlet_call is SCP-OUT-020), CostSchedule field names (per_tool_invoke → per_outlet_invoke), PaidActionType variants (ToolInvoke → OutletInvoke), domain separator strings in prose (SCP-TOOL-REGISTRATION-V1 → SCP-OUTLET-REGISTRATION-V2), and tabled per-row references in §19.15.2 and elsewhere. The new §5.4/§5.4.1/§5.4.2/§5.4.3/§5.4.4/§5.4.5/§6.2.0.3/§6.2.0.4/§6.2.0.5/§7.3.8/§8.5.1 sections already exist (added during PRD drafting); this story covers the remaining prose. Boundary exception: §8.5 MCP prose retains 'tool' where it refers to MCP-side vocabulary; §8.5.1 documents the translation. The shared prefix SCP-TOOL- in error codes is retained (see SCP-OUT-041).",
+      "acceptanceCriteria": [
+        "grep -c '\\btool\\b' .docs/specs/05-contexts.md returns 0 outside quoted code identifiers referencing external systems",
+        "grep -c '\\btools\\b' .docs/specs/05-contexts.md returns 0 outside quoted external-system vocabulary",
+        "grep -c 'ToolRegistration\\|ToolCost\\|ToolInvoked\\b\\|ToolCancel\\|ToolRequest\\|ToolResponse' .docs/specs/ returns 0",
+        "grep -c 'per_tool_invoke' .docs/specs/ returns 0",
+        "grep -c 'PaidActionType.*ToolInvoke\\|\"ToolInvoke\"' .docs/specs/19-economic-governance.md returns 0",
+        "grep -c 'SCP-TOOL-REGISTRATION-V1' .docs/specs/ returns 0",
+        "All occurrences of 'tool interface' become 'outlet interface' except §8.5 MCP prose and §8.5.1 translation table",
+        "Spec file for MCP retains 'tool' vocabulary only inside §8.5 / §8.5.1 MCP-side cells of the translation table",
+        "Section headings renamed: any '## X.Y Tools' becomes '## X.Y Outlets'; sub-headings likewise, except MCP §8.5 and the literal word 'Tool' inside a quoted MCP identifier",
+        "grep 'outlet' .docs/specs/05-contexts.md returns >= 40 matches (establishes forward sense)",
+        "python3.12 scripts/validate-prd.py passes after this change (no PRD section refs break)",
+        "No heading referenced by any other PRD story in this file is renamed without updating that story's sources array (verified by validate-prd.py)"
+      ],
+      "actionItems": [
+        "Enumerate every match of /\\btool\\b/ (case-insensitive) in .docs/specs/ and classify: rename / MCP-boundary / leave",
+        "Perform the rename in-place preserving surrounding prose",
+        "Update §19.15.2 CostSchedule table: per_tool_invoke → per_outlet_invoke; update PaidActionType variant ToolInvoke → OutletInvoke",
+        "Update §9.5 domain separator table (around line 1521): SCP-TOOL-REGISTRATION-V1 entry becomes SCP-OUTLET-REGISTRATION-V2 and its referenced section pointer is updated",
+        "Update §6.2 and §6.2.0 section headings + prose; keep §6.2 title 'Context-to-Context Outlet Interfaces'",
+        "Update §7.3.4 prose references to 'tool-schema-compliance' — the capability URI string stays (registry is external-facing) but narrative prose discussing the kind of capability reads 'outlet'",
+        "Re-run validate-prd.py to confirm no section reference broke",
+        "Run `grep -rn tool .docs/specs/ | wc -l` before and after; report the delta"
+      ],
+      "blockedBy": [],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.4 Outlets"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.1 Outlet Registration Wire Format"
+        },
+        {
+          "file": ".docs/specs/08-products-and-apps-in-the-graph.md",
+          "section": "### 8.5.1 MCP ↔ SCP Boundary Translation"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-002",
+      "title": "Rename tool → outlet in scp-protocol crate (types, modules, wire formats)",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/tools/mod.rs",
+        "crates/scp-protocol/src/context/tools/lifecycle.rs",
+        "crates/scp-protocol/src/context/tools/integrity.rs",
+        "crates/scp-protocol/src/context/tools/interface.rs",
+        "crates/scp-protocol/src/context/tools/registry.rs",
+        "crates/scp-protocol/src/context/tools/schema.rs",
+        "crates/scp-protocol/src/context/tools/summary.rs",
+        "crates/scp-protocol/src/context/mod.rs",
+        "crates/scp-protocol/src/context/params.rs",
+        "crates/scp-protocol/src/context/roles.rs",
+        "crates/scp-protocol/src/economy/mod.rs",
+        "crates/scp-protocol/src/economy/antispam.rs",
+        "crates/scp-protocol/src/lib.rs"
+      ],
+      "description": "Rename the tool subsystem of scp-protocol to outlets. Directory `src/context/tools/` becomes `src/context/outlets/`. All exported types carrying the Tool prefix (ToolRegistration, ToolCost, ToolId, ToolSchema, ToolTestVector, ToolRegistry, ToolInterface, ToolLifecycleEvent, ToolIntegrityStatus, ToolSummary) are renamed to the Outlet prefix. The `tool_id` field becomes `outlet_id` everywhere. The canonical hash domain separator constant `SCP_TOOL_REGISTRATION_V1` is deleted and replaced with `SCP_OUTLET_REGISTRATION_V2`. `ToolCost` → `OutletCost`. The UCAN capability variants in `roles.rs` are renamed `ToolInvoke{outlet_id}` → `OutletInvoke{outlet_id}` and `ToolInvokeAll` → `OutletInvokeAll` (the split into `OutletQuery`/`OutletCall` is SCP-OUT-020). Economy types `PaidActionType::ToolInvoke` → `PaidActionType::OutletInvoke`; `CostSchedule::per_tool_invoke` → `per_outlet_invoke`. The canonical hash scope now includes a kind byte per §5.4.1 but the actual kind field is added in SCP-OUT-017 — this story uses a placeholder 0x01 (Action) so signatures remain valid across the rename commit. No stubs; all call sites updated.",
+      "acceptanceCriteria": [
+        "Directory crates/scp-protocol/src/context/outlets/ exists with files mod.rs, lifecycle.rs, integrity.rs, interface.rs, registry.rs, schema.rs, summary.rs",
+        "Directory crates/scp-protocol/src/context/tools/ does not exist",
+        "grep -rn 'pub struct Tool' crates/scp-protocol/src/ returns 0",
+        "grep -rn 'ToolRegistration\\|ToolCost\\|ToolId\\|ToolSchema\\|ToolTestVector\\|ToolRegistry\\|ToolInterface\\|ToolLifecycleEvent\\|ToolIntegrityStatus\\|ToolSummary' crates/scp-protocol/src/ returns 0",
+        "crates/scp-protocol/src/lib.rs re-exports OutletRegistration, OutletCost, OutletId, OutletSchema, OutletTestVector, OutletRegistry, OutletInterface, OutletLifecycleEvent, OutletIntegrityStatus, OutletSummary",
+        "Constant SCP_OUTLET_REGISTRATION_V2 appears in the same module where SCP_TOOL_REGISTRATION_V1 used to",
+        "grep -rn 'SCP-TOOL-REGISTRATION-V1\\|SCP_TOOL_REGISTRATION_V1' crates/scp-protocol/src/ returns 0",
+        "Capability::OutletInvoke(OutletId), Capability::OutletInvokeAll exist in roles.rs (split variants added in SCP-OUT-020)",
+        "grep -rn 'ToolInvoke' crates/scp-protocol/src/context/roles.rs returns 0",
+        "PaidActionType enum has OutletInvoke variant; no ToolInvoke variant",
+        "CostSchedule struct has per_outlet_invoke field; no per_tool_invoke field",
+        "OutletRegistration::signature scope includes a kind_byte (placeholder 0x01 for Action) per §5.4.1",
+        "cargo build -p scp-protocol succeeds",
+        "cargo test -p scp-protocol succeeds (tests in this crate updated to new names)",
+        "cargo doc -p scp-protocol --no-deps succeeds with no broken links"
+      ],
+      "actionItems": [
+        "git mv crates/scp-protocol/src/context/tools crates/scp-protocol/src/context/outlets",
+        "Rename file content: all ToolX identifiers → OutletX in the moved directory",
+        "Update pub use statements in crates/scp-protocol/src/context/mod.rs and src/lib.rs",
+        "Update Capability enum in roles.rs",
+        "Update PaidActionType and CostSchedule in economy/mod.rs",
+        "Replace SCP_TOOL_REGISTRATION_V1 with SCP_OUTLET_REGISTRATION_V2 and extend preimage with kind_byte = 0x01",
+        "Update all in-crate call sites",
+        "Run cargo clippy -p scp-protocol --all-targets and fix warnings",
+        "Update rustdoc on every renamed type"
+      ],
+      "blockedBy": [
+        "SCP-OUT-001"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.4 Outlets"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.1 Outlet Registration Wire Format"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-003",
+      "title": "Rename tool → outlet in scp-event-log (event variants + renumber discriminants)",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-event-log/src/lib.rs",
+        "crates/scp-event-log/src/tree.rs",
+        "crates/scp-event-log/src/crypto.rs",
+        "crates/scp-event-log/src/proof.rs",
+        "crates/scp-event-log/src/metrics.rs"
+      ],
+      "description": "Rename Tool* event variants to Outlet* and assign new discriminant values per §5.14.10. All event kinds that mentioned 'tool' (ToolRegistered, ToolUpdated, ToolDeregistered, ToolInvoked, ToolCancel, ToolVerified, ToolInterfaceOffered, ToolInterfaceAccepted, ToolInterfaceRevoked) are renamed to the Outlet prefix. Because this is pre-1.0, breaking historical verification is acceptable: the discriminants are renumbered to a non-contiguous range to prevent accidental acceptance of stale event logs with the old numbering. The Merkle leaf hash covers the new discriminant; old event logs fail verification after this commit — the test suite explicitly confirms this.",
+      "acceptanceCriteria": [
+        "grep -rn 'Tool\\(Registered\\|Updated\\|Deregistered\\|Invoked\\|Cancel\\|Verified\\|InterfaceOffered\\|InterfaceAccepted\\|InterfaceRevoked\\)' crates/scp-event-log/src/ returns 0",
+        "Outlet-prefixed variants exist: OutletRegistered, OutletUpdated, OutletDeregistered, OutletInvoked, OutletCancel, OutletVerified, OutletInterfaceOffered, OutletInterfaceAccepted, OutletInterfaceRevoked",
+        "New discriminants differ from the old discriminants by at least 0x10 (bit 4 set) — old logs deserialize to an explicit OldFormatRejected error",
+        "EventKind::discriminant() returns new values documented in a docstring table",
+        "A unit test 'old_tool_event_deserializes_as_rejected' asserts that a pre-rename serialized ToolInvoked blob returns EventError::OldFormatRejected",
+        "crate-level docstring notes the break and cites ADR/spec section §5.14.10",
+        "cargo test -p scp-event-log succeeds",
+        "Merkle tree reconstruction tests use Outlet* event variants",
+        "Metrics counters renamed: tool_invocations_total → outlet_invocations_total; tool_registrations_total → outlet_registrations_total"
+      ],
+      "actionItems": [
+        "Rename every Tool* variant in EventKind to Outlet*",
+        "Assign new discriminants: bit 4 set relative to old, documented in a comment block above the enum",
+        "Implement EventError::OldFormatRejected",
+        "Update deserializer to detect old discriminants and return OldFormatRejected",
+        "Update tree.rs leaf construction to use new discriminants",
+        "Update metrics counter names",
+        "Add the old_tool_event_deserializes_as_rejected test",
+        "Update cargo doc with migration note"
+      ],
+      "blockedBy": [
+        "SCP-OUT-002"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.14.10 Event Log"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.4 Outlets"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-004",
+      "title": "Rename tool → outlet in scp-runtime (ContextManager, invoke, sessions, economy wiring)",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/tools/mod.rs",
+        "crates/scp-runtime/src/context/tools/invoke.rs",
+        "crates/scp-runtime/src/context/tools/session.rs",
+        "crates/scp-runtime/src/context/manager/tools.rs",
+        "crates/scp-runtime/src/context/manager/mod.rs",
+        "crates/scp-runtime/src/context/manager/economy.rs",
+        "crates/scp-runtime/src/context/manager/messaging.rs",
+        "crates/scp-runtime/src/context/manager/lifecycle.rs",
+        "crates/scp-runtime/src/context/manager/queries.rs",
+        "crates/scp-runtime/src/context/policy.rs",
+        "crates/scp-runtime/src/context/providers/mod.rs"
+      ],
+      "description": "Rename the tool runtime subsystem. Directory `src/context/tools/` → `src/context/outlets/`; `manager/tools.rs` → `manager/outlets.rs`. All public and internal identifiers switch to Outlet vocabulary: `invoke_tool` → `invoke_outlet`, `register_tool` → `register_outlet`, `update_tool` → `update_outlet`, `deregister_tool` → `deregister_outlet`, `verify_tool` → `verify_outlet`, `list_tools` → `list_outlets`, `get_tool` → `get_outlet`; session APIs `open_tool_session` → `open_outlet_session`; cross-context wrappers `invoke_tool_cross_context` → `invoke_outlet_cross_context` (final signature pinned in SCP-OUT-049 for streaming, but the rename happens here). The UCAN check references the temporary `outlet_invoke:*` capability stem (the split into `outlet_query`/`outlet_call` is SCP-OUT-020). Updates `invoke_tool_with_economy` helper → `invoke_outlet_with_economy`. Updates the internal error variant names `InvocationError::ToolNotFound` etc. to `OutletNotFound` etc. (the full OutletError envelope lands in Gate 4).",
+      "acceptanceCriteria": [
+        "Directory crates/scp-runtime/src/context/outlets/ exists with mod.rs, invoke.rs, session.rs",
+        "Directory crates/scp-runtime/src/context/tools/ does not exist",
+        "File crates/scp-runtime/src/context/manager/outlets.rs exists; manager/tools.rs does not",
+        "grep -rn 'fn invoke_tool\\|fn register_tool\\|fn update_tool\\|fn deregister_tool\\|fn verify_tool\\|fn list_tools\\|fn get_tool\\b\\|fn open_tool_session' crates/scp-runtime/src/ returns 0",
+        "Functions invoke_outlet, register_outlet, update_outlet, deregister_outlet, verify_outlet, list_outlets, get_outlet, open_outlet_session are defined on ContextManager",
+        "grep -rn 'invoke_tool_with_economy\\|invoke_tool_cross_context' crates/scp-runtime/src/ returns 0",
+        "Function invoke_outlet_with_economy exists in manager/economy.rs and is invoked by invoke_outlet",
+        "InvocationError::OutletNotFound, InvocationError::OutletDeregistered, InvocationError::OutletExecutionFailed exist",
+        "grep -rn 'ToolNotFound\\|ToolDeregistered\\|ToolExecutionFailed' crates/scp-runtime/src/ returns 0",
+        "cargo build -p scp-runtime succeeds",
+        "cargo test -p scp-runtime succeeds",
+        "At least one test file explicitly exercises invoke_outlet end-to-end"
+      ],
+      "actionItems": [
+        "git mv the two directories and one file as described",
+        "Rewrite every identifier within",
+        "Update pub use and internal use statements",
+        "Update ContextManager method bodies and test fixtures",
+        "Update rustdoc comments",
+        "Re-run cargo clippy --all-targets and fix warnings",
+        "Run the existing tool pipeline wiring tests and confirm they still pass under new names",
+        "Update any hardcoded strings in tracing/log messages from 'tool' to 'outlet'"
+      ],
+      "blockedBy": [
+        "SCP-OUT-002",
+        "SCP-OUT-003"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.4 Outlets"
+        },
+        {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "### 6.2.0 Tool Interface Transport"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-005",
+      "title": "Rename tool → outlet in PyO3 FFI bridge (crates/scp-ffi/src/tools.rs)",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/tools.rs",
+        "crates/scp-ffi/src/lib.rs",
+        "crates/scp-ffi/src/context.rs",
+        "crates/scp-ffi/src/error.rs"
+      ],
+      "description": "Rename the PyO3 bridge's tool surface. File `src/tools.rs` → `src/outlets.rs`. PyO3 classes `PyToolRegistration` → `PyOutletRegistration` etc. Function exports: every `context_tool_*` symbol becomes `context_outlet_*`. The PyO3 `#[pyfunction]` names include `outlet` in their Python-facing identifiers so the Python SDK import surface changes accordingly (SCP-OUT-009 consumes the new names). The PyO3 bridge is the reference bridge — every operation must exist here first before any other bridge exports it. This story enforces that by listing every exposed symbol and renaming it atomically.",
+      "acceptanceCriteria": [
+        "File crates/scp-ffi/src/outlets.rs exists; src/tools.rs does not",
+        "grep -rn 'PyTool' crates/scp-ffi/src/ returns 0",
+        "grep -rn 'context_tool_' crates/scp-ffi/src/ returns 0",
+        "PyOutletRegistration, PyOutletCost, PyOutletSchema, PyOutletTestVector classes exported from lib.rs",
+        "Python-facing function names: context_outlet_register, context_outlet_invoke, context_outlet_update, context_outlet_deregister, context_outlet_verify, context_outlet_list, context_outlet_get, context_outlet_session_open, context_outlet_session_invoke, context_outlet_session_close, context_outlet_interface_offer, context_outlet_interface_accept, context_outlet_interface_revoke",
+        "grep -n 'tool' crates/scp-ffi/src/lib.rs returns 0 outside doc comments referencing MCP boundary",
+        "cargo build -p scp-ffi succeeds",
+        "maturin develop --release in bindings/python works against the rebuilt bridge",
+        "Python `from scp_sdk import _scp_core; dir(_scp_core)` shows outlet-prefixed functions and no tool-prefixed ones"
+      ],
+      "actionItems": [
+        "git mv crates/scp-ffi/src/tools.rs crates/scp-ffi/src/outlets.rs",
+        "Rename every identifier in the moved file",
+        "Update pub mod and use statements in lib.rs",
+        "Update cross-references in context.rs",
+        "Update bridge-level error codes that reference tool in their slugs (codes stay SCP-TOOL- per SCP-OUT-041)",
+        "Re-run maturin develop and inspect the resulting .so / .pyi",
+        "Update inline rustdoc on renamed types"
+      ],
+      "blockedBy": [
+        "SCP-OUT-004"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.4 Outlets"
+        },
+        {
+          "file": ".docs/standards/sdk-capability-matrix.json",
+          "section": ""
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-006",
+      "title": "Rename tool → outlet in UniFFI FFI bridge (crates/scp-ffi/uniffi)",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/uniffi/src/scp.rs",
+        "crates/scp-ffi/uniffi/src/bridge.rs",
+        "crates/scp-ffi/uniffi/src/lib.rs",
+        "crates/scp-ffi/uniffi/src/scp.udl"
+      ],
+      "description": "Rename the UniFFI bridge's tool surface. UniFFI's generated FFI contracts (Swift + Kotlin) are derived from the .udl file and from `#[uniffi::export]` attributes — renaming in the Rust source changes both SDK surfaces simultaneously. All `tool_*` UDL members and Rust-exported functions become `outlet_*`. Types `ToolRegistration`, `ToolCost`, etc. switch to Outlet. Namespace tables in the UDL are renamed (`[namespace=Tools]` → `[namespace=Outlets]`).",
+      "acceptanceCriteria": [
+        "grep -n 'tool_' crates/scp-ffi/uniffi/src/scp.udl returns 0",
+        "grep -n 'Tool\\(Registration\\|Cost\\|Schema\\|TestVector\\|Id\\)' crates/scp-ffi/uniffi/src/scp.udl returns 0",
+        "UDL contains outlet_register, outlet_invoke, outlet_update, outlet_deregister, outlet_verify, outlet_list, outlet_get, outlet_session_open, outlet_session_invoke, outlet_session_close, outlet_interface_offer, outlet_interface_accept, outlet_interface_revoke",
+        "UniFFI scaffolding regenerates cleanly for both Swift and Kotlin targets",
+        "bash scripts/generate-uniffi-kotlin.sh succeeds",
+        "cargo build -p scp-ffi-uniffi succeeds",
+        "The generated Swift binding contains `public func outletRegister(` (or equivalent) and no `public func toolRegister(`"
+      ],
+      "actionItems": [
+        "Edit scp.udl: rename namespace, types, functions",
+        "Edit scp.rs and bridge.rs for matching Rust-side exports",
+        "Update any UniFFI custom type mappings",
+        "Run generate-uniffi-kotlin.sh and inspect output",
+        "Confirm the regenerated .kt file compiles against the rest of scp-kt"
+      ],
+      "blockedBy": [
+        "SCP-OUT-004"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.4 Outlets"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-007",
+      "title": "Rename tool → outlet in NAPI FFI bridge (crates/scp-ffi/napi)",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/napi/src/tools.rs",
+        "crates/scp-ffi/napi/src/lib.rs",
+        "crates/scp-ffi/napi/src/context.rs"
+      ],
+      "description": "Rename the NAPI bridge's tool surface. File `crates/scp-ffi/napi/src/tools.rs` → `crates/scp-ffi/napi/src/outlets.rs`. NAPI `#[napi]`-annotated functions renamed: `contextToolRegister` → `contextOutletRegister`, etc. (camelCase is the NAPI convention for JS-facing names). The TypeScript-facing index.d.ts generated by napi-rs picks up the new names automatically.",
+      "acceptanceCriteria": [
+        "File crates/scp-ffi/napi/src/outlets.rs exists; tools.rs does not",
+        "grep -rn 'contextTool\\|ContextTool' crates/scp-ffi/napi/src/ returns 0",
+        "NAPI-exported functions include contextOutletRegister, contextOutletInvoke, contextOutletUpdate, contextOutletDeregister, contextOutletVerify, contextOutletList, contextOutletGet, contextOutletSessionOpen, contextOutletSessionInvoke, contextOutletSessionClose",
+        "cargo build -p scp-ffi-napi --release succeeds",
+        "bun build in bindings/typescript produces a .d.ts that shows outlet-prefixed NAPI exports and no tool-prefixed ones",
+        "Error codes within NAPI bridge remain in SCP-TOOL- prefix per SCP-OUT-041 but their slugs reference outlet (e.g., outlet-not-found)"
+      ],
+      "actionItems": [
+        "git mv napi/src/tools.rs napi/src/outlets.rs",
+        "Rename all identifiers",
+        "Update napi JS-facing names (camelCase)",
+        "Rebuild via cargo build --release and regenerate .node file",
+        "Update the generated index.d.ts to confirm names surface correctly"
+      ],
+      "blockedBy": [
+        "SCP-OUT-004"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.4 Outlets"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-008",
+      "title": "Rename tool → outlet in WASM FFI bridge (crates/scp-ffi/wasm)",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/wasm/src/tools.rs",
+        "crates/scp-ffi/wasm/src/lib.rs",
+        "crates/scp-ffi/wasm/src/context.rs",
+        "crates/scp-ffi/wasm/src/manager.rs"
+      ],
+      "description": "Rename the wasm-bindgen bridge's tool surface. File `wasm/src/tools.rs` → `wasm/src/outlets.rs`. The `#[wasm_bindgen(js_name = toolRegister)]` etc. attributes are updated to `js_name = outletRegister`. The WASM bridge has a constrained surface per ADR-034 — all renames preserve the constraint set. No new functions are introduced in this story; feature additions land in Gates 2-5.",
+      "acceptanceCriteria": [
+        "File crates/scp-ffi/wasm/src/outlets.rs exists; tools.rs does not",
+        "grep -rn '#\\[wasm_bindgen(js_name = tool' crates/scp-ffi/wasm/src/ returns 0",
+        "grep -rn 'js_name = outlet' crates/scp-ffi/wasm/src/outlets.rs returns >= 10 matches (at least register/invoke/update/deregister/verify/list/get/interface-offer/interface-accept/interface-revoke)",
+        "wasm-pack build crates/scp-ffi/wasm --target bundler succeeds",
+        "The generated .d.ts exports outlet-prefixed names and no tool-prefixed names",
+        "cargo clippy -p scp-ffi-wasm --target wasm32-unknown-unknown passes"
+      ],
+      "actionItems": [
+        "git mv wasm/src/tools.rs wasm/src/outlets.rs",
+        "Rename all identifiers and js_name attributes",
+        "Update pub mod and use statements",
+        "Run wasm-pack build and validate generated output"
+      ],
+      "blockedBy": [
+        "SCP-OUT-004"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.4 Outlets"
+        },
+        {
+          "file": ".docs/adrs/phase-4.md",
+          "section": "## ADR-034: WASM Bridge Re-Implementation Strategy"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-009",
+      "title": "Rename tool → outlet in Python SDK (bindings/python)",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/python/scp_sdk/tools.py",
+        "bindings/python/scp_sdk/__init__.py",
+        "bindings/python/scp_sdk/context.py",
+        "bindings/python/scp_sdk/types.py",
+        "bindings/python/scp_sdk/errors.py",
+        "bindings/python/tests/test_tools.py"
+      ],
+      "description": "Rename the Python SDK tool module. `scp_sdk/tools.py` → `scp_sdk/outlets.py`. Classes: `ToolRegistration` → `OutletRegistration`, `ToolCost` → `OutletCost`, `ToolError` → `OutletError` (retains SCP-TOOL- code prefix per SCP-OUT-041). Methods on `Context`: `register_tool` → `register_outlet`, `invoke_tool` → `invoke_outlet`, etc. — exposed as `ctx.outlets.register(...)`, `ctx.outlets.invoke(...)` per the resolved API shape. A new `Context.outlets` accessor property returns an `OutletNamespace` object that holds the verbs. Sub-namespaces: `ctx.outlets.sessions` and `ctx.outlets.offers`. Top-level `ctx.invoke_outlet_cross_context(...)` for cross-context invocation. Tests renamed in parallel. The `_scp_core.pyi` type stub is regenerated.",
+      "acceptanceCriteria": [
+        "File bindings/python/scp_sdk/outlets.py exists; tools.py does not",
+        "grep -rn 'class Tool\\|import Tool\\|from .tools' bindings/python/scp_sdk/ returns 0",
+        "OutletRegistration, OutletCost, OutletError classes importable from scp_sdk",
+        "Context has an `outlets` property that returns an OutletNamespace; OutletNamespace has register, invoke, update, get, list, verify, deregister methods",
+        "OutletNamespace has .sessions (SessionsNamespace) and .offers (OffersNamespace) sub-namespaces",
+        "SessionsNamespace has open, invoke, close methods",
+        "OffersNamespace has extend, accept, revoke, list methods",
+        "Top-level Context has invoke_outlet_cross_context(source, target, outlet_id, input, ucan) method",
+        "Tests in bindings/python/tests/test_outlets.py cover every surface method",
+        "Test file tests/test_tools.py does not exist",
+        "bindings/python/scp_sdk/_scp_core.pyi reflects the outlet-prefixed surface (regenerated)",
+        "python3.12 -m ruff check bindings/python/ passes",
+        "python3.12 -m ruff format --check bindings/python/ passes",
+        "python3.12 -m pytest bindings/python/tests/test_outlets.py succeeds"
+      ],
+      "actionItems": [
+        "git mv scp_sdk/tools.py scp_sdk/outlets.py and tests/test_tools.py tests/test_outlets.py",
+        "Rewrite class and function names",
+        "Add OutletNamespace, SessionsNamespace, OffersNamespace classes with verb methods that delegate to _scp_core",
+        "Expose ctx.outlets accessor on Context",
+        "Add invoke_outlet_cross_context top-level method",
+        "Regenerate _scp_core.pyi",
+        "Update docstrings and module docstrings",
+        "Run ruff check + format + pytest"
+      ],
+      "blockedBy": [
+        "SCP-OUT-005"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.4 Outlets"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.1 Outlet Registration Wire Format"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-010",
+      "title": "Rename tool → outlet in TypeScript SDK (bindings/typescript)",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/typescript/src/tools.ts",
+        "bindings/typescript/src/index.ts",
+        "bindings/typescript/src/context.ts",
+        "bindings/typescript/src/types.ts",
+        "bindings/typescript/src/errors.ts",
+        "bindings/typescript/src/internal/napi.ts",
+        "bindings/typescript/src/internal/wasm.ts",
+        "bindings/typescript/tests/tools.test.ts"
+      ],
+      "description": "Rename the TypeScript SDK tool module. `src/tools.ts` → `src/outlets.ts`. The Context class exposes an `outlets` getter that returns an OutletNamespace (class or object literal carrying the verbs — class is preferred so async iterators are correctly typed). Sub-namespaces `outlets.sessions` and `outlets.offers`. Top-level `ctx.invokeOutletCrossContext(...)`. Both the NAPI and WASM internal shims are updated. Biome must pass; tsc --noEmit must pass; bun test must pass.",
+      "acceptanceCriteria": [
+        "File bindings/typescript/src/outlets.ts exists; src/tools.ts does not",
+        "grep -rn 'export class Tool\\|export interface Tool\\|from [\"\\.]+tools' bindings/typescript/src/ returns 0",
+        "OutletNamespace class with methods register, invoke, update, get, list, verify, deregister",
+        "OutletNamespace has sessions: OutletSessionsNamespace and offers: OutletOffersNamespace properties",
+        "OutletSessionsNamespace has open, invoke, close methods",
+        "OutletOffersNamespace has extend, accept, revoke, list methods",
+        "Context class has an outlets getter that returns an OutletNamespace",
+        "Context class has invokeOutletCrossContext method",
+        "NAPI internal shim (internal/napi.ts) calls the outlet-prefixed NAPI exports from SCP-OUT-007",
+        "WASM internal shim (internal/wasm.ts) calls the outlet-prefixed WASM exports from SCP-OUT-008",
+        "bun run lint passes",
+        "bun run format --check passes",
+        "bun run check (tsc --noEmit) passes",
+        "bun test bindings/typescript/tests/outlets.test.ts passes"
+      ],
+      "actionItems": [
+        "git mv src/tools.ts src/outlets.ts and tests/tools.test.ts tests/outlets.test.ts",
+        "Define OutletNamespace, OutletSessionsNamespace, OutletOffersNamespace classes",
+        "Add outlets getter to Context",
+        "Add invokeOutletCrossContext",
+        "Update both internal shims",
+        "Update types.ts exports and the public index.ts re-exports",
+        "Run all TS CI commands"
+      ],
+      "blockedBy": [
+        "SCP-OUT-007",
+        "SCP-OUT-008"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.4 Outlets"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.1 Outlet Registration Wire Format"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-011",
+      "title": "Rename tool → outlet in Swift SDK (bindings/swift)",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/swift/Sources/SCP/Tools.swift",
+        "bindings/swift/Sources/SCP/Context.swift",
+        "bindings/swift/Sources/SCP/Types.swift",
+        "bindings/swift/Sources/SCP/Errors.swift",
+        "bindings/swift/Tests/SCPTests/ToolsTests.swift"
+      ],
+      "description": "Rename the Swift SDK Tools module. `Sources/SCP/Tools.swift` → `Sources/SCP/Outlets.swift`. Swift convention: `Context.outlets` is a computed property returning an `OutletsAPI` struct (value type — Swift favors structs for namespace APIs). Sub-namespaces are accessed as `ctx.outlets.sessions.open(...)`, `ctx.outlets.offers.extend(...)`. Top-level `ctx.invokeOutletCrossContext(source:target:outletID:input:ucan:)`. SwiftLint --strict and SwiftFormat --lint must pass; swift test must pass.",
+      "acceptanceCriteria": [
+        "File bindings/swift/Sources/SCP/Outlets.swift exists; Tools.swift does not",
+        "grep -rn 'public struct Tool\\|public class Tool\\|public enum Tool\\|public func.*tool' bindings/swift/Sources/ returns 0 except MCP boundary types",
+        "OutletsAPI struct with methods register, invoke, update, get, list, verify, deregister",
+        "OutletsAPI has sessions: OutletSessionsAPI and offers: OutletOffersAPI properties",
+        "Context struct exposes `var outlets: OutletsAPI { get }`",
+        "Context has invokeOutletCrossContext method taking labeled arguments",
+        "Tests/SCPTests/OutletsTests.swift exists; Tests/SCPTests/ToolsTests.swift does not",
+        "swiftlint --strict succeeds",
+        "swiftformat --lint succeeds",
+        "swift test succeeds against the updated UniFFI binding from SCP-OUT-006"
+      ],
+      "actionItems": [
+        "git mv Tools.swift Outlets.swift",
+        "Rename types and functions throughout",
+        "Implement OutletsAPI / OutletSessionsAPI / OutletOffersAPI structs",
+        "Add outlets computed property to Context",
+        "Add invokeOutletCrossContext method",
+        "Update error code slugs (codes stay SCP-TOOL-)",
+        "Run swiftlint --strict and swiftformat --lint",
+        "Run swift test"
+      ],
+      "blockedBy": [
+        "SCP-OUT-006"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.4 Outlets"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.1 Outlet Registration Wire Format"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-012",
+      "title": "Rename tool → outlet in Kotlin SDK (bindings/kotlin)",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Types.kt",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/bridge/CoroutineBridge.kt",
+        "bindings/kotlin/scp-kt/src/test/kotlin/works/limn/scp/OutletsTest.kt"
+      ],
+      "description": "Rename the Kotlin SDK Tool surface. Kotlin convention: `Context.outlets` is a property returning an `OutletsApi` interface (backed by an internal class). Sub-namespaces via `ctx.outlets.sessions`, `ctx.outlets.offers`. Top-level `ctx.invokeOutletCrossContext(...)`. Detekt + Gradle tests (debug tier; release tier failure is a known ProGuard issue per project memory) must pass. Kotlin coroutine suspension is preserved — the async contract is unchanged for this story; streaming lands in SCP-OUT-051.",
+      "acceptanceCriteria": [
+        "Public interface OutletsApi exists with suspend fun register, invoke, update, get, list, verify, deregister",
+        "OutletsApi has sessions: OutletSessionsApi and offers: OutletOffersApi properties",
+        "Context class has outlets: OutletsApi property",
+        "Context has suspend fun invokeOutletCrossContext",
+        "grep -rn 'fun registerTool\\|fun invokeTool\\|fun updateTool' bindings/kotlin/ returns 0 outside MCP boundary types",
+        "Test file OutletsTest.kt exists; ToolsTest.kt does not",
+        "eval \"$(mise env)\" && ./gradlew detekt succeeds in bindings/kotlin/",
+        "eval \"$(mise env)\" && ./gradlew test succeeds (debug tier)",
+        "eval \"$(mise env)\" && ./gradlew :scp-sdk-kotlin:jar succeeds"
+      ],
+      "actionItems": [
+        "Define OutletsApi, OutletSessionsApi, OutletOffersApi interfaces",
+        "Implement Context.outlets property and invokeOutletCrossContext",
+        "Update CoroutineBridge.kt UniFFI call sites",
+        "Rename test class and update test bodies",
+        "Run gradle detekt and test"
+      ],
+      "blockedBy": [
+        "SCP-OUT-006"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.4 Outlets"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.1 Outlet Registration Wire Format"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-013",
+      "title": "Implement scp-mcp lexical translator (outlet ↔ tool at MCP boundary)",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-mcp/src/lib.rs",
+        "crates/scp-mcp/src/namespace.rs",
+        "crates/scp-mcp/src/protocol.rs",
+        "crates/scp-mcp/src/server.rs",
+        "crates/scp-mcp/src/client.rs",
+        "crates/scp-mcp/src/translator.rs",
+        "crates/scp-mcp/tests/translator.rs"
+      ],
+      "description": "Add a purely lexical `Translator` to `scp-mcp` that rewrites identifiers in both directions across the MCP boundary per §8.5.1. Wire shape is preserved: `tools/list` ↔ `outlet list`, `tools/call` ↔ `outlet invoke`, `tool.name` ↔ `outlet_id`, `tool.inputSchema` ↔ `schema.input`, etc. The translator is stateless; each message is translated in isolation. Two functions: `mcp_to_scp(value: serde_json::Value) -> serde_json::Value` and `scp_to_mcp(value: serde_json::Value) -> serde_json::Value`. Kind projection: SCP outlets with `kind: Query` surface as MCP tool names prefixed `query/`; MCP tools inbound default to `Action` unless `x-scp-kind` extension is present (classification per SCP-OUT-017 — this story scaffolds the logic but the kind enum is added in the classification gate). Until SCP-OUT-017 lands, the translator uses a sentinel `OutletKind::Action` to preserve wire correctness.",
+      "acceptanceCriteria": [
+        "File crates/scp-mcp/src/translator.rs exists and is re-exported from lib.rs",
+        "Function mcp_to_scp translates tools/list, tools/call, CallToolRequest, CallToolResult, tool.name, tool.description, tool.inputSchema, tool.outputSchema, tools/list_changed, isError",
+        "Function scp_to_mcp is the inverse",
+        "Round-trip property test: for every sample MCP message in tests/fixtures/, scp_to_mcp(mcp_to_scp(m)) == m (modulo the Query/Action kind prefix)",
+        "Round-trip property test: for every sample SCP outlet call in tests/fixtures/, mcp_to_scp(scp_to_mcp(s)) == s",
+        "Error envelope mapping: SCP OutletError → MCP CallToolResult { isError: true, meta: { scp_error_code, scp_source_chain } }",
+        "Streaming projection: SCP multi-chunk stream collapses to MCP CallToolResult by collecting Data chunks and using End.aggregate (or concatenation if aggregate is absent)",
+        "Allowlist (crates/scp-mcp/src/allowlist.rs) uses outlet_id vocabulary internally but still serializes MCP-facing tool.name when exposing to MCP clients",
+        "cargo test -p scp-mcp passes",
+        "grep -rn 'fn register_tool\\|fn invoke_tool' crates/scp-mcp/src/ returns 0 except where explicitly part of MCP JSON-RPC method names (\"tools/list\", \"tools/call\") — these are MCP wire identifiers",
+        "README or module doc documents the translator with example SCP↔MCP round trips"
+      ],
+      "actionItems": [
+        "Create crates/scp-mcp/src/translator.rs",
+        "Implement mcp_to_scp and scp_to_mcp for each covered message type",
+        "Wire Translator into crates/scp-mcp/src/server.rs (outbound-to-MCP) and crates/scp-mcp/src/client.rs (inbound-from-MCP)",
+        "Add tests/translator.rs with fixture-based round-trip tests",
+        "Add property-based tests (proptest)",
+        "Document semantics in module rustdoc"
+      ],
+      "blockedBy": [
+        "SCP-OUT-004",
+        "SCP-OUT-005"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/08-products-and-apps-in-the-graph.md",
+          "section": "## 8.5 MCP Compatibility (Model Context Protocol)"
+        },
+        {
+          "file": ".docs/specs/08-products-and-apps-in-the-graph.md",
+          "section": "### 8.5.1 MCP ↔ SCP Boundary Translation"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-014",
+      "title": "Update enforcement files (capability matrix, conformance, pipeline wiring, coverage, fuzz dicts)",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        ".docs/standards/sdk-capability-matrix.json",
+        "crates/scp-testing/tests/integration/ffi_conformance.rs",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs",
+        "crates/scp-testing/tests/integration/tool_economy_wiring.rs",
+        "scripts/check-sdk-coverage.py",
+        "scripts/check-cross-layer.sh",
+        "scripts/check-protocol-deps.sh",
+        "scripts/check-protocol-sync.py",
+        "fuzz/dicts/ucan_jwt.dict",
+        "fuzz/dicts/msgpack_client_message.dict"
+      ],
+      "description": "Update the mechanical enforcement surfaces so they validate the renamed symbols. The sdk-capability-matrix.json operation names flip from `tool_*` to `outlet_*` across the Python/TypeScript/Kotlin/Swift columns. The ffi_conformance.rs and pipeline_wiring.rs assertions are rewritten to reference `invoke_outlet_with_economy` etc. The file `tool_economy_wiring.rs` is moved to `outlet_economy_wiring.rs`. check-sdk-coverage.py parsers for operation names follow the new prefix. Fuzz dictionaries include both spelling (old dict entries are retained as invalid-input corpus — any observed behavior under `tool_*` inputs should return an OldFormatRejected or OutletErrorClass::Protocol::UnknownOperation error).",
+      "acceptanceCriteria": [
+        "sdk-capability-matrix.json: every operation whose previous name began with `tool_` has a new name beginning with `outlet_` and the domain `Tools` renamed to `Outlets`",
+        "grep -rn '\"tool_' .docs/standards/sdk-capability-matrix.json returns 0",
+        "crates/scp-testing/tests/integration/ffi_conformance.rs: every assertion referencing tool_ functions is rewritten to outlet_",
+        "File crates/scp-testing/tests/integration/outlet_economy_wiring.rs exists; tool_economy_wiring.rs does not",
+        "pipeline_wiring.rs assertions reference invoke_outlet_with_economy, register_outlet, and the outlet-prefixed helper names",
+        "scripts/check-sdk-coverage.py: the regex/token list that matches operation names uses the outlet_ prefix",
+        "scripts/check-cross-layer.sh: any tool_ string is replaced with outlet_",
+        "scripts/check-protocol-deps.sh + check-protocol-sync.py accept the new filenames (crates/scp-protocol/src/context/outlets/)",
+        "python3.12 scripts/check-sdk-coverage.py runs successfully post-rename",
+        "bash scripts/check-cross-layer.sh runs successfully",
+        "bash scripts/check-protocol-deps.sh runs successfully",
+        "python3.12 scripts/check-protocol-sync.py runs successfully",
+        "fuzz/dicts/ucan_jwt.dict includes outlet_query: and outlet_call: entries (split stems land in SCP-OUT-020; this story adds outlet_invoke: as a placeholder)",
+        "cargo test --workspace --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing succeeds (integration suite green)"
+      ],
+      "actionItems": [
+        "Systematic find-and-replace in the matrix JSON (preserving whitespace)",
+        "Rename tool_economy_wiring.rs → outlet_economy_wiring.rs",
+        "Update assertion strings in ffi_conformance.rs and pipeline_wiring.rs",
+        "Update check-sdk-coverage.py operation-name regex",
+        "Grep through all scripts/ and update any tool_ reference that is an operation name (leave SCP-TOOL- error codes alone — those are handled in SCP-OUT-041)",
+        "Add outlet_* entries to fuzz dicts",
+        "Run the full CI command and confirm zero warnings"
+      ],
+      "blockedBy": [
+        "SCP-OUT-002",
+        "SCP-OUT-004",
+        "SCP-OUT-005",
+        "SCP-OUT-006",
+        "SCP-OUT-007",
+        "SCP-OUT-008",
+        "SCP-OUT-009",
+        "SCP-OUT-010",
+        "SCP-OUT-011",
+        "SCP-OUT-012"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.4 Outlets"
+        },
+        {
+          "file": ".docs/standards/sdk-capability-matrix.json",
+          "section": ""
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-015",
+      "title": "Regenerate test vectors under SCP-OUTLET-REGISTRATION-V2 domain separator",
+      "gate": "gate-rename",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-testing/src/conformance/mod.rs",
+        "crates/scp-testing/tests/integration/conformance.rs",
+        ".docs/specs/25-test-vectors.md",
+        "tests/conformance/vectors/outlet_registration_v2.json"
+      ],
+      "description": "Regenerate the canonical outlet-registration test vectors under the new V2 domain separator (§5.4.1). The V1 vectors are deleted — they are no longer valid, and keeping them risks tools accidentally validating against the wrong separator. The new vector file documents 12 test cases: minimal Query, minimal Action, Query with cost=None, Query with cost=0, Action with cost>0, registration with aggregate_schema, registration with max-size schema (64 KiB), registration with 100 test vectors, registration with LLM-backed impl hash, registration with remote-service impl hash, multi-caveat UCAN invocation, and a cross-context invocation. Each vector's signature is computed against the V2 preimage and stored alongside the input. The conformance test harness loads these vectors and validates them against every bridge (PyO3, UniFFI-Swift, UniFFI-Kotlin, NAPI, WASM).",
+      "acceptanceCriteria": [
+        "File tests/conformance/vectors/outlet_registration_v2.json contains 12 test-vector entries",
+        "Each entry has fields: name, input (registration fields), expected_preimage (hex-encoded), expected_signature (hex-encoded), operator_did, operator_public_key (hex)",
+        "The V1 vector file tests/conformance/vectors/tool_registration_v1.json does not exist",
+        "Conformance test runs through every bridge: a vector is sign-verifiable via the Rust core AND via each FFI bridge",
+        "A negative test confirms the V1 preimage (with SCP-TOOL-REGISTRATION-V1) does NOT validate against the new code path",
+        ".docs/specs/25-test-vectors.md documents the V2 vector location and vector count",
+        "cargo test -p scp-testing --test conformance succeeds"
+      ],
+      "actionItems": [
+        "Delete V1 vectors",
+        "Implement a generator that reads the 12 test-vector specs and emits signed JSON",
+        "Wire the new vectors into the conformance harness",
+        "Add the negative V1-rejection test",
+        "Document the vectors in §25",
+        "Run the conformance suite across all bridges"
+      ],
+      "blockedBy": [
+        "SCP-OUT-002",
+        "SCP-OUT-005",
+        "SCP-OUT-006",
+        "SCP-OUT-007",
+        "SCP-OUT-008"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.1 Outlet Registration Wire Format"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "## 5.4 Outlets"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-016",
+      "title": "Spec: verify §5.4.2 Outlet Classification and §6.2.0.3 Chain Amplification Rule are cross-referenced from §5.4, §19.3, §7.3.7",
+      "gate": "gate-classification",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        ".docs/specs/05-contexts.md",
+        ".docs/specs/19-economic-governance.md",
+        ".docs/specs/07-trust-validation-and-capabilities.md"
+      ],
+      "description": "§5.4.2 (Outlet Classification), §5.4.3 (Query Result Cache), §6.2.0.3 (Chain Amplification Rule), §6.2.0.4 (Chain Depth Split) are already present (added during PRD drafting). This story ensures that all the upstream references point at them correctly: §5.4 bullets explicitly reference §5.4.2 for kind; §19.3 references §5.4.2 for the Query cost contract; §7.3.7 consequence mechanisms reference §5.4.2 for the QueryViolation trigger; §5.4.4 error taxonomy references §5.4.2 for the Protocol class codes. All cross-references must use §-style prose (not raw markdown anchors) to match existing spec style.",
+      "acceptanceCriteria": [
+        "grep -n '§5.4.2' .docs/specs/05-contexts.md returns >= 3 matches (one per §5.4 bullet about kind, one in §5.4.3, one in §5.4.4)",
+        "grep -n '§5.4.2' .docs/specs/19-economic-governance.md returns >= 1 match (in §19.3 Query outlet cost contract)",
+        "grep -n '§5.4.2' .docs/specs/07-trust-validation-and-capabilities.md returns >= 1 match",
+        "grep -n '§6.2.0.3' .docs/specs/05-contexts.md returns >= 1 match",
+        "grep -n '§6.2.0.4' .docs/specs/05-contexts.md returns >= 1 match",
+        "grep -n '§5.4.3' .docs/specs/05-contexts.md returns >= 2 matches (§5.4 bullets + §5.4.2 cache link)",
+        "python3.12 scripts/validate-prd.py passes (no broken section references introduced)"
+      ],
+      "actionItems": [
+        "Audit every reference to §5.4.2 and §6.2.0.3 and confirm it lands on the right content",
+        "Add any missing forward references so §5.4.2 is referenced from §5.4 (definition), §5.4.3 (cache), §5.4.4 (error class), §19.3 (cost contract), §7.3.7 (consequence hook), §6.2.0.3 (amplification)",
+        "Re-run validate-prd.py"
+      ],
+      "blockedBy": [
+        "SCP-OUT-001"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.2 Outlet Classification (Query vs Action)"
+        },
+        {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "#### 6.2.0.3 Chain Amplification Rule"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-017",
+      "title": "Add OutletKind enum and kind field to OutletRegistration (scp-protocol)",
+      "gate": "gate-classification",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/outlets/mod.rs",
+        "crates/scp-protocol/src/context/outlets/lifecycle.rs",
+        "crates/scp-protocol/src/context/outlets/schema.rs",
+        "crates/scp-protocol/src/lib.rs"
+      ],
+      "description": "Introduce `OutletKind { Query, Action }` as a tagged enum with serde `tag = \"kind\"` wire form, Default = Action (fail-safe per §5.4.2). Add `kind: OutletKind` field to `OutletRegistration`. Update the canonical signature preimage construction to use the real kind_byte (0x00 Query, 0x01 Action) in place of the placeholder value written in SCP-OUT-002. Verify preimage backward-compatibility with SCP-OUT-015 vectors — those vectors are authored with explicit kind values, so this story does not regenerate them.",
+      "acceptanceCriteria": [
+        "enum OutletKind { Query, Action } exists in crates/scp-protocol/src/context/outlets/mod.rs, derives Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize",
+        "OutletKind::default() returns Action",
+        "serde tag = \"kind\" on OutletKind; wire values are 'query' and 'action' (lowercase)",
+        "OutletRegistration struct has pub kind: OutletKind field",
+        "OutletRegistration::canonical_preimage includes kind_byte (0x00 = Query, 0x01 = Action)",
+        "Round-trip serde test: OutletRegistration { kind: Query, ... } serializes with kind: 'query' and deserializes back",
+        "Default-value test: serde_json::from_str of a registration omitting kind produces kind: Action (fail-safe)",
+        "cargo test -p scp-protocol succeeds",
+        "Rustdoc on OutletKind cites §5.4.2"
+      ],
+      "actionItems": [
+        "Define OutletKind enum",
+        "Add kind field to OutletRegistration",
+        "Update canonical_preimage fn to insert kind_byte at the correct position (between outlet_id and name per §5.4.1)",
+        "Add serde default annotation on kind (default = Action)",
+        "Add tests for round-trip, default, and preimage",
+        "Document in rustdoc"
+      ],
+      "blockedBy": [
+        "SCP-OUT-015",
+        "SCP-OUT-016"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.1 Outlet Registration Wire Format"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.2 Outlet Classification (Query vs Action)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-018",
+      "title": "Enforce Query outlet structural cost floor at registration",
+      "gate": "gate-classification",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/outlets/lifecycle.rs",
+        "crates/scp-runtime/src/context/manager/outlets.rs"
+      ],
+      "description": "Reject any OutletRegistration where `kind == Query` AND `cost.is_some() && cost.amount > 0`. The check runs at registration time in scp-protocol (pure validation) and is re-checked at the runtime event-log commit boundary. Rejection returns `OutletErrorClass::Protocol::QueryCostViolation` (the taxonomy is defined in SCP-OUT-036; this story emits the current InvocationError equivalent and SCP-OUT-038 upgrades to the typed class). Also reject `kind == Query` AND `cost.cost_formula.is_some()` — a dynamic pricing formula on a Query outlet is not coherent.",
+      "acceptanceCriteria": [
+        "Function OutletRegistration::validate() returns Err when kind == Query and cost is Some with amount > 0",
+        "Function OutletRegistration::validate() returns Err when kind == Query and cost.cost_formula is Some",
+        "Function OutletRegistration::validate() returns Ok when kind == Query and cost is None",
+        "Function OutletRegistration::validate() returns Ok when kind == Query and cost is Some with amount == 0 and cost_formula is None",
+        "Function OutletRegistration::validate() returns Ok for any kind == Action cost configuration",
+        "ContextManager::register_outlet calls validate() and returns InvocationError::OutletQueryCostViolation on failure",
+        "Unit tests cover all four combinations listed above",
+        "Integration test: registering a Query outlet with cost.amount = 1 fails end-to-end through the PyO3 bridge",
+        "cargo test --workspace succeeds"
+      ],
+      "actionItems": [
+        "Add validate() to OutletRegistration (or extend existing validate)",
+        "Wire validate() into register_outlet",
+        "Add the four-case unit test",
+        "Add the integration test",
+        "Document the rule in rustdoc with a §5.4.2 citation"
+      ],
+      "blockedBy": [
+        "SCP-OUT-017"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.2 Outlet Classification (Query vs Action)"
+        },
+        {
+          "file": ".docs/specs/19-economic-governance.md",
+          "section": "## 19.3 Economic Policy"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-019",
+      "title": "Implement ReadOnlyInvocation guard for Query outlets in scp-runtime",
+      "gate": "gate-classification",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/outlets/invoke.rs",
+        "crates/scp-runtime/src/context/providers/mod.rs",
+        "crates/scp-runtime/src/context/manager/outlets.rs"
+      ],
+      "description": "Introduce a `ReadOnlyInvocation` handle type that executors receive in place of the normal mutable-context handle when the outlet is `Query`. The handle denies writes to: messages, roles, registry (outlet/bridge/role), event log, governance proposals/votes, economic ledgers, and the caveat counter store. Any attempt by the executor to mutate returns `OutletErrorClass::Protocol::QueryViolation` from the handle method itself (no panic, no silent corruption). Deny-list is explicit: the handle exposes read methods only; the write methods exist on a separate handle type that only `Action` invocations see.",
+      "acceptanceCriteria": [
+        "struct ReadOnlyInvocation<'a> exists in context/outlets/invoke.rs",
+        "ReadOnlyInvocation exposes only read-side methods: list_members, get_member_role, get_outlet, list_outlets, get_event, current_epoch, get_economic_policy, get_caveat_counter (read-only view)",
+        "struct MutableInvocation<'a> exists for Action outlets with both read and write methods",
+        "trait OutletExecutor has signatures exec_query(&self, ctx: ReadOnlyInvocation, input: Value) -> Result<Value, OutletError> and exec_action(&self, ctx: MutableInvocation, input: Value) -> Result<Value, OutletError>",
+        "ContextManager::invoke_outlet dispatches to exec_query when kind == Query and exec_action when kind == Action",
+        "A test harness provides an Action-typed executor that attempts to mutate state; invoking it with kind == Query returns the compile-time-denied handle (proves absence via trait bound)",
+        "A runtime test: Query executor that somehow calls through to a write-side internal API is trapped by explicit deny-list runtime check, emits QueryViolation, and causes OutletVerified { integrity_ok: false, reason: QueryMisdeclaration } event per §5.4.2",
+        "cargo test -p scp-runtime passes"
+      ],
+      "actionItems": [
+        "Define ReadOnlyInvocation and MutableInvocation structs wrapping the internal handle",
+        "Define OutletExecutor trait with two methods (exec_query, exec_action) — the trait is implemented per outlet, default impls return OutletError::KindMismatch",
+        "Update invoke_outlet to dispatch based on registered kind",
+        "Add the QueryMisdeclaration signal emission",
+        "Update test harness helpers",
+        "Add both compile-time (trait bound) and runtime tests"
+      ],
+      "blockedBy": [
+        "SCP-OUT-017"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.2 Outlet Classification (Query vs Action)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-020",
+      "title": "Split UCAN capability stems: outlet_query:* and outlet_call:* (attenuation + validation)",
+      "gate": "gate-classification",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/roles.rs",
+        "crates/scp-protocol/src/trust/ucan.rs",
+        "crates/scp-runtime/src/context/manager/outlets.rs",
+        "crates/scp-runtime/src/context/manager/mod.rs",
+        "fuzz/dicts/ucan_jwt.dict"
+      ],
+      "description": "Split the single `outlet_invoke:*` UCAN stem introduced in SCP-OUT-002 into two kind-specific stems: `outlet_query:*` (required for Query invocations) and `outlet_call:*` (required for Action invocations). The Capability enum gains two variants: `Capability::OutletQuery(OutletId)` and `Capability::OutletCall(OutletId)`, plus wildcard variants `OutletQueryAll` and `OutletCallAll`. The single `OutletInvoke(_)` / `OutletInvokeAll` variants are deleted — there is no transitional alias, in line with the hard-break policy. The full 11-step UCAN validation (§7.2.1) uses the split: step 6 (capability match) checks the split stem against the outlet's registered kind. Attenuation is independent per stem — a delegation of `outlet_query:*` cannot be attenuated to `outlet_call:foo` (wrong class). The `narrow()` attenuation verifier rejects cross-class narrowing.",
+      "acceptanceCriteria": [
+        "Capability enum has variants OutletQuery(OutletId), OutletQueryAll, OutletCall(OutletId), OutletCallAll",
+        "Capability enum does NOT have variants OutletInvoke / OutletInvokeAll",
+        "Capability::new(\"outlet:query:{outlet_id}\") returns Some(Capability::OutletQuery(..))",
+        "Capability::new(\"outlet:call:{outlet_id}\") returns Some(Capability::OutletCall(..))",
+        "Capability::new(\"outlet:query:*\") returns Some(Capability::OutletQueryAll)",
+        "Capability::new(\"outlet:call:*\") returns Some(Capability::OutletCallAll)",
+        "Capability::new(\"outlet:invoke:{outlet_id}\") returns None (hard break)",
+        "UCAN wire form uses underscore: resource string is 'outlet_query:{outlet_id}' and 'outlet_call:{outlet_id}' (matching existing tool_invoke:* convention)",
+        "SDK-facing string form uses colons: 'outlet:query:{id}' and 'outlet:call:{id}' (matching existing tool:invoke:* convention)",
+        "A Query invocation checks OutletQuery(..) / OutletQueryAll; checking OutletCall(..) at a Query invocation fails with AuthorizationViolation",
+        "Delegation attenuation: parent(OutletQueryAll) → child(OutletQuery(x)) is valid; parent(OutletQueryAll) → child(OutletCall(x)) is rejected (cross-class)",
+        "fuzz/dicts/ucan_jwt.dict contains both 'outlet_query:' and 'outlet_call:' tokens",
+        "cargo test --workspace succeeds"
+      ],
+      "actionItems": [
+        "Refactor Capability enum",
+        "Update Capability::new and Capability::name for new stems",
+        "Delete OutletInvoke / OutletInvokeAll variants",
+        "Extend verify_attenuation to reject cross-class narrowing",
+        "Update invoke_outlet to pick the right stem based on registered kind",
+        "Update fuzz dictionaries",
+        "Add round-trip and attenuation tests"
+      ],
+      "blockedBy": [
+        "SCP-OUT-017"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.2 Outlet Classification (Query vs Action)"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "#### 7.3.4.1 Capability URI Namespace"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-021",
+      "title": "Enforce chain amplification rule (Query→Action forbidden) and per-kind chain depth budget",
+      "gate": "gate-classification",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/manager/outlets.rs",
+        "crates/scp-protocol/src/context/params.rs"
+      ],
+      "description": "Implement §6.2.0.3 (amplification rule) and §6.2.0.4 (chain depth split). The cross-context invocation path carries an `origin_kind: OutletKind` that is propagated from the outermost caller. At each hop, the runtime checks: (a) `origin_kind != Query OR hop_kind == Query` — else reject with `OutletErrorClass::Authorization::AmplificationViolation`; (b) the kind-appropriate counter: Query uses `max_chain_depth`, Action uses `max(1, max_chain_depth / 2)`. The counter decrement happens on each cross-context hop. A failed check produces a structured rejection event in both event logs.",
+      "acceptanceCriteria": [
+        "ContextParams field max_chain_depth_action exists, default = max(1, max_chain_depth / 2) = 4, range [1, 255]",
+        "Function cross_context_invoke(origin_kind, hop_kind, depth_remaining_query, depth_remaining_action) returns Err(AmplificationViolation) when origin_kind == Query AND hop_kind == Action",
+        "Function decrements the kind-appropriate counter on accept",
+        "Function returns Err(ChainDepthExceeded) when the relevant counter would go negative",
+        "When origin_kind == Action invokes a Query hop, the Query counter decrements (not Action counter — matches the invoked outlet, not the originator, for depth accounting)",
+        "Integration test Query → Query → Query valid chain with max_chain_depth=8",
+        "Integration test Query → Query → Action triggers AmplificationViolation with origin_kind == Query",
+        "Integration test Action → Query → Action is valid (origin_kind is Action for the outer hop, Query amplification rule is not triggered)",
+        "Integration test Action → Action at depth 5 with default budget triggers ChainDepthExceeded (Action budget = 4)",
+        "Rejection emits a failed OutletInvokedEvent in both contexts' event logs with an error code",
+        "cargo test --workspace succeeds"
+      ],
+      "actionItems": [
+        "Add max_chain_depth_action field with serde default to ContextParams",
+        "Extend cross-context invocation call frame with origin_kind and the two counters",
+        "Implement the amplification check",
+        "Implement the per-kind depth decrement",
+        "Emit failure events",
+        "Add the four integration tests"
+      ],
+      "blockedBy": [
+        "SCP-OUT-017",
+        "SCP-OUT-020"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "#### 6.2.0.3 Chain Amplification Rule"
+        },
+        {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "#### 6.2.0.4 Chain Depth Split"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-022",
+      "title": "Split cross-context rate tier defaults by kind (Query 600/100, Action 60/10)",
+      "gate": "gate-classification",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/outlets/interface.rs",
+        "crates/scp-protocol/src/context/params.rs",
+        "crates/scp-runtime/src/context/manager/outlets.rs"
+      ],
+      "description": "Update the cross-context outlet-interface default rate limits per §6.2.0.2 to distinguish kinds. Query interfaces: per_interface 600/min, per_caller 100/min. Action interfaces: per_interface 60/min, per_caller 10/min (unchanged from the pre-classification baseline). The existing `OutboundPolicy.max_calls_per_minute` and `InboundPolicy.max_calls_per_minute` remain single-value per instance, but the default-derivation logic now picks a different default based on the outlet's kind. Callers that set explicit values preserve that value. The sliding-window counter implementation is shared; only the default changes.",
+      "acceptanceCriteria": [
+        "OutletInterfaceDefaults::for_kind(OutletKind::Query) returns (600, 100)",
+        "OutletInterfaceDefaults::for_kind(OutletKind::Action) returns (60, 10)",
+        "When an InterfaceOffer is built for a Query outlet and the caller omits max_calls_per_minute, the runtime writes 600",
+        "When an InterfaceOffer is built for an Action outlet and the caller omits max_calls_per_minute, the runtime writes 60",
+        "Explicit max_calls_per_minute values are preserved regardless of kind",
+        "A rate-limit unit test for both tiers",
+        "cargo test --workspace succeeds"
+      ],
+      "actionItems": [
+        "Add OutletInterfaceDefaults helper",
+        "Wire it into InterfaceOffer builder",
+        "Add the unit tests",
+        "Update rustdoc on InterfaceOffer fields"
+      ],
+      "blockedBy": [
+        "SCP-OUT-017"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "#### 6.2.0.2 Tool Interface Rate Limit Defaults"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.2 Outlet Classification (Query vs Action)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-023",
+      "title": "Shared operator-signed relay-hosted Query cache: relay API + operator signing",
+      "gate": "gate-classification",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-transport/src/relay/mod.rs",
+        "crates/scp-transport/src/relay/cache.rs",
+        "crates/scp-relay/src/lib.rs",
+        "crates/scp-protocol/src/context/outlets/cache.rs",
+        "crates/scp-runtime/src/context/manager/outlets.rs"
+      ],
+      "description": "Implement the relay-hosted Query result cache per §5.4.3. The relay stores (cache_key, output_value, expires_at, operator_signature) tuples keyed by `SHA-256(\"SCP-OUTLET-QUERY-CACHE-V1:\" || outlet_id || canonical_jcs(input) || implementation_hash)`. The relay exposes two RPCs to authenticated subscribers: `query_cache_get(cache_key)` and `query_cache_put(entry)` (the put is authenticated — only the outlet's current operator DID may put). On successful Query invocation, the operator SDK signs the entry: signature preimage is `SHA-256(\"SCP-OUTLET-QUERY-CACHE-SIG-V1:\" || cache_key || canonical_jcs(output_value) || expires_at_be)`. The relay rejects puts whose signature does not verify against the outlet's registry-current operator_did. TTL default 60s per `x-scp-query-ttl-secs` extension; ceiling 86400s; range check on put.",
+      "acceptanceCriteria": [
+        "struct QueryCacheEntry { cache_key: [u8; 32], output_value: Value, expires_at: u64, operator_signature: [u8; 64] } exists in scp-protocol",
+        "QueryCacheEntry::canonical_preimage is SHA-256 over the prefixed concatenation described",
+        "Relay trait RelayCache has query_cache_get, query_cache_put, query_cache_purge methods",
+        "Relay impl rejects query_cache_put when operator_signature fails to verify against operator_did from the latest OutletRegistered/OutletUpdated event",
+        "Relay impl rejects query_cache_put when expires_at - now > 86400 seconds",
+        "Relay impl lazily purges entries with expires_at <= now on read and on every 60s background sweep",
+        "Runtime helper put_query_cache_entry (invoked by invoke_outlet after a successful Query) signs the entry with the operator's active signing key",
+        "Runtime helper get_query_cache_entry verifies the signature locally before returning the cached value",
+        "Integration test (real relay): Query invocation produces a cache entry; subsequent identical Query invocation returns the cached entry without re-executing",
+        "Integration test: forged signature on query_cache_put is rejected by the relay",
+        "Integration test: expired entry is not returned (verifier checks expires_at before returning)",
+        "cargo test --workspace succeeds"
+      ],
+      "actionItems": [
+        "Define QueryCacheEntry in scp-protocol",
+        "Add RelayCache trait methods",
+        "Implement on the SCP native relay (crates/scp-relay)",
+        "Add background sweep task with 60s tick",
+        "Wire invoke_outlet to call put_query_cache_entry on success and get_query_cache_entry on miss-or-cache-check",
+        "Add forged-signature and expiry integration tests"
+      ],
+      "blockedBy": [
+        "SCP-OUT-017",
+        "SCP-OUT-019",
+        "SCP-OUT-020"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.3 Query Result Cache"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-024",
+      "title": "SDK verification + cache key/TTL/invalidation wiring across all four SDKs",
+      "gate": "gate-classification",
+      "priority": "P0",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/manager/outlets.rs",
+        "bindings/python/scp_sdk/outlets.py",
+        "bindings/typescript/src/outlets.ts",
+        "bindings/swift/Sources/SCP/Outlets.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Outlets.kt"
+      ],
+      "description": "Wire the cache-hit path end-to-end. The SDK invoke_outlet flow: (1) if kind == Query, compute cache_key and call relay.query_cache_get; (2) on hit, verify operator_signature against the outlet's current operator_did and expires_at > now; (3) return cached output; (4) on miss or verification failure, fall through to a live invocation. Invalidation: an OutletUpdated event changes implementation_hash which is part of cache_key, so old entries become unreachable and are purged by TTL; on OutletVerified { integrity_ok: false }, the SDK calls relay.query_cache_purge(outlet_id); on OutletDeregistered, same purge. All four SDKs expose the same behavior; the branch logic lives in scp-runtime and each SDK just plumbs through invoke_outlet.",
+      "acceptanceCriteria": [
+        "ContextManager::invoke_outlet implements the cache-hit-verify-fallback flow when kind == Query",
+        "On a cache-hit path, no OutletExecutor method is called (executor is skipped)",
+        "Cache-hit verification failure returns OutletErrorClass::Protocol::CacheIntegrityFailure AND automatically retries as a live invocation (with an event-logged retry reason)",
+        "OutletUpdated handler does NOT explicitly purge (TTL handles it); documented in code comment",
+        "OutletVerified { integrity_ok: false } handler calls relay.query_cache_purge(outlet_id)",
+        "OutletDeregistered handler calls relay.query_cache_purge(outlet_id)",
+        "Python SDK integration test: invoke a Query outlet twice; second call returns identical output and records a cache-hit event",
+        "TypeScript SDK integration test: same shape",
+        "Swift SDK integration test: same shape",
+        "Kotlin SDK integration test: same shape",
+        "Negative SDK test: operator rotates key; stale cached entry verification fails; SDK falls through to live invocation",
+        "cargo test --workspace && pytest && bun test && swift test && gradle test all green"
+      ],
+      "actionItems": [
+        "Implement invoke_outlet cache-hit flow in scp-runtime",
+        "Expose operator_signature verification helper in scp-protocol (re-used by relay and SDKs)",
+        "Wire OutletVerified and OutletDeregistered handlers to purge",
+        "Add the integration tests per SDK",
+        "Document the semantics in each SDK's outlet module docs"
+      ],
+      "blockedBy": [
+        "SCP-OUT-023"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.3 Query Result Cache"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-025",
+      "title": "Emit reduced-payload OutletQueried events on cache hits",
+      "gate": "gate-classification",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-event-log/src/lib.rs",
+        "crates/scp-runtime/src/context/manager/outlets.rs"
+      ],
+      "description": "Add a new event kind `OutletQueried { invoker_did, outlet_id, cache_key, timestamp, cache_hit: true }` that is emitted ONLY on cache hits. The `output_hash` is omitted because the output is traced via the cache entry's cache_key — the Merkle event log records the fact of the invocation without re-hashing the output payload. Cache misses continue to emit the standard `OutletInvokedEvent` via the §5.4.5 flow (see Gate 5; for non-streaming Query invocations until Gate 5 lands, a minimal OutletInvokedEvent is emitted). The event log discriminant for OutletQueried is placed in the Outlet* variant block introduced in SCP-OUT-003.",
+      "acceptanceCriteria": [
+        "EventKind::OutletQueried { invoker_did, outlet_id, cache_key, timestamp, cache_hit: true } variant exists",
+        "Discriminant for OutletQueried is allocated within the OutletX block from SCP-OUT-003",
+        "invoke_outlet cache-hit path emits OutletQueried (not OutletInvokedEvent)",
+        "invoke_outlet cache-miss path emits OutletInvokedEvent",
+        "Event log reconstruction test asserts OutletQueried does not carry an output_hash field",
+        "Rustdoc on the variant cites §5.4.3",
+        "cargo test -p scp-event-log && cargo test -p scp-runtime pass"
+      ],
+      "actionItems": [
+        "Add OutletQueried variant",
+        "Wire it from the cache-hit flow",
+        "Add the discriminant-allocation and reconstruction tests"
+      ],
+      "blockedBy": [
+        "SCP-OUT-003",
+        "SCP-OUT-023"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.3 Query Result Cache"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.14.10 Event Log"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-026",
+      "title": "Expose OutletKind on SDK surfaces and implement per-kind ergonomic wrappers across 4 SDKs",
+      "gate": "gate-classification",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/outlets.rs",
+        "crates/scp-ffi/napi/src/outlets.rs",
+        "crates/scp-ffi/uniffi/src/scp.udl",
+        "crates/scp-ffi/wasm/src/outlets.rs",
+        "bindings/python/scp_sdk/outlets.py",
+        "bindings/typescript/src/outlets.ts",
+        "bindings/swift/Sources/SCP/Outlets.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Outlets.kt"
+      ],
+      "description": "Plumb OutletKind through every FFI bridge and expose ergonomic per-kind wrappers on each SDK. Python: `OutletKind.Query` / `OutletKind.Action` enum; `ctx.outlets.register(..., kind=OutletKind.Query, ...)`. TypeScript: `OutletKind` string-literal union `'query' | 'action'`. Swift: `enum OutletKind: String { case query, action }`. Kotlin: `enum class OutletKind { QUERY, ACTION }` (serde to lowercase). Each SDK also adds convenience methods `outlets.registerQuery(...)` / `outlets.registerAction(...)` that infer kind. The SDK automatically picks the UCAN stem (outlet_query vs outlet_call) based on the registered kind when `invoke(...)` is called — the caller never names the stem.",
+      "acceptanceCriteria": [
+        "Every FFI bridge exposes OutletKind (enum serialized as 'query'/'action')",
+        "Python: scp_sdk.OutletKind enum with Query and Action members; ctx.outlets.register accepts kind param",
+        "Python convenience: ctx.outlets.register_query(...) and ctx.outlets.register_action(...) set kind internally",
+        "TypeScript: type OutletKind = 'query' | 'action'; ctx.outlets.register({ kind, ... }); ctx.outlets.registerQuery(...); ctx.outlets.registerAction(...)",
+        "Swift: OutletKind enum; ctx.outlets.register(kind: .query, ...); convenience ctx.outlets.registerQuery(...), registerAction(...)",
+        "Kotlin: enum class OutletKind { QUERY, ACTION }; suspend fun register(kind: OutletKind, ...); convenience registerQuery, registerAction",
+        "ctx.outlets.invoke(id, input) automatically picks outlet_query or outlet_call stem based on the registered kind; caller does not pass stem",
+        "A negative test per SDK: invoking a Query outlet with an outlet_call UCAN fails with AuthorizationViolation",
+        "All four SDK CI suites green"
+      ],
+      "actionItems": [
+        "Add OutletKind to each FFI bridge",
+        "Implement language-idiomatic enum in each SDK",
+        "Add register_query / register_action convenience methods",
+        "Implement automatic stem selection in invoke",
+        "Add the per-SDK negative test"
+      ],
+      "blockedBy": [
+        "SCP-OUT-017",
+        "SCP-OUT-020"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.2 Outlet Classification (Query vs Action)"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.1 Outlet Registration Wire Format"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-027",
+      "title": "Spec: verify §7.3.8 Invocation Caveats is cross-referenced from §5.4, §19.5, §6.2",
+      "gate": "gate-caveats",
+      "priority": "P1",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        ".docs/specs/05-contexts.md",
+        ".docs/specs/06-cross-context-communication.md",
+        ".docs/specs/19-economic-governance.md",
+        ".docs/specs/07-trust-validation-and-capabilities.md"
+      ],
+      "description": "§7.3.8 (Invocation Caveats) is already present (added during PRD drafting). Audit upstream references and add missing ones: §5.4 bullets on UCAN point to §7.3.8 for caveat semantics; §19.5 (SpendingCapability) references §7.3.8 for the AND composition rule; §6.2 references §7.3.8 for the cross-context composition; §7.2.1 (11-step validation) references §7.3.8 at steps 7 and 11.",
+      "acceptanceCriteria": [
+        "grep -n '§7.3.8' .docs/specs/05-contexts.md returns >= 1 match",
+        "grep -n '§7.3.8' .docs/specs/06-cross-context-communication.md returns >= 1 match",
+        "grep -n '§7.3.8' .docs/specs/19-economic-governance.md returns >= 1 match",
+        "grep -n '§7.3.8' .docs/specs/07-trust-validation-and-capabilities.md returns >= 2 matches (cross-reference from §7.2.1 step 7 and step 11)",
+        "python3.12 scripts/validate-prd.py passes"
+      ],
+      "actionItems": [
+        "Audit each spec file for UCAN and capability prose that should cite §7.3.8",
+        "Add the missing cross-references",
+        "Run validate-prd.py"
+      ],
+      "blockedBy": [
+        "SCP-OUT-026"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "### 7.3.8 Invocation Caveats"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-028",
+      "title": "Define InvocationCaveats struct + serde + mint limits (scp-protocol)",
+      "gate": "gate-caveats",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/trust/caveats.rs",
+        "crates/scp-protocol/src/trust/mod.rs",
+        "crates/scp-protocol/src/trust/ucan.rs"
+      ],
+      "description": "Define the `InvocationCaveats` struct and `RateWindow` helper per §7.3.8. Implement serde serialization (MessagePack via rmp_serde for wire, canonical JCS for hashing). Implement mint-time limit enforcement as a constructor `InvocationCaveats::try_new(fields) -> Result<Self, CaveatMintError>` that checks: ≤ 8 non-None fields (the 8 caveats-per-attestation limit refers to the count of populated caveat fields), input_schema serialized size ≤ 4 KiB, input_schema nesting depth ≤ 8, list fields ≤ 16 entries. Errors: SCP-TOOL-6114 (caveat-mint-limit-exceeded) — new within the 6100-6199 sub-block.",
+      "acceptanceCriteria": [
+        "struct InvocationCaveats exists in crates/scp-protocol/src/trust/caveats.rs with all 11 fields from §7.3.8",
+        "struct RateWindow { max: u32, window_secs: u32 } exists",
+        "All fields Option-typed except RateWindow inner fields",
+        "Serde tag naming matches §7.3.8 ('amountMaxPerCall' etc. in camelCase for UCAN `nb` JSON compatibility; MessagePack uses the same strings for consistency)",
+        "InvocationCaveats::try_new enforces ≤ 8 populated caveats, ≤ 4 KiB serialized input_schema, ≤ 8 nesting depth (JSON Schema depth counted via traversal), ≤ 16 entries for allowed_adapters / allowed_target_dids",
+        "try_new returns CaveatMintError::TooManyCaveats / SchemaTooLarge / SchemaTooDeep / ListTooLong",
+        "Error envelope code SCP-TOOL-6114 slug 'caveat-mint-limit-exceeded' wired",
+        "JSON Schema depth counter respects both object nesting and array nesting",
+        "Round-trip serde test: serialize to MessagePack and JCS, deserialize back, field-equal",
+        "Round-trip test: non-camelCase field names fail to deserialize",
+        "cargo test -p scp-protocol succeeds"
+      ],
+      "actionItems": [
+        "Define the struct and helper",
+        "Implement try_new with four structural checks",
+        "Implement canonical JCS serialization (wrapper over serde_json_canonicalizer)",
+        "Implement JSON Schema depth-counter helper",
+        "Add round-trip, size-limit, depth-limit, list-limit, and camelCase tests",
+        "Document in rustdoc with §7.3.8 citation"
+      ],
+      "blockedBy": [
+        "SCP-OUT-027"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "### 7.3.8 Invocation Caveats"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-029",
+      "title": "Implement narrow() attenuation per field + conservative JSON Schema refinement",
+      "gate": "gate-caveats",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/trust/caveats.rs",
+        "crates/scp-protocol/src/trust/ucan.rs"
+      ],
+      "description": "Implement `InvocationCaveats::narrow(&self, child: &Self) -> Result<(), AttenuationViolation>` per §7.3.8 attenuation rules. Each of the 11 fields is checked independently. JSON Schema narrowing accepts only {enum, const, minimum, maximum, minLength, maxLength, pattern, required, additionalProperties:false}; anything else triggers AttenuationViolation. Implementation of JSON Schema conservative refinement walks both parent and child schemas recursively, verifying at each step that every child keyword appears in the whitelist AND the child value is at least as restrictive as parent's (e.g., child.enum is a subset of parent.enum, child.minimum >= parent.minimum, etc.).",
+      "acceptanceCriteria": [
+        "Method InvocationCaveats::narrow exists with signature fn narrow(&self, child: &Self) -> Result<(), AttenuationViolation>",
+        "Rule: amount_max_per_call — child <= parent (None→Some OK, Some→None fails)",
+        "Rule: amount_max_cumulative — same",
+        "Rule: max_calls — same",
+        "Rule: rate_window.max — same",
+        "Rule: valid_from — child >= parent",
+        "Rule: valid_until — child <= parent",
+        "Rule: hours_of_day — child & parent == child (subset bitmask)",
+        "Rule: days_of_week — same",
+        "Rule: rate_window.window_secs — child <= parent",
+        "Rule: allowed_adapters — child is Vec subset of parent (None parent, Some child introduces a bound)",
+        "Rule: allowed_target_dids — same subset logic",
+        "Rule: input_schema — conservative JSON Schema narrowing (only whitelisted keywords may introduce narrowing)",
+        "JSON Schema narrowing: enum narrows iff child.enum ⊂ parent.enum (Set semantics)",
+        "JSON Schema narrowing: minimum only narrows (child >= parent)",
+        "JSON Schema narrowing: unknown keyword in child triggers AttenuationViolation",
+        "Unit test for each rule (positive and negative)",
+        "Property test: narrow is transitive — A narrow B AND B narrow C implies A narrow C",
+        "cargo test -p scp-protocol succeeds"
+      ],
+      "actionItems": [
+        "Implement narrow() method",
+        "Implement json_schema_narrows helper with whitelist-based rules",
+        "Add 22+ unit tests (two per rule)",
+        "Add transitivity property test",
+        "Document in rustdoc"
+      ],
+      "blockedBy": [
+        "SCP-OUT-028"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "### 7.3.8 Invocation Caveats"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-030",
+      "title": "Implement CaveatCounterStore for rate/max_calls/cumulative accounting",
+      "gate": "gate-caveats",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/trust/caveat_counter_store.rs",
+        "crates/scp-runtime/src/trust/mod.rs",
+        "crates/scp-protocol/src/trust/mod.rs"
+      ],
+      "description": "Implement `CaveatCounterStore` — a sibling to `NonceTracker` (§9.5) — that tracks per-(ucan_cid, caveat_kind) counters durably. The store supports: `check_and_increment(ucan_cid, kind, amount) -> Result<(), CounterExhausted>` with CAS semantics so racing invocations cannot double-spend; `sliding_window_record(ucan_cid, window_secs, max)`; durability via `ProtocolRepository` under `context/{id}/caveat_counters/{ucan_cid}` per §17.3. Restart-safe. Unit tests cover race conditions via a mock clock + threaded increments.",
+      "acceptanceCriteria": [
+        "struct CaveatCounterStore in crates/scp-runtime/src/trust/caveat_counter_store.rs",
+        "Method check_and_increment(ucan_cid, CaveatKind::{MaxCalls|AmountCumulative|RateWindow}, amount) -> Result<(), CounterExhausted>",
+        "Method is atomic: a concurrent double-increment cannot both succeed when the combined result exceeds the cap (verified by tokio::task::spawn_blocking threaded test)",
+        "Persistence path context/{id}/caveat_counters/{ucan_cid} matches §17.3 layout",
+        "Sliding-window counter uses a ring buffer keyed by window_secs",
+        "A 1000-iteration race test: two concurrent invocations each increment amount 50 against cap 50; exactly one succeeds, one fails with CounterExhausted",
+        "Restart test: write counter, drop store, reopen, read back — same value",
+        "cargo test -p scp-runtime succeeds"
+      ],
+      "actionItems": [
+        "Implement the store against ProtocolRepository",
+        "Use tokio::sync::Mutex or redb transaction for atomicity",
+        "Add the race test and restart test",
+        "Wire CaveatKind enum in scp-protocol",
+        "Document in rustdoc"
+      ],
+      "blockedBy": [
+        "SCP-OUT-028"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "### 7.3.8 Invocation Caveats"
+        },
+        {
+          "file": ".docs/specs/17-persistence-and-storage.md",
+          "section": "## 17.3 Key Convention"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-031",
+      "title": "Wire caveat validation into the 11-step UCAN pipeline (Steps 7b, 11b, post-input)",
+      "gate": "gate-caveats",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/trust/ucan.rs",
+        "crates/scp-runtime/src/context/manager/outlets.rs"
+      ],
+      "description": "Wire caveat enforcement into the existing UCAN validation pipeline per §7.3.8: Step 7b (attenuation) uses InvocationCaveats::narrow() inside verify_attenuation; Step 11b (time-box) uses valid_from/valid_until/hours_of_day/days_of_week checks inside validate_ucan; post-input checks inside invoke_outlet verify input_schema conformance, amount_max_per_call against the cost estimate, allowed_adapters against the negotiated adapter, allowed_target_dids for cross-context, and consult CaveatCounterStore for max_calls, amount_max_cumulative, rate_window. Failure at each point returns OutletErrorClass::Authorization::{AttenuationViolation, TimeBoxViolation, CaveatViolation}.",
+      "acceptanceCriteria": [
+        "verify_attenuation extended: each delegation step calls parent.caveats.narrow(&child.caveats)?; failure returns AttenuationViolation",
+        "validate_ucan extended: after Step 11 (exp/nbf), the function checks caveat valid_from/valid_until/hours_of_day/days_of_week; failure returns TimeBoxViolation",
+        "invoke_outlet extended: after input schema validation, the function calls caveats.check_invocation(input, estimated_cost, negotiated_adapter, target_did, &counter_store); failure returns CaveatViolation with a class-specific sub-slug",
+        "Unit test: delegation with widened amount_max_per_call is rejected at Step 7b",
+        "Unit test: invocation during a disallowed hour is rejected at Step 11b",
+        "Unit test: invocation exceeding max_calls is rejected at post-input",
+        "Unit test: invocation exceeding amount_max_cumulative is rejected at post-input (via CounterStore)",
+        "Unit test: invocation exceeding rate_window is rejected at post-input",
+        "Unit test: invocation with a target_did not in allowed_target_dids is rejected",
+        "Unit test: invocation with input violating input_schema narrowing is rejected",
+        "cargo test --workspace succeeds"
+      ],
+      "actionItems": [
+        "Extend verify_attenuation to call narrow()",
+        "Extend validate_ucan with the Step 11b time-box checks",
+        "Add check_invocation method on InvocationCaveats (extends existing validation)",
+        "Wire check_invocation into invoke_outlet",
+        "Add the seven unit tests"
+      ],
+      "blockedBy": [
+        "SCP-OUT-028",
+        "SCP-OUT-029",
+        "SCP-OUT-030"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "### 7.3.8 Invocation Caveats"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "### 7.2.1 Tier 1: Full UCAN Chain Validation"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-032",
+      "title": "Compose caveat layer with SpendingCapability, MemberBudgetTracker, InboundPolicy, OutboundPolicy (all AND)",
+      "gate": "gate-caveats",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/manager/outlets.rs",
+        "crates/scp-runtime/src/context/manager/economy.rs"
+      ],
+      "description": "Implement the composition rule from §7.3.8: caveats are additive deny-surfaces that compose with SpendingCapability (§19.5), MemberBudgetTracker (§19.3), InboundPolicy and OutboundPolicy (§6.2) under logical AND. An invocation proceeds iff every layer admits it. Cross-context: effective guard is `OutboundPolicy ∧ InboundPolicy ∧ caveat`. Order of evaluation: caveat time-box → caveat rate/counter → OutboundPolicy → InboundPolicy → SpendingCapability → MemberBudgetTracker. Short-circuit on first denial; the resulting error names the layer that denied.",
+      "acceptanceCriteria": [
+        "Function evaluate_all_layers(ctx, caveats, outlet, input) returns Ok(()) iff every layer admits",
+        "Function short-circuits on the first Err and returns a class-specific error identifying the layer",
+        "Unit test: caveat admits, OutboundPolicy denies → error identifies OutboundPolicy",
+        "Unit test: caveat admits, OutboundPolicy admits, InboundPolicy denies → error identifies InboundPolicy",
+        "Unit test: all upstream admit, SpendingCapability denies → error identifies SpendingCapability",
+        "Unit test: all upstream admit, MemberBudgetTracker denies → error identifies MemberBudgetTracker",
+        "Unit test: all layers admit → Ok(()); invocation proceeds",
+        "Integration test: a widened child caveat (rejected at attenuation) never reaches the layer composition — proves the short-circuit",
+        "cargo test --workspace succeeds"
+      ],
+      "actionItems": [
+        "Define evaluate_all_layers",
+        "Wire into invoke_outlet after caveat post-input checks",
+        "Add the unit tests",
+        "Add the integration test"
+      ],
+      "blockedBy": [
+        "SCP-OUT-031"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "### 7.3.8 Invocation Caveats"
+        },
+        {
+          "file": ".docs/specs/19-economic-governance.md",
+          "section": "## 19.5 Spending Capability (UCAN Extension)"
+        },
+        {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "#### 6.2.0.1 Bidirectional Consent Protocol"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-033",
+      "title": "Pass-through InvocationCaveats on UCAN `nb` field across all 4 FFI bridges + 4 SDKs",
+      "gate": "gate-caveats",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/ucan.rs",
+        "crates/scp-ffi/napi/src/ucan.rs",
+        "crates/scp-ffi/uniffi/src/scp.udl",
+        "crates/scp-ffi/wasm/src/ucan.rs",
+        "bindings/python/scp_sdk/ucan.py",
+        "bindings/typescript/src/ucan.ts",
+        "bindings/swift/Sources/SCP/Ucan.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Ucan.kt"
+      ],
+      "description": "Expose InvocationCaveats through all 4 FFI bridges and 4 SDKs so apps can mint and delegate caveated tokens. Each SDK gets idiomatic constructors: Python InvocationCaveats(amount_max_per_call=100, ...); TypeScript const c: InvocationCaveats = { amountMaxPerCall: 100, ... }; Swift InvocationCaveats(amountMaxPerCall: 100, ...); Kotlin InvocationCaveats(amountMaxPerCall = 100, ...). Each SDK exposes `ucan.mint(caveats: InvocationCaveats, ...)` and `ucan.narrow(parent_token, child_caveats) -> child_token`. Mint-limit errors surface as SCP-TOOL-6114. Round-trip fidelity enforced via conformance test (SDK-created caveat survives marshal-unmarshal through FFI and back).",
+      "acceptanceCriteria": [
+        "Every FFI bridge has an InvocationCaveats marshalling shim that round-trips all 11 fields",
+        "Python: InvocationCaveats dataclass with optional fields; ucan.mint accepts caveats param; ucan.narrow(parent, child_caveats) returns a new token",
+        "TypeScript: InvocationCaveats type; ucan.mint + ucan.narrow match",
+        "Swift: InvocationCaveats struct; ucan.mint + ucan.narrow match",
+        "Kotlin: InvocationCaveats data class; ucan.mint + ucan.narrow match",
+        "Mint-limit violation in any SDK returns SCP-TOOL-6114 'caveat-mint-limit-exceeded'",
+        "A conformance test per SDK: build a caveats object in the SDK; pass to ucan.mint; decode the returned JWT; assert nb field matches the input caveats",
+        "cargo test --workspace && pytest && bun test && swift test && gradle test all green"
+      ],
+      "actionItems": [
+        "Add InvocationCaveats marshalling to each FFI bridge",
+        "Add SDK types per language",
+        "Wire ucan.mint + ucan.narrow",
+        "Add the round-trip conformance test",
+        "Document on each SDK"
+      ],
+      "blockedBy": [
+        "SCP-OUT-028",
+        "SCP-OUT-029"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "### 7.3.8 Invocation Caveats"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-034",
+      "title": "Spec: verify §5.4.4 Outlet Error Taxonomy is cross-referenced from §5.4, §6.2, §19, §9",
+      "gate": "gate-errors",
+      "priority": "P1",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        ".docs/specs/05-contexts.md",
+        ".docs/specs/06-cross-context-communication.md",
+        ".docs/specs/19-economic-governance.md",
+        ".docs/specs/09-security-model.md"
+      ],
+      "description": "§5.4.4 (Outlet Error Taxonomy) is already present. Audit upstream references: §5.4 bullets about error handling cite §5.4.4; §6.2 cross-context error wrapping cites §5.4.4 source_chain; §19.x economic errors reference the Economic class sub-block; §9 security model references the Authorization class sub-block.",
+      "acceptanceCriteria": [
+        "grep -n '§5.4.4' .docs/specs/05-contexts.md returns >= 2 matches",
+        "grep -n '§5.4.4' .docs/specs/06-cross-context-communication.md returns >= 1 match",
+        "grep -n '§5.4.4' .docs/specs/19-economic-governance.md returns >= 1 match",
+        "grep -n '§5.4.4' .docs/specs/09-security-model.md returns >= 1 match",
+        "python3.12 scripts/validate-prd.py passes"
+      ],
+      "actionItems": [
+        "Audit each spec file for error handling prose that should cite §5.4.4",
+        "Add the missing cross-references",
+        "Run validate-prd.py"
+      ],
+      "blockedBy": [
+        "SCP-OUT-033"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.4 Outlet Error Taxonomy"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-035",
+      "title": "Define OutletError + OutletErrorClass + RetryPolicy + ContextHop types (scp-protocol)",
+      "gate": "gate-errors",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/outlets/errors.rs",
+        "crates/scp-protocol/src/context/outlets/mod.rs",
+        "crates/scp-protocol/src/lib.rs"
+      ],
+      "description": "Define the typed error envelope per §5.4.4. `OutletError` is the top-level struct; `OutletErrorClass` is an 8-variant enum; `RetryPolicy` is a 4-variant enum with associated types; `ContextHop` is a struct. All derive Debug, Clone, PartialEq, Eq, Serialize, Deserialize. MessagePack numeric field tags 1-10 are via `#[serde(rename = \"1\")]` attributes (rmp_serde supports this). `code: String` holds the SCP-TOOL-{6100..6199} literal. `slug: String` is kebab-case; validated on construction.",
+      "acceptanceCriteria": [
+        "struct OutletError exists with exactly the 10 fields: code, slug, class, message, retry, detail, related_code, source_chain, i18n_key, trace_id",
+        "All 10 fields use #[serde(rename = \"{n}\")] with n in 1..=10 matching §5.4.4",
+        "enum OutletErrorClass has 8 variants: Protocol, Authorization, Input, Execution, Output, Economic, Transport, Governance",
+        "enum RetryPolicy has variants Never, Immediate, After(Duration), WithBackoff { min: Duration, max: Duration }",
+        "struct ContextHop has fields context_id, hop_index, wrapped_code",
+        "OutletError::new(code, slug, class, message) constructor validates code matches ^SCP-TOOL-61\\d{2}$ and slug matches ^[a-z][a-z0-9-]{0,63}$",
+        "MessagePack round-trip test on a fully-populated OutletError",
+        "JSON round-trip test on a fully-populated OutletError",
+        "An invalid code (e.g., SCP-TOOL-7000) returns OutletErrorConstructionFailed",
+        "cargo test -p scp-protocol succeeds"
+      ],
+      "actionItems": [
+        "Define all four types in context/outlets/errors.rs",
+        "Add constructor with validation",
+        "Add round-trip tests for MessagePack and JSON",
+        "Export from lib.rs",
+        "Document each variant in rustdoc with §5.4.4 citation"
+      ],
+      "blockedBy": [
+        "SCP-OUT-034"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.4 Outlet Error Taxonomy"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-036",
+      "title": "Enumerate all 8 OutletErrorClass variants with full code allocation (6100-6199)",
+      "gate": "gate-errors",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/outlets/errors.rs",
+        "crates/scp-protocol/src/context/outlets/error_codes.rs"
+      ],
+      "description": "Exhaustively enumerate every error variant across all 8 classes with its code, slug, class, default RetryPolicy, and intended source. Protocol (6100-6109): QueryCostViolation (6100), QueryViolation (6101), KindMismatch (6102), AmplificationViolation (6103), StructuralFloorViolation (6104), SchemaImmutabilityViolation (6105), CacheIntegrityFailure (6106), QueryMisdeclaration (6107). Authorization (6110-6119): UcanInvalid (6110), UcanExpired (6111), UcanRevoked (6112), AttenuationViolation (6113), CaveatMintLimitExceeded (6114), CaveatTimeBoxViolation (6115), CaveatRateExceeded (6116), CaveatCumulativeExceeded (6117), RevokedMidStream (6118), AdapterNotAllowed (6119). Input (6120-6129): SchemaViolation (6120), InputTooLarge (6121), InputNotSerializable (6122). Execution (6130-6139): HandlerPanic (6130), ExecutionTimeout (6131), CreditExhausted (6132), CreditStall (6133), StreamGap (6134), NonDeterministicExecution (6135). Output (6140-6149): OutputSchemaViolation (6140), OutputTooLarge (6141), OutputNotSerializable (6142). Economic (6150-6159): InsufficientFunds (6150), AdapterFailure (6151), PricingFormulaError (6152), BudgetExceeded (6153). Transport (6160-6169): RelayUnavailable (6160), CrossContextBridgeFailure (6161), RateLimited (6162). Governance (6170-6179): OutletDeregistered (6170), OutletSuspended (6171), CeilingExceeded (6172), ConsequenceActive (6173). Reserved: 6180-6199.",
+      "acceptanceCriteria": [
+        "File crates/scp-protocol/src/context/outlets/error_codes.rs contains const declarations for every code listed (>= 35 entries)",
+        "Each const has the form `pub const CODE_<SLUG>: &str = \"SCP-TOOL-{number}\";`",
+        "Function error_code_to_class(code: &str) -> Option<OutletErrorClass> maps every allocated code to its class",
+        "Function error_code_to_slug(code: &str) -> Option<&'static str> maps every allocated code to its slug",
+        "Function error_code_to_retry_policy(code: &str) -> Option<RetryPolicy> returns the default retry policy per code",
+        "Test: for every allocated code, all three lookup functions return Some",
+        "Test: an unallocated code (e.g., SCP-TOOL-6180) returns None from all three",
+        "Test: the count of allocated codes matches the documented count (>= 35)",
+        "Rustdoc on the module names each range and cites §5.4.4",
+        "cargo test -p scp-protocol succeeds"
+      ],
+      "actionItems": [
+        "Author error_codes.rs with const per code",
+        "Implement the three lookup functions",
+        "Add per-code tests",
+        "Document each range"
+      ],
+      "blockedBy": [
+        "SCP-OUT-035"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.4 Outlet Error Taxonomy"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-037",
+      "title": "MessagePack wire format with numeric field tags (1-10)",
+      "gate": "gate-errors",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/outlets/errors.rs",
+        "crates/scp-testing/tests/integration/conformance.rs"
+      ],
+      "description": "Confirm the wire format uses numeric field tags 1-10 (via rmp_serde's tuple-struct or explicit rename strategy). Add a forward-compat test: a serialized OutletError with an unknown field tag (e.g., tag 11) deserializes cleanly, preserving the unknown tag in an internal `_unknown_fields: BTreeMap<String, serde_value::Value>` field that round-trips unchanged. This allows forward evolution of the envelope without breaking old SDKs.",
+      "acceptanceCriteria": [
+        "OutletError has a private _unknown_fields: BTreeMap<String, serde_value::Value> field marked #[serde(flatten)] (or #[serde(other)] depending on rmp_serde capability)",
+        "Serializing and deserializing preserves unknown fields",
+        "Test: take a serialized envelope with a hand-crafted extra field '11' -> 'future-value'; deserialize; confirm the unknown field is preserved; re-serialize; confirm round-trip byte-equality",
+        "Test: envelope with field order reversed deserializes identically (tag-indexed, not position-indexed)",
+        "Test: envelope with field 4 (message) absent fails with a meaningful error (message is required per §5.4.4)",
+        "cargo test -p scp-protocol && cargo test -p scp-testing succeed"
+      ],
+      "actionItems": [
+        "Add _unknown_fields + appropriate serde attributes",
+        "Add forward-compat test",
+        "Add field-order-independence test",
+        "Add required-field test"
+      ],
+      "blockedBy": [
+        "SCP-OUT-035"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.4 Outlet Error Taxonomy"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-038",
+      "title": "Fix lossy error mapping at manager/outlets.rs (preserve all InvocationError variants)",
+      "gate": "gate-errors",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/manager/outlets.rs",
+        "crates/scp-runtime/src/context/outlets/invoke.rs"
+      ],
+      "description": "Fix the pre-existing lossy mapping at `crates/scp-runtime/src/context/manager/outlets.rs` (formerly tools.rs) lines ~960-984 where seven distinct InvocationError variants (OutletNotFound, OutletDeregistered, OutletExecutionFailed, SchemaViolation, CapabilityDenied, RateLimited, EconomicDenied) collapsed to a single PermissionDenied output. Rewrite the match arm so each variant maps to its specific OutletError code (from SCP-OUT-036). Add a test matrix that fires every InvocationError and asserts the returned OutletError.code is the right 6100-series code.",
+      "acceptanceCriteria": [
+        "manager/outlets.rs no longer contains any code path that collapses multiple InvocationError variants to a single OutletError",
+        "Every InvocationError variant maps to a distinct OutletError via From<InvocationError> for OutletError",
+        "Test matrix: for each InvocationError variant, the resulting OutletError has the correct code and class",
+        "Test: InvocationError::OutletNotFound → code SCP-TOOL-6170 (OutletDeregistered? or new AuthorizationViolation? — pick per spec) — confirmed via source",
+        "Test: InvocationError::SchemaViolation → code SCP-TOOL-6120 class Input",
+        "Test: InvocationError::CapabilityDenied → code in 6110-6119 class Authorization",
+        "Test: InvocationError::RateLimited → code SCP-TOOL-6162 class Transport",
+        "Test: InvocationError::EconomicDenied → code in 6150-6159 class Economic",
+        "cargo test --workspace succeeds",
+        "grep -n 'PermissionDenied' crates/scp-runtime/src/context/manager/outlets.rs returns 0 (the fallback is gone)"
+      ],
+      "actionItems": [
+        "Rewrite the match arm with one explicit mapping per variant",
+        "Implement From<InvocationError> for OutletError",
+        "Delete the PermissionDenied collapse",
+        "Add the test matrix"
+      ],
+      "blockedBy": [
+        "SCP-OUT-035",
+        "SCP-OUT-036"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.4 Outlet Error Taxonomy"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-039",
+      "title": "Wrap executor in catch_unwind and map to HandlerPanic (SCP-TOOL-6130)",
+      "gate": "gate-errors",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/outlets/invoke.rs"
+      ],
+      "description": "Wrap every call to `OutletExecutor::exec_query` and `exec_action` in `std::panic::catch_unwind(AssertUnwindSafe(...))`. On panic, recover, log at warn level, emit OutletVerified { integrity_ok: false, reason: HandlerPanicked } (§5.4.2 parallel signal), and return OutletError { code: SCP-TOOL-6130, slug: 'handler-panic', class: Execution, retry: Never, ... }. Document in rustdoc that panics are a protocol-visible signal attributable to the outlet's operator_did, not an SDK-internal bug.",
+      "acceptanceCriteria": [
+        "invoke_outlet wraps every executor call in catch_unwind",
+        "On panic, the result is OutletError { code: 'SCP-TOOL-6130', slug: 'handler-panic', class: Execution, retry: Never, ... }",
+        "OutletVerified { integrity_ok: false, reason: HandlerPanicked } event is emitted as a side-effect",
+        "Test: an executor that panics with panic!(\"boom\") produces the expected OutletError; no panic escapes invoke_outlet",
+        "Test: the OutletVerified event is observable via a test subscriber",
+        "Test: panic message is truncated to 1 KiB if longer (matches OutletError.message limit)",
+        "cargo test -p scp-runtime succeeds"
+      ],
+      "actionItems": [
+        "Add catch_unwind wrapper in invoke.rs",
+        "Implement panic-to-OutletError conversion",
+        "Emit the OutletVerified side-effect",
+        "Add the three tests"
+      ],
+      "blockedBy": [
+        "SCP-OUT-019",
+        "SCP-OUT-036"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.4 Outlet Error Taxonomy"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.2 Outlet Classification (Query vs Action)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-040",
+      "title": "Cross-context error wrapping with ContextHop source_chain prepending",
+      "gate": "gate-errors",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/manager/outlets.rs"
+      ],
+      "description": "At each cross-context bridge hop, when an OutletError propagates back to the caller, the caller's wrapping layer prepends a ContextHop to source_chain: `hop = ContextHop { context_id: caller_ctx, hop_index: prev_last_hop_index + 1, wrapped_code: prev_error.code }`; `new_error.code = prev_error.code` (preserved — NOT remapped). Purpose: the outermost caller sees the original error code AND the trail of contexts it traversed. This is the opposite of HTTP gateway remapping.",
+      "acceptanceCriteria": [
+        "Function wrap_cross_context_error(caller_ctx: ContextId, prev_error: OutletError) -> OutletError prepends a ContextHop",
+        "wrapped_error.code == prev_error.code (preserved)",
+        "wrapped_error.source_chain.first().context_id == caller_ctx",
+        "wrapped_error.source_chain.first().hop_index == prev_error.source_chain.last().hop_index + 1 (or 1 if source_chain was empty)",
+        "wrapped_error.source_chain.first().wrapped_code == prev_error.code",
+        "Unit test: one-hop wrap",
+        "Unit test: three-hop wrap asserts source_chain is ordered innermost→outermost with monotonic hop_index",
+        "Integration test: Context A → Context B → Context C invocation where C returns an OutletError at the innermost layer; A observes code == original and source_chain shows B and C",
+        "cargo test --workspace succeeds"
+      ],
+      "actionItems": [
+        "Implement wrap_cross_context_error",
+        "Wire it into the cross-context invocation response path",
+        "Add the three tests"
+      ],
+      "blockedBy": [
+        "SCP-OUT-035"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.4 Outlet Error Taxonomy"
+        },
+        {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "## 6.2 Context-to-Context Tool Interfaces"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-041",
+      "title": "Extend check-error-codes.sh for 6100-6199 sub-block + OutletErrorClass literal assertion",
+      "gate": "gate-errors",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "scripts/check-error-codes.sh",
+        ".docs/standards/sdk-common.md"
+      ],
+      "description": "Extend `scripts/check-error-codes.sh` so it validates the new 6100-6199 sub-block: every SCP-TOOL-61NN code must appear in the crates/scp-protocol/src/context/outlets/error_codes.rs registry AND the associated OutletErrorClass variant must appear as a Rust literal in the same file. The script also grep-asserts that every SCP-TOOL-61NN code found across the tree is registered. Update `.docs/standards/sdk-common.md` stub policy section with the 6100-6199 allocation.",
+      "acceptanceCriteria": [
+        "check-error-codes.sh reads crates/scp-protocol/src/context/outlets/error_codes.rs and extracts all allocated codes in the 6100-6199 range",
+        "Script fails if any SCP-TOOL-61NN in the tree is NOT in the allocated set",
+        "Script fails if any allocated code in the registry is missing its OutletErrorClass variant literal in the same file",
+        "Script output lists all 8 classes at every run",
+        "Running bash scripts/check-error-codes.sh exits 0 once the registry from SCP-OUT-036 is in place",
+        ".docs/standards/sdk-common.md §Error Code Registry (or the equivalent §) documents the 6100-6199 sub-block and the outlet class allocation",
+        "CI job that runs check-error-codes.sh remains green"
+      ],
+      "actionItems": [
+        "Extend check-error-codes.sh with outlet-sub-block logic",
+        "Update sdk-common.md documentation",
+        "Run the script and confirm pass"
+      ],
+      "blockedBy": [
+        "SCP-OUT-036"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.4 Outlet Error Taxonomy"
+        },
+        {
+          "file": ".docs/standards/sdk-common.md",
+          "section": "## Error Hierarchy"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-042",
+      "title": "SDK translation layers for OutletError (sealed hierarchies) + fixture round-trip across 4 SDKs",
+      "gate": "gate-errors",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/python/scp_sdk/errors.py",
+        "bindings/typescript/src/errors.ts",
+        "bindings/swift/Sources/SCP/Errors.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Errors.kt",
+        "crates/scp-testing/tests/integration/outlet_error_conformance.rs",
+        "tests/conformance/vectors/outlet_error_fixtures.json"
+      ],
+      "description": "Each SDK renders OutletErrorClass as a sealed type idiomatic to the language, and every concrete code surfaces as a distinct error class that extends or belongs to the appropriate class. Python: subclass tree (OutletError → ProtocolError → QueryViolationError etc.); TypeScript: discriminated union / tagged classes (OutletError abstract with class tag); Swift: enum OutletError with associated values per variant; Kotlin: sealed class OutletError with data classes per variant. A shared JSON fixture set (outlet_error_fixtures.json) containing >= 35 fixtures (one per code) is round-tripped: each fixture is deserialized through all 4 bridges, converted to the SDK type, serialized back, and asserted byte-equal. This ensures all 4 SDKs agree on the wire contract.",
+      "acceptanceCriteria": [
+        "Python: OutletError base class; 8 class subclasses (ProtocolError, AuthorizationError, ...); >= 35 concrete subclasses each with `code` class attr and mapping from wire code to subclass",
+        "TypeScript: abstract class OutletError { class, code, slug, ... }; discriminated subclasses with static `code` + runtime type guard",
+        "Swift: enum OutletError: Error with associated types per concrete variant",
+        "Kotlin: sealed class OutletError with data-class children",
+        "File tests/conformance/vectors/outlet_error_fixtures.json contains >= 35 fixtures, one per allocated code in SCP-OUT-036",
+        "Test outlet_error_conformance.rs round-trips each fixture through each bridge and asserts the resulting OutletError has the right class and code",
+        "Per-SDK test: pytest, bun test, swift test, gradle test all assert that round-tripping each fixture preserves every field",
+        "cargo test --workspace --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing succeeds"
+      ],
+      "actionItems": [
+        "Generate fixture JSON from the SCP-OUT-036 registry",
+        "Implement the 4 SDK class hierarchies",
+        "Wire FFI deserialization to pick the right SDK class by code",
+        "Add the conformance test",
+        "Add per-SDK round-trip tests"
+      ],
+      "blockedBy": [
+        "SCP-OUT-036",
+        "SCP-OUT-037",
+        "SCP-OUT-038",
+        "SCP-OUT-040"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.4 Outlet Error Taxonomy"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-043",
+      "title": "Spec: verify §5.4.5 Progressive Output and §6.2.0.5 Cross-Context Streaming are cross-referenced",
+      "gate": "gate-streaming",
+      "priority": "P1",
+      "severity": "minor",
+      "status": "pending",
+      "files": [
+        ".docs/specs/05-contexts.md",
+        ".docs/specs/06-cross-context-communication.md",
+        ".docs/specs/07-trust-validation-and-capabilities.md"
+      ],
+      "description": "§5.4.5 (Progressive Output / Streaming) and §6.2.0.5 (Cross-Context Streaming) are already present. Audit upstream references: §5.4 bullets about invocation cite §5.4.5; §5.4.3 Query cache notes the cache-hit synthetic stream; §7.3.1 event log references stream_manifest_hash; §7.3.6 participation records reference the streaming outcome attribution.",
+      "acceptanceCriteria": [
+        "grep -n '§5.4.5' .docs/specs/05-contexts.md returns >= 2 matches",
+        "grep -n '§6.2.0.5' .docs/specs/05-contexts.md returns >= 1 match",
+        "grep -n '§6.2.0.5' .docs/specs/06-cross-context-communication.md returns >= 1 match",
+        "grep -n '§5.4.5' .docs/specs/07-trust-validation-and-capabilities.md returns >= 1 match",
+        "python3.12 scripts/validate-prd.py passes"
+      ],
+      "actionItems": [
+        "Audit each spec file and add missing cross-references",
+        "Run validate-prd.py"
+      ],
+      "blockedBy": [
+        "SCP-OUT-042"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.5 Progressive Output (Streaming)"
+        },
+        {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "### 6.2.0.5 Cross-Context Streaming"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-044",
+      "title": "Define OutletStreamOpen / OutletStreamChunk / OutletStreamCredit + ChunkPayload; eliminate OutletResponse",
+      "gate": "gate-streaming",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/outlets/stream.rs",
+        "crates/scp-protocol/src/context/outlets/mod.rs",
+        "crates/scp-protocol/src/lib.rs"
+      ],
+      "description": "Define the streaming wire types per §5.4.5: OutletStreamOpen, OutletStreamChunk, OutletStreamCredit, ChunkPayload (4-variant enum: Data, Progress, End, Error), StreamTerminalStatus. Delete OutletResponse (the old non-streaming response type inherited from ToolResponse) entirely — there is no transitional alias. Add serde numeric field tags where the spec pins them. Provide a helper `ChunkPayload::is_terminal() -> bool` that returns true for End and Error { terminal: true }.",
+      "acceptanceCriteria": [
+        "struct OutletStreamOpen exists with fields request_id: [u8; 16], outlet_id: String, input: Value, invoker_did: DID, ucan: Vec<u8>, caveats_binding: [u8; 32], chain_depth: u16, credit_window: u32, timeout_ms: u32",
+        "struct OutletStreamChunk exists with fields request_id, sequence: u64, payload: ChunkPayload",
+        "struct OutletStreamCredit exists with fields request_id, grant: u32",
+        "enum ChunkPayload exists with 4 variants: Data { value }, Progress { pct: u16, note: Option<String> }, End { aggregate, provenance, execution_time_ms }, Error { code, message, terminal: bool }",
+        "ChunkPayload::is_terminal returns true for End and Error{ terminal: true }, false otherwise",
+        "enum StreamTerminalStatus { Ok, Error(String), Cancelled } exists",
+        "grep -rn 'struct OutletResponse\\|pub struct OutletResponse' crates/scp-protocol/ returns 0",
+        "grep -rn 'ToolResponse' crates/scp-protocol/ returns 0",
+        "Round-trip MessagePack test on each type",
+        "Round-trip test on a 100-chunk stream",
+        "cargo test -p scp-protocol succeeds"
+      ],
+      "actionItems": [
+        "Create stream.rs with all four types",
+        "Delete OutletResponse",
+        "Add is_terminal helper",
+        "Add round-trip tests",
+        "Document in rustdoc"
+      ],
+      "blockedBy": [
+        "SCP-OUT-035"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.5 Progressive Output (Streaming)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-045",
+      "title": "Rewrite invoke_outlet to return a stream (mpsc::Receiver) — executor signature change",
+      "gate": "gate-streaming",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/outlets/invoke.rs",
+        "crates/scp-runtime/src/context/manager/outlets.rs",
+        "crates/scp-runtime/src/context/outlets/mod.rs"
+      ],
+      "description": "Rewrite `invoke_outlet` so that it returns `mpsc::Receiver<OutletStreamChunk>`. The OutletExecutor trait gains streaming signatures: `async fn exec_query_stream(&self, ctx: ReadOnlyInvocation, input: Value, tx: mpsc::Sender<ChunkPayload>) -> Result<(), OutletError>` and `async fn exec_action_stream(&self, ctx: MutableInvocation, input: Value, tx: mpsc::Sender<ChunkPayload>) -> Result<(), OutletError>`. The executor writes ChunkPayload values to tx; the framework wraps them into OutletStreamChunk with monotonic sequence. Non-streaming legacy executors become one-chunk Data + End automatically via an adapter. `execute_timeout_ms` enforces a hard deadline; exceeding it sends an Error chunk with code SCP-TOOL-6131.",
+      "acceptanceCriteria": [
+        "ContextManager::invoke_outlet returns Result<tokio::sync::mpsc::Receiver<OutletStreamChunk>, OutletError>",
+        "Trait OutletExecutor has exec_query_stream and exec_action_stream methods",
+        "Adapter fn one_shot_to_stream(result: Value) automatically produces Data + End chunks for executors that return a single value",
+        "The framework assigns sequence starting at 0 and monotonic per request_id",
+        "End chunk is emitted after the executor returns successfully",
+        "Error { terminal: true } chunk is emitted if the executor returns Err",
+        "timeout_ms exceeded: framework sends Error { code: 'SCP-TOOL-6131', slug: 'execution-timeout', terminal: true } and drops the executor task",
+        "Test: single-value executor produces a two-chunk stream ending in End",
+        "Test: streaming executor produces Data chunks then End",
+        "Test: panicking executor produces Error { code: 'SCP-TOOL-6130', terminal: true }",
+        "Test: timeout executor produces Error { code: 'SCP-TOOL-6131', terminal: true }",
+        "cargo test -p scp-runtime succeeds"
+      ],
+      "actionItems": [
+        "Rewrite invoke_outlet to the stream-returning form",
+        "Update OutletExecutor trait",
+        "Add one_shot_to_stream adapter",
+        "Wire timeout enforcement via tokio::time::timeout",
+        "Add the four tests"
+      ],
+      "blockedBy": [
+        "SCP-OUT-044",
+        "SCP-OUT-039"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.5 Progressive Output (Streaming)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-046",
+      "title": "Implement credit-based backpressure module (credit_window, grants, stall timeout)",
+      "gate": "gate-streaming",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/outlets/stream.rs",
+        "crates/scp-runtime/src/context/outlets/invoke.rs",
+        "crates/scp-protocol/src/context/params.rs"
+      ],
+      "description": "Implement per-stream credit accounting per §5.4.5. A stream opens with `credit_window` chunks of headroom (default 32, via `ContextParams::stream_window_default`). Each Data/Progress chunk decrements credit; End and Error do NOT. When credit hits 0 and no grant arrives within `stream_credit_stall_secs` (default 30), the framework cancels the stream with OutletError { code: 'SCP-TOOL-6133', slug: 'credit-stall', terminal: true }. Grants replenish credit (additive). The module is re-used across intra- and cross-context streams.",
+      "acceptanceCriteria": [
+        "ContextParams has fields stream_window_default: u32 (default 32) and stream_credit_stall_secs: u32 (default 30)",
+        "struct CreditTracker with method try_consume(&mut self) -> Result<(), OutOfCredit> and grant(&mut self, additional: u32)",
+        "Stream framework enforces: Data/Progress decrement credit via try_consume; OutOfCredit pauses the executor",
+        "Stream framework starts a stall timer when credit reaches 0; grant() cancels the timer; timer firing sends Error { code: 'SCP-TOOL-6133', terminal: true }",
+        "Test: executor that sends 100 chunks with credit_window=32 and grants issued after every 32 chunks completes successfully",
+        "Test: executor that sends 33 chunks without a second grant stalls at 32 and receives credit-stall within 30s",
+        "Test: executor that sends Error { terminal: true } with 0 credit still succeeds (terminal chunks don't consume)",
+        "cargo test -p scp-runtime succeeds"
+      ],
+      "actionItems": [
+        "Add stream_window_default and stream_credit_stall_secs to ContextParams",
+        "Implement CreditTracker",
+        "Wire try_consume into chunk emission path",
+        "Wire grant into OutletStreamCredit handler",
+        "Implement stall timer via tokio::time::sleep in a separate task",
+        "Add the three tests"
+      ],
+      "blockedBy": [
+        "SCP-OUT-044",
+        "SCP-OUT-045"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.5 Progressive Output (Streaming)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-047",
+      "title": "Implement chunk manifest Merkle builder + inclusion proof API",
+      "gate": "gate-streaming",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/outlets/manifest.rs",
+        "crates/scp-event-log/src/proof.rs"
+      ],
+      "description": "Implement the stream chunk manifest per §5.4.5: leaves are `SHA-256(canonical_json(chunk))` per chunk; the Merkle root is `stream_manifest_hash`. Expose `StreamManifest::inclusion_proof(chunk_index) -> InclusionProof` that produces a standard Merkle path. Use the existing `scp-event-log` Merkle primitives (extended if necessary — e.g., even-padding semantics must match). A sample CT/SPV-style proof verifier is added to `scp-event-log` so auditors can verify a chunk's inclusion without replaying the whole stream.",
+      "acceptanceCriteria": [
+        "struct StreamManifest with methods add_chunk(chunk: &OutletStreamChunk), finalize() -> [u8; 32] (root), inclusion_proof(index: usize) -> InclusionProof",
+        "Manifest uses even-padding matching the §7.3.1 event-log Merkle tree convention",
+        "Function verify_inclusion(proof: &InclusionProof, root: &[u8; 32], chunk: &OutletStreamChunk, index: usize) -> bool",
+        "Test: a 5-chunk manifest produces a root; inclusion_proof(2) returns a 3-hop path; verify_inclusion returns true",
+        "Test: a tampered chunk fails verify_inclusion",
+        "Test: a 100-chunk manifest produces a root with 7-hop paths (ceil(log2(100)) = 7)",
+        "Test: a 1-chunk manifest produces an empty proof (root == leaf)",
+        "cargo test -p scp-runtime && cargo test -p scp-event-log succeed"
+      ],
+      "actionItems": [
+        "Implement StreamManifest struct",
+        "Implement inclusion_proof method",
+        "Add verify_inclusion in scp-event-log",
+        "Add the four tests",
+        "Document proof shape in rustdoc"
+      ],
+      "blockedBy": [
+        "SCP-OUT-044",
+        "SCP-OUT-045"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.5 Progressive Output (Streaming)"
+        },
+        {
+          "file": ".docs/specs/07-trust-validation-and-capabilities.md",
+          "section": "### 7.3.1 Verifiable Event Logs"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-048",
+      "title": "Extend OutletInvokedEvent with stream fields; ONE event per stream at close",
+      "gate": "gate-streaming",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-event-log/src/lib.rs",
+        "crates/scp-runtime/src/context/manager/outlets.rs"
+      ],
+      "description": "Extend the existing `OutletInvokedEvent` variant (introduced in SCP-OUT-003) with three stream fields: `stream_chunk_count: u32`, `stream_manifest_hash: [u8; 32]`, `stream_terminal_status: StreamTerminalStatus`. Emit exactly ONE OutletInvokedEvent per stream, at stream close (terminal chunk emitted). Cache-hit paths continue to emit the reduced-payload OutletQueried event from SCP-OUT-025. The SDK retains chunk leaves and tree for later inclusion proofs.",
+      "acceptanceCriteria": [
+        "EventKind::OutletInvoked has stream_chunk_count, stream_manifest_hash, stream_terminal_status fields",
+        "Runtime emits one OutletInvoked event after terminal chunk is written, not before",
+        "Test: a 5-chunk stream emits one event with stream_chunk_count = 5",
+        "Test: a cancelled stream emits one event with stream_terminal_status = Cancelled",
+        "Test: a failed stream emits one event with stream_terminal_status = Error(code)",
+        "Test: non-streaming (one-shot) invocation emits one event with stream_chunk_count = 2 (Data + End)",
+        "SDK retains chunk leaves and tree; ctx.outlets.inclusion_proof(invocation_id, chunk_index) returns a valid proof",
+        "Event log replay reconstructs stream_manifest_hash identically",
+        "cargo test --workspace succeeds"
+      ],
+      "actionItems": [
+        "Extend OutletInvokedEvent with the three fields",
+        "Wire emission to happen exactly once at terminal chunk",
+        "Expose inclusion_proof in ContextManager / SDK facade",
+        "Add the five tests"
+      ],
+      "blockedBy": [
+        "SCP-OUT-003",
+        "SCP-OUT-045",
+        "SCP-OUT-047"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.5 Progressive Output (Streaming)"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.14.10 Event Log"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-049",
+      "title": "Cross-context chunk bridge + aggregate_schema extension on OutletSchema",
+      "gate": "gate-streaming",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/manager/outlets.rs",
+        "crates/scp-protocol/src/context/outlets/schema.rs"
+      ],
+      "description": "Implement cross-context stream transport per §6.2.0.5. A shared-member bridge in ContextManager::invoke_outlet_cross_context forwards chunks between contexts, re-encrypting each chunk per-recipient (source encrypts for target, bridge decrypts, bridge encrypts for source's invoker). No bridge-level buffering — chunks flow through subject to credit. `chain_depth` is fixed at open. Add `aggregate_schema: Option<JSONSchema>` to OutletSchema (backward-compatible via Option). Per-chunk Data.value is validated against output_schema; End.aggregate is validated against aggregate_schema (or output_schema if aggregate_schema is absent). Both contexts emit one OutletInvokedEvent with the same stream_manifest_hash.",
+      "acceptanceCriteria": [
+        "OutletSchema struct has aggregate_schema: Option<JSONSchema> field (Option preserves backward compat with SCP-OUT-002)",
+        "ContextManager::invoke_outlet_cross_context returns mpsc::Receiver<OutletStreamChunk> that receives chunks re-encrypted for the invoker's context",
+        "Bridge does not buffer; chunk-to-chunk latency is bounded by MLS encryption + relay",
+        "chain_depth on every forwarded chunk == chain_depth on OutletStreamOpen",
+        "Per-chunk Data validation uses output_schema",
+        "End.aggregate validation uses aggregate_schema if present, else output_schema",
+        "Both contexts' event logs record OutletInvoked with identical stream_manifest_hash",
+        "Test: cross-context 10-chunk stream A → B completes successfully; both event logs agree",
+        "Test: mid-stream bridge failure produces Error { code: 'SCP-TOOL-6161', terminal: true }",
+        "Test: End.aggregate violating aggregate_schema produces Error { code: 'SCP-TOOL-6140', terminal: true }",
+        "cargo test --workspace succeeds"
+      ],
+      "actionItems": [
+        "Add aggregate_schema to OutletSchema",
+        "Implement the bridge loop in invoke_outlet_cross_context",
+        "Wire per-chunk and aggregate validation",
+        "Add the three integration tests"
+      ],
+      "blockedBy": [
+        "SCP-OUT-021",
+        "SCP-OUT-044",
+        "SCP-OUT-045",
+        "SCP-OUT-048"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.5 Progressive Output (Streaming)"
+        },
+        {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "### 6.2.0.5 Cross-Context Streaming"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.1 Outlet Registration Wire Format"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-050",
+      "title": "Stream APIs across all 4 FFI bridges (PyO3, UniFFI, NAPI, WASM)",
+      "gate": "gate-streaming",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/outlets.rs",
+        "crates/scp-ffi/napi/src/outlets.rs",
+        "crates/scp-ffi/uniffi/src/scp.udl",
+        "crates/scp-ffi/uniffi/src/scp.rs",
+        "crates/scp-ffi/wasm/src/outlets.rs"
+      ],
+      "description": "Plumb streaming through all 4 FFI bridges. PyO3: `context_outlet_invoke_stream` returns an async iterator wrapping Python asyncio queue; chunks flow through via a background task. UniFFI: `outlet_invoke_stream` returns an `OutletStreamHandle` with `next() -> Option<OutletStreamChunk>` (polling) AND a callback interface (push). NAPI: `contextOutletInvokeStream` returns an object with AsyncIterator protocol. WASM: `outletInvokeStream` returns an object with `{ next() -> Promise<Option<Chunk>> }`. Each bridge also exposes `outlet_stream_grant_credit(request_id, grant)` and `outlet_stream_cancel(request_id)`.",
+      "acceptanceCriteria": [
+        "PyO3 `context_outlet_invoke_stream` returns a Python async iterator (implements __aiter__, __anext__)",
+        "UniFFI exposes OutletStreamHandle with next and cancel methods; also a subscribe callback interface",
+        "NAPI `contextOutletInvokeStream` returns a JS object that satisfies `Symbol.asyncIterator`",
+        "WASM `outletInvokeStream` returns a JS object with a next() method returning a Promise",
+        "Each bridge exposes outlet_stream_grant_credit(request_id, grant)",
+        "Each bridge exposes outlet_stream_cancel(request_id)",
+        "Conformance test (scp-testing): invoke a streaming outlet through each bridge, collect 10 chunks, confirm terminal End chunk, confirm inclusion_proof round-trips",
+        "cargo build --workspace --release succeeds for all four bridges",
+        "Integration tests per bridge green"
+      ],
+      "actionItems": [
+        "Add stream APIs to each bridge",
+        "Use tokio mpsc channels bridged to the language runtime appropriately",
+        "Expose grant and cancel",
+        "Add the conformance test",
+        "Document semantics on each bridge"
+      ],
+      "blockedBy": [
+        "SCP-OUT-045",
+        "SCP-OUT-046",
+        "SCP-OUT-049"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.5 Progressive Output (Streaming)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-051",
+      "title": "SDK stream idioms: Python AsyncIterator, TS AsyncIterable, Swift AsyncThrowingStream, Kotlin Flow",
+      "gate": "gate-streaming",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "bindings/python/scp_sdk/outlets.py",
+        "bindings/typescript/src/outlets.ts",
+        "bindings/swift/Sources/SCP/Outlets.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Outlets.kt"
+      ],
+      "description": "Expose language-idiomatic streaming APIs on each SDK, backed by the FFI streams from SCP-OUT-050. Python: `async for chunk in ctx.outlets.invoke_stream(id, input): ...`; `ctx.outlets.invoke(id, input)` is a sugar that awaits the stream and returns End.aggregate. TypeScript: `for await (const chunk of ctx.outlets.invokeStream(id, input)) { ... }` + `ctx.outlets.invoke(...)` collect helper. Swift: `let stream: AsyncThrowingStream<OutletStreamChunk, Error> = ctx.outlets.invokeStream(id: id, input: input)` + `invoke` helper. Kotlin: `val flow: Flow<OutletStreamChunk> = ctx.outlets.invokeStream(id, input)` + `invoke` suspend helper. Each SDK also exposes `grantCredit(requestId, grant)` and `cancel(requestId)`. Progress chunks are surfaced; End's aggregate is the return value of the collect helper.",
+      "acceptanceCriteria": [
+        "Python: ctx.outlets.invoke_stream is an async generator yielding OutletStreamChunk; ctx.outlets.invoke returns End.aggregate after collecting",
+        "Python: ctx.outlets.grant_credit(request_id, grant) and ctx.outlets.cancel(request_id) methods",
+        "TypeScript: ctx.outlets.invokeStream returns AsyncIterable<OutletStreamChunk>; ctx.outlets.invoke returns End.aggregate",
+        "TypeScript: ctx.outlets.grantCredit and ctx.outlets.cancel methods",
+        "Swift: ctx.outlets.invokeStream returns AsyncThrowingStream; ctx.outlets.invoke returns End.aggregate",
+        "Swift: ctx.outlets.grantCredit and ctx.outlets.cancel methods",
+        "Kotlin: ctx.outlets.invokeStream returns Flow<OutletStreamChunk>; ctx.outlets.invoke returns End.aggregate",
+        "Kotlin: ctx.outlets.grantCredit(requestId, grant) and cancel(requestId) suspend methods",
+        "Progress chunks are observable (not filtered out) in every SDK iterator",
+        "End.aggregate validation matches aggregate_schema per §5.4.5",
+        "per-SDK integration test: stream 10 Data chunks + End; iterator yields 11 chunks and the collect helper returns End.aggregate",
+        "All SDK CI green"
+      ],
+      "actionItems": [
+        "Implement invoke_stream in each SDK over the FFI stream API",
+        "Implement invoke convenience that collects End.aggregate",
+        "Wire grantCredit and cancel",
+        "Add the integration test per SDK"
+      ],
+      "blockedBy": [
+        "SCP-OUT-050"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.5 Progressive Output (Streaming)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-052",
+      "title": "Test vectors: non-streaming, multi-chunk, cancellation, error-terminal, error-recoverable, gap, credit-exhaustion",
+      "gate": "gate-streaming",
+      "priority": "P1",
+      "severity": "major",
+      "status": "pending",
+      "files": [
+        "tests/conformance/vectors/outlet_stream_vectors.json",
+        "crates/scp-testing/tests/integration/outlet_stream_conformance.rs",
+        ".docs/specs/25-test-vectors.md"
+      ],
+      "description": "Author a conformance vector set that exercises every streaming edge case per §5.4.5. Seven vectors: (1) non-streaming one-shot Action (Data + End); (2) 10-chunk streaming Query; (3) cancellation mid-stream via OutletCancel; (4) terminal error mid-stream (Error { terminal: true }) — stream closes; (5) recoverable error mid-stream (Error { terminal: false }) followed by Data chunks — stream continues; (6) sequence gap — receiver observes missing sequence and cancels with SCP-TOOL-6134; (7) credit exhaustion — receiver sends no grant; executor stalls and framework cancels with SCP-TOOL-6133. Each vector is round-tripped through every bridge.",
+      "acceptanceCriteria": [
+        "File tests/conformance/vectors/outlet_stream_vectors.json has exactly 7 vectors with names non_streaming, multi_chunk, cancellation, error_terminal, error_recoverable, sequence_gap, credit_exhaustion",
+        "Each vector specifies: name, open (OutletStreamOpen fields), chunks (ordered list of OutletStreamChunk), credits (list of OutletStreamCredit grants with timing), expected_end_status (Ok/Error/Cancelled), expected_error_code (optional)",
+        "outlet_stream_conformance.rs replays each vector against the runtime and asserts exact chunk sequence and terminal status",
+        "Each vector is also driven through each of the 4 FFI bridges",
+        ".docs/specs/25-test-vectors.md documents the 7 vectors and their locations",
+        "Per-SDK smoke test: each vector runs in each SDK and produces the expected terminal status",
+        "cargo test --workspace succeeds"
+      ],
+      "actionItems": [
+        "Author the 7 vectors",
+        "Implement the conformance harness",
+        "Add per-SDK smoke tests",
+        "Document in §25"
+      ],
+      "blockedBy": [
+        "SCP-OUT-045",
+        "SCP-OUT-046",
+        "SCP-OUT-047",
+        "SCP-OUT-048",
+        "SCP-OUT-050",
+        "SCP-OUT-051"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.5 Progressive Output (Streaming)"
+        }
+      ],
+      "details": {}
+    }
+  ]
+}

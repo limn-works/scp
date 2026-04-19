@@ -114,6 +114,37 @@ Rate limits for cross-context tool interfaces use a sliding window counter with 
 
 **Per-caller vs. per-interface limits.** Both limits are enforced independently. A single caller is limited to 10 calls/minute by default; all callers combined are limited to 60 calls/minute per interface. This prevents a single caller from monopolizing an interface.
 
+**Classification-aware rate tiers (§5.4.2).** Defaults differ for Query and Action outlets. Query outlets: per-interface 600 calls/min, per-caller 100 calls/min — an order of magnitude higher, reflecting the idempotent read-only contract. Action outlets: per-interface 60 calls/min, per-caller 10 calls/min (the original defaults). Both tiers are independently configurable within the range shown in the table.
+
+#### 6.2.0.3 Chain Amplification Rule
+
+Cross-context outlet calls inherit an `OutletKind` (§5.4.2) from the originating invocation. At each cross-context hop, the runtime enforces:
+
+- **Query → Query: permitted.** A Query invocation may transitively invoke Query outlets in downstream contexts.
+- **Query → Action: forbidden.** A Query invocation MUST NOT trigger any Action invocation, directly or transitively. The runtime rejects the amplification attempt at the cross-context consent gate (§6.2.0.1) with `OutletErrorClass::Authorization::AmplificationViolation`.
+- **Action → Query: permitted.** An Action invocation may transitively invoke Query outlets.
+- **Action → Action: permitted.** An Action invocation may transitively invoke Action outlets, subject to chain depth.
+
+The rule closes the "free read laundered into paid write" class of attacks: Query is the cacheable, cost-capped tier, and allowing a cached Query to cascade into an Action would let an adversary exercise Action semantics under Query rate limits and Query cache economics.
+
+#### 6.2.0.4 Chain Depth Split
+
+The context-level `max_chain_depth` parameter (default 8) is partitioned by kind:
+
+- **Query chain budget:** `max_chain_depth` (full budget).
+- **Action chain budget:** `max(1, max_chain_depth / 2)` (default 4).
+
+On each cross-context hop, the runtime decrements the kind-appropriate counter. A Query → Query → Action chain at budget `(8, 4)` decrements Query on hops 1 and 2 and then, because Query → Action is forbidden under §6.2.0.3, is rejected before the Action hop consumes budget. The split ensures Action invocations have stricter amplification bounds than Query invocations without requiring two unrelated parameters.
+
+### 6.2.0.5 Cross-Context Streaming
+
+Outlet streams (§5.4.5) cross context boundaries under the same §6.2 tool-interface model. A shared-member bridge transports chunks from the target context to the source context, re-encrypting each chunk per-recipient as it crosses (source-context encryption on the outbound leg; target-context decryption on the inbound leg). The bridge does NOT buffer the full stream — chunks flow through as they arrive, subject to the credit window.
+
+- **`chain_depth` is set at open.** Every chunk inherits the chain depth recorded at the opening cross-context hop. Chunks do not recompute depth. Opening is subject to §6.2.0.3 and §6.2.0.4; chunks after open are not re-checked.
+- **Credit is end-to-end.** Credit grants from the invoker propagate across the bridge to the executor without re-accounting at the bridge.
+- **UCAN check locus.** UCAN is validated ONCE at stream open (§5.4.5). Mid-stream revocation terminates at the next executor checkpoint, but already-emitted chunks remain authorized.
+- **Event log recording.** Each of the two contexts records exactly one `OutletInvokedEvent` for the stream, with the same `stream_manifest_hash` (§5.4.5). Cross-context provenance (§7.7) chains the two events via the `source_chain` field on the error envelope (when the stream fails) or on the final `End.provenance` (when it succeeds).
+
 ### 6.2.1 Stateful Tool Sessions
 
 Tool interfaces support optional session-based multi-turn interaction. A tool can accept a session identifier and maintain state across sequential invocations. This enables multi-step workflows (negotiation, coordination, iterative refinement) within the governed tool call framework.
