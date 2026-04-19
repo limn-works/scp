@@ -4049,6 +4049,18 @@ async fn flush_all_contexts_persists_degraded_snapshot_for_locked_context() {
         .await
         .unwrap();
 
+    // `create_context` -> `finalize_create` -> `persist_context_and_broadcast`
+    // writes a good (non-degraded) snapshot synchronously. The bug-catcher
+    // PR 2 preservation guard (commit `11a884968`) correctly refuses to
+    // clobber that good snapshot with a degraded one under transient
+    // contention. To exercise the raw "no prior snapshot → degraded write
+    // fires" path (the original AC3 bug 1 scenario), clear the mock's
+    // persisted state before inducing contention. This simulates a context
+    // whose prior snapshot was never persisted (or was evicted), which is
+    // the only scenario where the degraded marker is load-bearing for
+    // `restore_context` to find the reconnect signal.
+    shared_persistence.contexts.lock().unwrap().clear();
+
     // Acquire the per-context lock and hold it across the flush. The flush's
     // per-context lock-acquisition budget is 250ms; we hold the lock for
     // 750ms, guaranteeing a timeout and forcing the degraded-snapshot

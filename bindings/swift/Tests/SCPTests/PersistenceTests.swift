@@ -56,7 +56,7 @@ final class PersistenceTests: XCTestCase {
             "scp.db must not exist before SCP.withStorage(sqliteDir:key:)"
         )
 
-        let scp = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
+        let scp = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: dbPath.path),
             "SCP.withStorage(sqliteDir:key:) must create scp.db at \(dbPath.path)"
@@ -71,7 +71,7 @@ final class PersistenceTests: XCTestCase {
         let dir = try makeTempDir()
         defer { removeTempDir(dir) }
 
-        let scp = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
+        let scp = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         try scp.suspend()
         try await scp.resume()
         try await scp.shutdown(timeout: 1)
@@ -84,12 +84,12 @@ final class PersistenceTests: XCTestCase {
         let dir = try makeTempDir()
         defer { removeTempDir(dir) }
 
-        let scp1 = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
+        let scp1 = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         let id1 = scp1.instanceId
         try await scp1.shutdown(timeout: 1)
 
         // Fresh SCP object, same underlying encrypted database.
-        let scp2 = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
+        let scp2 = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         let id2 = scp2.instanceId
         XCTAssertGreaterThan(
             id2, id1,
@@ -98,26 +98,37 @@ final class PersistenceTests: XCTestCase {
         try await scp2.shutdown(timeout: 1)
     }
 
-    /// Construction with a wrong key must not corrupt the original
-    /// encrypted database — the bridge logs and falls back, and a
-    /// subsequent correct-key open still works.
+    /// Construction with a wrong key must surface a validation error
+    /// (SCP-VALID-7005) rather than silently succeeding with an empty
+    /// in-memory instance — guards against silent downgrade where the
+    /// caller would lose access to persisted state. After commit
+    /// `9fa80e13c` (`fix(ffi): propagate SqliteStorage::new failure
+    /// from with_storage`) the `UniFFI` bridge surfaces the
+    /// `SQLCipher` key-mismatch as `ScpError` rather than falling
+    /// back to in-memory. The original encrypted DB must survive the
+    /// failed attempt so a subsequent correct-key open still works.
     func testSqliteRejectsMismatchedKeyWithoutCorruption() async throws {
         let dir = try makeTempDir()
         defer { removeTempDir(dir) }
 
         // First open with the correct key — creates the encrypted DB.
-        let scp1 = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
+        let scp1 = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         try await scp1.shutdown(timeout: 1)
 
-        // Second open with a wrong key. The bridge logs and falls back
-        // to an in-memory-only instance; construction succeeds but the
-        // original DB file must remain readable with the correct key.
+        // Second open with a wrong key MUST throw — `SqliteStorage::new`
+        // fails at the `PRAGMA key` / WAL-mode step because `SQLCipher`
+        // rejects the key as "file is not a database". The `UniFFI`
+        // bridge propagates that through `ScpError::Validation`.
         let wrongKey = Data(repeating: 0x11, count: 32)
-        let scp2 = SCP.withStorage(sqliteDir: dir, key: wrongKey)
-        try await scp2.shutdown(timeout: 1)
+        XCTAssertThrowsError(
+            try SCP.withStorage(sqliteDir: dir, key: wrongKey),
+            "mismatched-key construction must throw, not silently fall back"
+        )
 
-        // Third open with the correct key — must still succeed.
-        let scp3 = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
+        // Third open with the correct key — must still succeed, proving
+        // the failed mismatched-key attempt did not corrupt or truncate
+        // the encrypted database file.
+        let scp3 = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         try await scp3.shutdown(timeout: 1)
     }
 }
