@@ -2116,11 +2116,17 @@ impl HandleAffinityError {
 
 impl std::fmt::Display for HandleAffinityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Sanitized message: internal ids are not interesting to end users
-        // but are preserved in `Debug` for operator correlation.
+        // Sanitized message: internal ids stay out of the user-visible
+        // string (they are preserved in `Debug` for operator correlation).
+        // The recovery hint points the caller at the mechanical fix —
+        // use the SCP instance that minted the handle, or mint a fresh
+        // handle from the SCP instance the caller intends to operate on.
+        // See PR #1690 retro api-design MAJOR.
         write!(
             f,
-            "handle belongs to a different SCP instance — operation rejected"
+            "handle belongs to a different SCP instance — use the SCP \
+             instance that created this handle (check \
+             scp.instance_id matches handle.instance_id)"
         )
     }
 }
