@@ -16287,6 +16287,1786 @@ impl Scp {
             .map(format_context_event)
             .collect()
     }
+
+    // ===== UniFFI sub-slice F — tools + access keys + TTL + event log + UCAN =====
+    //
+    // Migrates the tool / access-key / TTL / event-log / UCAN free functions
+    // (`tool_register`, `tool_invoke`, `tool_verify`,
+    // `tool_invoke_cross_context`, `tool_session_create`,
+    // `tool_session_invoke`, `tool_session_close`,
+    // `tool_interface_expose`, `tool_interface_accept`,
+    // `tool_interface_revoke`, `access_key_generate`, `access_key_revoke`,
+    // `access_key_restore`, `context_handle_ttl_expiry`,
+    // `context_propose_ttl_extension`, `context_reset_ttl_timer`,
+    // `event_log_query`, `event_log_verify`, `event_log_checkpoint`,
+    // `ucan_validate`, `ucan_mint`, `ucan_revoke`, `ucan_delegate`) to
+    // `impl crate::scp::Scp` methods routing through `&self.inner` (the
+    // `UniffiBridgeInstance` owned by the caller).
+    //
+    // Free functions above are retained (they still compile and are still
+    // exported via `#[uniffi::export]`) — the demolition slice at the end
+    // of PR 4 removes them in one shot after every caller is migrated.
+    // Bodies are preserved verbatim except for the
+    // `crate::runtime::context_manager()` → `bi.context_manager_or_error()?`
+    // and `crate::runtime::context_manager_expect()` →
+    // `self.inner.context_manager_expect()?` (or `bi.context_manager_expect()?`
+    // inside spawned closures) swap and the handle-affinity inline check.
+    //
+    // Part of #1549 Phase 4 PR 4.
+
+    /// Per-instance equivalent of the free-function [`tool_register`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn tool_register(
+        &self,
+        handle: Arc<ContextHandle>,
+        definition: ToolDefinition,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        runtime()
+            .spawn(async move {
+                validate_tool_name(&definition.name)?;
+
+                let state = handle.state.lock().await;
+
+                if !matches!(*state, ContextState::Active) {
+                    return Err(ScpError::Tool {
+                        msg: format!(
+                            "cannot register tool in context in {:?} state — context must be active",
+                            *state
+                        ),
+                        code: codes::TOOL_6003.to_owned(),
+                    });
+                }
+                drop(state);
+
+                let input_schema: serde_json::Value =
+                    serde_json::from_str(&definition.input_schema_json).map_err(|e| {
+                        ScpError::Validation {
+                            msg: format!("invalid input_schema_json: {e}"),
+                            code: codes::VALID_7035.to_owned(),
+                        }
+                    })?;
+                if !input_schema.is_object() {
+                    return Err(ScpError::Validation {
+                        msg: format!(
+                            "invalid input_schema_json: expected a JSON object, got {}",
+                            json_value_type_name(&input_schema)
+                        ),
+                        code: codes::VALID_7035.to_owned(),
+                    });
+                }
+                let output_schema: serde_json::Value =
+                    serde_json::from_str(&definition.output_schema_json).map_err(|e| {
+                        ScpError::Validation {
+                            msg: format!("invalid output_schema_json: {e}"),
+                            code: codes::VALID_7036.to_owned(),
+                        }
+                    })?;
+                if !output_schema.is_object() {
+                    return Err(ScpError::Validation {
+                        msg: format!(
+                            "invalid output_schema_json: expected a JSON object, got {}",
+                            json_value_type_name(&output_schema)
+                        ),
+                        code: codes::VALID_7036.to_owned(),
+                    });
+                }
+
+                let test_vectors: Vec<scp_core::context::tools::TestVector> =
+                    match definition.test_vectors_json.as_deref() {
+                        None => Vec::new(),
+                        Some(json) => serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                            msg: format!("invalid test_vectors_json: {e}"),
+                            code: codes::VALID_7037.to_owned(),
+                        })?,
+                    };
+
+                let implementation_hash: [u8; 32] = match definition.implementation_hash.as_deref() {
+                    None => [0u8; 32],
+                    Some(bytes) => <[u8; 32]>::try_from(bytes).map_err(|_| ScpError::Validation {
+                        msg: format!(
+                            "implementation_hash must be exactly 32 bytes, got {}",
+                            bytes.len()
+                        ),
+                        code: codes::VALID_7038.to_owned(),
+                    })?,
+                };
+
+                let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
+
+                let cost = definition.cost.map(|c| scp_core::context::tools::ToolCost {
+                    amount: c.amount,
+                    currency: c.currency,
+                    payee: c.payee.into(),
+                    cost_formula: c.cost_formula,
+                });
+
+                let core_registration = scp_core::context::tools::ToolRegistration {
+                    tool_id: tool_id.clone(),
+                    name: definition.name,
+                    description: definition.description,
+                    schema: scp_core::context::tools::ToolSchema {
+                        input_schema,
+                        output_schema,
+                    },
+                    implementation_hash,
+                    test_vectors,
+                    operator_did: definition.operator_did.into(),
+                    cost,
+                    registered_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs()),
+                    signature: Vec::new(),
+                };
+
+                // Build a role state for capability checking.
+                let ceiling = scp_core::context::roles::default_ceiling();
+                let role_state = scp_core::context::roles::ContextRoleState::new(
+                    &handle.context_id,
+                    &handle.creator_did,
+                    ceiling,
+                    vec![],
+                    &scp_primitives::SystemClock,
+                )
+                .map_err(|e| ScpError::Tool {
+                    msg: format!("failed to create role state: {e}"),
+                    code: codes::TOOL_6003.to_owned(),
+                })?;
+
+                let mut registry = handle.tool_registry.lock().await;
+                let (registered_id, _event) = scp_core::context::tools::register_tool(
+                    &mut registry,
+                    &role_state,
+                    core_registration,
+                    &handle.creator_did,
+                )
+                .map_err(|e| ScpError::Tool {
+                    msg: format!("tool registration failed: {e}"),
+                    code: codes::TOOL_6001.to_owned(),
+                })?;
+
+                Ok(registered_id)
+            })
+            .await
+            .map_err(|e| ScpError::Tool {
+                msg: format!("tokio task join error during tool registration: {e}"),
+                code: codes::TOOL_6004.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`tool_invoke`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
+    /// `Identity` whose `instance_id` does not match this `SCP`'s.
+    #[allow(clippy::too_many_arguments)] // Mirrors the runtime's economy entry point.
+    pub async fn tool_invoke(
+        &self,
+        handle: Arc<ContextHandle>,
+        tool_id: String,
+        input_json: String,
+        identity: Arc<Identity>,
+        ucan_token: Option<String>,
+        proof_tokens: Option<Vec<String>>,
+        spending_ucan_jwt: Option<String>,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                validate_tool_id(&tool_id)?;
+                validate_did(&identity.did)?;
+
+                // UCAN token is mandatory for tool invocation — all bridges
+                // enforce this. Reject early if missing (§6.2, ADR-016, #423).
+                let ucan_token = ucan_token.ok_or_else(|| ScpError::Permission {
+                    msg: "UCAN token is required for tool invocation — \
+                              pass a valid JWT-encoded UCAN with tool_invoke:{tool_id} \
+                              or tool_invoke:* capability"
+                        .to_owned(),
+                    code: codes::PERM_3001.to_owned(),
+                })?;
+                validate_ucan_token(&ucan_token)?;
+                if let Some(jwt) = spending_ucan_jwt.as_deref() {
+                    validate_ucan_token(jwt)?;
+                }
+
+                let state = handle.state.lock().await;
+
+                if !matches!(*state, ContextState::Active) {
+                    return Err(ScpError::Tool {
+                        msg: format!(
+                            "cannot invoke tool in context in {:?} state — context must be active",
+                            *state
+                        ),
+                        code: codes::TOOL_6005.to_owned(),
+                    });
+                }
+                drop(state);
+
+                // Primary authorization: UCAN token validation via the full
+                // 11-step ADR-016 pipeline. Bridge-owned because the proof
+                // resolver, revocation list, and nonce tracker live in the
+                // bridge UCAN registry, not in the runtime.
+                validate_tool_ucan_uniffi(
+                    &handle,
+                    &tool_id,
+                    &ucan_token,
+                    &identity.did,
+                    proof_tokens.as_ref(),
+                )?;
+
+                // Parse the optional spending UCAN JWT (§19.5
+                // AND-composition). Mirrors `context_send`. An invalid JWT
+                // surfaces as `SCP-ECON-12061` before the manager call.
+                let spending_ucan_token = spending_ucan_jwt
+                    .as_deref()
+                    .map(scp_core::crypto::ucan::validate::parse_ucan)
+                    .transpose()
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("invalid spending UCAN: {e}"),
+                        code: codes::ECON_12061.to_owned(),
+                    })?;
+
+                // Snapshot the bridge-owned tool registry and (optionally) the
+                // registered handler closure BEFORE entering the runtime call.
+                // The runtime requires a `&ToolRegistry` so we clone the
+                // registry once (cheap — Vec of registrations); the handler
+                // is an `Arc<dyn Fn>` so cloning is a refcount bump. Doing
+                // this OUTSIDE the manager call means the bridge handle's
+                // `tool_registry` mutex is released before Phase 1 of
+                // `invoke_tool_with_economy` acquires the manager mutex.
+                let registry = {
+                    let reg = handle.tool_registry.lock().await;
+                    reg.clone()
+                };
+                let handler = {
+                    let handlers = handle.tool_handlers.lock().await;
+                    handlers.get(&tool_id).cloned()
+                };
+
+                // Parse input JSON once (the runtime expects
+                // `serde_json::Value`).
+                let input_value: serde_json::Value =
+                    serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
+                        msg: format!("invalid input JSON: {e}"),
+                        code: codes::TOOL_6002.to_owned(),
+                    })?;
+
+                let context_id = handle.context_id.clone();
+                let identity_did_for_executor = identity.did.clone();
+                let tool_id_for_executor = tool_id.clone();
+                let context_id_for_executor = context_id.clone();
+
+                // Build the executor closure. Phase 2 of
+                // `invoke_tool_with_economy` runs WITHOUT holding the
+                // `contexts` mutex; the runtime calls the executor exactly
+                // once with the validated input value.
+                let executor = move |input: serde_json::Value| {
+                    let handler = handler.clone();
+                    let input_for_echo = input.clone();
+                    async move {
+                        handler.map_or_else(
+                            || {
+                                Ok(serde_json::json!({
+                                    "tool": tool_id_for_executor,
+                                    "context": context_id_for_executor,
+                                    "status": "validated",
+                                    "input_valid": true,
+                                    "invoker_did": identity_did_for_executor,
+                                    "validated_input": input_for_echo,
+                                }))
+                            },
+                            |h| {
+                                h(input).map_err(|e| {
+                                    format!("tool handler for '{tool_id_for_executor}' failed: {e}")
+                                })
+                            },
+                        )
+                    }
+                };
+
+                let manager = bi.context_manager_expect()?;
+                let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
+                let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
+                let outcome = manager
+                    .invoke_tool_with_economy(
+                        &context_id,
+                        &registry,
+                        &tool_id_typed,
+                        input_value,
+                        &invoker_did_typed,
+                        spending_ucan_token.as_ref(),
+                        None,
+                        executor,
+                    )
+                    .await
+                    .map_err(ScpError::from)?;
+
+                // The runtime built the canonical `ToolInvokedEvent`; the
+                // transport / event-log layer is responsible for signing
+                // and appending it. Pull the JSON output back out for the
+                // Swift / Kotlin caller.
+                serde_json::to_string(&outcome.output).map_err(|e| ScpError::Tool {
+                    msg: format!("failed to serialize tool output: {e}"),
+                    code: codes::TOOL_6006.to_owned(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Tool {
+                msg: format!("tokio task join error during tool invocation: {e}"),
+                code: codes::TOOL_6006.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`tool_verify`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn tool_verify(
+        &self,
+        handle: Arc<ContextHandle>,
+        tool_id: String,
+    ) -> Result<ToolVerificationResult, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        runtime()
+            .spawn(async move {
+                let state = handle.state.lock().await;
+
+                if !matches!(*state, ContextState::Active) {
+                    return Err(ScpError::Tool {
+                        msg: format!(
+                            "cannot verify tool in context in {:?} state — context must be active",
+                            *state
+                        ),
+                        code: codes::TOOL_6007.to_owned(),
+                    });
+                }
+                drop(state);
+
+                Ok(ToolVerificationResult {
+                    tool_id,
+                    passed: true,
+                    failures: Vec::new(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Tool {
+                msg: format!("tokio task join error during tool verification: {e}"),
+                code: codes::TOOL_6008.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`tool_invoke_cross_context`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
+    /// `Identity` whose `instance_id` does not match this `SCP`'s.
+    #[allow(clippy::too_many_arguments)] // FFI boundary: UniFFI requires explicit params
+    pub async fn tool_invoke_cross_context(
+        &self,
+        source_handle: Arc<ContextHandle>,
+        target_handle: Arc<ContextHandle>,
+        tool_id: String,
+        input_json: String,
+        identity: Arc<Identity>,
+        ucan_token: String,
+        chain_depth: u8,
+        proof_tokens: Option<Vec<String>>,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(source_handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(target_handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                // Validate source context is active.
+                let source_state = source_handle.state.lock().await;
+                if !matches!(*source_state, ContextState::Active) {
+                    return Err(ScpError::Tool {
+                        msg: format!(
+                            "cannot invoke cross-context tool: source context in {:?} state",
+                            *source_state
+                        ),
+                        code: codes::TOOL_6010.to_owned(),
+                    });
+                }
+                drop(source_state);
+
+                // Validate target context is active.
+                let target_state = target_handle.state.lock().await;
+                if !matches!(*target_state, ContextState::Active) {
+                    return Err(ScpError::Tool {
+                        msg: format!(
+                            "cannot invoke cross-context tool: target context in {:?} state",
+                            *target_state
+                        ),
+                        code: codes::TOOL_6011.to_owned(),
+                    });
+                }
+                drop(target_state);
+
+                // Validate chain depth (context-configurable, default 8 per ADR-043).
+                let max_chain_depth = {
+                    let mgr = bi.context_manager_or_error()?;
+                    let source_max = mgr
+                        .context_params(&source_handle.context_id)
+                        .await
+                        .and_then(|p| p.max_chain_depth);
+                    scp_core::provenance::attach::effective_max_chain_depth(source_max)
+                };
+                if chain_depth > max_chain_depth {
+                    return Err(ScpError::Tool {
+                        msg: format!(
+                            "cross-context chain depth {chain_depth} exceeds maximum {max_chain_depth}"
+                        ),
+                        code: codes::TOOL_6012.to_owned(),
+                    });
+                }
+
+                // Primary authorization: UCAN token validation via the full 11-step
+                // ADR-016 pipeline against the TARGET context's ceiling.
+                // See spec §6.2, §8, ADR-016, and issue #319.
+                validate_tool_ucan_uniffi(
+                    &target_handle,
+                    &tool_id,
+                    &ucan_token,
+                    &identity.did,
+                    proof_tokens.as_ref(),
+                )?;
+
+                let input_value: serde_json::Value =
+                    serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
+                        msg: format!("invalid input JSON: {e}"),
+                        code: codes::TOOL_6002.to_owned(),
+                    })?;
+
+                let registry = target_handle.tool_registry.lock().await;
+                let registration = registry.get(&tool_id).ok_or_else(|| ScpError::Tool {
+                    msg: format!(
+                        "tool '{tool_id}' not found in target context '{}'",
+                        target_handle.context_id
+                    ),
+                    code: codes::TOOL_6002.to_owned(),
+                })?;
+
+                scp_core::context::tools::validate_value_against_schema(
+                    &input_value,
+                    &registration.schema.input_schema,
+                )
+                .map_err(|e| ScpError::Tool {
+                    msg: format!("input validation failed: {e}"),
+                    code: codes::TOOL_6002.to_owned(),
+                })?;
+
+                let output_schema = registration.schema.output_schema.clone();
+                drop(registry);
+
+                let handlers = target_handle.tool_handlers.lock().await;
+                let output = if let Some(handler) = handlers.get(&tool_id) {
+                    let handler = handler.clone();
+                    drop(handlers);
+                    let out = handler(input_value.clone()).map_err(|e| ScpError::Tool {
+                        msg: format!("cross-context tool handler for '{tool_id}' failed: {e}"),
+                        code: codes::TOOL_6002.to_owned(),
+                    })?;
+                    scp_core::context::tools::validate_value_against_schema(&out, &output_schema)
+                        .map_err(|msg| ScpError::Tool {
+                            msg: format!("output validation failed for tool '{tool_id}': {msg}"),
+                            code: codes::TOOL_6002.to_owned(),
+                        })?;
+                    out
+                } else {
+                    drop(handlers);
+                    serde_json::json!({
+                        "tool": tool_id,
+                        "source_context": source_handle.context_id,
+                        "target_context": target_handle.context_id,
+                        "status": "validated",
+                        "chain_depth": chain_depth,
+                        "invoker_did": identity.did,
+                        "validated_input": input_value,
+                    })
+                };
+
+                serde_json::to_string(&output).map_err(|e| ScpError::Tool {
+                    msg: format!("failed to serialize cross-context output: {e}"),
+                    code: codes::TOOL_6013.to_owned(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Tool {
+                msg: format!("tokio task join error during cross-context invocation: {e}"),
+                code: codes::TOOL_6009.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`tool_session_create`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn tool_session_create(
+        &self,
+        handle: Arc<ContextHandle>,
+        tool_id: String,
+        source_context_id: String,
+        ttl_seconds: Option<u64>,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let state = handle.state.lock().await;
+                if !matches!(*state, ContextState::Active) {
+                    return Err(ScpError::Tool {
+                        msg: format!(
+                            "cannot create session in context in {:?} state — context must be active",
+                            *state
+                        ),
+                        code: codes::TOOL_6014.to_owned(),
+                    });
+                }
+                drop(state);
+
+                let mut store = handle.session_store.lock().await;
+
+                // Enforce per-caller session cap (context-configured, default 1000, ADR-043).
+                let cap = {
+                    let mgr = bi.context_manager_or_error()?;
+                    mgr.context_params(&handle.context_id)
+                        .await
+                        .and_then(|p| p.session_cap)
+                        .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER)
+                        as usize
+                };
+                let current = store.count_by_source(&source_context_id);
+                if current >= cap {
+                    return Err(ScpError::Tool {
+                        msg: format!(
+                            "session cap exceeded for caller '{source_context_id}': {current} active (max {cap})"
+                        ),
+                        code: codes::TOOL_6015.to_owned(),
+                    });
+                }
+
+                let session_id = Uuid::new_v4().to_string();
+                let now_ms = scp_primitives::SystemClock.now_millis();
+
+                let session = scp_core::context::tools::ToolSession {
+                    session_id: session_id.clone(),
+                    tool_id,
+                    source_context: source_context_id,
+                    state: serde_json::Value::Null,
+                    created_at: now_ms,
+                    ttl: ttl_seconds.map(std::time::Duration::from_secs),
+                    call_count: 0,
+                };
+
+                store.insert(session);
+                Ok(session_id)
+            })
+            .await
+            .map_err(|e| ScpError::Tool {
+                msg: format!("tokio task join error during session creation: {e}"),
+                code: codes::TOOL_6009.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`tool_session_invoke`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
+    /// `Identity` whose `instance_id` does not match this `SCP`'s.
+    pub async fn tool_session_invoke(
+        &self,
+        handle: Arc<ContextHandle>,
+        session_id: String,
+        input_json: String,
+        identity: Arc<Identity>,
+        ucan_token: String,
+        proof_tokens: Option<Vec<String>>,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        runtime()
+            .spawn(async move {
+                let state = handle.state.lock().await;
+                if !matches!(*state, ContextState::Active) {
+                    return Err(ScpError::Tool {
+                        msg: format!(
+                            "cannot invoke session in context in {:?} state — context must be active",
+                            *state
+                        ),
+                        code: codes::TOOL_6017.to_owned(),
+                    });
+                }
+                drop(state);
+
+                // Look up tool_id from session for UCAN validation.
+                let tool_id_for_ucan = {
+                    let store = handle.session_store.lock().await;
+                    let session = store.get(&session_id).ok_or_else(|| ScpError::Tool {
+                        msg: format!("session '{session_id}' not found"),
+                        code: codes::TOOL_6018.to_owned(),
+                    })?;
+                    session.tool_id.clone()
+                };
+
+                // Primary authorization: UCAN token validation via the full 11-step
+                // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+                validate_tool_ucan_uniffi(
+                    &handle,
+                    &tool_id_for_ucan,
+                    &ucan_token,
+                    &identity.did,
+                    proof_tokens.as_ref(),
+                )?;
+
+                let mut store = handle.session_store.lock().await;
+
+                let session = store.get(&session_id).ok_or_else(|| ScpError::Tool {
+                    msg: format!("session '{session_id}' not found"),
+                    code: codes::TOOL_6018.to_owned(),
+                })?;
+
+                // Check expiry.
+                let now_ms = scp_primitives::SystemClock.now_millis();
+                if session.is_expired(now_ms) {
+                    store.remove(&session_id);
+                    return Err(ScpError::Tool {
+                        msg: format!("session '{session_id}' has expired"),
+                        code: codes::TOOL_6019.to_owned(),
+                    });
+                }
+
+                let tool_id = session.tool_id.clone();
+                let current_state = session.state.clone();
+                let call_count = session.call_count;
+                drop(store);
+
+                let input_value: serde_json::Value =
+                    serde_json::from_str(&input_json).map_err(|e| ScpError::Tool {
+                        msg: format!("invalid input JSON: {e}"),
+                        code: codes::TOOL_6002.to_owned(),
+                    })?;
+
+                // Validate input against tool's input schema if tool is registered.
+                let registry = handle.tool_registry.lock().await;
+                if let Some(registration) = registry.get(&tool_id) {
+                    scp_core::context::tools::validate_value_against_schema(
+                        &input_value,
+                        &registration.schema.input_schema,
+                    )
+                    .map_err(|e| ScpError::Tool {
+                        msg: format!("input validation failed: {e}"),
+                        code: codes::TOOL_6002.to_owned(),
+                    })?;
+                }
+                drop(registry);
+
+                // Execute via handler or echo mode.
+                let handlers = handle.tool_handlers.lock().await;
+                let (new_state, output) = if let Some(handler) = handlers.get(&tool_id) {
+                    let handler = handler.clone();
+                    drop(handlers);
+                    let out = handler(input_value.clone()).map_err(|e| ScpError::Tool {
+                        msg: format!("tool handler for '{tool_id}' failed: {e}"),
+                        code: codes::TOOL_6002.to_owned(),
+                    })?;
+                    (current_state, out)
+                } else {
+                    drop(handlers);
+                    let out = serde_json::json!({
+                        "tool": tool_id,
+                        "session_id": session_id,
+                        "status": "validated",
+                        "call_count": call_count + 1,
+                        "invoker_did": identity.did,
+                        "validated_input": input_value,
+                    });
+                    (current_state, out)
+                };
+
+                // Update session state and increment call count.
+                let mut store = handle.session_store.lock().await;
+                if let Some(session) = store.get_mut(&session_id) {
+                    session.state = new_state;
+                    session.call_count = session.call_count.saturating_add(1);
+                }
+
+                serde_json::to_string(&output).map_err(|e| ScpError::Tool {
+                    msg: format!("failed to serialize session invoke output: {e}"),
+                    code: codes::TOOL_6020.to_owned(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Tool {
+                msg: format!("tokio task join error during session invocation: {e}"),
+                code: codes::TOOL_6009.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`tool_session_close`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn tool_session_close(
+        &self,
+        handle: Arc<ContextHandle>,
+        session_id: String,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        runtime()
+            .spawn(async move {
+                let mut store = handle.session_store.lock().await;
+                if store.remove(&session_id).is_none() {
+                    return Err(ScpError::Tool {
+                        msg: format!("session '{session_id}' not found"),
+                        code: codes::TOOL_6021.to_owned(),
+                    });
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Tool {
+                msg: format!("tokio task join error during session close: {e}"),
+                code: codes::TOOL_6009.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`tool_interface_expose`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn tool_interface_expose(
+        &self,
+        handle: Arc<ContextHandle>,
+        tool_id: String,
+        target_context_id: String,
+        rate_limit_json: Option<String>,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        runtime()
+            .spawn(async move {
+                validate_tool_id(&tool_id)?;
+
+                let state = handle.state.lock().await;
+                if !matches!(*state, ContextState::Active) {
+                    return Err(ScpError::Tool {
+                        msg: format!(
+                            "cannot expose tool interface in context in {:?} state — context must be active",
+                            *state
+                        ),
+                        code: codes::TOOL_6030.to_owned(),
+                    });
+                }
+                drop(state);
+
+                let rate_limit = match rate_limit_json {
+                    Some(ref json) => {
+                        let parsed: scp_core::context::tools::interface::RateLimit =
+                            serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                                msg: format!("invalid rate_limit_json: {e}"),
+                                code: codes::VALID_7040.to_owned(),
+                            })?;
+                        Some(parsed)
+                    }
+                    None => None,
+                };
+
+                let ceiling = scp_core::context::roles::default_ceiling();
+                let role_state = scp_core::context::roles::ContextRoleState::new(
+                    &handle.context_id,
+                    &handle.creator_did,
+                    ceiling,
+                    vec![],
+                    &scp_primitives::SystemClock,
+                )
+                .map_err(|e| ScpError::Tool {
+                    msg: format!("failed to create role state: {e}"),
+                    code: codes::TOOL_6030.to_owned(),
+                })?;
+
+                let context_handle = scp_core::context::ContextHandle::new(
+                    handle.context_id.clone(),
+                    scp_core::context::ContextParams::default(),
+                );
+
+                let registry = handle.tool_registry.lock().await;
+
+                let interface = scp_core::context::tools::interface::expose_tool(
+                    context_handle.context_id(),
+                    &tool_id,
+                    &target_context_id,
+                    &role_state,
+                    &handle.creator_did,
+                    &registry,
+                    rate_limit,
+                    None,
+                )
+                .map_err(|e| ScpError::Tool {
+                    msg: format!("expose_tool failed: {e}"),
+                    code: codes::TOOL_6030.to_owned(),
+                })?;
+
+                serde_json::to_string(&interface).map_err(|e| ScpError::Tool {
+                    msg: format!("failed to serialize ToolInterface: {e}"),
+                    code: codes::TOOL_6031.to_owned(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Tool {
+                msg: format!("tokio task join error during tool_interface_expose: {e}"),
+                code: codes::TOOL_6009.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`tool_interface_accept`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn tool_interface_accept(
+        &self,
+        handle: Arc<ContextHandle>,
+        interface_json: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        runtime()
+            .spawn(async move {
+                let state = handle.state.lock().await;
+                if !matches!(*state, ContextState::Active) {
+                    return Err(ScpError::Tool {
+                        msg: format!(
+                            "cannot accept tool interface in context in {:?} state — context must be active",
+                            *state
+                        ),
+                        code: codes::TOOL_6032.to_owned(),
+                    });
+                }
+                drop(state);
+
+                let mut interface: scp_core::context::tools::interface::ToolInterface =
+                    serde_json::from_str(&interface_json).map_err(|e| ScpError::Validation {
+                        msg: format!("invalid interface_json: {e}"),
+                        code: codes::VALID_7041.to_owned(),
+                    })?;
+
+                let ceiling = scp_core::context::roles::default_ceiling();
+                let role_state = scp_core::context::roles::ContextRoleState::new(
+                    &handle.context_id,
+                    &handle.creator_did,
+                    ceiling,
+                    vec![],
+                    &scp_primitives::SystemClock,
+                )
+                .map_err(|e| ScpError::Tool {
+                    msg: format!("failed to create role state: {e}"),
+                    code: codes::TOOL_6032.to_owned(),
+                })?;
+
+                let context_handle = scp_core::context::ContextHandle::new(
+                    handle.context_id.clone(),
+                    scp_core::context::ContextParams::default(),
+                );
+
+                scp_core::context::tools::interface::accept_tool_interface(
+                    context_handle.context_id(),
+                    &mut interface,
+                    &role_state,
+                    &handle.creator_did,
+                    None,
+                )
+                .map_err(|e| ScpError::Tool {
+                    msg: format!("accept_tool_interface failed: {e}"),
+                    code: codes::TOOL_6032.to_owned(),
+                })?;
+
+                serde_json::to_string(&interface).map_err(|e| ScpError::Tool {
+                    msg: format!("failed to serialize ToolInterface: {e}"),
+                    code: codes::TOOL_6033.to_owned(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Tool {
+                msg: format!("tokio task join error during tool_interface_accept: {e}"),
+                code: codes::TOOL_6009.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`tool_interface_revoke`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn tool_interface_revoke(
+        &self,
+        handle: Arc<ContextHandle>,
+        interface_id_hex: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        runtime()
+            .spawn(async move {
+                let interface_id_bytes =
+                    hex::decode(&interface_id_hex).map_err(|e| ScpError::Validation {
+                        msg: format!("invalid interface_id_hex: not valid hex: {e}"),
+                        code: codes::VALID_7042.to_owned(),
+                    })?;
+                let interface_id: [u8; 32] = <[u8; 32]>::try_from(interface_id_bytes.as_slice())
+                    .map_err(|_| ScpError::Validation {
+                        msg: format!(
+                            "interface_id_hex must be exactly 32 bytes (64 hex chars), got {}",
+                            interface_id_bytes.len()
+                        ),
+                        code: codes::VALID_7042.to_owned(),
+                    })?;
+
+                let now_ms = scp_primitives::SystemClock.now_millis();
+
+                let event = scp_core::context::tools::interface::revoke_tool_interface(
+                    interface_id,
+                    &handle.context_id,
+                    now_ms,
+                );
+
+                serde_json::to_string(&event).map_err(|e| ScpError::Tool {
+                    msg: format!("failed to serialize InterfaceRevoked: {e}"),
+                    code: codes::TOOL_6035.to_owned(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Tool {
+                msg: format!("tokio task join error during tool_interface_revoke: {e}"),
+                code: codes::TOOL_6009.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`access_key_generate`].
+    ///
+    /// Routes through `&*self.inner`.
+    pub async fn access_key_generate(
+        &self,
+        context_id: String,
+        member_did: String,
+        caller_did: String,
+    ) -> Result<(), ScpError> {
+        let manager = self.inner.context_manager_expect()?;
+        manager
+            .generate_context_access_key(&context_id, &member_did, &caller_did)
+            .await
+            .map_err(ScpError::from)
+    }
+
+    /// Per-instance equivalent of the free-function [`access_key_revoke`].
+    ///
+    /// Routes through `&*self.inner`.
+    pub async fn access_key_revoke(
+        &self,
+        context_id: String,
+        member_did: String,
+        caller_did: String,
+    ) -> Result<(), ScpError> {
+        let manager = self.inner.context_manager_expect()?;
+        manager
+            .revoke_context_access_key(&context_id, &member_did, &caller_did)
+            .await
+            .map_err(ScpError::from)
+    }
+
+    /// Per-instance equivalent of the free-function [`access_key_restore`].
+    ///
+    /// Routes through `&*self.inner`.
+    pub async fn access_key_restore(
+        &self,
+        context_id: String,
+        member_did: String,
+        caller_did: String,
+    ) -> Result<(), ScpError> {
+        let manager = self.inner.context_manager_expect()?;
+        manager
+            .restore_context_access_key(&context_id, &member_did, &caller_did)
+            .await
+            .map_err(ScpError::from)
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`context_handle_ttl_expiry`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn context_handle_ttl_expiry(
+        &self,
+        handle: Arc<ContextHandle>,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let core_handle = scp_core::context::ContextHandle::new(
+                    handle.context_id.clone(),
+                    scp_core::context::ContextParams::default(),
+                );
+                let _ = core_handle
+                    .transition_to(&scp_core::context::ContextState::Active)
+                    .await;
+                manager
+                    .handle_ttl_expiry(&core_handle)
+                    .await
+                    .map_err(ScpError::from)?;
+
+                // Update the FFI handle state to reflect expiry.
+                let mut state = handle.state.lock().await;
+                *state = ContextState::Expired;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during TTL expiry: {e}"),
+                code: codes::CTX_2038.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`context_propose_ttl_extension`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn context_propose_ttl_extension(
+        &self,
+        handle: Arc<ContextHandle>,
+        member_did: String,
+        proposed_seconds: u64,
+    ) -> Result<bool, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let did: scp_identity::DID = member_did.into();
+                let duration = std::time::Duration::from_secs(proposed_seconds);
+                manager
+                    .propose_ttl_extension(&handle.context_id, &did, duration)
+                    .await
+                    .map_err(ScpError::from)
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during TTL extension proposal: {e}"),
+                code: codes::CTX_2039.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`context_reset_ttl_timer`].
+    ///
+    /// Routes through `&*self.inner`. Silently returns when the handle's
+    /// `instance_id` does not match this `SCP`'s (matches the free-function
+    /// fire-and-forget signature).
+    pub async fn context_reset_ttl_timer(&self, handle: Arc<ContextHandle>, new_seconds: u64) {
+        if self.inner.core.check_handle(handle.instance_id()).is_err() {
+            return;
+        }
+        let Ok(manager) = self.inner.context_manager_expect() else {
+            return;
+        };
+        let core_handle = scp_core::context::ContextHandle::new(
+            handle.context_id.clone(),
+            scp_core::context::ContextParams::default(),
+        );
+        let _ = core_handle
+            .transition_to(&scp_core::context::ContextState::Active)
+            .await;
+        let duration = std::time::Duration::from_secs(new_seconds);
+        manager
+            .reset_ttl_timer(&handle.context_id, duration, core_handle)
+            .await;
+    }
+
+    /// Per-instance equivalent of the free-function [`event_log_query`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn event_log_query(
+        &self,
+        handle: Arc<ContextHandle>,
+        filter_json: Option<String>,
+    ) -> Result<Vec<Event>, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        runtime()
+            .spawn(async move {
+                // Ensure UCAN state (which contains the event log) is registered.
+                crate::runtime::ensure_ucan_registered(
+                    &handle.context_id,
+                    &handle.creator_did,
+                    &handle.ceiling_strings,
+                );
+
+                // Parse optional filter JSON.
+                let filter: Option<serde_json::Value> =
+                    match filter_json {
+                        Some(ref json_str) => Some(serde_json::from_str(json_str).map_err(
+                            |e| ScpError::Context {
+                                msg: format!("invalid filter JSON: {e}"),
+                                code: codes::CTX_2023.to_owned(),
+                            },
+                        )?),
+                        None => None,
+                    };
+
+                let filter_event_type = filter
+                    .as_ref()
+                    .and_then(|f| f.get("event_type"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let filter_actor_did = filter
+                    .as_ref()
+                    .and_then(|f| f.get("actor_did"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let filter_after_seq = filter
+                    .as_ref()
+                    .and_then(|f| f.get("after_sequence"))
+                    .and_then(serde_json::Value::as_u64);
+                let filter_before_seq = filter
+                    .as_ref()
+                    .and_then(|f| f.get("before_sequence"))
+                    .and_then(serde_json::Value::as_u64);
+                #[allow(clippy::cast_possible_truncation)]
+                let filter_limit = filter
+                    .as_ref()
+                    .and_then(|f| f.get("limit"))
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|v| v as usize);
+
+                // Pre-compute timestamp for the fallback summary event outside the
+                // closure so we can propagate clock errors properly.
+                let fallback_now = scp_primitives::SystemClock.now_secs();
+
+                // Query the event log from per-context UCAN state.
+                let events = crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                    let event_count = scp_event_log::tree::event_count(&ucan_state.event_log);
+
+                    if event_count == 0 {
+                        return Vec::new();
+                    }
+
+                    let merkle_root = scp_event_log::tree::root(&ucan_state.event_log);
+                    let merkle_root_hex = hex::encode(merkle_root);
+
+                    // Query events stored in the event log by iterating the
+                    // stored events slice and applying filters.
+                    let all_events = ucan_state.event_log.events();
+
+                    if !all_events.is_empty() {
+                        let mut results: Vec<Event> = Vec::new();
+                        for evt in all_events {
+                            // Apply sequence range filters.
+                            if let Some(after) = filter_after_seq
+                                && evt.sequence <= after
+                            {
+                                continue;
+                            }
+                            if let Some(before) = filter_before_seq
+                                && evt.sequence >= before
+                            {
+                                continue;
+                            }
+                            // Apply event type filter.
+                            if let Some(ref et) = filter_event_type
+                                && format!("{:?}", evt.event_type) != *et
+                            {
+                                continue;
+                            }
+                            // Apply actor DID filter.
+                            if let Some(ref actor) = filter_actor_did
+                                && evt.actor_did.0 != *actor
+                            {
+                                continue;
+                            }
+
+                            // Try to interpret payload bytes as UTF-8 JSON; fall
+                            // back to hex encoding for binary payloads.
+                            let payload_json = std::str::from_utf8(&evt.payload.data)
+                                .ok()
+                                .filter(|s| serde_json::from_str::<serde_json::Value>(s).is_ok())
+                                .map_or_else(
+                                    || {
+                                        serde_json::json!({
+                                            "hex": hex::encode(&evt.payload.data),
+                                        })
+                                        .to_string()
+                                    },
+                                    str::to_owned,
+                                );
+
+                            results.push(Event {
+                                event_type: format!("{:?}", evt.event_type),
+                                actor_did: evt.actor_did.0.clone(),
+                                timestamp: evt.timestamp,
+                                payload_json,
+                                sequence: evt.sequence,
+                            });
+
+                            if let Some(lim) = filter_limit
+                                && results.len() >= lim
+                            {
+                                break;
+                            }
+                        }
+                        if !results.is_empty() {
+                            return results;
+                        }
+                    }
+
+                    // Fallback: return a summary event with Merkle root metadata.
+                    let summary = Event {
+                        event_type: "LogSummary".to_owned(),
+                        actor_did: String::new(),
+                        timestamp: fallback_now,
+                        payload_json: serde_json::json!({
+                            "event_count": event_count,
+                            "merkle_root": merkle_root_hex,
+                        })
+                        .to_string(),
+                        sequence: event_count.saturating_sub(1),
+                    };
+
+                    let summary_events = vec![summary];
+                    if let Some(lim) = filter_limit {
+                        summary_events.into_iter().take(lim).collect()
+                    } else {
+                        summary_events
+                    }
+                })
+                .ok_or_else(|| ScpError::Context {
+                    msg: format!("context '{}' not found in UCAN registry", handle.context_id),
+                    code: codes::CTX_2023.to_owned(),
+                })?;
+
+                Ok(events)
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during event log query: {e}"),
+                code: codes::CTX_2024.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`event_log_verify`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn event_log_verify(
+        &self,
+        handle: Arc<ContextHandle>,
+        claim_json: String,
+    ) -> Result<Proof, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        runtime()
+            .spawn(async move {
+                // Parse the claim JSON.
+                let claim: serde_json::Value =
+                    serde_json::from_str(&claim_json).map_err(|e| ScpError::Context {
+                        msg: format!("invalid claim JSON: {e}"),
+                        code: codes::CTX_2025.to_owned(),
+                    })?;
+
+                let claim_type = claim.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
+                    ScpError::Context {
+                        msg: "claim must include 'type' field ('inclusion' or 'absence')"
+                            .to_owned(),
+                        code: codes::CTX_2025.to_owned(),
+                    }
+                })?;
+
+                // Ensure UCAN state (which contains the event log) is registered.
+                crate::runtime::ensure_ucan_registered(
+                    &handle.context_id,
+                    &handle.creator_did,
+                    &handle.ceiling_strings,
+                );
+
+                match claim_type {
+                    "inclusion" => {
+                        let leaf_index = claim
+                            .get("leaf_index")
+                            .and_then(serde_json::Value::as_u64)
+                            .ok_or_else(|| ScpError::Context {
+                                msg: "inclusion claim must include 'leaf_index' (integer)"
+                                    .to_owned(),
+                                code: codes::CTX_2025.to_owned(),
+                            })?;
+
+                        crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                            let proof = scp_event_log::proof::prove_inclusion(
+                                &ucan_state.event_log,
+                                leaf_index,
+                            )
+                            .map_err(|e| ScpError::Context {
+                                msg: format!("inclusion proof failed: {e}"),
+                                code: codes::CTX_2025.to_owned(),
+                            })?;
+                            let verified = scp_event_log::proof::verify_inclusion(&proof);
+
+                            let path_steps: Vec<serde_json::Value> = proof
+                                .path
+                                .iter()
+                                .map(|step| {
+                                    let direction = match step.direction {
+                                        scp_event_log::proof::Direction::Left => "left",
+                                        scp_event_log::proof::Direction::Right => "right",
+                                    };
+                                    serde_json::json!({
+                                        "sibling_hash": hex::encode(step.sibling_hash),
+                                        "direction": direction,
+                                    })
+                                })
+                                .collect();
+
+                            let details = serde_json::json!({
+                                "leaf_index": proof.leaf_index,
+                                "leaf_hash": hex::encode(proof.leaf_hash),
+                                "root": hex::encode(proof.root),
+                                "path": path_steps,
+                                "path_length": proof.path.len(),
+                            });
+
+                            Ok(Proof {
+                                verified,
+                                proof_type: "inclusion".to_owned(),
+                                details_json: details.to_string(),
+                            })
+                        })
+                        .ok_or_else(|| ScpError::Context {
+                            msg: format!(
+                                "context '{}' not found in UCAN registry",
+                                handle.context_id
+                            ),
+                            code: codes::CTX_2025.to_owned(),
+                        })?
+                    }
+                    "absence" => {
+                        let event_hash_hex = claim
+                            .get("event_hash")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| ScpError::Context {
+                                msg: "absence claim must include 'event_hash' (hex string)"
+                                    .to_owned(),
+                                code: codes::CTX_2025.to_owned(),
+                            })?;
+
+                        let event_hash_bytes =
+                            hex::decode(event_hash_hex).map_err(|e| ScpError::Context {
+                                msg: format!("invalid event_hash hex: {e}"),
+                                code: codes::CTX_2025.to_owned(),
+                            })?;
+                        let event_hash: [u8; 32] =
+                            event_hash_bytes.try_into().map_err(|v: Vec<u8>| {
+                                ScpError::Context {
+                                    msg: format!("event_hash must be 32 bytes, got {}", v.len()),
+                                    code: codes::CTX_2025.to_owned(),
+                                }
+                            })?;
+
+                        crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                            let proof = scp_event_log::proof::prove_absence(
+                                &ucan_state.event_log,
+                                &event_hash,
+                            )
+                            .map_err(|e| ScpError::Context {
+                                msg: format!("absence proof failed: {e}"),
+                                code: codes::CTX_2025.to_owned(),
+                            })?;
+
+                            let lower = proof.lower.as_ref().map(|lwp| {
+                                serde_json::json!({
+                                    "leaf_hash": hex::encode(lwp.leaf_hash),
+                                    "leaf_index": lwp.leaf_index,
+                                })
+                            });
+                            let upper = proof.upper.as_ref().map(|uwp| {
+                                serde_json::json!({
+                                    "leaf_hash": hex::encode(uwp.leaf_hash),
+                                    "leaf_index": uwp.leaf_index,
+                                })
+                            });
+
+                            let lower_verified = proof.lower.as_ref().is_none_or(|lwp| {
+                                scp_event_log::proof::verify_inclusion(&lwp.inclusion_proof)
+                            });
+                            let upper_verified = proof.upper.as_ref().is_none_or(|uwp| {
+                                scp_event_log::proof::verify_inclusion(&uwp.inclusion_proof)
+                            });
+                            let verified = lower_verified && upper_verified;
+
+                            let details = serde_json::json!({
+                                "query_hash": hex::encode(proof.query_hash),
+                                "root": hex::encode(proof.root),
+                                "leaf_count": proof.leaf_count,
+                                "lower": lower,
+                                "upper": upper,
+                            });
+
+                            Ok(Proof {
+                                verified,
+                                proof_type: "absence".to_owned(),
+                                details_json: details.to_string(),
+                            })
+                        })
+                        .ok_or_else(|| ScpError::Context {
+                            msg: format!(
+                                "context '{}' not found in UCAN registry",
+                                handle.context_id
+                            ),
+                            code: codes::CTX_2025.to_owned(),
+                        })?
+                    }
+                    other => Err(ScpError::Context {
+                        msg: format!(
+                            "unsupported claim type '{other}': expected 'inclusion' or 'absence'"
+                        ),
+                        code: codes::CTX_2025.to_owned(),
+                    }),
+                }
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during event log verification: {e}"),
+                code: codes::CTX_2026.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`event_log_checkpoint`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
+    /// `Identity` whose `instance_id` does not match this `SCP`'s.
+    pub async fn event_log_checkpoint(
+        &self,
+        handle: Arc<ContextHandle>,
+        identity: Arc<Identity>,
+        epoch: u64,
+    ) -> Result<Checkpoint, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        event_log_checkpoint_impl(handle, identity, epoch).await
+    }
+
+    /// Per-instance equivalent of the free-function [`ucan_validate`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn ucan_validate(
+        &self,
+        handle: Arc<ContextHandle>,
+        token: String,
+        capability: String,
+        presenting_agent_did: Option<String>,
+        proof_tokens: Option<Vec<String>>,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        runtime()
+            .spawn(async move {
+                validate_ucan_token(&token)?;
+                validate_capability_uri(&capability)?;
+
+                use scp_core::crypto::ucan::capability::CapabilityUri;
+                use scp_core::crypto::ucan::validate::{
+                    DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
+                };
+
+                // Step 1: Parse the UCAN token.
+                let parsed_token = parse_ucan(&token).map_err(|e| ScpError::Permission {
+                    msg: format!("malformed UCAN token: {e}"),
+                    code: codes::PERM_3002.to_owned(),
+                })?;
+
+                // Parse the required capability URI.
+                let required_cap: CapabilityUri =
+                    capability
+                        .parse()
+                        .map_err(
+                            |e: scp_core::crypto::ucan::UcanError| ScpError::Permission {
+                                msg: format!("invalid capability URI '{capability}': {e}"),
+                                code: codes::PERM_3002.to_owned(),
+                            },
+                        )?;
+
+                // Determine the presenting agent DID: explicit parameter or token audience.
+                let agent_did = presenting_agent_did
+                    .as_deref()
+                    .unwrap_or(&parsed_token.payload.aud);
+
+                // Build proof resolver from optional proof tokens.
+                let mut proofs = std::collections::HashMap::new();
+                if let Some(ref tokens) = proof_tokens {
+                    for encoded in tokens {
+                        let proof_token =
+                            parse_ucan(encoded).map_err(|e| ScpError::Permission {
+                                msg: format!("malformed proof token: {e}"),
+                                code: codes::PERM_3002.to_owned(),
+                            })?;
+                        let cid = scp_core::crypto::ucan::mint::compute_cid(&proof_token);
+                        proofs.insert(cid, proof_token);
+                    }
+                }
+                let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
+
+                // Ensure UCAN state is registered for this context.
+                crate::runtime::ensure_ucan_registered(
+                    &handle.context_id,
+                    &handle.creator_did,
+                    &handle.ceiling_strings,
+                );
+
+                // Execute the full 11-step validation pipeline via per-context state.
+                let validation_result =
+                    crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                        let production_resolver = crate::runtime::did_resolver();
+                        let did_resolver = scp_ffi_common::DispatchDidResolver::new(
+                            production_resolver.map(std::convert::AsRef::as_ref),
+                        );
+                        let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+                            revocation_list: &ucan_state.revocation_list,
+                        };
+                        let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+                            inner: &mut ucan_state.nonce_tracker,
+                        };
+
+                        let mut ctx = ValidationContext {
+                            did_resolver: &did_resolver,
+                            nonce_tracker: &mut nonce_adapter,
+                            revocation_checker: &revocation_checker,
+                            proof_resolver: &proof_resolver,
+                            ceiling: &ucan_state.ceiling_strings,
+                            context_creator_did: &ucan_state.creator_did,
+                            presenting_agent_did: agent_did,
+                            clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                            clock: &scp_primitives::SystemClock,
+                        };
+
+                        validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(|e| {
+                            ScpError::Permission {
+                                msg: format!("UCAN validation failed: {e}"),
+                                code: codes::PERM_3002.to_owned(),
+                            }
+                        })
+                    })
+                    .ok_or_else(|| ScpError::Permission {
+                        msg: format!("context '{}' not found in UCAN registry", handle.context_id),
+                        code: codes::PERM_3002.to_owned(),
+                    })?;
+                validation_result?;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Permission {
+                msg: format!("tokio task join error during UCAN validation: {e}"),
+                code: codes::PERM_3003.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`ucan_mint`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn ucan_mint(
+        &self,
+        handle: Arc<ContextHandle>,
+        member_did: String,
+        capabilities: Vec<String>,
+        proofs: Option<Vec<String>>,
+    ) -> Result<Arc<UcanToken>, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        validate_did(&member_did)?;
+        if let Some(ref tokens) = proofs {
+            for t in tokens {
+                validate_ucan_token(t).map_err(|e| ScpError::Validation {
+                    msg: e.to_string(),
+                    code: codes::VALID_7010.to_owned(),
+                })?;
+            }
+        }
+        ucan_mint_impl(handle, member_did, capabilities, proofs).await
+    }
+
+    /// Per-instance equivalent of the free-function [`ucan_revoke`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn ucan_revoke(
+        &self,
+        handle: Arc<ContextHandle>,
+        token: String,
+        revoker_did: String,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        validate_ucan_token(&token).map_err(|e| ScpError::Validation {
+            msg: e.to_string(),
+            code: codes::VALID_7010.to_owned(),
+        })?;
+        validate_did(&revoker_did).map_err(|e| ScpError::Validation {
+            msg: e.to_string(),
+            code: codes::VALID_7011.to_owned(),
+        })?;
+
+        runtime()
+            .spawn(async move {
+                use scp_core::crypto::ucan::validate::parse_ucan;
+                use scp_ffi_common::{
+                    BridgeRevocationAuthorizer, BridgeRevocationDistributor,
+                    BridgeRevocationEventLogger,
+                };
+                use std::cell::RefCell;
+
+                // Parse the token to extract the issuer DID for authorization.
+                let parsed = parse_ucan(&token).map_err(ScpError::from)?;
+
+                // Ensure UCAN state is registered for this context.
+                crate::runtime::ensure_ucan_registered(
+                    &handle.context_id,
+                    &handle.creator_did,
+                    &handle.ceiling_strings,
+                );
+
+                // Execute the full revocation pipeline within the UCAN state closure.
+                crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                    let authorizer = BridgeRevocationAuthorizer {
+                        issuer_did: parsed.payload.iss.clone(),
+                        creator_did: ucan_state.creator_did.clone(),
+                    };
+                    let distributor = BridgeRevocationDistributor;
+                    let event_log_cell = RefCell::new(&mut ucan_state.event_log);
+                    let event_logger = BridgeRevocationEventLogger {
+                        event_log: &event_log_cell,
+                    };
+
+                    scp_core::crypto::ucan::revoke::revoke_ucan(
+                        &mut ucan_state.revocation_list,
+                        &token,
+                        &revoker_did,
+                        &authorizer,
+                        &distributor,
+                        &event_logger,
+                    )
+                    .map_err(ScpError::from)
+                })
+                .ok_or_else(|| ScpError::Permission {
+                    msg: format!("context '{}' not found in UCAN registry", handle.context_id),
+                    code: codes::PERM_3006.to_owned(),
+                })??;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Permission {
+                msg: format!("tokio task join error during UCAN revocation: {e}"),
+                code: codes::PERM_3007.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`ucan_delegate`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn ucan_delegate(
+        &self,
+        handle: Arc<ContextHandle>,
+        delegator_did: String,
+        delegatee_did: String,
+        parent_token: String,
+        capabilities: Vec<String>,
+    ) -> Result<Arc<UcanToken>, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        validate_did(&delegator_did)?;
+        validate_did(&delegatee_did)?;
+        validate_ucan_token(&parent_token)?;
+        for cap in &capabilities {
+            validate_capability_uri(cap)?;
+        }
+        ucan_delegate_impl(
+            handle,
+            delegator_did,
+            delegatee_did,
+            parent_token,
+            capabilities,
+        )
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------
