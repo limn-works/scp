@@ -18,7 +18,7 @@
 use scp_ffi_common::error_codes as codes;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 use napi_derive::napi;
@@ -28,7 +28,7 @@ use scp_mcp::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use scp_mcp::server::ContextProvider;
 
 use crate::error::ScpNapiError;
-use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
+use crate::runtime::NapiBridgeInstance;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -161,45 +161,10 @@ pub(crate) struct McpClientEntry {
     pub(crate) client: Mutex<McpClient<McpClientTransportWrapper>>,
 }
 
-/// Fallback empty MCP server registry for when the default
-/// `NapiBridgeInstance` has not been initialized yet. Mirrors the
-/// `PyO3` `EMPTY_SERVER_REGISTRY` fallback pattern.
-//
-// Retained alongside the `*_on` helpers until the Phase 4 demolition slice
-// removes the free-function entry points and their fallback.
-#[allow(dead_code)]
-static EMPTY_SERVER_REGISTRY: OnceLock<DashMap<String, McpServerEntry>> = OnceLock::new();
-
-/// Fallback empty MCP client registry.
-#[allow(dead_code)]
-static EMPTY_CLIENT_REGISTRY: OnceLock<DashMap<String, McpClientEntry>> = OnceLock::new();
-
-/// Returns a reference to the default bridge instance's MCP server registry.
-///
-/// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
-/// typed `mcp_server_registry` field on [`crate::runtime::NapiBridgeInstance`]
-/// in #1549 Phase 4 PR 2 commit 4. Falls back to an empty registry when the
-/// default instance has not been initialized yet.
-//
-// Retained until demolition slice; free functions migrated to `_on` helpers.
-#[allow(dead_code)]
-fn mcp_server_registry() -> &'static DashMap<String, McpServerEntry> {
-    crate::runtime::default_bridge_instance_raw().map_or_else(
-        || EMPTY_SERVER_REGISTRY.get_or_init(DashMap::new),
-        |bi| bi.mcp_server_registry().as_ref(),
-    )
-}
-
-/// Returns a reference to the default bridge instance's MCP client registry.
-//
-// Retained until demolition slice; free functions migrated to `_on` helpers.
-#[allow(dead_code)]
-fn mcp_client_registry() -> &'static DashMap<String, McpClientEntry> {
-    crate::runtime::default_bridge_instance_raw().map_or_else(
-        || EMPTY_CLIENT_REGISTRY.get_or_init(DashMap::new),
-        |bi| bi.mcp_client_registry().as_ref(),
-    )
-}
+// Phase D (#1695): EMPTY_*_REGISTRY fallbacks and the `mcp_*_registry()`
+// default-bridge lookup helpers were deleted. All MCP paths route through
+// `bi.mcp_server_registry()` / `bi.mcp_client_registry()` against an
+// explicit `&NapiBridgeInstance`.
 
 fn mcp_handle_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
@@ -875,26 +840,7 @@ pub struct NapiAllowlistState {
     pub unrestricted: bool,
 }
 
-/// Configures the MCP stdio subprocess allowlist.
-///
-/// By default, only well-known MCP server launchers are permitted (e.g.
-/// `uvx`, `npx`, `node`, `python3`). Use this function to extend the list.
-///
-/// # Arguments
-///
-/// * `additional_binaries` -- Binary basenames to add to the default allowlist.
-///
-/// # Errors
-///
-/// Throws if any entry is invalid (contains a path, NUL byte, or is empty).
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn mcp_configure_stdio_allowlist(additional_binaries: Vec<String>) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    mcp_configure_stdio_allowlist_on(&bi, additional_binaries)
-}
-
-/// Per-bridge-instance implementation of [`mcp_configure_stdio_allowlist`].
+/// Per-bridge-instance implementation of `mcp_configure_stdio_allowlist`.
 ///
 /// The stdio allowlist is currently a process-global singleton inside
 /// `scp-mcp::allowlist`, so the `bi` argument is carried for API symmetry
@@ -909,64 +855,21 @@ pub(crate) fn mcp_configure_stdio_allowlist_on(
     Ok(())
 }
 
-/// Disable the stdio allowlist entirely (unrestricted mode).
-///
-/// After calling this, **any** binary name may be spawned as a subprocess.
-/// Only use when the command source is fully trusted.
-///
-/// # Errors
-///
-/// Throws if the allowlist lock is poisoned.
-#[napi]
-pub fn mcp_disable_stdio_allowlist() -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    mcp_disable_stdio_allowlist_on(&bi)
-}
-
-/// Per-bridge-instance implementation of [`mcp_disable_stdio_allowlist`].
+/// Per-bridge-instance implementation of `mcp_disable_stdio_allowlist`.
 /// See [`mcp_configure_stdio_allowlist_on`] for `bi` rationale.
 pub(crate) fn mcp_disable_stdio_allowlist_on(_bi: &NapiBridgeInstance) -> napi::Result<()> {
     allowlist::disable_enforcement().map_err(|e| napi::Error::from(allowlist_err(e)))?;
     Ok(())
 }
 
-/// Reset the stdio allowlist to its default state.
-///
-/// Restores the default binaries, removes any additions, and re-enables
-/// enforcement (clears unrestricted mode).
-///
-/// # Errors
-///
-/// Throws if the allowlist lock is poisoned.
-#[napi]
-pub fn mcp_reset_stdio_allowlist() -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    mcp_reset_stdio_allowlist_on(&bi)
-}
-
-/// Per-bridge-instance implementation of [`mcp_reset_stdio_allowlist`].
+/// Per-bridge-instance implementation of `mcp_reset_stdio_allowlist`.
 /// See [`mcp_configure_stdio_allowlist_on`] for `bi` rationale.
 pub(crate) fn mcp_reset_stdio_allowlist_on(_bi: &NapiBridgeInstance) -> napi::Result<()> {
     allowlist::reset().map_err(|e| napi::Error::from(allowlist_err(e)))?;
     Ok(())
 }
 
-/// Return the current stdio allowlist state.
-///
-/// Returns an object with:
-/// - `allowed`: sorted list of allowed binary names
-/// - `unrestricted`: boolean indicating whether the allowlist is bypassed
-///
-/// # Errors
-///
-/// Throws if the allowlist lock is poisoned.
-#[napi]
-pub fn mcp_get_stdio_allowlist() -> napi::Result<NapiAllowlistState> {
-    let bi = default_bridge_instance()?;
-    mcp_get_stdio_allowlist_on(&bi)
-}
-
-/// Per-bridge-instance implementation of [`mcp_get_stdio_allowlist`].
+/// Per-bridge-instance implementation of `mcp_get_stdio_allowlist`.
 /// See [`mcp_configure_stdio_allowlist_on`] for `bi` rationale.
 pub(crate) fn mcp_get_stdio_allowlist_on(
     _bi: &NapiBridgeInstance,

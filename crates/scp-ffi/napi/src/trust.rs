@@ -1,14 +1,9 @@
 //! napi-rs bridge for trust engine operations.
 //!
-//! Exposes trust engine operations to Node.js/Bun:
-//!
-//! - [`trust_query_score`] — Query participation-based trust data for a DID.
-//! - [`trust_verify_attestation`] — Verify an attestation's signature and
-//!   validity.
-//! - [`trust_create_challenge`] — Create a challenge request.
-//! - [`trust_verify_response`] — Verify a challenge response.
-//! - [`aggregate_trust_input`] — Aggregate all trust engine layers into a
-//!   single `TrustInput` for agent-level evaluation.
+//! Per-bridge-instance (`_on`) implementations consumed by the corresponding
+//! methods on [`crate::scp::Scp`]. Phase D (#1695) deleted the
+//! free-function wrappers that routed through the process-global default
+//! bridge instance.
 //!
 //! See ADR-017 in `.docs/adrs/phase-4.md`.
 
@@ -18,7 +13,7 @@ use std::sync::Arc;
 use napi_derive::napi;
 
 use crate::error::ScpNapiError;
-use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
+use crate::runtime::NapiBridgeInstance;
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -98,17 +93,7 @@ pub(crate) fn trust_query_score_on(
     })
 }
 
-/// Verifies an attestation's Ed25519 signature, evidence, expiry, and
-/// revocation status.
-#[napi]
-pub fn trust_verify_attestation(
-    attestation_json: String,
-) -> napi::Result<NapiAttestationVerificationResult> {
-    let bi = default_bridge_instance()?;
-    trust_verify_attestation_on(&bi, attestation_json)
-}
-
-/// Per-bridge-instance implementation of [`trust_verify_attestation`].
+/// Per-bridge-instance implementation of `trust_verify_attestation`.
 ///
 /// Pure verification — the bridge instance is unused but accepted for API
 /// symmetry with the other `_on` helpers in this module.
@@ -136,14 +121,7 @@ pub(crate) fn trust_verify_attestation_on(
     }
 }
 
-/// Creates a challenge request for capability verification.
-#[napi]
-pub fn trust_create_challenge(target_did: String) -> napi::Result<NapiChallengeResult> {
-    let bi = default_bridge_instance()?;
-    trust_create_challenge_on(&bi, target_did)
-}
-
-/// Per-bridge-instance implementation of [`trust_create_challenge`].
+/// Per-bridge-instance implementation of `trust_create_challenge`.
 ///
 /// Pure construction — the bridge instance is unused but accepted for API
 /// symmetry with the other `_on` helpers in this module.
@@ -187,14 +165,7 @@ pub(crate) fn trust_create_challenge_on(
     })
 }
 
-/// Verifies a challenge response against its original challenge request.
-#[napi]
-pub fn trust_verify_response(challenge_json: String, response_json: String) -> napi::Result<bool> {
-    let bi = default_bridge_instance()?;
-    trust_verify_response_on(&bi, challenge_json, response_json)
-}
-
-/// Per-bridge-instance implementation of [`trust_verify_response`].
+/// Per-bridge-instance implementation of `trust_verify_response`.
 ///
 /// Pure verification — the bridge instance is unused but accepted for API
 /// symmetry with the other `_on` helpers in this module.
@@ -234,27 +205,7 @@ pub(crate) fn trust_verify_response_on(
 // verify_participation_requirements (SCP-BA-004)
 // ---------------------------------------------------------------------------
 
-/// Verifies participation profiles against admission requirements.
-///
-/// Both inputs are JSON strings:
-/// - `profile_json`: JSON array of `ParticipationProfile` objects.
-/// - `requirements_json`: JSON array of `RequireParticipation` objects.
-///
-/// Uses the current system time for freshness checks. Returns `true` if all
-/// requirements are satisfied, throws an error with a diagnostic message
-/// if any requirement fails or if the JSON is malformed.
-///
-/// See §7.3.2.1.
-#[napi]
-pub fn verify_participation_requirements(
-    profile_json: String,
-    requirements_json: String,
-) -> napi::Result<bool> {
-    let bi = default_bridge_instance()?;
-    verify_participation_requirements_on(&bi, profile_json, requirements_json)
-}
-
-/// Per-bridge-instance implementation of [`verify_participation_requirements`].
+/// Per-bridge-instance implementation of `verify_participation_requirements`.
 ///
 /// Pure verification — the bridge instance is unused but accepted for API
 /// symmetry with the other `_on` helpers in this module.
@@ -405,22 +356,31 @@ pub(crate) fn aggregate_trust_input_on(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::runtime::NapiBridgeInstance;
+
+    fn test_bi() -> NapiBridgeInstance {
+        NapiBridgeInstance::new_napi()
+    }
 
     #[test]
     fn trust_query_score_validates_empty_did() {
-        let result = trust_query_score_on(&crate::runtime::default_bridge_instance().unwrap(), String::new(), "ctx".to_owned());
+        let bi = test_bi();
+        let result = trust_query_score_on(&bi, String::new(), "ctx".to_owned());
         assert!(result.is_err());
     }
 
     #[test]
     fn trust_query_score_validates_empty_context() {
-        let result = trust_query_score_on(&crate::runtime::default_bridge_instance().unwrap(), "did:key:test".to_owned(), String::new());
+        let bi = test_bi();
+        let result = trust_query_score_on(&bi, "did:key:test".to_owned(), String::new());
         assert!(result.is_err());
     }
 
     #[test]
     fn trust_query_score_returns_zeros_for_unknown_context() {
-        let result = trust_query_score_on(&crate::runtime::default_bridge_instance().unwrap(), "did:key:test".to_owned(), "nonexistent-ctx".to_owned());
+        let bi = test_bi();
+        let result =
+            trust_query_score_on(&bi, "did:key:test".to_owned(), "nonexistent-ctx".to_owned());
         assert!(result.is_ok());
         let score = result.unwrap();
         assert_eq!(score.message_count, 0);
@@ -429,13 +389,15 @@ mod tests {
 
     #[test]
     fn trust_create_challenge_validates_empty_did() {
-        let result = trust_create_challenge(String::new());
+        let bi = test_bi();
+        let result = trust_create_challenge_on(&bi, String::new());
         assert!(result.is_err());
     }
 
     #[test]
     fn trust_create_challenge_succeeds() {
-        let result = trust_create_challenge("did:key:target".to_owned());
+        let bi = test_bi();
+        let result = trust_create_challenge_on(&bi, "did:key:target".to_owned());
         assert!(result.is_ok());
         let challenge = result.unwrap();
         assert!(!challenge.challenge_id.is_empty());
@@ -444,38 +406,47 @@ mod tests {
 
     #[test]
     fn trust_verify_attestation_rejects_invalid_json() {
-        let result = trust_verify_attestation("not json".to_owned());
+        let bi = test_bi();
+        let result = trust_verify_attestation_on(&bi, "not json".to_owned());
         assert!(result.is_err());
     }
 
     #[test]
     fn trust_verify_response_rejects_invalid_json() {
-        let result = trust_verify_response("bad".to_owned(), "bad".to_owned());
+        let bi = test_bi();
+        let result = trust_verify_response_on(&bi, "bad".to_owned(), "bad".to_owned());
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_profile_json() {
-        let result = verify_participation_requirements("not json".to_owned(), "[]".to_owned());
+        let bi = test_bi();
+        let result =
+            verify_participation_requirements_on(&bi, "not json".to_owned(), "[]".to_owned());
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_participation_requirements_rejects_invalid_requirements_json() {
-        let result = verify_participation_requirements("[]".to_owned(), "not json".to_owned());
+        let bi = test_bi();
+        let result =
+            verify_participation_requirements_on(&bi, "[]".to_owned(), "not json".to_owned());
         assert!(result.is_err());
     }
 
     #[test]
     fn verify_participation_requirements_empty_inputs_succeeds() {
-        let result = verify_participation_requirements("[]".to_owned(), "[]".to_owned());
+        let bi = test_bi();
+        let result = verify_participation_requirements_on(&bi, "[]".to_owned(), "[]".to_owned());
         assert!(result.is_ok());
         assert!(result.unwrap());
     }
 
     #[test]
     fn aggregate_trust_input_rejects_empty_context() {
-        let result = aggregate_trust_input_on(&crate::runtime::default_bridge_instance().unwrap(), 
+        let bi = test_bi();
+        let result = aggregate_trust_input_on(
+            &bi,
             String::new(),
             "did:key:test".to_owned(),
             "[]".to_owned(),
@@ -491,7 +462,9 @@ mod tests {
 
     #[test]
     fn aggregate_trust_input_rejects_invalid_events_json() {
-        let result = aggregate_trust_input_on(&crate::runtime::default_bridge_instance().unwrap(), 
+        let bi = test_bi();
+        let result = aggregate_trust_input_on(
+            &bi,
             "ctx-1".to_owned(),
             "did:key:test".to_owned(),
             "not json".to_owned(),
