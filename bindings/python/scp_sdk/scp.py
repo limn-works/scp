@@ -51,11 +51,41 @@ import asyncio
 import math
 import warnings
 from types import TracebackType
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 from scp_sdk.errors import ScpError
 
-__all__ = ["SCP"]
+__all__ = ["SCP", "InMemoryStorage", "SqliteStorage", "StorageConfig"]
+
+
+class InMemoryStorage(TypedDict):
+    """Storage config selecting ephemeral encrypted in-memory storage.
+
+    The PyO3 bridge allocates a random AES-256-GCM key at construction
+    and discards it on drop — nothing persists across instances.
+    """
+
+    type: Literal["in_memory"]
+
+
+class SqliteStorage(TypedDict):
+    """Storage config selecting `SQLCipher`-encrypted on-disk storage.
+
+    ``path`` is the directory the bridge opens ``scp.db`` inside;
+    ``key`` is raw encryption key material (32 bytes recommended) that
+    the Rust side zeroizes after `SQLCipher` has consumed it. See
+    :func:`SCP.with_storage`.
+    """
+
+    type: Literal["sqlite"]
+    path: str
+    key: bytes
+
+
+# Discriminated union of supported storage configurations. The PyO3
+# bridge's `SCP.with_storage` constructor dispatches on ``type``; adding
+# a new variant here requires a matching arm in `PyBridgeInstance::with_storage_py`.
+StorageConfig = InMemoryStorage | SqliteStorage
 
 # Sentinel tracking whether `SCP.default()` has already emitted its
 # one-time DeprecationWarning. Module-level state keyed by nothing (there
@@ -118,7 +148,7 @@ class SCP:
     def __init__(
         self,
         *,
-        storage: dict[str, Any] | None = None,
+        storage: StorageConfig | None = None,
     ) -> None:
         """Construct a fresh :class:`SCP` instance.
 
