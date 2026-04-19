@@ -167,14 +167,14 @@ public enum ScpId {
     /// Default challenge function — delegates to the process-wide default
     /// ``Scp`` instance's ``Scp/scpidChallenge(audience:ttlSeconds:)`` method.
     public static let defaultChallenge: ChallengeFn = { audience, ttlSeconds in
-        try Scp.defaultInstance().scpidChallenge(audience: audience, ttlSeconds: ttlSeconds)
+        try scpidChallenge(audience: audience, ttlSeconds: ttlSeconds)
     }
 
     /// Default sign function — delegates to the process-wide default
     /// ``Scp`` instance's
     /// ``Scp/scpidSign(identity:signingKeyId:challengeJson:)`` method.
     public static let defaultSign: SignFn = { identity, signingKeyId, challengeJson in
-        try Scp.defaultInstance().scpidSign(
+        try scpidSign(
             identity: identity,
             signingKeyId: signingKeyId,
             challengeJson: challengeJson
@@ -185,7 +185,7 @@ public enum ScpId {
     /// ``Scp`` instance's
     /// ``Scp/scpidVerify(responseJson:challengeJson:)`` method.
     public static let defaultVerify: VerifyFn = { responseJson, challengeJson in
-        try Scp.defaultInstance().scpidVerify(responseJson: responseJson, challengeJson: challengeJson)
+        try scpidVerify(responseJson: responseJson, challengeJson: challengeJson)
     }
 
     // MARK: - Public API

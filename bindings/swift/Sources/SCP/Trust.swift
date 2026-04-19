@@ -87,16 +87,13 @@ public nonisolated struct TrustEvaluation: Sendable {
     /// Maps the flat UniFFI record to the four-layer trust model structure.
     /// Protocol enforcement fields (Layer 1) default to `true` since the
     /// Rust engine enforces these mechanically.
-    init(from input: TrustInput) {
+    public init(from input: TrustInput) {
         tokensValid = true
         signaturesValid = true
         withinCeiling = true
         notRevoked = true
         behavioralRecord = BehavioralRecord(
             contextsParticipated: Int(input.participationCount),
-            // TrustInput provides participation count and consequence count only.
-            // Duration, tool invocations, and role transitions require event log
-            // queries not exposed in the current UniFFI bridge.
             totalDurationSecs: 0,
             governanceActionsAgainst: Int(input.triggeredConsequences),
             toolInvocations: 0,
@@ -108,19 +105,12 @@ public nonisolated struct TrustEvaluation: Sendable {
     }
 
     /// Creates a ``TrustEvaluation`` from a UniFFI ``TrustScoreResult``.
-    ///
-    /// Maps the participation-based trust score to the four-layer model.
-    /// Protocol enforcement fields (Layer 1) default to `true` since the
-    /// Rust engine enforces these mechanically.
-    init(from score: TrustScoreResult) {
+    public init(from score: TrustScoreResult) {
         tokensValid = true
         signaturesValid = true
         withinCeiling = true
         notRevoked = true
         behavioralRecord = BehavioralRecord(
-            // TrustScoreResult provides message_count and governance_count only.
-            // Context participation count requires cross-context event log queries
-            // not exposed in the current UniFFI bridge.
             contextsParticipated: 0,
             totalDurationSecs: 0,
             governanceActionsAgainst: Int(score.governanceCount),
@@ -171,238 +161,7 @@ public nonisolated struct BehavioralRecord: Sendable {
     }
 }
 
-// MARK: - TrustBridge
-
-/// Namespace for trust evaluation bridge function references.
-///
-/// Trust evaluation composes multiple UniFFI bridge calls to build a
-/// ``TrustEvaluation``. The injectable bridge pattern allows testing with
-/// mock inputs.
-///
-/// See ADR-017 for the trust model and ADR-026 for the delegation pattern.
-public enum TrustBridge {
-    /// Evaluate trust for a subject. Returns a ``TrustEvaluation``.
-    public typealias EvaluateFn = @Sendable (
-        _ subjectDid: String,
-        _ contextId: String
-    ) async throws -> TrustEvaluation
-
-    /// Query participation-based trust score for a DID in a context.
-    public typealias QueryScoreFn = @Sendable (
-        _ did: String,
-        _ contextId: String
-    ) throws -> TrustScoreResult
-
-    /// Verify an attestation's Ed25519 signature, evidence, expiry, and
-    /// revocation status.
-    public typealias VerifyAttestationFn = @Sendable (
-        _ attestationJson: String
-    ) throws -> AttestationVerificationResult
-
-    /// Create a challenge request for capability verification.
-    public typealias CreateChallengeFn = @Sendable (
-        _ targetDid: String
-    ) throws -> ChallengeResult
-
-    /// Verify a challenge response against its original challenge request.
-    public typealias VerifyResponseFn = @Sendable (
-        _ challengeJson: String,
-        _ responseJson: String
-    ) throws -> Bool
-
-    /// Default evaluate function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/trustQueryScore`` method.
-    public static let defaultEvaluate: EvaluateFn = { subjectDid, contextId in
-        let score = try Scp.defaultInstance().trustQueryScore(did: subjectDid, contextId: contextId)
-        return TrustEvaluation(from: score)
-    }
-
-    /// Default query score function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/trustQueryScore`` method.
-    public static let defaultQueryScore: QueryScoreFn = { did, contextId in
-        try Scp.defaultInstance().trustQueryScore(did: did, contextId: contextId)
-    }
-
-    /// Default verify attestation function — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/trustVerifyAttestation`` method.
-    public static let defaultVerifyAttestation: VerifyAttestationFn = { attestationJson in
-        try Scp.defaultInstance().trustVerifyAttestation(attestationJson: attestationJson)
-    }
-
-    /// Default create challenge function — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/trustCreateChallenge`` method.
-    public static let defaultCreateChallenge: CreateChallengeFn = { targetDid in
-        try Scp.defaultInstance().trustCreateChallenge(targetDid: targetDid)
-    }
-
-    /// Default verify response function — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/trustVerifyResponse`` method.
-    public static let defaultVerifyResponse: VerifyResponseFn = { challengeJson, responseJson in
-        try Scp.defaultInstance().trustVerifyResponse(
-            challengeJson: challengeJson,
-            responseJson: responseJson
-        )
-    }
-}
-
-// MARK: - Public API
-
-/// Evaluates trust for a subject DID within a specific context.
-///
-/// Composes trust evaluation from multiple UniFFI bridge data sources:
-/// event log queries, UCAN validation, and attestation verification.
-/// Returns a ``TrustEvaluation`` structured per the four-layer trust model.
-///
-/// - Parameters:
-///   - subjectDid: The DID of the subject being evaluated.
-///   - contextId: The context ID in which the evaluation is performed.
-///   - evaluateFn: Bridge function override for testing.
-/// - Returns: A ``TrustEvaluation`` with facts from all four trust layers.
-/// - Throws: ``ScpError`` if evaluation fails.
-///
-/// ## Provenance
-///
-/// - ADR-017 (Trust Model) in `.docs/adrs/phase-4.md`
-/// - `.docs/sketch.md` section 5 "Trust & Capabilities"
-/// - Story SCP-221, #331
-@available(
-    *,
-    deprecated,
-    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
-)
-public func evaluateTrust(
-    subjectDid: String,
-    contextId: String,
-    evaluateFn: TrustBridge.EvaluateFn = TrustBridge.defaultEvaluate
-) async throws -> TrustEvaluation {
-    try await evaluateFn(subjectDid, contextId)
-}
-
-/// Queries participation-based trust score for a DID within a context.
-///
-/// Returns a ``TrustScoreResult`` containing message count, governance
-/// action count, and a normalized composite score (0.0-1.0). The score
-/// is participation-based, not a judgment — agents apply their own
-/// criteria to these inputs.
-///
-/// Delegates to the UniFFI ``trustQueryScore`` bridge function.
-///
-/// - Parameters:
-///   - did: The DID of the subject being scored.
-///   - contextId: The context ID in which the score is queried.
-///   - queryScoreFn: Bridge function override for testing.
-/// - Returns: A ``TrustScoreResult`` with participation metrics.
-/// - Throws: ``ScpError`` if the query fails.
-///
-/// ## Provenance
-///
-/// - ADR-017 Layer 2 in `.docs/adrs/phase-4.md`
-/// - Story #331
-@available(
-    *,
-    deprecated,
-    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
-)
-public func queryTrustScore(
-    did: String,
-    contextId: String,
-    queryScoreFn: TrustBridge.QueryScoreFn = TrustBridge.defaultQueryScore
-) throws -> TrustScoreResult {
-    try queryScoreFn(did, contextId)
-}
-
-/// Verifies an attestation's Ed25519 signature, evidence, expiry, and
-/// revocation status.
-///
-/// Returns an ``AttestationVerificationResult`` indicating whether the
-/// attestation is valid, the chain depth, and an error message if invalid.
-///
-/// Delegates to the UniFFI ``trustVerifyAttestation`` bridge function.
-///
-/// - Parameters:
-///   - attestationJson: The attestation as a serialized JSON string.
-///   - verifyAttestationFn: Bridge function override for testing.
-/// - Returns: An ``AttestationVerificationResult``.
-/// - Throws: ``ScpError`` if verification fails (e.g., invalid JSON).
-///
-/// ## Provenance
-///
-/// - ADR-017 Layer 3 in `.docs/adrs/phase-4.md`
-/// - Story #331
-@available(
-    *,
-    deprecated,
-    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
-)
-public func verifyAttestation(
-    attestationJson: String,
-    verifyAttestationFn: TrustBridge.VerifyAttestationFn = TrustBridge.defaultVerifyAttestation
-) throws -> AttestationVerificationResult {
-    try verifyAttestationFn(attestationJson)
-}
-
-/// Creates a challenge request for capability verification.
-///
-/// Generates an ephemeral Ed25519 keypair, constructs a challenge request
-/// targeting the specified DID, and returns the challenge ID and serialized
-/// challenge JSON.
-///
-/// Delegates to the UniFFI ``trustCreateChallenge`` bridge function.
-///
-/// - Parameters:
-///   - targetDid: The DID of the entity being challenged.
-///   - createChallengeFn: Bridge function override for testing.
-/// - Returns: A ``ChallengeResult`` with the challenge ID and JSON payload.
-/// - Throws: ``ScpError`` if challenge creation fails.
-///
-/// ## Provenance
-///
-/// - ADR-017 Layer 3 (Challenge-Response) in `.docs/adrs/phase-4.md`
-/// - Story #331
-@available(
-    *,
-    deprecated,
-    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
-)
-public func createChallenge(
-    targetDid: String,
-    createChallengeFn: TrustBridge.CreateChallengeFn = TrustBridge.defaultCreateChallenge
-) throws -> ChallengeResult {
-    try createChallengeFn(targetDid)
-}
-
-/// Verifies a challenge response against its original challenge request.
-///
-/// Checks that the response correctly answers the challenge, including
-/// signature verification and challenge ID matching.
-///
-/// Delegates to the UniFFI ``trustVerifyResponse`` bridge function.
-///
-/// - Parameters:
-///   - challengeJson: The original challenge request as serialized JSON.
-///   - responseJson: The response to verify as serialized JSON.
-///   - verifyResponseFn: Bridge function override for testing.
-/// - Returns: `true` if the response is valid, `false` otherwise.
-/// - Throws: ``ScpError`` if verification fails (e.g., invalid JSON).
-///
-/// ## Provenance
-///
-/// - ADR-017 Layer 3 (Challenge-Response) in `.docs/adrs/phase-4.md`
-/// - Story #331
-@available(
-    *,
-    deprecated,
-    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
-)
-public func verifyChallengeResponse(
-    challengeJson: String,
-    responseJson: String,
-    verifyResponseFn: TrustBridge.VerifyResponseFn = TrustBridge.defaultVerifyResponse
-) throws -> Bool {
-    try verifyResponseFn(challengeJson, responseJson)
-}
-
-// MARK: - Trust Aggregation
+// MARK: - AggregatedTrustInput
 
 /// Aggregated trust input result.
 ///
@@ -430,71 +189,60 @@ public nonisolated struct AggregatedTrustInput {
     public let thresholdCounts: [String: [Int]]
 }
 
-/// Aggregates all trust engine layers into a single input for
-/// agent-level evaluation.
-///
-/// Combines participation records, attestation verification, challenge
-/// results, consequence structure, and threshold counts. The returned
-/// object contains verifiable facts -- agents apply their own criteria.
-///
-/// Delegates to the UniFFI `aggregateTrustInput` bridge function and
-/// parses the JSON result into a typed ``AggregatedTrustInput``.
-///
-/// - Parameters:
-///   - contextId: The context to aggregate trust inputs for.
-///   - subjectDid: The DID of the subject to evaluate.
-///   - eventsJson: JSON array of event log entries.
-///   - merkleRootJson: JSON array of 32 bytes (Merkle root).
-///   - consequenceRulesJson: JSON array of consequence rules.
-///   - thresholdRequirementsJson: JSON object of threshold requirements.
-///   - attestorSetsJson: JSON object of attestor sets.
-///   - cachedAttestationsJson: JSON array of cached attestations.
-///   - challengeResultsJson: JSON array of challenge results.
-/// - Returns: An ``AggregatedTrustInput`` with all trust layers.
-/// - Throws: ``ScpError`` if inputs are malformed or aggregation fails.
-///
-/// ## Provenance
-///
-/// - ADR-017 acceptance criterion 9
-/// - Spec section 7.3
-public func aggregateTrust(
-    contextId: String,
-    subjectDid: String,
-    eventsJson: String,
-    merkleRootJson: String,
-    consequenceRulesJson: String = "[]",
-    thresholdRequirementsJson: String = "{}",
-    attestorSetsJson: String = "{}",
-    cachedAttestationsJson: String = "[]",
-    challengeResultsJson: String = "[]"
-) throws -> AggregatedTrustInput {
-    let resultJson = try Scp.defaultInstance().aggregateTrustInput(
-        contextId: contextId,
-        subjectDid: subjectDid,
-        eventsJson: eventsJson,
-        merkleRootJson: merkleRootJson,
-        consequenceRulesJson: consequenceRulesJson,
-        thresholdRequirementsJson: thresholdRequirementsJson,
-        attestorSetsJson: attestorSetsJson,
-        cachedAttestationsJson: cachedAttestationsJson,
-        challengeResultsJson: challengeResultsJson
-    )
-
-    guard let data = resultJson.data(using: .utf8),
-          let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        throw ScpError.Validation(
-            msg: "failed to parse aggregation result JSON",
-            code: "SCP-VALID-7060"
-        )
+public extension SCP {
+    /// Evaluates trust for a subject DID within a context.
+    ///
+    /// Routes through ``SCP/trustQueryScore`` to build a
+    /// ``TrustEvaluation``.
+    func evaluateTrust(subjectDid: String, contextId: String) throws -> TrustEvaluation {
+        let score = try trustQueryScore(did: subjectDid, contextId: contextId)
+        return TrustEvaluation(from: score)
     }
 
-    return AggregatedTrustInput(
-        verifiedAttestations: json["verified_attestations"] as? [[String: Any]] ?? [],
-        participationRecord: json["participation_record"] as? [String: Any] ?? [:],
-        challengeResults: json["challenge_results"] as? [[String: Any]] ?? [],
-        consequenceStructure: json["consequence_structure"] as? [[String: Any]] ?? [],
-        thresholdCounts: json["threshold_counts"] as? [String: [Int]] ?? [:]
-    )
+    /// Aggregates all trust engine layers into a single input for
+    /// agent-level evaluation.
+    ///
+    /// Routes through ``SCP/aggregateTrustInput`` and parses the JSON
+    /// result into a typed ``AggregatedTrustInput``.
+    func aggregateTrust(
+        contextId: String,
+        subjectDid: String,
+        eventsJson: String,
+        merkleRootJson: String,
+        consequenceRulesJson: String = "[]",
+        thresholdRequirementsJson: String = "{}",
+        attestorSetsJson: String = "{}",
+        cachedAttestationsJson: String = "[]",
+        challengeResultsJson: String = "[]"
+    ) throws -> AggregatedTrustInput {
+        let resultJson = try aggregateTrustInput(
+            contextId: contextId,
+            subjectDid: subjectDid,
+            eventsJson: eventsJson,
+            merkleRootJson: merkleRootJson,
+            consequenceRulesJson: consequenceRulesJson,
+            thresholdRequirementsJson: thresholdRequirementsJson,
+            attestorSetsJson: attestorSetsJson,
+            cachedAttestationsJson: cachedAttestationsJson,
+            challengeResultsJson: challengeResultsJson
+        )
+
+        guard let data = resultJson.data(using: .utf8),
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ScpError.Validation(
+                msg: "failed to parse aggregation result JSON",
+                code: "SCP-VALID-7060"
+            )
+        }
+
+        return AggregatedTrustInput(
+            verifiedAttestations: json["verified_attestations"] as? [[String: Any]] ?? [],
+            participationRecord: json["participation_record"] as? [String: Any] ?? [:],
+            challengeResults: json["challenge_results"] as? [[String: Any]] ?? [],
+            consequenceStructure: json["consequence_structure"] as? [[String: Any]] ?? [],
+            thresholdCounts: json["threshold_counts"] as? [String: [Int]] ?? [:]
+        )
+    }
 }
 
 // MARK: - Participation Types
@@ -527,14 +275,6 @@ public enum ParticipationFact: String, Sendable, CaseIterable {
 }
 
 /// A minimum threshold for a specific participation fact.
-///
-/// Used in ``RequireParticipation`` to define the minimum observed value
-/// a participant must have for a given fact type.
-///
-/// ## Provenance
-///
-/// - ADR-017 Layer 2 (Behavioral Validation)
-/// - Spec section 23.7 (Participation Requirements)
 public nonisolated struct ParticipationThreshold: Sendable {
     /// The participation fact to check.
     public let fact: ParticipationFact
@@ -550,41 +290,17 @@ public nonisolated struct ParticipationThreshold: Sendable {
 }
 
 /// A participant's observed values for each participation fact.
-///
-/// Maps ``ParticipationFact`` cases to their observed counts. Missing
-/// keys are treated as zero when checked against thresholds.
-///
-/// ## Provenance
-///
-/// - ADR-017 Layer 2 (Behavioral Validation)
-/// - Spec section 23.7 (Participation Requirements)
 public typealias ParticipationProfile = [ParticipationFact: UInt64]
 
 /// A set of participation thresholds for admission gating.
-///
-/// Used as admission criteria or trust-gating requirements. When
-/// ``requireAll`` is `true` (the default), all thresholds must be
-/// satisfied (AND/conjunction). When `false`, any single threshold
-/// passing is sufficient (OR/disjunction).
-///
-/// ## Provenance
-///
-/// - ADR-017 Layer 2 (Behavioral Validation)
-/// - Spec section 23.7 (Participation Requirements)
 public nonisolated struct RequireParticipation: Sendable {
     /// The thresholds to check.
     public let thresholds: [ParticipationThreshold]
 
     /// If `true`, **all** thresholds must be met (AND logic).
-    /// If `false`, **any** single threshold is sufficient (OR logic).
     public let requireAll: Bool
 
     /// Memberwise initializer.
-    ///
-    /// - Parameters:
-    ///   - thresholds: The participation thresholds to check.
-    ///   - requireAll: Whether all thresholds must be met (`true`, default)
-    ///     or any single threshold is sufficient (`false`).
     public init(thresholds: [ParticipationThreshold], requireAll: Bool = true) {
         self.thresholds = thresholds
         self.requireAll = requireAll
@@ -595,22 +311,12 @@ public nonisolated struct RequireParticipation: Sendable {
 
 /// Verifies that a participation profile meets the required thresholds.
 ///
-/// When ``RequireParticipation/requireAll`` is `true` (default), returns
-/// `true` only if **every** threshold is met (AND). When `false`, returns
-/// `true` if **any** threshold is met (OR). Missing profile entries are
-/// treated as zero.
-///
 /// This is a pure Swift function with no bridge dependency.
 ///
 /// - Parameters:
 ///   - requirement: The participation thresholds to check.
 ///   - profile: The observed participation values.
 /// - Returns: `true` if the requirement is satisfied, `false` otherwise.
-///
-/// ## Provenance
-///
-/// - ADR-017 Layer 2 (Behavioral Validation)
-/// - Spec section 23.7 (Participation Requirements)
 public func verifyParticipationRequirements(
     requirement: RequireParticipation,
     profile: ParticipationProfile

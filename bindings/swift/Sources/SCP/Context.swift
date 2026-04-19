@@ -769,7 +769,7 @@ public func validateCapabilityDeclaration(
     ceilingCapabilities: [String],
     roleCapabilities: [String]
 ) throws -> DeclarationValidationResult {
-    let resultJson = try Scp.defaultInstance().sandboxValidateDeclaration(
+    let resultJson = try sandboxValidateDeclaration(
         declarationJson: declarationJson,
         ceilingCapabilities: ceilingCapabilities,
         roleCapabilities: roleCapabilities
@@ -851,7 +851,7 @@ public func serializeMetadataRecord(
     operationalJson: String,
     signatureHex: String
 ) throws -> String {
-    try Scp.defaultInstance().metadataRecordToJson(
+    try metadataRecordToJson(
         contextId: contextId,
         sequence: sequence,
         signerDid: signerDid,
@@ -870,7 +870,7 @@ public func serializeMetadataRecord(
 /// - Returns: Validated and re-serialized JSON string.
 /// - Throws: ``ScpError`` if the JSON is malformed.
 public func deserializeMetadataRecord(jsonStr: String) throws -> String {
-    try Scp.defaultInstance().metadataRecordFromJson(jsonStr: jsonStr)
+    try metadataRecordFromJson(jsonStr: jsonStr)
 }
 
 // MARK: - Context Template Inspection (§5.14, #615)
@@ -883,7 +883,7 @@ public func deserializeMetadataRecord(jsonStr: String) throws -> String {
 /// - Returns: JSON string of the canonical ContextParams.
 /// - Throws: ``ScpError`` if the template ID is not recognized.
 public func getTemplateParams(templateId: String) throws -> String {
-    try Scp.defaultInstance().templateGetParams(templateId: templateId)
+    try templateGetParams(templateId: templateId)
 }
 
 /// Validates that ContextParams match their template definition.
@@ -894,7 +894,7 @@ public func getTemplateParams(templateId: String) throws -> String {
 /// - Returns: `nil` on success, or a string error message on validation failure.
 /// - Throws: ``ScpError`` if the JSON is malformed.
 public func validateParamsAgainstTemplate(paramsJson: String) throws -> String? {
-    try Scp.defaultInstance().validateAgainstTemplate(paramsJson: paramsJson)
+    try validateAgainstTemplate(paramsJson: paramsJson)
 }
 
 /// Validates cross-field invariants for ContextParams regardless of template.
@@ -905,5 +905,5 @@ public func validateParamsAgainstTemplate(paramsJson: String) throws -> String? 
 /// - Returns: `nil` on success, or a string error message on validation failure.
 /// - Throws: ``ScpError`` if the JSON is malformed.
 public func validateParams(paramsJson: String) throws -> String? {
-    try Scp.defaultInstance().validateContextParams(paramsJson: paramsJson)
+    try validateContextParams(paramsJson: paramsJson)
 }

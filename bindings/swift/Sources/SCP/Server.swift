@@ -94,30 +94,24 @@ public enum ServerBridge {
         _ contextId: String
     ) async throws -> Void
 
-    /// Default relay in-memory startup — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/relayStartInMemory()`` method.
+    /// Default relay in-memory startup — delegates to the UniFFI free function.
     public static let defaultRelayStartInMemory: RelayStartInMemoryFn = {
-        try await Scp.defaultInstance().relayStartInMemory()
+        try await relayStartInMemory()
     }
 
-    /// Default relay local startup — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/relayStartLocal(dataDir:)`` method.
+    /// Default relay local startup — delegates to the UniFFI free function.
     public static let defaultRelayStartLocal: RelayStartLocalFn = { dataDir in
-        try await Scp.defaultInstance().relayStartLocal(dataDir: dataDir)
+        try await relayStartLocal(dataDir: dataDir)
     }
 
-    /// Default node in-memory startup — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/nodeStartInMemory(identity:)`` method.
+    /// Default node in-memory startup — delegates to the UniFFI free function.
     public static let defaultNodeStartInMemory: NodeStartInMemoryFn = { identity in
-        try await Scp.defaultInstance().nodeStartInMemory(identity: identity)
+        try await nodeStartInMemory(identity: identity)
     }
 
-    /// Default node local startup — delegates to the process-wide default
-    /// ``Scp`` instance's
-    /// ``Scp/nodeStartLocal(dataDir:identity:passphrase:)`` method.
+    /// Default node local startup — delegates to the UniFFI free function.
     public static let defaultNodeStartLocal: NodeStartLocalFn = { dataDir, identity, passphrase in
-        try await Scp.defaultInstance()
-            .nodeStartLocal(dataDir: dataDir, identity: identity, passphrase: passphrase)
+        try await nodeStartLocal(dataDir: dataDir, identity: identity, passphrase: passphrase)
     }
 
     /// Default enable site projection -- delegates to UniFFI ``NodeHandle.enableSiteProjection()``.

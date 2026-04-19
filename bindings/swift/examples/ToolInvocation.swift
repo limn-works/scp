@@ -1,8 +1,7 @@
 // Tool invocation: register a tool and invoke it within a context.
 //
-// Demonstrates ToolDefinition construction with the UniFFI field names
-// (inputSchemaJson, outputSchemaJson, testVectorsJson, implementationHash,
-// cost) and tool invocation via the bridge functions.
+// Demonstrates ToolDefinition construction and tool invocation through
+// an explicit `SCP` instance (ADR-048).
 
 import Foundation
 import SCP
@@ -10,11 +9,11 @@ import SCP
 @main
 struct ToolInvocation {
     static func main() async throws {
-        let identity = try await createIdentity(custody: "in_memory")
+        let scp = SCP()
+        defer { Task { try? await scp.shutdown(timeout: 5) } }
 
-        // ToolDefinition uses UniFFI field names: inputSchemaJson, outputSchemaJson,
-        // testVectorsJson (optional JSON string), implementationHash (optional Data),
-        // cost (optional ToolCostDefinition)
+        let identity = try await scp.identityCreate(custody: "in_memory")
+
         let weatherTool = ToolDefinition(
             name: "weather",
             description: "Get current weather for a city",
@@ -26,7 +25,6 @@ struct ToolInvocation {
             cost: nil
         )
 
-        // Create a context and register the tool
         let params = ContextParams(
             mode: .encrypted,
             ceiling: ["messages:read", "messages:write", "tool:invoke:*", "tool:register"],
@@ -41,14 +39,12 @@ struct ToolInvocation {
             sessionCap: nil,
             economicPolicy: nil
         )
-        let handle = try await contextCreate(identity: identity, params: params)
+        let handle = try await scp.contextCreate(identity: identity, params: params)
 
-        // Register the tool via the bridge function
-        let toolId = try await toolRegister(handle: handle, definition: weatherTool)
+        let toolId = try await scp.toolRegister(handle: handle, definition: weatherTool)
         print("Registered tool: \(toolId)")
 
-        // Invoke the tool via the bridge function. Input is a JSON string.
-        let resultJson = try await toolInvoke(
+        let resultJson = try await scp.toolInvoke(
             handle: handle,
             toolId: "weather",
             inputJson: #"{"city":"Berlin"}"#,
@@ -59,6 +55,6 @@ struct ToolInvocation {
         )
         print("Weather result: \(resultJson)")
 
-        try await contextClose(handle: handle, identity: identity)
+        try await scp.contextClose(handle: handle, identity: identity)
     }
 }

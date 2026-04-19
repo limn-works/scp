@@ -1,102 +1,79 @@
 @testable import SCP
 import XCTest
 
-// Tests for the SDK-level `SCP` wrapper class (ADR-048, #1549 Phase 4 PR 1).
+// Tests for the SDK-level `SCP` wrapper class (ADR-048, #1549 Phase 4).
 //
-// These tests require the UniFFI bindings to be regenerated against the
-// Phase 4 PR 1 FFI crate — specifically, they need the `Scp` class and its
-// `defaultInstance` / `withStorage` / `withPersistence` constructors to be
-// present in `Internal/ScpBindings.swift`. Hosted CI regenerates the
-// bindings before running tests; in local dev without regeneration the
-// tests fail to compile.
+// These tests exercise the per-instance lifecycle — each test gets a fresh
+// `SCP` via `setUp`, and `tearDown` shuts it down deterministically so
+// tests don't leak runtime state across the suite.
 //
-// Each test constructs a fresh `SCP` and verifies the lifecycle contract.
-// `SCP.default()` shares state with the deprecated free-function façade
-// (via the process-wide `DEFAULT_BRIDGE_INSTANCE`), so multiple calls
-// return distinct wrapper objects with the same `instanceId`.
+// After Phase 4 PR 4 (demolition) there is no `SCP.default()` — every
+// caller must construct `SCP()` explicitly.
 
 final class ScpClassTests: XCTestCase {
+    // Implicitly unwrapped because XCTest `setUp` initializes it before
+    // any test method runs — the XCTest lifecycle guarantees non-nil.
+    // swiftlint:disable:next implicitly_unwrapped_optional
+    var scp: SCP!
+
+    override func setUp() {
+        super.setUp()
+        scp = SCP()
+    }
+
+    override func tearDown() async throws {
+        try await scp.shutdown(timeoutMillis: 1000)
+        scp = nil
+        try await super.tearDown()
+    }
+
     /// `SCP()` must construct successfully and expose a non-zero
     /// monotonic `instanceId`.
     func testScpConstructsSuccessfully() {
-        let scp = SCP()
         XCTAssertGreaterThan(scp.instanceId, 0, "fresh SCP must have a non-zero monotonic id")
     }
 
     /// Two fresh `SCP()` objects must have distinct ids.
-    func testFreshInstancesHaveDistinctIds() {
-        let first = SCP()
+    func testFreshInstancesHaveDistinctIds() async throws {
         let second = SCP()
         XCTAssertNotEqual(
-            first.instanceId,
+            scp.instanceId,
             second.instanceId,
             "SCP() must allocate fresh instances, not reuse a cached handle"
         )
-    }
-
-    /// `SCP.default()` must return the same id on repeated calls.
-    func testDefaultInstanceIsStable() throws {
-        let first = try SCP.default()
-        let second = try SCP.default()
-        XCTAssertEqual(
-            first.instanceId,
-            second.instanceId,
-            "SCP.default() must wrap the same underlying Arc across calls"
-        )
-    }
-
-    /// A fresh `SCP()` must not collide with the default instance.
-    func testFreshInstanceDistinctFromDefault() throws {
-        let fresh = SCP()
-        let defaultInstance = try SCP.default()
-        XCTAssertNotEqual(
-            fresh.instanceId,
-            defaultInstance.instanceId,
-            "SCP() must allocate a fresh instance, not reuse the default"
-        )
+        try await second.shutdown(timeoutMillis: 1000)
     }
 
     /// `suspend()` followed by `resume()` must succeed on a fresh
     /// instance.
-    ///
-    /// `resume()` is `async throws` as of #1678 — UniFFI generates an
-    /// async Swift method because the underlying Rust `Scp::resume` is
-    /// `pub async fn` (transport reconnect + persisted-context
-    /// rehydration happen inside the future).
     func testSuspendResumeRoundtrip() async throws {
-        let scp = SCP()
         try scp.suspend()
         try await scp.resume()
     }
 
     /// `shutdown(timeout:)` must complete within the deadline and
     /// be idempotent on subsequent calls.
-    func testShutdownWithTimeout() async throws {
-        let scp = SCP()
-        try await scp.shutdown(timeout: 1)
+    func testShutdownIsIdempotent() async throws {
+        // Already shut down by tearDown; directly exercise a fresh one here.
+        let extra = SCP()
+        try await extra.shutdown(timeout: 1)
         // Second call must not throw — the SDK surface treats
         // AlreadyShutDown as a harmless no-op.
-        try await scp.shutdown(timeout: 1)
+        try await extra.shutdown(timeout: 1)
     }
 
     /// `withStorage(.inMemory)` must produce a fresh instance with a
     /// non-zero id.
-    ///
-    /// PR 3 added ``StorageConfig/sqlite(path:key:)`` alongside
-    /// ``StorageConfig/inMemory``; the SQLite variant has its own
-    /// convenience test below.
-    func testWithStorageInMemoryProducesFreshInstance() {
-        let scp = SCP.withStorage(.inMemory)
-        XCTAssertGreaterThan(scp.instanceId, 0)
+    func testWithStorageInMemoryProducesFreshInstance() async throws {
+        let instance = SCP.withStorage(.inMemory)
+        XCTAssertGreaterThan(instance.instanceId, 0)
+        try await instance.shutdown(timeoutMillis: 1000)
     }
 
     /// `withStorage(sqliteDir:key:)` must open a `SQLCipher`-encrypted
     /// database at `{sqliteDir}/scp.db` and return a fresh bridge
-    /// instance. Written to a per-test temporary directory so the test
-    /// is hermetic.
-    ///
-    /// PR 3 (#1260 / #1491).
-    func testWithStorageSqliteProducesFreshInstance() throws {
+    /// instance.
+    func testWithStorageSqliteProducesFreshInstance() async throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("scp-swift-sqlite-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -110,7 +87,8 @@ final class ScpClassTests: XCTestCase {
         }
         let key = Data(keyBytes)
 
-        let scp = SCP.withStorage(sqliteDir: dir, key: key)
-        XCTAssertGreaterThan(scp.instanceId, 0)
+        let instance = SCP.withStorage(sqliteDir: dir, key: key)
+        XCTAssertGreaterThan(instance.instanceId, 0)
+        try await instance.shutdown(timeoutMillis: 1000)
     }
 }
