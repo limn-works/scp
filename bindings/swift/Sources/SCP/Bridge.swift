@@ -37,20 +37,22 @@ public enum BridgeConnectorBridge {
         _ contextId: String
     ) throws -> ShadowIdentityResult
 
-    /// Default evaluate trust function — delegates to UniFFI
-    /// ``bridgeEvaluateTrust``.
+    /// Default evaluate trust function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/bridgeEvaluateTrust`` method.
     public static let defaultEvaluateTrust: EvaluateTrustFn = { isBridged, isNativeTransport, shadowStatus in
-        try bridgeEvaluateTrust(
+        try Scp.defaultInstance().bridgeEvaluateTrust(
             isBridged: isBridged,
             isNativeTransport: isNativeTransport,
             shadowStatus: shadowStatus
         )
     }
 
-    /// Default register function — delegates to UniFFI
-    /// ``bridgeRegister(contextId:operatorDid:governanceDid:platform:mode:)``.
+    /// Default register function — delegates to the process-wide default
+    /// ``Scp`` instance's
+    /// ``Scp/bridgeRegister(contextId:operatorDid:governanceDid:platform:mode:)``
+    /// method.
     public static let defaultRegister: RegisterFn = { contextId, operatorDid, governanceDid, platform, mode in
-        try bridgeRegister(
+        try Scp.defaultInstance().bridgeRegister(
             contextId: contextId,
             operatorDid: operatorDid,
             governanceDid: governanceDid,
@@ -59,10 +61,12 @@ public enum BridgeConnectorBridge {
         )
     }
 
-    /// Default create shadow function — delegates to UniFFI
-    /// ``bridgeCreateShadow(bridgeId:platformHandle:bridgeMode:contextId:)``.
+    /// Default create shadow function — delegates to the process-wide
+    /// default ``Scp`` instance's
+    /// ``Scp/bridgeCreateShadow(bridgeId:platformHandle:bridgeMode:contextId:)``
+    /// method.
     public static let defaultCreateShadow: CreateShadowFn = { bridgeId, platformHandle, bridgeMode, contextId in
-        try bridgeCreateShadow(
+        try Scp.defaultInstance().bridgeCreateShadow(
             bridgeId: bridgeId,
             platformHandle: platformHandle,
             bridgeMode: bridgeMode,

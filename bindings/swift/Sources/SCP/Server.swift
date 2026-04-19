@@ -94,24 +94,30 @@ public enum ServerBridge {
         _ contextId: String
     ) async throws -> Void
 
-    /// Default relay in-memory startup -- delegates to UniFFI ``relayStartInMemory()``.
+    /// Default relay in-memory startup — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/relayStartInMemory()`` method.
     public static let defaultRelayStartInMemory: RelayStartInMemoryFn = {
-        try await relayStartInMemory()
+        try await Scp.defaultInstance().relayStartInMemory()
     }
 
-    /// Default relay local startup -- delegates to UniFFI ``relayStartLocal(dataDir:)``.
+    /// Default relay local startup — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/relayStartLocal(dataDir:)`` method.
     public static let defaultRelayStartLocal: RelayStartLocalFn = { dataDir in
-        try await relayStartLocal(dataDir: dataDir)
+        try await Scp.defaultInstance().relayStartLocal(dataDir: dataDir)
     }
 
-    /// Default node in-memory startup -- delegates to UniFFI ``nodeStartInMemory(identity:)``.
+    /// Default node in-memory startup — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/nodeStartInMemory(identity:)`` method.
     public static let defaultNodeStartInMemory: NodeStartInMemoryFn = { identity in
-        try await nodeStartInMemory(identity: identity)
+        try await Scp.defaultInstance().nodeStartInMemory(identity: identity)
     }
 
-    /// Default node local startup -- delegates to UniFFI ``nodeStartLocal(dataDir:identity:passphrase:)``.
+    /// Default node local startup — delegates to the process-wide default
+    /// ``Scp`` instance's
+    /// ``Scp/nodeStartLocal(dataDir:identity:passphrase:)`` method.
     public static let defaultNodeStartLocal: NodeStartLocalFn = { dataDir, identity, passphrase in
-        try await nodeStartLocal(dataDir: dataDir, identity: identity, passphrase: passphrase)
+        try await Scp.defaultInstance()
+            .nodeStartLocal(dataDir: dataDir, identity: identity, passphrase: passphrase)
     }
 
     /// Default enable site projection -- delegates to UniFFI ``NodeHandle.enableSiteProjection()``.

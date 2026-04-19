@@ -29,7 +29,7 @@ public enum Economy {
         actionType: String,
         metricsJson: String = "{}"
     ) async throws -> UInt64? {
-        try await economyEstimateCost(
+        try await Scp.defaultInstance().economyEstimateCost(
             policyJson: policyJson,
             actionType: actionType,
             metricsJson: metricsJson
@@ -41,7 +41,7 @@ public enum Economy {
     /// - Parameter policyJson: Economic policy JSON string.
     /// - Returns: `true` if payment is required for at least one action type.
     public static func policyRequiresPayment(policyJson: String) async throws -> Bool {
-        try await economyPolicyRequiresPayment(policyJson: policyJson)
+        try await Scp.defaultInstance().economyPolicyRequiresPayment(policyJson: policyJson)
     }
 
     /// Checks whether auto-accept is blocked by the economic policy.
@@ -49,7 +49,7 @@ public enum Economy {
     /// - Parameter policyJson: Economic policy JSON string.
     /// - Returns: `true` if auto-accept is blocked.
     public static func autoAcceptBlocked(policyJson: String) async throws -> Bool {
-        try await economyAutoAcceptBlocked(policyJson: policyJson)
+        try await Scp.defaultInstance().economyAutoAcceptBlocked(policyJson: policyJson)
     }
 
     /// Checks whether an economic policy is locked (immutable).
@@ -57,7 +57,7 @@ public enum Economy {
     /// - Parameter policyJson: Economic policy JSON string.
     /// - Returns: `true` if the policy is locked.
     public static func checkPolicyLock(policyJson: String) async throws -> Bool {
-        try await economyCheckPolicyLock(policyJson: policyJson)
+        try await Scp.defaultInstance().economyCheckPolicyLock(policyJson: policyJson)
     }
 
     /// Validates a proposed economic policy change.
@@ -70,7 +70,7 @@ public enum Economy {
         currentJson: String,
         proposedJson: String
     ) async throws -> Bool {
-        try await economyValidatePolicyChange(
+        try await Scp.defaultInstance().economyValidatePolicyChange(
             currentPolicyJson: currentJson,
             proposedPolicyJson: proposedJson
         )
@@ -86,7 +86,7 @@ public enum Economy {
         formulaJson: String,
         metricsJson: String = "{}"
     ) async throws -> UInt64? {
-        try await economyEvaluateFormula(
+        try await Scp.defaultInstance().economyEvaluateFormula(
             formulaJson: formulaJson,
             metricsJson: metricsJson
         )
@@ -115,7 +115,7 @@ public enum Economy {
         message: "Use SCP() instance explicitly. Removal: two release cycles after Phase 4 merge (ADR-048)."
     )
     public static func budgetRemaining(contextId: String, did: String) async throws -> UInt64 {
-        try await economyBudgetRemaining(contextId: contextId, did: did)
+        try await Scp.defaultInstance().economyBudgetRemaining(contextId: contextId, did: did)
     }
 
     /// Grants spending budget to a member.
@@ -134,7 +134,7 @@ public enum Economy {
         did: String,
         amount: UInt64
     ) async throws {
-        try await economyBudgetGrant(contextId: contextId, did: did, amount: amount)
+        try await Scp.defaultInstance().economyBudgetGrant(contextId: contextId, did: did, amount: amount)
     }
 
     /// Records a spend against a member's budget.
@@ -153,7 +153,8 @@ public enum Economy {
         did: String,
         amount: UInt64
     ) async throws {
-        try await economyBudgetRecordSpend(contextId: contextId, did: did, amount: amount)
+        try await Scp.defaultInstance()
+            .economyBudgetRecordSpend(contextId: contextId, did: did, amount: amount)
     }
 
     // MARK: - Antispam
@@ -174,7 +175,7 @@ public enum Economy {
         senderDid: String,
         timestamp: UInt64
     ) async throws {
-        try await economyAntispamRecord(
+        try await Scp.defaultInstance().economyAntispamRecord(
             contextId: contextId,
             senderDid: senderDid,
             timestamp: timestamp
@@ -198,7 +199,7 @@ public enum Economy {
         senderDid: String,
         now: UInt64
     ) async throws -> UInt64 {
-        try await economyAntispamVelocity(
+        try await Scp.defaultInstance().economyAntispamVelocity(
             contextId: contextId,
             senderDid: senderDid,
             now: now
@@ -230,7 +231,7 @@ public enum Economy {
         floor: UInt64? = nil,
         cap: UInt64? = nil
     ) async throws -> UInt64 {
-        try await economyAntispamEscalatedCost(
+        try await Scp.defaultInstance().economyAntispamEscalatedCost(
             contextId: contextId,
             senderDid: senderDid,
             now: now,

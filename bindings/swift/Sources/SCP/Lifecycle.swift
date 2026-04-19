@@ -17,17 +17,19 @@ public enum Lifecycle {
     /// Function signature for the resume bridge call.
     public typealias ResumeFn = @Sendable () async throws -> Void
 
-    /// Default suspend implementation — delegates to UniFFI ``scpSuspend()``.
+    /// Default suspend implementation — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/suspend()`` method (ADR-048).
     public static let defaultSuspend: SuspendFn = {
-        try scpSuspend()
+        try Scp.defaultInstance().suspend()
     }
 
-    /// Default resume implementation — delegates to UniFFI ``scpResume()``.
+    /// Default resume implementation — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/resume()`` method (ADR-048).
     ///
-    /// `scpResume` is `async throws` in the UniFFI bindings (the Rust
+    /// `Scp.resume()` is `async throws` in the UniFFI bindings (the Rust
     /// entry point is `pub async fn`), so this closure is async as well.
     public static let defaultResume: ResumeFn = {
-        try await scpResume()
+        try await Scp.defaultInstance().resume()
     }
 
     /// Suspend the bridge instance for backgrounding.

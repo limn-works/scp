@@ -209,4 +209,123 @@ public final class SCP: @unchecked Sendable {
         }
         try await inner.shutdown(timeoutMillis: millis)
     }
+
+    // MARK: - Bridge method forwarding (ADR-048 PR 4)
+
+    //
+    // Common bridge methods are exposed on `SCP` by forwarding to the
+    // underlying UniFFI `Scp` object. This lets callers write
+    // `try await scp.identityCreate(...)` as an idiomatic Swift method
+    // call — mirroring the `Scp.identityCreate(...)` UniFFI surface —
+    // without reaching through the internal `inner` property.
+    //
+    // The full UniFFI method surface remains accessible through
+    // `inner` for less-common operations; the subset below covers the
+    // hot-path operations identified by the capability matrix. Other
+    // domain-specific methods on the SDK wrappers (`Context`, etc.)
+    // continue to route through their bridge closure parameters, whose
+    // defaults now call `Scp.defaultInstance().<method>(...)`.
+
+    // Identity
+
+    /// Creates a new SCP identity with the specified custody method.
+    /// Forwards to ``Scp/identityCreate(custody:)`` on ``inner``.
+    public func identityCreate(custody: String) async throws -> Identity {
+        try await inner.identityCreate(custody: custody)
+    }
+
+    /// Loads an existing SCP identity by DID. Forwards to
+    /// ``Scp/identityLoad(did:)`` on ``inner``.
+    public func identityLoad(did: String) async throws -> Identity {
+        try await inner.identityLoad(did: did)
+    }
+
+    /// Resolves a DID to its document. Forwards to
+    /// ``Scp/identityResolve(did:)`` on ``inner``.
+    public func identityResolve(did: String) async throws -> DidDocument {
+        try await inner.identityResolve(did: did)
+    }
+
+    // Context lifecycle
+
+    /// Creates a new context. Forwards to
+    /// ``Scp/contextCreate(identity:params:)`` on ``inner``.
+    public func contextCreate(
+        identity: Identity,
+        params: ContextParams
+    ) async throws -> ContextHandle {
+        try await inner.contextCreate(identity: identity, params: params)
+    }
+
+    /// Joins an existing context. Forwards to
+    /// ``Scp/contextJoin(handle:identity:spendingUcanJwt:)`` on ``inner``.
+    public func contextJoin(
+        handle: ContextHandle,
+        identity: Identity,
+        spendingUcanJwt: String? = nil
+    ) async throws {
+        try await inner.contextJoin(handle: handle, identity: identity, spendingUcanJwt: spendingUcanJwt)
+    }
+
+    /// Leaves a context. Forwards to
+    /// ``Scp/contextLeave(handle:identity:)`` on ``inner``.
+    public func contextLeave(handle: ContextHandle, identity: Identity) async throws {
+        try await inner.contextLeave(handle: handle, identity: identity)
+    }
+
+    /// Closes a context. Forwards to
+    /// ``Scp/contextClose(handle:identity:)`` on ``inner``.
+    public func contextClose(handle: ContextHandle, identity: Identity) async throws {
+        try await inner.contextClose(handle: handle, identity: identity)
+    }
+
+    /// Sends a message to a context. Forwards to
+    /// ``Scp/contextSend(handle:identity:payload:spendingUcanJwt:)`` on ``inner``.
+    public func contextSend(
+        handle: ContextHandle,
+        identity: Identity,
+        payload: Data,
+        spendingUcanJwt: String? = nil
+    ) async throws {
+        try await inner.contextSend(
+            handle: handle,
+            identity: identity,
+            payload: payload,
+            spendingUcanJwt: spendingUcanJwt
+        )
+    }
+
+    // Transport
+
+    /// Connects to a relay. Forwards to
+    /// ``Scp/transportConnect(relayUrl:)`` on ``inner``.
+    public func transportConnect(relayUrl: String) async throws -> TransportManager {
+        try await inner.transportConnect(relayUrl: relayUrl)
+    }
+
+    /// Disconnects a transport manager. Forwards to
+    /// ``Scp/transportDisconnect(manager:)`` on ``inner``.
+    public func transportDisconnect(manager: TransportManager) async throws {
+        try await inner.transportDisconnect(manager: manager)
+    }
+
+    /// Queries transport status. Forwards to
+    /// ``Scp/transportStatus(manager:)`` on ``inner``.
+    public func transportStatus(manager: TransportManager) async throws -> TransportStatus {
+        try await inner.transportStatus(manager: manager)
+    }
+
+    // Local DID registry
+
+    /// Registers a DID as locally controlled by this instance. Forwards to
+    /// ``Scp/registerLocalDid(did:)`` on ``inner``.
+    public func registerLocalDid(did: String) async throws {
+        try await inner.registerLocalDid(did: did)
+    }
+
+    /// Checks whether a DID is locally controlled. Forwards to
+    /// ``Scp/isLocalDid(did:)`` on ``inner``.
+    public func isLocalDid(did: String) async -> Bool {
+        await inner.isLocalDid(did: did)
+    }
 }

@@ -70,14 +70,16 @@ public enum EventLogBridge {
         _ claimJson: String
     ) async throws -> Proof
 
-    /// Default query function that delegates to the UniFFI-generated binding.
+    /// Default query function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/eventLogQuery(handle:filterJson:)`` method.
     public static let defaultQuery: QueryFn = { handle, filterJson in
-        try await eventLogQuery(handle: handle, filterJson: filterJson)
+        try await Scp.defaultInstance().eventLogQuery(handle: handle, filterJson: filterJson)
     }
 
-    /// Default verify function that delegates to the UniFFI-generated binding.
+    /// Default verify function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/eventLogVerify(handle:claimJson:)`` method.
     public static let defaultVerify: VerifyFn = { handle, claimJson in
-        try await eventLogVerify(handle: handle, claimJson: claimJson)
+        try await Scp.defaultInstance().eventLogVerify(handle: handle, claimJson: claimJson)
     }
 
     /// Generate a signed consistency checkpoint. Maps to ``eventLogCheckpoint``.
@@ -87,10 +89,11 @@ public enum EventLogBridge {
         _ epoch: UInt64
     ) async throws -> Checkpoint
 
-    /// Default checkpoint function — delegates to UniFFI
-    /// ``eventLogCheckpoint(handle:identity:epoch:)``.
+    /// Default checkpoint function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/eventLogCheckpoint(handle:identity:epoch:)``
+    /// method.
     public static let defaultCheckpoint: CheckpointFn = { handle, identity, epoch in
-        try await eventLogCheckpoint(handle: handle, identity: identity, epoch: epoch)
+        try await Scp.defaultInstance().eventLogCheckpoint(handle: handle, identity: identity, epoch: epoch)
     }
 }
 

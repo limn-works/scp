@@ -23,16 +23,25 @@ public enum SyncBridge {
         _ tier2ThresholdSecs: UInt64
     ) -> String
 
-    /// Default classify offline function — delegates to UniFFI
-    /// ``syncClassifyOffline``.
+    /// Default classify offline function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/syncClassifyOffline`` method.
+    ///
+    /// Non-throwing: falls back to `"long"` (the conservative tier) if the
+    /// default instance is currently suspended or shut down.
     public static let defaultClassifyOffline: ClassifyOfflineFn = { lastRelayContact, now in
-        syncClassifyOffline(lastRelayContact: lastRelayContact, now: now)
+        guard let scp = try? Scp.defaultInstance() else { return "long" }
+        return scp.syncClassifyOffline(lastRelayContact: lastRelayContact, now: now)
     }
 
-    /// Default classify offline custom function — delegates to UniFFI
-    /// ``syncClassifyOfflineCustom``.
+    /// Default classify offline custom function — delegates to the
+    /// process-wide default ``Scp`` instance's ``Scp/syncClassifyOfflineCustom``
+    /// method.
+    ///
+    /// Non-throwing: falls back to `"long"` (the conservative tier) if the
+    /// default instance is currently suspended or shut down.
     public static let defaultClassifyOfflineCustom: ClassifyOfflineCustomFn = { lastRelayContact, now, tier1ThresholdSecs, tier2ThresholdSecs in
-        syncClassifyOfflineCustom(
+        guard let scp = try? Scp.defaultInstance() else { return "long" }
+        return scp.syncClassifyOfflineCustom(
             lastRelayContact: lastRelayContact,
             now: now,
             tier1ThresholdSecs: tier1ThresholdSecs,
@@ -40,13 +49,36 @@ public enum SyncBridge {
         )
     }
 
-    /// Get the sync policy. Maps to UniFFI ``syncGetPolicy``.
+    /// Get the sync policy. Maps to UniFFI ``Scp/syncGetPolicy()``.
     public typealias GetPolicyFn = @Sendable () -> SyncPolicyResult
 
-    /// Default get sync policy function — delegates to UniFFI
-    /// ``syncGetPolicy()``.
+    /// Default get sync policy function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/syncGetPolicy()`` method.
+    ///
+    /// Non-throwing: falls back to a `SyncPolicyResult` built from
+    /// `scp_core::sync::SyncPolicy::default()` constants if the default
+    /// instance is currently suspended or shut down. The Rust default is
+    /// fixed at compile time, so the fallback matches the live policy
+    /// exactly — callers see no behavioral difference.
     public static let defaultGetPolicy: GetPolicyFn = {
-        syncGetPolicy()
+        if let scp = try? Scp.defaultInstance() {
+            return scp.syncGetPolicy()
+        }
+        // Mirror `scp_core::sync::SyncPolicy::default()` — the Rust side
+        // does not expose a `SyncPolicyResult::default()` via UniFFI, so
+        // the constants are re-asserted here. If Rust defaults ever
+        // change, this fallback must be updated in lockstep (the PR 4
+        // enforcement check will catch drift).
+        SyncPolicyResult(
+            tier1ThresholdSecs: 14400,
+            tier2ThresholdSecs: 604_800,
+            gapTimeoutSecs: 30,
+            reorderBufferCapacity: 100,
+            maxSequentialCommits: 10,
+            commitProcessTimeoutSecs: 5,
+            senderKeyTimeoutSecs: 10,
+            reconnectionDedupWindowSecs: 60
+        )
     }
 }
 

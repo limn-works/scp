@@ -139,9 +139,10 @@ public enum ToolBridge {
         _ sessionId: String
     ) async throws -> Void
 
-    /// Default invoke function that delegates to the UniFFI-generated binding.
+    /// Default invoke function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/toolInvoke`` method.
     public static let defaultInvoke: InvokeFn = { handle, toolId, inputJson, identity, ucanToken, proofTokens, spendingUcan in
-        try await toolInvoke(
+        try await Scp.defaultInstance().toolInvoke(
             handle: handle,
             toolId: toolId,
             inputJson: inputJson,
@@ -152,19 +153,23 @@ public enum ToolBridge {
         )
     }
 
-    /// Default register function that delegates to the UniFFI-generated binding.
+    /// Default register function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/toolRegister(handle:definition:)`` method.
     public static let defaultRegister: RegisterFn = { handle, definition in
-        try await toolRegister(handle: handle, definition: definition)
+        try await Scp.defaultInstance().toolRegister(handle: handle, definition: definition)
     }
 
-    /// Default verify function that delegates to the UniFFI-generated binding.
+    /// Default verify function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/toolVerify(handle:toolId:)`` method.
     public static let defaultVerify: VerifyFn = { handle, toolId in
-        try await toolVerify(handle: handle, toolId: toolId)
+        try await Scp.defaultInstance().toolVerify(handle: handle, toolId: toolId)
     }
 
-    /// Default cross-context invoke function — delegates to UniFFI.
+    /// Default cross-context invoke function — delegates to the
+    /// process-wide default ``Scp`` instance's ``Scp/toolInvokeCrossContext``
+    /// method.
     public static let defaultInvokeCrossContext: InvokeCrossContextFn = { sourceHandle, targetHandle, toolId, inputJson, identity, ucanToken, chainDepth, proofTokens in
-        try await toolInvokeCrossContext(
+        try await Scp.defaultInstance().toolInvokeCrossContext(
             sourceHandle: sourceHandle,
             targetHandle: targetHandle,
             toolId: toolId,
@@ -176,9 +181,10 @@ public enum ToolBridge {
         )
     }
 
-    /// Default session create function — delegates to UniFFI.
+    /// Default session create function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/toolSessionCreate`` method.
     public static let defaultSessionCreate: SessionCreateFn = { handle, toolId, sourceContextId, ttlSeconds in
-        try await toolSessionCreate(
+        try await Scp.defaultInstance().toolSessionCreate(
             handle: handle,
             toolId: toolId,
             sourceContextId: sourceContextId,
@@ -186,9 +192,10 @@ public enum ToolBridge {
         )
     }
 
-    /// Default session invoke function — delegates to UniFFI.
+    /// Default session invoke function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/toolSessionInvoke`` method.
     public static let defaultSessionInvoke: SessionInvokeFn = { handle, sessionId, inputJson, identity, ucanToken, proofTokens in
-        try await toolSessionInvoke(
+        try await Scp.defaultInstance().toolSessionInvoke(
             handle: handle,
             sessionId: sessionId,
             inputJson: inputJson,
@@ -198,9 +205,11 @@ public enum ToolBridge {
         )
     }
 
-    /// Default session close function — delegates to UniFFI.
+    /// Default session close function — delegates to the process-wide
+    /// default ``Scp`` instance's
+    /// ``Scp/toolSessionClose(handle:sessionId:)`` method.
     public static let defaultSessionClose: SessionCloseFn = { handle, sessionId in
-        try await toolSessionClose(handle: handle, sessionId: sessionId)
+        try await Scp.defaultInstance().toolSessionClose(handle: handle, sessionId: sessionId)
     }
 
     /// Expose a tool interface for cross-context sharing. Maps to ``toolInterfaceExpose`` in ScpBindings.
@@ -223,19 +232,29 @@ public enum ToolBridge {
         _ interfaceIdHex: String
     ) async throws -> String
 
-    /// Default interface expose function — delegates to UniFFI.
+    /// Default interface expose function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/toolInterfaceExpose`` method.
     public static let defaultInterfaceExpose: InterfaceExposeFn = { handle, toolId, targetContextId, rateLimitJson in
-        try await toolInterfaceExpose(handle: handle, toolId: toolId, targetContextId: targetContextId, rateLimitJson: rateLimitJson)
+        try await Scp.defaultInstance().toolInterfaceExpose(
+            handle: handle,
+            toolId: toolId,
+            targetContextId: targetContextId,
+            rateLimitJson: rateLimitJson
+        )
     }
 
-    /// Default interface accept function — delegates to UniFFI.
+    /// Default interface accept function — delegates to the process-wide
+    /// default ``Scp`` instance's
+    /// ``Scp/toolInterfaceAccept(handle:interfaceJson:)`` method.
     public static let defaultInterfaceAccept: InterfaceAcceptFn = { handle, interfaceJson in
-        try await toolInterfaceAccept(handle: handle, interfaceJson: interfaceJson)
+        try await Scp.defaultInstance().toolInterfaceAccept(handle: handle, interfaceJson: interfaceJson)
     }
 
-    /// Default interface revoke function — delegates to UniFFI.
+    /// Default interface revoke function — delegates to the process-wide
+    /// default ``Scp`` instance's
+    /// ``Scp/toolInterfaceRevoke(handle:interfaceIdHex:)`` method.
     public static let defaultInterfaceRevoke: InterfaceRevokeFn = { handle, interfaceIdHex in
-        try await toolInterfaceRevoke(handle: handle, interfaceIdHex: interfaceIdHex)
+        try await Scp.defaultInstance().toolInterfaceRevoke(handle: handle, interfaceIdHex: interfaceIdHex)
     }
 }
 

@@ -121,50 +121,65 @@ public enum ContextLifecycleBridge {
     ) throws -> Bool
 
     public static let defaultDrainEvents: DrainEventsFn = { handle in
-        await contextDrainEvents(handle: handle)
+        // Non-throwing — fall back to an empty list if the default instance
+        // cannot be resolved.
+        guard let scp = try? Scp.defaultInstance() else { return [] }
+        return await scp.contextDrainEvents(handle: handle)
     }
 
     public static let defaultHandleTtlExpiry: HandleTtlExpiryFn = { handle in
-        try await contextHandleTtlExpiry(handle: handle)
+        try await Scp.defaultInstance().contextHandleTtlExpiry(handle: handle)
     }
 
     public static let defaultProposeTtlExtension: ProposeTtlExtensionFn = { handle, memberDid, proposedSeconds in
-        try await contextProposeTtlExtension(
+        try await Scp.defaultInstance().contextProposeTtlExtension(
             handle: handle, memberDid: memberDid, proposedSeconds: proposedSeconds
         )
     }
 
     public static let defaultResetTtlTimer: ResetTtlTimerFn = { handle, newSeconds in
-        await contextResetTtlTimer(handle: handle, newSeconds: newSeconds)
+        // Non-throwing — silently swallow if the default instance is
+        // unavailable. Matches `contextResetTtlTimer` free-function
+        // behavior.
+        guard let scp = try? Scp.defaultInstance() else { return }
+        await scp.contextResetTtlTimer(handle: handle, newSeconds: newSeconds)
     }
 
-    /// Default export function — delegates to UniFFI
-    /// ``contextExport(handle:)``.
+    /// Default export function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/contextExport(handle:)`` method.
     public static let defaultExport: ExportFn = { handle in
-        try await contextExport(handle: handle)
+        try await Scp.defaultInstance().contextExport(handle: handle)
     }
 
-    /// Default import function — delegates to UniFFI
-    /// ``contextImport(data:)``.
+    /// Default import function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/contextImport(data:)`` method.
     public static let defaultImport: ImportFn = { data in
-        try await contextImport(data: data)
+        try await Scp.defaultInstance().contextImport(data: data)
     }
 
     public static let defaultRegisterLocalDid: RegisterLocalDidFn = { did in
-        try await registerLocalDid(did: did)
+        try await Scp.defaultInstance().registerLocalDid(did: did)
     }
 
     public static let defaultIsLocalDid: IsLocalDidFn = { did in
-        await isLocalDid(did: did)
+        // Non-throwing — `false` on default-instance failure. Matches
+        // `isLocalDid` free-function semantics.
+        guard let scp = try? Scp.defaultInstance() else { return false }
+        return await scp.isLocalDid(did: did)
     }
 
     /// Default verify participation requirements function — delegates to
-    /// UniFFI ``verifyParticipationRequirements(profileJson:requirementsJson:)``.
+    /// the process-wide default ``Scp`` instance's
+    /// ``Scp/verifyParticipationRequirements(profileJson:requirementsJson:)``
+    /// method.
     ///
     /// For a pure-Swift alternative using typed inputs, see
     /// ``verifyParticipationRequirements(requirement:profile:)`` in Trust.swift.
     public static let defaultVerifyParticipationRequirements: VerifyParticipationRequirementsFn = { profileJson, requirementsJson in
-        try verifyParticipationRequirements(profileJson: profileJson, requirementsJson: requirementsJson)
+        try Scp.defaultInstance().verifyParticipationRequirements(
+            profileJson: profileJson,
+            requirementsJson: requirementsJson
+        )
     }
 }
 
@@ -206,35 +221,40 @@ public enum GovernanceBridge {
         _ proposalIdHex: String
     ) async throws -> String
 
-    /// Default execute function that delegates to the UniFFI-generated binding.
+    /// Default execute function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/governanceExecute`` method.
     public static let defaultExecute: ExecuteFn = { handle, proposalJson in
-        try await governanceExecute(handle: handle, proposalJson: proposalJson)
+        try await Scp.defaultInstance().governanceExecute(handle: handle, proposalJson: proposalJson)
     }
 
-    /// Default propose function that delegates to the UniFFI-generated binding.
+    /// Default propose function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/governancePropose`` method.
     public static let defaultPropose: ProposeFn = { handle, proposerDid, actionJson in
-        try await governancePropose(
+        try await Scp.defaultInstance().governancePropose(
             handle: handle, proposerDid: proposerDid, actionJson: actionJson
         )
     }
 
-    /// Default approve function that delegates to the UniFFI-generated binding.
+    /// Default approve function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/governanceApprove`` method.
     public static let defaultApprove: ApproveFn = { handle, voterDid, proposalIdHex in
-        try await governanceApprove(
+        try await Scp.defaultInstance().governanceApprove(
             handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex
         )
     }
 
-    /// Default reject function that delegates to the UniFFI-generated binding.
+    /// Default reject function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/governanceReject`` method.
     public static let defaultReject: RejectFn = { handle, voterDid, proposalIdHex in
-        try await governanceReject(
+        try await Scp.defaultInstance().governanceReject(
             handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex
         )
     }
 
-    /// Default withdraw function that delegates to the UniFFI-generated binding.
+    /// Default withdraw function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/governanceWithdraw`` method.
     public static let defaultWithdraw: WithdrawFn = { handle, voterDid, proposalIdHex in
-        try await governanceWithdraw(
+        try await Scp.defaultInstance().governanceWithdraw(
             handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex
         )
     }
@@ -250,16 +270,18 @@ public enum GovernanceBridge {
         _ handle: ContextHandle
     ) async throws -> String
 
-    /// Default get proposal function that delegates to the UniFFI-generated binding.
+    /// Default get proposal function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/governanceGetProposal`` method.
     public static let defaultGetProposal: GetProposalFn = { handle, proposalIdHex in
-        try await governanceGetProposal(
+        try await Scp.defaultInstance().governanceGetProposal(
             handle: handle, proposalIdHex: proposalIdHex
         )
     }
 
-    /// Default list proposals function that delegates to the UniFFI-generated binding.
+    /// Default list proposals function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/governanceListProposals`` method.
     public static let defaultListProposals: ListProposalsFn = { handle in
-        try await governanceListProposals(handle: handle)
+        try await Scp.defaultInstance().governanceListProposals(handle: handle)
     }
 
     /// Apply a pending ceiling modification (#559).
@@ -301,23 +323,28 @@ public enum GovernanceBridge {
     /// Restore all persisted contexts (#559).
     public typealias RestoreAllContextsFn = @Sendable () async throws -> String
 
-    /// Default apply pending ceiling modification function.
+    /// Default apply pending ceiling modification function — delegates to
+    /// the process-wide default ``Scp`` instance's
+    /// ``Scp/applyPendingCeilingModification`` method.
     public static let defaultApplyPendingCeilingModification:
         ApplyPendingCeilingModificationFn = { handle, currentTimestamp in
-            try await applyPendingCeilingModification(
+            try await Scp.defaultInstance().applyPendingCeilingModification(
                 handle: handle, currentTimestamp: currentTimestamp
             )
         }
 
-    /// Default finalize close function.
+    /// Default finalize close function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/finalizeClose(handle:)`` method.
     public static let defaultFinalizeClose: FinalizeCloseFn = { handle in
-        try await finalizeClose(handle: handle)
+        try await Scp.defaultInstance().finalizeClose(handle: handle)
     }
 
-    /// Default create governance checkpoint function.
+    /// Default create governance checkpoint function — delegates to the
+    /// process-wide default ``Scp`` instance's
+    /// ``Scp/createGovernanceCheckpoint`` method.
     public static let defaultCreateGovernanceCheckpoint:
         CreateGovernanceCheckpointFn = { handle, checkpointSeq, merkleRootHex, eventCount, lastEventHashHex, stateSnapshotHashHex, creatorDid, creatorSignatureHex in
-            try await createGovernanceCheckpoint(
+            try await Scp.defaultInstance().createGovernanceCheckpoint(
                 handle: handle,
                 checkpointSeq: checkpointSeq,
                 merkleRootHex: merkleRootHex,
@@ -329,10 +356,12 @@ public enum GovernanceBridge {
             )
         }
 
-    /// Default add checkpoint cosignature function.
+    /// Default add checkpoint cosignature function — delegates to the
+    /// process-wide default ``Scp`` instance's
+    /// ``Scp/addCheckpointCosignature`` method.
     public static let defaultAddCheckpointCosignature:
         AddCheckpointCosignatureFn = { handle, checkpointJson, signerDid, signatureHex in
-            try await addCheckpointCosignature(
+            try await Scp.defaultInstance().addCheckpointCosignature(
                 handle: handle,
                 checkpointJson: checkpointJson,
                 signerDid: signerDid,
@@ -340,14 +369,16 @@ public enum GovernanceBridge {
             )
         }
 
-    /// Default restore context function.
+    /// Default restore context function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/restoreContext(contextId:)`` method.
     public static let defaultRestoreContext: RestoreContextFn = { contextId in
-        try await restoreContext(contextId: contextId)
+        try await Scp.defaultInstance().restoreContext(contextId: contextId)
     }
 
-    /// Default restore all contexts function.
+    /// Default restore all contexts function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/restoreAllContexts()`` method.
     public static let defaultRestoreAllContexts: RestoreAllContextsFn = {
-        try await restoreAllContexts()
+        try await Scp.defaultInstance().restoreAllContexts()
     }
 }
 
@@ -378,19 +409,19 @@ public enum MembershipBridge {
     ) async throws -> String?
 
     public static let defaultMemberCount: MemberCountFn = { handle in
-        try await contextMemberCount(handle: handle)
+        try await Scp.defaultInstance().contextMemberCount(handle: handle)
     }
 
     public static let defaultIsMember: IsMemberFn = { handle, did in
-        try await contextIsMember(handle: handle, did: did)
+        try await Scp.defaultInstance().contextIsMember(handle: handle, did: did)
     }
 
     public static let defaultMemberDids: MemberDidsFn = { handle in
-        try await contextMemberDids(handle: handle)
+        try await Scp.defaultInstance().contextMemberDids(handle: handle)
     }
 
     public static let defaultMemberRole: MemberRoleFn = { handle, did in
-        try await contextMemberRole(handle: handle, did: did)
+        try await Scp.defaultInstance().contextMemberRole(handle: handle, did: did)
     }
 }
 
@@ -662,61 +693,65 @@ public enum BroadcastBridge {
     ) async throws -> BatchPublishResult
 
     public static let defaultSubscribe: SubscribeFn = { handle, subscriberDid in
-        try await broadcastSubscribe(handle: handle, subscriberDid: subscriberDid)
+        try await Scp.defaultInstance().broadcastSubscribe(handle: handle, subscriberDid: subscriberDid)
     }
 
     public static let defaultUnsubscribe: UnsubscribeFn = { handle, subscriberDid, rotateKeys in
-        try await broadcastUnsubscribe(
+        try await Scp.defaultInstance().broadcastUnsubscribe(
             handle: handle, subscriberDid: subscriberDid, rotateKeys: rotateKeys
         )
     }
 
     public static let defaultPublish: PublishFn = { handle, identity, payload in
-        try await broadcastPublish(handle: handle, identity: identity, payload: payload)
+        try await Scp.defaultInstance().broadcastPublish(
+            handle: handle, identity: identity, payload: payload
+        )
     }
 
     public static let defaultBlockSubscriber: BlockSubscriberFn = { handle, subscriberDid, blockerDid in
-        try await broadcastBlockSubscriber(
+        try await Scp.defaultInstance().broadcastBlockSubscriber(
             handle: handle, subscriberDid: subscriberDid, blockerDid: blockerDid
         )
     }
 
     public static let defaultUnblockSubscriber: UnblockSubscriberFn = { handle, subscriberDid, unblockerDid in
-        try await broadcastUnblockSubscriber(
+        try await Scp.defaultInstance().broadcastUnblockSubscriber(
             handle: handle, subscriberDid: subscriberDid, unblockerDid: unblockerDid
         )
     }
 
     public static let defaultHandleKeyRequest: HandleKeyRequestFn = { handle, authorDid, requesterDid in
-        try await broadcastHandleKeyRequest(
+        try await Scp.defaultInstance().broadcastHandleKeyRequest(
             handle: handle, authorDid: authorDid, requesterDid: requesterDid
         )
     }
 
     public static let defaultSubscriberCount: SubscriberCountFn = { handle in
-        try await broadcastSubscriberCount(handle: handle)
+        try await Scp.defaultInstance().broadcastSubscriberCount(handle: handle)
     }
 
     public static let defaultIsSubscriber: IsSubscriberFn = { handle, did in
-        try await broadcastIsSubscriber(handle: handle, did: did)
+        try await Scp.defaultInstance().broadcastIsSubscriber(handle: handle, did: did)
     }
 
     public static let defaultAdmission: AdmissionFn = { handle in
-        try await broadcastAdmission(handle: handle)
+        try await Scp.defaultInstance().broadcastAdmission(handle: handle)
     }
 
-    /// Default publish asset function — delegates to UniFFI
-    /// ``broadcastPublishAsset(handle:identity:asset:deployId:)``.
+    /// Default publish asset function — delegates to the process-wide
+    /// default ``Scp`` instance's
+    /// ``Scp/broadcastPublishAsset(handle:identity:asset:deployId:)`` method.
     public static let defaultPublishAsset: PublishAssetFn = { handle, identity, asset, deployId in
-        try await broadcastPublishAsset(
+        try await Scp.defaultInstance().broadcastPublishAsset(
             handle: handle, identity: identity, asset: asset, deployId: deployId
         )
     }
 
-    /// Default publish assets function — delegates to UniFFI
-    /// ``broadcastPublishAssets(handle:identity:assets:deployId:)``.
+    /// Default publish assets function — delegates to the process-wide
+    /// default ``Scp`` instance's
+    /// ``Scp/broadcastPublishAssets(handle:identity:assets:deployId:)`` method.
     public static let defaultPublishAssets: PublishAssetsFn = { handle, identity, assets, deployId in
-        try await broadcastPublishAssets(
+        try await Scp.defaultInstance().broadcastPublishAssets(
             handle: handle, identity: identity, assets: assets, deployId: deployId
         )
     }

@@ -164,22 +164,28 @@ public enum ScpId {
         _ challengeJson: String
     ) throws -> String
 
-    /// Default challenge function — delegates to UniFFI
-    /// ``scpidChallenge(audience:ttlSeconds:)``.
+    /// Default challenge function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/scpidChallenge(audience:ttlSeconds:)`` method.
     public static let defaultChallenge: ChallengeFn = { audience, ttlSeconds in
-        try scpidChallenge(audience: audience, ttlSeconds: ttlSeconds)
+        try Scp.defaultInstance().scpidChallenge(audience: audience, ttlSeconds: ttlSeconds)
     }
 
-    /// Default sign function — delegates to UniFFI
-    /// ``scpidSign(identity:signingKeyId:challengeJson:)``.
+    /// Default sign function — delegates to the process-wide default
+    /// ``Scp`` instance's
+    /// ``Scp/scpidSign(identity:signingKeyId:challengeJson:)`` method.
     public static let defaultSign: SignFn = { identity, signingKeyId, challengeJson in
-        try scpidSign(identity: identity, signingKeyId: signingKeyId, challengeJson: challengeJson)
+        try Scp.defaultInstance().scpidSign(
+            identity: identity,
+            signingKeyId: signingKeyId,
+            challengeJson: challengeJson
+        )
     }
 
-    /// Default verify function — delegates to UniFFI
-    /// ``scpidVerify(responseJson:challengeJson:)``.
+    /// Default verify function — delegates to the process-wide default
+    /// ``Scp`` instance's
+    /// ``Scp/scpidVerify(responseJson:challengeJson:)`` method.
     public static let defaultVerify: VerifyFn = { responseJson, challengeJson in
-        try scpidVerify(responseJson: responseJson, challengeJson: challengeJson)
+        try Scp.defaultInstance().scpidVerify(responseJson: responseJson, challengeJson: challengeJson)
     }
 
     // MARK: - Public API

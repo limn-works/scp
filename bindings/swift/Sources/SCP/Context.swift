@@ -24,9 +24,11 @@ public enum ContextBridge {
         _ params: ContextParams
     ) async throws -> any ContextHandleProtocol
 
-    /// Default create function — delegates to UniFFI ``contextCreate(identity:params:)``.
+    /// Default create function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/contextCreate(identity:params:)`` method
+    /// (ADR-048 method migration).
     public static let defaultCreate: CreateFn = { identity, params in
-        try await contextCreate(identity: identity, params: params)
+        try await Scp.defaultInstance().contextCreate(identity: identity, params: params)
     }
 
     /// The closure type for sending a message. Injected for testability.
@@ -62,26 +64,31 @@ public enum ContextBridge {
         _ spendingUcanJwt: String?
     ) async throws -> Void
 
-    /// Default join function — delegates to UniFFI ``contextJoin``.
+    /// Default join function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/contextJoin`` method.
     public static let defaultJoin: JoinFn = { handle, identity, spendingUcanJwt in
-        try await contextJoin(handle: handle, identity: identity, spendingUcanJwt: spendingUcanJwt)
+        try await Scp.defaultInstance()
+            .contextJoin(handle: handle, identity: identity, spendingUcanJwt: spendingUcanJwt)
     }
 
-    /// Default send function — delegates to UniFFI ``contextSend``.
+    /// Default send function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/contextSend`` method.
     public static let defaultSend: SendFn = { handle, identity, payload, spendingUcanJwt in
-        try await contextSend(
+        try await Scp.defaultInstance().contextSend(
             handle: handle, identity: identity, payload: payload, spendingUcanJwt: spendingUcanJwt
         )
     }
 
-    /// Default leave function — delegates to UniFFI ``contextLeave``.
+    /// Default leave function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/contextLeave`` method.
     public static let defaultLeave: LeaveFn = { handle, identity in
-        try await contextLeave(handle: handle, identity: identity)
+        try await Scp.defaultInstance().contextLeave(handle: handle, identity: identity)
     }
 
-    /// Default close function — delegates to UniFFI ``contextClose``.
+    /// Default close function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/contextClose`` method.
     public static let defaultClose: CloseFn = { handle, identity in
-        try await contextClose(handle: handle, identity: identity)
+        try await Scp.defaultInstance().contextClose(handle: handle, identity: identity)
     }
 
     /// The closure type for setting economic policy. Injected for testability.
@@ -95,14 +102,16 @@ public enum ContextBridge {
         _ handle: ContextHandle
     ) throws -> String?
 
-    /// Default set economic policy function — delegates to UniFFI ``setEconomicPolicy``.
+    /// Default set economic policy function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/setEconomicPolicy`` method.
     public static let defaultSetEconomicPolicy: SetEconomicPolicyFn = { handle, policyJson in
-        try setEconomicPolicy(handle: handle, policyJson: policyJson)
+        try Scp.defaultInstance().setEconomicPolicy(handle: handle, policyJson: policyJson)
     }
 
-    /// Default get economic policy function — delegates to UniFFI ``getEconomicPolicy``.
+    /// Default get economic policy function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/getEconomicPolicy`` method.
     public static let defaultGetEconomicPolicy: GetEconomicPolicyFn = { handle in
-        try getEconomicPolicy(handle: handle)
+        try Scp.defaultInstance().getEconomicPolicy(handle: handle)
     }
 }
 
@@ -760,7 +769,7 @@ public func validateCapabilityDeclaration(
     ceilingCapabilities: [String],
     roleCapabilities: [String]
 ) throws -> DeclarationValidationResult {
-    let resultJson = try sandboxValidateDeclaration(
+    let resultJson = try Scp.defaultInstance().sandboxValidateDeclaration(
         declarationJson: declarationJson,
         ceilingCapabilities: ceilingCapabilities,
         roleCapabilities: roleCapabilities
@@ -806,7 +815,7 @@ public func evaluateContextInvitation(
     spendingJson: String? = nil,
     trustedDids: [String] = []
 ) throws -> InvitationEvaluationResult {
-    let decision = try evaluateInvitation(
+    let decision = try Scp.defaultInstance().evaluateInvitation(
         paramsJson: paramsJson,
         inviterDid: inviterDid,
         identityDid: identityDid,
@@ -842,7 +851,7 @@ public func serializeMetadataRecord(
     operationalJson: String,
     signatureHex: String
 ) throws -> String {
-    try metadataRecordToJson(
+    try Scp.defaultInstance().metadataRecordToJson(
         contextId: contextId,
         sequence: sequence,
         signerDid: signerDid,
@@ -861,7 +870,7 @@ public func serializeMetadataRecord(
 /// - Returns: Validated and re-serialized JSON string.
 /// - Throws: ``ScpError`` if the JSON is malformed.
 public func deserializeMetadataRecord(jsonStr: String) throws -> String {
-    try metadataRecordFromJson(jsonStr: jsonStr)
+    try Scp.defaultInstance().metadataRecordFromJson(jsonStr: jsonStr)
 }
 
 // MARK: - Context Template Inspection (§5.14, #615)
@@ -874,7 +883,7 @@ public func deserializeMetadataRecord(jsonStr: String) throws -> String {
 /// - Returns: JSON string of the canonical ContextParams.
 /// - Throws: ``ScpError`` if the template ID is not recognized.
 public func getTemplateParams(templateId: String) throws -> String {
-    try templateGetParams(templateId: templateId)
+    try Scp.defaultInstance().templateGetParams(templateId: templateId)
 }
 
 /// Validates that ContextParams match their template definition.
@@ -885,7 +894,7 @@ public func getTemplateParams(templateId: String) throws -> String {
 /// - Returns: `nil` on success, or a string error message on validation failure.
 /// - Throws: ``ScpError`` if the JSON is malformed.
 public func validateParamsAgainstTemplate(paramsJson: String) throws -> String? {
-    try validateAgainstTemplate(paramsJson: paramsJson)
+    try Scp.defaultInstance().validateAgainstTemplate(paramsJson: paramsJson)
 }
 
 /// Validates cross-field invariants for ContextParams regardless of template.
@@ -896,5 +905,5 @@ public func validateParamsAgainstTemplate(paramsJson: String) throws -> String? 
 /// - Returns: `nil` on success, or a string error message on validation failure.
 /// - Throws: ``ScpError`` if the JSON is malformed.
 public func validateParams(paramsJson: String) throws -> String? {
-    try validateContextParams(paramsJson: paramsJson)
+    try Scp.defaultInstance().validateContextParams(paramsJson: paramsJson)
 }

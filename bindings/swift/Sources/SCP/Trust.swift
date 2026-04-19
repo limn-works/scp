@@ -210,34 +210,38 @@ public enum TrustBridge {
         _ responseJson: String
     ) throws -> Bool
 
-    /// Default evaluate function that delegates to the UniFFI
-    /// ``trustQueryScore`` bridge function.
+    /// Default evaluate function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/trustQueryScore`` method.
     public static let defaultEvaluate: EvaluateFn = { subjectDid, contextId in
-        let score = try trustQueryScore(did: subjectDid, contextId: contextId)
+        let score = try Scp.defaultInstance().trustQueryScore(did: subjectDid, contextId: contextId)
         return TrustEvaluation(from: score)
     }
 
-    /// Default query score function — delegates to UniFFI ``trustQueryScore``.
+    /// Default query score function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/trustQueryScore`` method.
     public static let defaultQueryScore: QueryScoreFn = { did, contextId in
-        try trustQueryScore(did: did, contextId: contextId)
+        try Scp.defaultInstance().trustQueryScore(did: did, contextId: contextId)
     }
 
-    /// Default verify attestation function — delegates to UniFFI
-    /// ``trustVerifyAttestation``.
+    /// Default verify attestation function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/trustVerifyAttestation`` method.
     public static let defaultVerifyAttestation: VerifyAttestationFn = { attestationJson in
-        try trustVerifyAttestation(attestationJson: attestationJson)
+        try Scp.defaultInstance().trustVerifyAttestation(attestationJson: attestationJson)
     }
 
-    /// Default create challenge function — delegates to UniFFI
-    /// ``trustCreateChallenge``.
+    /// Default create challenge function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/trustCreateChallenge`` method.
     public static let defaultCreateChallenge: CreateChallengeFn = { targetDid in
-        try trustCreateChallenge(targetDid: targetDid)
+        try Scp.defaultInstance().trustCreateChallenge(targetDid: targetDid)
     }
 
-    /// Default verify response function — delegates to UniFFI
-    /// ``trustVerifyResponse``.
+    /// Default verify response function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/trustVerifyResponse`` method.
     public static let defaultVerifyResponse: VerifyResponseFn = { challengeJson, responseJson in
-        try trustVerifyResponse(challengeJson: challengeJson, responseJson: responseJson)
+        try Scp.defaultInstance().trustVerifyResponse(
+            challengeJson: challengeJson,
+            responseJson: responseJson
+        )
     }
 }
 
@@ -464,7 +468,7 @@ public func aggregateTrust(
     cachedAttestationsJson: String = "[]",
     challengeResultsJson: String = "[]"
 ) throws -> AggregatedTrustInput {
-    let resultJson = try aggregateTrustInput(
+    let resultJson = try Scp.defaultInstance().aggregateTrustInput(
         contextId: contextId,
         subjectDid: subjectDid,
         eventsJson: eventsJson,

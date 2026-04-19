@@ -34,10 +34,10 @@ public enum ProvenanceBridge {
         _ maxDepth: UInt8?
     ) -> Bool
 
-    /// Default evaluate quality function — delegates to UniFFI
-    /// ``evaluateProvenanceQuality``.
+    /// Default evaluate quality function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/evaluateProvenanceQuality`` method.
     public static let defaultEvaluateQuality: EvaluateQualityFn = { sourceContext, sourceType, contextState, counterparties in
-        try evaluateProvenanceQuality(
+        try Scp.defaultInstance().evaluateProvenanceQuality(
             sourceContext: sourceContext,
             sourceType: sourceType,
             contextState: contextState,
@@ -45,10 +45,10 @@ public enum ProvenanceBridge {
         )
     }
 
-    /// Default attach function — delegates to UniFFI
-    /// ``provenanceAttach``.
+    /// Default attach function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/provenanceAttach`` method.
     public static let defaultAttach: AttachFn = { sourceContextId, sourceType, memoryScope, members, targetContextId, actorDid, existingChainDepth in
-        try provenanceAttach(
+        try Scp.defaultInstance().provenanceAttach(
             sourceContextId: sourceContextId,
             sourceType: sourceType,
             memoryScopeStr: memoryScope,
@@ -59,10 +59,14 @@ public enum ProvenanceBridge {
         )
     }
 
-    /// Default check chain depth function — delegates to UniFFI
-    /// ``provenanceCheckChainDepth``.
+    /// Default check chain depth function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/provenanceCheckChainDepth`` method.
+    ///
+    /// Non-throwing: conservatively returns `false` (outside the allowed
+    /// limit) if the default instance cannot be resolved.
     public static let defaultCheckChainDepth: CheckChainDepthFn = { chainDepth, maxDepth in
-        provenanceCheckChainDepth(chainDepth: chainDepth, maxDepth: maxDepth)
+        guard let scp = try? Scp.defaultInstance() else { return false }
+        return scp.provenanceCheckChainDepth(chainDepth: chainDepth, maxDepth: maxDepth)
     }
 }
 

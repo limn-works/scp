@@ -51,22 +51,23 @@ public enum IdentityBridge {
         _ did: String
     ) async throws -> DidDocument
 
-    /// Default create function — delegates to UniFFI
-    /// ``identityCreate(custody:)``.
+    /// Default create function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/identityCreate(custody:)`` method
+    /// (ADR-048 method migration).
     public static let defaultCreate: CreateFn = { custody in
-        try await identityCreate(custody: custody)
+        try await Scp.defaultInstance().identityCreate(custody: custody)
     }
 
-    /// Default load function — delegates to UniFFI
-    /// ``identityLoad(did:)``.
+    /// Default load function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/identityLoad(did:)`` method.
     public static let defaultLoad: LoadFn = { did in
-        try await identityLoad(did: did)
+        try await Scp.defaultInstance().identityLoad(did: did)
     }
 
-    /// Default resolve function — delegates to UniFFI
-    /// ``identityResolve(did:)``.
+    /// Default resolve function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/identityResolve(did:)`` method.
     public static let defaultResolve: ResolveFn = { did in
-        try await identityResolve(did: did)
+        try await Scp.defaultInstance().identityResolve(did: did)
     }
 
     /// Check whether an identity has an agent signing key.
@@ -134,16 +135,17 @@ public enum IdentityBridge {
         _ identity: Identity
     ) async throws -> Identity
 
-    /// Default create with agent key function — delegates to UniFFI
-    /// ``identityCreateWithAgentKey(custody:)``.
+    /// Default create with agent key function — delegates to the
+    /// process-wide default ``Scp`` instance's
+    /// ``Scp/identityCreateWithAgentKey(custody:)`` method.
     public static let defaultCreateWithAgentKey: CreateWithAgentKeyFn = { custody in
-        try await identityCreateWithAgentKey(custody: custody)
+        try await Scp.defaultInstance().identityCreateWithAgentKey(custody: custody)
     }
 
-    /// Default migrate function — delegates to UniFFI
-    /// ``identityMigrate(identity:)``.
+    /// Default migrate function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/identityMigrate(identity:)`` method.
     public static let defaultMigrate: MigrateFn = { identity in
-        try await identityMigrate(identity: identity)
+        try await Scp.defaultInstance().identityMigrate(identity: identity)
     }
 
     /// Generate a device attestation token for an identity.
@@ -157,16 +159,18 @@ public enum IdentityBridge {
         _ tokenBase64: String
     ) async throws -> Bool
 
-    /// Default attest device function — delegates to UniFFI
-    /// ``identityAttestDevice(identity:)``.
+    /// Default attest device function — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/identityAttestDevice(identity:)``
+    /// method.
     public static let defaultAttestDevice: AttestDeviceFn = { identity in
-        try await identityAttestDevice(identity: identity)
+        try await Scp.defaultInstance().identityAttestDevice(identity: identity)
     }
 
-    /// Default verify device attestation function — delegates to UniFFI
-    /// ``identityVerifyDeviceAttestation(did:tokenBase64:)``.
+    /// Default verify device attestation function — delegates to the
+    /// process-wide default ``Scp`` instance's
+    /// ``Scp/identityVerifyDeviceAttestation(did:tokenBase64:)`` method.
     public static let defaultVerifyDeviceAttestation: VerifyDeviceAttestationFn = { did, tokenBase64 in
-        try await identityVerifyDeviceAttestation(did: did, tokenBase64: tokenBase64)
+        try await Scp.defaultInstance().identityVerifyDeviceAttestation(did: did, tokenBase64: tokenBase64)
     }
 
     /// Execute the compromise recovery protocol for an identity.
@@ -183,16 +187,19 @@ public enum IdentityBridge {
         _ contextIds: [String]
     ) async throws -> String
 
-    /// Default execute recovery function — delegates to UniFFI
-    /// ``identityExecuteRecovery(did:tier:contextIds:)``.
+    /// Default execute recovery function — delegates to the process-wide
+    /// default ``Scp`` instance's
+    /// ``Scp/identityExecuteRecovery(did:tier:contextIds:)`` method.
     public static let defaultExecuteRecovery: ExecuteRecoveryFn = { did, tier, contextIds in
-        try await identityExecuteRecovery(did: did, tier: tier, contextIds: contextIds)
+        try await Scp.defaultInstance().identityExecuteRecovery(did: did, tier: tier, contextIds: contextIds)
     }
 
-    /// Default execute custody migration function — delegates to UniFFI
-    /// ``identityExecuteCustodyMigration(did:target:contextIds:)``.
+    /// Default execute custody migration function — delegates to the
+    /// process-wide default ``Scp`` instance's
+    /// ``Scp/identityExecuteCustodyMigration(did:target:contextIds:)`` method.
     public static let defaultExecuteCustodyMigration: ExecuteCustodyMigrationFn = { did, target, contextIds in
-        try await identityExecuteCustodyMigration(did: did, target: target, contextIds: contextIds)
+        try await Scp.defaultInstance()
+            .identityExecuteCustodyMigration(did: did, target: target, contextIds: contextIds)
     }
 }
 
@@ -773,14 +780,18 @@ public enum IdentityAttestationBridge {
         _ attestationId: String
     ) async throws -> Bool
 
-    /// Default create function — delegates to UniFFI
-    /// ``identityCreateLinkAttestation(identity:platform:handle:proof:verificationMethod:platformId:)``.
+    /// Default create function — delegates to the process-wide default
+    /// ``Scp`` instance's
+    /// ``Scp/identityCreateLinkAttestation(identity:platform:handle:proof:verificationMethod:platformId:)``
+    /// method.
     ///
-    /// Loads the ``Identity`` from the DID string via ``identityLoad(did:)``,
-    /// then calls the UniFFI create function and parses the JSON result.
+    /// Loads the ``Identity`` from the DID string via
+    /// ``Scp/identityLoad(did:)``, then calls the UniFFI create method and
+    /// parses the JSON result.
     public static let defaultCreate: CreateFn = { did, platform, handle, proof, verificationMethod, platformId in
-        let identity = try await identityLoad(did: did)
-        let json = try await identityCreateLinkAttestation(
+        let scp = try Scp.defaultInstance()
+        let identity = try await scp.identityLoad(did: did)
+        let json = try await scp.identityCreateLinkAttestation(
             identity: identity,
             platform: platform,
             handle: handle,
@@ -791,19 +802,25 @@ public enum IdentityAttestationBridge {
         return try AttestationWire.parseAttestation(from: json)
     }
 
-    /// Default list function — delegates to UniFFI
-    /// ``identityLinkAttestations(did:)``.
+    /// Default list function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/identityLinkAttestations(did:)`` method.
     ///
-    /// Calls the UniFFI list function and parses the JSON array result.
+    /// Calls the UniFFI list method and parses the JSON array result.
     public static let defaultList: ListFn = { did in
-        let json = try identityLinkAttestations(did: did)
+        let json = try Scp.defaultInstance().identityLinkAttestations(did: did)
         return try AttestationWire.parseAttestations(from: json)
     }
 
-    /// Default remove function — delegates to UniFFI
-    /// ``identityRemoveLinkAttestation(did:attestationId:)``.
+    /// Default remove function — delegates to the process-wide default
+    /// ``Scp`` instance's
+    /// ``Scp/identityRemoveLinkAttestation(did:attestationId:)`` method.
     public static let defaultRemove: RemoveFn = { did, attestationId in
-        identityRemoveLinkAttestation(did: did, attestationId: attestationId)
+        // The UniFFI `Scp.identityRemoveLinkAttestation(...)` method is
+        // non-throwing (returns Bool); `Scp.defaultInstance()` throws so
+        // the `try?` fallback returns `false` if the default instance
+        // cannot be resolved (suspended / shut down).
+        guard let scp = try? Scp.defaultInstance() else { return false }
+        return scp.identityRemoveLinkAttestation(did: did, attestationId: attestationId)
     }
 
     /// Verify an attestation's signature and validity.
@@ -816,8 +833,10 @@ public enum IdentityAttestationBridge {
         _ issuerPublicKeyHex: String
     ) async throws -> Bool
 
-    /// Default verify function — delegates to UniFFI
-    /// ``identityVerifyLinkAttestation(attestationJson:issuerPublicKeyHex:)``.
+    /// Default verify function — delegates to the process-wide default
+    /// ``Scp`` instance's
+    /// ``Scp/identityVerifyLinkAttestation(attestationJson:issuerPublicKeyHex:)``
+    /// method.
     ///
     /// Uses ``IdentityAttestation/rawJson`` when available for exact
     /// roundtrip fidelity. Falls back to re-serializing the attestation
@@ -829,7 +848,7 @@ public enum IdentityAttestationBridge {
         } else {
             json = try AttestationWire.serializeAttestation(attestation)
         }
-        return try await identityVerifyLinkAttestation(
+        return try await Scp.defaultInstance().identityVerifyLinkAttestation(
             attestationJson: json,
             issuerPublicKeyHex: issuerPublicKeyHex
         )

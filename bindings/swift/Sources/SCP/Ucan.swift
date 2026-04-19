@@ -86,19 +86,33 @@ public enum UcanBridge {
         _ revokerDid: String
     ) async throws -> Void
 
-    /// Default validate function that delegates to the UniFFI-generated binding.
+    /// Default validate function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/ucanValidate`` method.
     public static let defaultValidate: ValidateFn = { handle, token, capability, presentingAgentDid, proofTokens in
-        try await ucanValidate(handle: handle, token: token, capability: capability, presentingAgentDid: presentingAgentDid, proofTokens: proofTokens)
+        try await Scp.defaultInstance().ucanValidate(
+            handle: handle,
+            token: token,
+            capability: capability,
+            presentingAgentDid: presentingAgentDid,
+            proofTokens: proofTokens
+        )
     }
 
-    /// Default mint function that delegates to the UniFFI-generated binding.
+    /// Default mint function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/ucanMint`` method.
     public static let defaultMint: MintFn = { handle, memberDid, capabilities, proofs in
-        try await ucanMint(handle: handle, memberDid: memberDid, capabilities: capabilities, proofs: proofs)
+        try await Scp.defaultInstance().ucanMint(
+            handle: handle,
+            memberDid: memberDid,
+            capabilities: capabilities,
+            proofs: proofs
+        )
     }
 
-    /// Default revoke function that delegates to the UniFFI-generated binding.
+    /// Default revoke function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/ucanRevoke`` method.
     public static let defaultRevoke: RevokeFn = { handle, token, revokerDid in
-        try await ucanRevoke(handle: handle, token: token, revokerDid: revokerDid)
+        try await Scp.defaultInstance().ucanRevoke(handle: handle, token: token, revokerDid: revokerDid)
     }
 
     /// Delegate a UCAN token. Maps to ``ucanDelegate`` in ScpBindings.
@@ -110,10 +124,18 @@ public enum UcanBridge {
         _ capabilities: [String]
     ) async throws -> UcanToken
 
-    /// Default delegate function — delegates to UniFFI
-    /// ``ucanDelegate(handle:delegatorDid:delegateeDid:parentToken:capabilities:)``.
+    /// Default delegate function — delegates to the process-wide default
+    /// ``Scp`` instance's
+    /// ``Scp/ucanDelegate(handle:delegatorDid:delegateeDid:parentToken:capabilities:)``
+    /// method.
     public static let defaultDelegate: DelegateFn = { handle, delegatorDid, delegateeDid, parentToken, capabilities in
-        try await ucanDelegate(handle: handle, delegatorDid: delegatorDid, delegateeDid: delegateeDid, parentToken: parentToken, capabilities: capabilities)
+        try await Scp.defaultInstance().ucanDelegate(
+            handle: handle,
+            delegatorDid: delegatorDid,
+            delegateeDid: delegateeDid,
+            parentToken: parentToken,
+            capabilities: capabilities
+        )
     }
 }
 

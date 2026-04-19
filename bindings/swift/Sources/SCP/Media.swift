@@ -83,59 +83,85 @@ public enum MediaBridge {
 
     // Default implementations
 
-    /// Default check capability -- delegates to UniFFI ``mediaCheckCapability``.
+    /// Default check capability — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/mediaCheckCapability`` method.
     public static let defaultCheckCapability: CheckCapabilityFn = { ceiling, capability in
-        try mediaCheckCapability(ceiling: ceiling, capability: capability)
+        try Scp.defaultInstance().mediaCheckCapability(ceiling: ceiling, capability: capability)
     }
 
-    /// Default initiate session -- delegates to UniFFI ``mediaInitiateSession``.
+    /// Default initiate session — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/mediaInitiateSession`` method.
     public static let defaultInitiateSession: InitiateSessionFn = { contextId, ceiling, capabilities, participants, timestamp in
-        try mediaInitiateSession(contextId: contextId, ceiling: ceiling, capabilities: capabilities, participants: participants, timestamp: timestamp)
+        try Scp.defaultInstance().mediaInitiateSession(
+            contextId: contextId,
+            ceiling: ceiling,
+            capabilities: capabilities,
+            participants: participants,
+            timestamp: timestamp
+        )
     }
 
-    /// Default activate session -- delegates to UniFFI ``mediaActivateSession``.
+    /// Default activate session — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/mediaActivateSession`` method.
     public static let defaultActivateSession: ActivateSessionFn = { sessionJson in
-        try mediaActivateSession(sessionJson: sessionJson)
+        try Scp.defaultInstance().mediaActivateSession(sessionJson: sessionJson)
     }
 
-    /// Default join session -- delegates to UniFFI ``mediaJoinSession``.
+    /// Default join session — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/mediaJoinSession`` method.
     public static let defaultJoinSession: JoinSessionFn = { sessionJson, participantDid in
-        try mediaJoinSession(sessionJson: sessionJson, participantDid: participantDid)
+        try Scp.defaultInstance().mediaJoinSession(sessionJson: sessionJson, participantDid: participantDid)
     }
 
-    /// Default end session -- delegates to UniFFI ``mediaEndSession``.
+    /// Default end session — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/mediaEndSession`` method.
     public static let defaultEndSession: EndSessionFn = { sessionJson, timestamp in
-        try mediaEndSession(sessionJson: sessionJson, timestamp: timestamp)
+        try Scp.defaultInstance().mediaEndSession(sessionJson: sessionJson, timestamp: timestamp)
     }
 
-    /// Default create offer -- delegates to UniFFI ``mediaCreateOffer``.
+    /// Default create offer — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/mediaCreateOffer`` method.
     public static let defaultCreateOffer: CreateOfferFn = { sessionId, sdp, senderDid in
-        try mediaCreateOffer(sessionId: sessionId, sdp: sdp, senderDid: senderDid)
+        try Scp.defaultInstance().mediaCreateOffer(sessionId: sessionId, sdp: sdp, senderDid: senderDid)
     }
 
-    /// Default create answer -- delegates to UniFFI ``mediaCreateAnswer``.
+    /// Default create answer — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/mediaCreateAnswer`` method.
     public static let defaultCreateAnswer: CreateAnswerFn = { sessionId, sdp, senderDid in
-        try mediaCreateAnswer(sessionId: sessionId, sdp: sdp, senderDid: senderDid)
+        try Scp.defaultInstance().mediaCreateAnswer(sessionId: sessionId, sdp: sdp, senderDid: senderDid)
     }
 
-    /// Default create ICE candidate -- delegates to UniFFI ``mediaCreateIceCandidate``.
+    /// Default create ICE candidate — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/mediaCreateIceCandidate`` method.
     public static let defaultCreateIceCandidate: CreateIceCandidateFn = { sessionId, candidate, senderDid, sdpMid, sdpMlineIndex in
-        try mediaCreateIceCandidate(sessionId: sessionId, candidate: candidate, senderDid: senderDid, sdpMid: sdpMid, sdpMlineIndex: sdpMlineIndex)
+        try Scp.defaultInstance().mediaCreateIceCandidate(
+            sessionId: sessionId,
+            candidate: candidate,
+            senderDid: senderDid,
+            sdpMid: sdpMid,
+            sdpMlineIndex: sdpMlineIndex
+        )
     }
 
-    /// Default create session end -- delegates to UniFFI ``mediaCreateSessionEnd``.
+    /// Default create session end — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/mediaCreateSessionEnd`` method.
     public static let defaultCreateSessionEnd: CreateSessionEndFn = { sessionId, senderDid in
-        try mediaCreateSessionEnd(sessionId: sessionId, senderDid: senderDid)
+        try Scp.defaultInstance().mediaCreateSessionEnd(sessionId: sessionId, senderDid: senderDid)
     }
 
-    /// Default send signaling -- delegates to UniFFI ``mediaSendSignaling``.
+    /// Default send signaling — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/mediaSendSignaling`` method.
     public static let defaultSendSignaling: SendSignalingFn = { signalingJson in
-        try mediaSendSignaling(signalingJson: signalingJson)
+        try Scp.defaultInstance().mediaSendSignaling(signalingJson: signalingJson)
     }
 
-    /// Default verify sender attribution -- delegates to UniFFI ``mediaVerifySenderAttribution``.
+    /// Default verify sender attribution — delegates to the process-wide
+    /// default ``Scp`` instance's ``Scp/mediaVerifySenderAttribution`` method.
     public static let defaultVerifySenderAttribution: VerifySenderAttributionFn = { signalingJson, envelopeSenderDid in
-        try mediaVerifySenderAttribution(signalingJson: signalingJson, envelopeSenderDid: envelopeSenderDid)
+        try Scp.defaultInstance().mediaVerifySenderAttribution(
+            signalingJson: signalingJson,
+            envelopeSenderDid: envelopeSenderDid
+        )
     }
 }
 

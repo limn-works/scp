@@ -78,19 +78,22 @@ public enum TransportBridge {
         _ manager: TransportManager
     ) async throws -> Void
 
-    /// Default connect function that delegates to the UniFFI-generated binding.
+    /// Default connect function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/transportConnect(relayUrl:)`` method.
     public static let defaultConnect: ConnectFn = { relayUrl in
-        try await transportConnect(relayUrl: relayUrl)
+        try await Scp.defaultInstance().transportConnect(relayUrl: relayUrl)
     }
 
-    /// Default status function that delegates to the UniFFI-generated binding.
+    /// Default status function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/transportStatus(manager:)`` method.
     public static let defaultStatus: StatusFn = { manager in
-        try await transportStatus(manager: manager)
+        try await Scp.defaultInstance().transportStatus(manager: manager)
     }
 
-    /// Default disconnect function that delegates to the UniFFI-generated binding.
+    /// Default disconnect function — delegates to the process-wide default
+    /// ``Scp`` instance's ``Scp/transportDisconnect(manager:)`` method.
     public static let defaultDisconnect: DisconnectFn = { manager in
-        try await transportDisconnect(manager: manager)
+        try await Scp.defaultInstance().transportDisconnect(manager: manager)
     }
 }
 
