@@ -42,7 +42,7 @@ def scp() -> Iterator:
 
     try:
         instance = SCP()
-    except Exception as exc:  # noqa: BLE001 - surface bridge init failure clearly
+    except Exception as exc:
         pytest.skip(f"SCP() construction failed — extension not built: {exc}")
 
     try:
@@ -51,5 +51,5 @@ def scp() -> Iterator:
         # Matches SCP.__exit__: 5-second graceful shutdown.
         try:
             instance.shutdown(5.0)
-        except Exception:  # noqa: BLE001 - idempotent shutdown at teardown
+        except Exception:
             pass
