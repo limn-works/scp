@@ -851,9 +851,9 @@ The cross-context saga coordinator (§5.15.4) writes phase transitions to a dura
 
 The journal surface provides three operations:
 
-- **Append a journal entry.** The operation does not return until the entry is durably persisted: any write buffers the backend maintains (OS page cache, application buffer, network replication pipeline) MUST be flushed before the call returns success. Backends that cannot flush durably MUST refuse to be used as a saga journal; construction fails closed. Partial writes MUST be detectable on reload (e.g., length prefix plus checksum).
+- **Append a journal entry.** The operation does not return until the entry is durably persisted: any write buffers the backend maintains (OS page cache, application buffer, network replication pipeline) MUST be flushed before the call returns success. Backends that cannot flush durably MUST refuse to be used as a saga journal; construction fails closed. Partial writes MUST be detectable on reload (e.g., length prefix plus checksum). The operation is non-cancellable in practice: callers MUST NOT cancel it mid-flight, and a cancelled append is treated as "state unknown" at restart — the next unresolved-saga scan detects any half-written entry and reconciles.
 - **Load unresolved sagas.** Returns the latest entry per saga identifier for sagas not in a terminal state. Used at process start for crash-recovery replay.
-- **Mark a saga terminally resolved.** For sagas classified as secret-bearing (§9.4.3), the operation MUST synchronously overwrite the on-disk evidence bytes before returning; it does not wait for the backend's next compaction.
+- **Mark a saga terminally resolved.** For sagas classified as secret-bearing (§9.4.3), the operation MUST synchronously overwrite the on-disk evidence bytes before returning; it does not wait for the backend's next compaction. The operation is non-cancellable for secret-bearing sagas: if a cancellation occurs before the overwrite completes (e.g., process abort), implementations MUST complete the overwrite on the next process start before the journal is opened for any other use. Secret bytes MUST NOT survive on disk past the next journal open.
 
 Journal entries are append-only per saga identifier. Earlier entries are not rewritten.
 

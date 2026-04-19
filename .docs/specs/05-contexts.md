@@ -1589,6 +1589,8 @@ Runtimes apply backpressure when a single context's operation queue grows unboun
 
 Authorization-downward operations (see §9.4.2) MUST NOT be starved by coalesced or lower-priority traffic: either the queue is strict FIFO (so §9.4.2 sync-persist bounds remain time-bounded), or authorization-downward commands are processed at or above all other categories. Implementations choose; callers observe no weaker ordering than strict FIFO.
 
+Among commands in the same priority class (including two authorization-downward operations on the same context, or an authorization-downward operation co-pending with a saga-phase message), arrival order is preserved. No reordering is permitted beyond the FIFO or strict-priority-lane-plus-FIFO shapes above; a conformant implementation never processes a later-arriving command of the same class before an earlier-arriving one of the same class.
+
 ### 5.15.2 Context State Variants
 
 A context's state is mode-specific. An encrypted context carries MLS group state and sender keys; a broadcast context carries per-author broadcast keys, subscriber list, and author blocks.
