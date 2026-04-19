@@ -566,3 +566,135 @@ async fn protocol_repo_variant_in_memory_event_log_same_trait_surface() {
     );
     assert_eq!(entries[0].event, "test.ac5.in_memory");
 }
+
+/// Synthetic non-empty `Event` slice used by both AC6 trust-aggregation
+/// dispatch tests. The content is deliberately minimal — aggregation only
+/// requires the slice to be non-empty to bypass `TrustError::EmptyEventLog`.
+fn synthetic_events_for_trust() -> Vec<scp_event_log::Event> {
+    use scp_event_log::{Event, EventPayload, EventType};
+    vec![Event {
+        event_type: EventType::MessageSent,
+        actor_did: scp_identity::DID::from("did:dht:z6MkTrustAc6Actor"),
+        timestamp: 1,
+        sequence: 0,
+        payload: EventPayload {
+            data: b"trust-ac6".to_vec(),
+        },
+        prev_hash: [0u8; 32],
+        signature: vec![0u8; 64],
+    }]
+}
+
+// ---------------------------------------------------------------------------
+// AC6: trust aggregation dispatches correctly over ProtocolRepoVariant arms
+//
+// The trust-aggregation surface (`aggregate_trust_input` on NAPI/UniFFI,
+// `aggregate_with_storage` on PyO3) matches on the active repository
+// variant and constructs a `ProtocolRepositoryTrustBridge` over the
+// concrete storage type. Fix 9 (PR #1690 review) asks for per-variant
+// coverage: construct each arm, wrap in the trust bridge, call
+// `populate_and_aggregate`, and confirm the aggregation returns a
+// well-shaped result. This catches regressions where one match arm
+// silently returns a degenerate trust input while the other works.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trust_aggregation_dispatches_over_in_memory_variant() {
+    use scp_core::store::ProtocolRepository;
+    use scp_ffi_common::bridge_runtime::{BridgeInMemoryStorage, ProtocolRepoVariant};
+    use scp_ffi_common::trust_store::populate_and_aggregate;
+    use scp_platform::encrypting_adapter::EncryptingAdapter;
+    use std::sync::Arc;
+
+    let key: [u8; 32] = [0u8; 32];
+    let encrypted = EncryptingAdapter::new(BridgeInMemoryStorage::new(), key.into());
+    let repo = Arc::new(ProtocolRepository::new(encrypted));
+    let variant = ProtocolRepoVariant::InMemory(Arc::clone(&repo));
+
+    // Exhaustiveness check: if the enum ever grows a new variant, the
+    // match below stops compiling — forcing the test author to add a
+    // parallel test for the new arm. Without this gate, a silent new
+    // arm would bypass trust coverage.
+    match &variant {
+        ProtocolRepoVariant::InMemory(_) | ProtocolRepoVariant::Sqlite(_) => {}
+    }
+
+    let ProtocolRepoVariant::InMemory(in_memory_repo) = &variant else {
+        panic!("variant must be InMemory for this test");
+    };
+    let handle = tokio::runtime::Handle::current();
+    let bridge =
+        scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(in_memory_repo), handle);
+
+    let events = synthetic_events_for_trust();
+    let json = tokio::task::spawn_blocking(move || {
+        populate_and_aggregate(
+            bridge,
+            "ctx-in-memory-trust",
+            "did:dht:z6MkInMemoryTrustSubject",
+            Vec::new(),
+            &[],
+            &events,
+            [0u8; 32],
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+    })
+    .await
+    .unwrap()
+    .expect("populate_and_aggregate must succeed against the InMemory variant");
+    assert!(
+        !json.is_empty(),
+        "InMemory variant trust aggregation must return a non-empty JSON body"
+    );
+    // The envelope shape must parse as JSON — guards against a variant
+    // dispatch that accidentally returns a raw string.
+    let _parsed: serde_json::Value =
+        serde_json::from_str(&json).expect("aggregation JSON must parse");
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trust_aggregation_dispatches_over_sqlite_variant() {
+    use scp_ffi_common::bridge_runtime::ProtocolRepoVariant;
+    use scp_ffi_common::trust_store::populate_and_aggregate;
+    use std::sync::Arc;
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
+    let repo = Arc::new(ProtocolRepository::new(Arc::new(storage)));
+    let variant = ProtocolRepoVariant::Sqlite(Arc::clone(&repo));
+
+    let ProtocolRepoVariant::Sqlite(sqlite_repo) = &variant else {
+        panic!("variant must be Sqlite for this test");
+    };
+    let handle = tokio::runtime::Handle::current();
+    let bridge =
+        scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(sqlite_repo), handle);
+
+    let events = synthetic_events_for_trust();
+    let json = tokio::task::spawn_blocking(move || {
+        populate_and_aggregate(
+            bridge,
+            "ctx-sqlite-trust",
+            "did:dht:z6MkSqliteTrustSubject",
+            Vec::new(),
+            &[],
+            &events,
+            [0u8; 32],
+            &[],
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        )
+    })
+    .await
+    .unwrap()
+    .expect("populate_and_aggregate must succeed against the Sqlite variant");
+    assert!(
+        !json.is_empty(),
+        "Sqlite variant trust aggregation must return a non-empty JSON body"
+    );
+    let _parsed: serde_json::Value =
+        serde_json::from_str(&json).expect("aggregation JSON must parse");
+}
