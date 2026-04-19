@@ -755,8 +755,33 @@ impl CoreFields {
             }
             return;
         }
+        // Re-check `is_shutdown` after acquiring the lock to close the
+        // TOCTOU window between the check above and the push below. Without
+        // this, a concurrent shutdown could drain and clear the hook vec
+        // (inside `shutdown_core_async`) after we saw `is_shutdown() ==
+        // false` but before our push, leaving the hook registered in a
+        // vec that `shutdown()` has already finished with — so the hook
+        // would never run. When that race happens, run the hook inline,
+        // consistent with the fast-path above.
         match self.shutdown_hooks.lock() {
-            Ok(mut hooks) => hooks.push(hook),
+            Ok(mut hooks) => {
+                if self.is_shutdown() {
+                    drop(hooks);
+                    tracing::warn!(
+                        "shutdown raced with hook registration — running hook immediately"
+                    );
+                    if let Err(_payload) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook))
+                    {
+                        tracing::error!(
+                            "post-shutdown hook panicked — bridge-specific cleanup \
+                             may be incomplete"
+                        );
+                    }
+                } else {
+                    hooks.push(hook);
+                }
+            }
             Err(_) => {
                 tracing::error!(
                     "shutdown_hooks mutex poisoned — hook not registered; \
@@ -966,10 +991,19 @@ impl CoreFields {
     /// URL in subsequent reconnect attempts after [`resume`]. Duplicate
     /// calls are idempotent because the underlying set deduplicates.
     ///
+    /// No-op after [`shutdown`] — [`pending_relay_urls`] is cleared on
+    /// shutdown and we must not resurrect it by admitting a late writer.
+    /// Without this guard, a concurrent `add_relay_url` racing with a
+    /// shutdown-triggered `relay_urls.clear()` could leave a stale URL in
+    /// the set that a subsequent `resume` would try to dial.
+    ///
     /// If the `relay_urls` mutex is poisoned (a previous caller panicked
     /// while holding it), the URL is silently dropped and a warning is
     /// logged — a lost relay URL on resume is recoverable by the caller.
     pub fn add_relay_url(&self, url: String) {
+        if self.is_shutdown() {
+            return;
+        }
         match self.relay_urls.lock() {
             Ok(mut guard) => {
                 guard.insert(url);
@@ -2773,6 +2807,59 @@ mod tests {
         assert!(instance.is_shutdown());
     }
 
+    #[test]
+    fn register_hook_race_with_shutdown_never_drops_hook() {
+        // Stress test for the TOCTOU race between `is_shutdown()` and the
+        // `shutdown_hooks.lock()` acquisition in `register_shutdown_hook`.
+        //
+        // Before the double-check fix, a hook registered on thread B
+        // between the first `is_shutdown()` check (false) and the push
+        // after lock acquisition could land in a hook vec that
+        // `shutdown()` had already drained on thread A — silently losing
+        // the hook. The fix rechecks `is_shutdown()` under the lock and
+        // runs the hook inline when shutdown raced us.
+        //
+        // This test verifies the contract: every hook registered must
+        // either run (inline or during shutdown()) or not be registered
+        // at all. It cannot be forgotten.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for _ in 0..50 {
+            let instance = Arc::new(CoreFields::with_context_manager(test_context_manager()));
+            let fired = Arc::new(AtomicUsize::new(0));
+
+            // Thread B: register several hooks concurrently with shutdown.
+            let inst_b = Arc::clone(&instance);
+            let fired_b = Arc::clone(&fired);
+            let b = std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let f = Arc::clone(&fired_b);
+                    inst_b.register_shutdown_hook(Box::new(move || {
+                        f.fetch_add(1, Ordering::SeqCst);
+                    }));
+                }
+            });
+
+            // Thread A: trigger shutdown while B is still registering.
+            let inst_a = Arc::clone(&instance);
+            let a = std::thread::spawn(move || {
+                inst_a.shutdown();
+            });
+
+            a.join().unwrap();
+            b.join().unwrap();
+
+            // Every one of the 100 hooks must have fired — none may be
+            // silently dropped. They either ran during shutdown() or ran
+            // immediately on the late-registration path.
+            assert_eq!(
+                fired.load(Ordering::SeqCst),
+                100,
+                "every registered hook must run; race must not drop any"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------
     // Shutdown hook: hooks run exactly once, modify external state
     // -----------------------------------------------------------------
@@ -3092,6 +3179,19 @@ mod tests {
         let urls = instance.pending_relay_urls();
         assert_eq!(urls.len(), 1);
         assert!(urls.contains("wss://relay2.example.com"));
+    }
+
+    #[test]
+    fn add_relay_url_after_shutdown_is_noop() {
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        instance.shutdown();
+        instance.add_relay_url("wss://relay.example.com".to_owned());
+        assert!(
+            instance.pending_relay_urls().is_empty(),
+            "add_relay_url must not resurrect the relay_urls set after shutdown \
+             cleared it — that would leak a URL into a subsequent resume attempt"
+        );
+        assert!(!instance.has_pending_relay_urls());
     }
 
     #[test]
