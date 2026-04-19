@@ -14033,6 +14033,764 @@ impl Scp {
         // not need to flow into the implementation.
         identity_verify_link_attestation_impl(attestation_json, issuer_public_key_hex).await
     }
+
+    // ===== UniFFI sub-slice C — context lifecycle =====
+    //
+    // Migrates the 6 context lifecycle free functions
+    // (`context_create`, `context_join`, `context_leave`, `context_close`,
+    // `context_send`, `context_subscribe`) to `impl crate::scp::Scp`
+    // methods routing through `&self.inner` (the `UniffiBridgeInstance`
+    // owned by the caller).
+    //
+    // Free functions above are retained (they still compile and are still
+    // exported via `#[uniffi::export]`) — the demolition slice at the end
+    // of PR 4 removes them in one shot after every caller is migrated.
+    // Bodies are preserved verbatim except for the
+    // `DEFAULT_BRIDGE_INSTANCE`/module-level-helper → `&*self.inner` swap
+    // described in the PR 4 sub-slice C plan.
+    //
+    // Part of #1549 Phase 4 PR 4.
+
+    /// Per-instance equivalent of the free-function [`context_create`].
+    ///
+    /// Creates a new SCP context under this instance. Routes through
+    /// `&*self.inner` instead of the process-wide
+    /// `DEFAULT_BRIDGE_INSTANCE` — the `ContextManager` initialization
+    /// (`init_context_manager_with_did`), the per-context UCAN registry,
+    /// and the returned handle's `instance_id` stamping are all scoped to
+    /// this `SCP`. The context handle is rejected on any other `SCP`.
+    ///
+    /// See the documentation on the free [`context_create`] function for
+    /// argument semantics and MLS group / event-log initialization
+    /// details.
+    pub async fn context_create(
+        &self,
+        identity: Arc<Identity>,
+        params: ContextParams,
+    ) -> Result<Arc<ContextHandle>, ScpError> {
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                validate_did(&identity.did)?;
+
+                let context_id = format!("ctx-{}", Uuid::new_v4());
+
+                // Convert bridge ContextParams to scp-core ContextParams.
+                let core_params = bridge_params_to_core(&params)?;
+                // Retain a clone for the FFI handle — finalize_close needs the real
+                // memory_scope to decide key destruction behavior.
+                let retained_core_params = core_params.clone();
+
+                // Initialize the ContextManager with the creator's DID if not
+                // already done. `init_context_manager_with_did` is idempotent
+                // (`OnceLock` — first call wins). The bridge no longer supports
+                // a DID-less stub crypto path; the creator DID becomes the
+                // process-wide MLS credential identity.
+                bi.init_context_manager_with_did(&identity.did);
+
+                // Extract key custody and signing key from the identity.
+                #[cfg(feature = "allow_in_memory_custody")]
+                let in_memory_custody = identity.in_memory_custody.clone();
+                let callback_custody = identity.callback_custody.clone();
+                let signing_key = identity.core_id.as_ref().map(|id| id.active_signing_key);
+
+                // §9.10.4: Derive the context-scoped pseudonym routing ID via the
+                // retained KeyCustody BEFORE context creation so it can be passed
+                // to the ContextManager for per-member routing.
+                let local_pseudonym: Option<[u8; 32]> = if let Some(identity_key) =
+                    identity.core_id.as_ref().map(|id| &id.identity_key)
+                {
+                    let pseudonym = if let Some(ref cb) = callback_custody {
+                        cb.derive_pseudonym(identity_key, context_id.as_bytes())
+                            .await
+                            .ok()
+                    } else {
+                        #[cfg(feature = "allow_in_memory_custody")]
+                        {
+                            if let Some(ref imc) = identity.in_memory_custody {
+                                imc.0
+                                    .derive_pseudonym(identity_key, context_id.as_bytes())
+                                    .await
+                                    .ok()
+                            } else {
+                                None
+                            }
+                        }
+                        #[cfg(not(feature = "allow_in_memory_custody"))]
+                        {
+                            None
+                        }
+                    };
+                    pseudonym.and_then(|p| p.public_key.as_bytes().try_into().ok())
+                } else {
+                    None
+                };
+
+                // Delegate to the shared ContextManager with pseudonym.
+                let manager = bi.context_manager_or_error()?;
+                let _core_handle = manager
+                    .create_context(
+                        context_id.clone(),
+                        core_params,
+                        identity.did.clone().into(),
+                        local_pseudonym,
+                    )
+                    .await
+                    .map_err(ScpError::from)?;
+
+                // Register the creator's DID as a local DID for defense-in-depth,
+                // matching NAPI's behavior.
+                manager
+                    .register_local_did(identity.did.clone().into())
+                    .await;
+
+                // Register per-context UCAN validation state (revocation list,
+                // nonce tracker, event log) for the UCAN pipeline.
+                crate::runtime::ensure_ucan_registered(&context_id, &identity.did, &params.ceiling);
+
+                // §9.10.4: Send pseudonym announcement to inform other members of
+                // the creator's per-context routing ID. For freshly created
+                // single-member contexts this is a no-op (no recipients), but on
+                // restored/imported contexts with existing members the announcement
+                // is needed. Best-effort: if signing key is not available, skip.
+                if local_pseudonym.is_some() {
+                    let sender_did = scp_identity::DID(identity.did.clone());
+                    let core_handle = scp_core::context::ContextHandle::new(
+                        context_id.clone(),
+                        retained_core_params.clone(),
+                    );
+                    let _ = core_handle
+                        .transition_to(&scp_core::context::ContextState::Active)
+                        .await;
+                    let sk_opt: Option<ed25519_dalek::SigningKey> =
+                        if let Some(ref ik) = identity.core_id {
+                            if let Some(ref cb) = identity.callback_custody {
+                                cb.export_ed25519_signing_key(&ik.active_signing_key)
+                                    .await
+                                    .ok()
+                            } else {
+                                #[cfg(feature = "allow_in_memory_custody")]
+                                {
+                                    if let Some(ref custody) = identity.in_memory_custody {
+                                        custody
+                                            .0
+                                            .export_ed25519_signing_key(&ik.active_signing_key)
+                                            .await
+                                            .ok()
+                                    } else {
+                                        None
+                                    }
+                                }
+                                #[cfg(not(feature = "allow_in_memory_custody"))]
+                                {
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                    if let Some(sk) = sk_opt {
+                        manager
+                            .send_pseudonym_announcement(&core_handle, &sender_did, &sk)
+                            .await;
+                    }
+                }
+
+                let handle = Arc::new(ContextHandle {
+                    context_id,
+                    state: tokio::sync::Mutex::new(ContextState::Active),
+                    creator_did: identity.did.clone(),
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    in_memory_custody,
+                    callback_custody,
+                    signing_key,
+                    ceiling_strings: params
+                        .ceiling
+                        .iter()
+                        .map(|s| {
+                            scp_core::context::roles::Capability::new(s).ucan_capability_name()
+                        })
+                        .collect(),
+                    tool_registry: tokio::sync::Mutex::new(
+                        scp_core::context::tools::ToolRegistry::new(),
+                    ),
+                    tool_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+                    session_store: tokio::sync::Mutex::new(
+                        scp_core::context::tools::SessionStore::new(),
+                    ),
+                    economic_policy: std::sync::Mutex::new(None),
+                    core_context_params: retained_core_params,
+                    instance_id: bi.core.instance_id(),
+                });
+                // Register in the global context handle registry so the MCP
+                // bridge provider can look up per-context state by context ID.
+                register_context_handle(&handle);
+                increment_handle_count();
+                Ok(handle)
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during context creation: {e}"),
+                code: codes::CTX_2011.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`context_join`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` /
+    /// `Identity` whose `instance_id` does not match this `SCP`'s.
+    ///
+    /// See the documentation on the free [`context_join`] function for
+    /// argument semantics and the spending-UCAN AND-composition path.
+    pub async fn context_join(
+        &self,
+        handle: Arc<ContextHandle>,
+        identity: Arc<Identity>,
+        spending_ucan_jwt: Option<String>,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                validate_did(&identity.did)?;
+
+                let state = handle.state.lock().await;
+
+                if !matches!(*state, ContextState::Active) {
+                    return Err(ScpError::Context {
+                        msg: format!(
+                            "cannot join context in {:?} state — context must be active",
+                            *state
+                        ),
+                        code: codes::CTX_2013.to_owned(),
+                    });
+                }
+                drop(state);
+
+                // Parse the optional spending UCAN JWT once at the bridge boundary
+                // so malformed tokens are rejected before the manager is touched.
+                // Mirrors PyO3 (`scp-ffi/src/context.rs`) and NAPI parity.
+                let spending_ucan = spending_ucan_jwt
+                    .as_deref()
+                    .map(|jwt| {
+                        scp_core::crypto::ucan::validate::parse_ucan(jwt).map_err(|e| {
+                            ScpError::Context {
+                                msg: format!("invalid spending UCAN: {e}"),
+                                code: codes::ECON_12061.to_owned(),
+                            }
+                        })
+                    })
+                    .transpose()?;
+
+                // Ensure the ContextManager is initialized with the joining
+                // identity's DID — context_join is a valid first operation
+                // (e.g. a device joining a context without creating one).
+                // `init_context_manager_with_did` is idempotent (`OnceLock`). #1073
+                bi.init_context_manager_with_did(&identity.did);
+
+                // Delegate to the shared ContextManager. Build a core ContextHandle
+                // to pass the context_id, then join via the manager.
+                //
+                // This ephemeral ContextHandle carries default params — the
+                // ContextManager ignores them, performing version compatibility
+                // checks against the stored context's params instead.
+                let manager = bi.context_manager_or_error()?;
+                let core_handle = scp_core::context::ContextHandle::new(
+                    handle.context_id.clone(),
+                    scp_core::context::ContextParams::default(),
+                );
+                // Transition core handle to Active so join_context accepts it.
+                let _ = core_handle
+                    .transition_to(&scp_core::context::ContextState::Active)
+                    .await;
+
+                // Generate a real MLS key package for the joining member. The
+                // `MlsCryptoProvider` requires `Some(bytes)` — the old DID-less
+                // `FfiBridgeCrypto` stub accepted `None`, but commit 4 replaced
+                // it with real MLS crypto across every bridge entry point.
+                let kp_bytes = generate_mls_key_package_bytes(&identity.did)?;
+                let key_package = KeyPackage {
+                    owner_did: identity.did.clone().into(),
+                    mls_key_package_bytes: Some(kp_bytes),
+                };
+
+                // §9.10.4: Derive pseudonym for per-member routing. Uses the
+                // identity's custody provider (callback or in-memory).
+                let identity_key = identity.core_id.as_ref().map(|id| id.identity_key);
+                let local_pseudonym: Option<[u8; 32]> = if let Some(ik) = identity_key {
+                    let pseudonym = if let Some(ref cb) = identity.callback_custody {
+                        cb.derive_pseudonym(&ik, handle.context_id.as_bytes())
+                            .await
+                            .ok()
+                    } else {
+                        #[cfg(feature = "allow_in_memory_custody")]
+                        {
+                            if let Some(ref custody) = identity.in_memory_custody {
+                                custody
+                                    .0
+                                    .derive_pseudonym(&ik, handle.context_id.as_bytes())
+                                    .await
+                                    .ok()
+                            } else {
+                                None
+                            }
+                        }
+                        #[cfg(not(feature = "allow_in_memory_custody"))]
+                        {
+                            None
+                        }
+                    };
+                    pseudonym.and_then(|p| p.public_key.as_bytes().try_into().ok())
+                } else {
+                    None
+                };
+
+                manager
+                    .join_context(
+                        &core_handle,
+                        key_package,
+                        spending_ucan.as_ref(),
+                        local_pseudonym,
+                    )
+                    .await
+                    .map_err(ScpError::from)?;
+
+                // §9.10.4: Send pseudonym announcement to inform existing members.
+                // Best-effort: if signing key is not available, skip silently.
+                if local_pseudonym.is_some() {
+                    let sender_did = scp_identity::DID(identity.did.clone());
+                    let sk_opt: Option<ed25519_dalek::SigningKey> =
+                        if let Some(ref ik) = identity.core_id {
+                            if let Some(ref cb) = identity.callback_custody {
+                                cb.export_ed25519_signing_key(&ik.active_signing_key)
+                                    .await
+                                    .ok()
+                            } else {
+                                #[cfg(feature = "allow_in_memory_custody")]
+                                {
+                                    if let Some(ref custody) = identity.in_memory_custody {
+                                        custody
+                                            .0
+                                            .export_ed25519_signing_key(&ik.active_signing_key)
+                                            .await
+                                            .ok()
+                                    } else {
+                                        None
+                                    }
+                                }
+                                #[cfg(not(feature = "allow_in_memory_custody"))]
+                                {
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                    if let Some(sk) = sk_opt {
+                        manager
+                            .send_pseudonym_announcement(&core_handle, &sender_did, &sk)
+                            .await;
+                    }
+                }
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during context join: {e}"),
+                code: codes::CTX_2014.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`context_leave`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` /
+    /// `Identity` whose `instance_id` does not match this `SCP`'s.
+    pub async fn context_leave(
+        &self,
+        handle: Arc<ContextHandle>,
+        identity: Arc<Identity>,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let state = handle.state.lock().await;
+
+                if !matches!(*state, ContextState::Active) {
+                    return Err(ScpError::Context {
+                        msg: format!(
+                            "cannot leave context in {:?} state — context must be active",
+                            *state
+                        ),
+                        code: codes::CTX_2015.to_owned(),
+                    });
+                }
+                drop(state);
+
+                // Delegate to the shared ContextManager.
+                let manager = bi.context_manager_or_error()?;
+                let core_handle = scp_core::context::ContextHandle::new(
+                    handle.context_id.clone(),
+                    scp_core::context::ContextParams::default(),
+                );
+                let _ = core_handle
+                    .transition_to(&scp_core::context::ContextState::Active)
+                    .await;
+
+                let member_did: scp_identity::DID = identity.did.clone().into();
+                manager
+                    .leave_context(&core_handle, &member_did, &member_did)
+                    .await
+                    .map_err(ScpError::from)?;
+
+                // Deregister the context handle from the MCP lookup registry.
+                deregister_context_handle(&handle.context_id);
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during context leave: {e}"),
+                code: codes::CTX_2016.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`context_close`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` /
+    /// `Identity` whose `instance_id` does not match this `SCP`'s.
+    ///
+    /// Authorization is enforced by the `ContextManager` (which delegates
+    /// to `ttl::close_context` checking the `ContextClose` capability) —
+    /// no bridge-layer auth check.
+    pub async fn context_close(
+        &self,
+        handle: Arc<ContextHandle>,
+        identity: Arc<Identity>,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                // Authorization is enforced by the ContextManager (which delegates
+                // to ttl::close_context checking the ContextClose capability). No
+                // bridge-layer auth check — the ContextManager is authoritative.
+                let identity_did = identity.did.clone();
+
+                let mut state = handle.state.lock().await;
+                if !matches!(*state, ContextState::Active) {
+                    return Err(ScpError::Context {
+                        msg: format!(
+                            "cannot close context in {:?} state — context must be active",
+                            *state
+                        ),
+                        code: codes::CTX_2017.to_owned(),
+                    });
+                }
+
+                // Delegate to the shared ContextManager.
+                let manager = bi.context_manager_or_error()?;
+                let core_handle = scp_core::context::ContextHandle::new(
+                    handle.context_id.clone(),
+                    scp_core::context::ContextParams::default(),
+                );
+                let _ = core_handle
+                    .transition_to(&scp_core::context::ContextState::Active)
+                    .await;
+
+                let initiator_did: scp_identity::DID = identity_did.clone().into();
+                manager
+                    .close_context(&core_handle, &initiator_did)
+                    .await
+                    .map_err(ScpError::from)?;
+
+                // Wire CloseOrchestrator for contexts with summary verification.
+                // After the ContextManager has processed the close, check the
+                // context's memory scope and initiate the appropriate destruction
+                // path via CloseOrchestrator (#365).
+                let memory_scope = core_handle.params().memory_scope;
+                let now = scp_primitives::SystemClock.now_secs();
+
+                // Build a fresh `MlsCryptoProvider` for key-destruction scoped to
+                // the initiator's DID. The bridge no longer caches a global stub
+                // crypto provider (commit 4 removed `FfiBridgeCrypto`). The
+                // `CloseOrchestrator` only uses this provider to destroy MLS group
+                // and sender-key material for the context being closed; a fresh
+                // per-call instance is correct.
+                let crypto_provider =
+                    scp_core::crypto::mls::provider::MlsCryptoProvider::new(identity_did);
+                let orchestrator =
+                    scp_core::context::close::CloseOrchestrator::new(&crypto_provider);
+
+                let close_action = orchestrator
+                    .initiate_close(
+                        &handle.context_id,
+                        scp_core::context::close::ContextCloseReason::GovernanceClosed,
+                        memory_scope,
+                        &[], // relay_urls — not available at bridge layer
+                        &[], // blob_ids — not available at bridge layer
+                        scp_core::context::memory_scope::KeyDestructionLevel::SoftwareOnly,
+                        0,    // member_count — not tracked at bridge layer
+                        None, // verification_window_secs — use default
+                        now,
+                    )
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("close orchestration failed: {e}"),
+                        code: codes::CTX_2017.to_owned(),
+                    })?;
+
+                // Log the close action for observability. For Summary scope,
+                // the verification window is opened but not actively polled —
+                // that requires a SummaryTool which needs design decisions.
+                // For Ephemeral, keys are destroyed immediately.
+                // For Full, data is preserved.
+                match close_action {
+                    scp_core::context::close::CloseAction::KeysDestroyed { .. } => {
+                        tracing::info!(
+                            context_id = %handle.context_id,
+                            "close orchestrator: keys destroyed (ephemeral scope)"
+                        );
+                    }
+                    scp_core::context::close::CloseAction::VerificationWindowOpened {
+                        ref window,
+                        ..
+                    } => {
+                        tracing::info!(
+                            context_id = %handle.context_id,
+                            deadline = window.deadline(),
+                            "close orchestrator: summary verification window opened"
+                        );
+                    }
+                    scp_core::context::close::CloseAction::Preserved { .. } => {
+                        tracing::info!(
+                            context_id = %handle.context_id,
+                            "close orchestrator: full data preservation (no key destruction)"
+                        );
+                    }
+                }
+
+                // Clean up per-context UCAN state.
+                crate::runtime::remove_ucan_state(&handle.context_id);
+
+                // Clean up per-context bridge connector state and economy state.
+                bi.core.remove_bridge_state(&handle.context_id);
+                bi.core.remove_economy_state(&handle.context_id);
+
+                // Deregister the context handle from the MCP lookup registry.
+                deregister_context_handle(&handle.context_id);
+
+                *state = ContextState::Closed;
+                drop(state);
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during context close: {e}"),
+                code: codes::CTX_2018.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`context_send`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` /
+    /// `Identity` whose `instance_id` does not match this `SCP`'s.
+    pub async fn context_send(
+        &self,
+        handle: Arc<ContextHandle>,
+        identity: Arc<Identity>,
+        payload: Vec<u8>,
+        spending_ucan_jwt: Option<String>,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                validate_did(&identity.did)?;
+
+                let state = handle.state.lock().await;
+
+                if !matches!(*state, ContextState::Active) {
+                    return Err(ScpError::Context {
+                        msg: format!(
+                            "cannot send to context in {:?} state — context must be active",
+                            *state
+                        ),
+                        code: codes::CTX_2019.to_owned(),
+                    });
+                }
+                drop(state);
+
+                // Validate inner envelope signing via the retained KeyCustody
+                // (SCP-214 criterion 6). This ensures the identity's active signing
+                // key can produce a valid Ed25519 signature before delegating to
+                // the ContextManager for message delivery.
+                if let Some(core_id) = identity.core_id.as_ref() {
+                    let context_id = handle.context_id.clone();
+                    let sender_did_str = identity.did.clone();
+                    let now_ms = scp_primitives::SystemClock.now_millis();
+
+                    let params = scp_core::envelope::InnerEnvelopeParams {
+                        version: scp_core::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
+                        context_id: &context_id,
+                        sender_did: &sender_did_str,
+                        epoch: 0,
+                        generation: 0,
+                        sequence: 0,
+                        timestamp: now_ms,
+                        message_type: scp_core::envelope::MessageType::Content,
+                        payload: &payload,
+                        provenance: None,
+                        signing_key_id: scp_identity::SigningKeyId::Active,
+                    };
+
+                    if let Some(ref cb) = handle.callback_custody {
+                        scp_core::envelope::create_inner_envelope(
+                            &params,
+                            cb.as_ref(),
+                            &core_id.active_signing_key,
+                        )
+                        .await
+                        .map_err(|e| ScpError::Crypto {
+                            msg: format!("inner envelope signing failed: {e}"),
+                            code: codes::CRYPTO_4001.to_owned(),
+                        })?;
+                    } else {
+                        #[cfg(feature = "allow_in_memory_custody")]
+                        if let Some(ref imc) = handle.in_memory_custody {
+                            scp_core::envelope::create_inner_envelope(
+                                &params,
+                                &imc.0,
+                                &core_id.active_signing_key,
+                            )
+                            .await
+                            .map_err(|e| ScpError::Crypto {
+                                msg: format!("inner envelope signing failed: {e}"),
+                                code: codes::CRYPTO_4001.to_owned(),
+                            })?;
+                        }
+                    }
+                }
+
+                // Resolve the signing key from the handle's retained custody so the
+                // ContextManager can produce a valid inner envelope signature. Passing
+                // None would cause the encrypted send path to fail with "signing key
+                // required".
+                let resolved_signing_key = resolve_uniffi_signing_key(&handle).await.ok();
+
+                // Delegate to the shared ContextManager for message delivery
+                // through the transport provider.
+                let manager = bi.context_manager_or_error()?;
+                let core_handle = scp_core::context::ContextHandle::new(
+                    handle.context_id.clone(),
+                    scp_core::context::ContextParams::default(),
+                );
+                let _ = core_handle
+                    .transition_to(&scp_core::context::ContextState::Active)
+                    .await;
+
+                // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
+                let spending_ucan = spending_ucan_jwt
+                    .as_deref()
+                    .map(scp_core::crypto::ucan::validate::parse_ucan)
+                    .transpose()
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("invalid spending UCAN: {e}"),
+                        code: codes::ECON_12061.to_owned(),
+                    })?;
+
+                let sender_did: scp_identity::DID = identity.did.clone().into();
+                manager
+                    .send_message(
+                        &core_handle,
+                        &sender_did,
+                        &payload,
+                        resolved_signing_key.as_ref(),
+                        None,
+                        spending_ucan.as_ref(),
+                    )
+                    .await
+                    .map_err(ScpError::from)?;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during message send: {e}"),
+                code: codes::CTX_2020.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`context_subscribe`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    ///
+    /// The current implementation is a stub that signals stream
+    /// completion immediately — full transport wiring lands in a later
+    /// slice. When background tasks are introduced, they will register
+    /// into the per-instance `CoreFields` task set rather than a shared
+    /// global registry.
+    pub async fn context_subscribe(
+        &self,
+        handle: Arc<ContextHandle>,
+        listener: Box<dyn crate::MessageListener>,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let state = handle.state.lock().await;
+
+        if !matches!(*state, ContextState::Active) {
+            return Err(ScpError::Context {
+                msg: format!(
+                    "cannot subscribe to context in {:?} state — context must be active",
+                    *state
+                ),
+                code: codes::CTX_2021.to_owned(),
+            });
+        }
+        drop(state);
+
+        // Signal stream completion — full transport wiring connects this
+        // listener to the message pipeline in integration stories.
+        listener.on_complete();
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
