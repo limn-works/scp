@@ -182,6 +182,43 @@ mod production_only_cfg_not_test {
     }
 }
 
+// Pattern 14: tuple-literal bare reference. The primitive is placed
+// inside a `tuple_expression` as a value — there is no enclosing
+// `call_expression` and no direct `let x = ...` binding to its name,
+// so both the call-site scanner and the rebind tracker miss it. A
+// subsequent `pair.0(|| ())` call dispatches through the tuple field.
+#[allow(dead_code)]
+fn tuple_literal_bare_ref() {
+    let pair = (tokio::task::block_in_place, 0u32);
+    pair.0(|| {
+        let _ = 14;
+    });
+}
+
+// Pattern 15: return-position bare fn pointer. The fn body is a single
+// expression whose value is the bare `tokio::task::block_in_place`
+// path; the function returns a fn-pointer that the caller can later
+// invoke. No call_expression at the reference site, and no
+// let_declaration either — the scanner must flag the bare path.
+#[allow(dead_code)]
+fn return_position_bare_fn_ptr() -> fn(fn()) {
+    tokio::task::block_in_place
+}
+
+// Pattern 16: struct-field initializer bare reference. A `field_initializer`
+// inside a `struct_expression` sets the field to the bare primitive. This
+// is a common disguise when wiring a sync-bridge into a config struct.
+#[allow(dead_code)]
+struct SyncBridgeConfig {
+    bridge: fn(fn()),
+}
+#[allow(dead_code)]
+fn struct_field_init_bare_ref() -> SyncBridgeConfig {
+    SyncBridgeConfig {
+        bridge: tokio::task::block_in_place,
+    }
+}
+
 // Allow-listed site 1: block_on with directive on same line (with reason).
 fn allowlisted_block_on(handle: &Handle) -> u32 {
     handle.block_on(async { 14 }) // ci-allow: block-on: fixture coverage for allow-list

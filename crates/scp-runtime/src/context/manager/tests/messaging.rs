@@ -359,7 +359,7 @@ async fn report_degraded_mode_noop_for_exact() {
 /// encrypted bytes after `send_message`.
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn setup_two_member_verified_context() -> (
     ContextManager,
@@ -418,7 +418,7 @@ async fn setup_two_member_verified_context() -> (
 /// Returns the last message captured by a transport sent-messages buffer.
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 fn last_sent(sent: &Arc<std::sync::Mutex<Vec<Vec<u8>>>>) -> Vec<u8> {
     sent.lock()
@@ -2349,7 +2349,7 @@ enum AdapterCall {
 
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 struct RecordingPaymentAdapter {
     calls: Arc<std::sync::Mutex<Vec<AdapterCall>>>,
@@ -2358,7 +2358,7 @@ struct RecordingPaymentAdapter {
 
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 impl RecordingPaymentAdapter {
     fn new() -> Self {
@@ -3654,7 +3654,7 @@ fn role_name_max_length_matches_doc() {
 /// `FailingAppendEventLog` instances.
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn setup_two_member_context_with(
     event_log: Box<dyn ContextEventLogProvider>,

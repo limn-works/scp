@@ -68,16 +68,20 @@ impl OwnedIdentityDid {
     }
 }
 
-// BYPASS 5: tuple-struct form with `pub(super)` field. The outer
-// struct visibility is correct BUT the inner field is reachable.
+// BYPASS 5: tuple-struct form named OwnedIdentityDid with a
+// `pub(super)` inner field. Tree-sitter-rust 0.21+ emits
+// `visibility_modifier` as a DIRECT child of
+// `ordered_field_declaration_list` (no `ordered_field_declaration`
+// wrapper), so a pub tuple field bypasses any walker that scans for
+// the wrapper. The scanner MUST flag this case. We use `pub(super)`
+// here (the named-field case above uses `pub(crate)`) so the scanner
+// self-test can distinguish the tuple-field diagnostic from the
+// named-field diagnostic by visibility string. (Duplicate
+// `OwnedIdentityDid` names parse cleanly at the syntax level —
+// tree-sitter does not resolve names, and the fixture is never
+// compiled by cargo. Production code has exactly one declaration.)
 #[allow(dead_code)]
-pub(super) struct OwnedIdentityDidTupleBypass(pub(super) Did);
-
-// The tuple bypass is a separate declaration name. To exercise the
-// public-field check on OwnedIdentityDid itself we use the named
-// form above. (The scanner treats declarations independently; this
-// file has multiple OwnedIdentityDid-related declarations only for
-// fixture coverage — production will have exactly one.)
+pub(super) struct OwnedIdentityDid(pub(super) Did);
 
 // @file: context/supervisor/other_bypass.rs
 // Still under the required supervisor module tree, but NOT at the

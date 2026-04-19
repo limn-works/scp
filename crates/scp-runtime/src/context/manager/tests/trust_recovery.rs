@@ -779,7 +779,7 @@ async fn cac010_single_admin_auto_execute() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn test_recovery_advance_epoch_calls_crypto_provider() {
     let shared_epochs: Arc<std::sync::Mutex<Vec<[u8; 32]>>> = Arc::default();

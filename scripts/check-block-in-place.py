@@ -206,7 +206,7 @@ class Hit:
     file: str  # repo-relative path
     line: int  # 1-indexed (start)
     end_line: int  # 1-indexed (end; equals `line` for single-line hits)
-    kind: str  # "block_in_place" | "block_on" | "runtime_new" | "macro_invocation" | "macro_definition"
+    kind: str  # "block_in_place" | "bare_block_in_place" | "block_on" | "runtime_new" | "macro_invocation" | "macro_definition"
     snippet: str  # short code excerpt
     allow_reason: str | None  # non-None if allow-listed
 
@@ -454,6 +454,118 @@ def _collect_runtime_aliases(root, source: bytes) -> set[str]:
     return aliases
 
 
+def _is_bare_block_in_place_reference(
+    node, source: bytes, aliases: set[str]
+) -> bool:
+    """True if `node` is a `scoped_identifier` or bare `identifier`
+    that names `block_in_place` (or a known alias) AND is used as a
+    VALUE EXPRESSION rather than as a call callee, a let binding's
+    right-hand side, or an import path.
+
+    This catches bare-expression bypasses that a call-site-only scanner
+    misses:
+
+      - `fn get_ptr() -> fn() { tokio::task::block_in_place }`
+        — return-position bare fn pointer.
+      - `let pair = (tokio::task::block_in_place, 0); pair.0(|| ());`
+        — tuple literal element (no `let x = ...` direct binding).
+      - `struct S { f: fn() } let _ = S { f: tokio::task::block_in_place };`
+        — struct-field initializer expression.
+      - `let arr = [tokio::task::block_in_place]; arr[0](|| ());`
+        — array literal element.
+      - `let x = tokio::task::block_in_place as fn(fn());`
+        — type-cast expression value (the scoped_identifier is the
+        cast's `value`, NOT the `let`'s `value`, so the existing
+        rebind path does not catch this).
+
+    The node must NOT be:
+
+      (1) The callee (`function` field) of a `call_expression` — that
+          is the classic call-site case and is caught by
+          `_call_is_block_in_place`.
+      (2) The `value` field of a `let_declaration` whose `pattern` is a
+          plain identifier — that is the fn-pointer rebind path and is
+          caught by `_collect_aliased_block_in_place` (which then
+          rewrites `aliases`, and subsequent `alias(...)` call sites
+          are caught by `_call_is_block_in_place`).
+      (3) Anywhere inside a `use_declaration` — `use tokio::task::block_in_place`
+          (and its `... as alias;` form) are imports, not usages.
+      (4) Inside a `scoped_identifier`'s `path` component — we only
+          flag the OUTER scoped_identifier whose `name` is
+          `block_in_place`; inner path nodes are traversal noise.
+      (5) Inside a `macro_invocation` or `macro_rules_definition` /
+          `macro_definition` body — those are already flagged whole by
+          `_macro_body_contains_sync_bridge` at the macro node level,
+          and per-leaf bare-expression flagging would double-count.
+
+    Identifiers that are NOT the tail of a path are filtered by the
+    `scoped_identifier`-parent check: `tokio` and `task` in
+    `tokio::task::block_in_place` have a `scoped_identifier` parent,
+    so they would collide unless we only match when the node is a
+    top-level `scoped_identifier` (whose `name` is `block_in_place`)
+    or a stand-alone `identifier` whose parent is not a
+    `scoped_identifier`.
+    """
+    # Filter 1: shape. Only scoped_identifier/identifier leaves.
+    if node.type == "scoped_identifier":
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return False
+        if node_text(name_node, source) != "block_in_place":
+            return False
+        # Reject if this scoped_identifier is itself the PATH of a
+        # larger scoped_identifier (extremely unusual in Rust syntax,
+        # but cheap to guard).
+        parent = node.parent
+        if parent is not None and parent.type == "scoped_identifier":
+            path_field = parent.child_by_field_name("path")
+            if path_field is not None and path_field == node:
+                return False
+    elif node.type == "identifier":
+        name = node_text(node, source)
+        if name != "block_in_place" and name not in aliases:
+            return False
+        # Reject path components of scoped_identifier (e.g. `tokio` or
+        # `task` in `tokio::task::block_in_place`) — they have a
+        # `scoped_identifier` parent. The ONLY scoped_identifier-parent
+        # position we care about is the `name` field of a
+        # scoped_identifier whose OWN name is `block_in_place`, and
+        # that's already handled by the `scoped_identifier` branch
+        # above.
+        if node.parent is not None and node.parent.type == "scoped_identifier":
+            return False
+    else:
+        return False
+
+    # Filter 2: parent-chain rejection.
+    parent = node.parent
+    # (1) Callee of a call — existing call-site logic handles it.
+    if parent is not None and parent.type == "call_expression":
+        fn_field = parent.child_by_field_name("function")
+        if fn_field is not None and fn_field == node:
+            return False
+    # (2) Direct value of a let binding — existing rebind logic handles it.
+    if parent is not None and parent.type == "let_declaration":
+        val_field = parent.child_by_field_name("value")
+        if val_field is not None and val_field == node:
+            return False
+
+    # (3) Inside a use_declaration, (5) inside a macro. Walk ancestors.
+    ancestor = parent
+    while ancestor is not None:
+        if ancestor.type == "use_declaration":
+            return False
+        if ancestor.type in (
+            "macro_invocation",
+            "macro_definition",
+            "macro_rules_definition",
+        ):
+            return False
+        ancestor = ancestor.parent
+
+    return True
+
+
 def _call_is_block_in_place(call_node, source: bytes, aliases: set[str]) -> bool:
     """True if `call_node` (a call_expression) invokes block_in_place."""
     fn = call_node.child_by_field_name("function")
@@ -650,6 +762,18 @@ def scan_file(rel_path: str) -> tuple[list[Hit], list[str]]:
                 # wrapper itself is visible.
                 if _macro_body_contains_sync_bridge(node, source):
                     record_hit(node, "macro_definition", tctx)
+            elif node.type in ("scoped_identifier", "identifier"):
+                # Bare-expression bypass: `block_in_place` (or an alias)
+                # used as a value — in a tuple literal, struct-field
+                # init, array literal, return-position expression,
+                # type-cast expression, etc. The existing call-site and
+                # let-rebind detectors miss these because there is no
+                # `call_expression` parent and no direct `let x = ...`
+                # binding. See `_is_bare_block_in_place_reference` for
+                # the full exclusion set (callee / let-value / use /
+                # path-component / macro).
+                if _is_bare_block_in_place_reference(node, source, aliases):
+                    record_hit(node, "bare_block_in_place", tctx)
 
         for c in node.children:
             walk(c, tctx)
@@ -935,6 +1059,22 @@ REQUIRED_FIXTURE_PATTERNS: list[tuple[str, str]] = [
     #     must NOT be excluded as test code. The call inside it must be
     #     caught.
     ("block_on", "production_only_cfg_not_test:.block_on"),
+    # 14. Tuple-literal bare reference: `(tokio::task::block_in_place, 0)`
+    #     — the primitive is a value inside a tuple_expression. Neither
+    #     `_call_is_block_in_place` (no call_expression parent) nor
+    #     `_collect_aliased_block_in_place` (no direct `let x = ...`
+    #     binding) catch this; `_is_bare_block_in_place_reference`
+    #     must.
+    ("bare_block_in_place", "tuple_literal_bare_ref:tokio::task::block_in_place"),
+    # 15. Return-position bare fn pointer: fn body is a single
+    #     expression resolving to `tokio::task::block_in_place`. No
+    #     call, no let — caught only by the bare-reference walker.
+    ("bare_block_in_place", "return_position_bare_fn_ptr:tokio::task::block_in_place"),
+    # 16. Struct-field initializer bare reference: field in a
+    #     `struct_expression` is set to the bare primitive. Same
+    #     category as 14–15 (no call, no direct let) and must be
+    #     flagged by the bare-reference walker.
+    ("bare_block_in_place", "struct_field_init_bare_ref:tokio::task::block_in_place"),
 ]
 
 

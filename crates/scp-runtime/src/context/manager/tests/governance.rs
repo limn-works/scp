@@ -5200,7 +5200,7 @@ async fn migration_destination_has_migration_source_metadata() {
 #[allow(clippy::too_many_lines)]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn test_remove_member_sender_key_before_mls_removal() {
     use std::sync::Arc;
@@ -5944,7 +5944,7 @@ async fn test_participation_decay_clears_caches() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn test_rotate_content_keys_advances_epoch() {
     use std::sync::Arc;
@@ -6875,7 +6875,7 @@ async fn event_log_entries_feed_consequence_evaluation() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn remaining_members_keys_after_removal() {
     let crypto = MockCrypto::default();
@@ -7009,7 +7009,7 @@ async fn broadcast_rotation_calls_rotate_author_keys() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn encrypted_rotation_updates_epoch_counter() {
     let epochs = Arc::new(std::sync::Mutex::new(Vec::<[u8; 32]>::new()));
@@ -8141,7 +8141,7 @@ fn ucan_spending_capability_checked_on_tool_invoke() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn encrypted_rotation_advance_epoch_called() {
     let epochs = Arc::new(std::sync::Mutex::new(Vec::<[u8; 32]>::new()));
@@ -9006,7 +9006,7 @@ async fn test_broadcast_rotation_rotates_author_keys() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn test_encrypted_rotation_increments_epoch() {
     let epochs = Arc::new(std::sync::Mutex::new(Vec::<[u8; 32]>::new()));
@@ -14661,7 +14661,7 @@ async fn test_governance_close_decays_participation() {
 /// encrypted bytes after `send_message`.
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 fn h17_h16_make_manager() -> (
     ContextManager,
@@ -14693,7 +14693,7 @@ fn h17_h16_make_manager() -> (
 ///   * `bob_manager` for delivery + assertions
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn h17_setup_alice_and_bob(
     context_id: &str,

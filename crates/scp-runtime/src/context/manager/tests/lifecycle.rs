@@ -510,7 +510,7 @@ async fn concurrent_joins_and_sends_do_not_corrupt_state() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn panic_does_not_poison_mutex() {
     use std::sync::Arc;
@@ -571,7 +571,7 @@ async fn panic_does_not_poison_mutex() {
 #[derive(Default)]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 struct MockContextPersistence {
     contexts: std::sync::Mutex<HashMap<String, super::ContextSnapshot>>,
@@ -694,7 +694,7 @@ fn context_persistence_is_object_safe() {
 #[allow(clippy::too_many_lines)]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn persist_drop_restore_roundtrip() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
@@ -844,7 +844,7 @@ async fn persist_drop_restore_roundtrip() {
 #[allow(clippy::too_many_lines)] // DashMap lock pattern adds verbosity
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn restore_preserves_executed_proposals() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
@@ -971,7 +971,7 @@ async fn restore_preserves_executed_proposals() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn restore_respawns_ttl_timer() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
@@ -1079,7 +1079,7 @@ async fn restore_respawns_ttl_timer() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn restore_all_contexts_restores_persisted() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
@@ -1174,7 +1174,7 @@ async fn restore_all_contexts_restores_persisted() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn restore_context_rejects_duplicate() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
@@ -1288,7 +1288,7 @@ async fn restore_context_rejects_duplicate() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
     use crate::crypto::mls::epoch_grace::GraceEntry;
@@ -1410,7 +1410,7 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn restore_context_no_reconnect_when_grace_consistent() {
     use crate::crypto::mls::epoch_grace::GraceEntry;
@@ -1541,7 +1541,7 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn restore_preserves_spending_nonce_tracker_across_restart() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
@@ -3527,7 +3527,7 @@ async fn import_context_clamps_cooldown_until() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn restore_context_preserves_budget_tracker() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
@@ -3610,7 +3610,7 @@ async fn restore_context_preserves_budget_tracker() {
 #[tokio::test]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn restore_context_validates_consequence_rules() {
     use scp_protocol::context::AccessScope;

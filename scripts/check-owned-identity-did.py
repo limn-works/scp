@@ -238,7 +238,20 @@ def _public_fields(node, source: bytes) -> list[tuple[int, str]]:
     Handles both:
       - `struct S { pub(crate) field: T }`               named fields
       - `struct S(pub Did);`                             tuple fields
+      - `struct S(pub(crate) Did, pub Did, Did);`        multi-field tuple
       - Unit struct `struct S;`                           — no fields
+
+    Tree-sitter-rust grammar note (0.21+): named fields wrap each field
+    in a `field_declaration` node inside `field_declaration_list`, with
+    the `visibility_modifier` as a CHILD of `field_declaration`. Tuple
+    fields, however, do NOT use an `ordered_field_declaration` wrapper —
+    `ordered_field_declaration_list` has `visibility_modifier` and
+    `type_identifier` (or other type nodes) as DIRECT children, separated
+    by `,` punctuation. A `visibility_modifier` direct child of the list
+    therefore marks a pub tuple field, even though there is no wrapper
+    node to attach it to. Earlier versions of this scanner looked for an
+    `ordered_field_declaration` wrapper and missed every tuple pub-field
+    bypass such as `pub(super) struct OwnedIdentityDid(pub(crate) Did);`.
     """
     if node.type != "struct_item":
         return []
@@ -247,7 +260,9 @@ def _public_fields(node, source: bytes) -> list[tuple[int, str]]:
     if body is None:
         return []
     if body.type == "field_declaration_list":
-        # Named fields: `{ field: T, pub(crate) field: T }`
+        # Named fields: `{ field: T, pub(crate) field: T }`. The grammar
+        # emits a `field_declaration` wrapper per field, with its own
+        # `visibility_modifier` child for pub fields.
         for child in body.children:
             if child.type == "field_declaration":
                 for grand in child.children:
@@ -260,19 +275,19 @@ def _public_fields(node, source: bytes) -> list[tuple[int, str]]:
                         )
                         break
     elif body.type == "ordered_field_declaration_list":
-        # Tuple fields: `(pub Did, pub(crate) String)`
+        # Tuple fields: tree-sitter-rust 0.21+ emits
+        #   `ordered_field_declaration_list` → (`(`, (`visibility_modifier`?, type_node, `,`?)*, `)`)
+        # with NO `ordered_field_declaration` wrapper per field. Every
+        # DIRECT `visibility_modifier` child of the list therefore
+        # corresponds to exactly one pub tuple field. Record each one.
         for child in body.children:
-            # `ordered_field_declaration` in tree-sitter-rust grammar.
-            if child.type == "ordered_field_declaration":
-                for grand in child.children:
-                    if grand.type == "visibility_modifier":
-                        publics.append(
-                            (
-                                child.start_point[0] + 1,
-                                node_text(grand, source).strip(),
-                            )
-                        )
-                        break
+            if child.type == "visibility_modifier":
+                publics.append(
+                    (
+                        child.start_point[0] + 1,
+                        node_text(child, source).strip(),
+                    )
+                )
     return publics
 
 
@@ -522,7 +537,15 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
     ("forbidden_derive", "forbidden derive"),
     ("manual_impl_clone", "manual `impl Clone"),
     ("manual_impl_from", "manual `impl From"),
-    ("public_tuple_field", "public field"),
+    # Named-struct public field — the fixture's named-struct case uses
+    # `pub(crate)`. Asserts the field_declaration_list path still works.
+    ("public_named_field", "public field with visibility 'pub(crate)'"),
+    # Tuple-struct public field — the fixture's tuple-struct case uses
+    # `pub(super)`. Asserts the NEW tuple-field detection (direct
+    # `visibility_modifier` children of `ordered_field_declaration_list`,
+    # no wrapper) catches `struct OwnedIdentityDid(pub(super) Did);`.
+    # Before the tree-sitter-rust 0.21+ fix, this was silently missed.
+    ("public_tuple_field", "public field with visibility 'pub(super)'"),
     ("type_alias", "declared as a `type` alias"),
     ("wrong_visibility", "visibility is"),
     ("wrong_location", "must be declared in"),
@@ -623,7 +646,8 @@ def do_self_test() -> int:
         f"{C_GREEN}owned-identity-did self-test PASSED{C_RESET}: "
         f"fixture triggered {len(REQUIRED_FIXTURE_FAILURES)} distinct "
         f"enforcement modes (derive, manual-impl Clone + From, "
-        f"public field, type alias, wrong visibility, wrong location)."
+        f"public named field, public tuple field, type alias, "
+        f"wrong visibility, wrong location)."
     )
     return 0
 

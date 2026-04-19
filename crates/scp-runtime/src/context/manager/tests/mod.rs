@@ -259,7 +259,7 @@ fn build_spending_ucan(
 #[derive(Default)]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 pub(super) struct MockCrypto {
     pub(super) fail_create_mls: AtomicBool,
@@ -594,7 +594,7 @@ impl ContextCryptoProvider for MockCrypto {
 
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 pub(super) struct MockTransport {
     pub(super) connected: AtomicBool,
@@ -608,7 +608,7 @@ pub(super) struct MockTransport {
 
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 impl Default for MockTransport {
     fn default() -> Self {
@@ -624,7 +624,7 @@ impl Default for MockTransport {
 
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 impl MockTransport {
     pub(super) fn connected() -> Self {
@@ -682,7 +682,7 @@ impl ContextTransportProvider for MockTransport {
 #[derive(Default)]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 pub(super) struct MockEventLog {
     pub(super) inited: std::sync::Mutex<Vec<[u8; 32]>>,
@@ -763,7 +763,7 @@ impl ContextEventLogProvider for MockEventLog {
 #[derive(Default)]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 pub(super) struct MockEventLogWithActorDid {
     pub(super) inited: std::sync::Mutex<Vec<[u8; 32]>>,
@@ -878,7 +878,7 @@ impl ContextEventLogProvider for ArcEventLog {
 #[derive(Default)]
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 pub(super) struct OrderedMockEventLog {
     pub(super) inited: std::sync::Mutex<Vec<[u8; 32]>>,
@@ -1011,7 +1011,7 @@ impl ContextEventLogProvider for ArcOrderedEventLog {
 /// `evaluate_consequence_rules` would reject (`event.timestamp <= now`).
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 pub(super) struct ClockedMockEventLog {
     pub(super) inited: std::sync::Mutex<Vec<[u8; 32]>>,
@@ -1023,7 +1023,7 @@ pub(super) struct ClockedMockEventLog {
 
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 impl ClockedMockEventLog {
     pub(super) fn new(clock: Arc<dyn scp_primitives::Clock>) -> Self {
@@ -1130,7 +1130,7 @@ impl ContextEventLogProvider for ArcClockedEventLog {
 /// failures (the receive buffer already holds the message).
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 pub(super) struct FailingAppendEventLog {
     pub(super) inited: std::sync::Mutex<Vec<[u8; 32]>>,
@@ -1145,7 +1145,7 @@ pub(super) struct FailingAppendEventLog {
 
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 impl FailingAppendEventLog {
     pub(super) fn new(fail_event: impl Into<String>) -> Self {
@@ -1253,7 +1253,7 @@ impl ContextTransportProvider for FailingTransport {
 /// it always fail; any positive value fails that many times then succeeds.
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 pub(super) struct RetriableMockTransport {
     pub(super) fail_count: std::sync::atomic::AtomicU32,
@@ -1263,7 +1263,7 @@ pub(super) struct RetriableMockTransport {
 
 #[allow(
     clippy::disallowed_types,
-    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 impl Default for RetriableMockTransport {
     fn default() -> Self {
