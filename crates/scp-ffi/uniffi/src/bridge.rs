@@ -15539,6 +15539,754 @@ impl Scp {
                 code: codes::CTX_2050.to_owned(),
             })?
     }
+
+    // ===== UniFFI sub-slice E — broadcast + membership queries + events =====
+    //
+    // Migrates the 16 broadcast / membership-query / drain free functions
+    // (`broadcast_subscribe`, `broadcast_unsubscribe`, `broadcast_publish`,
+    // `broadcast_publish_asset`, `broadcast_publish_assets`,
+    // `broadcast_block_subscriber`, `broadcast_unblock_subscriber`,
+    // `broadcast_handle_key_request`, `broadcast_subscriber_count`,
+    // `broadcast_is_subscriber`, `broadcast_admission`,
+    // `context_member_count`, `context_is_member`, `context_member_dids`,
+    // `context_member_role`, `context_drain_events`) to
+    // `impl crate::scp::Scp` methods routing through `&self.inner` (the
+    // `UniffiBridgeInstance` owned by the caller).
+    //
+    // Free functions above are retained (they still compile and are still
+    // exported via `#[uniffi::export]`) — the demolition slice at the end
+    // of PR 4 removes them in one shot after every caller is migrated.
+    // Bodies are preserved verbatim except for the
+    // `crate::runtime::context_manager()` → `bi.context_manager_or_error()?`
+    // and `crate::runtime::context_manager_expect()` →
+    // `self.inner.context_manager_expect()?` swap and the handle-affinity
+    // inline check described in the PR 4 sub-slice E plan.
+    //
+    // Part of #1549 Phase 4 PR 4.
+
+    /// Per-instance equivalent of the free-function [`broadcast_subscribe`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn broadcast_subscribe(
+        &self,
+        handle: Arc<ContextHandle>,
+        subscriber_did: String,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let did: scp_identity::DID = subscriber_did.into();
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                manager
+                    .subscribe_broadcast::<
+                        crate::bridge::NoOpDidResolver,
+                        crate::bridge::NoOpNonceTracker,
+                        crate::bridge::NoOpRevocationChecker,
+                        crate::bridge::NoOpProofResolver,
+                        std::hash::RandomState,
+                    >(&handle.context_id, &did, None, timestamp, None)
+                    .await
+                    .map_err(ScpError::from)?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during broadcast subscribe: {e}"),
+                code: codes::CTX_2033.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`broadcast_unsubscribe`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn broadcast_unsubscribe(
+        &self,
+        handle: Arc<ContextHandle>,
+        subscriber_did: String,
+        rotate_keys: bool,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let did: scp_identity::DID = subscriber_did.into();
+                manager
+                    .unsubscribe_broadcast(&handle.context_id, &did, rotate_keys)
+                    .await
+                    .map_err(ScpError::from)?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during broadcast unsubscribe: {e}"),
+                code: codes::CTX_2034.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`broadcast_publish`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
+    /// `Identity` whose `instance_id` does not match this `SCP`'s.
+    pub async fn broadcast_publish(
+        &self,
+        handle: Arc<ContextHandle>,
+        identity: Arc<Identity>,
+        payload: Vec<u8>,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let did: scp_identity::DID = identity.did.clone().into();
+
+                let core_id = identity
+                    .core_id
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Permission {
+                        msg: "broadcast publish requires a fully created identity with key handles"
+                            .to_owned(),
+                        code: codes::PERM_3020.to_owned(),
+                    })?;
+                let signing_key_handle = &core_id.active_signing_key;
+
+                // Dispatch to the correct custody path (callback > in-memory).
+                if let Some(ref cb) = identity.callback_custody {
+                    manager
+                        .publish_broadcast(
+                            &handle.context_id,
+                            &did,
+                            &payload,
+                            cb.as_ref(),
+                            signing_key_handle,
+                        )
+                        .await
+                        .map_err(ScpError::from)?;
+                } else {
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    {
+                        let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
+                            ScpError::Permission {
+                                msg: "broadcast publish requires key custody — create the \
+                                          identity with identity_create(\"in_memory\") or \
+                                          identity_create_with_custody()"
+                                    .to_owned(),
+                                code: codes::PERM_3021.to_owned(),
+                            }
+                        })?;
+                        manager
+                            .publish_broadcast(
+                                &handle.context_id,
+                                &did,
+                                &payload,
+                                &imc.0,
+                                signing_key_handle,
+                            )
+                            .await
+                            .map_err(ScpError::from)?;
+                    }
+                    #[cfg(not(feature = "allow_in_memory_custody"))]
+                    {
+                        return Err(ScpError::Permission {
+                            msg: "broadcast publish requires key custody — use \
+                                      identity_create_with_custody() to inject a platform \
+                                      custody provider"
+                                .to_owned(),
+                            code: codes::PERM_3022.to_owned(),
+                        });
+                    }
+                }
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during broadcast publish: {e}"),
+                code: codes::CTX_2035.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`broadcast_publish_asset`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
+    /// `Identity` whose `instance_id` does not match this `SCP`'s.
+    pub async fn broadcast_publish_asset(
+        &self,
+        handle: Arc<ContextHandle>,
+        identity: Arc<Identity>,
+        asset: AssetEntry,
+        deploy_id: Option<String>,
+    ) -> Result<PublishResult, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let did: scp_identity::DID = identity.did.clone().into();
+
+                let core_id = identity
+                    .core_id
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Permission {
+                        msg:
+                            "broadcast publish asset requires a fully created identity with key handles"
+                                .to_owned(),
+                        code: codes::PERM_3020.to_owned(),
+                    })?;
+                let signing_key_handle = &core_id.active_signing_key;
+
+                // Validate fields.
+                let content_path =
+                    scp_core::context::ContentPath::new(asset.path).map_err(|e| ScpError::Context {
+                        msg: format!("invalid path: {e}"),
+                        code: codes::CTX_2040.to_owned(),
+                    })?;
+                let mime_type = scp_core::context::MimeType::new(asset.content_type).map_err(|e| {
+                    ScpError::Context {
+                        msg: format!("invalid content_type: {e}"),
+                        code: codes::CTX_2041.to_owned(),
+                    }
+                })?;
+                // Auto-generate deploy_id when None, matching batch behavior.
+                let deploy_id = Some(deploy_id.unwrap_or_else(|| {
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(handle.context_id.as_bytes());
+                    hasher.update(identity.did.as_bytes());
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    hasher.update(ts.to_le_bytes());
+                    hex::encode(&Sha256::digest(hasher.finalize())[..16])
+                }));
+                if let Some(ref did_str) = deploy_id {
+                    scp_core::context::validate_deploy_id(did_str).map_err(|e| ScpError::Context {
+                        msg: format!("invalid deploy_id: {e}"),
+                        code: codes::CTX_2042.to_owned(),
+                    })?;
+                }
+
+                let etag = scp_core::context::compute_etag(&asset.body);
+                // Capture deploy_id string before moving into BroadcastContent (SCP-292).
+                let deploy_id_str = deploy_id.clone().unwrap_or_default();
+                let content = scp_core::context::BroadcastContent {
+                    version: scp_core::context::BROADCAST_CONTENT_VERSION,
+                    metadata: scp_core::context::ContentMetadata {
+                        path: Some(content_path),
+                        content_type: Some(mime_type),
+                        deploy_id,
+                        etag: Some(etag.clone()),
+                        immutable: false,
+                    },
+                    body: asset.body,
+                };
+
+                // Dispatch to the correct custody path (callback > in-memory).
+                let envelope = if let Some(ref cb) = identity.callback_custody {
+                    manager
+                        .publish_broadcast_content(
+                            &handle.context_id,
+                            &did,
+                            content,
+                            cb.as_ref(),
+                            signing_key_handle,
+                        )
+                        .await
+                        .map_err(ScpError::from)?
+                } else {
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    {
+                        let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
+                            ScpError::Permission {
+                                msg: "broadcast publish asset requires key custody — create the \
+                                      identity with identity_create(\"in_memory\") or \
+                                      identity_create_with_custody()"
+                                    .to_owned(),
+                                code: codes::PERM_3021.to_owned(),
+                            }
+                        })?;
+                        manager
+                            .publish_broadcast_content(
+                                &handle.context_id,
+                                &did,
+                                content,
+                                &imc.0,
+                                signing_key_handle,
+                            )
+                            .await
+                            .map_err(ScpError::from)?
+                    }
+                    #[cfg(not(feature = "allow_in_memory_custody"))]
+                    {
+                        return Err(ScpError::Permission {
+                            msg: "broadcast publish asset requires key custody — use \
+                                  identity_create_with_custody() to inject a platform \
+                                  custody provider"
+                                .to_owned(),
+                            code: codes::PERM_3022.to_owned(),
+                        });
+                    }
+                };
+
+                let envelope_bytes =
+                    rmp_serde::to_vec_named(&envelope).map_err(|e| ScpError::Context {
+                        msg: format!("failed to serialize envelope for blob_id: {e}"),
+                        code: codes::CTX_2043.to_owned(),
+                    })?;
+                let blob_id = {
+                    use sha2::{Digest, Sha256};
+                    hex::encode(Sha256::digest(&envelope_bytes))
+                };
+
+                Ok(PublishResult {
+                    blob_id,
+                    etag,
+                    deploy_id: deploy_id_str,
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during broadcast publish asset: {e}"),
+                code: codes::CTX_2035.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`broadcast_publish_assets`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
+    /// `Identity` whose `instance_id` does not match this `SCP`'s.
+    pub async fn broadcast_publish_assets(
+        &self,
+        handle: Arc<ContextHandle>,
+        identity: Arc<Identity>,
+        assets: Vec<AssetEntry>,
+        deploy_id: Option<String>,
+    ) -> Result<BatchPublishResult, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        const MAX_BATCH_ASSETS: usize = 10_000;
+        if assets.len() > MAX_BATCH_ASSETS {
+            return Err(ScpError::Context {
+                msg: format!(
+                    "batch too large: {} assets (max {MAX_BATCH_ASSETS})",
+                    assets.len()
+                ),
+                code: codes::CTX_2074.to_owned(),
+            });
+        }
+        let bi = Arc::clone(&self.inner);
+
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let did: scp_identity::DID = identity.did.clone().into();
+
+                let core_id = identity
+                    .core_id
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Permission {
+                        msg: "broadcast publish assets requires a fully created identity"
+                            .to_owned(),
+                        code: codes::PERM_3020.to_owned(),
+                    })?;
+                let signing_key_handle = &core_id.active_signing_key;
+
+                // Generate deploy_id if not provided.
+                let deploy_id_val = deploy_id.unwrap_or_else(|| {
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(handle.context_id.as_bytes());
+                    hasher.update(identity.did.as_bytes());
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    hasher.update(ts.to_le_bytes());
+                    hex::encode(&Sha256::digest(hasher.finalize())[..16])
+                });
+
+                scp_core::context::validate_deploy_id(&deploy_id_val).map_err(|e| {
+                    ScpError::Context {
+                        msg: format!("invalid deploy_id: {e}"),
+                        code: codes::CTX_2042.to_owned(),
+                    }
+                })?;
+
+                let mut results = Vec::with_capacity(assets.len());
+                for asset in assets {
+                    let content_path =
+                        scp_core::context::ContentPath::new(asset.path).map_err(|e| {
+                            ScpError::Context {
+                                msg: format!("invalid path: {e}"),
+                                code: codes::CTX_2040.to_owned(),
+                            }
+                        })?;
+                    let mime_type =
+                        scp_core::context::MimeType::new(asset.content_type).map_err(|e| {
+                            ScpError::Context {
+                                msg: format!("invalid content_type: {e}"),
+                                code: codes::CTX_2041.to_owned(),
+                            }
+                        })?;
+
+                    let etag = scp_core::context::compute_etag(&asset.body);
+                    let content = scp_core::context::BroadcastContent {
+                        version: scp_core::context::BROADCAST_CONTENT_VERSION,
+                        metadata: scp_core::context::ContentMetadata {
+                            path: Some(content_path),
+                            content_type: Some(mime_type),
+                            deploy_id: Some(deploy_id_val.clone()),
+                            etag: Some(etag.clone()),
+                            immutable: false,
+                        },
+                        body: asset.body,
+                    };
+
+                    let envelope = if let Some(ref cb) = identity.callback_custody {
+                        manager
+                            .publish_broadcast_content(
+                                &handle.context_id,
+                                &did,
+                                content,
+                                cb.as_ref(),
+                                signing_key_handle,
+                            )
+                            .await
+                            .map_err(ScpError::from)?
+                    } else {
+                        #[cfg(feature = "allow_in_memory_custody")]
+                        {
+                            let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
+                                ScpError::Permission {
+                                    msg: "broadcast publish assets requires key custody".to_owned(),
+                                    code: codes::PERM_3021.to_owned(),
+                                }
+                            })?;
+                            manager
+                                .publish_broadcast_content(
+                                    &handle.context_id,
+                                    &did,
+                                    content,
+                                    &imc.0,
+                                    signing_key_handle,
+                                )
+                                .await
+                                .map_err(ScpError::from)?
+                        }
+                        #[cfg(not(feature = "allow_in_memory_custody"))]
+                        {
+                            return Err(ScpError::Permission {
+                                msg: "broadcast publish assets requires key custody".to_owned(),
+                                code: codes::PERM_3022.to_owned(),
+                            });
+                        }
+                    };
+
+                    let envelope_bytes =
+                        rmp_serde::to_vec_named(&envelope).map_err(|e| ScpError::Context {
+                            msg: format!("failed to serialize envelope for blob_id: {e}"),
+                            code: codes::CTX_2043.to_owned(),
+                        })?;
+                    let blob_id = {
+                        use sha2::{Digest, Sha256};
+                        hex::encode(Sha256::digest(&envelope_bytes))
+                    };
+
+                    results.push(PublishResult {
+                        blob_id,
+                        etag,
+                        deploy_id: deploy_id_val.clone(),
+                    });
+                }
+
+                Ok(BatchPublishResult {
+                    results,
+                    deploy_id: deploy_id_val,
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during broadcast publish assets: {e}"),
+                code: codes::CTX_2035.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`broadcast_block_subscriber`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn broadcast_block_subscriber(
+        &self,
+        handle: Arc<ContextHandle>,
+        subscriber_did: String,
+        blocker_did: String,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let subscriber: scp_identity::DID = subscriber_did.into();
+                let blocker: scp_identity::DID = blocker_did.into();
+                manager
+                    .block_broadcast_subscriber(&handle.context_id, &blocker, &subscriber)
+                    .await
+                    .map_err(ScpError::from)?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during broadcast block: {e}"),
+                code: codes::CTX_2036.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`broadcast_unblock_subscriber`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn broadcast_unblock_subscriber(
+        &self,
+        handle: Arc<ContextHandle>,
+        subscriber_did: String,
+        unblocker_did: String,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let subscriber: scp_identity::DID = subscriber_did.into();
+                let unblocker: scp_identity::DID = unblocker_did.into();
+                manager
+                    .unblock_broadcast_subscriber(&handle.context_id, &unblocker, &subscriber)
+                    .await
+                    .map_err(ScpError::from)?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during broadcast unblock: {e}"),
+                code: codes::CTX_2037.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`broadcast_handle_key_request`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn broadcast_handle_key_request(
+        &self,
+        handle: Arc<ContextHandle>,
+        author_did: String,
+        requester_did: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let author: scp_identity::DID = author_did.into();
+                let requester: scp_identity::DID = requester_did.into();
+                let decision = manager
+                    .handle_broadcast_key_request(&handle.context_id, &author, &requester)
+                    .await
+                    .map_err(ScpError::from)?;
+                Ok(format!("{decision:?}"))
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during key request handling: {e}"),
+                code: codes::CTX_2037.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`broadcast_subscriber_count`].
+    ///
+    /// Routes through `&*self.inner`. Returns `None` when the handle's
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn broadcast_subscriber_count(&self, handle: Arc<ContextHandle>) -> Option<u64> {
+        if self.inner.core.check_handle(handle.instance_id()).is_err() {
+            return None;
+        }
+        let Ok(manager) = self.inner.context_manager_expect() else {
+            return None;
+        };
+        manager
+            .broadcast_subscriber_count(&handle.context_id)
+            .await
+            .map(|n| n as u64)
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`broadcast_is_subscriber`].
+    ///
+    /// Routes through `&*self.inner`. Returns `false` when the handle's
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn broadcast_is_subscriber(&self, handle: Arc<ContextHandle>, did: String) -> bool {
+        if self.inner.core.check_handle(handle.instance_id()).is_err() {
+            return false;
+        }
+        let Ok(manager) = self.inner.context_manager_expect() else {
+            return false;
+        };
+        manager
+            .is_broadcast_subscriber(&handle.context_id, &did)
+            .await
+    }
+
+    /// Per-instance equivalent of the free-function [`broadcast_admission`].
+    ///
+    /// Routes through `&*self.inner`. Returns `None` when the handle's
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn broadcast_admission(&self, handle: Arc<ContextHandle>) -> Option<String> {
+        if self.inner.core.check_handle(handle.instance_id()).is_err() {
+            return None;
+        }
+        let Ok(manager) = self.inner.context_manager_expect() else {
+            return None;
+        };
+        manager
+            .broadcast_admission(&handle.context_id)
+            .await
+            .map(|a| format!("{a:?}"))
+    }
+
+    /// Per-instance equivalent of the free-function [`context_member_count`].
+    ///
+    /// Routes through `&*self.inner`. Returns `None` when the handle's
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn context_member_count(&self, handle: Arc<ContextHandle>) -> Option<u64> {
+        if self.inner.core.check_handle(handle.instance_id()).is_err() {
+            return None;
+        }
+        let Ok(manager) = self.inner.context_manager_expect() else {
+            return None;
+        };
+        manager
+            .member_count(&handle.context_id)
+            .await
+            .map(|n| n as u64)
+    }
+
+    /// Per-instance equivalent of the free-function [`context_is_member`].
+    ///
+    /// Routes through `&*self.inner`. Returns `false` when the handle's
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn context_is_member(&self, handle: Arc<ContextHandle>, did: String) -> bool {
+        if self.inner.core.check_handle(handle.instance_id()).is_err() {
+            return false;
+        }
+        let Ok(manager) = self.inner.context_manager_expect() else {
+            return false;
+        };
+        manager.is_member(&handle.context_id, &did).await
+    }
+
+    /// Per-instance equivalent of the free-function [`context_member_dids`].
+    ///
+    /// Routes through `&*self.inner`. Returns an empty `Vec` when the
+    /// handle's `instance_id` does not match this `SCP`'s.
+    pub async fn context_member_dids(&self, handle: Arc<ContextHandle>) -> Vec<String> {
+        if self.inner.core.check_handle(handle.instance_id()).is_err() {
+            return Vec::new();
+        }
+        let Ok(manager) = self.inner.context_manager_expect() else {
+            return Vec::new();
+        };
+        manager.member_dids(&handle.context_id).await
+    }
+
+    /// Per-instance equivalent of the free-function [`context_member_role`].
+    ///
+    /// Routes through `&*self.inner`. Returns `None` when the handle's
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn context_member_role(
+        &self,
+        handle: Arc<ContextHandle>,
+        did: String,
+    ) -> Option<String> {
+        if self.inner.core.check_handle(handle.instance_id()).is_err() {
+            return None;
+        }
+        let Ok(manager) = self.inner.context_manager_expect() else {
+            return None;
+        };
+        manager
+            .member_role(&handle.context_id, &did)
+            .await
+            .map(|r| format!("{r:?}"))
+    }
+
+    /// Per-instance equivalent of the free-function [`context_drain_events`].
+    ///
+    /// Routes through `&*self.inner`. Returns an empty `Vec` when the
+    /// handle's `instance_id` does not match this `SCP`'s.
+    pub async fn context_drain_events(&self, handle: Arc<ContextHandle>) -> Vec<String> {
+        if self.inner.core.check_handle(handle.instance_id()).is_err() {
+            return Vec::new();
+        }
+        let Ok(manager) = self.inner.context_manager_expect() else {
+            return Vec::new();
+        };
+        manager
+            .drain_events(&handle.context_id)
+            .await
+            .iter()
+            .map(format_context_event)
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
