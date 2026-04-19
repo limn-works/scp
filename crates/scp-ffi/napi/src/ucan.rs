@@ -844,7 +844,7 @@ mod tests {
     fn revocation_persists_across_with_context_calls() {
         use crate::runtime;
 
-        let bi = runtime::default_bridge_instance().expect("default bridge");
+        let bi = runtime::NapiBridgeInstance::new_napi();
         // Use a unique context ID per test to avoid cross-test interference.
         let context_id = format!("ctx-revoke-persist-{}", uuid::Uuid::new_v4());
 
@@ -889,7 +889,7 @@ mod tests {
     fn nonce_replay_detected_across_with_context_calls() {
         use crate::runtime;
 
-        let bi = runtime::default_bridge_instance().expect("default bridge");
+        let bi = runtime::NapiBridgeInstance::new_napi();
         let context_id = format!("ctx-nonce-persist-{}", uuid::Uuid::new_v4());
         runtime::register_test_context(&bi, &context_id, "did:dht:zCreator");
 
@@ -951,7 +951,7 @@ mod tests {
         use crate::runtime;
         use std::cell::RefCell;
 
-        let bi = runtime::default_bridge_instance().expect("default bridge");
+        let bi = runtime::NapiBridgeInstance::new_napi();
         let context_id = format!("ctx-revoke-wire-{}", uuid::Uuid::new_v4());
         let creator_did = "did:dht:zCreator";
         runtime::register_test_context(&bi, &context_id, creator_did);
@@ -1022,7 +1022,7 @@ mod tests {
         use crate::runtime;
         use std::cell::RefCell;
 
-        let bi = runtime::default_bridge_instance().expect("default bridge");
+        let bi = runtime::NapiBridgeInstance::new_napi();
         let context_id = format!("ctx-revoke-unauth-{}", uuid::Uuid::new_v4());
         let creator_did = "did:dht:zCreator";
         runtime::register_test_context(&bi, &context_id, creator_did);
@@ -1109,7 +1109,7 @@ mod tests {
         let did_a = identity_a.did.clone();
         let did_b = identity_b.did.clone();
 
-        let bi = runtime::default_bridge_instance().expect("default bridge");
+        let bi = runtime::NapiBridgeInstance::new_napi();
 
         // Register both in the global identity registry.
         runtime::register_identity(
@@ -1197,7 +1197,7 @@ mod tests {
         let (identity, doc) = rt.block_on(dht.create(&custody.0)).unwrap();
         let did = identity.did.clone();
 
-        let bi = runtime::default_bridge_instance().expect("default bridge");
+        let bi = runtime::NapiBridgeInstance::new_napi();
 
         // Register the identity.
         runtime::register_identity(
@@ -1248,7 +1248,7 @@ mod tests {
         let (identity, doc) = rt.block_on(dht.create(&custody.0)).unwrap();
         let did = identity.did.clone();
 
-        let bi = runtime::default_bridge_instance().expect("default bridge");
+        let bi = runtime::NapiBridgeInstance::new_napi();
 
         // Register the identity.
         runtime::register_identity(

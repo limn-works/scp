@@ -13,6 +13,8 @@
 //! Gated behind the `server` feature on `scp-ffi-common`. Not available for
 //! WASM (ADR-034).
 
+use std::sync::Arc;
+
 use napi::Error as NapiError;
 use napi_derive::napi;
 use zeroize::Zeroizing;
@@ -22,7 +24,7 @@ use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate
 use scp_node::NodeError;
 
 use crate::error::ScpNapiError;
-use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
+use crate::runtime::NapiBridgeInstance;
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
@@ -66,7 +68,7 @@ fn node_err(e: NodeError) -> NapiError {
 /// Best-effort: logs a warning if the relay connection fails rather than
 /// blocking node startup.
 async fn auto_wire_context_manager(
-    bi: &NapiBridgeInstance,
+    bi: &Arc<NapiBridgeInstance>,
     did: &str,
     relay_url: &str,
     bridge_token: Zeroizing<String>,
@@ -212,6 +214,12 @@ impl Drop for NapiRelayHandle {
 #[napi]
 pub struct NapiNodeHandle {
     inner: RunningNode,
+    /// The `NapiBridgeInstance` that minted this handle.
+    ///
+    /// Retained so that methods like `enable_site_projection` can resolve
+    /// the `ContextManager` for broadcast-key auto-resolution without
+    /// depending on the process-global default bridge.
+    pub(crate) bi: Arc<NapiBridgeInstance>,
     /// `NapiBridgeInstance` id that minted this handle.
     pub(crate) instance_id: u64,
 }
@@ -295,8 +303,7 @@ impl NapiNodeHandle {
         }
 
         // Resolve broadcast key: explicit or auto-lookup from ContextManager.
-        let bi = default_bridge_instance()?;
-        let mgr = crate::runtime::context_manager(&bi)?;
+        let mgr = crate::runtime::context_manager(&self.bi)?;
         let resolved = server::resolve_broadcast_key(
             broadcast_key_hex,
             author_did,
@@ -528,9 +535,9 @@ fn build_node_identity(_bi: &NapiBridgeInstance, _did: &str) -> napi::Result<Nod
 // Free functions — relay startup
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`relay_start_in_memory`].
+/// Per-bridge-instance implementation of `relay_start_in_memory`.
 pub(crate) async fn relay_start_in_memory_on(
-    bi: &NapiBridgeInstance,
+    bi: &Arc<NapiBridgeInstance>,
 ) -> napi::Result<NapiRelayHandle> {
     let relay = server::start_relay_in_memory().await.map_err(server_err)?;
     increment_handle_count();
@@ -540,9 +547,9 @@ pub(crate) async fn relay_start_in_memory_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`relay_start_local`].
+/// Per-bridge-instance implementation of `relay_start_local`.
 pub(crate) async fn relay_start_local_on(
-    bi: &NapiBridgeInstance,
+    bi: &Arc<NapiBridgeInstance>,
     data_dir: String,
 ) -> napi::Result<NapiRelayHandle> {
     let relay = server::start_relay_local(std::path::Path::new(&data_dir))
@@ -559,9 +566,9 @@ pub(crate) async fn relay_start_local_on(
 // Free functions — node startup
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`node_start_in_memory`].
+/// Per-bridge-instance implementation of `node_start_in_memory`.
 pub(crate) async fn node_start_in_memory_on(
-    bi: &NapiBridgeInstance,
+    bi: &Arc<NapiBridgeInstance>,
     identity_did: Option<String>,
 ) -> napi::Result<NapiNodeHandle> {
     let node_identity = match identity_did {
@@ -575,13 +582,6 @@ pub(crate) async fn node_start_in_memory_on(
         .await
         .map_err(server_err)?;
 
-    // Auto-wire the ContextManager with relay transport so that
-    // context operations work immediately after node startup.
-    // Use the internal loopback URL (ws://127.0.0.1:{port}/scp/v1) instead of
-    // node.relay_url() which returns the advertised URL (wss://localhost/scp/v1)
-    // that requires TLS and lacks the actual bound port.
-    // The bridge token is required because ApplicationNode relays enforce
-    // Authorization: Bearer <token> on all WebSocket connections.
     let did = node.identity().did().to_owned();
     let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
     let bridge_token = node.bridge_token_hex();
@@ -590,13 +590,14 @@ pub(crate) async fn node_start_in_memory_on(
     increment_handle_count();
     Ok(NapiNodeHandle {
         inner: RunningNode::InMemory(node),
+        bi: Arc::clone(bi),
         instance_id: bi.instance_id(),
     })
 }
 
-/// Per-bridge-instance implementation of [`node_start_local`].
+/// Per-bridge-instance implementation of `node_start_local`.
 pub(crate) async fn node_start_local_on(
-    bi: &NapiBridgeInstance,
+    bi: &Arc<NapiBridgeInstance>,
     data_dir: String,
     identity_did: Option<String>,
     passphrase: Option<String>,
@@ -617,8 +618,6 @@ pub(crate) async fn node_start_local_on(
     .await
     .map_err(server_err)?;
 
-    // Auto-wire the ContextManager with relay transport.
-    // Use the internal loopback URL — see comment in node_start_in_memory.
     let did = node.identity().did().to_owned();
     let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
     let bridge_token = node.bridge_token_hex();
@@ -627,6 +626,7 @@ pub(crate) async fn node_start_local_on(
     increment_handle_count();
     Ok(NapiNodeHandle {
         inner: RunningNode::Filesystem(node),
+        bi: Arc::clone(bi),
         instance_id: bi.instance_id(),
     })
 }

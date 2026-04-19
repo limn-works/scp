@@ -140,9 +140,10 @@ impl ProtocolRepoVariant {
 ///
 /// Constructed via [`NapiBridgeInstance::new_napi`] /
 /// [`NapiBridgeInstance::with_persistence_napi`] /
-/// [`NapiBridgeInstance::with_storage_napi`]. The default global instance is
-/// lazily allocated into [`DEFAULT_BRIDGE_INSTANCE`]; user-owned instances
-/// (via `#[napi] Scp`) build their own instead.
+/// [`NapiBridgeInstance::with_storage_napi`]. Each `#[napi] Scp` owns an
+/// `Arc<NapiBridgeInstance>` exclusively — there is no process-global
+/// default bridge (the legacy `DEFAULT_BRIDGE_INSTANCE` was deleted in
+/// Phase D, #1695).
 ///
 /// Implements [`BridgeInstanceCore`] so shared helpers can operate on
 /// `&dyn BridgeInstanceCore`. `shutdown(timeout)` delegates to
@@ -582,212 +583,15 @@ pub fn context_manager(bi: &NapiBridgeInstance) -> napi::Result<&Arc<ContextMana
 }
 
 // ---------------------------------------------------------------------------
-// Default bridge instance (#1549 Phase 4 PR 1)
-//
-// The free-function façade (`contextCreate`, `identityCreate`, …) continues
-// to work by looking up a single process-global `NapiBridgeInstance` here.
-// New callers should instead hold a `#[napi] Scp` instance and call methods
-// on it directly. This static will be sunset two release cycles after Phase
-// 4 merges (see ADR + plan).
+// Phase D (#1695): DEFAULT_BRIDGE_INSTANCE static and the default-lookup
+// helpers (`default_bridge_instance`, `default_bridge_instance_raw`,
+// `bridge_instance`, `bridge_instance_for_affinity`, `ensure_bridge_instance`,
+// `default_instance_id`, `check_handle_affinity`, and
+// `attach_context_manager_to_bridge`) have been deleted. Every FFI entry
+// point routes through an explicit `&NapiBridgeInstance` — typically
+// `&*self.inner` inside a `#[napi] impl Scp` block. Tests construct fresh
+// `NapiBridgeInstance::new_napi()` instances directly.
 // ---------------------------------------------------------------------------
-
-/// Default [`NapiBridgeInstance`] for the legacy free-function façade.
-///
-/// Lazily initialized on the first free-function call that touches bridge
-/// state (via [`ensure_bridge_instance`]). User-owned instances
-/// (from `#[napi] Scp`) do **not** share state with this default — the two
-/// paths have independent `ContextManager`s, registries, and transports.
-static DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<NapiBridgeInstance>> = OnceLock::new();
-
-/// Initializes the default [`NapiBridgeInstance`] without a `ContextManager`.
-///
-/// Called by [`ensure_bridge_instance`] and (transitively) by the
-/// `init_context_manager*` family. The `ContextManager` is attached later
-/// via [`CoreFields::set_context_manager`] once `identity_create` has
-/// produced the local DID and the `MlsCryptoProvider` has been constructed
-/// with it. Per spec §12.2.3 the bridge instance carries no DID of its own.
-///
-/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-fn init_default_bridge_instance() {
-    // All typed registries (MCP, UCAN, identity) are now fields on
-    // `NapiBridgeInstance` and are cleared by
-    // `BridgeInstanceCore::bridge_specific_shutdown`; no shutdown hooks
-    // need to be registered here. Post commit 4 of #1549 Phase 4 PR 2.
-    let _ = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| Arc::new(NapiBridgeInstance::new_napi()));
-}
-
-/// Returns the raw default `NapiBridgeInstance`, if initialized.
-///
-/// Used by [`crate::scp_shutdown`] to reach the default instance during
-/// teardown. Returns `None` if the default was never initialized.
-#[must_use]
-#[cfg_attr(test, allow(dead_code))]
-pub fn default_bridge_instance_raw() -> Option<&'static Arc<NapiBridgeInstance>> {
-    DEFAULT_BRIDGE_INSTANCE.get()
-}
-
-/// Returns a handle to the default `NapiBridgeInstance`, initializing it if needed.
-///
-/// Used by the `#[napi] Scp::default_instance` factory to surface the same
-/// long-lived `Arc` shared by the free-function façade.
-///
-/// # Errors
-///
-/// Returns an error if the default bridge has been permanently shut down.
-pub fn default_bridge_instance() -> napi::Result<Arc<NapiBridgeInstance>> {
-    ensure_bridge_instance();
-    let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Context {
-            message: "default bridge instance not initialized".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })
-    })?;
-    if bi.core.is_shutdown() {
-        return Err(napi::Error::from(ScpNapiError::Context {
-            message: "default bridge instance has been permanently shut down".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        }));
-    }
-    Ok(Arc::clone(bi))
-}
-
-/// Ensures a `BridgeInstance` exists (without a `ContextManager`).
-///
-/// Called by [`crate::identity::ensure_did_resolver_initialized`] before
-/// `DidDht::create()` runs, so that the DID resolver slot owned by
-/// `BridgeInstance` is available. The `ContextManager` is attached later
-/// via [`init_context_manager`] (or [`attach_context_manager_to_bridge`])
-/// once the identity is known. Per spec §12.2.3 the `BridgeInstance`
-/// container has no DID requirement.
-///
-/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-pub fn ensure_bridge_instance() {
-    if DEFAULT_BRIDGE_INSTANCE.get().is_some() {
-        return;
-    }
-    init_default_bridge_instance();
-}
-
-/// Attaches an externally-constructed `ContextManager` to the default
-/// `NapiBridgeInstance`.
-///
-/// Used by `set_transport_manager` and similar code paths that need to install
-/// a `ContextManager` that was not created by `init_context_manager*`. Creates
-/// the default bridge if one does not yet exist.
-///
-/// No-op if the default bridge already has a `ContextManager` attached.
-pub fn attach_context_manager_to_bridge(cm: Arc<ContextManager>) {
-    ensure_bridge_instance();
-    if let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get()
-        && !bi.core.has_context_manager()
-    {
-        bi.core.set_context_manager(cm);
-    }
-}
-
-/// Returns a reference to the default [`NapiBridgeInstance`]'s core for
-/// handle-affinity checks only.
-///
-/// Unlike [`bridge_instance`], this helper does NOT return an error when
-/// the bridge is suspended — a handle-affinity check is a pure
-/// compare-two-u64 operation that does not touch transport or context
-/// manager state, so suspending the bridge must not block it. Used
-/// exclusively by the [`crate::napi_check_handle!`] macro at FFI entry
-/// points.
-///
-/// # Errors
-///
-/// Returns `napi::Error` if the default bridge has not been initialized
-/// via [`init_context_manager`] (initializes it if needed — same
-/// semantics as the old `check_handle_affinity` path).
-#[must_use = "the returned CoreFields reference must be used for the affinity check"]
-pub fn bridge_instance_for_affinity() -> napi::Result<&'static CoreFields> {
-    ensure_bridge_instance();
-    DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .map(|bi| &bi.core)
-        .ok_or_else(|| {
-            napi::Error::from(ScpNapiError::Context {
-                message: "bridge not initialized — call identityCreate first".to_owned(),
-                code: codes::CTX_2000.to_owned(),
-            })
-        })
-}
-
-/// Returns a reference to the default [`NapiBridgeInstance`]'s core.
-///
-/// Existing callers interacting with core state (known contexts, transport,
-/// economy trackers) continue to use this helper. Handle-affinity checks
-/// on the default path collapse to trivial equality because every handle
-/// minted by the free-function façade carries the default `instance_id`.
-///
-/// # Errors
-///
-/// Returns `napi::Error` if the default bridge has not been initialized
-/// via [`init_context_manager`], or if it is currently suspended.
-pub fn bridge_instance() -> napi::Result<&'static CoreFields> {
-    let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Context {
-            message: "bridge not initialized — call identityCreate first".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })
-    })?;
-    // Suspended: return error (recoverable — caller should resume()).
-    // AlreadyShutDown: warn only — shutdown already destroyed state,
-    // operations will fail naturally at MLS/transport layer.
-    if bi.core.is_suspended() {
-        return Err(napi::Error::from(ScpNapiError::Context {
-            message: "bridge is suspended — call resume() before performing operations".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        }));
-    }
-    if bi.core.is_shutdown() {
-        tracing::warn!("bridge_instance() called after shutdown — operations may fail");
-    }
-    Ok(&bi.core)
-}
-
-/// Returns the default instance id for handle-affinity checks in free-function
-/// entry points.
-///
-/// Every handle minted by the free-function façade carries this id, so
-/// the `check_handle` call at each entry is essentially a sanity check in
-/// PR 1. Distinct `instance_id`s appear in PR 2 once `#[napi] Scp::new`
-/// is the primary construction path.
-pub fn default_instance_id() -> napi::Result<u64> {
-    ensure_bridge_instance();
-    DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .map(|bi| bi.core.instance_id())
-        .ok_or_else(|| {
-            napi::Error::from(ScpNapiError::Context {
-                message: "default bridge instance not initialized".to_owned(),
-                code: codes::CTX_2000.to_owned(),
-            })
-        })
-}
-
-/// Runtime handle-affinity check against the default `NapiBridgeInstance`.
-///
-/// Compares `handle_instance_id` against the default bridge's
-/// [`CoreFields::instance_id`] and maps any mismatch to
-/// [`ScpNapiError::Permission`] with error code `SCP-PERM-3030`.
-///
-/// Every free-function bridge entry that takes a `#[napi]` handle calls
-/// this helper (or the [`crate::napi_check_handle!`] macro) on the handle's
-/// stored `instance_id`. Once multi-instance is primary (PR 2+),
-/// `SCP::method` entries will instead compare against
-/// `self.inner.core.instance_id`.
-pub fn check_handle_affinity(handle_instance_id: u64) -> napi::Result<()> {
-    let expected = default_instance_id()?;
-    if handle_instance_id == expected {
-        Ok(())
-    } else {
-        Err(napi::Error::from(ScpNapiError::from(
-            scp_ffi_common::bridge_instance::HandleAffinityError::new(handle_instance_id, expected),
-        )))
-    }
-}
 
 /// Uniform accessor for the instance id carried by every `#[napi]` handle type.
 ///
@@ -1072,14 +876,13 @@ fn event_log_provider_from_existing_repo(
 /// package bytes with `did:key:` test DIDs.
 ///
 /// Must be called before the first `context_manager()` call in tests.
-/// `OnceLock::get_or_init` ensures only the first initialization wins.
+/// Initializes the given bridge instance's `ContextManager` with
+/// test-only providers (no-op crypto + local transport).
+///
+/// Must be called before the first `context_manager(bi)` call in tests.
+/// First-call-wins semantics via `CoreFields::set_context_manager`.
 #[cfg(test)]
-pub(crate) fn init_context_manager_for_test() {
-    ensure_bridge_instance();
-    let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
-        tracing::error!("init_context_manager_for_test: BridgeInstance unexpectedly None");
-        return;
-    };
+pub(crate) fn init_context_manager_for_test_on(bi: &NapiBridgeInstance) {
     if bi.core.has_context_manager() {
         return;
     }
@@ -1562,30 +1365,9 @@ pub fn query_trust_event_counts(
 // Delegates to the `BridgeInstance`'s `rate_limiters` DashMap (#1549).
 // ---------------------------------------------------------------------------
 
-/// Returns a mutable reference to the rate limit tracker for the given
-/// identity DID, creating one if it does not exist.
-///
-/// Delegates to [`CoreFields::with_rate_limit_tracker`]. If the bridge
-/// has not been initialized (unusual — identity must be created before
-/// invitation evaluation), falls back to a thread-local default tracker
-/// to preserve the original infallible signature.
-pub fn with_rate_limit_tracker<F, T>(identity_did: &str, f: F) -> T
-where
-    F: FnOnce(&mut scp_core::context::invitation::RateLimitTracker) -> T,
-{
-    if let Ok(bi) = bridge_instance() {
-        bi.with_rate_limit_tracker(identity_did, f)
-    } else {
-        // Bridge not initialized — use a temporary tracker. This path
-        // should not be hit in normal operation (identity is always
-        // created before invitation evaluation).
-        tracing::warn!(
-            "with_rate_limit_tracker called before bridge init — using ephemeral tracker"
-        );
-        let mut tracker = scp_core::context::invitation::RateLimitTracker::default();
-        f(&mut tracker)
-    }
-}
+// Phase D (#1695): `with_rate_limit_tracker` default-bridge shim deleted.
+// Callers pass a `&NapiBridgeInstance` and call
+// `bi.core.with_rate_limit_tracker(identity_did, f)` directly.
 
 /// Registers a test context in the UCAN state registry.
 ///
@@ -1820,31 +1602,29 @@ mod tests {
 
     #[test]
     fn bridge_instance_populated_by_init_context_manager() {
-        // init_context_manager_for_test populates DEFAULT_BRIDGE_INSTANCE which
-        // owns the ContextManager. Since OnceLock is process-global, the first
-        // call in any test wins — subsequent calls are no-ops. We rely on this
-        // being called (possibly by other tests) before asserting.
-        init_context_manager_for_test();
+        // A fresh NapiBridgeInstance must accept a ContextManager via
+        // init_context_manager_for_test_on and make it visible through
+        // context_manager(&bi).
+        let bi = NapiBridgeInstance::new_napi();
+        init_context_manager_for_test_on(&bi);
 
-        let bi = default_bridge_instance().expect("default bridge");
         let cm = context_manager(&bi).expect("context_manager should be initialized");
-        let core = bridge_instance().expect("bridge_instance should be initialized");
 
         // Both should point to the same ContextManager allocation.
         assert!(
-            Arc::ptr_eq(cm, core.try_context_manager().unwrap()),
-            "bridge_instance().try_context_manager() must be the same Arc as context_manager()"
+            Arc::ptr_eq(cm, bi.core.try_context_manager().unwrap()),
+            "context_manager(&bi) must match bi.core.try_context_manager()"
         );
     }
 
     #[test]
     fn bridge_instance_not_shutdown_initially() {
-        init_context_manager_for_test();
+        let bi = NapiBridgeInstance::new_napi();
+        init_context_manager_for_test_on(&bi);
 
-        let core = bridge_instance().expect("bridge_instance should be initialized");
         assert!(
-            !core.is_shutdown(),
-            "bridge_instance should not be shutdown immediately after init"
+            !bi.core.is_shutdown(),
+            "fresh bridge instance should not be shutdown after init"
         );
     }
 
@@ -1926,16 +1706,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_default_instance_is_same_arc() {
-        // First call may or may not initialize depending on test order; second
-        // call must return an `Arc` pointing at the same allocation.
-        let a = default_bridge_instance().expect("default instance must be available");
-        let b = default_bridge_instance().expect("default instance must be available");
-        assert!(
-            Arc::ptr_eq(&a, &b),
-            "repeated default_bridge_instance() calls must return the same Arc"
-        );
-        assert_eq!(a.instance_id(), b.instance_id());
-    }
+    // Phase D (#1695): `test_default_instance_is_same_arc` deleted —
+    // DEFAULT_BRIDGE_INSTANCE no longer exists. Each caller owns its own
+    // `NapiBridgeInstance` and `Scp::new()` verifies uniqueness via
+    // `test_napi_bridge_instance_unique_ids` above.
 }

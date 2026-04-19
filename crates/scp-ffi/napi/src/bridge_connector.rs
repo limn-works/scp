@@ -425,8 +425,7 @@ mod tests {
 
     #[test]
     fn create_shadow_returns_observer_role() {
-        crate::runtime::init_context_manager_for_test();
-        let bi = crate::runtime::default_bridge_instance().expect("default bi");
+        let bi = crate::runtime::NapiBridgeInstance::new_napi();
         let result = bridge_create_shadow_on(
             &bi,
             "bridge-1".to_owned(),

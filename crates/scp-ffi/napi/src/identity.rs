@@ -119,20 +119,9 @@ pub(crate) fn ensure_did_resolver_initialized_on(bi: &crate::runtime::NapiBridge
     crate::runtime::init_did_resolver(bi, resolver, handle);
 }
 
-/// Default-bridge wrapper around [`ensure_did_resolver_initialized_on`].
-///
-/// Retained for the legacy free-function façade paths. Routes through
-/// [`crate::runtime::default_bridge_instance`] so the behaviour matches
-/// the prior process-global path exactly.
-//
-// Retained until the Phase 4 demolition slice removes the remaining
-// free-function identity façade entries.
-#[allow(dead_code)]
-fn ensure_did_resolver_initialized() {
-    if let Ok(bi) = crate::runtime::default_bridge_instance() {
-        ensure_did_resolver_initialized_on(&bi);
-    }
-}
+// Phase D (#1695): `ensure_did_resolver_initialized` default-bridge wrapper
+// deleted. All callers pass `&NapiBridgeInstance` and invoke
+// `ensure_did_resolver_initialized_on(bi)` directly.
 
 /// Publishes a newly created DID document to the shared `InMemoryDhtClient`.
 ///
@@ -261,7 +250,6 @@ fn make_dht_with_signer(
 // ---------------------------------------------------------------------------
 
 /// Inner state for a [`NapiIdentity`] handle.
-#[derive(Debug)]
 pub(crate) struct NapiIdentityInner {
     /// The DID string (e.g., `"did:dht:z6Mk..."`).
     pub(crate) did: String,
@@ -282,6 +270,13 @@ pub(crate) struct NapiIdentityInner {
     /// Used by agent key operations to read/modify the document. `None` for
     /// externally loaded identities.
     pub(crate) document: Option<DidDocument>,
+    /// The `NapiBridgeInstance` that minted this identity.
+    ///
+    /// Retained so mutable identity methods (rotateKey, addAgentKey,
+    /// rotateAgentKey, removeAgentKey, migrate) can register the derived
+    /// identity state on the correct bridge registry without depending on
+    /// the process-global default bridge. Phase D (#1695).
+    pub(crate) bi: Arc<crate::runtime::NapiBridgeInstance>,
     /// `NapiBridgeInstance` id that minted this handle — used for runtime
     /// handle-affinity checks at every FFI entry point that accepts a
     /// `NapiIdentity`. Mismatches are rejected with `SCP-PERM-3030`.
@@ -407,7 +402,7 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("rotateKey")?;
 
-            let bi = crate::runtime::default_bridge_instance()?;
+            let bi = &self.inner.bi;
 
             // Read attestations BEFORE async operation (entry guaranteed to exist).
             let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
@@ -440,7 +435,7 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
-                    instance_id: crate::runtime::default_instance_id()?,
+                    bi: Arc::clone(&self.inner.bi), instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -479,7 +474,7 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("addAgentKey")?;
 
-            let bi = crate::runtime::default_bridge_instance()?;
+            let bi = &self.inner.bi;
 
             // Read attestations BEFORE async operation (entry guaranteed to exist).
             let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
@@ -513,7 +508,7 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
-                    instance_id: crate::runtime::default_instance_id()?,
+                    bi: Arc::clone(&self.inner.bi), instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -553,7 +548,7 @@ impl NapiIdentity {
             let (scp_identity, custody, document) =
                 self.extract_in_memory_state("rotateAgentKey")?;
 
-            let bi = crate::runtime::default_bridge_instance()?;
+            let bi = &self.inner.bi;
 
             // Read attestations BEFORE async operation (entry guaranteed to exist).
             let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
@@ -586,7 +581,7 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
-                    instance_id: crate::runtime::default_instance_id()?,
+                    bi: Arc::clone(&self.inner.bi), instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -626,7 +621,7 @@ impl NapiIdentity {
             let (scp_identity, custody, document) =
                 self.extract_in_memory_state("removeAgentKey")?;
 
-            let bi = crate::runtime::default_bridge_instance()?;
+            let bi = &self.inner.bi;
 
             // Read attestations BEFORE async operation (entry guaranteed to exist).
             let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
@@ -659,7 +654,7 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
-                    instance_id: crate::runtime::default_instance_id()?,
+                    bi: Arc::clone(&self.inner.bi), instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -709,7 +704,7 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("migrate")?;
 
-            let bi = crate::runtime::default_bridge_instance()?;
+            let bi = &self.inner.bi;
 
             // Read attestations BEFORE async operation (entry guaranteed to exist now).
             let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
@@ -772,7 +767,7 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
-                    instance_id: crate::runtime::default_instance_id()?,
+                    bi: Arc::clone(&self.inner.bi), instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -1047,7 +1042,8 @@ mod tests {
     use scp_ffi_common::error_codes as codes;
 
     /// Creates a test `NapiIdentity` with in-memory custody, returning the
-    /// identity and its initial active signing key's public key (multibase).
+    /// identity (stamped with a dedicated `NapiBridgeInstance`) and its
+    /// initial active signing key's public key (multibase).
     async fn create_test_identity() -> (NapiIdentity, String) {
         let key_custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
         let dht = DidDht::new();
@@ -1065,6 +1061,21 @@ mod tests {
             .public_key_multibase
             .clone();
 
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        // Register the identity on the bridge so rotate_key / agent-key
+        // methods can look it up via `with_identity`.
+        crate::runtime::register_identity(
+            &bi,
+            &scp_identity.did,
+            crate::runtime::NapiIdentityEntry {
+                identity: scp_identity.clone(),
+                custody: Arc::clone(&key_custody),
+                document: document.clone(),
+                identity_link_attestations: Vec::new(),
+            },
+        );
+        let instance_id = bi.instance_id();
+
         let handle = NapiIdentity {
             inner: Arc::new(NapiIdentityInner {
                 did: scp_identity.did.clone(),
@@ -1072,7 +1083,8 @@ mod tests {
                 scp_identity: Some(scp_identity),
                 in_memory_custody: Some(key_custody),
                 document: Some(document),
-                instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
+                bi,
+                instance_id,
             }),
         };
         increment_handle_count();
@@ -1208,6 +1220,8 @@ mod tests {
 
         // Construct a NapiIdentity with no scp_identity and no in_memory_custody,
         // simulating an externally loaded identity with no retained key material.
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let instance_id = bi.instance_id();
         let identity = NapiIdentity {
             inner: Arc::new(NapiIdentityInner {
                 did: "did:dht:z6MkTest".to_owned(),
@@ -1215,7 +1229,8 @@ mod tests {
                 scp_identity: None,
                 in_memory_custody: None,
                 document: None,
-                instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
+                bi,
+                instance_id,
             }),
         };
         increment_handle_count();
@@ -1460,7 +1475,10 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let (identity, _) = rt.block_on(create_test_identity());
         let old_did = identity.did();
-        let bi = crate::runtime::default_bridge_instance().expect("default bridge");
+        // `create_test_identity` stamped the handle with its own bridge;
+        // reuse that bridge so registry writes land on the same instance
+        // the migrate() method will consult via `self.inner.bi`.
+        let bi = Arc::clone(&identity.inner.bi);
 
         // Register the identity in the runtime (simulating what identity_create does).
         crate::runtime::register_identity(
@@ -1502,6 +1520,8 @@ mod tests {
     fn migrate_errors_without_retained_crypto_state() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let instance_id = bi.instance_id();
         let identity = NapiIdentity {
             inner: Arc::new(NapiIdentityInner {
                 did: "did:dht:z6MkTest".to_owned(),
@@ -1509,7 +1529,8 @@ mod tests {
                 scp_identity: None,
                 in_memory_custody: None,
                 document: None,
-                instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
+                bi,
+                instance_id,
             }),
         };
         increment_handle_count();

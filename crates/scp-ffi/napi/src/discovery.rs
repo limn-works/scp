@@ -32,24 +32,6 @@ use scp_ffi_common::petname_helpers::{self};
 
 use crate::error::ScpNapiError;
 
-// ---------------------------------------------------------------------------
-// Test-only reset helpers
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-fn reset_petname_map_for(owner_did: &str) {
-    if let Ok(bi) = crate::runtime::default_bridge_instance() {
-        petname_helpers::reset_petname_map_for(&bi.core, owner_did);
-    }
-}
-
-#[cfg(test)]
-fn reset_handle_registry_for(context_id: &str) {
-    if let Ok(bi) = crate::runtime::default_bridge_instance() {
-        petname_helpers::reset_handle_registry_for(&bi.core, context_id);
-    }
-}
-
 fn parse_handle_target(json: &str) -> napi::Result<HandleTarget> {
     petname_helpers::parse_handle_target(json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
@@ -358,14 +340,14 @@ mod tests {
     #[test]
     fn petname_set_and_resolve() {
         let owner = "did:dht:zNapiTest1".to_owned();
-        reset_petname_map_for(&owner);
-        crate::scp::Scp::new().unwrap().petname_set(
+        let scp = crate::scp::Scp::new().unwrap();
+        scp.petname_set(
             owner.clone(),
             "did:dht:zAlice".to_owned(),
             "alice".to_owned(),
         )
         .unwrap();
-        let json = crate::scp::Scp::new().unwrap().petname_resolve_did(owner, "alice".to_owned()).unwrap();
+        let json = scp.petname_resolve_did(owner, "alice".to_owned()).unwrap();
         let dids: Vec<String> = serde_json::from_str(&json).unwrap();
         assert_eq!(dids.len(), 1);
         assert_eq!(dids[0], "did:dht:zAlice");
@@ -374,9 +356,16 @@ mod tests {
     #[test]
     fn petname_context_set_and_resolve() {
         let owner = "did:dht:zNapiTest2".to_owned();
-        reset_petname_map_for(&owner);
-        crate::scp::Scp::new().unwrap().petname_set_context(owner.clone(), "ctx-napi-1".to_owned(), "work".to_owned()).unwrap();
-        let json = crate::scp::Scp::new().unwrap().petname_resolve_context(owner, "work".to_owned()).unwrap();
+        let scp = crate::scp::Scp::new().unwrap();
+        scp.petname_set_context(
+            owner.clone(),
+            "ctx-napi-1".to_owned(),
+            "work".to_owned(),
+        )
+        .unwrap();
+        let json = scp
+            .petname_resolve_context(owner, "work".to_owned())
+            .unwrap();
         let ids: Vec<String> = serde_json::from_str(&json).unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], "ctx-napi-1");
@@ -387,21 +376,22 @@ mod tests {
     #[test]
     fn handle_register_and_lookup_napi() {
         let ctx = "ctx-napi-handle-1".to_owned();
-        reset_handle_registry_for(&ctx);
         let target = r#"{"type": "identity", "did": "did:dht:zNapiAlice"}"#.to_owned();
-        let result = crate::scp::Scp::new().unwrap().handle_register(
-            ctx.clone(),
-            "alice".to_owned(),
-            target,
-            "did:dht:zNapiAlice".to_owned(),
-            None,
-            None,
-        )
-        .unwrap();
+        let scp = crate::scp::Scp::new().unwrap();
+        let result = scp
+            .handle_register(
+                ctx.clone(),
+                "alice".to_owned(),
+                target,
+                "did:dht:zNapiAlice".to_owned(),
+                None,
+                None,
+            )
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["status"], "registered");
 
-        let lookup = crate::scp::Scp::new().unwrap().handle_lookup(ctx, "alice".to_owned(), None).unwrap();
+        let lookup = scp.handle_lookup(ctx, "alice".to_owned(), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&lookup).unwrap();
         assert_eq!(parsed["results"].as_array().unwrap().len(), 1);
     }

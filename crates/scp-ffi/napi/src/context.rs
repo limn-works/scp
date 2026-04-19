@@ -30,7 +30,7 @@ use crate::error::ScpNapiError;
 use crate::identity::NapiIdentity;
 #[cfg(feature = "allow_in_memory_custody")]
 use crate::identity::OpaqueInMemoryKeyCustody;
-use crate::runtime::{NapiBridgeInstance, context_manager, default_bridge_instance};
+use crate::runtime::{NapiBridgeInstance, context_manager};
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
@@ -135,10 +135,15 @@ pub struct NapiContextHandle {
     /// the first successful call; reset to `false` when the spawned task exits,
     /// enabling re-subscription after relay disconnect or task termination.
     pub(crate) subscription_active: Arc<std::sync::atomic::AtomicBool>,
+    /// The `NapiBridgeInstance` that minted this handle.
+    ///
+    /// Retained so getter methods on the handle (e.g. `memberCount`) can
+    /// reach the `ContextManager` without depending on the process-global
+    /// default bridge. Phase D (#1695).
+    pub(crate) bi: Arc<NapiBridgeInstance>,
     /// Identifier of the `NapiBridgeInstance` that minted this handle.
-    /// Checked at every FFI entry point that accepts the handle (see
-    /// [`crate::runtime::default_instance_id`] and the
-    /// [`napi_check_handle!`](crate::napi_check_handle) macro). Rejects
+    /// Checked at every FFI entry point that accepts the handle via the
+    /// [`napi_check_handle!`](crate::napi_check_handle) macro. Rejects
     /// cross-instance misuse with `SCP-PERM-3030`.
     pub(crate) instance_id: u64,
 }
@@ -241,8 +246,7 @@ impl NapiContextHandle {
     /// Returns an error if the `ContextManager` is not initialised.
     #[napi(getter, js_name = "memberCount")]
     pub fn member_count(&self) -> napi::Result<u32> {
-        let bi = default_bridge_instance()?;
-        let manager = context_manager(&bi)?;
+        let manager = context_manager(&self.bi)?;
         let count = crate::runtime()
             .block_on(manager.member_count(&self.context_id))
             .unwrap_or(0);
@@ -310,19 +314,16 @@ impl Drop for NapiContextHandle {
 
 #[cfg(test)]
 impl NapiContextHandle {
-    /// Creates a minimal active handle for cross-module tests.
-    ///
-    /// The handle is in `Active` state with default parameters and no
-    /// `core_handle`. Suitable for testing bridge functions that only need
+    /// Creates a minimal active handle stamped with the given bridge
+    /// instance's id. Suitable for testing bridge functions that only need
     /// UCAN state (set up via `ensure_registered`).
-    pub(crate) fn test_active(context_id: String, creator_did: String) -> Self {
+    pub(crate) fn test_active_on(
+        bi: &Arc<NapiBridgeInstance>,
+        context_id: String,
+        creator_did: String,
+    ) -> Self {
         increment_handle_count();
-        // Stamp with the default bridge instance's id when available so
-        // `napi_check_handle!` accepts the handle at FFI entry points. Falls
-        // back to `UNSET_INSTANCE_ID` only if the default instance cannot be
-        // resolved (ensures this helper remains infallible).
-        let instance_id = crate::runtime::default_instance_id()
-            .unwrap_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID);
+        let instance_id = bi.instance_id();
         Self {
             context_id,
             state: std::sync::Mutex::new(ContextState::Active),
@@ -340,6 +341,7 @@ impl NapiContextHandle {
             core_handle: None,
             subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
             subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            bi: Arc::clone(bi),
             instance_id,
         }
     }
@@ -399,9 +401,13 @@ async fn derive_context_pseudonym(_identity: &NapiIdentity, _context_id: &str) -
 // Bridge functions — context lifecycle (delegated to ContextManager)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`context_create`].
+/// Per-bridge-instance implementation of `context_create`.
+///
+/// Takes an `Arc<NapiBridgeInstance>` so the returned handle can retain a
+/// clone for subsequent bridge-scoped operations (e.g. `memberCount`
+/// getter) without depending on the process-global default bridge.
 pub(crate) async fn context_create_on(
-    bi: &NapiBridgeInstance,
+    bi: &Arc<NapiBridgeInstance>,
     identity: &NapiIdentity,
     params_json: String,
 ) -> napi::Result<NapiContextHandle> {
@@ -596,6 +602,7 @@ pub(crate) async fn context_create_on(
         core_handle: Some(core_handle),
         subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
         subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        bi: Arc::clone(bi),
         instance_id: bi.instance_id(),
     };
     increment_handle_count();
@@ -2896,26 +2903,7 @@ pub(crate) fn context_get_economic_policy_on(
 // App Sandboxing (#595, spec §8.4.1, §8.4.2)
 // ---------------------------------------------------------------------------
 
-/// Validates a capability declaration JSON string against context ceiling and role.
-///
-/// Returns a JSON string with fields: `valid` (bool), `grantedCapabilities`
-/// (string[]), `error` (string | null), and `appDid` (string).
-#[napi]
-pub fn validate_capability_declaration(
-    declaration_json: String,
-    ceiling_capabilities: Vec<String>,
-    role_capabilities: Vec<String>,
-) -> napi::Result<String> {
-    let bi = default_bridge_instance()?;
-    validate_capability_declaration_on(
-        &bi,
-        declaration_json,
-        ceiling_capabilities,
-        role_capabilities,
-    )
-}
-
-/// Per-bridge-instance implementation of [`validate_capability_declaration`].
+/// Per-bridge-instance implementation of `validate_capability_declaration`.
 pub(crate) fn validate_capability_declaration_on(
     _bi: &NapiBridgeInstance,
     declaration_json: String,
@@ -3026,9 +3014,9 @@ impl scp_core::context::invitation::TrustOracle for NapiBridgeTrustOracle {
     }
 }
 
-/// Per-bridge-instance implementation of [`evaluate_invitation`].
+/// Per-bridge-instance implementation of `evaluate_invitation`.
 pub(crate) fn evaluate_invitation_on(
-    _bi: &NapiBridgeInstance,
+    bi: &NapiBridgeInstance,
     params_json: String,
     inviter_did: String,
     identity_did: String,
@@ -3101,7 +3089,7 @@ pub(crate) fn evaluate_invitation_on(
     let oracle = NapiBridgeTrustOracle { trusted_dids };
     let inviter = scp_identity::DID::from(inviter_did.as_str());
 
-    let decision = crate::runtime::with_rate_limit_tracker(&identity_did, |tracker| {
+    let decision = bi.core.with_rate_limit_tracker(&identity_did, |tracker| {
         core_evaluate(
             &params,
             &inviter,
@@ -3131,35 +3119,7 @@ pub(crate) fn evaluate_invitation_on(
 // MetadataRecord inspection (§5.7.2, #615)
 // ---------------------------------------------------------------------------
 
-/// Serializes a `MetadataRecord` to a JSON string.
-///
-/// Constructs a `MetadataRecord` from the provided fields and returns its
-/// JSON representation. The `signature` field is provided as a hex-encoded
-/// string (64 bytes = 128 hex characters).
-#[napi]
-pub fn metadata_record_to_json(
-    context_id: String,
-    sequence: u32,
-    signer_did: String,
-    timestamp: f64,
-    structural_json: String,
-    operational_json: String,
-    signature_hex: String,
-) -> napi::Result<String> {
-    let bi = default_bridge_instance()?;
-    metadata_record_to_json_on(
-        &bi,
-        context_id,
-        sequence,
-        signer_did,
-        timestamp,
-        structural_json,
-        operational_json,
-        signature_hex,
-    )
-}
-
-/// Per-bridge-instance implementation of [`metadata_record_to_json`].
+/// Per-bridge-instance implementation of `metadata_record_to_json`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn metadata_record_to_json_on(
     _bi: &NapiBridgeInstance,
@@ -3242,14 +3202,6 @@ pub(crate) fn metadata_record_to_json_on(
     })
 }
 
-/// Deserializes a `MetadataRecord` from a JSON string.
-///
-/// Returns the validated and re-serialized JSON.
-#[napi]
-pub fn metadata_record_from_json(json_str: String) -> napi::Result<String> {
-    let bi = default_bridge_instance()?;
-    metadata_record_from_json_on(&bi, json_str)
-}
 
 /// Per-bridge-instance implementation of [`metadata_record_from_json`].
 pub(crate) fn metadata_record_from_json_on(
@@ -3296,14 +3248,7 @@ pub(crate) fn metadata_record_from_json_on(
 // Context template inspection (§5.14, #615)
 // ---------------------------------------------------------------------------
 
-/// Returns the canonical `ContextParams` for a given template ID as JSON.
-#[napi]
-pub fn template_get_params(template_id: String) -> napi::Result<String> {
-    let bi = default_bridge_instance()?;
-    template_get_params_on(&bi, template_id)
-}
-
-/// Per-bridge-instance implementation of [`template_get_params`].
+/// Per-bridge-instance implementation of `template_get_params`.
 pub(crate) fn template_get_params_on(
     _bi: &NapiBridgeInstance,
     template_id: String,
@@ -3320,16 +3265,7 @@ pub(crate) fn template_get_params_on(
     })
 }
 
-/// Validates that a `ContextParams` JSON matches its template definition.
-///
-/// Returns `null` on success, or a string error message on validation failure.
-#[napi]
-pub fn validate_against_template(params_json: String) -> napi::Result<Option<String>> {
-    let bi = default_bridge_instance()?;
-    validate_against_template_on(&bi, params_json)
-}
-
-/// Per-bridge-instance implementation of [`validate_against_template`].
+/// Per-bridge-instance implementation of `validate_against_template`.
 pub(crate) fn validate_against_template_on(
     _bi: &NapiBridgeInstance,
     params_json: String,
@@ -3350,16 +3286,7 @@ pub(crate) fn validate_against_template_on(
     }
 }
 
-/// Validates cross-field invariants for `ContextParams` regardless of template.
-///
-/// Returns `null` on success, or a string error message on validation failure.
-#[napi]
-pub fn validate_context_params(params_json: String) -> napi::Result<Option<String>> {
-    let bi = default_bridge_instance()?;
-    validate_context_params_on(&bi, params_json)
-}
-
-/// Per-bridge-instance implementation of [`validate_context_params`].
+/// Per-bridge-instance implementation of `validate_context_params`.
 pub(crate) fn validate_context_params_on(
     _bi: &NapiBridgeInstance,
     params_json: String,
@@ -3437,8 +3364,8 @@ mod tests {
     /// creator); after a join it becomes 2.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn member_count_reflects_actual_membership() {
-        crate::runtime::init_context_manager_for_test();
-        let bi = crate::runtime::default_bridge_instance().expect("default bridge");
+        
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi()); crate::runtime::init_context_manager_for_test_on(&bi);
         let manager = context_manager(&bi).expect("manager initialized above");
         let ctx_id = format!("test-member-count-{}", uuid::Uuid::new_v4());
         let creator = DID("did:key:z6MkCreator".to_owned());
@@ -3475,10 +3402,8 @@ mod tests {
         use super::*;
         use std::sync::Mutex;
 
-        // Stamp the handle with the default bridge instance's id so
-        // `napi_check_handle!` accepts it.
-        let default_instance_id = crate::runtime::default_instance_id()
-            .expect("default instance id should be available in tests");
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let instance_id = bi.instance_id();
 
         let mut handle = NapiContextHandle {
             context_id: "test-ctx-econ".to_owned(),
@@ -3497,27 +3422,28 @@ mod tests {
             core_handle: None,
             subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
             subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            instance_id: default_instance_id,
+            bi: std::sync::Arc::clone(&bi),
+            instance_id,
         };
 
         // Initially None.
         assert!(
-            context_get_economic_policy_on(&crate::runtime::default_bridge_instance().unwrap(), &handle)
-                .expect("handle is default-instance")
+            context_get_economic_policy_on(&bi, &handle)
+                .expect("handle matches bi")
                 .is_none()
         );
 
         // Direct set always rejects — must use governance (#728).
         let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":100,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
-        let result = context_set_economic_policy_on(&crate::runtime::default_bridge_instance().unwrap(), &mut handle, json.to_owned());
+        let result = context_set_economic_policy_on(&bi, &mut handle, json.to_owned());
         assert!(
             result.is_err(),
             "direct set must be rejected — use governance"
         );
         // Policy should remain unchanged.
         assert!(
-            context_get_economic_policy_on(&crate::runtime::default_bridge_instance().unwrap(), &handle)
-                .expect("handle is default-instance")
+            context_get_economic_policy_on(&bi, &handle)
+                .expect("handle matches bi")
                 .is_none()
         );
     }
@@ -3528,8 +3454,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_change_role() {
-        crate::runtime::init_context_manager_for_test();
-        let bi = crate::runtime::default_bridge_instance().expect("default bridge");
+        
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi()); crate::runtime::init_context_manager_for_test_on(&bi);
         let manager = context_manager(&bi).expect("manager initialized above");
         let ctx_id = format!("napi-sync-role-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator1";
@@ -3590,8 +3516,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_add_member() {
-        crate::runtime::init_context_manager_for_test();
-        let bi = crate::runtime::default_bridge_instance().expect("default bridge");
+        
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi()); crate::runtime::init_context_manager_for_test_on(&bi);
         let manager = context_manager(&bi).expect("manager initialized above");
         let ctx_id = format!("napi-sync-add-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator2";
@@ -3643,8 +3569,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_remove_member() {
-        crate::runtime::init_context_manager_for_test();
-        let bi = crate::runtime::default_bridge_instance().expect("default bridge");
+        
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi()); crate::runtime::init_context_manager_for_test_on(&bi);
         let manager = context_manager(&bi).expect("manager initialized above");
         let ctx_id = format!("napi-sync-rm-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator3";
@@ -3802,13 +3728,14 @@ mod tests {
 
     #[test]
     fn evaluate_invitation_accepts_spending_json() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         let params = scp_core::context::ContextParams::default();
         let params_json = serde_json::to_string(&params).unwrap();
         let spending_json =
             r#"{"has_spending_ucan":true,"configured_adapters":["x402"],"available_balance":10000}"#
                 .to_owned();
 
-        let result = super::evaluate_invitation_on(&crate::runtime::default_bridge_instance().unwrap(), 
+        let result = super::evaluate_invitation_on(&bi,
             params_json,
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
@@ -3824,10 +3751,11 @@ mod tests {
 
     #[test]
     fn evaluate_invitation_rejects_invalid_spending_json() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         let params = scp_core::context::ContextParams::default();
         let params_json = serde_json::to_string(&params).unwrap();
 
-        let result = super::evaluate_invitation_on(&crate::runtime::default_bridge_instance().unwrap(), 
+        let result = super::evaluate_invitation_on(&bi,
             params_json,
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
@@ -3841,10 +3769,11 @@ mod tests {
 
     #[test]
     fn evaluate_invitation_none_spending_accepted() {
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         let params = scp_core::context::ContextParams::default();
         let params_json = serde_json::to_string(&params).unwrap();
 
-        let result = super::evaluate_invitation_on(&crate::runtime::default_bridge_instance().unwrap(), 
+        let result = super::evaluate_invitation_on(&bi,
             params_json,
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
@@ -3868,9 +3797,11 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_create_threads_consequence_rules_and_config() {
-        crate::runtime::init_context_manager_for_test();
+        let scp = crate::scp::Scp::new().unwrap();
+        let bi = std::sync::Arc::clone(&scp.inner);
 
-        let identity = crate::scp::Scp::new().unwrap().identity_create("in_memory".to_owned())
+        let identity = scp
+            .identity_create("in_memory".to_owned())
             .await
             .expect("identity_create should succeed");
 
@@ -3894,11 +3825,10 @@ mod tests {
         })
         .to_string();
 
-        let handle = super::context_create_on(&crate::runtime::default_bridge_instance().unwrap(), &identity, params_json)
+        let handle = super::context_create_on(&bi, &identity, params_json)
             .await
             .expect("context_create should succeed");
 
-        let bi = crate::runtime::default_bridge_instance().expect("default bridge");
         let manager = context_manager(&bi).expect("manager should be initialized");
         let stored = manager
             .context_params(&handle.context_id)
@@ -3923,9 +3853,11 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_create_rejects_revoke_access_when_config_disallows() {
-        crate::runtime::init_context_manager_for_test();
+        let scp = crate::scp::Scp::new().unwrap();
+        let bi = std::sync::Arc::clone(&scp.inner);
 
-        let identity = crate::scp::Scp::new().unwrap().identity_create("in_memory".to_owned())
+        let identity = scp
+            .identity_create("in_memory".to_owned())
             .await
             .expect("identity_create should succeed");
 
@@ -3948,7 +3880,7 @@ mod tests {
         })
         .to_string();
 
-        let result = super::context_create_on(&crate::runtime::default_bridge_instance().unwrap(), &identity, params_json).await;
+        let result = super::context_create_on(&bi, &identity, params_json).await;
         assert!(
             result.is_err(),
             "RevokeAccess rule must be rejected when config.allow_automatic_access_revocation is false"
@@ -3960,9 +3892,11 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_rejects_malformed_spending_ucan_jwt() {
-        crate::runtime::init_context_manager_for_test();
+        let scp = crate::scp::Scp::new().unwrap();
+        let bi = std::sync::Arc::clone(&scp.inner);
 
-        let identity = crate::scp::Scp::new().unwrap().identity_create("in_memory".to_owned())
+        let identity = scp
+            .identity_create("in_memory".to_owned())
             .await
             .expect("identity_create should succeed");
 
@@ -3972,11 +3906,11 @@ mod tests {
             "governance": "single_admin",
         })
         .to_string();
-        let handle = super::context_create_on(&crate::runtime::default_bridge_instance().unwrap(), &identity, params_json)
+        let handle = super::context_create_on(&bi, &identity, params_json)
             .await
             .expect("context_create should succeed");
 
-        let result = super::context_join_on(&crate::runtime::default_bridge_instance().unwrap(), 
+        let result = super::context_join_on(&bi, 
             &handle,
             identity.inner.did.clone(),
             Some("not.a.jwt".to_owned()),
@@ -3999,9 +3933,11 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_accepts_none_spending_ucan_jwt() {
-        crate::runtime::init_context_manager_for_test();
+        let scp = crate::scp::Scp::new().unwrap();
+        let bi = std::sync::Arc::clone(&scp.inner);
 
-        let identity = crate::scp::Scp::new().unwrap().identity_create("in_memory".to_owned())
+        let identity = scp
+            .identity_create("in_memory".to_owned())
             .await
             .expect("identity_create should succeed");
 
@@ -4011,14 +3947,14 @@ mod tests {
             "governance": "single_admin",
         })
         .to_string();
-        let handle = super::context_create_on(&crate::runtime::default_bridge_instance().unwrap(), &identity, params_json)
+        let handle = super::context_create_on(&bi, &identity, params_json)
             .await
             .expect("context_create should succeed");
 
         // Same identity rejoining is fine for the smoke check — the
         // important assertion is that the bridge reaches the manager
         // instead of erroring on parameter handling.
-        let result = super::context_join_on(&crate::runtime::default_bridge_instance().unwrap(), &handle, identity.inner.did.clone(), None).await;
+        let result = super::context_join_on(&bi, &handle, identity.inner.did.clone(), None).await;
         // Manager may or may not error depending on duplicate-member rules.
         // We only verify the bridge accepted the call shape (no
         // SCP-ECON-12061 / SCP-VALID parsing failure).
@@ -4152,7 +4088,7 @@ mod tests {
     async fn subscription_flag_resets_on_suspend() {
         use std::sync::atomic::Ordering;
 
-        crate::runtime::init_context_manager_for_test();
+        
 
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 

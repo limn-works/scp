@@ -408,14 +408,10 @@ mod tests {
         scp.resume().await.expect("double resume must succeed");
         assert!(!scp.inner.core.is_suspended());
 
-        // Case 3: the default instance is unaffected — no free-function
-        // mutation leaked onto it.
-        if let Some(default_bi) = crate::runtime::default_bridge_instance_raw() {
-            assert!(
-                !default_bi.core.is_suspended(),
-                "default bridge instance must not be suspended after a scoped Scp roundtrip"
-            );
-        }
+        // Case 3: Phase D (#1695) — DEFAULT_BRIDGE_INSTANCE deleted, so
+        // there is no "default instance" to check against. Every caller
+        // owns its own NapiBridgeInstance; suspension on one cannot leak
+        // into another by construction.
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

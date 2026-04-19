@@ -1209,11 +1209,11 @@ mod tests {
     async fn registered_at_is_seconds_epoch() {
         use crate::context::NapiContextHandle;
 
-        let bi = crate::runtime::default_bridge_instance().expect("default bridge");
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
         let ctx_id = format!("ctx-napi-ts-test-{}", std::process::id());
         let creator_did = "did:dht:z6MkNapiTsTest";
 
-        let handle = NapiContextHandle::test_active(ctx_id.clone(), creator_did.to_owned());
+        let handle = NapiContextHandle::test_active_on(&bi, ctx_id.clone(), creator_did.to_owned());
 
         let definition = NapiToolDefinition {
             name: "napi-timestamp-probe".to_owned(),
@@ -1228,7 +1228,7 @@ mod tests {
             cost: None,
         };
 
-        let tool_id = tool_register_on(&crate::runtime::default_bridge_instance().unwrap(), &handle, definition)
+        let tool_id = tool_register_on(&bi, &handle, definition)
             .await
             .expect("tool_register should succeed");
 
