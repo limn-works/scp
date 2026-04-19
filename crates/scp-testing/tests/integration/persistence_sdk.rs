@@ -397,3 +397,172 @@ async fn ffi_scp_with_sqlite_full_lifecycle() {
     //   scp2.context_send(ctx, b"world").await.unwrap();
     panic!("ignored — see #[ignore] reason above");
 }
+
+// ---------------------------------------------------------------------------
+// AC5: ProtocolRepoVariant::Sqlite event-log roundtrip
+//
+// This test exercises the exact shared machinery that
+// `NapiBridgeInstance::with_storage_napi` and
+// `UniffiBridgeInstance::with_storage_uniffi` compose when
+// `StorageConfig::Sqlite` is selected:
+//
+//   SqliteStorage::new(tmpdir, key)
+//     → ProtocolRepository::new(Arc<SqliteStorage>)
+//     → ProtocolRepoVariant::Sqlite(Arc<ProtocolRepository<…>>)
+//     → ProtocolRepoVariant::event_log_provider()
+//     → MerkleEventLogProvider with persistence
+//
+// then appends a Merkle event, drops the provider, reopens the same
+// SQLCipher file with the same key, rebuilds the variant, and asserts
+// the appended event is readable.
+//
+// Before the `ProtocolRepoVariant` fix landed, `with_storage(Sqlite)`
+// on both bridges returned a `ProtocolRepository<BridgeInMemoryStorage>`
+// for the event log even when the caller passed a SQLite config. The
+// Merkle entries invisibly persisted into an ephemeral in-memory store
+// that was dropped on shutdown; on reopen the event log was empty even
+// though context snapshots survived. This test is the regression guard.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protocol_repo_variant_sqlite_event_log_roundtrip() {
+    use scp_core::context::providers::event_log::MerkleEventLogProvider;
+    use scp_core::store::context::ProtocolRepositoryEventLogBridge;
+    use scp_ffi_common::bridge_runtime::ProtocolRepoVariant;
+    use std::sync::Arc;
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let ctx_id_bytes: [u8; 32] = {
+        let mut h = [0u8; 32];
+        h[..4].copy_from_slice(b"CTX1");
+        h
+    };
+    let event_kind = "test.ac5.event";
+    let actor = "did:dht:z6MkTestPersistAc5Actor";
+    let payload = serde_json::json!({"body": "persistence roundtrip smoke test"});
+
+    // ---- Phase 1: open SQLite, construct the variant, append one Merkle
+    //               event through `event_log_provider()`, drop everything. ----
+    //
+    // This is the exact wiring that `NapiBridgeInstance::with_storage_napi`
+    // and `UniffiBridgeInstance::with_storage_uniffi` compose internally:
+    // open the SQLCipher DB once, wrap in `Arc<ProtocolRepository<…>>`,
+    // stash in `ProtocolRepoVariant::Sqlite`, dispatch through
+    // `event_log_provider()`. We then append via the trait-object that
+    // bridge callers see.
+    {
+        let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
+        let repo = Arc::new(ProtocolRepository::new(Arc::new(storage)));
+        let variant = ProtocolRepoVariant::Sqlite(Arc::clone(&repo));
+        let provider = variant.event_log_provider();
+
+        provider
+            .init_event_log(&ctx_id_bytes)
+            .expect("init_event_log must succeed");
+        provider
+            .append_event(&ctx_id_bytes, event_kind, actor, Some(&payload))
+            .expect("append_event must succeed");
+
+        let entries_before = provider
+            .event_log_entries(&ctx_id_bytes)
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(
+            entries_before.len(),
+            1,
+            "one append must produce one entry in the live log"
+        );
+        assert_eq!(entries_before[0].event, event_kind);
+        assert_eq!(entries_before[0].actor_did, actor);
+
+        // Letting the scope exit drops `provider`, `variant`, `repo`, and
+        // the Arc<SqliteStorage> behind them — simulating an FFI
+        // `shutdown()`. `ProtocolRepositoryEventLogBridge` persists each
+        // append synchronously via `persist_entry_best_effort`, so the
+        // SQLCipher DB on disk now carries the entry.
+        drop(provider);
+    }
+
+    // ---- Phase 2: reopen SAME path with SAME key and assert the Merkle
+    //               entry is restorable through a fresh variant.
+    //
+    // `MerkleEventLogProvider::with_persistence` is the same constructor
+    // `ProtocolRepoVariant::event_log_provider()` uses — we rebuild it
+    // directly so we can call `restore_event_log`, which loads persisted
+    // entries into the in-memory `logs` map. The bridge `resume()` path
+    // invokes the same method via `restore_all_contexts`.
+    let storage2 = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
+    let repo2 = Arc::new(ProtocolRepository::new(Arc::new(storage2)));
+    let _variant2 = ProtocolRepoVariant::Sqlite(Arc::clone(&repo2));
+    let bridge2 = ProtocolRepositoryEventLogBridge::new(Arc::clone(&repo2));
+    let provider2 = MerkleEventLogProvider::with_persistence(Arc::new(bridge2));
+
+    provider2
+        .restore_event_log(&ctx_id_bytes)
+        .expect("restore_event_log must succeed against a sqlite-backed repo");
+
+    let entries_after = provider2.entries(&ctx_id_bytes).unwrap_or_default();
+    assert_eq!(
+        entries_after.len(),
+        1,
+        "event log must carry exactly the one entry we appended before drop — \
+         this is the split-brain regression guard: if the event log had fallen \
+         back to an in-memory store despite the SQLite config, the reopen \
+         would see an empty log"
+    );
+    assert_eq!(
+        entries_after[0].event, event_kind,
+        "appended event kind must survive SQLite roundtrip"
+    );
+    assert_eq!(
+        entries_after[0].actor_did, actor,
+        "appended actor DID must survive SQLite roundtrip"
+    );
+}
+
+// Same roundtrip, but against `ProtocolRepoVariant::InMemory`. The purpose
+// is NOT to prove persistence (an in-memory store necessarily loses state
+// on drop) but to prove the match arms in `event_log_provider()` dispatch
+// correctly and that the in-memory variant supports the same trait surface.
+// If the variant dispatch ever regresses (e.g. one arm returns a different
+// provider type), this test catches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protocol_repo_variant_in_memory_event_log_same_trait_surface() {
+    use scp_core::store::ProtocolRepository;
+    use scp_ffi_common::bridge_runtime::{BridgeInMemoryStorage, ProtocolRepoVariant};
+    use scp_platform::encrypting_adapter::EncryptingAdapter;
+    use std::sync::Arc;
+
+    // EncryptingAdapter consumes the key wrapped in `Zeroizing`. Passing a
+    // plain zero key via `.into()` is acceptable in a unit test (no disk
+    // leak). Production paths get a random key via `OsRng`.
+    let key: [u8; 32] = [0u8; 32];
+    let encrypted = EncryptingAdapter::new(BridgeInMemoryStorage::new(), key.into());
+    let repo = Arc::new(ProtocolRepository::new(encrypted));
+    let variant = ProtocolRepoVariant::InMemory(repo);
+    let provider = variant.event_log_provider();
+
+    let ctx_id_bytes: [u8; 32] = {
+        let mut h = [0u8; 32];
+        h[..4].copy_from_slice(b"CTX2");
+        h
+    };
+    provider.init_event_log(&ctx_id_bytes).unwrap();
+    provider
+        .append_event(
+            &ctx_id_bytes,
+            "test.ac5.in_memory",
+            "did:dht:z6MkTestInMemoryActor",
+            None,
+        )
+        .unwrap();
+    let entries = provider.event_log_entries(&ctx_id_bytes).unwrap().unwrap();
+    assert_eq!(
+        entries.len(),
+        1,
+        "InMemory variant must support append/read via the same trait surface \
+         as the Sqlite variant — variant dispatch regression guard"
+    );
+    assert_eq!(entries[0].event, "test.ac5.in_memory");
+}

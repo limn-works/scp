@@ -18,9 +18,11 @@ pub mod key_custody;
 #[cfg(feature = "software_platform")]
 pub use key_custody::SqliteKeyCustody;
 
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::Mutex;
 
+use fs2::FileExt;
 use rusqlite::Connection;
 
 use zeroize::Zeroize;
@@ -49,10 +51,28 @@ pub struct SqliteStorage {
     // single-writer guarantee — only one thread can hold the lock at a time,
     // and each operation completes quickly.
     conn: Mutex<Connection>,
+    // Advisory exclusive lock on `{dir}/scp.db.lock`. Held for the lifetime
+    // of the `SqliteStorage` — refuses a second process, or a second
+    // in-process instance, trying to open the same database directory
+    // concurrently. This guards against split-brain writes and SQLite WAL
+    // corruption that can occur when two `rusqlite` handles share the same
+    // database file without coordinating access. See red-hat RED-1002.
+    //
+    // Dropping the struct drops the File, which releases the flock(2) /
+    // LockFileEx lock automatically.
+    _lock_file: File,
 }
 
 impl SqliteStorage {
     /// Opens or creates an encrypted `SQLite` database at `{dir}/scp.db`.
+    ///
+    /// An advisory exclusive file lock on `{dir}/scp.db.lock` is taken for
+    /// the lifetime of the returned `SqliteStorage`. If the lock is already
+    /// held by another process or another in-process instance, this
+    /// constructor returns [`PlatformError::StorageError`] rather than
+    /// opening a second `SQLite` handle against the same database — a
+    /// configuration that can produce WAL corruption, split-brain writes,
+    /// or silent data loss (red-hat RED-1002).
     ///
     /// The `key` parameter is the raw encryption key material. It is
     /// hex-encoded and passed to `SQLCipher` via `PRAGMA key`. The
@@ -67,11 +87,42 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns [`PlatformError::StorageError`] if the database cannot be
-    /// opened, the encryption key is rejected, or the schema cannot be
-    /// created.
+    /// opened, the encryption key is rejected, the schema cannot be
+    /// created, or the advisory file lock is already held by another
+    /// `SqliteStorage` instance (same process or other).
     pub fn new(dir: &Path, key: &[u8]) -> Result<Self, PlatformError> {
         std::fs::create_dir_all(dir)
             .map_err(|e| PlatformError::StorageError(format!("failed to create directory: {e}")))?;
+
+        // Take the advisory exclusive lock BEFORE opening the database. We
+        // use `try_lock_exclusive` (non-blocking) so a second caller gets an
+        // actionable error immediately rather than silently blocking — the
+        // caller is expected to use a single `SqliteStorage` per database
+        // directory. The lock file is persistent (created with OpenOptions
+        // so it survives across process restarts) but the lock itself is
+        // advisory and released automatically when the File is dropped.
+        let lock_path = dir.join("scp.db.lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                PlatformError::StorageError(format!(
+                    "failed to open lock file at {}: {e}",
+                    lock_path.display()
+                ))
+            })?;
+        FileExt::try_lock_exclusive(&lock_file).map_err(|e| {
+            PlatformError::StorageError(format!(
+                "database at {} is already open by another SCP instance \
+                 (advisory lock held on {}): {e} — close the existing \
+                 SqliteStorage before opening a second handle",
+                dir.display(),
+                lock_path.display()
+            ))
+        })?;
 
         let db_path = dir.join("scp.db");
         let conn = Connection::open(&db_path)
@@ -113,6 +164,7 @@ impl SqliteStorage {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            _lock_file: lock_file,
         })
     }
 }
@@ -336,5 +388,41 @@ mod tests {
     #[test]
     fn prefix_successor_single_char() {
         assert_eq!(prefix_successor("a"), Some("b".to_owned()));
+    }
+
+    /// Red-hat RED-1002: opening a second `SqliteStorage` against the same
+    /// database directory while the first is still live must fail fast,
+    /// not silently corrupt the `SQLite` WAL by producing two concurrent
+    /// `rusqlite` handles on the same file.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    fn second_open_on_same_dir_fails_while_first_is_live() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = [0u8; 32];
+
+        let first = SqliteStorage::new(tmp.path(), &key).expect("first open must succeed");
+
+        // Second open while `first` is alive must fail.
+        let second = SqliteStorage::new(tmp.path(), &key);
+        assert!(
+            second.is_err(),
+            "second open on the same database directory must fail while the \
+             first instance holds the advisory lock"
+        );
+        match second {
+            Err(PlatformError::StorageError(msg)) => {
+                assert!(
+                    msg.contains("already open"),
+                    "error message must mention lock contention: got {msg}"
+                );
+            }
+            Err(other) => panic!("expected StorageError, got {other:?}"),
+            Ok(_) => unreachable!("second open must fail — already handled above"),
+        }
+
+        // Dropping `first` releases the lock; a fresh open must succeed.
+        drop(first);
+        SqliteStorage::new(tmp.path(), &key)
+            .expect("fresh open after drop of prior instance must succeed");
     }
 }
