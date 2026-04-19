@@ -51,6 +51,7 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 scp-ffi-common = { path = "../common", features = ["testing"] }
+tempfile = "3"
 
 [build-dependencies]
 napi-build = "2"

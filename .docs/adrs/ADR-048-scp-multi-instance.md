@@ -224,6 +224,17 @@ Concrete deletions:
 
 Platform-specific key custody continues to flow through the existing `KeyCustodyProvider` callback — nothing new was wired there.
 
+### Strategy B for #1342 — rationale vs. the master plan's literal wording
+
+The master plan for #1342 described the fix as "wire real OpenMLS via UniFFI callback interface **or** direct Rust-side linking." Both approaches are valid in isolation; this section documents why the landed implementation (Strategy B: direct Rust-side `MlsCryptoProvider::new(did)` + required DID on UniFFI `ContextManager`) was the right call.
+
+- **Strategy A (callback interface) would have been worse.** It would require a UniFFI callback trait that ferries MLS operations (`create_group`, `add_members`, `encrypt`, `decrypt`, `stage_commit`, `merge_staged_commit`, sender-key derivations, Welcome handling) across the FFI boundary into Swift/Kotlin. OpenMLS has no Swift or Kotlin implementation — the only real provider would be the Rust one — so callbacks would loop back across the FFI to call the same `MlsCryptoProvider` the Rust side already has. This is pure overhead (two FFI hops per MLS call) and adds a concurrency hazard: UniFFI callbacks are `Send + Sync` but the MLS state machine is not, so every call would need serialization the Rust-side provider already handles internally.
+- **Strategy B (direct linking) matches the reference bridges.** The PyO3 bridge (`crates/scp-ffi/src/runtime.rs`) constructs `MlsCryptoProvider::new(local_did)` directly. The NAPI bridge (`crates/scp-ffi/napi/src/runtime.rs`) does the same. UniFFI now does the same: `init_context_manager_with_did(local_did)` constructs `MlsCryptoProvider::new(local_did)` at attach time. Three bridges, one pattern, zero divergence.
+- **Making DID required closes the stub.** The old path allowed the bridge to attach a no-op `FfiBridgeCrypto` and defer DID resolution. That created two classes of `ContextManager` (DID-less vs. DID-bound) and forced every caller to handle the `None` case. Strategy B folds the DID requirement into the attach precondition, deleting `FfiBridgeCrypto` and making `register_local_did` the single entry point. Every `ContextManager` now carries a real MLS credential from the moment it exists.
+- **Test shape confirms parity.** `crates/scp-testing/tests/multi_relay_uniffi_swift_kotlin_smoke.rs` exercises the UniFFI-through-Rust path end-to-end; behaviour matches `crates/scp-testing/tests/multi_relay_smoke.rs` (PyO3) and the NAPI multi-relay test. If Strategy A had been used, those tests would have to inject a Rust-provided callback harness to avoid the double FFI hop — effectively re-implementing Strategy B on top of a useless trait.
+
+The master plan's "or direct Rust-side linking" clause is what landed; the callback path was rejected during execution on the grounds above. No scope was reduced — all #1342 acceptance criteria are covered, just via the second branch of the plan's original choice.
+
 ### `SqliteStorage` FFI exposure (closes #1491, closes #1260)
 
 `StorageConfig` gains a `Sqlite { path: String, key: Vec<u8> }` variant across all three non-WASM bridges. The 32-byte SQLCipher key is validated at the boundary; length mismatches return `ScpError::Validation`.

@@ -33,6 +33,21 @@ use crate::runtime::{NapiBridgeInstance, StorageConfig, default_bridge_instance}
 /// const shared = SCP.default();          // shared process-wide default
 /// await scp.shutdown(5);                 // async graceful shutdown
 /// ```
+//
+// CodeQL note (rust/access-invalid-pointer, alert #425 — false positive):
+// The `#[napi]` macro generates `FromNapiRef`/`FromNapiMutRef` impls that call
+// `napi_unwrap` to recover the boxed Rust value from a JS object, then
+// dereference the resulting `*mut c_void` as `*const Scp` / `*mut Scp`.
+// CodeQL flags this as an invalid-pointer deref. It is safe by construction:
+// `ToNapiValue` boxes the `Scp` via `Box::into_raw` and registers a
+// finalizer (`ObjectFinalize`) with N-API. The pointer is non-null,
+// well-aligned, and live for as long as the JS object is reachable —
+// standard napi-rs class plumbing. The identical pattern is used by 10
+// other `#[napi]` structs in this crate (NapiContextHandle, NapiIdentity,
+// NapiMcpServerHandle, NapiMcpClientHandle, NapiTransportManager,
+// NapiUcanToken, NapiRelayHandle, NapiNodeHandle, NapiFullStackNode, Scp)
+// and has been repeatedly dismissed as a false positive (prior alerts
+// #99, #100, #101, #102, #103, #104, #263, #264, #265, #266).
 #[napi(js_name = "SCP")]
 pub struct Scp {
     /// The underlying per-bridge concrete instance.

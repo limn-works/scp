@@ -10130,30 +10130,57 @@ pub fn aggregate_trust_input(
 
     // Use persistent storage if the global ProtocolRepository is initialized,
     // otherwise fall back to an ephemeral in-memory store. See issue #502.
-    if let Some(repo) = crate::runtime::protocol_repository() {
-        let handle = crate::runtime().handle().clone();
-        let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
-            std::sync::Arc::clone(repo),
-            handle,
-        );
-        scp_ffi_common::trust_store::populate_and_aggregate(
-            bridge,
-            &context_id,
-            &subject_did,
-            cached_attestations,
-            &challenge_results,
-            &events,
-            merkle_root,
-            &consequence_rules,
-            &threshold_requirements,
-            &attestor_sets,
-        )
-        .map_err(|e| ScpError::Validation {
-            msg: e.to_string(),
-            code: codes::VALID_7052.to_owned(),
-        })
-    } else {
-        scp_ffi_common::trust_store::populate_and_aggregate(
+    // Dispatches over `ProtocolRepoVariant` so SQLite-backed bridges route
+    // trust attestations into the same SQLCipher database as context
+    // snapshots and event log entries.
+    match crate::runtime::protocol_repository() {
+        Some(crate::runtime::ProtocolRepoVariant::InMemory(repo)) => {
+            let handle = crate::runtime().handle().clone();
+            let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
+                std::sync::Arc::clone(repo),
+                handle,
+            );
+            scp_ffi_common::trust_store::populate_and_aggregate(
+                bridge,
+                &context_id,
+                &subject_did,
+                cached_attestations,
+                &challenge_results,
+                &events,
+                merkle_root,
+                &consequence_rules,
+                &threshold_requirements,
+                &attestor_sets,
+            )
+            .map_err(|e| ScpError::Validation {
+                msg: e.to_string(),
+                code: codes::VALID_7052.to_owned(),
+            })
+        }
+        Some(crate::runtime::ProtocolRepoVariant::Sqlite(repo)) => {
+            let handle = crate::runtime().handle().clone();
+            let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
+                std::sync::Arc::clone(repo),
+                handle,
+            );
+            scp_ffi_common::trust_store::populate_and_aggregate(
+                bridge,
+                &context_id,
+                &subject_did,
+                cached_attestations,
+                &challenge_results,
+                &events,
+                merkle_root,
+                &consequence_rules,
+                &threshold_requirements,
+                &attestor_sets,
+            )
+            .map_err(|e| ScpError::Validation {
+                msg: e.to_string(),
+                code: codes::VALID_7052.to_owned(),
+            })
+        }
+        None => scp_ffi_common::trust_store::populate_and_aggregate(
             InMemoryFfiTrustStore::new(),
             &context_id,
             &subject_did,
@@ -10168,7 +10195,7 @@ pub fn aggregate_trust_input(
         .map_err(|e| ScpError::Validation {
             msg: e.to_string(),
             code: codes::VALID_7052.to_owned(),
-        })
+        }),
     }
 }
 
