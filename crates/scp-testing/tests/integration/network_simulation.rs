@@ -2,11 +2,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::cast_possible_truncation,
-    // `InMemoryKeyCustody::from_seed(u64)` is deprecated (entropy
-    // truncation). These tests use it deliberately for small-integer
-    // seeds.
-    deprecated
+    clippy::cast_possible_truncation
 )]
 
 //! End-to-end network simulation — run with `cargo test --test network_simulation -- --nocapture`
@@ -181,7 +177,11 @@ async fn end_to_end_network_demo() {
     println!();
 
     // Create real Ed25519 key custody for Alice and Bob.
-    let alice_custody = InMemoryKeyCustody::from_seed(1);
+    let alice_custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(1u64).to_le_bytes());
+        __s
+    });
     let alice_sign_key = alice_custody
         .generate_keypair(KeyType::Ed25519)
         .await
@@ -192,7 +192,11 @@ async fn end_to_end_network_demo() {
         .await
         .unwrap();
 
-    let bob_custody = InMemoryKeyCustody::from_seed(2);
+    let bob_custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(2u64).to_le_bytes());
+        __s
+    });
     let bob_sign_key = bob_custody
         .generate_keypair(KeyType::Ed25519)
         .await

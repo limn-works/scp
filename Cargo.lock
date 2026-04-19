@@ -5127,7 +5127,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
- "cc",
  "dashmap",
  "ed25519-dalek 2.2.0",
  "futures",
@@ -5140,6 +5139,7 @@ dependencies = [
  "scp-core",
  "scp-event-log",
  "scp-ffi-common",
+ "scp-ffi-napi-test-stubs",
  "scp-identity",
  "scp-mcp",
  "scp-media",
@@ -5159,6 +5159,13 @@ dependencies = [
  "uuid",
  "z-base-32",
  "zeroize",
+]
+
+[[package]]
+name = "scp-ffi-napi-test-stubs"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

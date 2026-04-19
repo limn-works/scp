@@ -1780,15 +1780,7 @@ pub fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    // `InMemoryKeyCustody::from_seed(u64)` is deprecated (entropy
-    // truncation) but this test uses it deliberately as a small-integer
-    // determinism fixture.
-    deprecated
-)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use std::sync::Arc;
 
@@ -1931,8 +1923,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_identity_deterministic_with_seeded_custody() {
-        let custody1 = InMemoryKeyCustody::from_seed(42);
-        let custody2 = InMemoryKeyCustody::from_seed(42);
+        let custody1 = InMemoryKeyCustody::from_seed_bytes([42u8; 32]);
+        let custody2 = InMemoryKeyCustody::from_seed_bytes([42u8; 32]);
         let dht = DidDht::new();
 
         let (identity1, doc1) = dht.create(&custody1).await.unwrap();

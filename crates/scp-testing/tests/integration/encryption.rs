@@ -2,11 +2,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::similar_names,
-    // `InMemoryKeyCustody::from_seed(u64)` is deprecated (entropy
-    // truncation). These tests use it deliberately for small-integer
-    // seeds.
-    deprecated
+    clippy::similar_names
 )]
 
 //! B8: Encryption integration tests.
@@ -331,7 +327,11 @@ async fn sender_layer_aad_binding() {
 
 #[tokio::test]
 async fn sender_key_pull_protocol() {
-    let custody = InMemoryKeyCustody::from_seed(10);
+    let custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(10u64).to_le_bytes());
+        __s
+    });
     let signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
     let public_key = custody.public_key(&signing_key).await.unwrap();
 
@@ -372,7 +372,11 @@ async fn sender_key_request_response() {
     };
     use std::collections::HashSet;
 
-    let requester_custody = InMemoryKeyCustody::from_seed(100);
+    let requester_custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(100u64).to_le_bytes());
+        __s
+    });
     let requester_sign_key = requester_custody
         .generate_keypair(KeyType::Ed25519)
         .await
@@ -489,7 +493,11 @@ async fn sender_key_nonce_dedup() {
 async fn block_notification_roundtrip() {
     use scp_core::crypto::sender_keys::BlockNotification;
 
-    let custody = InMemoryKeyCustody::from_seed(13);
+    let custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(13u64).to_le_bytes());
+        __s
+    });
     let blocker_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
     let blocker_pub = custody.public_key(&blocker_key).await.unwrap();
 
@@ -527,7 +535,11 @@ async fn block_notification_roundtrip() {
 
 #[tokio::test]
 async fn double_encryption_roundtrip() {
-    let custody = InMemoryKeyCustody::from_seed(14);
+    let custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(14u64).to_le_bytes());
+        __s
+    });
     let signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
     let creator_cred = ScpCredential::new(
@@ -649,7 +661,11 @@ async fn double_encryption_roundtrip() {
 
 #[tokio::test]
 async fn pseudonym_derivation() {
-    let custody = InMemoryKeyCustody::from_seed(15);
+    let custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(15u64).to_le_bytes());
+        __s
+    });
     let identity_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
     let ctx_a = b"context-alpha";

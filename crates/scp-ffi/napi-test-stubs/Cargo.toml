@@ -1,0 +1,13 @@
+[package]
+name = "scp-ffi-napi-test-stubs"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "Weak C stubs for napi runtime symbols so scp-ffi-napi test binaries can link without a Node.js runtime."
+links = "napi_test_stubs"
+
+[lib]
+path = "src/lib.rs"
+
+[build-dependencies]
+cc = "1"

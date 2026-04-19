@@ -63,8 +63,8 @@ impl KeyStore {
 ///
 /// # Deterministic Testing
 ///
-/// Use [`InMemoryKeyCustody::from_seed`] to create an instance with a seedable
-/// RNG for reproducible test scenarios.
+/// Use [`InMemoryKeyCustody::from_seed_bytes`] to create an instance with a
+/// seedable RNG for reproducible test scenarios.
 ///
 /// # Thread Safety
 ///
@@ -116,39 +116,15 @@ impl InMemoryKeyCustody {
     }
 
     /// Creates a new in-memory key custody with a deterministic RNG seeded by
-    /// the low 8 bytes of `seed` (little-endian) and 24 zero bytes.
-    ///
-    /// **Prefer [`InMemoryKeyCustody::from_seed_bytes`] for any new test.**
-    /// `from_seed(u64)` only supplies 64 bits of entropy across the 32-byte
-    /// seed that `rand::rngs::StdRng::from_seed` expects — the other 24
-    /// bytes are zero-padded. That is fine for "these two custodies make
-    /// the same keys" determinism assertions, but it silently truncates
-    /// when callers intend a 32-byte seed (e.g. from external test
-    /// vectors, ADR-046 parity fixtures). `from_seed_bytes` takes the
-    /// full seed and is the byte-exact path used by the cross-bridge
-    /// parity harness.
-    ///
-    /// Kept for existing callers in the scp-testing integration suite
-    /// that deliberately want a small-integer seed.
-    #[must_use]
-    #[deprecated(note = "Use from_seed_bytes for full 32-byte seeds; `from_seed(u64)` \
-                silently truncates entropy to 8 bytes. See crate docs.")]
-    pub fn from_seed(seed: u64) -> Self {
-        let mut seed_bytes = [0u8; 32];
-        seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
-        Self::from_seed_bytes(seed_bytes)
-    }
-
-    /// Creates a new in-memory key custody with a deterministic RNG seeded by
     /// the full 32-byte `seed`.
     ///
     /// This is the byte-level seed API used by cross-bridge parity testing
     /// (ADR-046): bridges that accept a 32-byte seed from the harness feed it
     /// directly into this constructor so that every bridge's
     /// `generate_keypair` call sequence yields byte-identical Ed25519 signing
-    /// keys. Prefer this over [`InMemoryKeyCustody::from_seed`] (which only
-    /// supplies 64 bits of entropy) whenever the caller already has full
-    /// 32-byte seed material.
+    /// keys. Callers with a narrower source of entropy (e.g. a u64
+    /// determinism fixture) must zero-pad into a full `[u8; 32]` at the
+    /// call site — the library no longer does this implicitly.
     ///
     /// # Determinism contract
     ///
@@ -522,15 +498,19 @@ impl KeyCustody for InMemoryKeyCustody {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    // `InMemoryKeyCustody::from_seed(u64)` is deprecated (entropy
-    // truncation) but these tests exercise that API directly.
-    deprecated
-)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    /// Converts a `u64` into a 32-byte seed (low 8 bytes little-endian,
+    /// remaining 24 bytes zero) for determinism tests that only need a
+    /// small-integer handle. Callers that actually want full 32-byte
+    /// entropy should pass a `[u8; 32]` to `from_seed_bytes` directly.
+    #[must_use]
+    fn seed_from_u64(v: u64) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[..8].copy_from_slice(&v.to_le_bytes());
+        out
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -642,7 +622,7 @@ mod tests {
 
     #[tokio::test]
     async fn derive_pseudonym_is_deterministic() {
-        let custody = InMemoryKeyCustody::from_seed(42);
+        let custody = InMemoryKeyCustody::from_seed_bytes(seed_from_u64(42));
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let context_id = b"test-context";
 
@@ -745,8 +725,8 @@ mod tests {
 
     #[tokio::test]
     async fn seeded_custody_produces_deterministic_keys() {
-        let first = InMemoryKeyCustody::from_seed(12345);
-        let second = InMemoryKeyCustody::from_seed(12345);
+        let first = InMemoryKeyCustody::from_seed_bytes(seed_from_u64(12345));
+        let second = InMemoryKeyCustody::from_seed_bytes(seed_from_u64(12345));
 
         let handle_first = first.generate_keypair(KeyType::Ed25519).await.unwrap();
         let handle_second = second.generate_keypair(KeyType::Ed25519).await.unwrap();
@@ -816,7 +796,7 @@ mod tests {
 
     #[tokio::test]
     async fn derive_rotatable_pseudonym_is_deterministic() {
-        let custody = InMemoryKeyCustody::from_seed(42);
+        let custody = InMemoryKeyCustody::from_seed_bytes(seed_from_u64(42));
         let handle = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
         let context_id = b"test-context";
 

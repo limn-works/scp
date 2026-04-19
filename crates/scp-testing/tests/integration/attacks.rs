@@ -4,11 +4,7 @@
     clippy::panic,
     clippy::items_after_statements,
     clippy::too_many_lines,
-    clippy::iter_on_single_items,
-    // `InMemoryKeyCustody::from_seed(u64)` is deprecated (entropy
-    // truncation). These tests use it deliberately for small-integer
-    // seeds.
-    deprecated
+    clippy::iter_on_single_items
 )]
 
 //! B14: Attack scenario integration tests.
@@ -1135,7 +1131,11 @@ async fn capability_expansion_outside_ceiling_rejected() {
 async fn sequence_replay_detected() {
     let mut tracker = SequenceTracker::new();
 
-    let custody = InMemoryKeyCustody::from_seed(230);
+    let custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(230u64).to_le_bytes());
+        __s
+    });
     let key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
 
     // First envelope at sequence 5.
@@ -1165,7 +1165,11 @@ async fn sequence_replay_detected() {
     );
 
     // Replay: same sequence number (5) from same sender.
-    let custody2 = InMemoryKeyCustody::from_seed(231);
+    let custody2 = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(231u64).to_le_bytes());
+        __s
+    });
     let key2 = custody2.generate_keypair(KeyType::Ed25519).await.unwrap();
     let env2 = create_inner_envelope(
         &InnerEnvelopeParams {
@@ -1355,7 +1359,11 @@ async fn stale_participation_profile_rejected() {
 
 #[tokio::test]
 async fn sender_key_request_blocked_did_denied() {
-    let requester_custody = InMemoryKeyCustody::from_seed(270);
+    let requester_custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(270u64).to_le_bytes());
+        __s
+    });
     let requester_key = requester_custody
         .generate_keypair(KeyType::Ed25519)
         .await
@@ -1427,7 +1435,11 @@ async fn sender_key_request_blocked_did_denied() {
 async fn self_delegation_without_key_scope_rejected() {
     use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
 
-    let custody = InMemoryKeyCustody::from_seed(280);
+    let custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(280u64).to_le_bytes());
+        __s
+    });
     let issuer_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
     let issuer_pk: [u8; 32] = custody
         .public_key(&issuer_key)
@@ -1501,7 +1513,11 @@ async fn ucan_kid_scope_mismatch_rejected() {
     use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
     use scp_core::crypto::ucan::validate::{ValidationContext, validate_ucan};
 
-    let custody = InMemoryKeyCustody::from_seed(290);
+    let custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(290u64).to_le_bytes());
+        __s
+    });
     let issuer_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
     let issuer_pk: [u8; 32] = custody
         .public_key(&issuer_key)

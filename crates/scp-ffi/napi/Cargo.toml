@@ -55,10 +55,15 @@ async-trait = { workspace = true }
 [dev-dependencies]
 scp-ffi-common = { path = "../common", features = ["testing"] }
 tempfile = "3"
+# Provides weak C stubs for napi runtime symbols so the test binary
+# can link without a Node.js runtime. Kept as a dev-dependency so
+# the cdylib build NEVER sees these stubs (if they leaked into the
+# cdylib, they would shadow Node's real napi_* functions at static
+# link time and every #[napi] registration would silently no-op).
+scp-ffi-napi-test-stubs = { path = "../napi-test-stubs" }
 
 [build-dependencies]
 napi-build = "2"
-cc = "1"
 
 [lints]
 workspace = true

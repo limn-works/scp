@@ -2,11 +2,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::similar_names,
-    // `InMemoryKeyCustody::from_seed(u64)` is deprecated (entropy
-    // truncation). These tests use it deliberately for small-integer
-    // seeds.
-    deprecated
+    clippy::similar_names
 )]
 
 //! B7: UCAN capabilities integration tests.
@@ -104,7 +100,11 @@ async fn mint_validate_roundtrip() {
     use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
     use scp_core::crypto::ucan::validate::validate_ucan;
 
-    let custody = InMemoryKeyCustody::from_seed(42);
+    let custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(42u64).to_le_bytes());
+        __s
+    });
 
     // Generate issuer (creator) and audience (member) keypairs.
     let issuer_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
@@ -294,7 +294,11 @@ async fn capability_match_check() {
 async fn token_expiry_rejected() {
     use scp_core::crypto::ucan::mint::{MintParams, mint_ucan};
 
-    let custody = InMemoryKeyCustody::from_seed(99);
+    let custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(99u64).to_le_bytes());
+        __s
+    });
 
     let issuer_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
     let audience_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
@@ -407,7 +411,11 @@ async fn delegation_chain() {
     use scp_core::crypto::ucan::mint::{MintParams, compute_cid, mint_ucan};
     use scp_core::crypto::ucan::validate::validate_ucan;
 
-    let custody = InMemoryKeyCustody::from_seed(11);
+    let custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(11u64).to_le_bytes());
+        __s
+    });
 
     // Three levels: root (creator) -> mid (delegator) -> leaf (agent).
     let root_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
@@ -512,7 +520,11 @@ async fn broken_delegation_chain() {
     use scp_core::crypto::ucan::mint::{MintParams, compute_cid, mint_ucan};
     use scp_core::crypto::ucan::validate::validate_ucan;
 
-    let custody = InMemoryKeyCustody::from_seed(12);
+    let custody = InMemoryKeyCustody::from_seed_bytes({
+        let mut __s = [0u8; 32];
+        __s[..8].copy_from_slice(&(12u64).to_le_bytes());
+        __s
+    });
 
     let root_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
     let mid_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
