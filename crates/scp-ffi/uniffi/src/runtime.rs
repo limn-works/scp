@@ -145,6 +145,43 @@ pub struct UniffiBridgeInstance {
     /// Wrapped in `Arc` for cheap clones into the `MerkleEventLogProvider`.
     pub(crate) protocol_repository:
         Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
+
+    // -----------------------------------------------------------------
+    // #1549 Phase 4 PR 2 commit 1 — additive typed fields replacing
+    // process-global singletons in later commits.
+    // -----------------------------------------------------------------
+    /// Identity link attestation registry (replaces
+    /// `identity_link_attestation_registry` `OnceLock` in `bridge.rs`).
+    ///
+    /// Keyed by DID string. Migrated from a process-global
+    /// `OnceLock<DashMap<String, Vec<IdentityLinkAttestation>>>` singleton in
+    /// commit 6.
+    pub(crate) identity_link_attestation_registry:
+        Arc<DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>>,
+
+    /// Context handle registry (replaces `context_handle_registry` `OnceLock`
+    /// in `bridge.rs`).
+    ///
+    /// Maps `context_id` to `Arc<ContextHandle>`. Migrated from a process-
+    /// global `OnceLock<DashMap<String, Arc<ContextHandle>>>` singleton in
+    /// commit 6. Used by the MCP bridge provider to look up per-context state.
+    pub(crate) context_handle_registry: Arc<DashMap<String, Arc<crate::bridge::ContextHandle>>>,
+
+    /// MCP server registry (replaces `mcp_server_registry` `OnceLock` in
+    /// `bridge.rs`).
+    ///
+    /// Migrated from a process-global
+    /// `OnceLock<DashMap<String, McpServerEntry>>` singleton in commit 4.
+    /// Cleared by [`BridgeInstanceCore::bridge_specific_shutdown`].
+    pub(crate) mcp_server_registry: Arc<DashMap<String, crate::bridge::McpServerEntry>>,
+
+    /// MCP client registry (replaces `mcp_client_registry` `OnceLock` in
+    /// `bridge.rs`).
+    ///
+    /// Migrated from a process-global
+    /// `OnceLock<DashMap<String, McpClientEntry>>` singleton in commit 4.
+    /// Cleared by [`BridgeInstanceCore::bridge_specific_shutdown`].
+    pub(crate) mcp_client_registry: Arc<DashMap<String, crate::bridge::McpClientEntry>>,
 }
 
 impl UniffiBridgeInstance {
@@ -164,6 +201,10 @@ impl UniffiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository,
+            identity_link_attestation_registry: Arc::new(DashMap::new()),
+            context_handle_registry: Arc::new(DashMap::new()),
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -186,6 +227,10 @@ impl UniffiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository,
+            identity_link_attestation_registry: Arc::new(DashMap::new()),
+            context_handle_registry: Arc::new(DashMap::new()),
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -268,6 +313,10 @@ impl UniffiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             identity_custody_registry: Arc::new(DashMap::new()),
             protocol_repository,
+            identity_link_attestation_registry: Arc::new(DashMap::new()),
+            context_handle_registry: Arc::new(DashMap::new()),
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -316,6 +365,42 @@ impl UniffiBridgeInstance {
     ) -> &Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>> {
         &self.protocol_repository
     }
+
+    /// Returns a reference to the identity link attestation registry.
+    #[must_use]
+    pub const fn identity_link_attestation_registry(
+        &self,
+    ) -> &Arc<DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>> {
+        &self.identity_link_attestation_registry
+    }
+
+    /// Returns a reference to the context handle registry.
+    #[must_use]
+    pub const fn context_handle_registry(
+        &self,
+    ) -> &Arc<DashMap<String, Arc<crate::bridge::ContextHandle>>> {
+        &self.context_handle_registry
+    }
+
+    /// Returns a reference to the MCP server registry.
+    ///
+    /// `pub(crate)` because `McpServerEntry` is itself `pub(crate)`.
+    #[must_use]
+    pub(crate) const fn mcp_server_registry(
+        &self,
+    ) -> &Arc<DashMap<String, crate::bridge::McpServerEntry>> {
+        &self.mcp_server_registry
+    }
+
+    /// Returns a reference to the MCP client registry.
+    ///
+    /// `pub(crate)` — see `mcp_server_registry`.
+    #[must_use]
+    pub(crate) const fn mcp_client_registry(
+        &self,
+    ) -> &Arc<DashMap<String, crate::bridge::McpClientEntry>> {
+        &self.mcp_client_registry
+    }
 }
 
 #[async_trait]
@@ -356,10 +441,19 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         self.ucan_registry.clear();
         #[cfg(feature = "allow_in_memory_custody")]
         self.identity_custody_registry.clear();
-        // MCP, identity-link-attestation, and context-handle registries live
-        // in `crate::bridge` as their own `OnceLock`s during PR 1 (migrated
-        // onto this struct in PR 2). Their clear path runs via the core
-        // `shutdown_hooks` vector populated by `init_default_bridge_instance`.
+        // Clear MCP registries so server shutdown senders and client
+        // connections drop, allowing background tasks to terminate cleanly.
+        // Migrated off `crate::bridge::clear_mcp_registries` (called by a
+        // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
+        self.mcp_server_registry.clear();
+        self.mcp_client_registry.clear();
+        // Clear identity-link-attestation and context-handle registries.
+        // Migrated off module-level `OnceLock` statics in bridge.rs in
+        // #1549 Phase 4 PR 2 commit 6. Dropping `Arc<ContextHandle>`
+        // values releases any remaining handle references held past
+        // shutdown (the caller normally holds its own `Arc`).
+        self.identity_link_attestation_registry.clear();
+        self.context_handle_registry.clear();
     }
 }
 
@@ -379,27 +473,13 @@ pub(crate) static DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<UniffiBridgeInstance>> =
 
 /// Initializes the default [`UniffiBridgeInstance`] without a `ContextManager`.
 ///
-/// Registers the MCP shutdown hook (MCP registries still live in
-/// `crate::bridge` during PR 1). Subsequent calls are no-ops (`OnceLock`
-/// guarantees single initialization).
+/// All typed registries (MCP, UCAN, identity custody, etc.) are fields on
+/// `UniffiBridgeInstance` and are cleared by
+/// `BridgeInstanceCore::bridge_specific_shutdown`; no shutdown hooks need to
+/// be registered here. Subsequent calls are no-ops (`OnceLock` guarantees
+/// single initialization).
 fn init_default_bridge_instance() {
-    // Register the MCP shutdown hook INSIDE the `get_or_init` closure so it
-    // runs exactly once per process regardless of how many threads race
-    // through `init_default_bridge_instance` before the OnceLock is filled.
-    // A prior pattern registered the hook outside the closure, which caused
-    // duplicate-registration races under concurrent first-call scenarios.
-    let _ = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| {
-        let instance = Arc::new(UniffiBridgeInstance::new_uniffi());
-        // Shutdown hook for state still living outside
-        // `UniffiBridgeInstance` during PR 1 (MCP registries — migrated
-        // onto the struct in PR 2). Identity and UCAN registries are now
-        // typed fields and are cleared by `bridge_specific_shutdown`
-        // without needing a hook.
-        instance.core.register_shutdown_hook(Box::new(|| {
-            crate::bridge::clear_mcp_registries();
-        }));
-        instance
-    });
+    let _ = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| Arc::new(UniffiBridgeInstance::new_uniffi()));
 }
 
 /// Returns the raw default `UniffiBridgeInstance` without lifecycle checks.
@@ -824,8 +904,10 @@ fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProv
 /// # Errors
 ///
 /// Returns `ScpError::Context` (code `SCP-CTX-2000`) when the bridge has not
-/// been initialized, when no local DID has been registered yet, or when the
-/// bridge is currently suspended.
+/// been initialized, when no local DID has been registered yet, when the
+/// bridge is currently suspended, or when the bridge has been permanently
+/// shut down. The shutdown branch is a hard error (not a warning) so
+/// stateful exports never run against a zombie bridge (ADR-048 §PR 2, #1646).
 pub fn context_manager_expect() -> Result<&'static Arc<ContextManager>, crate::ScpError> {
     let bi = DEFAULT_BRIDGE_INSTANCE
         .get()
@@ -835,12 +917,15 @@ pub fn context_manager_expect() -> Result<&'static Arc<ContextManager>, crate::S
         })?;
     if bi.core.is_suspended() {
         return Err(crate::ScpError::Context {
-            msg: "bridge is suspended — call resume() before performing operations".to_owned(),
+            msg: "bridge not ready: suspended".to_owned(),
             code: codes::CTX_2000.to_owned(),
         });
     }
     if bi.core.is_shutdown() {
-        tracing::warn!("context_manager_expect() called after shutdown — operations may fail");
+        return Err(crate::ScpError::Context {
+            msg: "bridge not ready: shut down".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        });
     }
     bi.core
         .try_context_manager()
@@ -969,16 +1054,16 @@ pub type UcanContextState = scp_ffi_common::bridge_runtime::UcanContextStateCore
 
 /// Returns a reference to the default instance's UCAN registry.
 ///
-/// Falls back to an empty (process-static) registry when the default instance
-/// has not been initialized. Consistent with the previous behaviour of
-/// `EMPTY_UCAN_REGISTRY` in PR 0.
-static EMPTY_UCAN_REGISTRY: std::sync::OnceLock<DashMap<String, UcanContextState>> =
-    std::sync::OnceLock::new();
-
+/// The registry is a typed `Arc<DashMap<String, UcanContextState>>` field
+/// on [`UniffiBridgeInstance`]. `ensure_bridge_instance()` initializes
+/// `DEFAULT_BRIDGE_INSTANCE` if it is not yet set, so the registry is
+/// always real — there is no fallback empty map that writers could land in
+/// before a reader sees the instance registry (the H1 bug fixed in commit
+/// 10 of #1549 Phase 4 PR 2).
 fn ucan_registry() -> &'static DashMap<String, UcanContextState> {
     ensure_bridge_instance();
     DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
-        || EMPTY_UCAN_REGISTRY.get_or_init(DashMap::new),
+        || unreachable!("DEFAULT_BRIDGE_INSTANCE set by ensure_bridge_instance()"),
         |bi| bi.ucan_registry.as_ref(),
     )
 }

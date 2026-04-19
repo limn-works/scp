@@ -1085,7 +1085,7 @@ impl ContextProvider for FfiBridgeProvider {
 // ---------------------------------------------------------------------------
 
 /// State for an active MCP server instance.
-struct McpServerState {
+pub(crate) struct McpServerState {
     /// The identity DID running this server.
     identity_did: String,
     /// The context IDs being served.
@@ -1107,7 +1107,7 @@ struct McpServerState {
 }
 
 /// State for an active MCP client connection.
-struct McpClientState {
+pub(crate) struct McpClientState {
     /// The transport mode (stdio or sse).
     transport: String,
     /// For stdio, the command used to spawn the subprocess.
@@ -1118,18 +1118,33 @@ struct McpClientState {
     client: Arc<Mutex<McpClient<ClientTransport, SystemTimestamp>>>,
 }
 
-/// Global registry of MCP server instances.
-static SERVER_REGISTRY: OnceLock<DashMap<String, McpServerState>> = OnceLock::new();
+/// Fallback empty MCP server registry for when the default
+/// `PyBridgeInstance` has not been initialized yet. Mirrors the
+/// `EMPTY_FFI_BRIDGE_STATE` / `EMPTY_IDENTITY_REGISTRY` fallback pattern.
+static EMPTY_SERVER_REGISTRY: OnceLock<DashMap<String, McpServerState>> = OnceLock::new();
 
-/// Global registry of MCP client instances.
-static CLIENT_REGISTRY: OnceLock<DashMap<String, McpClientState>> = OnceLock::new();
+/// Fallback empty MCP client registry.
+static EMPTY_CLIENT_REGISTRY: OnceLock<DashMap<String, McpClientState>> = OnceLock::new();
 
+/// Returns a reference to the default bridge instance's MCP server registry.
+///
+/// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
+/// typed `mcp_server_registry` field on [`crate::runtime::PyBridgeInstance`]
+/// in #1549 Phase 4 PR 2 commit 4. Falls back to an empty registry when the
+/// default instance has not been initialized yet.
 fn server_registry() -> &'static DashMap<String, McpServerState> {
-    SERVER_REGISTRY.get_or_init(DashMap::new)
+    crate::runtime::bridge_instance_raw().map_or_else(
+        || EMPTY_SERVER_REGISTRY.get_or_init(DashMap::new),
+        |bi| bi.mcp_server_registry().as_ref(),
+    )
 }
 
+/// Returns a reference to the default bridge instance's MCP client registry.
 fn client_registry() -> &'static DashMap<String, McpClientState> {
-    CLIENT_REGISTRY.get_or_init(DashMap::new)
+    crate::runtime::bridge_instance_raw().map_or_else(
+        || EMPTY_CLIENT_REGISTRY.get_or_init(DashMap::new),
+        |bi| bi.mcp_client_registry().as_ref(),
+    )
 }
 
 /// Generates a unique, unpredictable handle ID.
@@ -1139,20 +1154,6 @@ fn client_registry() -> &'static DashMap<String, McpClientState> {
 /// they are internal-only and never appear in `scp://` URIs.
 fn generate_handle_id(prefix: &str) -> String {
     crate::types::generate_random_id(prefix)
-}
-
-/// Clears both MCP server and client registries during shutdown.
-///
-/// Called by the shutdown hook registered in `crate::runtime::init_bridge_instance_empty`.
-/// This ensures server shutdown senders and client connections are dropped,
-/// allowing background tasks to terminate cleanly.
-pub(crate) fn clear_registries() {
-    if let Some(reg) = SERVER_REGISTRY.get() {
-        reg.clear();
-    }
-    if let Some(reg) = CLIENT_REGISTRY.get() {
-        reg.clear();
-    }
 }
 
 // ---------------------------------------------------------------------------

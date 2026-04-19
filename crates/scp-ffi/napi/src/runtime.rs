@@ -126,6 +126,34 @@ pub struct NapiBridgeInstance {
     /// Wrapped in `Arc` for cheap clones into the `MerkleEventLogProvider`.
     pub(crate) protocol_repository:
         Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
+
+    // -----------------------------------------------------------------
+    // #1549 Phase 4 PR 2 commit 1 — additive typed fields replacing
+    // process-global singletons in later commits.
+    // -----------------------------------------------------------------
+    /// MCP server registry (replaces `mcp_server_registry` `OnceLock` in
+    /// `mcp.rs`).
+    ///
+    /// Migrated from a process-global
+    /// `OnceLock<DashMap<String, McpServerEntry>>` singleton in commit 4.
+    /// Cleared by [`BridgeInstanceCore::bridge_specific_shutdown`].
+    pub(crate) mcp_server_registry: Arc<DashMap<String, crate::mcp::McpServerEntry>>,
+
+    /// MCP client registry (replaces `mcp_client_registry` `OnceLock` in
+    /// `mcp.rs`).
+    ///
+    /// Migrated from a process-global
+    /// `OnceLock<DashMap<String, McpClientEntry>>` singleton in commit 4.
+    /// Cleared by [`BridgeInstanceCore::bridge_specific_shutdown`].
+    pub(crate) mcp_client_registry: Arc<DashMap<String, crate::mcp::McpClientEntry>>,
+
+    /// Shared full-stack test network (replaces `NETWORK` in `testing.rs`).
+    ///
+    /// Migrated from a process-global
+    /// `std::sync::Mutex<Option<FullStackNetwork>>` singleton in commit 9.
+    /// Feature-gated behind `allow_in_memory_custody` to mirror `testing.rs`.
+    #[cfg(feature = "allow_in_memory_custody")]
+    pub(crate) network: std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>>,
 }
 
 impl NapiBridgeInstance {
@@ -145,6 +173,10 @@ impl NapiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository,
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "allow_in_memory_custody")]
+            network: std::sync::Mutex::new(None),
         }
     }
 
@@ -164,6 +196,10 @@ impl NapiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository,
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "allow_in_memory_custody")]
+            network: std::sync::Mutex::new(None),
         }
     }
 
@@ -237,6 +273,10 @@ impl NapiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository,
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "allow_in_memory_custody")]
+            network: std::sync::Mutex::new(None),
         }
     }
 
@@ -244,6 +284,35 @@ impl NapiBridgeInstance {
     #[must_use]
     pub const fn instance_id(&self) -> u64 {
         self.core.instance_id()
+    }
+
+    /// Returns a reference to the MCP server registry.
+    ///
+    /// `pub(crate)` because `McpServerEntry` is itself `pub(crate)`.
+    #[must_use]
+    pub(crate) const fn mcp_server_registry(
+        &self,
+    ) -> &Arc<DashMap<String, crate::mcp::McpServerEntry>> {
+        &self.mcp_server_registry
+    }
+
+    /// Returns a reference to the MCP client registry.
+    ///
+    /// `pub(crate)` — see `mcp_server_registry`.
+    #[must_use]
+    pub(crate) const fn mcp_client_registry(
+        &self,
+    ) -> &Arc<DashMap<String, crate::mcp::McpClientEntry>> {
+        &self.mcp_client_registry
+    }
+
+    /// Returns a reference to the shared full-stack test network slot.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[must_use]
+    pub const fn network(
+        &self,
+    ) -> &std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>> {
+        &self.network
     }
 }
 
@@ -286,10 +355,12 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         self.ucan_registry.clear();
         #[cfg(feature = "allow_in_memory_custody")]
         self.identity_registry.clear();
-        // MCP registries continue to live in `crate::mcp` as their own
-        // `OnceLock`s during PR 1 (migrated onto this struct in PR 2).
-        // Their clear path runs via the core `shutdown_hooks` vector
-        // populated by `init_bridge_instance_empty`.
+        // Clear MCP registries so server shutdown senders and client
+        // connections drop, allowing background tasks to terminate cleanly.
+        // Migrated off `crate::mcp::clear_registries` (called by a
+        // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
+        self.mcp_server_registry.clear();
+        self.mcp_client_registry.clear();
     }
 }
 
@@ -304,10 +375,35 @@ pub type ToolHandler =
 
 /// Global shared `InMemoryDhtClient` used by the DID resolver.
 ///
-/// Stored here so that `identity_create` can publish newly created DID
-/// documents to the same DHT client that the resolver reads from. Without
-/// this, UCAN validation fails because `IdentityBackedDidResolver` cannot
-/// find the issuer's DID document.
+/// # Why this remains a process-global after the #1549 Phase 4 singleton purge
+///
+/// Every other bridge-level `OnceLock` was migrated onto
+/// [`NapiBridgeInstance`] so that an `SCP` instance can be constructed, used,
+/// and dropped without leaking state into a second instance. `SHARED_DHT_CLIENT`
+/// intentionally stays process-global because the cross-identity Alice+Bob
+/// integration flows published and read from a single in-memory DHT:
+///
+///   1. `Alice.identity_create(...)` publishes a DID document into the DHT.
+///   2. `Bob.ucan_validate(token_minted_by_alice)` must resolve Alice's DID
+///      document to verify her signature — in the **same process** — using
+///      the **same DHT instance** Alice published to.
+///
+/// If this were per-bridge, Alice's document would land in her instance's DHT
+/// and Bob's resolver would see an empty DHT, and the test would spuriously
+/// report a missing DID document. That was the behaviour before #1144, and it
+/// broke every parity test that exercises multi-identity UCAN paths.
+///
+/// Production ecosystems do not share this constraint because they use real
+/// `did:dht` (Mainline DHT, bittorrent BEP44) or `did:web` resolvers backed by
+/// the public network, not an in-memory stub. The `InMemoryDhtClient` is a
+/// test/demo affordance; its process-global scope matches the scope of the
+/// network it is emulating, and it stores only signed, public DID documents.
+///
+/// # Ratchet justification
+///
+/// The #1549 Phase 4 PR 2 plan explicitly retains `SHARED_DHT_CLIENT` alongside
+/// `DEFAULT_BRIDGE_INSTANCE`, `RUNTIME`, `HANDLE_COUNT`, and `INSTANCE_ID_COUNTER`
+/// in the enforcement allowlist. See `scripts/check-no-bridge-globals.sh`.
 ///
 /// See issue #1144 (UCAN validation tests require shared DHT state).
 static SHARED_DHT_CLIENT: OnceLock<Arc<scp_identity::InMemoryDhtClient>> = OnceLock::new();
@@ -434,23 +530,11 @@ static DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<NapiBridgeInstance>> = OnceLock::ne
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
 fn init_default_bridge_instance() {
-    // Register the MCP shutdown hook INSIDE the `get_or_init` closure so it
-    // runs exactly once per process regardless of how many threads race
-    // through `init_default_bridge_instance` before the OnceLock is filled.
-    // A prior pattern registered the hook outside the closure, which caused
-    // duplicate-registration races under concurrent first-call scenarios.
-    let _ = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| {
-        let instance = Arc::new(NapiBridgeInstance::new_napi());
-        // Shutdown hook for state still living outside the
-        // `NapiBridgeInstance` during PR 1 (MCP registries — migrated onto
-        // the struct in PR 2). Identity + UCAN registries are now typed
-        // fields and are cleared by `bridge_specific_shutdown` without
-        // needing a hook.
-        instance.core.register_shutdown_hook(Box::new(|| {
-            crate::mcp::clear_registries();
-        }));
-        instance
-    });
+    // All typed registries (MCP, UCAN, identity) are now fields on
+    // `NapiBridgeInstance` and are cleared by
+    // `BridgeInstanceCore::bridge_specific_shutdown`; no shutdown hooks
+    // need to be registered here. Post commit 4 of #1549 Phase 4 PR 2.
+    let _ = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| Arc::new(NapiBridgeInstance::new_napi()));
 }
 
 /// Returns the raw default `NapiBridgeInstance`, if initialized.
@@ -920,29 +1004,16 @@ fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProv
     )))
 }
 
-/// Process-wide async mutex that serializes the
-/// `scp_suspend_resume_roundtrip` test with EVERY other test in this
-/// binary that calls `context_manager()` or `bridge_instance()` (both of
-/// which error when the `BridgeInstance::suspended` flag is set). Cargo
-/// runs lib-tests in parallel by default, and because NAPI is a cdylib
-/// (`napi_wrap` is only defined when loaded by Node), suspend/resume
-/// cannot be moved into a separate integration-test binary as in the
-/// `PyO3` and `UniFFI` bridges.
-///
-/// Every test that touches shared bridge state — including context
-/// creation, governance, economy trackers, and bridge-connector
-/// registration — must acquire this mutex for the duration of its
-/// assertions so the roundtrip test cannot observe `is_suspended=true`
-/// mid-test. A `tokio::sync::Mutex` is used (not `std::sync::Mutex`)
-/// because several callers are `async` tests that hold the guard across
-/// `.await` points — `std::sync::Mutex` guards are not `Send` and would
-/// trigger the `await_holding_lock` lint, which specifically warns
-/// against deadlock via blocked worker threads.
-#[cfg(test)]
-pub(crate) fn bridge_lifecycle_serial() -> &'static tokio::sync::Mutex<()> {
-    static BRIDGE_LIFECYCLE_SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    BRIDGE_LIFECYCLE_SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
-}
+// `bridge_lifecycle_serial` (and its backing `BRIDGE_LIFECYCLE_SERIAL`
+// `OnceLock`) were deleted in #1549 Phase 4 PR 2 commit 11. They existed
+// solely to serialize the `scp_suspend_resume_roundtrip` test — which
+// mutated the process-global `DEFAULT_BRIDGE_INSTANCE::suspended` flag —
+// against every other test that touched shared bridge state. The
+// roundtrip test has been rewritten to use a caller-owned `Scp::new()`
+// instance (see `scp_class_suspend_resume_roundtrip` in `lib.rs`), so the
+// default instance is never suspended mid-test and the serial is no
+// longer required. Other tests that previously acquired the guard now
+// simply run without it.
 
 /// Test variant of [`context_manager`] initialization that uses
 /// [`LocalTransportProvider`](scp_core::context::LocalTransportProvider)
@@ -1097,27 +1168,16 @@ pub(crate) struct NapiIdentityEntry {
         Vec<scp_core::identity::attestation::IdentityLinkAttestation>,
 }
 
-/// Fallback empty identity registry for when `BridgeInstance` is not initialized
-/// or the identity registry feature gate is disabled.
-#[cfg(feature = "allow_in_memory_custody")]
-static EMPTY_IDENTITY_REGISTRY: std::sync::OnceLock<DashMap<String, NapiIdentityEntry>> =
-    std::sync::OnceLock::new();
-
-/// Returns a reference to the default-instance identity registry.
-///
-/// The registry is a typed field on [`NapiBridgeInstance`]. We eagerly call
-/// [`ensure_bridge_instance`] so writers never silently land in the dead
-/// `EMPTY_IDENTITY_REGISTRY` fallback — that was the H1 bug where
-/// `register_identity` wrote to the empty map before the bridge was
-/// initialized, and a later `with_identity` read from the real instance
-/// registry and missed the write. The fallback branch remains only for
-/// code paths that cannot trigger initialization (vanishingly rare); PR 2
-/// deletes it once single-ownership sequencing makes it unreachable.
+/// The registry is a typed field on [`NapiBridgeInstance`].
+/// `ensure_bridge_instance()` initializes `DEFAULT_BRIDGE_INSTANCE` if it
+/// is not yet set, so the registry is always real — there is no fallback
+/// empty map that writers could land in before a reader sees the instance
+/// registry (the H1 bug fixed in commit 10 of #1549 Phase 4 PR 2).
 #[cfg(feature = "allow_in_memory_custody")]
 fn identity_registry() -> &'static DashMap<String, NapiIdentityEntry> {
     ensure_bridge_instance();
     DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
-        || EMPTY_IDENTITY_REGISTRY.get_or_init(DashMap::new),
+        || unreachable!("DEFAULT_BRIDGE_INSTANCE set by ensure_bridge_instance()"),
         |bi| bi.identity_registry.as_ref(),
     )
 }
@@ -1245,19 +1305,16 @@ pub struct UcanContextState {
 
 /// Returns a reference to the UCAN state registry.
 ///
-/// The registry is stored as a type-erased `Arc<DashMap<String, UcanContextState>>`
-/// in the `BridgeInstance`. Falls back to an empty registry when the bridge
-/// has not been initialized (e.g. in unit tests that don't call
-/// `init_context_manager`).
-///
-/// Fallback empty UCAN registry for when `BridgeInstance` is not initialized.
-static EMPTY_UCAN_REGISTRY: std::sync::OnceLock<DashMap<String, UcanContextState>> =
-    std::sync::OnceLock::new();
-
+/// The registry is a typed `Arc<DashMap<String, UcanContextState>>` field
+/// on [`NapiBridgeInstance`]. `ensure_bridge_instance()` initializes
+/// `DEFAULT_BRIDGE_INSTANCE` if it is not yet set, so the registry is
+/// always real — there is no fallback empty map that writers could land in
+/// before a reader sees the instance registry (the H1 bug fixed in commit
+/// 10 of #1549 Phase 4 PR 2).
 fn ucan_registry() -> &'static DashMap<String, UcanContextState> {
     ensure_bridge_instance();
     DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
-        || EMPTY_UCAN_REGISTRY.get_or_init(DashMap::new),
+        || unreachable!("DEFAULT_BRIDGE_INSTANCE set by ensure_bridge_instance()"),
         |bi| bi.ucan_registry.as_ref(),
     )
 }
@@ -1707,7 +1764,6 @@ mod tests {
 
     #[test]
     fn bridge_instance_populated_by_init_context_manager() {
-        let _lifecycle_guard = bridge_lifecycle_serial().blocking_lock();
         // init_context_manager_for_test populates DEFAULT_BRIDGE_INSTANCE which
         // owns the ContextManager. Since OnceLock is process-global, the first
         // call in any test wins — subsequent calls are no-ops. We rely on this
@@ -1726,7 +1782,6 @@ mod tests {
 
     #[test]
     fn bridge_instance_not_shutdown_initially() {
-        let _lifecycle_guard = bridge_lifecycle_serial().blocking_lock();
         init_context_manager_for_test();
 
         let core = bridge_instance().expect("bridge_instance should be initialized");

@@ -1453,6 +1453,12 @@ impl Identity {
     ///
     /// See SCP-214 acceptance criterion 9.
     pub async fn rotate_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        // #1646: every Category B (CoreFields-touching) UniFFI method must
+        // route through `default_bridge_instance()?` so `check_ready()`
+        // rejects operations against a suspended or shut-down bridge.
+        // `rotate_key` writes DID resolver state on `CoreFields` via the
+        // DHT signer path, so the gate is mandatory.
+        let _bi = crate::runtime::default_bridge_instance()?;
         let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
             msg: "key rotation requires retained crypto state — this identity \
                       was loaded without key material (use identity_create or \
@@ -1575,6 +1581,9 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn add_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        // #1646: Category B gate — writes DID resolver / DHT state through
+        // `CoreFields`, must not run on a suspended or shut-down bridge.
+        let _bi = crate::runtime::default_bridge_instance()?;
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -1663,6 +1672,9 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn remove_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        // #1646: Category B gate — writes DID resolver / DHT state through
+        // `CoreFields`, must not run on a suspended or shut-down bridge.
+        let _bi = crate::runtime::default_bridge_instance()?;
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -1753,6 +1765,9 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn rotate_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
+        // #1646: Category B gate — writes DID resolver / DHT state through
+        // `CoreFields`, must not run on a suspended or shut-down bridge.
+        let _bi = crate::runtime::default_bridge_instance()?;
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -2178,7 +2193,11 @@ impl TransportManager {
 
         validate_relay_url(&relay_url)?;
 
-        let bi = crate::runtime::bridge_instance()?;
+        // #1646: Category B gate — mutates `CoreFields::transport` state,
+        // must not run on a suspended or shut-down bridge.
+        // `default_bridge_instance()` errors on shutdown; `bridge_instance()`
+        // only warns, which is too permissive for a mutation.
+        let bi = crate::runtime::default_bridge_instance()?;
         let rt = runtime();
         let sourced = SourcedRelayUrl {
             url: relay_url.clone(),
@@ -2237,7 +2256,9 @@ impl TransportManager {
     /// Returns `ScpError::Transport` if no adapters are registered.
     pub fn assign_relay_set(&self, context_id: String) -> Result<Vec<u32>, ScpError> {
         validate_context_id(&context_id)?;
-        let bi = crate::runtime::bridge_instance()?;
+        // #1646: Category B gate — mutates `CoreFields::transport` state,
+        // must not run on a suspended or shut-down bridge.
+        let bi = crate::runtime::default_bridge_instance()?;
         let indices = bi
             .core
             .with_transport(|mgr| {
@@ -2819,15 +2840,35 @@ const UNIFFI_LINK_ATTESTATION_REGISTRY_CAP: usize = 10_000;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 
-/// Global registry of identity link attestations, keyed by DID string.
+/// Fallback empty identity link attestation registry for when the default
+/// `UniffiBridgeInstance` has not been initialized yet.
+static EMPTY_IDENTITY_LINK_ATTESTATION_REGISTRY: std::sync::OnceLock<
+    dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>,
+> = std::sync::OnceLock::new();
+
+/// Returns a reference to the default bridge instance's identity link
+/// attestation registry.
+///
+/// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
+/// typed `identity_link_attestation_registry` field on
+/// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 6.
+/// Falls back to an empty registry when the default instance has not been
+/// initialized yet.
 fn identity_link_attestation_registry()
 -> &'static dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>
 {
-    static REGISTRY: std::sync::OnceLock<
-        dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>,
-    > = std::sync::OnceLock::new();
-    REGISTRY.get_or_init(dashmap::DashMap::new)
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_IDENTITY_LINK_ATTESTATION_REGISTRY.get_or_init(dashmap::DashMap::new),
+        |bi| bi.identity_link_attestation_registry().as_ref(),
+    )
 }
+
+/// Fallback empty identity custody registry for when the default
+/// `UniffiBridgeInstance` has not been initialized yet.
+#[cfg(feature = "allow_in_memory_custody")]
+static EMPTY_IDENTITY_CUSTODY_REGISTRY: std::sync::OnceLock<
+    dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)>,
+> = std::sync::OnceLock::new();
 
 /// Retained identity custody for attestation verification (keyed by DID).
 ///
@@ -2835,23 +2876,18 @@ fn identity_link_attestation_registry()
 /// created attestations, so that `identity_verify_link_attestation` can look
 /// up the issuer's public key without requiring the caller to pass the
 /// Identity object.
+///
+/// PR 1 moved the registry onto the typed `identity_custody_registry` field
+/// on the default `UniffiBridgeInstance`. Commit 6 of #1549 Phase 4 PR 2
+/// lifts the internal `EMPTY` fallback `OnceLock` out of this function onto
+/// module scope so all three `UniFFI` registries follow the uniform
+/// `EMPTY_* -> bi.field.as_ref()` resolution pattern.
 #[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn identity_custody_registry()
 -> &'static dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
-    // Phase 4 PR 1: the registry now lives as a typed field on the default
-    // `UniffiBridgeInstance`. Ensure the default instance exists, then borrow
-    // its typed field as a `&'static` — safe because the `DEFAULT_BRIDGE_INSTANCE`
-    // `OnceLock<Arc<_>>` is itself `'static`, and the `Arc<DashMap<...>>` it
-    // holds never moves.
-    //
-    // Fallback empty registry when the default instance fails to initialize
-    // (unreachable in practice; kept so the signature stays infallible).
-    static EMPTY: std::sync::OnceLock<
-        dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)>,
-    > = std::sync::OnceLock::new();
     crate::runtime::ensure_bridge_instance();
     crate::runtime::default_bridge_instance_raw().map_or_else(
-        || EMPTY.get_or_init(dashmap::DashMap::new),
+        || EMPTY_IDENTITY_CUSTODY_REGISTRY.get_or_init(dashmap::DashMap::new),
         |bi| bi.identity_custody_registry.as_ref(),
     )
 }
@@ -5317,15 +5353,29 @@ pub struct McpAllowlistState {
 // context_create and deregistered during context_close/leave.
 // ---------------------------------------------------------------------------
 
-/// Global registry mapping context IDs to their `ContextHandle` instances.
+/// Fallback empty context handle registry for when the default
+/// `UniffiBridgeInstance` has not been initialized yet.
+static EMPTY_CONTEXT_HANDLE_REGISTRY: std::sync::OnceLock<
+    dashmap::DashMap<String, Arc<ContextHandle>>,
+> = std::sync::OnceLock::new();
+
+/// Returns a reference to the default bridge instance's context handle
+/// registry.
+///
+/// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
+/// typed `context_handle_registry` field on
+/// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 6.
+/// Falls back to an empty registry when the default instance has not been
+/// initialized yet.
 ///
 /// Used by `McpUniFfiBridgeProvider` to look up per-context tool registries,
 /// handlers, and event log state. The `Arc<ContextHandle>` keeps the handle
 /// alive as long as it is in the registry (the caller also holds an Arc).
 fn context_handle_registry() -> &'static dashmap::DashMap<String, Arc<ContextHandle>> {
-    static REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, Arc<ContextHandle>>> =
-        std::sync::OnceLock::new();
-    REGISTRY.get_or_init(dashmap::DashMap::new)
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_CONTEXT_HANDLE_REGISTRY.get_or_init(dashmap::DashMap::new),
+        |bi| bi.context_handle_registry().as_ref(),
+    )
 }
 
 /// Registers a context handle in the global registry.
@@ -5351,45 +5401,55 @@ fn deregister_context_handle(context_id: &str) {
 // ---------------------------------------------------------------------------
 
 /// Internal state for a running MCP server.
-struct McpServerEntry {
+pub(crate) struct McpServerEntry {
     /// Shutdown signal sender. Dropping this signals the transport task to stop.
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Handle to the tokio task running the transport.
-    _task_handle: tokio::task::JoinHandle<()>,
+    pub(crate) _task_handle: tokio::task::JoinHandle<()>,
     /// Whether the server has been stopped.
-    stopped: bool,
+    pub(crate) stopped: bool,
 }
 
 /// Internal state for an active MCP client connection.
-struct McpClientEntry {
+pub(crate) struct McpClientEntry {
     /// The real MCP client, connected and initialized.
-    client: std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>,
+    pub(crate) client: std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>,
 }
 
+/// Fallback empty MCP server registry for when the default
+/// `UniffiBridgeInstance` has not been initialized yet. Mirrors the
+/// NAPI `EMPTY_SERVER_REGISTRY` fallback pattern.
+static EMPTY_MCP_SERVER_REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpServerEntry>> =
+    std::sync::OnceLock::new();
+
+/// Fallback empty MCP client registry.
+static EMPTY_MCP_CLIENT_REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpClientEntry>> =
+    std::sync::OnceLock::new();
+
+/// Returns a reference to the default bridge instance's MCP server registry.
+///
+/// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
+/// typed `mcp_server_registry` field on
+/// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 4.
+/// Falls back to an empty registry when the default instance has not been
+/// initialized yet.
 fn mcp_server_registry() -> &'static dashmap::DashMap<String, McpServerEntry> {
-    static REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpServerEntry>> =
-        std::sync::OnceLock::new();
-    REGISTRY.get_or_init(dashmap::DashMap::new)
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_MCP_SERVER_REGISTRY.get_or_init(dashmap::DashMap::new),
+        |bi| bi.mcp_server_registry().as_ref(),
+    )
 }
 
+/// Returns a reference to the default bridge instance's MCP client registry.
 fn mcp_client_registry() -> &'static dashmap::DashMap<String, McpClientEntry> {
-    static REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpClientEntry>> =
-        std::sync::OnceLock::new();
-    REGISTRY.get_or_init(dashmap::DashMap::new)
+    crate::runtime::default_bridge_instance_raw().map_or_else(
+        || EMPTY_MCP_CLIENT_REGISTRY.get_or_init(dashmap::DashMap::new),
+        |bi| bi.mcp_client_registry().as_ref(),
+    )
 }
 
 fn mcp_handle_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
-}
-
-/// Clears both MCP server and client registries during shutdown.
-///
-/// Called by the shutdown hook registered in `crate::runtime::init_bridge_instance_empty`.
-/// This ensures server shutdown senders and client connections are dropped,
-/// allowing background tasks to terminate cleanly.
-pub(crate) fn clear_mcp_registries() {
-    mcp_server_registry().clear();
-    mcp_client_registry().clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -5401,7 +5461,7 @@ pub(crate) fn clear_mcp_registries() {
 const MCP_MAX_LINE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Transport wrapper that delegates to either stdio or SSE.
-enum McpUniFFITransportWrapper {
+pub(crate) enum McpUniFFITransportWrapper {
     Stdio(McpStdioTransport),
     Sse(McpSseTransport),
 }
@@ -5431,7 +5491,7 @@ impl scp_mcp::client::McpTransport for McpUniFFITransportWrapper {
 }
 
 /// Stdio MCP transport: communicates with a subprocess via stdin/stdout.
-struct McpStdioTransport {
+pub(crate) struct McpStdioTransport {
     inner: std::sync::Mutex<McpStdioTransportInner>,
 }
 
@@ -5561,7 +5621,7 @@ impl Drop for McpStdioTransport {
 ///
 /// SSE transport is a placeholder — stdio is the primary transport for
 /// mobile clients. SSE methods return descriptive errors.
-struct McpSseTransport {
+pub(crate) struct McpSseTransport {
     _url: String,
 }
 
@@ -9089,7 +9149,9 @@ pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u6
     if check.is_err() {
         return None;
     }
-    let manager = crate::runtime::context_manager_expect().ok()?;
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return None;
+    };
     manager
         .broadcast_subscriber_count(&handle.context_id)
         .await
@@ -9127,7 +9189,9 @@ pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
     if check.is_err() {
         return None;
     }
-    let manager = crate::runtime::context_manager_expect().ok()?;
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return None;
+    };
     manager
         .broadcast_admission(&handle.context_id)
         .await
@@ -9150,7 +9214,9 @@ pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
     if check.is_err() {
         return None;
     }
-    let manager = crate::runtime::context_manager_expect().ok()?;
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return None;
+    };
     manager
         .member_count(&handle.context_id)
         .await
@@ -9201,7 +9267,9 @@ pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Opt
     if check.is_err() {
         return None;
     }
-    let manager = crate::runtime::context_manager_expect().ok()?;
+    let Ok(manager) = crate::runtime::context_manager_expect() else {
+        return None;
+    };
     manager
         .member_role(&handle.context_id, &did)
         .await
@@ -11091,18 +11159,8 @@ pub fn discovery_normalize_address(address: String) -> String {
 // Petname bridge functions (§22.4)
 // ---------------------------------------------------------------------------
 
+use crate::runtime::default_bridge_instance;
 use scp_ffi_common::petname_helpers;
-
-fn uniffi_petname_maps()
--> &'static std::sync::Mutex<std::collections::HashMap<String, scp_core::discovery::PetnameMap>> {
-    petname_helpers::petname_maps()
-}
-
-fn uniffi_handle_registries()
--> &'static std::sync::Mutex<std::collections::HashMap<String, scp_core::discovery::HandleRegistry>>
-{
-    petname_helpers::handle_registries()
-}
 
 /// Sets a petname for a DID.
 #[uniffi::export]
@@ -11119,7 +11177,10 @@ pub fn petname_set(owner_did: String, target_did: String, name: String) -> Resul
             code: codes::VALID_7111.to_owned(),
         });
     }
-    let mut guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11139,7 +11200,10 @@ pub fn petname_remove(owner_did: String, target_did: String) -> Result<(), ScpEr
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let mut guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11170,7 +11234,10 @@ pub fn petname_set_context(
             code: codes::VALID_7113.to_owned(),
         });
     }
-    let mut guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11190,7 +11257,10 @@ pub fn petname_remove_context(owner_did: String, context_id: String) -> Result<(
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let mut guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11211,7 +11281,10 @@ pub fn petname_resolve_did(owner_did: String, name: String) -> Result<String, Sc
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11241,7 +11314,10 @@ pub fn petname_resolve_context(owner_did: String, name: String) -> Result<String
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11269,7 +11345,10 @@ pub fn petname_get_for_did(
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11293,7 +11372,10 @@ pub fn petname_get_for_context(
             code: codes::VALID_7110.to_owned(),
         });
     }
-    let guard = uniffi_petname_maps()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .petname_maps()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("petname lock poisoned: {e}"),
@@ -11325,7 +11407,10 @@ pub fn handle_register(
         target,
         metadata: Some(scp_core::discovery::HandleMetadata { description, tags }),
     };
-    let mut guard = uniffi_handle_registries()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .handle_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("handle registry lock poisoned: {e}"),
@@ -11363,7 +11448,10 @@ pub fn handle_lookup(
         }
         None => None,
     };
-    let guard = uniffi_handle_registries()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .handle_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("handle registry lock poisoned: {e}"),
@@ -11393,7 +11481,10 @@ pub fn handle_deregister(
     handle: String,
     did: String,
 ) -> Result<String, ScpError> {
-    let mut guard = uniffi_handle_registries()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .handle_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("handle registry lock poisoned: {e}"),
@@ -11417,12 +11508,6 @@ pub fn handle_deregister(
 // ---------------------------------------------------------------------------
 // Scope registry bridge functions (§22.3.5, ADR-043)
 // ---------------------------------------------------------------------------
-
-fn uniffi_scope_registries()
--> &'static std::sync::Mutex<std::collections::HashMap<String, scp_core::discovery::ScopeRegistry>>
-{
-    petname_helpers::scope_registries()
-}
 
 /// Registers a scope name in a scope registry. Returns JSON result.
 #[uniffi::export]
@@ -11462,7 +11547,10 @@ pub fn scope_register(
         },
     };
 
-    let mut guard = uniffi_scope_registries()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .scope_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registry lock poisoned: {e}"),
@@ -11495,7 +11583,10 @@ pub fn scope_register(
 pub fn scope_lookup(scope_context_id: String, name: String) -> Result<String, ScpError> {
     validate_context_id(&scope_context_id)?;
 
-    let guard = uniffi_scope_registries()
+    let bi = default_bridge_instance()?;
+    let guard = bi
+        .core
+        .scope_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registry lock poisoned: {e}"),
@@ -11530,7 +11621,10 @@ pub fn scope_deregister(
     validate_context_id(&scope_context_id)?;
     validate_did(&did)?;
 
-    let mut guard = uniffi_scope_registries()
+    let bi = default_bridge_instance()?;
+    let mut guard = bi
+        .core
+        .scope_registries()
         .lock()
         .map_err(|e| ScpError::Validation {
             msg: format!("scope registry lock poisoned: {e}"),
@@ -11571,6 +11665,8 @@ pub fn address_resolve(
         });
     }
 
+    let bi = default_bridge_instance()?;
+
     let mut known_contexts: std::collections::HashMap<String, String> =
         if let Some(ref json) = known_contexts_json {
             serde_json::from_str(json).map_err(|e| ScpError::Validation {
@@ -11578,7 +11674,9 @@ pub fn address_resolve(
                 code: codes::VALID_7090.to_owned(),
             })?
         } else {
-            let guard = uniffi_handle_registries()
+            let guard = bi
+                .core
+                .handle_registries()
                 .lock()
                 .map_err(|e| ScpError::Validation {
                     msg: format!("handle registry lock poisoned: {e}"),
@@ -11588,14 +11686,16 @@ pub fn address_resolve(
         };
 
     // Merge scope registry contexts for two-hop resolution (§22.3.5).
-    let scope_contexts = petname_helpers::known_contexts_from_scope_registries();
+    let scope_contexts = petname_helpers::known_contexts_from_scope_registries(&bi.core);
     for (name, ctx_id) in scope_contexts {
         known_contexts.entry(name).or_insert(ctx_id);
     }
 
     let known_domains: Vec<&str> = Vec::new();
     let petname_map = {
-        let guard = uniffi_petname_maps()
+        let guard = bi
+            .core
+            .petname_maps()
             .lock()
             .map_err(|e| ScpError::Validation {
                 msg: format!("petname lock poisoned: {e}"),
@@ -11608,7 +11708,7 @@ pub fn address_resolve(
     let results = tokio::task::block_in_place(|| {
         handle.block_on(async {
             let mut resolver = scp_core::discovery::AddressResolver::new();
-            let querier = petname_helpers::LocalHandleQuerier;
+            let querier = petname_helpers::LocalHandleQuerier::new(&bi.core);
             resolver
                 .resolve(
                     &address,

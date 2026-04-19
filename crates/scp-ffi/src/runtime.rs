@@ -55,7 +55,7 @@
 //! roundtripping.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -345,6 +345,61 @@ pub struct PyBridgeInstance {
     /// construction) time. Typed (not `dyn`) because the `Storage` trait is
     /// not dyn-compatible (RPITIT).
     pub(crate) storage_provider: OnceLock<StorageProvider>,
+
+    // -----------------------------------------------------------------
+    // #1549 Phase 4 PR 2 commit 1 — additive typed fields replacing
+    // process-global singletons in later commits.
+    // -----------------------------------------------------------------
+    /// Per-context FFI bridge state registry (replaces `FFI_BRIDGE_STATE`).
+    ///
+    /// Migrated from a process-global `OnceLock<DashMap<String, FfiBridgeState>>`
+    /// singleton in commit 3. Wrapped in `Arc` so the existing free-function
+    /// helpers (`with_ffi_state` / `register_ffi_state` / `remove_ffi_state`)
+    /// can borrow it as `&'static` via the default-instance fallback pattern
+    /// established for `identity_registry`.
+    pub(crate) ffi_bridge_state: Arc<DashMap<String, FfiBridgeState>>,
+
+    /// MCP server registry (replaces `SERVER_REGISTRY` in `mcp.rs`).
+    ///
+    /// Migrated from a process-global `OnceLock<DashMap<String, McpServerState>>`
+    /// singleton in commit 4. Cleared by
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`] so server shutdown
+    /// senders drop during instance shutdown.
+    pub(crate) mcp_server_registry: Arc<DashMap<String, crate::mcp::McpServerState>>,
+
+    /// MCP client registry (replaces `CLIENT_REGISTRY` in `mcp.rs`).
+    ///
+    /// Migrated from a process-global `OnceLock<DashMap<String, McpClientState>>`
+    /// singleton in commit 4. Cleared by
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`] so client connections
+    /// drop during instance shutdown.
+    pub(crate) mcp_client_registry: Arc<DashMap<String, crate::mcp::McpClientState>>,
+
+    /// Bridge credential store (replaces `CREDENTIAL_STORE` in
+    /// `bridge_connector.rs`).
+    ///
+    /// Migrated from a process-global `OnceLock<InMemoryCredentialStore>`
+    /// singleton in commit 5. Production deployments should replace this with
+    /// a `Storage`-backed implementation when it lands (spec §12.11.2).
+    pub(crate) credential_store: Arc<scp_core::bridge::credentials::InMemoryCredentialStore>,
+
+    /// Most recently connected relay URL (replaces `CONNECTED_RELAY_URL` in
+    /// `transport.rs`).
+    ///
+    /// Migrated from a process-global `OnceLock<RwLock<Option<String>>>`
+    /// singleton in commit 8. Distinct from `CoreFields::pending_relay_url`:
+    /// that tracks the pending URL saved for resume; this tracks the URL
+    /// currently bound to an active `TransportManager`.
+    pub(crate) connected_relay_url: RwLock<Option<String>>,
+
+    /// Shared full-stack test network (replaces `NETWORK` in `testing.rs`).
+    ///
+    /// Migrated from a process-global
+    /// `std::sync::Mutex<Option<FullStackNetwork>>` singleton in commit 9.
+    /// Feature-gated behind `allow_in_memory_custody` to mirror `testing.rs`
+    /// which is only compiled with that feature.
+    #[cfg(feature = "allow_in_memory_custody")]
+    pub(crate) network: std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>>,
 }
 
 impl PyBridgeInstance {
@@ -357,6 +412,15 @@ impl PyBridgeInstance {
             core: CoreFields::new(),
             identity_registry: Arc::new(DashMap::new()),
             storage_provider: OnceLock::new(),
+            ffi_bridge_state: Arc::new(DashMap::new()),
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
+            connected_relay_url: RwLock::new(None),
+            #[cfg(feature = "allow_in_memory_custody")]
+            network: std::sync::Mutex::new(None),
         }
     }
 
@@ -370,6 +434,15 @@ impl PyBridgeInstance {
             core: CoreFields::with_persistence(persistence),
             identity_registry: Arc::new(DashMap::new()),
             storage_provider: OnceLock::new(),
+            ffi_bridge_state: Arc::new(DashMap::new()),
+            mcp_server_registry: Arc::new(DashMap::new()),
+            mcp_client_registry: Arc::new(DashMap::new()),
+            credential_store: Arc::new(
+                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+            ),
+            connected_relay_url: RwLock::new(None),
+            #[cfg(feature = "allow_in_memory_custody")]
+            network: std::sync::Mutex::new(None),
         }
     }
 
@@ -429,6 +502,15 @@ impl PyBridgeInstance {
                             core: CoreFields::with_persistence_arc(persistence),
                             identity_registry: Arc::new(DashMap::new()),
                             storage_provider: OnceLock::new(),
+                            ffi_bridge_state: Arc::new(DashMap::new()),
+                            mcp_server_registry: Arc::new(DashMap::new()),
+                            mcp_client_registry: Arc::new(DashMap::new()),
+                            credential_store: Arc::new(
+                                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+                            ),
+                            connected_relay_url: RwLock::new(None),
+                            #[cfg(feature = "allow_in_memory_custody")]
+                            network: std::sync::Mutex::new(None),
                         };
                         let _ = instance
                             .storage_provider
@@ -464,6 +546,65 @@ impl PyBridgeInstance {
     #[must_use]
     pub fn storage_provider(&self) -> Option<&StorageProvider> {
         self.storage_provider.get()
+    }
+
+    /// Returns a reference to the per-context FFI bridge state registry.
+    ///
+    /// Wired into the existing `with_ffi_state` / `register_ffi_state` /
+    /// `remove_ffi_state` free helpers in commit 3 via the default-instance
+    /// fallback pattern established for `identity_registry`.
+    #[must_use]
+    pub const fn ffi_bridge_state(&self) -> &Arc<DashMap<String, FfiBridgeState>> {
+        &self.ffi_bridge_state
+    }
+
+    /// Returns a reference to the MCP server registry.
+    ///
+    /// `pub(crate)` because `McpServerState` is itself `pub(crate)` — this
+    /// accessor is used from `crate::mcp` to migrate the registry off the
+    /// process-global `OnceLock` in commit 4.
+    #[must_use]
+    pub(crate) const fn mcp_server_registry(
+        &self,
+    ) -> &Arc<DashMap<String, crate::mcp::McpServerState>> {
+        &self.mcp_server_registry
+    }
+
+    /// Returns a reference to the MCP client registry.
+    ///
+    /// `pub(crate)` — see `mcp_server_registry`.
+    #[must_use]
+    pub(crate) const fn mcp_client_registry(
+        &self,
+    ) -> &Arc<DashMap<String, crate::mcp::McpClientState>> {
+        &self.mcp_client_registry
+    }
+
+    /// Returns a reference to the bridge credential store.
+    #[must_use]
+    pub const fn credential_store(
+        &self,
+    ) -> &Arc<scp_core::bridge::credentials::InMemoryCredentialStore> {
+        &self.credential_store
+    }
+
+    /// Returns a reference to the connected-relay URL slot.
+    ///
+    /// Distinct from `CoreFields::pending_relay_url`: this field tracks the
+    /// URL bound to the active `TransportManager`; the core's field tracks
+    /// the pending URL saved for resume.
+    #[must_use]
+    pub const fn connected_relay_url(&self) -> &RwLock<Option<String>> {
+        &self.connected_relay_url
+    }
+
+    /// Returns a reference to the shared full-stack test network slot.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[must_use]
+    pub const fn network(
+        &self,
+    ) -> &std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>> {
+        &self.network
     }
 
     /// Initializes the in-memory storage provider on this instance.
@@ -554,14 +695,14 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // `storage_provider` is `OnceLock` — we cannot clear it. The
         // `Arc<EncryptingAdapter>` is released when the `PyBridgeInstance`
         // is dropped.
-        // Clear PyO3-specific singletons that are not owned by CoreFields
-        // (FFI_BRIDGE_STATE, MCP registries). These live at module scope
-        // because they hold PyO3 types that cannot cross the scp-ffi-common
-        // boundary.
-        if let Some(reg) = FFI_BRIDGE_STATE.get() {
-            reg.clear();
-        }
-        crate::mcp::clear_registries();
+        // Clear the typed per-context FFI state registry so per-context
+        // `ToolRegistry`, `EventLog`, receive channel senders, and
+        // registered tool handlers drop.
+        self.ffi_bridge_state.clear();
+        // Clear MCP registries so server shutdown senders and client
+        // connections drop, allowing background tasks to terminate cleanly.
+        self.mcp_server_registry.clear();
+        self.mcp_client_registry.clear();
     }
 }
 
@@ -1112,21 +1253,38 @@ impl ContextEventLogProvider for NoOpEventLogProvider {
 // FfiBridgeState -- per-context FFI-specific state
 // ---------------------------------------------------------------------------
 
-/// Global registry of per-context FFI-specific state.
+/// Fallback empty FFI bridge state registry for when the default
+/// `PyBridgeInstance` has not been initialized yet.
+///
+/// Mirrors the `EMPTY_IDENTITY_REGISTRY` pattern introduced for the
+/// identity-registry migration. Used by [`ffi_state_registry`] to keep the
+/// existing free-function signatures infallible even when callers touch
+/// bridge state before `ensure_bridge_instance` runs.
+static EMPTY_FFI_BRIDGE_STATE: OnceLock<DashMap<String, FfiBridgeState>> = OnceLock::new();
+
+/// Returns a reference to the default bridge instance's FFI bridge state
+/// registry.
+///
+/// Resolves the registry via the typed `ffi_bridge_state` field on the
+/// default [`PyBridgeInstance`]. Falls back to an empty registry when the
+/// default instance has not been initialized yet — matching the behaviour of
+/// the removed standalone `OnceLock<DashMap<...>>` (callers previously saw
+/// an empty registry on first touch; they still do).
 ///
 /// Stores state that is NOT managed by [`ContextManager`]: tool registries,
 /// event logs, UCAN revocation/nonce tracking, tool handlers, and message
-/// channels. Context lifecycle state (membership, roles, governance, broadcast,
-/// TTL) lives in the `ContextManager`.
+/// channels. Context lifecycle state (membership, roles, governance,
+/// broadcast, TTL) lives in the `ContextManager`.
 ///
 /// # Safety: Single-Tenant Only
 ///
-/// This registry is process-global. See module-level documentation.
-static FFI_BRIDGE_STATE: OnceLock<DashMap<String, FfiBridgeState>> = OnceLock::new();
-
-/// Returns a reference to the global FFI bridge state registry.
+/// The default instance's registry is process-global. See module-level
+/// documentation.
 fn ffi_state_registry() -> &'static DashMap<String, FfiBridgeState> {
-    FFI_BRIDGE_STATE.get_or_init(DashMap::new)
+    DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
+        || EMPTY_FFI_BRIDGE_STATE.get_or_init(DashMap::new),
+        |bi| bi.ffi_bridge_state.as_ref(),
+    )
 }
 
 /// Per-context FFI-specific state that does NOT duplicate [`ContextManager`].
@@ -1567,30 +1725,26 @@ where
 // Identity registry (SCP-214: KeyCustody wiring)
 // ---------------------------------------------------------------------------
 
-/// Returns a reference to the default bridge instance's identity registry.
+/// Returns the default bridge instance's identity registry.
 ///
 /// The registry is a typed `Arc<DashMap<String, IdentityEntry>>` field on
-/// [`PyBridgeInstance`]. Falls back to an empty registry if the default
-/// instance has not been initialized yet — matching the previous
-/// `get_or_init` behavior of the standalone `OnceLock`.
+/// [`PyBridgeInstance`]. `ensure_bridge_instance()` initializes
+/// `DEFAULT_BRIDGE_INSTANCE` if it is not yet set, so the registry is
+/// always real — there is no fallback empty map that writers could land in
+/// before a reader sees the instance registry (the H1 bug fixed in commit
+/// 10 of #1549 Phase 4 PR 2).
 ///
 /// The `DashMap` provides lock-free concurrent access matching the context
 /// registry pattern (ADR-006).
-///
-/// Fallback empty identity registry for when the default `PyBridgeInstance`
-/// is not initialized.
-static EMPTY_IDENTITY_REGISTRY: std::sync::OnceLock<DashMap<String, IdentityEntry>> =
-    std::sync::OnceLock::new();
-
-/// Returns the default bridge instance's identity registry.
-///
-/// Eagerly initializes the default bridge so writers never silently land in
-/// the dead `EMPTY_IDENTITY_REGISTRY` fallback. The fallback branch remains
-/// as a safety net but is unreachable in normal code paths; PR 2 deletes it.
 fn identity_registry() -> &'static DashMap<String, IdentityEntry> {
     ensure_bridge_instance();
+    // `ensure_bridge_instance()` returns early if the instance is already
+    // set, otherwise it runs `OnceLock::get_or_init` to allocate one. The
+    // only `None` path left is a compiler-level `OnceLock` bug — treat that
+    // as unreachable. A panicking fallback matches the previous behavior
+    // on instance-poisoned paths (e.g. `context_manager()` after shutdown).
     DEFAULT_BRIDGE_INSTANCE.get().map_or_else(
-        || EMPTY_IDENTITY_REGISTRY.get_or_init(DashMap::new),
+        || unreachable!("DEFAULT_BRIDGE_INSTANCE set by ensure_bridge_instance()"),
         |bi| bi.identity_registry.as_ref(),
     )
 }

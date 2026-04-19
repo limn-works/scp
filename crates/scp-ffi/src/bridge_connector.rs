@@ -26,7 +26,7 @@
 //! and ADR-023.
 
 use scp_ffi_common::error_codes as codes;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -60,22 +60,31 @@ use zeroize::Zeroizing;
 use crate::error::ScpPyError;
 
 // ---------------------------------------------------------------------------
-// Global credential store (in-memory, per-process)
+// Credential store — resolved via default PyBridgeInstance (commit 5)
 // ---------------------------------------------------------------------------
 
-/// Global in-memory credential store for bridge credential lifecycle.
-///
-/// Uses `OnceLock` for single-initialization, matching the runtime registry
-/// pattern used throughout the `PyO3` bridge. The `InMemoryCredentialStore` is
-/// thread-safe via internal `tokio::sync::RwLock`.
-///
-/// Production deployments should replace this with a `Storage`-backed
-/// implementation when it lands (see §12.11.2).
-static CREDENTIAL_STORE: OnceLock<InMemoryCredentialStore> = OnceLock::new();
+/// Fallback empty credential store for when the default `PyBridgeInstance`
+/// has not been initialized yet. Mirrors the `EMPTY_FFI_BRIDGE_STATE`
+/// fallback pattern.
+static EMPTY_CREDENTIAL_STORE: OnceLock<Arc<InMemoryCredentialStore>> = OnceLock::new();
 
-/// Returns or initializes the global credential store.
-fn credential_store() -> &'static InMemoryCredentialStore {
-    CREDENTIAL_STORE.get_or_init(InMemoryCredentialStore::new)
+/// Returns a reference to the default bridge instance's credential store.
+///
+/// Migrated from a process-global `OnceLock<InMemoryCredentialStore>` onto
+/// the typed `credential_store` field on
+/// [`crate::runtime::PyBridgeInstance`] in #1549 Phase 4 PR 2 commit 5.
+/// Falls back to a fresh empty store when the default instance has not been
+/// initialized yet.
+///
+/// The returned [`Arc<InMemoryCredentialStore>`] is the same instance the
+/// `PyBridgeInstance` holds — `InMemoryCredentialStore` is thread-safe via
+/// internal `tokio::sync::RwLock`. Production deployments should replace
+/// this with a `Storage`-backed implementation when it lands (spec §12.11.2).
+fn credential_store() -> &'static Arc<InMemoryCredentialStore> {
+    crate::runtime::bridge_instance_raw().map_or_else(
+        || EMPTY_CREDENTIAL_STORE.get_or_init(|| Arc::new(InMemoryCredentialStore::new())),
+        |bi| bi.credential_store(),
+    )
 }
 
 // ---------------------------------------------------------------------------
