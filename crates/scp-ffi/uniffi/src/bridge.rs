@@ -1453,12 +1453,10 @@ impl Identity {
     ///
     /// See SCP-214 acceptance criterion 9.
     pub async fn rotate_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
-        // #1646: every Category B (CoreFields-touching) UniFFI method must
-        // route through `default_bridge_instance()?` so `check_ready()`
-        // rejects operations against a suspended or shut-down bridge.
-        // `rotate_key` writes DID resolver state on `CoreFields` via the
-        // DHT signer path, so the gate is mandatory.
-        let _bi = crate::runtime::default_bridge_instance()?;
+        // Phase D (#1695): lifecycle gate deleted along with
+        // `DEFAULT_BRIDGE_INSTANCE`. The handle's own custody `Arc` keeps
+        // the signing key material alive; DID resolver state is now owned
+        // per-`Scp` (via `UniffiBridgeInstance`) and no longer process-wide.
         let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
             msg: "key rotation requires retained crypto state — this identity \
                       was loaded without key material (use identity_create or \
@@ -1581,9 +1579,8 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn add_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
-        // #1646: Category B gate — writes DID resolver / DHT state through
-        // `CoreFields`, must not run on a suspended or shut-down bridge.
-        let _bi = crate::runtime::default_bridge_instance()?;
+        // Phase D (#1695): lifecycle gate deleted — handle's own custody
+        // `Arc` keeps state alive; DID resolver is per-`Scp` now.
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -1672,9 +1669,8 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn remove_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
-        // #1646: Category B gate — writes DID resolver / DHT state through
-        // `CoreFields`, must not run on a suspended or shut-down bridge.
-        let _bi = crate::runtime::default_bridge_instance()?;
+        // Phase D (#1695): lifecycle gate deleted — handle's own custody
+        // `Arc` keeps state alive; DID resolver is per-`Scp` now.
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -1765,9 +1761,8 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn rotate_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
-        // #1646: Category B gate — writes DID resolver / DHT state through
-        // `CoreFields`, must not run on a suspended or shut-down bridge.
-        let _bi = crate::runtime::default_bridge_instance()?;
+        // Phase D (#1695): lifecycle gate deleted — handle's own custody
+        // `Arc` keeps state alive; DID resolver is per-`Scp` now.
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -2074,6 +2069,15 @@ impl Drop for UcanToken {
 pub struct TransportManager {
     /// Current connection state (relay URL, latency).
     pub(crate) status: std::sync::Mutex<TransportStatus>,
+    /// Owning `UniffiBridgeInstance` whose `CoreFields::transport` slot this
+    /// handle operates against.
+    ///
+    /// Phase D (#1695) replaces the old process-wide `DEFAULT_BRIDGE_INSTANCE`
+    /// lookup with a per-handle `Arc` — the `Scp` that minted the handle
+    /// keeps its transport state alive through this field, and
+    /// `suspend()`/`shutdown()` on that `Scp` transparently clears the
+    /// transport the handle reads from.
+    pub(crate) bi: Arc<crate::runtime::UniffiBridgeInstance>,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
     /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
@@ -2083,13 +2087,10 @@ pub struct TransportManager {
 
 impl fmt::Debug for TransportManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let adapter_count = crate::runtime::bridge_instance()
-            .ok()
-            .and_then(|bi| {
-                bi.core
-                    .with_transport(scp_transport::TransportManager::adapter_count)
-                    .ok()
-            })
+        let adapter_count = self
+            .bi
+            .core
+            .with_transport(scp_transport::TransportManager::adapter_count)
             .unwrap_or(0);
         f.debug_struct("TransportManager")
             .field("adapter_count", &adapter_count)
@@ -2134,9 +2135,10 @@ impl TransportManager {
     /// Reflects actual connection state: `connected` is `true` only if the
     /// inner transport manager has at least one adapter registered.
     pub fn status(&self) -> TransportStatus {
-        let has_adapters = crate::runtime::bridge_instance()
-            .ok()
-            .and_then(|bi| bi.core.with_transport(|mgr| mgr.adapter_count() > 0).ok())
+        let has_adapters = self
+            .bi
+            .core
+            .with_transport(|mgr| mgr.adapter_count() > 0)
             .unwrap_or(false);
         let status = self.status.lock().map_or(
             TransportStatus {
@@ -2155,22 +2157,18 @@ impl TransportManager {
 
     /// Returns `true` if the transport is currently connected (has adapters).
     pub fn is_connected(&self) -> bool {
-        crate::runtime::bridge_instance()
-            .ok()
-            .and_then(|bi| bi.core.with_transport(|mgr| mgr.adapter_count() > 0).ok())
+        self.bi
+            .core
+            .with_transport(|mgr| mgr.adapter_count() > 0)
             .unwrap_or(false)
     }
 
     /// Returns the number of adapters registered in the transport manager.
     #[allow(clippy::cast_possible_truncation)] // Adapter count is bounded by connection budget (<<u32::MAX).
     pub fn adapter_count(&self) -> u32 {
-        crate::runtime::bridge_instance()
-            .ok()
-            .and_then(|bi| {
-                bi.core
-                    .with_transport(|mgr| mgr.adapter_count() as u32)
-                    .ok()
-            })
+        self.bi
+            .core
+            .with_transport(|mgr| mgr.adapter_count() as u32)
             .unwrap_or(0)
     }
 
@@ -2193,11 +2191,8 @@ impl TransportManager {
 
         validate_relay_url(&relay_url)?;
 
-        // #1646: Category B gate — mutates `CoreFields::transport` state,
-        // must not run on a suspended or shut-down bridge.
-        // `default_bridge_instance()` errors on shutdown; `bridge_instance()`
-        // only warns, which is too permissive for a mutation.
-        let bi = crate::runtime::default_bridge_instance()?;
+        // Phase D (#1695): the handle's `bi` field is the owning
+        // `UniffiBridgeInstance` — mutate its transport slot directly.
         let rt = runtime();
         let sourced = SourcedRelayUrl {
             url: relay_url.clone(),
@@ -2216,7 +2211,8 @@ impl TransportManager {
         // events and downgrades the relay's reliability score (#1533 AC5).
         let suppression_rx = adapter.take_suppression_receiver();
 
-        let count = bi
+        let count = self
+            .bi
             .core
             .with_transport_mut(|mgr| {
                 let _eviction = mgr.add_adapter(Box::new(adapter));
@@ -2229,10 +2225,10 @@ impl TransportManager {
                 code: codes::TRANS_5003.to_owned(),
             })?;
 
-        // Spawn suppression → scoring bridge task.
-        // Uses BridgeInstance transport for score updates.
+        // Spawn suppression → scoring bridge task against this handle's
+        // owning `UniffiBridgeInstance`.
         if let Some(rx) = suppression_rx {
-            spawn_suppression_scoring_task(rx, relay_url);
+            spawn_suppression_scoring_task(Arc::clone(&self.bi), rx, relay_url);
         }
 
         Ok(count)
@@ -2256,10 +2252,9 @@ impl TransportManager {
     /// Returns `ScpError::Transport` if no adapters are registered.
     pub fn assign_relay_set(&self, context_id: String) -> Result<Vec<u32>, ScpError> {
         validate_context_id(&context_id)?;
-        // #1646: Category B gate — mutates `CoreFields::transport` state,
-        // must not run on a suspended or shut-down bridge.
-        let bi = crate::runtime::default_bridge_instance()?;
-        let indices = bi
+        // Phase D (#1695): mutate this handle's owning instance's transport.
+        let indices = self
+            .bi
             .core
             .with_transport(|mgr| {
                 mgr.assign_relay_set(&context_id)
@@ -2284,8 +2279,8 @@ impl TransportManager {
     ///
     /// * `adapter_index` -- The adapter index (0-based) to query.
     pub fn reliability_score(&self, adapter_index: u32) -> Option<ReliabilityScoreRecord> {
-        let bi = crate::runtime::bridge_instance().ok()?;
-        let score = bi
+        let score = self
+            .bi
             .core
             .with_transport(|mgr| mgr.get_reliability_score(adapter_index as usize))
             .ok()??;
@@ -2324,18 +2319,20 @@ impl Drop for TransportManager {
 /// #1533 AC5). Each suppression event downgrades the relay's reliability
 /// score via `DeliveryOutcome::Failure`.
 ///
-/// Accesses the transport via `BridgeInstance` — the task exits gracefully
-/// when the bridge is shut down or the transport is cleared.
+/// Accesses the transport via a cloned `Arc<UniffiBridgeInstance>` — the
+/// task exits gracefully when the bridge is shut down or the transport is
+/// cleared.
 fn spawn_suppression_scoring_task(
+    bi: Arc<crate::runtime::UniffiBridgeInstance>,
     mut rx: tokio::sync::mpsc::Receiver<scp_transport::heartbeat::SuppressionSuspected>,
     relay_url: String,
 ) {
     tokio::spawn(async move {
         while let Some(_suppression) = rx.recv().await {
-            let Ok(bi) = crate::runtime::bridge_instance() else {
+            if bi.core.is_shutdown() {
                 // Bridge shut down — exit gracefully.
                 break;
-            };
+            }
             tracing::debug!(
                 relay_url = %relay_url,
                 "heartbeat suppression → downgrading relay reliability score"
@@ -2740,7 +2737,6 @@ async fn identity_create_link_attestation_impl(
 ///
 /// See spec §3.5.1.
 #[cfg(feature = "allow_in_memory_custody")]
-#[must_use]
 #[allow(clippy::unused_async)]
 async fn identity_verify_link_attestation_impl(
     attestation_json: String,
@@ -11191,13 +11187,15 @@ impl Scp {
                         relay_url: Some(relay_url.clone()),
                         latency_ms: None,
                     }),
+                    bi: Arc::clone(&bi),
                     instance_id: bi.core.instance_id(),
                 });
                 increment_handle_count();
 
-                // Spawn suppression → scoring bridge task.
+                // Spawn suppression → scoring bridge task bound to this
+                // instance (not the process-wide default).
                 if let Some(rx) = suppression_rx {
-                    spawn_suppression_scoring_task(rx, relay_url);
+                    spawn_suppression_scoring_task(Arc::clone(&bi), rx, relay_url);
                 }
 
                 Ok(handle)

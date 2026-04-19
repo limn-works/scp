@@ -707,7 +707,7 @@ async fn event_log_query_returns_events() {
 
 #[tokio::test]
 async fn discovery_parse_various_address_types() {
-    let scp = Scp::new();
+    let _scp = Scp::new();
     // Unscoped name (petname)
     let result = discovery_parse_address("alice".to_owned()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -746,7 +746,7 @@ async fn discovery_parse_various_address_types() {
 
 #[tokio::test]
 async fn discovery_normalize_trims_whitespace() {
-    let scp = Scp::new();
+    let _scp = Scp::new();
     let result = discovery_normalize_address("  alice  ".to_owned());
     assert!(!result.starts_with(' '), "Should trim leading whitespace");
     assert!(!result.ends_with(' '), "Should trim trailing whitespace");
@@ -754,7 +754,7 @@ async fn discovery_normalize_trims_whitespace() {
 
 #[tokio::test]
 async fn discovery_create_query_produces_json() {
-    let scp = Scp::new();
+    let _scp = Scp::new();
     let result = discovery_create_query(
         Some(vec!["tool:search".to_owned()]),
         Some(vec!["rust".to_owned()]),
@@ -772,7 +772,7 @@ async fn discovery_create_query_produces_json() {
 
 #[tokio::test]
 async fn sync_classify_offline_tiers() {
-    let scp = Scp::new();
+    let _scp = Scp::new();
     let now = 1_700_000_000u64;
 
     // Short offline (< TIER_1 = 14,400s)
@@ -790,7 +790,7 @@ async fn sync_classify_offline_tiers() {
 
 #[tokio::test]
 async fn sync_classify_offline_custom_thresholds() {
-    let scp = Scp::new();
+    let _scp = Scp::new();
     let now = 1_700_000_000u64;
 
     // Custom thresholds: tier1 = 120s, tier2 = 600s
@@ -853,7 +853,7 @@ async fn provenance_attach_increments_chain_depth() {
 
 #[tokio::test]
 async fn provenance_check_chain_depth_within_limit() {
-    let scp = Scp::new();
+    let _scp = Scp::new();
     assert!(
         provenance_check_chain_depth(0, None),
         "Depth 0 should be within default limit"
@@ -875,7 +875,7 @@ async fn provenance_check_chain_depth_within_limit() {
 
 #[tokio::test]
 async fn evaluate_provenance_quality_returns_score() {
-    let scp = Scp::new();
+    let _scp = Scp::new();
     let score = evaluate_provenance_quality(
         Some("ctx-001".to_owned()),
         "persistent".to_owned(),
@@ -893,7 +893,7 @@ async fn evaluate_provenance_quality_returns_score() {
 
 #[tokio::test]
 async fn evaluate_provenance_quality_rejects_invalid_source_type() {
-    let scp = Scp::new();
+    let _scp = Scp::new();
     let result =
         evaluate_provenance_quality(None, "invalid_type".to_owned(), "active".to_owned(), vec![]);
     assert!(result.is_err(), "Invalid source type should be rejected");
@@ -905,7 +905,7 @@ async fn evaluate_provenance_quality_rejects_invalid_source_type() {
 
 #[tokio::test]
 async fn bridge_evaluate_trust_native() {
-    let scp = Scp::new();
+    let _scp = Scp::new();
     // Non-bridged, native transport → highest trust
     let level = bridge_evaluate_trust(false, true, "shadow".to_owned()).unwrap();
     assert!(level > 0, "Native trust level should be positive");
@@ -913,7 +913,7 @@ async fn bridge_evaluate_trust_native() {
 
 #[tokio::test]
 async fn bridge_evaluate_trust_shadow_vs_claimed() {
-    let scp = Scp::new();
+    let _scp = Scp::new();
     // Shadow bridged
     let shadow = bridge_evaluate_trust(true, false, "shadow".to_owned()).unwrap();
     // Claimed bridged
@@ -927,7 +927,7 @@ async fn bridge_evaluate_trust_shadow_vs_claimed() {
 
 #[tokio::test]
 async fn bridge_evaluate_trust_rejects_invalid_status() {
-    let scp = Scp::new();
+    let _scp = Scp::new();
     let result = bridge_evaluate_trust(true, false, "invalid".to_owned());
     assert!(result.is_err(), "Invalid shadow status should be rejected");
 }

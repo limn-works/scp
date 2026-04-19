@@ -258,45 +258,11 @@ pub(crate) fn decrement_handle_count() {
         .ok();
 }
 
-/// Waits for all outstanding FFI handles to be released, then shuts down.
-///
-/// Call this from Swift/Kotlin before your process exits or before tearing
-/// down the SCP library. It blocks (asynchronously) until either:
-///
-/// - All opaque handle objects (`Identity`, `ContextHandle`, `UcanToken`,
-///   `TransportManager`) have been garbage-collected / freed, **or**
-/// - The `timeout_millis` deadline has elapsed.
-///
-/// After this call returns, the tokio runtime may be dropped safely — no
-/// outstanding FFI handles remain that could attempt to call into it.
-///
-/// The unit is **milliseconds** — unified across all Rust bridges so the
-/// Swift, Kotlin, and TypeScript SDKs can share a single conversion
-/// surface (the SDK wrappers multiply by 1000 before crossing FFI). The
-/// default is 5000 ms (per ADR-021 acceptance criterion 1). Pass `0` to
-/// return immediately without waiting.
-///
-/// # Thread safety
-///
-/// This function is safe to call from any thread. It polls `HANDLE_COUNT`
-/// in 10 ms intervals on the tokio runtime (via `tokio::time::sleep`) so
-/// the worker is not blocked — critical for mobile apps that run this on
-/// the main event loop.
-///
-/// **Bug fix (PR 1 post-review):** the previous implementation polled
-/// with `std::thread::sleep`, which blocks the current tokio worker.
-/// Mobile apps invoking `scpShutdown` from the foreground ran the risk
-/// of a frozen UI while tasks drained. The new implementation yields
-/// via `tokio::time::sleep` as every other async bridge function does.
-///
-/// # Example (Swift)
-///
-/// ```swift
-/// // Call before application exit:
-/// try await scpShutdown(timeoutMillis: 5_000)
-/// ```
-// Phase D (#1695): `scp_shutdown` free function deleted. Callers must use
-// `SCP.shutdown(timeout_millis)` on their per-instance handle.
+// Phase D (#1695): `scp_shutdown` free function deleted. The old
+// process-wide shutdown helper (and its drain-on-HANDLE_COUNT rationale)
+// is replaced by the per-instance `SCP.shutdown(timeout_millis)` method
+// on the caller-owned `Scp` handle, which drives its own
+// `UniffiBridgeInstance::shutdown` without touching shared global state.
 
 /// Returns a handle to the shared tokio runtime, initializing it on first call.
 ///
