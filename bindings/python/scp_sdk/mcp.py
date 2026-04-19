@@ -21,14 +21,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
 from scp_sdk.errors import TransportError, ValidationError
 
 if TYPE_CHECKING:
-    import _scp_core
-
     from scp_sdk.context import Context
     from scp_sdk.identity import Identity
+    from scp_sdk.scp import SCP
 
 logger = logging.getLogger("scp_sdk")
 
@@ -79,7 +77,7 @@ def _bridge() -> Any:
         ) from exc
 
 
-def _resolve_bridge(scp: _scp_core.SCP | None = None) -> Any:
+def _resolve_bridge(scp: SCP) -> Any:
     """Return the effective bridge object for MCP operations.
 
     Tests patch ``scp_sdk.mcp._bridge`` to return a ``MagicMock`` with
@@ -87,13 +85,13 @@ def _resolve_bridge(scp: _scp_core.SCP | None = None) -> Any:
     helper returns that mock when detected so the existing tests still
     route through it. Production code sees the real ``_scp_core`` module
     (whose ``py_mcp_*`` methods moved onto :class:`SCP` in Phase 4 PR 4)
-    and falls through to :func:`resolve_scp` so calls dispatch on the
+    and falls through to ``scp._native`` so calls dispatch on the
     :class:`SCP` instance's methods.
     """
     bridge = _bridge()
     if hasattr(bridge, "_mock_name"):
         return bridge
-    return resolve_scp(scp)
+    return scp._native
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +173,7 @@ class McpServer:
     ``read_messages``, and ``list_members``.
     """
 
-    __slots__ = ("_contexts", "_handle", "_identity", "_stopped", "_transport")
+    __slots__ = ("_contexts", "_handle", "_identity", "_scp", "_stopped", "_transport")
 
     def __init__(
         self,
@@ -183,11 +181,13 @@ class McpServer:
         identity: Identity,
         contexts: list[Context],
         transport: str,
+        scp: SCP,
     ) -> None:
         self._handle = handle
         self._identity = identity
         self._contexts = list(contexts)
         self._transport = transport
+        self._scp = scp
         self._stopped = False
 
     @property
@@ -200,13 +200,8 @@ class McpServer:
         """The active SCP contexts being served."""
         return list(self._contexts)
 
-    async def stop(self, scp: _scp_core.SCP | None = None) -> None:
+    async def stop(self) -> None:
         """Stop the MCP server gracefully.
-
-        Args:
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Raises:
             TransportError: If shutdown fails.
@@ -214,7 +209,7 @@ class McpServer:
         if self._stopped:
             return
         logger.info("Stopping MCP server (transport=%s)", self._transport)
-        instance = _resolve_bridge(scp)
+        instance = _resolve_bridge(self._scp)
         await asyncio.to_thread(instance.py_mcp_server_stop, self._handle)
         self._stopped = True
         logger.debug("MCP server stopped")
@@ -248,10 +243,9 @@ class McpServer:
         """Stop the server if not already stopped.
 
         Called by the garbage collector. Errors are silently suppressed.
-
-        During interpreter shutdown, module globals (including ``_bridge``)
-        may already be ``None``, so we import ``_scp_core`` directly to
-        avoid relying on module-level names that could be torn down.
+        The server's owning :class:`SCP` is stored on the instance so the
+        finalizer can dispatch on it without touching module globals that
+        may be in teardown.
         """
         try:
             if self._stopped:
@@ -260,12 +254,7 @@ class McpServer:
             # _stopped may not exist if __init__ was never completed.
             return
         try:
-            import _scp_core
-
-            # __del__ must not assume a particular SCP instance is alive —
-            # fall back to the default instance, which the shared module
-            # finalizer keeps around until interpreter shutdown.
-            _scp_core.SCP.default_instance().py_mcp_server_stop(self._handle)
+            self._scp._native.py_mcp_server_stop(self._handle)
             self._stopped = True
         except Exception:
             pass
@@ -280,12 +269,11 @@ class McpServer:
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
 async def serve_mcp(
+    scp: SCP,
     identity: Identity,
     contexts: list[Context],
     transport: str = "stdio",
-    scp: _scp_core.SCP | None = None,
 ) -> McpServer:
     """Start an MCP server that exposes SCP context tools.
 
@@ -357,6 +345,7 @@ async def serve_mcp(
         identity=identity,
         contexts=contexts,
         transport=transport,
+        scp=scp,
     )
 
     logger.info("MCP server started (transport=%s)", transport)
@@ -368,7 +357,6 @@ async def serve_mcp(
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
 def configure_stdio_allowlist(
     *,
     additional_binaries: list[str] | None = None,
@@ -404,7 +392,6 @@ def configure_stdio_allowlist(
     bridge.py_mcp_configure_stdio_allowlist(additional_binaries)
 
 
-@deprecated_default_instance
 def disable_stdio_allowlist(
     *,
     i_trust_all_commands: bool = False,
@@ -444,7 +431,6 @@ def disable_stdio_allowlist(
     bridge.py_mcp_disable_stdio_allowlist()
 
 
-@deprecated_default_instance
 def reset_stdio_allowlist() -> None:
     """Reset the stdio allowlist to its default state.
 
@@ -462,7 +448,6 @@ def reset_stdio_allowlist() -> None:
     logger.info("MCP stdio allowlist reset to defaults")
 
 
-@deprecated_default_instance
 def get_stdio_allowlist() -> dict[str, Any]:
     """Return the current stdio allowlist state.
 
@@ -484,12 +469,11 @@ def get_stdio_allowlist() -> dict[str, Any]:
     return bridge.py_mcp_get_stdio_allowlist()
 
 
-@deprecated_default_instance
 def register_tool_handler(
+    scp: SCP,
     context: Context,
     tool_name: str,
     handler: Any,
-    scp: _scp_core.SCP | None = None,
 ) -> None:
     """Register a Python callable as the handler for an SCP tool.
 
@@ -533,8 +517,7 @@ def register_tool_handler(
     )
 
 
-@deprecated_default_instance
-def registry_stats(scp: _scp_core.SCP | None = None) -> dict[str, Any]:
+def registry_stats(scp: SCP) -> dict[str, Any]:
     """Return current entry counts for all FFI registries.
 
     Intended for monitoring and debugging in long-running processes.
@@ -561,8 +544,7 @@ def registry_stats(scp: _scp_core.SCP | None = None) -> dict[str, Any]:
     return instance.py_registry_stats()
 
 
-@deprecated_default_instance
-def registry_cleanup(scp: _scp_core.SCP | None = None) -> dict[str, Any]:
+def registry_cleanup(scp: SCP) -> dict[str, Any]:
     """Remove stale entries from all FFI registries.
 
     Currently cleans up:
@@ -609,22 +591,25 @@ class McpClient:
         )
     """
 
-    __slots__ = ("_command", "_disconnected", "_handle", "_transport")
+    __slots__ = ("_command", "_disconnected", "_handle", "_scp", "_transport")
 
-    def __init__(self, handle: Any, transport: str, command: list[str] | None) -> None:
+    def __init__(
+        self, handle: Any, transport: str, command: list[str] | None, scp: SCP
+    ) -> None:
         self._handle = handle
         self._transport = transport
         self._command = command
+        self._scp = scp
         self._disconnected = False
 
     @classmethod
     async def connect(
         cls,
+        scp: SCP,
         transport: str,
         *,
         command: list[str] | None = None,
         url: str | None = None,
-        scp: _scp_core.SCP | None = None,
     ) -> McpClient:
         """Connect to an external MCP server.
 
@@ -711,17 +696,12 @@ class McpClient:
         else:
             handle = await asyncio.to_thread(instance.py_mcp_client_connect_sse, url)
 
-        client = cls(handle=handle, transport=transport, command=command)
+        client = cls(handle=handle, transport=transport, command=command, scp=scp)
         logger.info("MCP client connected (transport=%s)", transport)
         return client
 
-    async def list_tools(self, scp: _scp_core.SCP | None = None) -> list[McpToolDefinition]:
+    async def list_tools(self) -> list[McpToolDefinition]:
         """List available tools from the external MCP server.
-
-        Args:
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Returns:
             A list of :class:`McpToolDefinition` objects.
@@ -729,7 +709,7 @@ class McpClient:
         Raises:
             TransportError: If the server communication fails.
         """
-        instance = _resolve_bridge(scp)
+        instance = _resolve_bridge(self._scp)
         raw_tools = await asyncio.to_thread(instance.py_mcp_client_list_tools, self._handle)
         return [
             McpToolDefinition(
@@ -746,7 +726,6 @@ class McpClient:
         input: dict[str, Any],
         context: Context,
         identity: Identity,
-        scp: _scp_core.SCP | None = None,
     ) -> McpToolResult:
         """Invoke an external tool with SCP provenance wrapping.
 
@@ -770,7 +749,7 @@ class McpClient:
             ToolError: If the tool invocation fails.
             TransportError: If server communication fails.
         """
-        instance = _resolve_bridge(scp)
+        instance = _resolve_bridge(self._scp)
         raw = await asyncio.to_thread(
             instance.py_mcp_client_invoke,
             self._handle,
@@ -793,13 +772,8 @@ class McpClient:
             provenance=provenance,
         )
 
-    async def disconnect(self, scp: _scp_core.SCP | None = None) -> None:
+    async def disconnect(self) -> None:
         """Disconnect from the external MCP server.
-
-        Args:
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Raises:
             TransportError: If disconnection fails.
@@ -807,7 +781,7 @@ class McpClient:
         if self._disconnected:
             return
         logger.info("Disconnecting MCP client (transport=%s)", self._transport)
-        instance = _resolve_bridge(scp)
+        instance = _resolve_bridge(self._scp)
         await asyncio.to_thread(instance.py_mcp_client_disconnect, self._handle)
         self._disconnected = True
         logger.debug("MCP client disconnected")
@@ -841,10 +815,9 @@ class McpClient:
         """Disconnect the client if not already disconnected.
 
         Called by the garbage collector. Errors are silently suppressed.
-
-        During interpreter shutdown, module globals (including ``_bridge``)
-        may already be ``None``, so we import ``_scp_core`` directly to
-        avoid relying on module-level names that could be torn down.
+        The client's owning :class:`SCP` is stored on the instance so the
+        finalizer can dispatch on it without touching module globals that
+        may be in teardown.
         """
         try:
             if self._disconnected:
@@ -853,12 +826,7 @@ class McpClient:
             # _disconnected may not exist if __init__ was never completed.
             return
         try:
-            import _scp_core
-
-            # __del__ must not assume a particular SCP instance is alive —
-            # fall back to the default instance, which the shared module
-            # finalizer keeps around until interpreter shutdown.
-            _scp_core.SCP.default_instance().py_mcp_client_disconnect(self._handle)
+            self._scp._native.py_mcp_client_disconnect(self._handle)
             self._disconnected = True
         except Exception:
             pass
@@ -922,7 +890,8 @@ async def _cli_serve(did: str, relay_url: str, transport: str) -> None:
     """Internal async implementation of the ``scp-mcp serve`` command.
 
     Loads the identity, connects to the relay, discovers active contexts,
-    and starts the MCP server.
+    and starts the MCP server. Owns its own :class:`SCP` instance —
+    CLI entry points always construct a fresh instance (ADR-048).
 
     Args:
         did: The DID string of the identity to serve.
@@ -930,6 +899,7 @@ async def _cli_serve(did: str, relay_url: str, transport: str) -> None:
         transport: The MCP transport mode (``"stdio"`` or ``"sse"``).
     """
     from scp_sdk.identity import Identity
+    from scp_sdk.scp import SCP
     from scp_sdk.transport import connect_relay
 
     logger.info(
@@ -939,19 +909,22 @@ async def _cli_serve(did: str, relay_url: str, transport: str) -> None:
         transport,
     )
 
+    # CLI entry point constructs its own SCP instance.
+    scp = SCP()
+
     # Step 1: Load the identity.
-    await Identity.load(did)
+    await Identity.load(scp, did)
 
     # Step 2: Connect to the relay.
-    await connect_relay(relay_url)
+    await connect_relay(scp, relay_url)
 
     # Step 3: Load active contexts via the bridge.
-    instance = resolve_scp(None)
-    context_handles = await asyncio.to_thread(instance.py_mcp_load_contexts, did, relay_url)
+    native = scp._native
+    context_handles = await asyncio.to_thread(native.py_mcp_load_contexts, did, relay_url)
 
     # Step 4: Start the MCP server.
     context_ids = [h["context_id"] for h in context_handles]
-    handle = await asyncio.to_thread(instance.py_mcp_serve, did, context_ids, transport)
+    handle = await asyncio.to_thread(native.py_mcp_serve, did, context_ids, transport)
 
     logger.info(
         "MCP server running: %d contexts, transport=%s",
@@ -960,24 +933,24 @@ async def _cli_serve(did: str, relay_url: str, transport: str) -> None:
     )
 
     # Block until the server exits (stdin EOF for stdio, signal for SSE).
-    await _wait_for_shutdown(handle, transport)
+    await _wait_for_shutdown(scp, handle, transport)
 
 
-async def _wait_for_shutdown(handle: Any, transport: str) -> None:
+async def _wait_for_shutdown(scp: SCP, handle: Any, transport: str) -> None:
     """Wait for the MCP server to shut down.
 
     For stdio transport, waits until stdin is closed (EOF).
     For SSE transport, waits until a termination signal is received.
     """
-    instance = resolve_scp(None)
+    native = scp._native
     try:
         # The bridge provides a blocking wait that we run in a thread
         # to avoid blocking the asyncio event loop.
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, instance.py_mcp_server_wait, handle)
+        await loop.run_in_executor(None, native.py_mcp_server_wait, handle)
     except KeyboardInterrupt:
         logger.info("Received interrupt, shutting down MCP server")
-        await asyncio.to_thread(instance.py_mcp_server_stop, handle)
+        await asyncio.to_thread(native.py_mcp_server_stop, handle)
 
 
 __all__ = [

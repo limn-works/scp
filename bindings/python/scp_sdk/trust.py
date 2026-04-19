@@ -25,11 +25,10 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
 from scp_sdk.errors import ContextError, ScpError
 
 if TYPE_CHECKING:
-    import _scp_core
+    from scp_sdk.scp import SCP
 
 logger = logging.getLogger("scp_sdk")
 
@@ -399,12 +398,11 @@ class TrustEvaluation:
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
 async def evaluate_trust(
+    scp: SCP,
     subject_did: str,
     context_id: str,
     capability_tokens: list[str] | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> TrustEvaluation:
     """Evaluate the trustworthiness of a participant in a context.
 
@@ -459,12 +457,11 @@ async def evaluate_trust(
     # bridge. In production, `_bridge()` returns the actual `_scp_core`
     # module; calls like `bridge.ucan_validate` on the real module would
     # fail (the free function has been removed), so we route through the
-    # :class:`SCP` instance instead. Tests that set a non-mock bridge
-    # therefore use the real SCP instance below. See ADR-048.
+    # :class:`SCP` instance instead. See ADR-048.
     if hasattr(bridge, "_mock_name"):
         instance: Any = bridge
     else:
-        instance = resolve_scp(scp)
+        instance = scp._native
 
     # Layer 1: Validate capability tokens if provided.
     # Each of the six CapabilityValidation fields is set independently
@@ -820,7 +817,6 @@ class RequireParticipation:
         }
 
 
-@deprecated_default_instance
 def verify_participation_requirements(
     requirements: list[RequireParticipation],
     profiles: list[ParticipationProfile],
@@ -859,8 +855,8 @@ def verify_participation_requirements(
     bridge.verify_participation_requirements(profile_json, requirements_json)
 
 
-@deprecated_default_instance
 def aggregate_trust_input(
+    scp: SCP,
     context_id: str,
     subject_did: str,
     events: list[dict[str, Any]],
@@ -870,7 +866,6 @@ def aggregate_trust_input(
     attestor_sets: dict[str, Any] | None = None,
     cached_attestations: list[dict[str, Any]] | None = None,
     challenge_results: list[dict[str, Any]] | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Aggregate all trust engine layers into a single TrustInput.
 
@@ -933,7 +928,7 @@ def aggregate_trust_input(
     if hasattr(bridge, "_mock_name"):
         instance: Any = bridge
     else:
-        instance = resolve_scp(scp)
+        instance = scp._native
 
     events_json = json.dumps(events)
     merkle_root_json = json.dumps(merkle_root)

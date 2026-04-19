@@ -22,11 +22,10 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import resolve_scp
 from scp_sdk.errors import ContextError
 
 if TYPE_CHECKING:
-    import _scp_core
+    from scp_sdk.scp import SCP
 
 logger = logging.getLogger("scp_sdk")
 
@@ -88,20 +87,19 @@ def _bridge() -> Any:
         ) from exc
 
 
-def _resolve_bridge(scp: _scp_core.SCP | None = None) -> Any:
+def _resolve_bridge(scp: SCP) -> Any:
     """Return the effective bridge object for event-log operations.
 
     Tests patch ``scp_sdk.event_log._bridge`` to return a ``MagicMock``
     whose ``event_log_*`` attributes stand in for the live bridge. In
     production those attributes do not exist on the real ``_scp_core``
     module (Phase 4 PR 4 consolidated them onto :class:`SCP`), so we
-    fall through to :func:`resolve_scp` and dispatch on the SCP
-    instance.
+    fall through to ``scp._native`` and dispatch on the SCP instance.
     """
     bridge = _bridge()
     if hasattr(bridge, "_mock_name"):
         return bridge
-    return resolve_scp(scp)
+    return scp._native
 
 
 # ---------------------------------------------------------------------------
@@ -295,11 +293,11 @@ class EventLog:
 
     async def query(
         self,
+        scp: SCP,
         query_filter: str | None = None,
         since: float | None = None,
         actor: str | None = None,
         event_type: str | None = None,
-        scp: _scp_core.SCP | None = None,
     ) -> list[Event]:
         """Query the event log with optional filters.
 
@@ -358,7 +356,7 @@ class EventLog:
             for e in raw_events
         ]
 
-    async def verify(self, claim: dict[str, Any], scp: _scp_core.SCP | None = None) -> Proof:
+    async def verify(self, scp: SCP, claim: dict[str, Any]) -> Proof:
         """Verify a claim against the event log.
 
         Generates and verifies a Merkle proof for the given claim.
@@ -392,7 +390,7 @@ class EventLog:
             details=raw_proof.details,
         )
 
-    async def checkpoint(self, scp: _scp_core.SCP | None = None) -> Checkpoint:
+    async def checkpoint(self, scp: SCP) -> Checkpoint:
         """Create a checkpoint of the current event log state.
 
         Returns a :class:`Checkpoint` capturing the log's current root
@@ -442,9 +440,9 @@ class EventLog:
 
     async def signed_checkpoint(
         self,
+        scp: SCP,
         identity_did: str,
         epoch: int = 0,
-        scp: _scp_core.SCP | None = None,
     ) -> SignedCheckpoint:
         """Generate a cryptographically signed consistency checkpoint.
 

@@ -28,33 +28,32 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
 from scp_sdk.errors import UcanPermissionError
 
 if TYPE_CHECKING:
-    import _scp_core
+    from scp_sdk.scp import SCP
 
 try:
-    import _scp_core  # type: ignore[import-not-found,no-redef]
+    import _scp_core  # type: ignore[import-not-found]
 except ImportError:
     _scp_core = None  # type: ignore[assignment]
 
 
-def _resolve_bridge(scp: _scp_core.SCP | None = None) -> Any:
+def _resolve_bridge(scp: SCP) -> Any:
     """Return the effective bridge object for UCAN operations.
 
     When tests patch ``scp_sdk.ucan._scp_core`` with a ``MagicMock``,
     that mock's ``ucan_*`` attributes stand in for the real bridge
     calls. Production code sees the real ``_scp_core`` module here
     (which does NOT expose the ``ucan_*`` methods at module level after
-    Phase 4 PR 4), so we fall through to :func:`resolve_scp` and
-    dispatch via the :class:`SCP` instance. See ADR-048 for the
-    consolidation rationale.
+    Phase 4 PR 4), so we fall through to ``scp._native`` and dispatch
+    via the :class:`SCP` instance. See ADR-048 for the consolidation
+    rationale.
     """
     mod = _scp_core
     if mod is not None and hasattr(mod, "_mock_name"):
         return mod
-    return resolve_scp(scp)
+    return scp._native
 
 
 # ---------------------------------------------------------------------------
@@ -126,12 +125,11 @@ class UcanToken:
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
 async def validate(
+    scp: SCP,
     context: str,
     token: str,
     capability: str,
-    scp: _scp_core.SCP | None = None,
 ) -> None:
     """Validate a UCAN token against a required capability.
 
@@ -164,14 +162,13 @@ async def validate(
         raise UcanPermissionError(str(exc)) from exc
 
 
-@deprecated_default_instance
 async def mint(
+    scp: SCP,
     audience: str,
     capabilities: Sequence[str],
     context: str,
     expiry: float | None = None,
     proofs: Sequence[str] | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> UcanToken:
     """Mint a new UCAN token.
 
@@ -221,12 +218,11 @@ async def mint(
     return UcanToken._from_bridge(bridge_token)
 
 
-@deprecated_default_instance
 async def revoke(
+    scp: SCP,
     context: str,
     token: str,
     revoker_did: str,
-    scp: _scp_core.SCP | None = None,
 ) -> None:
     """Revoke a UCAN token using the full revocation pipeline.
 
@@ -251,8 +247,8 @@ async def revoke(
         raise UcanPermissionError(str(exc)) from exc
 
 
-@deprecated_default_instance
 async def delegate(
+    scp: SCP,
     parent_token: UcanToken,
     delegator: str,
     delegatee: str,
@@ -260,7 +256,6 @@ async def delegate(
     context: str,
     *,
     encoded_parent: str,
-    scp: _scp_core.SCP | None = None,
 ) -> UcanToken:
     """Create a delegated UCAN from a parent token.
 

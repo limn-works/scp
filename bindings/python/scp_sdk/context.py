@@ -26,7 +26,6 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import resolve_scp
 from scp_sdk.errors import ContextError, ValidationError
 from scp_sdk.types import (
     Capability,
@@ -39,9 +38,8 @@ from scp_sdk.types import (
 )
 
 if TYPE_CHECKING:
-    import _scp_core
-
     from scp_sdk.identity import Identity
+    from scp_sdk.scp import SCP
 
 logger = logging.getLogger("scp_sdk")
 
@@ -96,7 +94,7 @@ class _LegacyBridgeAdapter:
         return getattr(self._mod, name)
 
 
-def _resolve_bridge(scp: _scp_core.SCP | None = None) -> Any:
+def _resolve_bridge(scp: SCP) -> Any:
     """Return the effective bridge object for context operations.
 
     Tests inject a ``MagicMock`` into ``sys.modules["_scp_core"]`` and set
@@ -105,7 +103,7 @@ def _resolve_bridge(scp: _scp_core.SCP | None = None) -> Any:
     :class:`_LegacyBridgeAdapter` so the new per-op method names still
     resolve) when detected. Production code sees the real ``_scp_core``
     module (which no longer exposes those free functions after Phase 4
-    PR 4) and falls through to :func:`resolve_scp` so calls dispatch on
+    PR 4) and falls through to ``scp._native`` so calls dispatch on
     the :class:`SCP` instance's per-operation methods (see ADR-048).
     """
     try:
@@ -114,7 +112,7 @@ def _resolve_bridge(scp: _scp_core.SCP | None = None) -> Any:
         mod = None  # type: ignore[assignment]
     if mod is not None and hasattr(mod, "_mock_name"):
         return _LegacyBridgeAdapter(mod)
-    return resolve_scp(scp)
+    return scp._native
 
 
 # ---------------------------------------------------------------------------
@@ -633,9 +631,15 @@ class Context:
             ``'closing'``, ``'closed'``, ``'expired'``).
     """
 
-    def __init__(self, handle: Any, creator_did: str) -> None:
+    def __init__(self, handle: Any, creator_did: str, scp: SCP | None = None) -> None:
         self._handle = handle
         self._creator_did = creator_did
+        # The owning :class:`scp_sdk.SCP` instance. Set by :meth:`create`
+        # and propagated to every method that needs to dispatch on the
+        # bridge. Legacy test paths that construct Context directly with
+        # a mock handle may pass ``None`` — the mock-detection branch in
+        # :func:`_resolve_bridge` handles that case.
+        self._scp = scp
 
     # -- Properties ---------------------------------------------------------
 
@@ -654,6 +658,7 @@ class Context:
     @classmethod
     async def create(
         cls,
+        scp: SCP,
         creator: Identity,
         ceiling: list[Capability | str],
         tools: list[Any] | None = None,
@@ -668,7 +673,6 @@ class Context:
         economic_policy: str | None = None,
         consequence_rules: list | None = None,
         consequence_config: dict | None = None,
-        scp: _scp_core.SCP | None = None,
     ) -> Context:
         """Create a new SCP context.
 
@@ -764,7 +768,7 @@ class Context:
         }
 
         handle = await asyncio.to_thread(instance.context_create, creator.did, params)
-        return cls(handle=handle, creator_did=creator.did)
+        return cls(handle=handle, creator_did=creator.did, scp=scp)
 
     # -- Lifecycle ----------------------------------------------------------
 
@@ -772,7 +776,6 @@ class Context:
         self,
         identity: Identity,
         spending_ucan_jwt: str | None = None,
-        scp: _scp_core.SCP | None = None,
     ) -> Membership:
         """Join this context with the given identity.
 
@@ -791,7 +794,7 @@ class Context:
             ContextError: If the context is not active.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -810,7 +813,7 @@ class Context:
             context_id=self.context_id,
         )
 
-    async def leave(self, identity: Identity, scp: _scp_core.SCP | None = None) -> None:
+    async def leave(self, identity: Identity) -> None:
         """Leave this context with the given identity.
 
         Args:
@@ -823,7 +826,7 @@ class Context:
             ContextError: If the context is not active.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -832,7 +835,7 @@ class Context:
 
         await asyncio.to_thread(instance.context_leave, self._handle, identity.did)
 
-    async def close(self, identity: Identity, scp: _scp_core.SCP | None = None) -> None:
+    async def close(self, identity: Identity) -> None:
         """Close this context.
 
         Requires admin role or ``ContextClose`` capability.
@@ -847,7 +850,7 @@ class Context:
             ContextError: If the context is not active.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -863,7 +866,6 @@ class Context:
         message: str | bytes,
         identity: Identity | None = None,
         spending_ucan_jwt: str | None = None,
-        scp: _scp_core.SCP | None = None,
     ) -> None:
         """Send a message to this context.
 
@@ -881,7 +883,7 @@ class Context:
             ContextError: If the context is not active.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -897,7 +899,7 @@ class Context:
             spending_ucan_jwt,
         )
 
-    async def receive(self, scp: _scp_core.SCP | None = None) -> AsyncIterator[Message]:
+    async def receive(self) -> AsyncIterator[Message]:
         """Return an async iterator of incoming messages.
 
         The iterator is backed by a bounded buffer (default 1,000
@@ -918,7 +920,7 @@ class Context:
             ContextError: If the context is not active.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -938,7 +940,6 @@ class Context:
         identity: Identity | None = None,
         proof_tokens: list[str] | None = None,
         spending_ucan: str | None = None,
-        scp: _scp_core.SCP | None = None,
     ) -> dict[str, Any]:
         """Invoke a tool registered in this context.
 
@@ -1001,7 +1002,7 @@ class Context:
                 or lacks the required tool invocation capability.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1023,7 +1024,7 @@ class Context:
 
     # -- Membership queries -------------------------------------------------
 
-    async def member_count(self, scp: _scp_core.SCP | None = None) -> int | None:
+    async def member_count(self) -> int | None:
         """Return the number of members in this context.
 
         Returns:
@@ -1033,7 +1034,7 @@ class Context:
             ContextError: If the bridge is unavailable.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1043,7 +1044,7 @@ class Context:
         result = await asyncio.to_thread(instance.context_member_count, self._handle)
         return int(result) if result is not None else None
 
-    async def is_member(self, did: str, scp: _scp_core.SCP | None = None) -> bool:
+    async def is_member(self, did: str) -> bool:
         """Check whether a DID is a member of this context.
 
         Args:
@@ -1056,7 +1057,7 @@ class Context:
             ContextError: If the bridge is unavailable.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1065,7 +1066,7 @@ class Context:
 
         return await asyncio.to_thread(instance.context_is_member, self._handle, did)
 
-    async def member_dids(self, scp: _scp_core.SCP | None = None) -> list[str]:
+    async def member_dids(self) -> list[str]:
         """Return all member DIDs in this context.
 
         Returns:
@@ -1075,7 +1076,7 @@ class Context:
             ContextError: If the bridge is unavailable.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1084,7 +1085,7 @@ class Context:
 
         return await asyncio.to_thread(instance.context_member_dids, self._handle)
 
-    async def member_role(self, did: str, scp: _scp_core.SCP | None = None) -> MemberRole | None:
+    async def member_role(self, did: str) -> MemberRole | None:
         """Return the role of a member in this context.
 
         Args:
@@ -1098,7 +1099,7 @@ class Context:
             ContextError: If the bridge is unavailable.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1112,7 +1113,7 @@ class Context:
 
     # -- Economic policy ----------------------------------------------------
 
-    async def set_economic_policy(self, policy_json: str, scp: _scp_core.SCP | None = None) -> None:
+    async def set_economic_policy(self, policy_json: str) -> None:
         """Set the economic policy for this context (spec section 19).
 
         Validates the JSON against the ``EconomicPolicy`` schema before
@@ -1127,7 +1128,7 @@ class Context:
                 to the ``EconomicPolicy`` schema.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1136,7 +1137,7 @@ class Context:
 
         await asyncio.to_thread(instance.set_economic_policy, self._handle, policy_json)
 
-    async def get_economic_policy(self, scp: _scp_core.SCP | None = None) -> str | None:
+    async def get_economic_policy(self) -> str | None:
         """Return the economic policy for this context as a JSON string.
 
         Returns:
@@ -1146,7 +1147,7 @@ class Context:
             ContextError: If the bridge is unavailable.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1158,7 +1159,7 @@ class Context:
     # -- Broadcast operations -----------------------------------------------
 
     async def broadcast_subscribe(
-        self, subscriber_did: str, scp: _scp_core.SCP | None = None
+        self, subscriber_did: str
     ) -> None:
         """Subscribe a DID to this broadcast context.
 
@@ -1172,7 +1173,7 @@ class Context:
             ContextError: If the context is not active or not broadcast.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1186,7 +1187,6 @@ class Context:
         subscriber_did: str,
         *,
         rotate_keys: bool = False,
-        scp: _scp_core.SCP | None = None,
     ) -> None:
         """Unsubscribe a DID from this broadcast context.
 
@@ -1199,7 +1199,7 @@ class Context:
             ContextError: If the context is not active or not broadcast.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1214,7 +1214,6 @@ class Context:
         self,
         payload: bytes,
         identity: Identity | None = None,
-        scp: _scp_core.SCP | None = None,
     ) -> None:
         """Publish a message to this broadcast context.
 
@@ -1229,7 +1228,7 @@ class Context:
             ContextError: If the context is not active or not broadcast.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1244,7 +1243,6 @@ class Context:
         asset: AssetEntry,
         identity: Identity | None = None,
         deploy_id: str | None = None,
-        scp: _scp_core.SCP | None = None,
     ) -> PublishResult:
         """Publish a single asset to this broadcast context (SCP-290).
 
@@ -1271,7 +1269,7 @@ class Context:
             validate_deploy_id(deploy_id)
 
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1299,7 +1297,6 @@ class Context:
         assets: list[AssetEntry],
         identity: Identity | None = None,
         deploy_id: str | None = None,
-        scp: _scp_core.SCP | None = None,
     ) -> BatchPublishResult:
         """Publish multiple assets to this broadcast context (SCP-290, SCP-292).
 
@@ -1327,7 +1324,7 @@ class Context:
             validate_deploy_id(deploy_id)
 
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1359,7 +1356,6 @@ class Context:
         self,
         subscriber_did: str,
         blocker_did: str | None = None,
-        scp: _scp_core.SCP | None = None,
     ) -> None:
         """Block a subscriber's read access in this broadcast context.
 
@@ -1372,7 +1368,7 @@ class Context:
             ContextError: If the operation fails.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1388,7 +1384,6 @@ class Context:
         self,
         subscriber_did: str,
         unblocker_did: str | None = None,
-        scp: _scp_core.SCP | None = None,
     ) -> None:
         """Unblock a previously blocked subscriber in this broadcast context.
 
@@ -1405,7 +1400,7 @@ class Context:
             ContextError: If the operation fails.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1424,7 +1419,6 @@ class Context:
         self,
         author_did: str,
         requester_did: str,
-        scp: _scp_core.SCP | None = None,
     ) -> str:
         """Handle a broadcast key request from a subscriber.
 
@@ -1439,7 +1433,7 @@ class Context:
             ContextError: If the operation fails.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1453,7 +1447,7 @@ class Context:
             requester_did,
         )
 
-    async def broadcast_subscriber_count(self, scp: _scp_core.SCP | None = None) -> int | None:
+    async def broadcast_subscriber_count(self) -> int | None:
         """Return the number of broadcast subscribers for this context.
 
         Returns:
@@ -1464,7 +1458,7 @@ class Context:
             ContextError: If the bridge is unavailable.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1474,7 +1468,7 @@ class Context:
         result = await asyncio.to_thread(instance.broadcast_subscriber_count, self._handle)
         return int(result) if result is not None else None
 
-    async def broadcast_is_subscriber(self, did: str, scp: _scp_core.SCP | None = None) -> bool:
+    async def broadcast_is_subscriber(self, did: str) -> bool:
         """Check whether a DID is a broadcast subscriber.
 
         Args:
@@ -1487,7 +1481,7 @@ class Context:
             ContextError: If the bridge is unavailable.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1496,7 +1490,7 @@ class Context:
 
         return await asyncio.to_thread(instance.broadcast_is_subscriber, self._handle, did)
 
-    async def broadcast_admission(self, scp: _scp_core.SCP | None = None) -> str | None:
+    async def broadcast_admission(self) -> str | None:
         """Return the broadcast admission policy for this context.
 
         Returns:
@@ -1507,7 +1501,7 @@ class Context:
             ContextError: If the bridge is unavailable.
         """
         try:
-            instance = _resolve_bridge(scp)
+            instance = _resolve_bridge(self._scp)
         except ImportError as exc:
             raise ContextError(
                 "failed to import _scp_core -- is the Rust extension built?",
@@ -1548,7 +1542,7 @@ class Context:
         try:
             if self.state == "active":
                 try:
-                    instance = _resolve_bridge(None)
+                    instance = _resolve_bridge(self._scp)
                     await asyncio.to_thread(instance.context_leave, self._handle, self._creator_did)
                 except Exception:
                     logger.debug(
@@ -1571,7 +1565,7 @@ class Context:
         Errors during destruction are logged but never raised.
         """
         try:
-            instance = _resolve_bridge(None)
+            instance = _resolve_bridge(self._scp)
             # The `context_destroy_local` method is only present when the
             # bridge exposes an explicit local-state teardown surface;
             # older native builds treat leave/close as the only teardown.
@@ -1615,7 +1609,7 @@ class Context:
 
             if state == "active":
                 try:
-                    instance = _resolve_bridge(None)
+                    instance = _resolve_bridge(self._scp)
                     instance.context_close(handle, creator_did)
                 except Exception:
                     # Best-effort: context may already be closed, or
@@ -1690,6 +1684,7 @@ def validate_capability_declaration(
 
 
 def evaluate_invitation(
+    scp: SCP,
     params_json: str,
     inviter_did: str,
     identity_did: str,
@@ -1697,7 +1692,6 @@ def evaluate_invitation(
     policy_json: str | None = None,
     spending_json: str | None = None,
     trusted_dids: list[str] | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> str:
     """Evaluate a context invitation through the sequential pipeline.
 

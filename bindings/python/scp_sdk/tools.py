@@ -21,13 +21,11 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
 from scp_sdk.errors import BRIDGE_ERROR_MAP, ContextError, ValidationError
 
 if TYPE_CHECKING:
-    import _scp_core
-
     from scp_sdk.identity import Identity
+    from scp_sdk.scp import SCP
 
 try:
     import _scp_core  # type: ignore[import-not-found]
@@ -35,19 +33,19 @@ except ImportError:
     _scp_core = None  # type: ignore[assignment]
 
 
-def _resolve_bridge(scp: _scp_core.SCP | None = None) -> Any:
+def _resolve_bridge(scp: SCP) -> Any:
     """Return the effective bridge object for tool operations.
 
     Tests patch ``scp_sdk.tools._scp_core`` with a ``MagicMock`` whose
     ``tool_*`` attributes stand in for the live bridge. In production
     those attributes do not exist on the real ``_scp_core`` module
     (Phase 4 PR 4 consolidated them onto :class:`SCP`), so we fall
-    through to :func:`resolve_scp` and dispatch on the SCP instance.
+    through to ``scp._native`` and dispatch on the SCP instance.
     """
     mod = _scp_core
     if mod is not None and hasattr(mod, "_mock_name"):
         return mod
-    return resolve_scp(scp)
+    return scp._native
 
 
 def _translate_bridge_error(exc: Exception) -> Exception:
@@ -151,8 +149,8 @@ class ToolDefinition:
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
 async def invoke_cross_context(
+    scp: SCP,
     source_context_id: str,
     target_context_id: str,
     tool_id: str,
@@ -161,7 +159,6 @@ async def invoke_cross_context(
     ucan_token: str,
     chain_depth: int = 0,
     proof_tokens: list[str] | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Invoke a tool across context boundaries.
 
@@ -237,13 +234,12 @@ async def invoke_cross_context(
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
 async def session_create(
+    scp: SCP,
     context_id: str,
     tool_id: str,
     source_context_id: str,
     ttl_seconds: int | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> str:
     """Create a stateful tool session.
 
@@ -298,15 +294,14 @@ async def session_create(
         raise _translate_bridge_error(exc) from exc
 
 
-@deprecated_default_instance
 async def session_invoke(
+    scp: SCP,
     context_id: str,
     session_id: str,
     input: dict[str, Any],
     invoker_did: str,
     ucan_token: str,
     proof_tokens: list[str] | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Invoke a tool within an active session.
 
@@ -361,8 +356,7 @@ async def session_invoke(
     return result
 
 
-@deprecated_default_instance
-async def session_close(context_id: str, session_id: str, scp: _scp_core.SCP | None = None) -> None:
+async def session_close(scp: SCP, context_id: str, session_id: str) -> None:
     """Close a stateful tool session.
 
     Removes the session from the store, releasing the caller's session
@@ -400,13 +394,12 @@ async def session_close(context_id: str, session_id: str, scp: _scp_core.SCP | N
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
 async def interface_expose(
+    scp: SCP,
     context_id: str,
     tool_id: str,
     target_context_id: str,
     rate_limit_json: str | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Expose a tool interface for cross-context sharing (step 1).
 
@@ -454,11 +447,10 @@ async def interface_expose(
     return json.loads(result_json)
 
 
-@deprecated_default_instance
 async def interface_accept(
+    scp: SCP,
     context_id: str,
     interface_json: str,
-    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Accept a cross-context tool interface (step 4).
 
@@ -501,11 +493,10 @@ async def interface_accept(
     return json.loads(result_json)
 
 
-@deprecated_default_instance
 async def interface_revoke(
+    scp: SCP,
     context_id: str,
     interface_id_hex: str,
-    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Revoke a cross-context tool interface (step 5).
 
