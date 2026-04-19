@@ -93,6 +93,16 @@ tasks.withType<io.gitlab.arturbosch.detekt.Detekt>().configureEach {
     exclude("**/internal/uniffi/**")
 }
 
+// ktlint also needs to skip the generated bindings — it fails to parse
+// UniFFI's output (single-file, ≥3000 lines of trampolines, Long alias
+// declarations etc.). Same CI / local divergence as detekt: CI doesn't
+// generate before lint, so we only hit this locally.
+ktlint {
+    filter {
+        exclude { element -> element.file.path.contains("/internal/uniffi/") }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UniFFI Kotlin binding generation
 //
