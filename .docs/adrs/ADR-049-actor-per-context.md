@@ -147,7 +147,7 @@ Rejected; MLS ops and HPKE ops are independent primitives. Tests may mock one wi
 - **50ms coalesced-persistence rollback window on actor crash.** Not a security regression (all authorization-downward operations are sync-persisted), but a behavioral change for participation counters, velocity trackers, and non-critical state. Documented in release notes.
 - **`async_trait` heap allocation per trait method call.** Negligible vs MLS crypto operation cost.
 - **Per-identity state scattered.** Reader-side discipline required for `Arc<WrappingKeyPair>` (load → use → drop within same poll), enforced by CI.
-- **Saga `NeedsRepair` requires operator action.** Runbook `.docs/runbooks/saga-needs-repair.md` documents detection (`saga_repair_needed` metric), inspection, and `repair_saga(saga_id)` admin command.
+- **Saga `NeedsRepair` requires operator action.** Detection (`saga_repair_needed` metric), inspection, and `repair_saga(saga_id)` admin command are documented in a runbook that ships with the implementation commits (per the plan's doc-deliverables list), at `.docs/runbooks/saga-needs-repair.md`.
 - **Pre-existing dev-database snapshots do not load.** The schema-version check fails with `ContextError::UnsupportedSnapshotVersion`. No migration code; pre-1.0 has no deployed state to preserve.
 - **Test mocks rewritten.** The ~20 existing `impl ContextCryptoProvider` mocks migrate to `MlsBackend` (~10 methods) and/or `HpkeBackend` (~3 methods) — net smaller mock surface per test, more mocks overall because most tests touch both.
 - **~13 internal commits.** Large single atomic PR; expected 6–12 full-roster review rounds to double-zero.
