@@ -372,6 +372,26 @@ pub struct CoreFields {
     /// `cancel.cancelled()` alongside their usual work.
     cancel: CancellationToken,
 
+    /// Cancellation signal scoped to the **current reconnect generation**
+    /// — fired on [`suspend`] and [`shutdown`] so any in-flight
+    /// [`reconnect_transport_if_pending`] dial can drop its
+    /// half-connected socket instead of completing against a torn-down
+    /// instance (#1696).
+    ///
+    /// Rotated (old one cancelled, fresh one installed) on each
+    /// `suspend()`. [`reconnect_transport_if_pending`] clones the token
+    /// once at entry and races each `NativeRelayAdapter::connect_sourced`
+    /// against `token.cancelled()`. If suspend fires mid-dial, the
+    /// `.await` resolves with the cancellation branch and the pending
+    /// adapter future is dropped — the TCP/TLS socket teardown happens
+    /// inside the adapter's own state machine rather than leaking out as
+    /// an unowned `NativeRelayAdapter`.
+    ///
+    /// Wrapped in `Mutex` (not `RwLock`) because writes dominate the
+    /// access pattern during `suspend()` and reads are cheap (a
+    /// single `clone()` at the top of `reconnect_transport_if_pending`).
+    reconnect_cancel: Mutex<CancellationToken>,
+
     /// In-flight async tasks owned by this instance. Accessed from async
     /// contexts, so wrapped in [`tokio::sync::Mutex`] rather than
     /// [`std::sync::Mutex`] (guards cross `.await` points during shutdown
@@ -443,6 +463,7 @@ impl CoreFields {
             relay_urls: Mutex::new(HashSet::new()),
             instance_id: next_instance_id(),
             cancel: CancellationToken::new(),
+            reconnect_cancel: Mutex::new(CancellationToken::new()),
             tasks: AsyncMutex::new(JoinSet::new()),
             petname_maps: Mutex::new(HashMap::new()),
             handle_registries: Mutex::new(HashMap::new()),
@@ -521,6 +542,7 @@ impl CoreFields {
             relay_urls: Mutex::new(HashSet::new()),
             instance_id: next_instance_id(),
             cancel: CancellationToken::new(),
+            reconnect_cancel: Mutex::new(CancellationToken::new()),
             tasks: AsyncMutex::new(JoinSet::new()),
             petname_maps: Mutex::new(HashMap::new()),
             handle_registries: Mutex::new(HashMap::new()),
@@ -813,6 +835,13 @@ impl CoreFields {
         // Set flag FIRST to prevent new operations from starting between
         // flag check and transport teardown.
         self.suspended.store(true, Ordering::SeqCst);
+        // #1696: cancel the current reconnect-generation token so any
+        // in-flight `reconnect_transport_if_pending` dial wakes on the
+        // cancellation branch and drops its half-connected adapter
+        // instead of completing against a torn-down instance. Rotate to
+        // a fresh token so a later `resume()` gets a clean cancellation
+        // scope rather than inheriting the already-cancelled one.
+        self.rotate_reconnect_cancel();
         // Flush all context snapshots before disconnecting transport.
         // Best-effort: errors are logged inside flush_all_contexts_sync and do
         // not prevent suspension from completing. Skipped if the
@@ -829,6 +858,40 @@ impl CoreFields {
         }
         tracing::debug!("bridge instance suspended");
         Ok(())
+    }
+
+    /// Cancels the current reconnect-generation token and installs a
+    /// fresh one in its place (#1696).
+    ///
+    /// Lock is held only briefly — the cancellation itself is
+    /// non-blocking (`CancellationToken::cancel()` is a relaxed
+    /// `AtomicUsize` flip plus waker notification) and `take` +
+    /// assignment are cheap.
+    fn rotate_reconnect_cancel(&self) {
+        let Ok(mut guard) = self.reconnect_cancel.lock() else {
+            // Poisoned mutex — the previous holder panicked. Log and
+            // move on; the stale token will still be cancelled (we can
+            // still signal cancellation through a poisoned lock via
+            // `PoisonError::into_inner`), but rotation is best-effort.
+            tracing::warn!(
+                "reconnect_cancel mutex poisoned — the stale token will remain; \
+                 a subsequent resume() will fire against it"
+            );
+            return;
+        };
+        let old = std::mem::replace(&mut *guard, CancellationToken::new());
+        old.cancel();
+    }
+
+    /// Returns a clone of the current reconnect-generation cancellation
+    /// token (#1696). Callers select on this alongside their dial future
+    /// so `suspend()` / `shutdown()` can drop half-connected sockets.
+    #[must_use]
+    pub fn reconnect_cancel_token(&self) -> CancellationToken {
+        self.reconnect_cancel.lock().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |guard| guard.clone(),
+        )
     }
 
     /// Resumes a suspended bridge instance.
@@ -899,6 +962,13 @@ impl CoreFields {
         // are not drained here — the sync variant cannot await. Callers
         // that need a bounded wait use `shutdown_core_async`.
         self.cancel.cancel();
+        // #1696: also cancel any in-flight reconnect dial so its socket
+        // teardown fires before the instance is considered dropped.
+        // Rotation is unnecessary during shutdown (no resume will
+        // follow), so a plain cancel is enough.
+        if let Ok(guard) = self.reconnect_cancel.lock() {
+            guard.cancel();
+        }
         self.blocking_run_shutdown_side_effects();
     }
 
@@ -1094,6 +1164,14 @@ impl CoreFields {
         if urls.is_empty() {
             return Ok(());
         }
+        // #1696: snapshot the current reconnect-generation cancellation
+        // token once, at entry, and race every dial against it. If
+        // `suspend()` fires mid-dial, `token.cancelled()` wakes and we
+        // abort the whole reconnect — any in-flight
+        // `NativeRelayAdapter::connect_sourced` future is dropped, so
+        // its socket teardown happens before we return instead of
+        // leaking an unowned adapter.
+        let cancel = self.reconnect_cancel_token();
         let profile = scp_transport::profile::TransportProfile::platform_default();
         // Build ONE TransportManager and register every successful adapter
         // in it. `TransportManager::new(adapter)` creates a manager with a
@@ -1108,33 +1186,73 @@ impl CoreFields {
                 url: url.clone(),
                 source: scp_transport::relay::connection::RelayUrlSource::Explicit,
             };
-            let adapter = match scp_transport::native::adapter::NativeRelayAdapter::connect_sourced(
+            let dial = scp_transport::native::adapter::NativeRelayAdapter::connect_sourced(
                 &sourced,
                 Some(&profile),
-            )
-            .await
-            {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::warn!(
+            );
+            let adapter = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    // #1696: a concurrent `suspend()` / `shutdown()`
+                    // cancelled the reconnect generation. Drop the dial
+                    // future before it completes — any partially-built
+                    // socket is torn down inside the adapter's own
+                    // Drop / cancel path instead of ending up as an
+                    // unowned `NativeRelayAdapter`.
+                    tracing::debug!(
                         url = %url,
-                        error = %e,
-                        "reconnect_transport_if_pending: relay reconnect failed — leaving URL in pending set for retry"
+                        "reconnect_transport_if_pending: cancelled mid-dial — dropping future"
                     );
-                    if first_failure.is_none() {
-                        first_failure = Some(LifecycleError::ReconnectFailed {
-                            url: url.clone(),
-                            reason: e.to_string(),
-                        });
-                    }
-                    continue;
+                    return Err(LifecycleError::ReconnectFailed {
+                        url: url.clone(),
+                        reason: "reconnect cancelled by suspend/shutdown".to_owned(),
+                    });
                 }
+                result = dial => match result {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::warn!(
+                            url = %url,
+                            error = %e,
+                            "reconnect_transport_if_pending: relay reconnect failed — leaving URL in pending set for retry"
+                        );
+                        if first_failure.is_none() {
+                            first_failure = Some(LifecycleError::ReconnectFailed {
+                                url: url.clone(),
+                                reason: e.to_string(),
+                            });
+                        }
+                        continue;
+                    }
+                },
             };
             // `add_adapter` may return an `EvictionOutcome` if we hit the
             // connection budget; we don't surface it here because the
             // caller's reconnect intent is best-effort multi-relay.
             let _eviction = manager.add_adapter(Box::new(adapter));
             connected_count += 1;
+        }
+        // #1696: one more cancellation check between the dial loop and
+        // `set_transport`. If suspend fired *after* the last successful
+        // dial but *before* we install the manager, installing it now
+        // would immediately fail the suspended-state guard — but more
+        // importantly, the adapters we just connected belong to a
+        // cancelled generation and should be dropped rather than
+        // installed.
+        if cancel.is_cancelled() {
+            tracing::debug!(
+                "reconnect_transport_if_pending: cancelled before set_transport — dropping {connected_count} connected adapter(s)"
+            );
+            // `manager` (and its adapters) are dropped at the end of
+            // this block. Each adapter's Drop fires `cover_traffic_cancel`
+            // and `heartbeat_cancel`, and the relay client's background
+            // tasks exit — so the socket closes cleanly rather than
+            // leaking.
+            drop(manager);
+            return Err(LifecycleError::ReconnectFailed {
+                url: String::new(),
+                reason: "reconnect cancelled by suspend/shutdown".to_owned(),
+            });
         }
         // Only install the manager if at least one adapter is registered —
         // installing an empty manager would make later relay operations fail
@@ -1642,6 +1760,12 @@ impl CoreFields {
 
         // Signal cooperating tasks to exit. Cheap and idempotent.
         self.cancel.cancel();
+        // #1696: cancel any in-flight reconnect dial so its socket
+        // teardown fires before shutdown completes. Matches the sync
+        // `shutdown()` path.
+        if let Ok(guard) = self.reconnect_cancel.lock() {
+            guard.cancel();
+        }
 
         let start = std::time::Instant::now();
         let outcome = drain_under_deadline(&self.tasks, timeout, start).await;
@@ -3249,6 +3373,121 @@ mod tests {
         assert!(
             matches!(result, Err(LifecycleError::AlreadyShutDown)),
             "shutdown must short-circuit with AlreadyShutDown, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn suspend_cancels_in_flight_reconnect_dial() {
+        // #1696 regression: a `suspend()` firing while
+        // `reconnect_transport_if_pending` is mid-dial must cancel the
+        // reconnect so the half-connected adapter is dropped before
+        // `NativeRelayAdapter` construction completes — preventing the
+        // socket leak that motivated #1696. We can't directly observe
+        // an OS-level socket handle in a unit test, but we can prove
+        // the cancellation path fires and aborts the loop: the dial
+        // target is unreachable so the future is "in-flight" until
+        // connect timeout, giving us a window to cancel.
+        use std::time::Duration;
+
+        let instance =
+            std::sync::Arc::new(CoreFields::with_context_manager(test_context_manager()));
+        // Reserved TEST-NET-1 address (RFC 5737) with a closed port —
+        // `connect_sourced` stalls until the profile's handshake timeout.
+        let unreachable = "ws://192.0.2.1:1/".to_owned();
+        instance.add_relay_url(unreachable.clone());
+
+        let instance_clone = std::sync::Arc::clone(&instance);
+        let reconnect_handle =
+            tokio::spawn(async move { instance_clone.reconnect_transport_if_pending().await });
+
+        // Give the reconnect a moment to enter the dial. Spawn order
+        // does not guarantee the future has polled through `.await`
+        // yet, so sleep a short tick before firing suspend.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Fire suspend — rotates the reconnect-cancel token and
+        // cancels the in-flight dial.
+        instance.suspend().unwrap();
+
+        // The reconnect must wake on cancellation promptly — with a
+        // generous upper bound to tolerate slow CI runners. The
+        // production handshake timeout would be on the order of
+        // seconds, so anything inside ~1s proves the cancellation
+        // actually fired rather than the dial naturally timing out.
+        let reconnect_result = tokio::time::timeout(Duration::from_secs(2), reconnect_handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            matches!(
+                reconnect_result,
+                Err(LifecycleError::ReconnectFailed { .. })
+            ),
+            "cancelled reconnect must surface as ReconnectFailed, got {reconnect_result:?}"
+        );
+        assert!(
+            !instance.has_transport(),
+            "suspend must leave transport cleared after the cancelled reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_in_flight_reconnect_dial() {
+        // #1696: `shutdown()` must also cancel a pending reconnect.
+        // Same dynamics as the suspend variant — uses the same TEST-NET-1
+        // unreachable target to keep the dial in-flight.
+        use std::time::Duration;
+
+        let instance =
+            std::sync::Arc::new(CoreFields::with_context_manager(test_context_manager()));
+        let unreachable = "ws://192.0.2.1:1/".to_owned();
+        instance.add_relay_url(unreachable);
+
+        let instance_clone = std::sync::Arc::clone(&instance);
+        let reconnect_handle =
+            tokio::spawn(async move { instance_clone.reconnect_transport_if_pending().await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        instance.shutdown();
+
+        let reconnect_result = tokio::time::timeout(Duration::from_secs(2), reconnect_handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            matches!(
+                reconnect_result,
+                Err(LifecycleError::ReconnectFailed { .. })
+            ),
+            "cancelled reconnect must surface as ReconnectFailed, got {reconnect_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn suspend_rotates_reconnect_cancel_token() {
+        // #1696: the reconnect-cancel token must be rotated on every
+        // suspend so subsequent resume cycles get a fresh cancellation
+        // scope rather than inheriting an already-cancelled one. Without
+        // rotation, every reconnect after the first suspend would short-
+        // circuit on the cancellation branch.
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        let token_before = instance.reconnect_cancel_token();
+        assert!(!token_before.is_cancelled());
+
+        instance.suspend().unwrap();
+
+        // Old token must be cancelled — any in-flight reconnect sees it.
+        assert!(
+            token_before.is_cancelled(),
+            "suspend must cancel the previous reconnect token"
+        );
+        // New token must be fresh — future reconnects aren't pre-cancelled.
+        let token_after = instance.reconnect_cancel_token();
+        assert!(
+            !token_after.is_cancelled(),
+            "suspend must install a fresh reconnect-cancel token"
         );
     }
 

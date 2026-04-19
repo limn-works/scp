@@ -1842,7 +1842,13 @@ export function createNativeBridge(scp?: SCP): Bridge {
     },
 
     async shutdown(timeoutMillis: number): Promise<void> {
-      await (native.shutdown as (t: number) => Promise<void>)(timeoutMillis);
+      // #1692: NAPI `shutdown(timeoutMillis: u64)` — napi-rs exposes `u64`
+      // as JS `BigInt` on the wire, so the `number` at this layer is
+      // coerced to `bigint` before hitting the native binding. The SDK
+      // public surface (`BridgeApi.shutdown`, `SCP.shutdown`) keeps
+      // `number` so the WASM / mock paths stay uniform.
+      const millis = BigInt(Math.max(0, Math.trunc(timeoutMillis)));
+      await (native.shutdown as (t: bigint) => Promise<void>)(millis);
     },
 
     suspend(): void {

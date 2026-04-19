@@ -116,7 +116,10 @@ if (bridge === null || serverAddon === null) {
     // unification — 1000 ms (1 second) gives pending tasks time to
     // drain without stalling the suite. `napi.shutdown` is now async
     // (returns `Promise<void>`); previously sync — fire-and-forget
-    // would clear bridge state mid-test in later tests.
+    // would clear bridge state mid-test in later tests. The `napi`
+    // handle is the `BridgeApi` wrapper — it keeps a `number`-valued
+    // `shutdown(ms)` signature through the #1692 NAPI `u64` widening;
+    // the wrapper converts to `BigInt` internally before crossing FFI.
     await napi.shutdown(1000);
     if (relayHandle && !relayHandle.isShutdown) {
       relayHandle.shutdown();

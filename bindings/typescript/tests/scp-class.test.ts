@@ -189,12 +189,14 @@ describe.skipIf(!addon)(`SCP class (Phase 4 PR 1) [${skipReason}]`, () => {
 // SDK-wrapper shutdown clamp — pure-function regression tests
 // ---------------------------------------------------------------------------
 //
-// These tests exercise the float-seconds → u32-millis clamp on the SDK
+// These tests exercise the float-seconds → millis clamp on the SDK
 // wrapper's `shutdown(timeoutSecs)` via the internal
 // `__clampShutdownMillisForTests` helper. Pure logic, no native addon
-// required — runs on every platform.
-describe("SCP.shutdown timeout clamp (round 5 RED-2001)", () => {
-  const MAX_MILLIS = 0xffffffff;
+// required — runs on every platform. The clamp ceiling widened from
+// `u32::MAX` to `Number.MAX_SAFE_INTEGER` when the NAPI bridge moved to
+// `u64` (#1692).
+describe("SCP.shutdown timeout clamp (round 5 RED-2001, #1692)", () => {
+  const MAX_MILLIS = Number.MAX_SAFE_INTEGER;
 
   test("shutdown accepts Infinity as wait-forever", () => {
     // Regression for round 5 RED-2001: the previous clamp ordering
@@ -220,9 +222,11 @@ describe("SCP.shutdown timeout clamp (round 5 RED-2001)", () => {
     expect(__clampShutdownMillisForTests(0)).toBe(0);
   });
 
-  test("u32-overflowing values clamp to MAX_MILLIS", () => {
-    // 1e12 s * 1000 = 1e15 ms, far beyond u32::MAX (~4.29e9).
-    expect(__clampShutdownMillisForTests(1e12)).toBe(MAX_MILLIS);
+  test("MAX_SAFE_INTEGER-overflowing values clamp to MAX_MILLIS (#1692)", () => {
+    // 1e20 s * 1000 = 1e23 ms, far beyond MAX_SAFE_INTEGER (~9.007e15).
+    // Previously clamped at u32::MAX; after the NAPI u64 widening the
+    // ceiling is the JS `number` safe-integer boundary.
+    expect(__clampShutdownMillisForTests(1e20)).toBe(MAX_MILLIS);
   });
 
   test("finite fractional seconds round to nearest ms", () => {

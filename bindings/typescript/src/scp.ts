@@ -87,7 +87,13 @@ interface NativeScpInstance {
    * (#1678).
    */
   resume(): Promise<void>;
-  shutdown(timeoutMillis: number): Promise<void>;
+  /**
+   * #1692: NAPI `shutdown(timeoutMillis: u64)` — `u64` maps to JS
+   * `BigInt` on the napi-rs wire, so the native method accepts a
+   * `bigint`. The SDK public wrapper (`SCP.shutdown`) keeps a
+   * `number`-valued seconds budget and converts at the boundary.
+   */
+  shutdown(timeoutMillis: bigint): Promise<void>;
 }
 
 /**
@@ -211,16 +217,27 @@ function nativeScp(): NativeScpCtor {
 // ---------------------------------------------------------------------------
 
 /**
- * Clamps a float-seconds timeout into a `u32`-millisecond count suitable
- * for the NAPI `shutdown(timeoutMillis)` boundary. Exposed as an
- * internal export so the regression tests around `Infinity` /`NaN`
- * handling can exercise the clamp without needing a live native addon.
+ * Clamps a float-seconds timeout into a millisecond count suitable for
+ * the NAPI `shutdown(timeoutMillis)` boundary. Exposed as an internal
+ * export so the regression tests around `Infinity` / `NaN` handling
+ * can exercise the clamp without needing a live native addon.
+ *
+ * The ceiling is pinned to `Number.MAX_SAFE_INTEGER` (2^53 − 1 ms, ≈ 285
+ * million years) rather than the full `u64::MAX` — the public SDK API
+ * still takes a JS `number`, so anything above `MAX_SAFE_INTEGER` cannot
+ * be represented losslessly anyway. The NAPI bridge itself is `u64`
+ * (#1692), so wider values are technically supported on the wire; any
+ * caller that needs billion-year timeouts can hit the NAPI binding
+ * directly with a `bigint` literal.
  *
  * @internal
  */
 export function __clampShutdownMillisForTests(timeoutSecs: number): number {
-  // u32::MAX ms — matches the Rust-side NAPI bridge type.
-  const MAX_MILLIS = 0xffffffff;
+  // Largest millisecond count representable losslessly as a JS `number`.
+  // The NAPI binding accepts the full `u64` range via `BigInt`, but the
+  // SDK seconds-valued input is a `number`, so `MAX_SAFE_INTEGER` is
+  // the safe upper bound for this helper.
+  const MAX_MILLIS = Number.MAX_SAFE_INTEGER;
   // Order matters: +Infinity must be caught BEFORE !isFinite, otherwise
   // Infinity collapses to the NaN/negative abort branch (Number.isFinite
   // is false for both Infinity and NaN).
@@ -469,7 +486,11 @@ export class SCP {
    */
   async shutdown(timeoutSecs: number = 5): Promise<void> {
     const millis = __clampShutdownMillisForTests(timeoutSecs);
-    await this.#native.shutdown(millis);
+    // #1692: NAPI widened `timeoutMillis` to `u64`, exposed as JS
+    // `BigInt` on the wire. The clamp above already produces an integer
+    // number of millis inside `u64` range — coerce to `bigint` for the
+    // FFI call.
+    await this.#native.shutdown(BigInt(millis));
   }
 
   /**

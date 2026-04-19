@@ -257,33 +257,35 @@ pub fn scp_version() -> String {
 /// (`NapiIdentity`, `NapiContextHandle`, `NapiUcanToken`,
 /// `NapiTransportManager`, …) to be released.
 ///
-/// The unit is **milliseconds** — unified across all Rust bridges so the
-/// Python, TypeScript, Swift, and Kotlin SDKs can share a single
-/// conversion surface (`timeout_secs: number` in the SDK wrapper is
-/// multiplied by 1000 before crossing FFI). The NAPI `u32` millis range
-/// is 2^32 ms ≈ 49.7 days, which is far beyond any realistic shutdown
-/// budget.
+/// The unit is **milliseconds** and the width is `u64` — unified across
+/// all Rust bridges (NAPI, `UniFFI`, `PyO3`) per #1692 so the Python,
+/// TypeScript, Swift, and Kotlin SDKs can share a single conversion
+/// surface (`timeout_secs: number` in the SDK wrapper is multiplied by
+/// 1000 before crossing FFI). NAPI exposes `u64` as JS `BigInt`, so
+/// TypeScript callers must pass a `bigint` (`scpShutdown(5000n)`).
 ///
-/// Returns a `Promise<void>` — call `await scpShutdown(5000)` from JS.
-/// Pass `0` to skip both graceful drain and handle-release polling.
+/// Returns a `Promise<void>` — call `await scpShutdown(5000n)` from JS.
+/// Pass `0n` to skip both graceful drain and handle-release polling.
 ///
 /// **Breaking change (Phase 4 PR 1 / AC5)**: the signature moved from
 /// sync `void` to async `Promise<void>`, and the unit changed from
-/// **seconds** (`u32`) to **milliseconds** (`u32`) to unify the Rust
-/// bridge signatures. Callers migrating away from the free-function
-/// façade should switch to `scp.shutdown(5000)` on an owned `SCP`
-/// instance.
+/// **seconds** (`u32`) to **milliseconds**. Width later widened to `u64`
+/// (#1692) for cross-bridge parity; a NAPI source-compat break was
+/// accepted because all existing callsites fit easily in `u32`.
+/// Callers migrating away from the free-function façade should switch
+/// to `scp.shutdown(5000n)` on an owned `SCP` instance.
 ///
 /// # JS usage
 ///
 /// ```js
 /// process.on('beforeExit', async () => {
-///   await scpShutdown(5_000); // wait up to 5 seconds (5,000 ms)
+///   await scpShutdown(5_000n); // wait up to 5 seconds (5,000 ms)
 /// });
 /// ```
 #[napi]
-pub async fn scp_shutdown(timeout_millis: u32) -> napi::Result<()> {
-    let timeout = Duration::from_millis(u64::from(timeout_millis));
+pub async fn scp_shutdown(timeout_millis: napi::bindgen_prelude::BigInt) -> napi::Result<()> {
+    let (_sign, timeout_millis, _lossless) = timeout_millis.get_u64();
+    let timeout = Duration::from_millis(timeout_millis);
 
     // In test builds we intentionally skip shutting down the default
     // bridge instance — the `OnceLock` is process-global and one shutdown
@@ -418,7 +420,14 @@ mod tests {
     #[tokio::test]
     async fn scp_shutdown_zero_timeout_returns_immediately() {
         // Must return without hanging even if handles are live.
-        scp_shutdown(0).await.expect("scp_shutdown(0) must succeed");
+        // #1692: `scp_shutdown` takes `napi::bindgen_prelude::BigInt`
+        // (u64 on the wire). Construct a zero-valued BigInt directly.
+        scp_shutdown(napi::bindgen_prelude::BigInt {
+            sign_bit: false,
+            words: vec![0],
+        })
+        .await
+        .expect("scp_shutdown(0) must succeed");
     }
 
     #[test]
@@ -542,9 +551,16 @@ mod tests {
         // mirroring `scp_shutdown_zero_timeout_returns_immediately` but
         // against an isolated `NapiBridgeInstance`. The default instance
         // is untouched.
+        //
+        // #1692: `Scp::shutdown` takes `napi::bindgen_prelude::BigInt`
+        // (u64 on the wire). Build a zero-valued BigInt directly for
+        // the test — in production callers pass a JS `bigint` literal.
         let scp = crate::scp::Scp::new().expect("Scp::new must succeed");
-        scp.shutdown(0)
-            .await
-            .expect("Scp::shutdown(0) must succeed");
+        scp.shutdown(napi::bindgen_prelude::BigInt {
+            sign_bit: false,
+            words: vec![0],
+        })
+        .await
+        .expect("Scp::shutdown(0) must succeed");
     }
 }

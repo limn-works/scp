@@ -165,6 +165,9 @@ if (bridge === null || serverAddon === null) {
     // `napi.shutdown` is async and must be awaited; prior to #1549
     // Phase 4 it was synchronous, so a fire-and-forget call worked
     // by accident and would clear bridge state under concurrent tests.
+    // The `napi` handle here is the `BridgeApi` wrapper, which kept its
+    // `shutdown(ms: number)` signature through the #1692 NAPI `u64`
+    // widening — the wrapper coerces to `BigInt` before crossing FFI.
     await napi.shutdown(1000);
     if (relayHandle && !relayHandle.isShutdown) {
       relayHandle.shutdown();

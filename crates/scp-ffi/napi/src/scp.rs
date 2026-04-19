@@ -248,10 +248,21 @@ impl Scp {
     /// shutdown hooks. Permanent — a shut-down instance cannot be reused.
     ///
     /// The unit is **milliseconds** — unified across all Rust bridges.
-    /// 2^32 ms is ≈ 49.7 days, far beyond any realistic budget.
+    /// The width is `u64` so the NAPI / `UniFFI` / `PyO3` bridges share
+    /// a single canonical shutdown-timeout surface (#1692). NAPI
+    /// exposes `u64` as JS `BigInt` on the wire — TypeScript callers
+    /// must pass a `bigint` (`shutdown(5000n)`). Negative /
+    /// out-of-range values saturate at `u64::MAX` per `BigInt::get_u64`
+    /// semantics (last tuple element flags lossless conversion, which
+    /// we intentionally ignore — any bigint beyond `u64::MAX` is
+    /// clamped to "effectively unbounded").
     #[napi]
-    pub async fn shutdown(&self, timeout_millis: u32) -> napi::Result<()> {
-        let timeout = Duration::from_millis(u64::from(timeout_millis));
+    pub async fn shutdown(
+        &self,
+        timeout_millis: napi::bindgen_prelude::BigInt,
+    ) -> napi::Result<()> {
+        let (_sign, value, _lossless) = timeout_millis.get_u64();
+        let timeout = Duration::from_millis(value);
         match self.inner.shutdown(timeout).await {
             Ok(_) => Ok(()),
             // `AlreadyShutDown` is treated as a harmless lifecycle
