@@ -234,6 +234,13 @@ export { connectLocalTransport, Node, Relay } from "./server";
 export { scpResume, scpSuspend } from "./lifecycle";
 
 // ---------------------------------------------------------------------------
+// SCP multi-instance handle (ADR-048)
+// ---------------------------------------------------------------------------
+
+export type { ScpOptions, StorageConfig } from "./scp";
+export { SCP } from "./scp";
+
+// ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 

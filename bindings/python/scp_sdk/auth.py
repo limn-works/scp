@@ -24,6 +24,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from scp_sdk._deprecation import deprecated_default_instance
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -171,6 +173,7 @@ class ScpIdAuthentication:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 def scpid_challenge(audience: str, ttl_seconds: int = 300) -> ScpIdChallenge:
     """Generate an SCPID challenge for a relying party (section 3.11.8).
 
@@ -193,6 +196,7 @@ def scpid_challenge(audience: str, ttl_seconds: int = 300) -> ScpIdChallenge:
     return ScpIdChallenge.from_json(challenge_json)
 
 
+@deprecated_default_instance
 def scpid_sign(
     identity: Any,
     signing_key_id: str,
@@ -227,6 +231,7 @@ def scpid_sign(
     return ScpIdResponse.from_json(response_json)
 
 
+@deprecated_default_instance
 def scpid_verify(
     response: ScpIdResponse,
     challenge: ScpIdChallenge,

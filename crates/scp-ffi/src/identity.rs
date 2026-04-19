@@ -112,6 +112,10 @@ pub struct PyIdentity {
     custody: String,
     /// Whether this identity has an agent signing key (`#agent` VM).
     has_agent_key: bool,
+    /// Bridge instance affinity id (Phase 4 PR 1 — #1549). Consumed by
+    /// [`crate::pyscp_check_handle!`] at every `#[pyfunction]` entry that
+    /// accepts this handle.
+    pub(crate) instance_id: u64,
 }
 
 #[pymethods]
@@ -166,6 +170,25 @@ impl PyIdentity {
     }
 }
 
+impl PyIdentity {
+    /// Creates a new `PyIdentity` tagged with the default bridge instance's
+    /// `instance_id`. Phase 4 PR 1 (#1549): centralises affinity-id wiring
+    /// so every construction site picks up the same monotonic counter.
+    #[must_use]
+    pub fn new(did: String, custody: String, has_agent_key: bool) -> Self {
+        let instance_id = crate::runtime::bridge_instance_raw()
+            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
+                bi.core.instance_id()
+            });
+        Self {
+            did,
+            custody,
+            has_agent_key,
+            instance_id,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PyDIDDocument — opaque Python object for DID documents
 // ---------------------------------------------------------------------------
@@ -190,6 +213,12 @@ impl PyIdentity {
 pub struct PyDIDDocument {
     /// The underlying Rust DID document.
     inner: DidDocument,
+    /// Bridge instance affinity id (Phase 4 PR 1 — #1549).
+    ///
+    /// `dead_code` allowance: future commits of this PR will add
+    /// `check_handle` at every entry point that accepts this handle.
+    #[allow(dead_code)]
+    pub(crate) instance_id: u64,
 }
 
 #[pymethods]
@@ -288,6 +317,22 @@ impl PyDIDDocument {
 
     fn __str__(&self) -> &str {
         &self.inner.id
+    }
+}
+
+impl PyDIDDocument {
+    /// Creates a new `PyDIDDocument` tagged with the default bridge
+    /// instance's `instance_id`.
+    #[must_use]
+    pub fn new(document: DidDocument) -> Self {
+        let instance_id = crate::runtime::bridge_instance_raw()
+            .map_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID, |bi| {
+                bi.core.instance_id()
+            });
+        Self {
+            inner: document,
+            instance_id,
+        }
     }
 }
 
@@ -530,11 +575,7 @@ fn py_identity_create(py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
                 })?;
             }
 
-            Ok(PyIdentity {
-                did,
-                custody: custody_str,
-                has_agent_key: false,
-            })
+            Ok(PyIdentity::new(did, custody_str, false))
         })
     })
 }
@@ -602,11 +643,7 @@ fn py_identity_create_with_agent_key(py: Python<'_>, custody: &str) -> PyResult<
                 })?;
             }
 
-            Ok(PyIdentity {
-                did,
-                custody: custody_str,
-                has_agent_key: true,
-            })
+            Ok(PyIdentity::new(did, custody_str, true))
         })
     })
 }
@@ -699,11 +736,7 @@ fn py_identity_load(py: Python<'_>, did: &str) -> PyResult<PyIdentity> {
                     Ok(entry.document.has_agent_key())
                 })
                 .unwrap_or(false);
-                return Ok(PyIdentity {
-                    did: stored_did,
-                    custody: custody_str,
-                    has_agent_key: has_agent,
-                });
+                return Ok(PyIdentity::new(stored_did, custody_str, has_agent));
             }
 
             Err(PyErr::from(ScpPyError::identity(format!(
@@ -748,7 +781,7 @@ fn py_identity_resolve(py: Python<'_>, did: &str) -> PyResult<PyDIDDocument> {
                 .await
                 .map_err(ScpPyError::from)?;
 
-            Ok(PyDIDDocument { inner: document })
+            Ok(PyDIDDocument::new(document))
         })
     })
 }
@@ -775,6 +808,7 @@ fn py_identity_resolve(py: Python<'_>, did: &str) -> PyResult<PyDIDDocument> {
 /// See ADR-003 acceptance criterion 4a and SCP-214 criterion 9.
 #[pyfunction]
 fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
+    crate::pyscp_check_handle!(identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -802,11 +836,7 @@ fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyI
             entry.identity = new_identity;
             entry.document = new_document;
 
-            Ok(PyIdentity {
-                did: did.clone(),
-                custody: custody_str.clone(),
-                has_agent_key: has_agent,
-            })
+            Ok(PyIdentity::new(did.clone(), custody_str.clone(), has_agent))
         })
     });
     result.map_err(PyErr::from)
@@ -837,6 +867,7 @@ fn py_identity_rotate_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyI
 /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
 #[pyfunction]
 fn py_identity_add_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
+    crate::pyscp_check_handle!(identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -863,11 +894,7 @@ fn py_identity_add_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<
             entry.identity = new_identity;
             entry.document = new_document;
 
-            Ok(PyIdentity {
-                did: did.clone(),
-                custody: custody_str.clone(),
-                has_agent_key: true,
-            })
+            Ok(PyIdentity::new(did.clone(), custody_str.clone(), true))
         })
     });
     result.map_err(PyErr::from)
@@ -898,6 +925,7 @@ fn py_identity_add_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<
 /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
 #[pyfunction]
 fn py_identity_rotate_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
+    crate::pyscp_check_handle!(identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -924,11 +952,7 @@ fn py_identity_rotate_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
             entry.identity = new_identity;
             entry.document = new_document;
 
-            Ok(PyIdentity {
-                did: did.clone(),
-                custody: custody_str.clone(),
-                has_agent_key: true,
-            })
+            Ok(PyIdentity::new(did.clone(), custody_str.clone(), true))
         })
     });
     result.map_err(PyErr::from)
@@ -958,6 +982,7 @@ fn py_identity_rotate_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
 /// See ADR-039 acceptance criterion 4 and SCP-AB-016.
 #[pyfunction]
 fn py_identity_remove_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
+    crate::pyscp_check_handle!(identity);
     let did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -984,11 +1009,7 @@ fn py_identity_remove_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
             entry.identity = new_identity;
             entry.document = new_document;
 
-            Ok(PyIdentity {
-                did: did.clone(),
-                custody: custody_str.clone(),
-                has_agent_key: false,
-            })
+            Ok(PyIdentity::new(did.clone(), custody_str.clone(), false))
         })
     });
     result.map_err(PyErr::from)
@@ -1017,6 +1038,7 @@ fn py_identity_remove_agent_key(py: Python<'_>, identity: &PyIdentity) -> PyResu
 /// See ADR-003 acceptance criterion 4b and SCP-214 criterion 10.
 #[pyfunction]
 fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
+    crate::pyscp_check_handle!(identity);
     let old_did = identity.did.clone();
     let custody_str = identity.custody.clone();
     let rt = crate::runtime()?;
@@ -1106,11 +1128,7 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
                     identity_link_attestations: existing_attestations,
                 },
             );
-            Ok(PyIdentity {
-                did: new_did,
-                custody: custody_str,
-                has_agent_key: has_agent,
-            })
+            Ok(PyIdentity::new(new_did, custody_str, has_agent))
         })
     })
 }

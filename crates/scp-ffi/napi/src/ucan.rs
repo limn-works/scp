@@ -98,6 +98,10 @@ pub struct NapiUcanToken {
     pub(crate) data: NapiUcanTokenData,
     /// Raw encoded JWT string — retained for validation and delegation operations.
     encoded: String,
+    /// `NapiBridgeInstance` id that minted this token — used for handle
+    /// affinity checks at every FFI entry point. Mismatches are rejected
+    /// with `SCP-PERM-3030`.
+    pub(crate) instance_id: u64,
 }
 
 #[napi]
@@ -170,6 +174,14 @@ impl NapiUcanToken {
     pub fn expires_at(&self) -> Option<f64> {
         self.data.expires_at
     }
+
+    /// Returns the id of the `SCP` instance that minted this token, as a
+    /// base-10 string (u64 serialized as string to survive JS number limits).
+    #[napi(getter, js_name = "instanceId")]
+    #[must_use]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
+    }
 }
 
 impl Drop for NapiUcanToken {
@@ -218,6 +230,7 @@ pub async fn ucan_validate(
     presenting_agent_did: Option<String>,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_ucan_token(&token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_capability_uri(&capability).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
@@ -324,6 +337,7 @@ pub async fn ucan_mint(
     capabilities: Vec<String>,
     proofs: Option<Vec<String>>,
 ) -> napi::Result<NapiUcanToken> {
+    crate::napi_check_handle!(handle);
     validate_did(&member_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     if let Some(ref tokens) = proofs {
         for t in tokens {
@@ -420,6 +434,7 @@ pub async fn ucan_mint(
         Ok(NapiUcanToken {
             data,
             encoded: token.encoded,
+            instance_id: crate::runtime::default_instance_id()?,
         })
     }
 }
@@ -467,6 +482,7 @@ pub async fn ucan_delegate(
     parent_token: String,
     capabilities: Vec<String>,
 ) -> napi::Result<NapiUcanToken> {
+    crate::napi_check_handle!(handle);
     validate_did(&delegator_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&delegatee_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_ucan_token(&parent_token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -601,6 +617,7 @@ pub async fn ucan_delegate(
         Ok(NapiUcanToken {
             data,
             encoded: token.encoded,
+            instance_id: crate::runtime::default_instance_id()?,
         })
     }
 }
@@ -639,6 +656,7 @@ pub async fn ucan_revoke(
     token: String,
     revoker_did: String,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_ucan_token(&token).map_err(ScpNapiError::from)?;
     validate_did(&revoker_did).map_err(ScpNapiError::from)?;
 

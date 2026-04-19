@@ -138,6 +138,11 @@ public enum UcanBridge {
 /// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func validateUcanToken(
     handle: ContextHandle,
     token: String,
@@ -167,6 +172,11 @@ public func validateUcanToken(
 /// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func mintUcanToken(
     handle: ContextHandle,
     memberDid: String,
@@ -200,6 +210,11 @@ public func mintUcanToken(
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
 /// - Closes #499
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func revokeUcanToken(
     handle: ContextHandle,
     token: String,
@@ -230,6 +245,11 @@ public func revokeUcanToken(
 ///
 /// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`, criterion 4
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func delegateUcanToken(
     handle: ContextHandle,
     delegatorDid: String,
@@ -263,6 +283,11 @@ public func delegateUcanToken(
 /// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func validate(
     encoded: String,
     handle: ContextHandle,
@@ -290,6 +315,11 @@ public func validate(
 /// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func mint(
     handle: ContextHandle,
     issuerDid _: String,
@@ -314,6 +344,11 @@ public func mint(
 /// - ADR-016 (UCAN) in `.docs/adrs/phase-3.md`
 /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
 /// - Story SCP-221
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func revoke(
     handle: ContextHandle,
     encoded: String,

@@ -84,6 +84,8 @@ pub struct NapiMcpInvokeResult {
 #[napi]
 pub struct NapiMcpServerHandle {
     handle_id: String,
+    /// `NapiBridgeInstance` id that minted this handle.
+    pub(crate) instance_id: u64,
 }
 
 #[napi]
@@ -93,6 +95,14 @@ impl NapiMcpServerHandle {
     #[must_use]
     pub fn handle_id(&self) -> String {
         self.handle_id.clone()
+    }
+
+    /// Returns the id of the `SCP` instance that minted this handle, as a
+    /// base-10 string.
+    #[napi(getter, js_name = "instanceId")]
+    #[must_use]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
     }
 }
 
@@ -106,6 +116,8 @@ impl Drop for NapiMcpServerHandle {
 #[napi]
 pub struct NapiMcpClientHandle {
     handle_id: String,
+    /// `NapiBridgeInstance` id that minted this handle.
+    pub(crate) instance_id: u64,
 }
 
 #[napi]
@@ -115,6 +127,14 @@ impl NapiMcpClientHandle {
     #[must_use]
     pub fn handle_id(&self) -> String {
         self.handle_id.clone()
+    }
+
+    /// Returns the id of the `SCP` instance that minted this handle, as a
+    /// base-10 string.
+    #[napi(getter, js_name = "instanceId")]
+    #[must_use]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
     }
 }
 
@@ -553,13 +573,17 @@ pub async fn mcp_server_create(config: NapiMcpServerConfig) -> napi::Result<Napi
     mcp_server_registry().insert(handle_id.clone(), entry);
     crate::increment_handle_count();
 
-    Ok(NapiMcpServerHandle { handle_id })
+    Ok(NapiMcpServerHandle {
+        handle_id,
+        instance_id: crate::runtime::default_instance_id()?,
+    })
 }
 
 /// Stops a running MCP server.
 #[napi]
 #[allow(clippy::unused_async)]
 pub async fn mcp_server_stop(handle: &NapiMcpServerHandle) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     let mut entry = mcp_server_registry()
         .get_mut(&handle.handle_id)
         .ok_or_else(|| {
@@ -629,7 +653,10 @@ pub async fn mcp_client_connect_stdio(command: Vec<String>) -> napi::Result<Napi
     mcp_client_registry().insert(handle_id.clone(), entry);
     crate::increment_handle_count();
 
-    Ok(NapiMcpClientHandle { handle_id })
+    Ok(NapiMcpClientHandle {
+        handle_id,
+        instance_id: crate::runtime::default_instance_id()?,
+    })
 }
 
 /// Connects to an external MCP server via SSE transport.
@@ -654,13 +681,17 @@ pub async fn mcp_client_connect_sse(url: String) -> napi::Result<NapiMcpClientHa
     mcp_client_registry().insert(handle_id.clone(), entry);
     crate::increment_handle_count();
 
-    Ok(NapiMcpClientHandle { handle_id })
+    Ok(NapiMcpClientHandle {
+        handle_id,
+        instance_id: crate::runtime::default_instance_id()?,
+    })
 }
 
 /// Disconnects from an external MCP server.
 #[napi]
 #[allow(clippy::unused_async)]
 pub async fn mcp_client_disconnect(handle: &NapiMcpClientHandle) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     let removed = mcp_client_registry().remove(&handle.handle_id);
     if removed.is_none() {
         return Err(ScpNapiError::Transport {
@@ -678,6 +709,7 @@ pub async fn mcp_client_disconnect(handle: &NapiMcpClientHandle) -> napi::Result
 pub async fn mcp_client_list_tools(
     handle: &NapiMcpClientHandle,
 ) -> napi::Result<Vec<NapiMcpToolInfo>> {
+    crate::napi_check_handle!(handle);
     let entry = mcp_client_registry()
         .get(&handle.handle_id)
         .ok_or_else(|| {
@@ -723,6 +755,7 @@ pub async fn mcp_client_invoke(
     context_id: String,
     invoker_did: String,
 ) -> napi::Result<NapiMcpInvokeResult> {
+    crate::napi_check_handle!(handle);
     let entry = mcp_client_registry()
         .get(&handle.handle_id)
         .ok_or_else(|| {

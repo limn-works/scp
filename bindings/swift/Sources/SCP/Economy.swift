@@ -94,12 +94,26 @@ public enum Economy {
 
     // MARK: - Budget Tracking
 
+    // The budget and antispam free functions below route through the
+    // process-wide default bridge instance via the UniFFI free-function
+    // façade. They are deprecated in favour of explicit `SCP()`
+    // construction (ADR-048). The pure helpers above (estimateCost,
+    // policyRequiresPayment, autoAcceptBlocked, checkPolicyLock,
+    // validatePolicyChange, evaluateFormula) are stateless — they stay
+    // unannotated because they can be evaluated from any caller without
+    // touching the default bridge.
+
     /// Queries the remaining budget for a member.
     ///
     /// - Parameters:
     ///   - contextId: The context ID.
     ///   - did: The member's DID.
     /// - Returns: Remaining budget (smallest currency unit).
+    @available(
+        *,
+        deprecated,
+        message: "Use SCP() instance explicitly. Removal: two release cycles after Phase 4 merge (ADR-048)."
+    )
     public static func budgetRemaining(contextId: String, did: String) async throws -> UInt64 {
         try await economyBudgetRemaining(contextId: contextId, did: did)
     }
@@ -110,6 +124,11 @@ public enum Economy {
     ///   - contextId: The context ID.
     ///   - did: The member's DID.
     ///   - amount: Budget to grant.
+    @available(
+        *,
+        deprecated,
+        message: "Use SCP() instance explicitly. Removal: two release cycles after Phase 4 merge (ADR-048)."
+    )
     public static func budgetGrant(
         contextId: String,
         did: String,
@@ -124,6 +143,11 @@ public enum Economy {
     ///   - contextId: The context ID.
     ///   - did: The member's DID.
     ///   - amount: Amount spent.
+    @available(
+        *,
+        deprecated,
+        message: "Use SCP() instance explicitly. Removal: two release cycles after Phase 4 merge (ADR-048)."
+    )
     public static func budgetRecordSpend(
         contextId: String,
         did: String,
@@ -140,6 +164,11 @@ public enum Economy {
     ///   - contextId: The context ID.
     ///   - senderDid: The sender's DID.
     ///   - timestamp: Unix timestamp in seconds.
+    @available(
+        *,
+        deprecated,
+        message: "Use SCP() instance explicitly. Removal: two release cycles after Phase 4 merge (ADR-048)."
+    )
     public static func antispamRecord(
         contextId: String,
         senderDid: String,
@@ -159,6 +188,11 @@ public enum Economy {
     ///   - senderDid: The sender's DID.
     ///   - now: Current Unix timestamp in seconds.
     /// - Returns: Number of messages within the sliding window.
+    @available(
+        *,
+        deprecated,
+        message: "Use SCP() instance explicitly. Removal: two release cycles after Phase 4 merge (ADR-048)."
+    )
     public static func antispamVelocity(
         contextId: String,
         senderDid: String,
@@ -182,6 +216,11 @@ public enum Economy {
     ///   - floor: Optional minimum cost.
     ///   - cap: Optional maximum cost.
     /// - Returns: Escalated cost.
+    @available(
+        *,
+        deprecated,
+        message: "Use SCP() instance explicitly. Removal: two release cycles after Phase 4 merge (ADR-048)."
+    )
     public static func antispamEscalatedCost(
         contextId: String,
         senderDid: String,

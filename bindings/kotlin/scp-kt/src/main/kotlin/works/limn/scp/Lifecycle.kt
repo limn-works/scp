@@ -67,6 +67,15 @@ object LifecycleBridge {
  *   UniFFI-generated functions.
  * @throws uniffi.scp.ScpException if transport cleanup fails.
  */
+@Deprecated(
+    message = (
+        "Operates on the default SCP instance. Construct an explicit `SCP` and call " +
+            "`scp.suspend(bridge)` instead. Removal target: two release cycles after " +
+            "Phase 4 merge (ADR-048)."
+    ),
+    replaceWith = ReplaceWith("scp.suspend(bridge)"),
+    level = DeprecationLevel.WARNING,
+)
 suspend fun suspend(
     bridge: CoroutineBridge,
     bindings: LifecycleBindings = LifecycleBridge.default,
@@ -88,6 +97,15 @@ suspend fun suspend(
  *   UniFFI-generated functions.
  * @throws uniffi.scp.ScpException if the bridge has been permanently shut down.
  */
+@Deprecated(
+    message = (
+        "Operates on the default SCP instance. Construct an explicit `SCP` and call " +
+            "`scp.resume(bridge)` instead. Removal target: two release cycles after " +
+            "Phase 4 merge (ADR-048)."
+    ),
+    replaceWith = ReplaceWith("scp.resume(bridge)"),
+    level = DeprecationLevel.WARNING,
+)
 suspend fun resume(
     bridge: CoroutineBridge,
     bindings: LifecycleBindings = LifecycleBridge.default,

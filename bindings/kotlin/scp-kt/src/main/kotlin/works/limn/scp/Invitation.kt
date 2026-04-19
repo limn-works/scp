@@ -71,6 +71,14 @@ data class InvitationEvaluationResult(val decision: String) {
  * @throws works.limn.scp.bridge.BridgeException if evaluation fails.
  * @throws IllegalStateException if invitation bindings are not configured.
  */
+@Deprecated(
+    message = (
+        "Operates on the default SCP instance. Construct an explicit `SCP` and " +
+            "invoke invitation evaluation through its scope instead. Removal target: " +
+            "two release cycles after Phase 4 merge (ADR-048)."
+    ),
+    level = DeprecationLevel.WARNING,
+)
 @Suppress("LongParameterList")
 suspend fun evaluateContextInvitation(
     bridge: CoroutineBridge,

@@ -138,7 +138,7 @@ describe("Context runtime (mock bridge)", () => {
     );
 
     const received: Array<{ senderDid: string; content: string | Uint8Array }> = [];
-    mockBridge.contextSubscribe(ctx, identity.did, {
+    await mockBridge.contextSubscribe(ctx, identity.did, {
       onMessage: (msg) => received.push(msg),
       onComplete: () => {},
     });
@@ -161,7 +161,7 @@ describe("Context runtime (mock bridge)", () => {
     );
 
     let completed = false;
-    mockBridge.contextSubscribe(ctx, identity.did, {
+    await mockBridge.contextSubscribe(ctx, identity.did, {
       onMessage: () => {},
       onComplete: () => {
         completed = true;
@@ -974,7 +974,7 @@ describe("End-to-end context lifecycle", () => {
 
     // Subscribe to messages
     const messages: Array<{ senderDid: string; contextId: string }> = [];
-    mockBridge.contextSubscribe(ctx, bob.did, {
+    await mockBridge.contextSubscribe(ctx, bob.did, {
       onMessage: (msg) => messages.push({ senderDid: msg.senderDid, contextId: msg.contextId }),
       onComplete: () => {},
     });

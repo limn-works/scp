@@ -153,6 +153,11 @@ public enum MediaBridge {
 /// ## Provenance
 ///
 /// - ADR-024 (Media)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func checkMediaCapability(
     ceiling: [String],
     capability: String,
@@ -176,6 +181,11 @@ public func checkMediaCapability(
 /// ## Provenance
 ///
 /// - ADR-024 (Media)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func initiateMediaSession(
     contextId: String,
     ceiling: [String],
@@ -198,6 +208,11 @@ public func initiateMediaSession(
 /// ## Provenance
 ///
 /// - ADR-024 (Media)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func activateMediaSession(
     sessionJson: String,
     activateSessionFn: MediaBridge.ActivateSessionFn = MediaBridge.defaultActivateSession
@@ -217,6 +232,11 @@ public func activateMediaSession(
 /// ## Provenance
 ///
 /// - ADR-024 (Media)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func joinMediaSession(
     sessionJson: String,
     participantDid: String,
@@ -237,6 +257,11 @@ public func joinMediaSession(
 /// ## Provenance
 ///
 /// - ADR-024 (Media)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func endMediaSession(
     sessionJson: String,
     timestamp: UInt64,
@@ -260,6 +285,11 @@ public func endMediaSession(
 /// ## Provenance
 ///
 /// - ADR-024 (Media)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func createMediaOffer(
     sessionId: String,
     sdp: String,
@@ -282,6 +312,11 @@ public func createMediaOffer(
 /// ## Provenance
 ///
 /// - ADR-024 (Media)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func createMediaAnswer(
     sessionId: String,
     sdp: String,
@@ -306,6 +341,11 @@ public func createMediaAnswer(
 /// ## Provenance
 ///
 /// - ADR-024 (Media)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func createMediaIceCandidate(
     sessionId: String,
     candidate: String,
@@ -329,6 +369,11 @@ public func createMediaIceCandidate(
 /// ## Provenance
 ///
 /// - ADR-024 (Media)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func createMediaSessionEnd(
     sessionId: String,
     senderDid: String,
@@ -348,6 +393,11 @@ public func createMediaSessionEnd(
 /// ## Provenance
 ///
 /// - ADR-024 (Media)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func sendSignaling(
     signalingJson: String,
     sendSignalingFn: MediaBridge.SendSignalingFn = MediaBridge.defaultSendSignaling
@@ -367,6 +417,11 @@ public func sendSignaling(
 /// ## Provenance
 ///
 /// - ADR-024 (Media)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func verifyMediaSenderAttribution(
     signalingJson: String,
     envelopeSenderDid: String,

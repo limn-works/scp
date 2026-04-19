@@ -42,6 +42,11 @@ public enum Lifecycle {
     /// - Parameter suspendFn: Injectable bridge function (for testing).
     ///   Defaults to the UniFFI-generated ``scpSuspend()``.
     /// - Throws: ``ScpError.transport`` if transport cleanup fails.
+    @available(
+        *,
+        deprecated,
+        message: "Operates on the default SCP instance. Construct an explicit `SCP` and call `scp.suspend()` instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+    )
     public static func suspend(
         suspendFn: SuspendFn = defaultSuspend
     ) throws {
@@ -60,6 +65,11 @@ public enum Lifecycle {
     /// - Parameter resumeFn: Injectable bridge function (for testing).
     ///   Defaults to the UniFFI-generated ``scpResume()``.
     /// - Throws: ``ScpError.context`` if the bridge has been permanently shut down.
+    @available(
+        *,
+        deprecated,
+        message: "Operates on the default SCP instance. Construct an explicit `SCP` and call `scp.resume()` instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+    )
     public static func resume(
         resumeFn: ResumeFn = defaultResume
     ) throws {

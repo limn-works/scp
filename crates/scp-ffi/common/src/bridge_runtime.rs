@@ -7,11 +7,11 @@
 //!
 //! - [`not_configured_key_resolver`] — governance key resolver that rejects
 //!   all lookups (identical in all 3 bridges).
-//! - [`init_did_resolver_on`] — stores a DID resolver in a [`BridgeInstance`].
+//! - [`init_did_resolver_on`] — stores a DID resolver in a [`CoreFields`].
 //!   All three bridges delegate to it from their thin `init_did_resolver`
 //!   wrapper.
 //! - [`did_resolver_from`] — retrieves the DID resolver from a
-//!   [`BridgeInstance`]. All three bridges delegate to it from their thin
+//!   [`CoreFields`]. All three bridges delegate to it from their thin
 //!   `did_resolver` wrapper.
 //! - [`BridgeInMemoryStorage`] — in-memory `Storage` impl for event log
 //!   persistence without pulling in `scp-platform/testing` (identical in
@@ -19,7 +19,8 @@
 //! - [`build_event_log_provider`] — constructs a persistent
 //!   `MerkleEventLogProvider` backed by `BridgeInMemoryStorage` (identical in
 //!   NAPI and `UniFFI`). Returns both the provider and the underlying
-//!   `ProtocolRepository` so callers can stash it on [`BridgeInstance`].
+//!   `ProtocolRepository` so callers can stash it on the per-bridge
+//!   concrete struct (alongside [`CoreFields`]).
 //! - [`UcanContextStateCore`] — shared UCAN validation state fields common to
 //!   NAPI and `UniFFI` bridges.
 //!
@@ -38,7 +39,7 @@ use scp_platform::error::PlatformError;
 use zeroize::Zeroizing;
 
 use crate::IdentityBackedDidResolver;
-use crate::bridge_instance::BridgeInstance;
+use crate::bridge_instance::CoreFields;
 
 // ---------------------------------------------------------------------------
 // Key resolver
@@ -72,19 +73,19 @@ pub fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolv
 // DID resolver helpers
 // ---------------------------------------------------------------------------
 
-/// Initializes the production DID resolver on a [`BridgeInstance`].
+/// Initializes the production DID resolver on a [`CoreFields`] instance.
 ///
 /// Wraps any `scp_identity::resolver::DidResolver` implementation in an
-/// [`IdentityBackedDidResolver`] and stores it in the `BridgeInstance`
+/// [`IdentityBackedDidResolver`] and stores it in the `CoreFields`
 /// for UCAN validation and attestation verification.
 ///
 /// Called once during identity system setup. Subsequent calls are no-ops
-/// (`OnceLock` inside `BridgeInstance` guarantees single initialization).
+/// (`OnceLock` inside `CoreFields` guarantees single initialization).
 ///
 /// If `bridge` is `None` (bridge not yet initialized), logs an error.
 /// This helper replaces the per-bridge `init_did_resolver` functions.
 pub fn init_did_resolver_on<R>(
-    bridge: Option<&Arc<BridgeInstance>>,
+    bridge: Option<&Arc<CoreFields>>,
     resolver: Arc<R>,
     handle: tokio::runtime::Handle,
 ) where
@@ -94,20 +95,22 @@ pub fn init_did_resolver_on<R>(
         bi.set_did_resolver(Arc::new(IdentityBackedDidResolver::new(resolver, handle)));
     } else {
         tracing::error!(
-            "init_did_resolver called before BridgeInstance initialized — resolver not stored"
+            "init_did_resolver called before bridge CoreFields initialized — \
+             resolver not stored"
         );
     }
 }
 
-/// Returns the production DID resolver from a [`BridgeInstance`], if initialized.
+/// Returns the production DID resolver from a [`CoreFields`] instance, if
+/// initialized.
 ///
-/// Delegates to [`BridgeInstance::did_resolver`]. Returns `None` if the
+/// Delegates to [`CoreFields::did_resolver`]. Returns `None` if the
 /// bridge is not initialized or the resolver has not been set.
 ///
 /// This helper replaces the per-bridge `did_resolver` functions.
 #[must_use]
 pub fn did_resolver_from(
-    bridge: Option<&Arc<BridgeInstance>>,
+    bridge: Option<&Arc<CoreFields>>,
 ) -> Option<&Arc<IdentityBackedDidResolver>> {
     bridge.and_then(|bi| bi.did_resolver())
 }
@@ -240,11 +243,10 @@ impl Storage for BridgeInMemoryStorage {
 /// The resulting `MerkleEventLogProvider` persists entries on each append.
 ///
 /// Returns both the event log provider (for `ContextManager` initialization)
-/// and the `ProtocolRepository` (for trust store usage and `BridgeInstance`
-/// storage). Callers own the repository handle and typically stash it in
-/// [`BridgeInstance::set_protocol_repository`](crate::bridge_instance::BridgeInstance::set_protocol_repository)
-/// so the trust-aggregation bridge can downcast it back via
-/// [`BridgeInstance::get_protocol_repository_as`](crate::bridge_instance::BridgeInstance::get_protocol_repository_as).
+/// and the `ProtocolRepository` (for trust store usage and per-bridge
+/// storage). Callers own the repository handle and typically stash it on
+/// the per-bridge concrete struct (e.g. `PyBridgeInstance`,
+/// `NapiBridgeInstance`, `UniffiBridgeInstance`).
 ///
 /// Uses [`BridgeInMemoryStorage`] instead of
 /// `scp_platform::testing::InMemoryStorage` so that the `testing` feature

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import ScpError
 from scp_sdk.types import BridgeMode, ShadowStatus
 
@@ -31,6 +32,7 @@ def _bridge() -> Any:
         ) from exc
 
 
+@deprecated_default_instance
 def register(
     context_id: str,
     operator_did: str,
@@ -70,6 +72,7 @@ def register(
     )
 
 
+@deprecated_default_instance
 def evaluate_trust(
     *,
     is_bridged: bool = False,
@@ -104,6 +107,7 @@ def evaluate_trust(
     return bridge.bridge_evaluate_trust(is_bridged, is_native_transport, status_str)
 
 
+@deprecated_default_instance
 def create_shadow(
     bridge_id: str,
     platform_handle: str,

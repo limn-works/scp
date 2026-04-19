@@ -250,6 +250,10 @@ pub(crate) struct NapiIdentityInner {
     /// Used by agent key operations to read/modify the document. `None` for
     /// externally loaded identities.
     pub(crate) document: Option<DidDocument>,
+    /// `NapiBridgeInstance` id that minted this handle — used for runtime
+    /// handle-affinity checks at every FFI entry point that accepts a
+    /// `NapiIdentity`. Mismatches are rejected with `SCP-PERM-3030`.
+    pub(crate) instance_id: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +329,14 @@ impl NapiIdentity {
             .map(|vm| vm.public_key_multibase.clone())
     }
 
+    /// Returns the id of the `SCP` instance that minted this handle, as a
+    /// base-10 string (u64 serialized as string to survive JS number limits).
+    #[napi(getter, js_name = "instanceId")]
+    #[must_use]
+    pub fn instance_id_js(&self) -> String {
+        self.inner.instance_id.to_string()
+    }
+
     /// Rotates the active signing key for this identity.
     ///
     /// Generates a new Active Signing Key, updates the DID document on the
@@ -393,6 +405,7 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -462,6 +475,7 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -531,6 +545,7 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -600,6 +615,7 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -709,6 +725,7 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -718,6 +735,13 @@ impl NapiIdentity {
 }
 
 impl NapiIdentity {
+    /// Returns the raw instance id carried by this handle (used by the
+    /// [`crate::napi_check_handle!`] macro for handle-affinity checks).
+    #[must_use]
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.inner.instance_id
+    }
+
     /// Returns the retained `InMemoryKeyCustody` if this identity uses in-memory
     /// custody. Used by context creation for routing ID derivation (SCP-214).
     #[cfg(feature = "allow_in_memory_custody")]
@@ -951,6 +975,7 @@ pub async fn identity_create(custody: String) -> napi::Result<NapiIdentity> {
                     scp_identity: Some(scp_identity),
                     in_memory_custody: Some(key_custody),
                     document: Some(document),
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -1050,6 +1075,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<Nap
                     scp_identity: Some(scp_identity),
                     in_memory_custody: Some(key_custody),
                     document: Some(document),
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -1136,6 +1162,7 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
                     scp_identity: Some(identity),
                     in_memory_custody: Some(custody),
                     document: Some(document),
+                    instance_id: crate::runtime::default_instance_id()?,
                 }),
             };
             increment_handle_count();
@@ -1158,6 +1185,7 @@ pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
             #[cfg(feature = "allow_in_memory_custody")]
             in_memory_custody: None,
             document: Some(document),
+            instance_id: crate::runtime::default_instance_id()?,
         }),
     };
     increment_handle_count();
@@ -1835,6 +1863,7 @@ mod tests {
                 scp_identity: Some(scp_identity),
                 in_memory_custody: Some(key_custody),
                 document: Some(document),
+                instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
             }),
         };
         increment_handle_count();
@@ -1977,6 +2006,7 @@ mod tests {
                 scp_identity: None,
                 in_memory_custody: None,
                 document: None,
+                instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
             }),
         };
         increment_handle_count();
@@ -2268,6 +2298,7 @@ mod tests {
                 scp_identity: None,
                 in_memory_custody: None,
                 document: None,
+                instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
             }),
         };
         increment_handle_count();

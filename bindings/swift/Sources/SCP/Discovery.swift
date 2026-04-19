@@ -250,6 +250,11 @@ public enum DiscoveryBridge {
 ///
 /// - ADR-020 in `.docs/adrs/phase-4.md`
 /// - Spec section 22 (Addressing)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func parseAddress(
     address: String,
     parseAddressFn: DiscoveryBridge.ParseAddressFn = DiscoveryBridge.defaultParseAddress
@@ -274,6 +279,11 @@ public func parseAddress(
 ///
 /// - ADR-020 in `.docs/adrs/phase-4.md`
 /// - Spec section 22 (Addressing)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func createDiscoveryQuery(
     capabilities: [String]? = nil,
     keywords: [String]? = nil,
@@ -296,6 +306,11 @@ public func createDiscoveryQuery(
 ///
 /// - ADR-020 in `.docs/adrs/phase-4.md`
 /// - Spec section 22 (Addressing)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func normalizeAddress(
     address: String,
     normalizeAddressFn: DiscoveryBridge.NormalizeAddressFn = DiscoveryBridge.defaultNormalizeAddress
@@ -321,6 +336,11 @@ public func normalizeAddress(
 ///
 /// - ADR-020 in `.docs/adrs/phase-4.md`
 /// - Spec section 22 (Addressing)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func discover(
     query: String,
     discoverFn: DiscoveryBridge.DiscoverFn = DiscoveryBridge.defaultDiscover
@@ -338,6 +358,11 @@ public func discover(
 ///   - name: The petname string.
 ///   - petnameSetFn: Bridge function override for testing.
 /// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func setPetname(
     ownerDid: String,
     targetDid: String,
@@ -354,6 +379,11 @@ public func setPetname(
 ///   - targetDid: DID to remove the petname from.
 ///   - petnameRemoveFn: Bridge function override for testing.
 /// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func removePetname(
     ownerDid: String,
     targetDid: String,
@@ -370,6 +400,11 @@ public func removePetname(
 ///   - name: The petname string.
 ///   - petnameSetContextFn: Bridge function override for testing.
 /// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func setContextPetname(
     ownerDid: String,
     contextId: String,
@@ -386,6 +421,11 @@ public func setContextPetname(
 ///   - contextId: Context ID to remove the petname from.
 ///   - petnameRemoveContextFn: Bridge function override for testing.
 /// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func removeContextPetname(
     ownerDid: String,
     contextId: String,
@@ -402,6 +442,11 @@ public func removeContextPetname(
 ///   - petnameResolveDidFn: Bridge function override for testing.
 /// - Returns: An array of DID strings.
 /// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func resolvePetnameDid(
     ownerDid: String,
     name: String,
@@ -419,6 +464,11 @@ public func resolvePetnameDid(
 ///   - petnameResolveContextFn: Bridge function override for testing.
 /// - Returns: An array of context ID strings.
 /// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func resolvePetnameContext(
     ownerDid: String,
     name: String,
@@ -436,6 +486,11 @@ public func resolvePetnameContext(
 ///   - petnameGetForDidFn: Bridge function override for testing.
 /// - Returns: The petname string, or `nil` if no petname is assigned.
 /// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func getPetnameForDid(
     ownerDid: String,
     targetDid: String,
@@ -452,6 +507,11 @@ public func getPetnameForDid(
 ///   - petnameGetForContextFn: Bridge function override for testing.
 /// - Returns: The petname string, or `nil` if no petname is assigned.
 /// - Throws: ``ScpError/Validation(msg:code:)`` if ``ownerDid`` is empty.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func getPetnameForContext(
     ownerDid: String,
     contextId: String,
@@ -474,6 +534,11 @@ public func getPetnameForContext(
 ///   - handleRegisterFn: Bridge function override for testing.
 /// - Returns: A JSON string with the registration result.
 /// - Throws: ``ScpError/Validation(msg:code:)`` if ``targetJson`` is malformed.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func registerHandle(
     discoveryContextId: String,
     handle: String,
@@ -494,6 +559,11 @@ public func registerHandle(
 ///   - typeFilter: Optional filter: ``"identity"`` or ``"context"``.
 ///   - handleLookupFn: Bridge function override for testing.
 /// - Returns: A JSON string with a ``results`` array of matching entries.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func lookupHandle(
     discoveryContextId: String,
     handle: String,
@@ -511,6 +581,11 @@ public func lookupHandle(
 ///   - did: DID of the registrant requesting deregistration.
 ///   - handleDeregisterFn: Bridge function override for testing.
 /// - Returns: A JSON string with a ``removed`` boolean.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func deregisterHandle(
     discoveryContextId: String,
     handle: String,
@@ -535,6 +610,11 @@ public func deregisterHandle(
 ///   - scopeRegisterFn: Bridge function override for testing.
 /// - Returns: A JSON string with the registration result.
 /// - Throws: ``ScpError/Validation(msg:code:)`` if the scope name or relay URLs are invalid.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func registerScope(
     scopeContextId: String,
     name: String,
@@ -557,6 +637,11 @@ public func registerScope(
 ///   - name: The scope name to look up.
 ///   - scopeLookupFn: Bridge function override for testing.
 /// - Returns: A JSON string with a ``results`` array of matching scope entries.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func lookupScope(
     scopeContextId: String,
     name: String,
@@ -573,6 +658,11 @@ public func lookupScope(
 ///   - did: DID of the registrant requesting deregistration.
 ///   - scopeDeregisterFn: Bridge function override for testing.
 /// - Returns: A JSON string with a ``removed`` boolean.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func deregisterScope(
     scopeContextId: String,
     name: String,
@@ -596,6 +686,11 @@ public func deregisterScope(
 ///   - addressResolveFn: Bridge function override for testing.
 /// - Returns: An array of ``AddressResolution`` dictionaries.
 /// - Throws: ``ScpError/Validation(msg:code:)`` if resolution fails.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func resolveDiscoveryAddress(
     ownerDid: String,
     address: String,

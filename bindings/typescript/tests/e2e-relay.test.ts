@@ -54,7 +54,7 @@ type ServerAddon = {
     handle: unknown,
     identityDid: string,
     onMessage: (msg: NapiRawMessage | null) => void,
-  ): void;
+  ): Promise<void>;
 };
 
 /**
@@ -158,7 +158,12 @@ if (bridge === null || serverAddon === null) {
     }
     subscribedContexts.length = 0;
 
-    napi.shutdown(1);
+    // Shutdown timeout is in milliseconds after #1549 Phase 4 unit
+    // unification — 1000 ms is enough for pending tasks to drain.
+    // `napi.shutdown` is async and must be awaited; prior to #1549
+    // Phase 4 it was synchronous, so a fire-and-forget call worked
+    // by accident and would clear bridge state under concurrent tests.
+    await napi.shutdown(1000);
     if (relayHandle && !relayHandle.isShutdown) {
       relayHandle.shutdown();
     }
@@ -354,8 +359,11 @@ if (bridge === null || serverAddon === null) {
       );
 
       // contextSubscribe should not throw -- it establishes a relay
-      // subscription and spawns a background task.
-      addon.contextSubscribe(ctx, alice.did, (_msg: NapiRawMessage | null) => {
+      // subscription and spawns a background task. Signature is now
+      // `async` after #1549 Phase 4 PR 1 — the returned Promise
+      // resolves once the task is registered against the bridge's
+      // JoinSet.
+      await addon.contextSubscribe(ctx, alice.did, (_msg: NapiRawMessage | null) => {
         // Callback may or may not fire depending on relay delivery.
       });
 
@@ -376,13 +384,15 @@ if (bridge === null || serverAddon === null) {
       );
 
       // First subscription succeeds.
-      addon.contextSubscribe(ctx, alice.did, () => {});
+      await addon.contextSubscribe(ctx, alice.did, () => {});
       subscribedContexts.push({ handle: ctx, did: alice.did });
 
-      // Second subscription to the same context must fail.
-      expect(() => {
-        addon.contextSubscribe(ctx, alice.did, () => {});
-      }).toThrow(/already subscribed/);
+      // Second subscription to the same context must fail. Async
+      // rejection — use `.rejects.toThrow()` rather than
+      // sync `.toThrow()`.
+      await expect(addon.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow(
+        /already subscribed/,
+      );
     });
 
     test("subscription rejected on non-active context", async () => {
@@ -400,10 +410,9 @@ if (bridge === null || serverAddon === null) {
       // Close the context first.
       await napi.contextClose(ctx, alice.did);
 
-      // Subscription to a closed context must fail.
-      expect(() => {
-        addon.contextSubscribe(ctx, alice.did, () => {});
-      }).toThrow();
+      // Subscription to a closed context must fail. Promise-rejection,
+      // not synchronous throw.
+      await expect(addon.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow();
     });
   });
 

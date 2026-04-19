@@ -67,6 +67,10 @@ pub struct NapiFullStackNode {
     inner: FullStackNode,
     /// Stored context handles, keyed by context ID string.
     handles: Mutex<HashMap<String, ContextHandle>>,
+    /// `NapiBridgeInstance` id that minted this node. In the testing
+    /// harness this is always the default instance — cross-instance
+    /// isolation on test doubles is meaningless.
+    pub(crate) instance_id: u64,
 }
 
 #[napi]
@@ -75,6 +79,13 @@ impl NapiFullStackNode {
     #[napi(getter)]
     pub fn did(&self) -> String {
         self.inner.did.to_string()
+    }
+
+    /// Returns the id of the `SCP` instance that minted this node, as a
+    /// base-10 string.
+    #[napi(getter, js_name = "instanceId")]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
     }
 }
 
@@ -90,11 +101,14 @@ impl NapiFullStackNode {
 #[must_use]
 #[napi]
 pub fn fullstack_create_node(did: String) -> NapiFullStackNode {
+    let instance_id = crate::runtime::default_instance_id()
+        .unwrap_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID);
     with_network(|network| {
         let node = network.create_node(&did, permissive_key_resolver());
         NapiFullStackNode {
             inner: node,
             handles: Mutex::new(HashMap::new()),
+            instance_id,
         }
     })
 }

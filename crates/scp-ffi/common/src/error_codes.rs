@@ -313,6 +313,8 @@ pub const PERM_3021: &str = "SCP-PERM-3021";
 pub const PERM_3022: &str = "SCP-PERM-3022";
 /// UCAN permission: nonce replay detected.
 pub const PERM_3023: &str = "SCP-PERM-3023";
+/// Handle affinity violation — handle from a different SCP instance.
+pub const PERM_3030: &str = "SCP-PERM-3030";
 
 // -------------------------------------------------------------------------
 // Crypto (SCP-CRYPTO- 4000--4999)

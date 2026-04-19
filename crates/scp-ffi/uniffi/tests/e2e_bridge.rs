@@ -927,14 +927,14 @@ async fn register_and_check_local_did() {
 // Shutdown ordering
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+// scp_shutdown is async; integration tests must use multi-threaded tokio
+// runtime because the eventual shutdown path relies on `block_in_place`.
+// We only call `scp_shutdown(0)` to avoid permanently tearing down the
+// shared default UniffiBridgeInstance while other concurrent tests still
+// depend on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scp_shutdown_zero_timeout_returns_immediately() {
-    scp_shutdown(0);
-}
-
-#[tokio::test]
-async fn scp_shutdown_with_no_handles_returns_immediately() {
-    scp_shutdown(1);
+    let _ = scp_shutdown(0).await;
 }
 
 // ---------------------------------------------------------------------------

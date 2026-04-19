@@ -29,6 +29,7 @@ allow_in_memory_custody = ["scp-platform/testing", "dep:scp-testing"]
 server = ["scp-ffi-common/server", "dep:scp-node"]
 
 [dependencies]
+async-trait = { workspace = true }
 pyo3 = { version = "0.24.1", features = ["experimental-async"] }
 tokio = { workspace = true }
 scp-core = { path = "../scp-core" }

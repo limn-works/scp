@@ -825,11 +825,15 @@ export function createWasmBridge(): Bridge {
       }
     },
 
-    contextSubscribe(
+    // WASM `context_subscribe` is still synchronous — the WASM bridge
+    // registers subscriptions inline rather than spawning runtime tasks
+    // (ADR-034). The async signature mirrors NAPI for API parity; the
+    // Promise resolves immediately once registration returns.
+    async contextSubscribe(
       handle: BridgeContextHandle,
       _identityDid: string,
       callback: MessageCallback,
-    ): void {
+    ): Promise<void> {
       const wasm = getWasm();
       wasm.context_subscribe(handle, {
         onMessage: (msg) => {
@@ -2137,7 +2141,8 @@ export function createWasmBridge(): Bridge {
       return wasm.scp_version();
     },
 
-    shutdown(_timeoutSecs: number): void {
+    // eslint-disable-next-line @typescript-eslint/require-await -- WASM has no bridge state to drain, but the signature must match the NAPI async shutdown for isomorphic callers.
+    async shutdown(_timeoutMillis: number): Promise<void> {
       // No-op in the WASM bridge -- browser manages resource cleanup.
     },
 

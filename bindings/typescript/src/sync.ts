@@ -9,6 +9,7 @@
 
 import { mapBridgeError } from "./errors";
 import { getBridge } from "./internal/bridge";
+import { deprecatedDefaultInstance } from "./internal/deprecation";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -38,6 +39,7 @@ export interface SyncPolicy {
  * @returns `"short"`, `"extended"`, or `"long"`.
  */
 export async function classifyOffline(lastRelayContact: number, now: number): Promise<string> {
+  deprecatedDefaultInstance("classifyOffline");
   try {
     const bridge = await getBridge();
     return bridge.syncClassifyOffline(lastRelayContact, now);
@@ -61,6 +63,7 @@ export async function classifyOfflineCustom(
   tier1ThresholdSecs: number,
   tier2ThresholdSecs: number,
 ): Promise<string> {
+  deprecatedDefaultInstance("classifyOfflineCustom");
   try {
     const bridge = await getBridge();
     return bridge.syncClassifyOfflineCustom(
@@ -80,6 +83,7 @@ export async function classifyOfflineCustom(
  * @returns A `SyncPolicy` with the default parameters.
  */
 export async function getSyncPolicy(): Promise<SyncPolicy> {
+  deprecatedDefaultInstance("getSyncPolicy");
   try {
     const bridge = await getBridge();
     const raw = bridge.syncGetPolicy();

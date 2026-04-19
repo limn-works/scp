@@ -261,6 +261,11 @@ public enum TrustBridge {
 /// - ADR-017 (Trust Model) in `.docs/adrs/phase-4.md`
 /// - `.docs/sketch.md` section 5 "Trust & Capabilities"
 /// - Story SCP-221, #331
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func evaluateTrust(
     subjectDid: String,
     contextId: String,
@@ -289,6 +294,11 @@ public func evaluateTrust(
 ///
 /// - ADR-017 Layer 2 in `.docs/adrs/phase-4.md`
 /// - Story #331
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func queryTrustScore(
     did: String,
     contextId: String,
@@ -315,6 +325,11 @@ public func queryTrustScore(
 ///
 /// - ADR-017 Layer 3 in `.docs/adrs/phase-4.md`
 /// - Story #331
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func verifyAttestation(
     attestationJson: String,
     verifyAttestationFn: TrustBridge.VerifyAttestationFn = TrustBridge.defaultVerifyAttestation
@@ -340,6 +355,11 @@ public func verifyAttestation(
 ///
 /// - ADR-017 Layer 3 (Challenge-Response) in `.docs/adrs/phase-4.md`
 /// - Story #331
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func createChallenge(
     targetDid: String,
     createChallengeFn: TrustBridge.CreateChallengeFn = TrustBridge.defaultCreateChallenge
@@ -365,6 +385,11 @@ public func createChallenge(
 ///
 /// - ADR-017 Layer 3 (Challenge-Response) in `.docs/adrs/phase-4.md`
 /// - Story #331
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func verifyChallengeResponse(
     challengeJson: String,
     responseJson: String,

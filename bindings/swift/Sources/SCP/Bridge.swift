@@ -94,6 +94,11 @@ public enum BridgeConnectorBridge {
 ///
 /// - Spec section 12 (Bridge System)
 /// - ADR-023 (Bridge Connector)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func evaluateBridgeTrust(
     isBridged: Bool,
     isNativeTransport: Bool,
@@ -126,6 +131,11 @@ public func evaluateBridgeTrust(
 ///
 /// - Spec section 12 (Bridge System)
 /// - ADR-023 (Bridge Connector)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func bridgeRegister(
     contextId: String,
     operatorDid: String,
@@ -157,6 +167,11 @@ public func bridgeRegister(
 ///
 /// - Spec section 12 (Bridge System)
 /// - ADR-023 (Bridge Connector)
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func bridgeCreateShadow(
     bridgeId: String,
     platformHandle: String,
@@ -181,6 +196,11 @@ public func bridgeCreateShadow(
 ///   - evaluateTrustFn: Bridge function override for testing.
 /// - Returns: Trust tier integer (0-3).
 /// - Throws: ``ScpError/Validation(msg:code:)`` if evaluation fails.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func evaluateBridgeTrust(
     isBridged: Bool,
     isNativeTransport: Bool,
@@ -206,6 +226,11 @@ public func evaluateBridgeTrust(
 ///   - registerFn: Bridge function override for testing.
 /// - Returns: A ``BridgeRegistrationResult`` with the registration details.
 /// - Throws: ``ScpError`` if registration fails (including self-approval).
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func bridgeRegister(
     contextId: String,
     operatorDid: String,
@@ -230,6 +255,11 @@ public func bridgeRegister(
 ///   - createShadowFn: Bridge function override for testing.
 /// - Returns: A ``ShadowIdentityResult`` with the shadow identity details.
 /// - Throws: ``ScpError`` if shadow creation fails.
+@available(
+    *,
+    deprecated,
+    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
+)
 public func bridgeCreateShadow(
     bridgeId: String,
     platformHandle: String,

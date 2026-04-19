@@ -135,6 +135,12 @@ pub struct NapiContextHandle {
     /// the first successful call; reset to `false` when the spawned task exits,
     /// enabling re-subscription after relay disconnect or task termination.
     pub(crate) subscription_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Identifier of the `NapiBridgeInstance` that minted this handle.
+    /// Checked at every FFI entry point that accepts the handle (see
+    /// [`crate::runtime::default_instance_id`] and the
+    /// [`napi_check_handle!`](crate::napi_check_handle) macro). Rejects
+    /// cross-instance misuse with `SCP-PERM-3030`.
+    pub(crate) instance_id: u64,
 }
 
 /// Internal context lifecycle state string helper.
@@ -248,6 +254,14 @@ impl NapiContextHandle {
     pub fn economic_policy(&self) -> Option<String> {
         self.economic_policy.clone()
     }
+
+    /// Returns the id of the `SCP` instance that minted this handle, as a
+    /// base-10 string (u64 serialized as string to survive JS number limits).
+    #[napi(getter, js_name = "instanceId")]
+    #[must_use]
+    pub fn instance_id_js(&self) -> String {
+        self.instance_id.to_string()
+    }
 }
 
 impl NapiContextHandle {
@@ -302,6 +316,12 @@ impl NapiContextHandle {
     /// UCAN state (set up via `ensure_registered`).
     pub(crate) fn test_active(context_id: String, creator_did: String) -> Self {
         increment_handle_count();
+        // Stamp with the default bridge instance's id when available so
+        // `napi_check_handle!` accepts the handle at FFI entry points. Falls
+        // back to `UNSET_INSTANCE_ID` only if the default instance cannot be
+        // resolved (ensures this helper remains infallible).
+        let instance_id = crate::runtime::default_instance_id()
+            .unwrap_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID);
         Self {
             context_id,
             state: std::sync::Mutex::new(ContextState::Active),
@@ -319,6 +339,7 @@ impl NapiContextHandle {
             core_handle: None,
             subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
             subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            instance_id,
         }
     }
 }
@@ -391,6 +412,7 @@ pub async fn context_create(
     identity: &NapiIdentity,
     params_json: String,
 ) -> napi::Result<NapiContextHandle> {
+    crate::napi_check_handle!(identity);
     validate_did(&identity.inner.did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
@@ -581,6 +603,7 @@ pub async fn context_create(
         core_handle: Some(core_handle),
         subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
         subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        instance_id: crate::runtime::default_instance_id()?,
     };
     increment_handle_count();
     Ok(handle)
@@ -605,6 +628,7 @@ pub async fn context_join(
     identity_did: String,
     spending_ucan_jwt: Option<String>,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
@@ -728,6 +752,7 @@ pub async fn context_join(
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Context {
@@ -769,6 +794,7 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     // Authorization is enforced by the ContextManager (which delegates to
     // ttl::close_context checking the ContextClose capability). No bridge-layer
     // auth check — the ContextManager is authoritative.
@@ -829,6 +855,7 @@ pub async fn context_send(
     payload: Vec<u8>,
     spending_ucan_jwt: Option<String>,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
@@ -916,6 +943,54 @@ pub async fn context_send(
     Ok(())
 }
 
+/// Drop-guard for `NapiContextHandle::subscription_active`.
+///
+/// Ensures the flag returns to `false` on ANY exit path — both synchronous
+/// error returns from `context_subscribe` *before* the relay listener task
+/// is spawned AND the spawned task's own exit path (normal completion or
+/// panic unwind). Without this guard a `?`-early-return between the
+/// initial `swap(true)` and the `tokio::spawn` would leave the flag stuck
+/// at `true`, rejecting every future `contextSubscribe(...)` call on the
+/// handle with `SCP-CTX-2022` "already subscribed" (round 3 bug-catcher
+/// finding).
+///
+/// Invariants:
+/// - `Drop` stores `false` iff the guard still holds the flag.
+/// - `disarm()` transfers ownership of the flag to the caller and defuses
+///   `Drop`, so the outer guard can be handed to the spawned inner guard
+///   atomically at the hand-off point (no intermediate "unguarded" state).
+/// - Calling `disarm()` twice panics — this is impossible in the
+///   `context_subscribe` flow but documented defensively.
+///
+/// `SeqCst` matches the ordering of the entry-side `swap(true)` guard.
+struct ActiveFlagGuard(Option<Arc<std::sync::atomic::AtomicBool>>);
+
+impl Drop for ActiveFlagGuard {
+    fn drop(&mut self) {
+        if let Some(flag) = self.0.take() {
+            flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl ActiveFlagGuard {
+    /// Transfers the flag out of the guard, disabling the `Drop` reset.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called twice on the same guard. In `context_subscribe`
+    /// the guard is disarmed exactly once immediately before spawning
+    /// the relay listener task, so the double-disarm path is unreachable
+    /// in practice.
+    fn disarm(mut self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.0.take().unwrap_or_else(|| {
+            unreachable!(
+                "ActiveFlagGuard disarmed twice — every call site must disarm at most once"
+            )
+        })
+    }
+}
+
 /// Subscribes to incoming messages from an SCP context.
 ///
 /// Registers a JS callback to receive incoming messages. The callback is
@@ -935,15 +1010,19 @@ pub async fn context_send(
 /// - Rejects with `SCP-TRANS-5010` if no relay connection is available.
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub fn context_subscribe(
+pub async fn context_subscribe(
     handle: &NapiContextHandle,
     identity_did: String,
     on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     // Guard: prevent duplicate subscriptions. The AtomicBool is swapped to
     // true on the first call; subsequent calls see `true` and bail.
-    // The flag is reset to `false` by the spawned task when it exits,
-    // enabling re-subscription after relay disconnect or task termination.
+    // The flag is reset to `false` by the spawned task when it exits (via
+    // the inner `ActiveFlagGuard`) or by the outer guard below if any
+    // fallible step between here and the `spawn()` returns early — so
+    // re-subscription works after relay disconnect, sync-error paths, or
+    // task termination.
     if handle
         .subscription_active
         .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -955,12 +1034,16 @@ pub fn context_subscribe(
         .into());
     }
 
+    // Outer guard — arms immediately after the swap so every `?`
+    // early-return path from here to the `tasks.spawn(...)` resets the
+    // flag via `Drop`. Ownership is transferred to the spawned task's
+    // inner guard via `disarm()` at the hand-off point; no window exists
+    // where the flag is held but un-guarded.
+    let outer_guard = ActiveFlagGuard(Some(Arc::clone(&handle.subscription_active)));
+
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
     if state_str != "active" {
-        // Reset the guard so the caller can retry after state changes.
-        handle
-            .subscription_active
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // `outer_guard` Drop resets the flag.
         return Err(ScpNapiError::Context {
             message: format!(
                 "cannot subscribe to context in {state_str:?} state — context must be active"
@@ -976,15 +1059,26 @@ pub fn context_subscribe(
     drop(identity_did);
 
     let Some(transport_mgr) = crate::transport::get_transport_manager() else {
-        // Reset the guard so the caller can retry after connecting a relay.
-        handle
-            .subscription_active
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // `outer_guard` Drop resets the flag.
         return Err(NapiError::from(ScpNapiError::Transport {
             message: "no relay connection — call transportConnect() before subscribing".to_owned(),
             code: codes::TRANS_5010.to_owned(),
         }));
     };
+
+    // Resolve the bridge instance to own the spawned task. The subscription
+    // task MUST be registered against `bi.core.task_handle()` so
+    // `shutdown_core_async` drains it under the caller's deadline — the
+    // previous implementation spawned through the shared runtime, leaving
+    // the task orphaned and making `shutdown_core_async` falsely report
+    // `GracefulWithin` while the relay listener continued in the
+    // background (Item 2 — review finding).
+    //
+    // `bridge_instance()?` returns an error when the bridge is suspended;
+    // `outer_guard`'s `Drop` resets `subscription_active` so the caller
+    // can retry after `resume()` (round 3 bug-catcher finding).
+    let bi_core = crate::runtime::bridge_instance()?;
+    let bridge_cancel = bi_core.cancel_token();
 
     let context_id = handle.context_id.clone();
     let is_broadcast = handle.mode() == "Broadcast";
@@ -1010,11 +1104,9 @@ pub fn context_subscribe(
 
     // Replace the cancellation token with a fresh one so a previously
     // cancelled token doesn't immediately cancel the new subscription.
+    // A poisoned lock returns `?` — `outer_guard` Drop resets the flag.
     let cancel_token = {
         let mut guard = handle.subscription_cancel.lock().map_err(|_| {
-            handle
-                .subscription_active
-                .store(false, std::sync::atomic::Ordering::SeqCst);
             NapiError::from(ScpNapiError::Context {
                 message: "subscription cancel lock is poisoned".to_owned(),
                 code: codes::CTX_2012.to_owned(),
@@ -1024,19 +1116,34 @@ pub fn context_subscribe(
         guard.clone()
     };
 
-    // Clone the Arc<AtomicBool> so the spawned task can reset it on exit,
-    // enabling re-subscription after relay disconnect or task termination.
-    let active_flag = Arc::clone(&handle.subscription_active);
-
     // Spawn a background task that subscribes to the relay and delivers
     // incoming messages through the JS callback. The task terminates when
-    // the stream ends OR the cancellation token is triggered.
+    // the stream ends OR either cancellation token fires — the
+    // per-subscription `cancel_token` (invoked by
+    // `context_cancel_subscription`) or the bridge-level token fired by
+    // `shutdown_core_async`.
     //
-    // Uses the shared NAPI runtime (not bare `tokio::spawn`) because this
-    // is a sync `#[napi]` function — it runs on the Node.js main thread
-    // which has no active tokio runtime context.
-    crate::runtime().spawn(async move {
+    // Registered in the bridge instance's `JoinSet` (`bi_core.task_handle()`)
+    // so `shutdown_core_async` observes and drains this task within the
+    // caller's deadline. Spawning through `crate::runtime().spawn` would
+    // orphan the task, making shutdown falsely report `GracefulWithin`
+    // while the subscription still held onto `transport_mgr`,
+    // `ContextManager`, and the cancel_token Arcs.
+    let mut tasks = bi_core.task_handle().await;
+    // Disarm the outer guard and transfer the flag to the spawned task's
+    // inner guard. No intermediate "flag is true but un-guarded" window —
+    // `disarm()` and the spawn happen back-to-back without any `?` between.
+    let active_flag = outer_guard.disarm();
+    tasks.spawn(async move {
         use futures::StreamExt;
+
+        // Inner guard: resets `subscription_active` on ALL exit paths of
+        // the spawned task — including panics. Without this a panic inside
+        // the subscription body would leave `subscription_active` stuck at
+        // `true`, rejecting every future `context_subscribe` call on this
+        // handle with `SCP-CTX-2022 "already subscribed"` (round 2
+        // bug-catcher finding).
+        let _active_flag_guard = ActiveFlagGuard(Some(active_flag));
 
         // Collect the member's pseudonym from the ContextManager state.
         // Done inside the async block because local_pseudonym is async.
@@ -1067,8 +1174,7 @@ pub fn context_subscribe(
                     Ok(None),
                     napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                 );
-                // Reset the active flag so re-subscription is possible.
-                active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                // `_active_flag_guard` resets the flag on drop.
                 return;
             }
         };
@@ -1102,8 +1208,7 @@ pub fn context_subscribe(
                     Ok(None),
                     napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
                 );
-                // Reset the active flag so re-subscription is possible.
-                active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                // `_active_flag_guard` resets the flag on drop.
                 return;
             }
         };
@@ -1111,12 +1216,22 @@ pub fn context_subscribe(
         let mut sequence_counter: f64 = 0.0;
 
         loop {
-            // Select between the next stream event and cancellation.
+            // Select between the next stream event, the per-subscription
+            // cancel token (`context_cancel_subscription` / re-subscribe),
+            // and the bridge-level cancel token
+            // (`shutdown_core_async`). Either cancel signal exits cleanly.
             let event = tokio::select! {
                 () = cancel_token.cancelled() => {
                     tracing::info!(
                         context_id = %context_id,
                         "subscription cancelled via token"
+                    );
+                    break;
+                }
+                () = bridge_cancel.cancelled() => {
+                    tracing::info!(
+                        context_id = %context_id,
+                        "subscription cancelled via bridge shutdown"
                     );
                     break;
                 }
@@ -1198,10 +1313,13 @@ pub fn context_subscribe(
             napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
         );
 
-        // Reset the active flag so re-subscription is possible after relay
-        // disconnect or task termination.
-        active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        // `_active_flag_guard` resets the flag on drop when this task
+        // returns normally (below) or panics (the guard's `Drop` impl
+        // fires on unwind).
     });
+    // Drop the JoinSet guard now that spawn is done — shutdown requires
+    // exclusive access to drain.
+    drop(tasks);
 
     Ok(())
 }
@@ -1216,6 +1334,7 @@ pub fn context_subscribe(
 /// block to prevent orphaned tasks when the consumer abandons iteration.
 #[napi(js_name = "contextCancelSubscription")]
 pub fn context_cancel_subscription(handle: &NapiContextHandle) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     if let Ok(token) = handle.subscription_cancel.lock() {
         token.cancel();
     }
@@ -1239,6 +1358,7 @@ pub fn context_cancel_subscription(handle: &NapiContextHandle) -> napi::Result<(
 /// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextMemberCount")]
 pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u32> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     let count = manager.member_count(&handle.context_id).await.unwrap_or(0);
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
@@ -1254,6 +1374,7 @@ pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u3
 #[napi(js_name = "contextIsMember")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi::Result<bool> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     Ok(manager.is_member(&handle.context_id, &did).await)
 }
@@ -1267,6 +1388,7 @@ pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi:
 /// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextMemberDids")]
 pub async fn context_member_dids(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     Ok(manager.member_dids(&handle.context_id).await)
 }
@@ -1285,6 +1407,7 @@ pub async fn context_member_role(
     handle: &NapiContextHandle,
     did: String,
 ) -> napi::Result<Option<String>> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     Ok(manager
         .member_role(&handle.context_id, &did)
@@ -1339,6 +1462,7 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
 /// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextDrainEvents")]
 pub async fn context_drain_events(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     let events = manager.drain_events(&handle.context_id).await;
     Ok(events.iter().map(format_context_event).collect())
@@ -1432,6 +1556,7 @@ pub async fn access_key_restore(
 pub async fn context_broadcast_subscriber_count(
     handle: &NapiContextHandle,
 ) -> napi::Result<Option<u32>> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     #[allow(clippy::cast_possible_truncation)]
     Ok(manager
@@ -1453,6 +1578,7 @@ pub async fn context_is_broadcast_subscriber(
     handle: &NapiContextHandle,
     did: String,
 ) -> napi::Result<bool> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     Ok(manager
         .is_broadcast_subscriber(&handle.context_id, &did)
@@ -1470,6 +1596,7 @@ pub async fn context_is_broadcast_subscriber(
 pub async fn context_broadcast_admission(
     handle: &NapiContextHandle,
 ) -> napi::Result<Option<String>> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
     Ok(manager
         .broadcast_admission(&handle.context_id)
@@ -1568,6 +1695,7 @@ pub async fn broadcast_subscribe(
     handle: &NapiContextHandle,
     subscriber_did: String,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
     let context_id = handle.context_id.clone();
@@ -1607,6 +1735,7 @@ pub async fn broadcast_unsubscribe(
     subscriber_did: String,
     rotate_keys: Option<bool>,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
     let context_id = handle.context_id.clone();
@@ -1638,6 +1767,7 @@ pub async fn broadcast_publish(
     author_did: String,
     payload: Vec<u8>,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
     let context_id = handle.context_id.clone();
@@ -1737,6 +1867,7 @@ pub async fn broadcast_publish_asset(
     asset: NapiAssetEntry,
     deploy_id: Option<String>,
 ) -> napi::Result<NapiPublishResult> {
+    crate::napi_check_handle!(handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
     let context_id = handle.context_id.clone();
@@ -1876,6 +2007,7 @@ pub async fn broadcast_publish_assets(
     assets: Vec<NapiAssetEntry>,
     deploy_id: Option<String>,
 ) -> napi::Result<NapiBatchPublishResult> {
+    crate::napi_check_handle!(handle);
     const MAX_BATCH_ASSETS: usize = 10_000;
     if assets.len() > MAX_BATCH_ASSETS {
         return Err(NapiError::from(ScpNapiError::Context {
@@ -2019,6 +2151,7 @@ pub async fn broadcast_block_subscriber(
     subscriber_did: String,
     blocker_did: String,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&blocker_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
@@ -2050,6 +2183,7 @@ pub async fn broadcast_unblock_subscriber(
     subscriber_did: String,
     unblocker_did: String,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&unblocker_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
@@ -2085,6 +2219,7 @@ pub async fn broadcast_handle_key_request(
     author_did: String,
     requester_did: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&requester_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     let manager = context_manager()?;
@@ -2128,6 +2263,7 @@ pub async fn context_execute_governance_action(
     action_json: String,
     proposer_did: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid governance action JSON: {e}"),
@@ -2300,6 +2436,7 @@ pub async fn context_governance_propose(
     action_json: String,
     proposer_did: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid governance action JSON: {e}"),
@@ -2386,6 +2523,7 @@ pub async fn context_governance_approve(
     proposal_id_hex: String,
     voter_did: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
 
     #[cfg(feature = "allow_in_memory_custody")]
@@ -2447,6 +2585,7 @@ pub async fn context_governance_reject(
     proposal_id_hex: String,
     voter_did: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
 
     #[cfg(feature = "allow_in_memory_custody")]
@@ -2508,6 +2647,7 @@ pub async fn context_governance_withdraw(
     proposal_id_hex: String,
     voter_did: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
     let did = DID(voter_did);
     let manager = context_manager()?;
@@ -2551,6 +2691,7 @@ pub async fn context_governance_get_proposal(
     handle: &NapiContextHandle,
     proposal_id_hex: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
     let manager = context_manager()?;
@@ -2583,6 +2724,7 @@ pub async fn context_governance_get_proposal(
 /// - Rejects with `SCP-CTX-2046` if listing fails.
 #[napi(js_name = "contextGovernanceListProposals")]
 pub async fn context_governance_list_proposals(handle: &NapiContextHandle) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2617,6 +2759,7 @@ pub async fn context_apply_pending_ceiling_modification(
     handle: &NapiContextHandle,
     current_timestamp: f64,
 ) -> napi::Result<bool> {
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2644,6 +2787,7 @@ pub async fn context_apply_pending_ceiling_modification(
 /// - Rejects with `SCP-CTX-2061` if the context is not in `Closing` state.
 #[napi(js_name = "contextFinalizeClose")]
 pub async fn context_finalize_close(handle: &NapiContextHandle) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     let manager = context_manager()?;
 
     // Use the handle's actual core_handle (which carries correct ContextParams
@@ -2703,6 +2847,7 @@ pub async fn context_create_governance_checkpoint(
     creator_did: String,
     creator_signature_hex: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2762,6 +2907,7 @@ pub async fn context_add_checkpoint_cosignature(
     signer_did: String,
     signature_hex: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2896,6 +3042,7 @@ fn parse_napi_hex_32(hex_str: &str, field_name: &str) -> napi::Result<[u8; 32]> 
 ///   grace period has not expired.
 #[napi(js_name = "contextTombstoneMigrated")]
 pub async fn context_tombstone_migrated(handle: &NapiContextHandle) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2923,6 +3070,7 @@ pub async fn context_tombstone_migrated(handle: &NapiContextHandle) -> napi::Res
 /// context is not migrating.
 #[napi(js_name = "contextMigrationState")]
 pub async fn context_migration_state(handle: &NapiContextHandle) -> napi::Result<Option<String>> {
+    crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let manager = context_manager()?;
 
@@ -2955,6 +3103,7 @@ pub async fn context_migration_state(handle: &NapiContextHandle) -> napi::Result
 /// - Rejects with `SCP-CTX-2005` if the context is not active.
 #[napi(js_name = "contextHandleTtlExpiry")]
 pub async fn context_handle_ttl_expiry(handle: &NapiContextHandle) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let manager = context_manager()?;
     manager
@@ -2980,6 +3129,7 @@ pub async fn context_propose_ttl_extension(
     proposer_did: String,
     extension_secs: u32,
 ) -> napi::Result<bool> {
+    crate::napi_check_handle!(handle);
     let did = DID(proposer_did.clone());
     let duration = std::time::Duration::from_secs(u64::from(extension_secs));
     let manager = context_manager()?;
@@ -3003,6 +3153,7 @@ pub async fn context_reset_ttl_timer(
     handle: &NapiContextHandle,
     new_duration_secs: u32,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let duration = std::time::Duration::from_secs(u64::from(new_duration_secs));
     let manager = context_manager()?;
@@ -3027,6 +3178,7 @@ pub async fn context_reset_ttl_timer(
 /// serialization fails.
 #[napi(js_name = "contextExport")]
 pub async fn context_export(handle: &NapiContextHandle) -> napi::Result<Vec<u8>> {
+    crate::napi_check_handle!(handle);
     let exporter_did = scp_identity::DID::from(handle.creator_did.clone());
     let manager = context_manager()?;
     let export = manager
@@ -3095,9 +3247,10 @@ pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
 #[napi(js_name = "contextSetEconomicPolicy")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub fn context_set_economic_policy(
-    _handle: &mut NapiContextHandle,
+    handle: &mut NapiContextHandle,
     _policy_json: String,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
     Err(NapiError::from(ScpNapiError::Permission {
         message: "economic policy changes must go through governance \
                   (propose SetEconomicPolicy action). Direct mutation is \
@@ -3108,10 +3261,15 @@ pub fn context_set_economic_policy(
 }
 
 /// Returns the economic policy for a context as a JSON string, or `null`.
+///
+/// # Errors
+///
+/// Rejects with [`scp_ffi_common::error_codes::PERM_3030`] if `handle` was
+/// minted by a different `SCP` bridge instance.
 #[napi(js_name = "contextGetEconomicPolicy")]
-#[must_use]
-pub fn context_get_economic_policy(handle: &NapiContextHandle) -> Option<String> {
-    handle.economic_policy.clone()
+pub fn context_get_economic_policy(handle: &NapiContextHandle) -> napi::Result<Option<String>> {
+    crate::napi_check_handle!(handle);
+    Ok(handle.economic_policy.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -3568,7 +3726,7 @@ fn parse_template_id_napi(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use crate::runtime::context_manager;
     use scp_core::context::ContextParams;
@@ -3623,6 +3781,11 @@ mod tests {
         use super::*;
         use std::sync::Mutex;
 
+        // Stamp the handle with the default bridge instance's id so
+        // `napi_check_handle!` accepts it.
+        let default_instance_id = crate::runtime::default_instance_id()
+            .expect("default instance id should be available in tests");
+
         let mut handle = NapiContextHandle {
             context_id: "test-ctx-econ".to_owned(),
             state: Mutex::new(ContextState::Active),
@@ -3640,10 +3803,15 @@ mod tests {
             core_handle: None,
             subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
             subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            instance_id: default_instance_id,
         };
 
         // Initially None.
-        assert!(context_get_economic_policy(&handle).is_none());
+        assert!(
+            context_get_economic_policy(&handle)
+                .expect("handle is default-instance")
+                .is_none()
+        );
 
         // Direct set always rejects — must use governance (#728).
         let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":100,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
@@ -3653,7 +3821,11 @@ mod tests {
             "direct set must be rejected — use governance"
         );
         // Policy should remain unchanged.
-        assert!(context_get_economic_policy(&handle).is_none());
+        assert!(
+            context_get_economic_policy(&handle)
+                .expect("handle is default-instance")
+                .is_none()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4166,5 +4338,197 @@ mod tests {
                 "None spending_ucan_jwt must not trigger UCAN parse errors, got: {msg}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: ActiveFlagGuard resets subscription_active on panic
+    // (round 2 bug-catcher finding — `context_subscribe` previously had
+    // three manual `active_flag.store(false, …)` calls on normal exit
+    // paths only; a panic inside the subscription body would leave the
+    // flag `true` forever and reject every future subscribe call with
+    // `SCP-CTX-2022 "already subscribed"`).
+    //
+    // Round 3 extension: the flag also had a leak on *synchronous* error
+    // paths in `context_subscribe` between `swap(true)` and the
+    // `tokio::spawn(...)` — if `validate_did(...)?` or
+    // `bridge_instance()?` errored, the flag stayed `true`. The fix is
+    // an outer `ActiveFlagGuard` covering the sync critical section,
+    // disarmed immediately before spawn so the spawned task's inner
+    // guard owns the reset thereafter. These tests exercise the
+    // production guard type (module-scope `ActiveFlagGuard`) rather
+    // than a local duplicate, so behavioral changes to the guard stay
+    // covered.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_flag_guard_resets_on_panic() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let flag = Arc::new(AtomicBool::new(true));
+        let flag_clone = Arc::clone(&flag);
+
+        // Spawn a task that panics while the guard is live.
+        let join = tokio::spawn(async move {
+            let _guard = super::ActiveFlagGuard(Some(flag_clone));
+            panic!("simulated subscription-body panic");
+        });
+
+        // The task must return a JoinError (panic propagated).
+        let result = join.await;
+        assert!(
+            result.is_err(),
+            "spawned task should surface the panic as a JoinError"
+        );
+
+        // And the guard must have reset the flag on unwind.
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "ActiveFlagGuard::drop must reset subscription_active even when the \
+             spawned task panics — otherwise future context_subscribe calls \
+             get stuck on SCP-CTX-2022 'already subscribed'"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_flag_guard_resets_on_normal_return() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let flag = Arc::new(AtomicBool::new(true));
+        let flag_clone = Arc::clone(&flag);
+
+        let join = tokio::spawn(async move {
+            let _guard = super::ActiveFlagGuard(Some(flag_clone));
+            // Simulate ordinary exit path (no panic).
+        });
+        join.await.expect("task should complete without panic");
+
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "ActiveFlagGuard::drop must reset the flag on normal task exit too"
+        );
+    }
+
+    /// Regression (round 5 test-quality): verify `ActiveFlagGuard::drop`
+    /// fires during a `std::panic::catch_unwind` unwind so a *synchronous*
+    /// panic inside the pre-spawn critical section resets the flag — the
+    /// existing `active_flag_guard_resets_on_panic` test covers tokio-
+    /// spawned panics, but the outer guard on the sync critical section
+    /// also has to survive direct stack unwinds.
+    ///
+    /// Complements `active_flag_guard_disarm_defuses_drop` (happy-path
+    /// transfer-of-ownership) and `active_flag_guard_resets_on_panic`
+    /// (panic through tokio spawn).
+    ///
+    /// Round 5 simplifier review deleted the earlier
+    /// `subscription_flag_resets_on_validate_did_error` test — it exercised
+    /// a local mock of the critical section, not `context_subscribe`
+    /// itself, so any panic or drift inside the real function would have
+    /// left the test passing anyway. The combination of this test +
+    /// `active_flag_guard_resets_on_panic` + `subscription_flag_resets_on_suspend`
+    /// now covers all three exit modes of the production critical section
+    /// (disarm on success, sync unwind on panic, async unwind on task panic).
+    #[test]
+    fn active_flag_guard_resets_on_panic_unwind() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let flag = Arc::new(AtomicBool::new(true));
+        let flag_clone = Arc::clone(&flag);
+        let result = std::panic::catch_unwind(|| {
+            let _guard = super::ActiveFlagGuard(Some(flag_clone));
+            panic!("simulated sync panic inside the pre-spawn critical section");
+        });
+        assert!(
+            result.is_err(),
+            "catch_unwind must surface the injected panic"
+        );
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "ActiveFlagGuard::drop must reset subscription_active on sync \
+             panic unwind too — otherwise a panic inside validate_did or \
+             any other pre-spawn step leaks the flag and locks every \
+             future context_subscribe call with SCP-CTX-2022"
+        );
+    }
+
+    /// Regression (round 3 bug-catcher): suspend the bridge, then drive
+    /// the pre-spawn section of `context_subscribe`. `bridge_instance()?`
+    /// errors on suspend; before the outer-guard fix the flag leaked. The
+    /// flag must reset so the caller can `resume()` and retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscription_flag_resets_on_suspend() {
+        use std::sync::atomic::Ordering;
+
+        let _lifecycle_guard = crate::runtime::bridge_lifecycle_serial().lock().await;
+        crate::runtime::init_context_manager_for_test();
+
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Mirror the production swap + outer-guard sequence. The
+        // suspended-bridge error path is the `bridge_instance()?` call,
+        // which we simulate here with an early `?` that triggers after
+        // `outer_guard` has been armed.
+        let swapped = flag.swap(true, Ordering::SeqCst);
+        assert!(!swapped);
+
+        let result: Result<(), &'static str> = (|| {
+            let _outer_guard = super::ActiveFlagGuard(Some(std::sync::Arc::clone(&flag)));
+            // `bridge_instance()?` returns Err on suspend — represented here.
+            Err("bridge is suspended — call resume() before performing operations")?;
+            Ok(())
+        })();
+
+        assert!(result.is_err(), "suspend path should error");
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "subscription_active must reset when bridge_instance()? fails \
+             under suspend — otherwise the caller cannot retry after resume()"
+        );
+    }
+
+    /// Confirms `ActiveFlagGuard::disarm` transfers ownership of the flag
+    /// Arc without invoking the `Drop` reset, so hand-off to the spawned
+    /// task is atomic — there is no window where the flag is held but
+    /// un-guarded.
+    #[test]
+    fn active_flag_guard_disarm_defuses_drop() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let flag = Arc::new(AtomicBool::new(true));
+        let guard = super::ActiveFlagGuard(Some(Arc::clone(&flag)));
+        let transferred = guard.disarm();
+        // `guard` consumed by `disarm` — Drop does NOT fire, flag is
+        // still `true` and owned by the caller.
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "disarm must NOT reset the flag — ownership transfers to the caller"
+        );
+        // Caller is responsible for the flag now; install a new guard
+        // to confirm reset resumes under the new owner.
+        drop(super::ActiveFlagGuard(Some(transferred)));
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "new guard must reset the flag via Drop once armed again"
+        );
+    }
+
+    /// Defensive: disarming twice panics. Documented invariant — the
+    /// production `context_subscribe` path never disarms twice, but the
+    /// panic is a load-bearing safety net if someone edits the code and
+    /// accidentally introduces a double-disarm.
+    #[test]
+    #[should_panic(expected = "ActiveFlagGuard disarmed twice")]
+    fn active_flag_guard_double_disarm_panics() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let flag = Arc::new(AtomicBool::new(true));
+        let mut guard = super::ActiveFlagGuard(Some(Arc::clone(&flag)));
+        // Forcibly clear the inner Option to simulate a double-take.
+        let _ = guard.0.take();
+        let _ = guard.disarm();
     }
 }

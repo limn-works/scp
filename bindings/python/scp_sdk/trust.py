@@ -25,6 +25,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import ContextError, ScpError
 
 logger = logging.getLogger("scp_sdk")
@@ -395,6 +396,7 @@ class TrustEvaluation:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 async def evaluate_trust(
     subject_did: str,
     context_id: str,
@@ -802,6 +804,7 @@ class RequireParticipation:
         }
 
 
+@deprecated_default_instance
 def verify_participation_requirements(
     requirements: list[RequireParticipation],
     profiles: list[ParticipationProfile],
@@ -840,6 +843,7 @@ def verify_participation_requirements(
     bridge.verify_participation_requirements(profile_json, requirements_json)
 
 
+@deprecated_default_instance
 def aggregate_trust_input(
     context_id: str,
     subject_did: str,

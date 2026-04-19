@@ -76,6 +76,51 @@ use std::time::Duration;
 
 use napi_derive::napi;
 
+/// Runtime handle-affinity check at every `#[napi]` entry that accepts a
+/// handle.
+///
+/// Matches the `PyO3` bridge's
+/// [`pyscp_check_handle!`](../../scp_ffi/macro.pyscp_check_handle.html)
+/// for cross-bridge symmetry.
+///
+/// Resolves [`bridge_instance_for_affinity`](crate::runtime::bridge_instance_for_affinity)
+/// internally and checks each `$handle.instance_id` against the core's.
+///
+/// `$handle` must carry an inherent `instance_id(&self) -> u64` method
+/// (`HandleInstance` in the runtime module).
+///
+/// Raises [`crate::error::ScpNapiError::Permission`] with error code
+/// `SCP-PERM-3030` on mismatch.
+///
+/// Round 5 simplifier review dropped the explicit `$core` parameter
+/// after confirming all 175 call sites across the three bridges passed
+/// the same `bridge_instance_for_affinity()?` value. If a future
+/// per-instance `Scp::method` needs to target `&self.inner.core`, add a
+/// second macro arm rather than re-expanding the default one.
+///
+/// Usage:
+///
+/// ```ignore
+/// napi_check_handle!(handle);
+/// napi_check_handle!(identity, context_handle);
+/// ```
+#[macro_export]
+macro_rules! napi_check_handle {
+    ($($handle:expr),+ $(,)?) => {{
+        // Method resolution on `check_handle` auto-derefs through `&T`,
+        // `&Arc<T>`, `Arc<T>`, and `CoreFields` directly. `CoreFields`
+        // has an inherent `check_handle` method, so the trait need not
+        // be in scope. Mirrors the PyO3 bridge's `pyscp_check_handle!`
+        // pattern.
+        let __core = $crate::runtime::bridge_instance_for_affinity()?;
+        $(
+            __core
+                .check_handle($crate::runtime::HandleInstance::instance_id($handle))
+                .map_err(|e| ::napi::Error::from($crate::error::ScpNapiError::from(e)))?;
+        )+
+    }};
+}
+
 pub mod bridge_connector;
 pub mod context;
 pub mod discovery;
@@ -87,12 +132,15 @@ pub mod mcp;
 pub mod media;
 pub mod provenance;
 pub mod runtime;
+pub mod scp;
 pub mod scpid;
 pub mod sync;
 pub mod tools;
 pub mod transport;
 pub mod trust;
 pub mod ucan;
+
+pub use scp::Scp;
 
 // Server startup (relay + application node) — behind the `server` feature on
 // scp-ffi-common. Not available for WASM (ADR-034).
@@ -199,57 +247,96 @@ pub fn scp_version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
 }
 
-/// Waits for all outstanding FFI handles to be released, then returns.
+/// Shuts down the default bridge instance gracefully.
 ///
-/// Call this from Node.js/Bun before your process exits (e.g., in a
-/// `process.on('exit', ...)` handler or after shutting down all SCP objects).
-/// It blocks (on a background thread) until either:
+/// Awaits in-flight tasks up to `timeout_millis` **milliseconds**, aborts
+/// any remaining tasks when the deadline expires, then clears registries,
+/// disconnects transport, and runs shutdown hooks. Finally waits up to the
+/// same deadline for outstanding opaque FFI handles
+/// (`NapiIdentity`, `NapiContextHandle`, `NapiUcanToken`,
+/// `NapiTransportManager`, …) to be released.
 ///
-/// - All opaque handle objects (`NapiIdentity`, `NapiContextHandle`,
-///   `NapiUcanToken`, `NapiTransportManager`) have been GC'd / freed, **or**
-/// - The `timeout_secs` deadline has elapsed.
+/// The unit is **milliseconds** — unified across all Rust bridges so the
+/// Python, TypeScript, Swift, and Kotlin SDKs can share a single
+/// conversion surface (`timeout_secs: number` in the SDK wrapper is
+/// multiplied by 1000 before crossing FFI). The NAPI `u32` millis range
+/// is 2^32 ms ≈ 49.7 days, which is far beyond any realistic shutdown
+/// budget.
 ///
-/// The default timeout is 5 seconds (per ADR-022 acceptance criterion 7).
-/// Pass `0` to return immediately without waiting.
+/// Returns a `Promise<void>` — call `await scpShutdown(5000)` from JS.
+/// Pass `0` to skip both graceful drain and handle-release polling.
 ///
-/// # Thread safety
-///
-/// This function is safe to call from any thread. It polls `HANDLE_COUNT`
-/// in 10 ms intervals and does not block the Node.js event loop.
+/// **Breaking change (Phase 4 PR 1 / AC5)**: the signature moved from
+/// sync `void` to async `Promise<void>`, and the unit changed from
+/// **seconds** (`u32`) to **milliseconds** (`u32`) to unify the Rust
+/// bridge signatures. Callers migrating away from the free-function
+/// façade should switch to `scp.shutdown(5000)` on an owned `SCP`
+/// instance.
 ///
 /// # JS usage
 ///
 /// ```js
-/// process.on('exit', () => {
-///   scpShutdown(5); // wait up to 5 seconds for handle cleanup
+/// process.on('beforeExit', async () => {
+///   await scpShutdown(5_000); // wait up to 5 seconds (5,000 ms)
 /// });
 /// ```
 #[napi]
-pub fn scp_shutdown(timeout_secs: u32) {
-    // Shut down the BridgeInstance first (clears registries, runs hooks,
-    // disconnects transport). Best-effort: if the instance was never
-    // initialized or is already shut down, this is a no-op.
-    //
-    // Skip in test builds: shutdown permanently poisons the OnceLock-based
-    // BridgeInstance, and since cargo runs all tests in the same process,
-    // this would destroy contexts created by concurrently-running tests.
-    // Wrap in catch_unwind: during process teardown (e.g., bun test exit),
-    // MLS or tokio state may already be partially dropped, causing panics
-    // in destroy_mls_group or task abort. A panic here would abort the
-    // process with "failed to initiate panic" (double-panic).
+pub async fn scp_shutdown(timeout_millis: u32) -> napi::Result<()> {
+    let timeout = Duration::from_millis(u64::from(timeout_millis));
+
+    // In test builds we intentionally skip shutting down the default
+    // bridge instance — the `OnceLock` is process-global and one shutdown
+    // would poison state shared by every other test in the same binary.
     #[cfg(not(test))]
-    if let Some(bi) = runtime::bridge_instance_raw()
-        && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bi.shutdown())).is_err()
-    {
-        tracing::error!("BridgeInstance shutdown panicked — cleanup may be incomplete");
+    if let Some(bi) = runtime::default_bridge_instance_raw() {
+        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
+        // Wrap in catch_unwind: during process teardown (e.g., bun test
+        // exit), MLS or tokio state may already be partially dropped,
+        // causing panics in destroy_mls_group or task abort. A panic here
+        // would abort the process with "failed to initiate panic"
+        // (double-panic).
+        let bi_for_catch = std::sync::Arc::clone(bi);
+        let fut = bi_for_catch.shutdown(timeout);
+        match std::panic::AssertUnwindSafe(fut).catch_unwind_await().await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::debug!("bridge shutdown returned: {e}");
+            }
+            Err(_) => {
+                tracing::error!("NapiBridgeInstance shutdown panicked — cleanup may be incomplete");
+            }
+        }
     }
 
-    if timeout_secs == 0 {
-        return;
+    if timeout_millis == 0 {
+        return Ok(());
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(u64::from(timeout_secs));
+    let deadline = std::time::Instant::now() + timeout;
     while HANDLE_COUNT.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Ok(())
+}
+
+/// Helper trait to support `catch_unwind` on async futures.
+///
+/// `std::panic::catch_unwind` is sync-only; wrapping a future in
+/// `AssertUnwindSafe` still yields a sync `catch_unwind` guard around the
+/// `Future` polls. We use `futures::FutureExt::catch_unwind` instead for
+/// the async path (already pulled in via workspace `futures`).
+#[cfg(not(test))]
+trait CatchUnwindAwait: core::future::Future + Sized {
+    async fn catch_unwind_await(self) -> Result<Self::Output, Box<dyn std::any::Any + Send>>;
+}
+
+#[cfg(not(test))]
+impl<F> CatchUnwindAwait for std::panic::AssertUnwindSafe<F>
+where
+    F: core::future::Future,
+{
+    async fn catch_unwind_await(self) -> Result<Self::Output, Box<dyn std::any::Any + Send>> {
+        use futures::FutureExt;
+        self.catch_unwind().await
     }
 }
 
@@ -276,8 +363,8 @@ pub fn scp_shutdown(timeout_secs: u32) {
 /// ```
 #[napi]
 pub fn scp_suspend() -> napi::Result<()> {
-    if let Some(bi) = runtime::bridge_instance_raw() {
-        bi.suspend().map_err(|e| {
+    if let Some(bi) = runtime::default_bridge_instance_raw() {
+        bi.core.suspend().map_err(|e| {
             napi::Error::from(crate::error::ScpNapiError::Transport {
                 message: format!("suspend failed: {e}"),
                 code: scp_ffi_common::error_codes::TRANS_5001.to_owned(),
@@ -300,8 +387,8 @@ pub fn scp_suspend() -> napi::Result<()> {
 /// Throws `ScpContextError` if the instance has been permanently shut down.
 #[napi]
 pub fn scp_resume() -> napi::Result<()> {
-    if let Some(bi) = runtime::bridge_instance_raw() {
-        bi.resume().map_err(|e| {
+    if let Some(bi) = runtime::default_bridge_instance_raw() {
+        bi.core.resume().map_err(|e| {
             napi::Error::from(crate::error::ScpNapiError::Context {
                 message: format!("resume failed: {e}"),
                 code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
@@ -326,10 +413,10 @@ mod tests {
         assert!(!v.is_empty(), "version string must not be empty");
     }
 
-    #[test]
-    fn scp_shutdown_zero_timeout_returns_immediately() {
+    #[tokio::test]
+    async fn scp_shutdown_zero_timeout_returns_immediately() {
         // Must return without hanging even if handles are live.
-        scp_shutdown(0);
+        scp_shutdown(0).await.expect("scp_shutdown(0) must succeed");
     }
 
     #[test]

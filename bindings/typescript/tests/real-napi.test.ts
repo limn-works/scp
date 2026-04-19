@@ -110,8 +110,13 @@ if (bridge === null || serverAddon === null) {
   // Lifecycle hooks
   // ---------------------------------------------------------------------------
 
-  afterAll(() => {
-    napi.shutdown(1);
+  afterAll(async () => {
+    // Shutdown timeout is in milliseconds after #1549 Phase 4 unit
+    // unification — 1000 ms (1 second) gives pending tasks time to
+    // drain without stalling the suite. `napi.shutdown` is now async
+    // (returns `Promise<void>`); previously sync — fire-and-forget
+    // would clear bridge state mid-test in later tests.
+    await napi.shutdown(1000);
     if (relayHandle && !relayHandle.isShutdown) {
       relayHandle.shutdown();
     }
@@ -928,10 +933,12 @@ if (bridge === null || serverAddon === null) {
       expect(v.length).toBeGreaterThan(0);
     });
 
-    test("shutdown with 0 timeout returns immediately", () => {
-      // Should not hang.
-      napi.shutdown(0);
-    });
+    // NOTE: There is no `shutdown(0)` test here because the bridge is
+    // process-global and once shut down it cannot be revived for
+    // subsequent tests. A shutdown test belongs in a dedicated test
+    // file that runs in a process of its own (see `lifecycle.test.ts`
+    // for suspend/resume coverage). `shutdown(timeoutMillis)` is
+    // exercised end-to-end via the `afterAll` hook above.
   });
 
   // ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
+from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import UcanPermissionError
 
 try:
@@ -103,6 +104,7 @@ class UcanToken:
 # ---------------------------------------------------------------------------
 
 
+@deprecated_default_instance
 async def validate(context: str, token: str, capability: str) -> None:
     """Validate a UCAN token against a required capability.
 
@@ -131,6 +133,7 @@ async def validate(context: str, token: str, capability: str) -> None:
         raise UcanPermissionError(str(exc)) from exc
 
 
+@deprecated_default_instance
 async def mint(
     audience: str,
     capabilities: Sequence[str],
@@ -185,6 +188,7 @@ async def mint(
     return UcanToken._from_bridge(bridge_token)
 
 
+@deprecated_default_instance
 async def revoke(context: str, token: str, revoker_did: str) -> None:
     """Revoke a UCAN token using the full revocation pipeline.
 
@@ -208,6 +212,7 @@ async def revoke(context: str, token: str, revoker_did: str) -> None:
         raise UcanPermissionError(str(exc)) from exc
 
 
+@deprecated_default_instance
 async def delegate(
     parent_token: UcanToken,
     delegator: str,
