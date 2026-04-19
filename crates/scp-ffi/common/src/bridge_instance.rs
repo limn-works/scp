@@ -995,7 +995,11 @@ impl CoreFields {
     /// shutdown and we must not resurrect it by admitting a late writer.
     /// Without this guard, a concurrent `add_relay_url` racing with a
     /// shutdown-triggered `relay_urls.clear()` could leave a stale URL in
-    /// the set that a subsequent `resume` would try to dial.
+    /// the set that a subsequent `resume` would try to dial. The
+    /// `is_shutdown()` check is performed twice — once fast-path before
+    /// acquiring the lock, and once after — to close the TOCTOU window
+    /// between the first check and the insert (symmetric with
+    /// [`register_shutdown_hook`]).
     ///
     /// If the `relay_urls` mutex is poisoned (a previous caller panicked
     /// while holding it), the URL is silently dropped and a warning is
@@ -1006,6 +1010,19 @@ impl CoreFields {
         }
         match self.relay_urls.lock() {
             Ok(mut guard) => {
+                // Re-check `is_shutdown` after acquiring the lock to close
+                // the TOCTOU window between the check above and the insert
+                // below. Without this, a concurrent `shutdown()` could drain
+                // and clear the `relay_urls` set (inside
+                // `shutdown_core_async`) after we saw `is_shutdown() ==
+                // false` but before our insert, leaving a stale URL in a
+                // set that a subsequent `resume()` would try to dial.
+                // Matches the symmetric re-check pattern in
+                // [`register_shutdown_hook`].
+                if self.is_shutdown() {
+                    drop(guard);
+                    return;
+                }
                 guard.insert(url);
             }
             Err(_) => {
@@ -3192,6 +3209,43 @@ mod tests {
              cleared it — that would leak a URL into a subsequent resume attempt"
         );
         assert!(!instance.has_pending_relay_urls());
+    }
+
+    #[test]
+    fn add_relay_url_race_with_shutdown_never_leaks_urls() {
+        // Regression: if `add_relay_url`'s `is_shutdown()` check happens
+        // outside the lock, a concurrent shutdown can clear the URL set
+        // between the check and the insert. The post-condition of a
+        // completed shutdown is that `pending_relay_urls()` is empty; if
+        // the race leaves any URL behind, a subsequent `resume()` would
+        // dial a relay the caller already walked away from.
+        //
+        // Run 50 trials × 100 concurrent URL adds racing against shutdown.
+        // Each trial constructs a fresh instance, launches a writer thread
+        // pushing 100 distinct URLs, concurrently shuts the instance down,
+        // joins both, and asserts the post-shutdown URL set is empty.
+        use std::thread;
+        for trial in 0..50 {
+            let instance = Arc::new(CoreFields::with_context_manager(test_context_manager()));
+            let writer_instance = Arc::clone(&instance);
+            let writer = thread::spawn(move || {
+                for i in 0..100 {
+                    writer_instance.add_relay_url(format!("wss://relay{i}.example.com"));
+                }
+            });
+            let shutdown_instance = Arc::clone(&instance);
+            let shutter = thread::spawn(move || {
+                shutdown_instance.shutdown();
+            });
+            writer.join().unwrap();
+            shutter.join().unwrap();
+            assert!(
+                instance.pending_relay_urls().is_empty(),
+                "trial {trial}: relay URLs leaked past shutdown — \
+                 add_relay_url admitted a writer after shutdown cleared the set"
+            );
+            assert!(!instance.has_pending_relay_urls());
+        }
     }
 
     #[test]
