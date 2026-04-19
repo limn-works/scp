@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Closes #1342, #1260, #1491, #1678. See `.docs/adrs/ADR-048-scp-multi-instance.md` § "PR 3 actualized" for the full design commentary.
 
+### Phase 4 PR 4 — Test codemod + enforcement + docs
+
+- **Migration guide published** at `.docs/migration/phase-4.md`. Covers every breaking change landed in PR 1 → PR 3, the per-test `SCP` fixture recipe for Python / TypeScript / Swift / Kotlin, the `SCP-DEFAULT-INSTANCE-OK` opt-in tag, and the CI gate reference table.
+- **New CI gate — `scripts/check-no-default-in-tests.sh`.** Fails the build if a test file calls a free-function façade (`scp_sdk.context_create(...)`, `.contextCreate(...)`, etc.) without an explicit `SCP-DEFAULT-INSTANCE-OK: <reason>` tag on the offending line or within 2 lines above. Guards the per-test-fixture invariant from ADR-048 §Decision 3. Exempts deprecation-verifying tests by filename.
+- **New CI gate — `scripts/check-no-fallback-registry.sh`.** Greps for the `EMPTY_IDENTITY_REGISTRY` / `EMPTY_UCAN_REGISTRY` identifiers deleted in PR 2. Accepts occurrences inside comments (they remain as historical context); fails on any non-comment use. Regression guard for the silent "bridge not initialized" data-loss pattern described in ADR-048 §Context.
+- **CI wiring.** `check-no-bridge-globals.sh`, `check-no-fallback-registry.sh`, and `check-handle-affinity.sh` are now required status checks alongside the existing `cross-layer`, `protocol-sync`, and `sdk-coverage` gates. `check-no-default-in-tests.sh` is staged in-tree but NOT yet wired to CI — it fires on ~500 pre-existing call sites that the per-test SCP fixture codemod (next PR) migrates to the new fixture pattern. The gate lights up in the codemod PR once those call sites move or carry the `SCP-DEFAULT-INSTANCE-OK` opt-in tag.
+- **SDK capability matrix.** Added explicit rows for `scp_new`, `scp_default` (deprecated), `scp_with_storage_in_memory`, `scp_instance_id`, `shutdown_timeout`. The pre-existing `suspend` / `resume` / `with_storage_sqlite` / `add_relay_url` rows already documented the async / multi-relay surface.
+- **CLAUDE.md enforcement file list updated.** The four gate scripts, `ratchet/once-lock-count.json`, and `sdk-capability-matrix.json` are all flagged as "modify only to expand coverage" so future agents can't silently weaken them.
+
+No runtime or semantic changes. Closes #1549.
+
 ## [Unreleased] - 2026-03-16
 
 ### Security

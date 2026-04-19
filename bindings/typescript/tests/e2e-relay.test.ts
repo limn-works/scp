@@ -130,6 +130,7 @@ if (bridge === null || serverAddon === null) {
     // Bootstrap identity first to get a DID for MLS credential identity.
     // This must happen BEFORE configureRelayTransport because the
     // ContextManager OnceLock is set by whichever call wins the race.
+    // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
     const bootstrap = await napi.identityCreate("in_memory");
 
     // Configure the ContextManager with a relay-backed transport provider.
@@ -151,6 +152,7 @@ if (bridge === null || serverAddon === null) {
     // tasks terminate before the relay shuts down.
     for (const { handle, did } of subscribedContexts) {
       try {
+        // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
         await napi.contextClose(handle, did);
       } catch {
         // Best-effort — context may already be closed.
@@ -203,7 +205,9 @@ if (bridge === null || serverAddon === null) {
 
   describe("Two-party encrypted messaging", () => {
     test("Alice sends to Bob through relay -- full send pipeline", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const alice = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const bob = await napi.identityCreate("in_memory");
 
       expect(alice.did).toMatch(/^did:dht:/);
@@ -211,6 +215,7 @@ if (bridge === null || serverAddon === null) {
       expect(alice.did).not.toBe(bob.did);
 
       // Alice creates an encrypted context
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
@@ -222,6 +227,7 @@ if (bridge === null || serverAddon === null) {
       expect(ctx.contextId).toBeTruthy();
 
       // Bob joins
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, bob.did);
 
       // Verify membership
@@ -241,13 +247,17 @@ if (bridge === null || serverAddon === null) {
       // No error means the relay accepted the well-formed envelope.
       const plaintext = "hello from Alice to Bob -- E2E encrypted via MLS";
       const payload = new TextEncoder().encode(plaintext);
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextSend(ctx, alice.did, payload);
     });
 
     test("Bob sends a reply through relay", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const alice = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const bob = await napi.identityCreate("in_memory");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
@@ -257,10 +267,13 @@ if (bridge === null || serverAddon === null) {
         }),
       );
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, bob.did);
 
       // Both Alice and Bob can send through the relay without error.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextSend(ctx, alice.did, new TextEncoder().encode("message from Alice"));
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextSend(ctx, bob.did, new TextEncoder().encode("reply from Bob"));
     });
   });
@@ -271,10 +284,14 @@ if (bridge === null || serverAddon === null) {
 
   describe("Three-party encrypted messaging", () => {
     test("three members can all send through relay", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const alice = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const bob = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const carol = await napi.identityCreate("in_memory");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
@@ -284,15 +301,20 @@ if (bridge === null || serverAddon === null) {
         }),
       );
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, bob.did);
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, carol.did);
 
       const count = await napi.contextMemberCount(ctx);
       expect(count).toBe(3);
 
       // Each member sends through the relay -- all succeed.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextSend(ctx, alice.did, new TextEncoder().encode("hello from Alice"));
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextSend(ctx, bob.did, new TextEncoder().encode("hello from Bob"));
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextSend(ctx, carol.did, new TextEncoder().encode("hello from Carol"));
     });
   });
@@ -303,9 +325,12 @@ if (bridge === null || serverAddon === null) {
 
   describe("Multiple sequential messages", () => {
     test("five messages sent sequentially through relay", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const alice = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const bob = await napi.identityCreate("in_memory");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
@@ -315,17 +340,21 @@ if (bridge === null || serverAddon === null) {
         }),
       );
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, bob.did);
 
       // Send 5 messages -- all should succeed through the relay.
       for (let i = 0; i < 5; i++) {
+        // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
         await napi.contextSend(ctx, alice.did, new TextEncoder().encode(`message ${i}`));
       }
     });
 
     test("binary payload through send pipeline", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const alice = await napi.identityCreate("in_memory");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
@@ -337,6 +366,7 @@ if (bridge === null || serverAddon === null) {
 
       // Send raw binary (not UTF-8 text) -- relay must accept it.
       const binaryPayload = new Uint8Array([0x00, 0xff, 0x42, 0xde, 0xad, 0xbe, 0xef]);
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextSend(ctx, alice.did, binaryPayload);
     });
   });
@@ -347,8 +377,10 @@ if (bridge === null || serverAddon === null) {
 
   describe("contextSubscribe relay wiring", () => {
     test("contextSubscribe establishes relay subscription without throwing", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const alice = await napi.identityCreate("in_memory");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
@@ -363,6 +395,7 @@ if (bridge === null || serverAddon === null) {
       // `async` after #1549 Phase 4 PR 1 — the returned Promise
       // resolves once the task is registered against the bridge's
       // JoinSet.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await addon.contextSubscribe(ctx, alice.did, (_msg: NapiRawMessage | null) => {
         // Callback may or may not fire depending on relay delivery.
       });
@@ -372,8 +405,10 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("duplicate subscription is rejected (SCP-CTX-2022)", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const alice = await napi.identityCreate("in_memory");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
@@ -384,20 +419,24 @@ if (bridge === null || serverAddon === null) {
       );
 
       // First subscription succeeds.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await addon.contextSubscribe(ctx, alice.did, () => {});
       subscribedContexts.push({ handle: ctx, did: alice.did });
 
       // Second subscription to the same context must fail. Async
       // rejection — use `.rejects.toThrow()` rather than
       // sync `.toThrow()`.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await expect(addon.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow(
         /already subscribed/,
       );
     });
 
     test("subscription rejected on non-active context", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const alice = await napi.identityCreate("in_memory");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
@@ -408,10 +447,12 @@ if (bridge === null || serverAddon === null) {
       );
 
       // Close the context first.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextClose(ctx, alice.did);
 
       // Subscription to a closed context must fail. Promise-rejection,
       // not synchronous throw.
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await expect(addon.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow();
     });
   });
@@ -429,9 +470,12 @@ if (bridge === null || serverAddon === null) {
   // accepts raw proposal JSON with caller-specified status.
   describe("Governance operations with real relay", () => {
     test("Alice changes Bob's role after join", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const alice = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const bob = await napi.identityCreate("in_memory");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
@@ -447,6 +491,7 @@ if (bridge === null || serverAddon === null) {
         }),
       );
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, bob.did);
 
       // Verify Bob's initial role
@@ -474,9 +519,12 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("Alice removes Bob from context", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const alice = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const bob = await napi.identityCreate("in_memory");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
@@ -492,6 +540,7 @@ if (bridge === null || serverAddon === null) {
         }),
       );
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, bob.did);
       expect(await napi.contextIsMember(ctx, bob.did)).toBe(true);
 
@@ -517,9 +566,12 @@ if (bridge === null || serverAddon === null) {
 
   describe("Context lifecycle with relay", () => {
     test("create -> join -> send -> leave -> close", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const alice = await napi.identityCreate("in_memory");
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const bob = await napi.identityCreate("in_memory");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
@@ -536,23 +588,29 @@ if (bridge === null || serverAddon === null) {
       );
 
       // Join
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextJoin(ctx, bob.did);
       expect(await napi.contextMemberCount(ctx)).toBe(2);
 
       // Send through relay
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextSend(ctx, alice.did, new TextEncoder().encode("test message"));
 
       // Bob leaves
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextLeave(ctx, bob.did);
       expect(await napi.contextMemberCount(ctx)).toBe(1);
 
       // Alice closes
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextClose(ctx, alice.did);
     });
 
     test("send fails on closed context", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const alice = await napi.identityCreate("in_memory");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
@@ -562,10 +620,12 @@ if (bridge === null || serverAddon === null) {
         }),
       );
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       await napi.contextClose(ctx, alice.did);
 
       // Sending to a closed context must fail
       await expect(
+        // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
         napi.contextSend(ctx, alice.did, new TextEncoder().encode("should fail")),
       ).rejects.toThrow();
     });
@@ -577,8 +637,10 @@ if (bridge === null || serverAddon === null) {
 
   describe("Event log on relay-connected context", () => {
     test("event log records context creation", async () => {
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const alice = await napi.identityCreate("in_memory");
 
+      // SCP-DEFAULT-INSTANCE-OK: raw NAPI bridge test; bypasses SDK facade by design
       const ctx = await napi.contextCreate(
         alice,
         JSON.stringify({
