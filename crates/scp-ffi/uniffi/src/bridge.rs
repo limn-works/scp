@@ -9139,63 +9139,52 @@ pub async fn broadcast_handle_key_request(
 
 /// Returns the number of broadcast subscribers for a context.
 ///
-/// Returns `None` if the context is not registered or not a broadcast context.
+/// Returns `Ok(None)` if the context is not a broadcast context. Returns
+/// `Err(ScpError)` if the handle is foreign or the bridge is not
+/// initialized — callers must not silently collapse these into a
+/// missing-context signal (PR #1690 retro: commit 14's hard-error
+/// contract).
 #[uniffi::export]
-pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u64> {
-    let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(handle);
-        Ok(())
-    })();
-    if check.is_err() {
-        return None;
-    }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return None;
-    };
-    manager
+pub async fn broadcast_subscriber_count(
+    handle: Arc<ContextHandle>,
+) -> Result<Option<u64>, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    let manager = crate::runtime::context_manager_expect()?;
+    Ok(manager
         .broadcast_subscriber_count(&handle.context_id)
         .await
-        .map(|n| n as u64)
+        .map(|n| n as u64))
 }
 
 /// Returns `true` if the given DID is a broadcast subscriber.
+///
+/// Returns `Err(ScpError)` if the handle is foreign or the bridge is not
+/// initialized; do not silently collapse those conditions into `false`.
 #[uniffi::export]
-pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) -> bool {
-    let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(handle);
-        Ok(())
-    })();
-    if check.is_err() {
-        return false;
-    }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return false;
-    };
-    manager
+pub async fn broadcast_is_subscriber(
+    handle: Arc<ContextHandle>,
+    did: String,
+) -> Result<bool, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    let manager = crate::runtime::context_manager_expect()?;
+    Ok(manager
         .is_broadcast_subscriber(&handle.context_id, &did)
-        .await
+        .await)
 }
 
 /// Returns the broadcast admission policy for a context.
 ///
-/// Returns the policy as a string: `"Open"` or `"Gated"`.
-/// Returns `None` if the context is not a broadcast context.
+/// Returns `Ok(Some(policy))` with the policy as a string (`"Open"` or
+/// `"Gated"`), `Ok(None)` if the context is not a broadcast context, and
+/// `Err(ScpError)` for handle-affinity or bridge-not-initialized errors.
 #[uniffi::export]
-pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
-    let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(handle);
-        Ok(())
-    })();
-    if check.is_err() {
-        return None;
-    }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return None;
-    };
-    manager
+pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Result<Option<String>, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    let manager = crate::runtime::context_manager_expect()?;
+    Ok(manager
         .broadcast_admission(&handle.context_id)
         .await
-        .map(|a| format!("{a:?}"))
+        .map(|a| format!("{a:?}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -9204,76 +9193,58 @@ pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
 
 /// Returns the current member count for a context.
 ///
-/// Returns `None` if the context is not registered.
+/// Returns `Ok(None)` if the context is not registered; `Err(ScpError)`
+/// for handle-affinity or bridge-not-initialized errors — these are
+/// programmer / lifecycle bugs, not a missing-context signal.
 #[uniffi::export]
-pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
-    let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(handle);
-        Ok(())
-    })();
-    if check.is_err() {
-        return None;
-    }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return None;
-    };
-    manager
+pub async fn context_member_count(handle: Arc<ContextHandle>) -> Result<Option<u64>, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    let manager = crate::runtime::context_manager_expect()?;
+    Ok(manager
         .member_count(&handle.context_id)
         .await
-        .map(|n| n as u64)
+        .map(|n| n as u64))
 }
 
 /// Returns `true` if the given DID is a member of the context.
+///
+/// Returns `Err(ScpError)` for handle-affinity or bridge-not-initialized
+/// errors — callers must not silently collapse those into `false`.
 #[uniffi::export]
-pub async fn context_is_member(handle: Arc<ContextHandle>, did: String) -> bool {
-    let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(handle);
-        Ok(())
-    })();
-    if check.is_err() {
-        return false;
-    }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return false;
-    };
-    manager.is_member(&handle.context_id, &did).await
+pub async fn context_is_member(handle: Arc<ContextHandle>, did: String) -> Result<bool, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    let manager = crate::runtime::context_manager_expect()?;
+    Ok(manager.is_member(&handle.context_id, &did).await)
 }
 
 /// Returns all member DIDs for a context.
+///
+/// Returns `Err(ScpError)` for handle-affinity or bridge-not-initialized
+/// errors — callers must not silently collapse those into an empty list,
+/// which would look like "context has no members" to the caller.
 #[uniffi::export]
-pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
-    let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(handle);
-        Ok(())
-    })();
-    if check.is_err() {
-        return Vec::new();
-    }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return Vec::new();
-    };
-    manager.member_dids(&handle.context_id).await
+pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Result<Vec<String>, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    let manager = crate::runtime::context_manager_expect()?;
+    Ok(manager.member_dids(&handle.context_id).await)
 }
 
 /// Returns the role assignment for a specific member as a JSON string.
 ///
-/// Returns `None` if the member is not found or the context is not registered.
+/// Returns `Ok(None)` if the member is not found or the context is not
+/// registered; `Err(ScpError)` for handle-affinity or bridge-not-
+/// initialized errors.
 #[uniffi::export]
-pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Option<String> {
-    let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(handle);
-        Ok(())
-    })();
-    if check.is_err() {
-        return None;
-    }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return None;
-    };
-    manager
+pub async fn context_member_role(
+    handle: Arc<ContextHandle>,
+    did: String,
+) -> Result<Option<String>, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    let manager = crate::runtime::context_manager_expect()?;
+    Ok(manager
         .member_role(&handle.context_id, &did)
         .await
-        .map(|r| format!("{r:?}"))
+        .map(|r| format!("{r:?}")))
 }
 
 // ---------------------------------------------------------------------------

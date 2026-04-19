@@ -883,24 +883,25 @@ struct RealFFIIdentityAndContextTests {
 
         let handle = try await contextCreate(identity: identity, params: params)
 
-        // Query member count (async, not throws)
-        let count = await contextMemberCount(handle: handle)
+        // Query member count (async, throws on handle-affinity or
+        // bridge-not-initialized errors per PR #1690 retro Fix 5).
+        let count = try await contextMemberCount(handle: handle)
         // Creator should be the first member
         #expect(count != nil)
         if let count {
             #expect(count >= 1)
         }
 
-        // Check if creator is a member (async, not throws)
-        let isMember = await contextIsMember(handle: handle, did: identity.did())
+        // Check if creator is a member.
+        let isMember = try await contextIsMember(handle: handle, did: identity.did())
         #expect(isMember == true)
 
-        // Get member DIDs (async, not throws)
-        let dids = await contextMemberDids(handle: handle)
+        // Get member DIDs.
+        let dids = try await contextMemberDids(handle: handle)
         #expect(dids.contains(identity.did()))
 
-        // Get creator's role (async, not throws)
-        let role = await contextMemberRole(handle: handle, did: identity.did())
+        // Get creator's role.
+        let role = try await contextMemberRole(handle: handle, did: identity.did())
         #expect(role != nil)
     }
 
@@ -1453,18 +1454,18 @@ struct RealFFITrustTests {
             // Subscribe
             try await broadcastSubscribe(handle: handle, subscriberDid: identity.did())
 
-            // Check subscriber status (async, not throws)
-            let isSub = await broadcastIsSubscriber(handle: handle, did: identity.did())
+            // Check subscriber status (throws per PR #1690 retro Fix 5).
+            let isSub = try await broadcastIsSubscriber(handle: handle, did: identity.did())
             #expect(isSub == true)
 
-            // Get subscriber count (async, not throws)
-            let count = await broadcastSubscriberCount(handle: handle)
+            // Get subscriber count.
+            let count = try await broadcastSubscriberCount(handle: handle)
             if let count {
                 #expect(count >= 1)
             }
 
-            // Get admission policy (async, not throws)
-            let policy = await broadcastAdmission(handle: handle)
+            // Get admission policy.
+            let policy = try await broadcastAdmission(handle: handle)
             if let policy {
                 #expect(policy == "Open" || policy == "Gated")
             }
