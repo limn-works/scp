@@ -10,7 +10,7 @@
 
 import { mapBridgeError } from "./errors";
 import { getBridge } from "./internal/bridge";
-import { deprecatedDefaultInstance } from "./internal/deprecation";
+import type { SCP } from "./scp";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -53,13 +53,13 @@ export type PaidActionType =
  * @returns Estimated cost (smallest currency unit), or -1 on overflow.
  */
 export async function estimateCost(
+  scp: SCP,
   policyJson: string,
   actionType: PaidActionType,
   metrics?: ObservableMetrics,
 ): Promise<number> {
-  deprecatedDefaultInstance("estimateCost");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const metricsJson = JSON.stringify({
       context_message_rate: metrics?.contextMessageRate ?? 0,
       member_count: metrics?.memberCount ?? 0,
@@ -80,10 +80,9 @@ export async function estimateCost(
  * @param policyJson - Economic policy JSON string.
  * @returns `true` if payment is required.
  */
-export async function policyRequiresPayment(policyJson: string): Promise<boolean> {
-  deprecatedDefaultInstance("policyRequiresPayment");
+export async function policyRequiresPayment(scp: SCP, policyJson: string): Promise<boolean> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.economyPolicyRequiresPayment(policyJson);
   } catch (error) {
     throw mapBridgeError(error);
@@ -96,10 +95,9 @@ export async function policyRequiresPayment(policyJson: string): Promise<boolean
  * @param policyJson - Economic policy JSON string.
  * @returns `true` if auto-accept is blocked.
  */
-export async function autoAcceptBlocked(policyJson: string): Promise<boolean> {
-  deprecatedDefaultInstance("autoAcceptBlocked");
+export async function autoAcceptBlocked(scp: SCP, policyJson: string): Promise<boolean> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.economyAutoAcceptBlocked(policyJson);
   } catch (error) {
     throw mapBridgeError(error);
@@ -112,10 +110,9 @@ export async function autoAcceptBlocked(policyJson: string): Promise<boolean> {
  * @param policyJson - Economic policy JSON string.
  * @returns `true` if the policy is locked.
  */
-export async function checkPolicyLock(policyJson: string): Promise<boolean> {
-  deprecatedDefaultInstance("checkPolicyLock");
+export async function checkPolicyLock(scp: SCP, policyJson: string): Promise<boolean> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.economyCheckPolicyLock(policyJson);
   } catch (error) {
     throw mapBridgeError(error);
@@ -131,12 +128,12 @@ export async function checkPolicyLock(policyJson: string): Promise<boolean> {
  * @throws {ValidationError} If the policy is locked or invalid.
  */
 export async function validatePolicyChange(
+  scp: SCP,
   currentJson: string,
   proposedJson: string,
 ): Promise<boolean> {
-  deprecatedDefaultInstance("validatePolicyChange");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.economyValidatePolicyChange(currentJson, proposedJson);
   } catch (error) {
     throw mapBridgeError(error);
@@ -151,12 +148,12 @@ export async function validatePolicyChange(
  * @returns Computed cost, or -1 on overflow.
  */
 export async function evaluateFormula(
+  scp: SCP,
   formulaJson: string,
   metrics?: ObservableMetrics,
 ): Promise<number> {
-  deprecatedDefaultInstance("evaluateFormula");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const metricsJson = JSON.stringify({
       context_message_rate: metrics?.contextMessageRate ?? 0,
       member_count: metrics?.memberCount ?? 0,
@@ -182,10 +179,9 @@ export async function evaluateFormula(
  * @param did - The member's DID.
  * @returns Remaining budget (smallest currency unit).
  */
-export async function budgetRemaining(contextId: string, did: string): Promise<number> {
-  deprecatedDefaultInstance("budgetRemaining");
+export async function budgetRemaining(scp: SCP, contextId: string, did: string): Promise<number> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.economyBudgetRemaining(contextId, did);
   } catch (error) {
     throw mapBridgeError(error);
@@ -199,10 +195,14 @@ export async function budgetRemaining(contextId: string, did: string): Promise<n
  * @param did - The member's DID.
  * @param amount - Budget to grant (smallest currency unit).
  */
-export async function budgetGrant(contextId: string, did: string, amount: number): Promise<void> {
-  deprecatedDefaultInstance("budgetGrant");
+export async function budgetGrant(
+  scp: SCP,
+  contextId: string,
+  did: string,
+  amount: number,
+): Promise<void> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     bridge.economyBudgetGrant(contextId, did, amount);
   } catch (error) {
     throw mapBridgeError(error);
@@ -218,13 +218,13 @@ export async function budgetGrant(contextId: string, did: string, amount: number
  * @throws {ValidationError} If no budget exists or spend exceeds remaining.
  */
 export async function budgetRecordSpend(
+  scp: SCP,
   contextId: string,
   did: string,
   amount: number,
 ): Promise<void> {
-  deprecatedDefaultInstance("budgetRecordSpend");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     bridge.economyBudgetRecordSpend(contextId, did, amount);
   } catch (error) {
     throw mapBridgeError(error);
@@ -243,13 +243,13 @@ export async function budgetRecordSpend(
  * @param timestamp - Unix timestamp in seconds.
  */
 export async function antispamRecord(
+  scp: SCP,
   contextId: string,
   senderDid: string,
   timestamp: number,
 ): Promise<void> {
-  deprecatedDefaultInstance("antispamRecord");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     bridge.economyAntispamRecord(contextId, senderDid, timestamp);
   } catch (error) {
     throw mapBridgeError(error);
@@ -265,13 +265,13 @@ export async function antispamRecord(
  * @returns Number of messages within the window.
  */
 export async function antispamVelocity(
+  scp: SCP,
   contextId: string,
   senderDid: string,
   now: number,
 ): Promise<number> {
-  deprecatedDefaultInstance("antispamVelocity");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.economyAntispamVelocity(contextId, senderDid, now);
   } catch (error) {
     throw mapBridgeError(error);
@@ -291,6 +291,7 @@ export async function antispamVelocity(
  * @returns Escalated cost (smallest currency unit).
  */
 export async function antispamEscalatedCost(
+  scp: SCP,
   contextId: string,
   senderDid: string,
   now: number,
@@ -299,9 +300,8 @@ export async function antispamEscalatedCost(
   floor?: number,
   cap?: number,
 ): Promise<number> {
-  deprecatedDefaultInstance("antispamEscalatedCost");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const thresholdsJson = JSON.stringify(thresholds);
     return bridge.economyAntispamEscalatedCost(
       contextId,

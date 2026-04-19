@@ -27,7 +27,7 @@ import { createRequire } from "node:module";
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
 import { TransportError } from "../errors";
-import { __defaultScpForInternalUse, __getNativeScp, type SCP } from "../scp";
+import { __getNativeScp, type SCP } from "../scp";
 import type {
   BroadcastAdmissionPolicy,
   Checkpoint,
@@ -126,26 +126,21 @@ function loadNativeAddon(): NativeAddon {
  * The returned bridge delegates method calls to the given {@link SCP}
  * instance's class methods (ADR-048 per-instance routing) and falls back
  * to module-level free functions for the handful of bridge operations
- * that have not yet been ported onto the `SCP` class. When `scp` is
- * omitted, the process-wide default instance is used — which matches
- * the behavior of the deprecated free-function façade.
+ * that have not yet been ported onto the `SCP` class.
  *
- * @param scp Optional {@link SCP} wrapper whose native handle should
- *   receive all routable method calls. Defaults to the shared
- *   process-wide default instance when omitted.
+ * @param scp The {@link SCP} wrapper whose native handle should receive
+ *   all routable method calls. Required — the legacy process-wide
+ *   default-instance fallback was removed in Phase 4 PR 4 (#1549)
+ *   demolition.
  *
  * @internal
  */
-export function createNativeBridge(scp?: SCP): Bridge {
+export function createNativeBridge(scp: SCP): Bridge {
   const addon = loadNativeAddon();
-  const scpInstance = scp ?? __defaultScpForInternalUse();
   // Type-erased native handle — every NAPI `Scp` class method shares
   // the `async (...args) => unknown` shape after FFI monomorphization,
   // and routing requires dynamic lookup by camelCase method name.
-  const native = __getNativeScp(scpInstance) as unknown as Record<
-    string,
-    (...args: never[]) => unknown
-  >;
+  const native = __getNativeScp(scp) as unknown as Record<string, (...args: never[]) => unknown>;
 
   return {
     // Identity

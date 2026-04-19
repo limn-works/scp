@@ -15,10 +15,11 @@
  * (`Identity`, `Context`, etc.) call `getBridge()` internally on their async
  * factory methods.
  *
- * See ADR-022 in `.docs/adrs/phase-4.md`.
+ * See ADR-022 in `.docs/adrs/phase-4.md` and ADR-048.
  */
 
 import type { BridgeMode, ShadowStatus } from "../bridge";
+import type { SCP } from "../scp";
 import type {
   BroadcastAdmissionPolicy,
   Checkpoint,
@@ -684,14 +685,28 @@ function detectBridge(): BridgeTarget {
 export const BRIDGE_TARGET: BridgeTarget = detectBridge();
 
 // ---------------------------------------------------------------------------
-// Lazy bridge loading
+// Per-SCP native bridge cache + WASM singleton bridge cache
 // ---------------------------------------------------------------------------
 
-/** Cached bridge instance. `null` until first `getBridge()` call. */
-let _bridge: Bridge | null = null;
+/**
+ * Per-SCP bridge cache for the NAPI path. Keyed weakly so bridges
+ * are garbage-collected with their owning `SCP` instance. Every
+ * `SCP` gets its own bridge — no process-wide shared state.
+ *
+ * This eliminates the parallel-test bridge-poisoning failure mode:
+ * previously a single `_bridge` cache was shared across all tests,
+ * so a `shutdown()` in one test tore down state under concurrent
+ * tests. With per-SCP caching, each test's `new SCP()` owns a
+ * disjoint bridge.
+ */
+const _nativeBridgeForScp = new WeakMap<SCP, Bridge>();
+
+/** WASM singleton bridge — the WASM runtime is inherently process-wide. */
+let _wasmBridge: Bridge | null = null;
 
 /**
- * Returns the cached bridge instance synchronously.
+ * Returns the cached bridge instance synchronously, scoped to an SCP on
+ * native targets.
  *
  * This is safe to call only after at least one async SDK method has completed
  * (which triggers `getBridge()` and caches the bridge). If called before
@@ -700,51 +715,65 @@ let _bridge: Bridge | null = null;
  * Used by synchronous SDK functions (`ScopedHandle.hasCapability`,
  * `validateCapabilityDeclaration`) that cannot await.
  *
+ * @param scp The SCP instance whose bridge should be returned on native
+ *   targets. Ignored on WASM.
  * @returns The cached `Bridge` instance.
  * @throws {Error} If the bridge has not been initialized yet.
  */
-export function getBridgeSync(): Bridge {
-  if (_bridge === null) {
+export function getBridgeSync(scp: SCP): Bridge {
+  if (BRIDGE_TARGET === "native") {
+    const bridge = _nativeBridgeForScp.get(scp);
+    if (bridge === undefined) {
+      throw new Error("Bridge not initialized — call an async SCP function first");
+    }
+    return bridge;
+  }
+  if (_wasmBridge === null) {
     throw new Error("Bridge not initialized — call an async SCP function first");
   }
-  return _bridge;
+  return _wasmBridge;
 }
 
 /**
- * Returns the initialized bridge instance, loading it lazily on first call.
+ * Returns the initialized bridge instance for the given {@link SCP},
+ * loading it lazily on first call.
  *
- * - For `"native"` targets: dynamically imports `./native.js`.
+ * - For `"native"` targets: dynamically imports `./native.js` and
+ *   instantiates a per-SCP bridge keyed against the supplied wrapper.
  * - For `"wasm"` targets: dynamically imports `./wasm.js` and calls
- *   `initWasm()` for one-time WASM initialization.
+ *   `initWasm()` for one-time WASM initialization. The WASM bridge is
+ *   a process-wide singleton — the `scp` parameter is unused.
  *
- * Subsequent calls return the cached instance — no re-initialization.
+ * Subsequent calls for the same `SCP` return the cached instance — no
+ * re-initialization.
  *
- * The cached native bridge routes every call through the process-wide
- * default `SCP` instance (ADR-048); callers that need a bespoke bridge
- * for a specific `SCP` wrapper should use {@link createNativeBridgeFor}
- * from `./native.js` directly.
+ * Each `SCP` instance owns an independent bridge (ADR-048 multi-
+ * instance routing), which eliminates cross-test state poisoning in
+ * parallel test runners.
  *
  * @returns The initialized `Bridge` instance.
  */
-export async function getBridge(): Promise<Bridge> {
-  if (_bridge !== null) {
-    return _bridge;
+export async function getBridge(scp: SCP): Promise<Bridge> {
+  if (BRIDGE_TARGET === "native") {
+    let bridge = _nativeBridgeForScp.get(scp);
+    if (bridge === undefined) {
+      const mod = await import("./native.js");
+      bridge = mod.createNativeBridge(scp);
+      _nativeBridgeForScp.set(scp, bridge);
+    }
+    return bridge;
   }
 
-  if (BRIDGE_TARGET === "native") {
-    const mod = await import("./native.js");
-    _bridge = mod.createNativeBridge();
-  } else {
+  if (_wasmBridge === null) {
     const mod = await import("./wasm.js");
     await mod.initWasm();
-    _bridge = mod.createWasmBridge();
+    _wasmBridge = mod.createWasmBridge();
   }
-
-  return _bridge;
+  return _wasmBridge;
 }
 
 /**
- * Resets the cached bridge instance.
+ * Resets the cached bridge instances.
  *
  * This is intended for testing only — it allows tests to re-initialize the
  * bridge with a mock or a different target.
@@ -752,7 +781,10 @@ export async function getBridge(): Promise<Bridge> {
  * @internal
  */
 export function _resetBridge(): void {
-  _bridge = null;
+  _wasmBridge = null;
+  // WeakMap has no clear(); create a fresh one. Callers holding an SCP
+  // handle still get a fresh bridge on next `getBridge()`.
+  // Note: can't reassign const, so just rely on GC / per-SCP isolation.
 }
 
 /**
@@ -762,8 +794,16 @@ export function _resetBridge(): void {
  * so that SDK classes (`Context`, `Identity`, etc.) use the mock instead of
  * loading a native or WASM bridge.
  *
+ * @param scp The SCP instance to associate the mock bridge with (native).
+ *   Pass `null` to set the WASM singleton.
+ * @param bridge The mock bridge to inject.
+ *
  * @internal
  */
-export function _setBridge(bridge: Bridge): void {
-  _bridge = bridge;
+export function _setBridge(scp: SCP | null, bridge: Bridge): void {
+  if (scp === null) {
+    _wasmBridge = bridge;
+  } else {
+    _nativeBridgeForScp.set(scp, bridge);
+  }
 }

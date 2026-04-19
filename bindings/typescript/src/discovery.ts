@@ -10,8 +10,8 @@
 
 import { mapBridgeError, ValidationError } from "./errors";
 import { getBridge } from "./internal/bridge";
-import { deprecatedDefaultInstance } from "./internal/deprecation";
 import { safeJsonParse } from "./internal/json-utils";
+import type { SCP } from "./scp";
 import type { AddressResolution, ResolutionLayer, ResolutionPath, TrustLevel } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -152,10 +152,9 @@ function parseDiscoveryResult(item: Record<string, unknown>): DiscoveryResult {
  * @returns The parsed address object.
  * @throws {ValidationError} If the address is malformed.
  */
-export async function parseAddress(address: string): Promise<ParsedAddress> {
-  deprecatedDefaultInstance("parseAddress");
+export async function parseAddress(scp: SCP, address: string): Promise<ParsedAddress> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const result = await bridge.discoveryParseAddress(address);
     return safeJsonParse(result, "discoveryParseAddress") as ParsedAddress;
   } catch (error) {
@@ -169,14 +168,16 @@ export async function parseAddress(address: string): Promise<ParsedAddress> {
  * @param options - Query parameters.
  * @returns A JSON string representing the discovery query.
  */
-export async function createQuery(options?: {
-  capabilities?: string[];
-  keywords?: string[];
-  minHistorySecs?: number;
-}): Promise<string> {
-  deprecatedDefaultInstance("createQuery");
+export async function createQuery(
+  scp: SCP,
+  options?: {
+    capabilities?: string[];
+    keywords?: string[];
+    minHistorySecs?: number;
+  },
+): Promise<string> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.discoveryCreateQuery(
       options?.capabilities,
       options?.keywords,
@@ -193,10 +194,9 @@ export async function createQuery(options?: {
  * @param address - The address to normalize.
  * @returns The normalized address string.
  */
-export async function normalizeAddress(address: string): Promise<string> {
-  deprecatedDefaultInstance("normalizeAddress");
+export async function normalizeAddress(scp: SCP, address: string): Promise<string> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.discoveryNormalizeAddress(address);
   } catch (error) {
     throw mapBridgeError(error);
@@ -211,10 +211,9 @@ export async function normalizeAddress(address: string): Promise<string> {
  * @throws {ContextError} If discovery fails.
  * @throws {ValidationError} If the query is neither a DID nor an `scp://` URI.
  */
-export async function discoverContexts(query: string): Promise<DiscoveryResult[]> {
-  deprecatedDefaultInstance("discoverContexts");
+export async function discoverContexts(scp: SCP, query: string): Promise<DiscoveryResult[]> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = await bridge.contextDiscover(query);
     const parsed = safeJsonParse(raw, "contextDiscover") as Array<Record<string, unknown>>;
     return parsed.map(parseDiscoveryResult);
@@ -239,9 +238,8 @@ export async function discoverContexts(query: string): Promise<DiscoveryResult[]
  * @throws {ContextError} If discovery fails.
  * @throws {ValidationError} If the query is neither a DID nor an `scp://` URI.
  */
-export async function resolveAddress(query: string): Promise<AddressResolution[]> {
-  deprecatedDefaultInstance("resolveAddress");
-  const results = await discoverContexts(query);
+export async function resolveAddress(scp: SCP, query: string): Promise<AddressResolution[]> {
+  const results = await discoverContexts(scp, query);
   return results.map(
     (r): AddressResolution => ({
       type: "Context",
@@ -266,10 +264,14 @@ export async function resolveAddress(query: string): Promise<AddressResolution[]
  * @param name - The petname string.
  * @throws {ValidationError} If `ownerDid` is empty.
  */
-export async function petnameSet(ownerDid: string, targetDid: string, name: string): Promise<void> {
-  deprecatedDefaultInstance("petnameSet");
+export async function petnameSet(
+  scp: SCP,
+  ownerDid: string,
+  targetDid: string,
+  name: string,
+): Promise<void> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     bridge.petnameSet(ownerDid, targetDid, name);
   } catch (error) {
     throw mapBridgeError(error);
@@ -283,10 +285,9 @@ export async function petnameSet(ownerDid: string, targetDid: string, name: stri
  * @param targetDid - DID to remove the petname from.
  * @throws {ValidationError} If `ownerDid` is empty.
  */
-export async function petnameRemove(ownerDid: string, targetDid: string): Promise<void> {
-  deprecatedDefaultInstance("petnameRemove");
+export async function petnameRemove(scp: SCP, ownerDid: string, targetDid: string): Promise<void> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     bridge.petnameRemove(ownerDid, targetDid);
   } catch (error) {
     throw mapBridgeError(error);
@@ -302,13 +303,13 @@ export async function petnameRemove(ownerDid: string, targetDid: string): Promis
  * @throws {ValidationError} If `ownerDid` is empty.
  */
 export async function petnameSetContext(
+  scp: SCP,
   ownerDid: string,
   contextId: string,
   name: string,
 ): Promise<void> {
-  deprecatedDefaultInstance("petnameSetContext");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     bridge.petnameSetContext(ownerDid, contextId, name);
   } catch (error) {
     throw mapBridgeError(error);
@@ -322,10 +323,13 @@ export async function petnameSetContext(
  * @param contextId - Context ID to remove the petname from.
  * @throws {ValidationError} If `ownerDid` is empty.
  */
-export async function petnameRemoveContext(ownerDid: string, contextId: string): Promise<void> {
-  deprecatedDefaultInstance("petnameRemoveContext");
+export async function petnameRemoveContext(
+  scp: SCP,
+  ownerDid: string,
+  contextId: string,
+): Promise<void> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     bridge.petnameRemoveContext(ownerDid, contextId);
   } catch (error) {
     throw mapBridgeError(error);
@@ -340,10 +344,13 @@ export async function petnameRemoveContext(ownerDid: string, contextId: string):
  * @returns Array of DID strings matching the petname.
  * @throws {ValidationError} If `ownerDid` is empty.
  */
-export async function petnameResolveDid(ownerDid: string, name: string): Promise<string[]> {
-  deprecatedDefaultInstance("petnameResolveDid");
+export async function petnameResolveDid(
+  scp: SCP,
+  ownerDid: string,
+  name: string,
+): Promise<string[]> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const json = bridge.petnameResolveDid(ownerDid, name);
     return safeJsonParse(json, "petnameResolveDid") as string[];
   } catch (error) {
@@ -359,10 +366,13 @@ export async function petnameResolveDid(ownerDid: string, name: string): Promise
  * @returns Array of context ID strings matching the petname.
  * @throws {ValidationError} If `ownerDid` is empty.
  */
-export async function petnameResolveContext(ownerDid: string, name: string): Promise<string[]> {
-  deprecatedDefaultInstance("petnameResolveContext");
+export async function petnameResolveContext(
+  scp: SCP,
+  ownerDid: string,
+  name: string,
+): Promise<string[]> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const json = bridge.petnameResolveContext(ownerDid, name);
     return safeJsonParse(json, "petnameResolveContext") as string[];
   } catch (error) {
@@ -379,12 +389,12 @@ export async function petnameResolveContext(ownerDid: string, name: string): Pro
  * @throws {ValidationError} If `ownerDid` is empty.
  */
 export async function petnameGetForDid(
+  scp: SCP,
   ownerDid: string,
   targetDid: string,
 ): Promise<string | null> {
-  deprecatedDefaultInstance("petnameGetForDid");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.petnameGetForDid(ownerDid, targetDid);
   } catch (error) {
     throw mapBridgeError(error);
@@ -400,12 +410,12 @@ export async function petnameGetForDid(
  * @throws {ValidationError} If `ownerDid` is empty.
  */
 export async function petnameGetForContext(
+  scp: SCP,
   ownerDid: string,
   contextId: string,
 ): Promise<string | null> {
-  deprecatedDefaultInstance("petnameGetForContext");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.petnameGetForContext(ownerDid, contextId);
   } catch (error) {
     throw mapBridgeError(error);
@@ -444,15 +454,15 @@ export interface HandleDeregisterResult {
  * @throws {ValidationError} If `targetJson` is malformed.
  */
 export async function handleRegister(
+  scp: SCP,
   discoveryContextId: string,
   handle: string,
   targetJson: string,
   registrantDid: string,
   options?: { description?: string; tags?: string[] },
 ): Promise<HandleRegisterResult> {
-  deprecatedDefaultInstance("handleRegister");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const result = bridge.handleRegister(
       discoveryContextId,
       handle,
@@ -476,13 +486,13 @@ export async function handleRegister(
  * @returns Lookup result with a `results` array of matching entries.
  */
 export async function handleLookup(
+  scp: SCP,
   discoveryContextId: string,
   handle: string,
   typeFilter?: string,
 ): Promise<HandleLookupResult> {
-  deprecatedDefaultInstance("handleLookup");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const result = bridge.handleLookup(discoveryContextId, handle, typeFilter);
     return safeJsonParse(result, "handleLookup") as HandleLookupResult;
   } catch (error) {
@@ -499,13 +509,13 @@ export async function handleLookup(
  * @returns Deregistration result with a `removed` boolean.
  */
 export async function handleDeregister(
+  scp: SCP,
   discoveryContextId: string,
   handle: string,
   did: string,
 ): Promise<HandleDeregisterResult> {
-  deprecatedDefaultInstance("handleDeregister");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const result = bridge.handleDeregister(discoveryContextId, handle, did);
     return safeJsonParse(result, "handleDeregister") as HandleDeregisterResult;
   } catch (error) {
@@ -568,6 +578,7 @@ export interface ScopeDeregisterResult {
  * @throws {ValidationError} If the scope name or relay URLs are invalid.
  */
 export async function scopeRegister(
+  scp: SCP,
   scopeContextId: string,
   name: string,
   targetContextId: string,
@@ -575,9 +586,8 @@ export async function scopeRegister(
   registrantDid: string,
   options?: { description?: string; tags?: string[] },
 ): Promise<ScopeRegisterResult> {
-  deprecatedDefaultInstance("scopeRegister");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const result = bridge.scopeRegister(
       scopeContextId,
       name,
@@ -601,12 +611,12 @@ export async function scopeRegister(
  * @returns Lookup result with a `results` array of matching scope entries.
  */
 export async function scopeLookup(
+  scp: SCP,
   scopeContextId: string,
   name: string,
 ): Promise<ScopeLookupResult> {
-  deprecatedDefaultInstance("scopeLookup");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const result = bridge.scopeLookup(scopeContextId, name);
     return safeJsonParse(result, "scopeLookup") as ScopeLookupResult;
   } catch (error) {
@@ -623,13 +633,13 @@ export async function scopeLookup(
  * @returns Deregistration result with a `removed` boolean.
  */
 export async function scopeDeregister(
+  scp: SCP,
   scopeContextId: string,
   name: string,
   did: string,
 ): Promise<ScopeDeregisterResult> {
-  deprecatedDefaultInstance("scopeDeregister");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const result = bridge.scopeDeregister(scopeContextId, name, did);
     return safeJsonParse(result, "scopeDeregister") as ScopeDeregisterResult;
   } catch (error) {
@@ -655,13 +665,13 @@ export async function scopeDeregister(
  * @throws {ValidationError} If `ownerDid` is empty or address parsing fails.
  */
 export async function addressResolve(
+  scp: SCP,
   ownerDid: string,
   address: string,
   knownContextsJson?: string,
 ): Promise<AddressResolution[]> {
-  deprecatedDefaultInstance("addressResolve");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = await bridge.addressResolve(ownerDid, address, knownContextsJson);
     const parsed = safeJsonParse(raw, "addressResolve") as Array<Record<string, unknown>>;
     return parsed.map((item): AddressResolution => {

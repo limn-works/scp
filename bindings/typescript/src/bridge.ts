@@ -10,7 +10,7 @@
 
 import { mapBridgeError } from "./errors";
 import { getBridge } from "./internal/bridge";
-import { deprecatedDefaultInstance } from "./internal/deprecation";
+import type { SCP } from "./scp";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -48,6 +48,10 @@ export interface ShadowIdentity {
 /**
  * Registers a bridge connector with a context.
  *
+ * Routes through the supplied `SCP` instance (ADR-048). The back-compat
+ * default-instance fallback was removed in Phase 4 PR 4 (#1549) demolition.
+ *
+ * @param scp - The `SCP` wrapper whose bridge instance should own this call.
  * @param contextId - Context to register the bridge in.
  * @param operatorDid - DID of the human operator.
  * @param governanceDid - DID of the governance authority approving the
@@ -60,15 +64,15 @@ export interface ShadowIdentity {
  * @throws {ContextError} If governance DID matches operator DID (self-approval).
  */
 export async function bridgeRegister(
+  scp: SCP,
   contextId: string,
   operatorDid: string,
   governanceDid: string,
   platform: string,
   mode: BridgeMode,
 ): Promise<BridgeRegistration> {
-  deprecatedDefaultInstance("bridgeRegister");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = bridge.bridgeRegister(contextId, operatorDid, governanceDid, platform, mode);
     return {
       bridgeId: raw.bridge_id,
@@ -86,19 +90,20 @@ export async function bridgeRegister(
 /**
  * Evaluates the trust level for an action based on bridge provenance.
  *
+ * @param scp - The `SCP` wrapper whose bridge instance should own this call.
  * @param isBridged - Whether the action has bridge provenance.
  * @param isNativeTransport - Whether the transport is native SCP.
  * @param shadowStatus - `"shadow"` or `"claimed"`.
  * @returns Trust tier as an integer (0-3).
  */
 export async function bridgeEvaluateTrust(
+  scp: SCP,
   isBridged = false,
   isNativeTransport = true,
   shadowStatus: ShadowStatus = "shadow",
 ): Promise<number> {
-  deprecatedDefaultInstance("bridgeEvaluateTrust");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.bridgeEvaluateTrust(isBridged, isNativeTransport, shadowStatus);
   } catch (error) {
     throw mapBridgeError(error);
@@ -108,6 +113,7 @@ export async function bridgeEvaluateTrust(
 /**
  * Creates a shadow identity for an external platform participant.
  *
+ * @param scp - The `SCP` wrapper whose bridge instance should own this call.
  * @param bridgeId - The bridge connector ID.
  * @param platformHandle - External platform handle.
  * @param bridgeMode - Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
@@ -115,14 +121,14 @@ export async function bridgeEvaluateTrust(
  * @returns The shadow identity result.
  */
 export async function bridgeCreateShadow(
+  scp: SCP,
   bridgeId: string,
   platformHandle: string,
   bridgeMode: BridgeMode,
   contextId?: string,
 ): Promise<ShadowIdentity> {
-  deprecatedDefaultInstance("bridgeCreateShadow");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = bridge.bridgeCreateShadow(bridgeId, platformHandle, bridgeMode, contextId);
     return {
       shadowId: raw.shadow_id,

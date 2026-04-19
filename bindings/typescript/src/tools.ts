@@ -17,7 +17,7 @@
 import { mapBridgeError, ValidationError } from "./errors";
 import type { BridgeContextHandle } from "./internal/bridge";
 import { getBridge } from "./internal/bridge";
-import { deprecatedDefaultInstance } from "./internal/deprecation";
+import type { SCP } from "./scp";
 import type {
   CrossContextInvocationResult,
   TestVector,
@@ -112,6 +112,7 @@ export function defineToolDefinition(params: {
  * @throws {ToolError} If the bridge call fails (inactive context, rate limit, etc.).
  */
 export async function toolInvokeCrossContext(
+  scp: SCP,
   sourceHandle: BridgeContextHandle,
   targetHandle: BridgeContextHandle,
   toolId: string,
@@ -121,7 +122,6 @@ export async function toolInvokeCrossContext(
   chainDepth = 0,
   proofTokens?: readonly string[],
 ): Promise<CrossContextInvocationResult> {
-  deprecatedDefaultInstance("toolInvokeCrossContext");
   // Chain depth is context-configurable (ADR-043). The u8 type in core bounds
   // the range to [0, 255]. Values above 255 are always rejected by core, so
   // we catch them early with a clear SDK-level message.
@@ -132,7 +132,7 @@ export async function toolInvokeCrossContext(
     );
   }
 
-  const bridge = await getBridge();
+  const bridge = await getBridge(scp);
   try {
     const output = await bridge.toolInvokeCrossContext(
       sourceHandle,
@@ -177,12 +177,12 @@ export async function toolInvokeCrossContext(
  * @throws {ToolError} If the bridge call fails (inactive context, session cap, etc.).
  */
 export async function toolSessionCreate(
+  scp: SCP,
   handle: BridgeContextHandle,
   toolId: string,
   sourceContextId: string,
   ttlSeconds?: number,
 ): Promise<ToolSessionResult> {
-  deprecatedDefaultInstance("toolSessionCreate");
   if (ttlSeconds !== undefined) {
     if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0) {
       throw new ValidationError(
@@ -192,7 +192,7 @@ export async function toolSessionCreate(
     }
   }
 
-  const bridge = await getBridge();
+  const bridge = await getBridge(scp);
   try {
     const sessionId = await bridge.toolSessionCreate(handle, toolId, sourceContextId, ttlSeconds);
     return { sessionId };
@@ -219,6 +219,7 @@ export async function toolSessionCreate(
  * @throws {ToolError} If the session is not found or has expired.
  */
 export async function toolSessionInvoke(
+  scp: SCP,
   handle: BridgeContextHandle,
   sessionId: string,
   inputJson: string,
@@ -226,8 +227,7 @@ export async function toolSessionInvoke(
   ucanToken: string,
   proofTokens?: readonly string[],
 ): Promise<ToolSessionInvokeResult> {
-  deprecatedDefaultInstance("toolSessionInvoke");
-  const bridge = await getBridge();
+  const bridge = await getBridge(scp);
   try {
     const output = await bridge.toolSessionInvoke(
       handle,
@@ -260,11 +260,11 @@ export async function toolSessionInvoke(
  * @throws {ToolError} If the session is not found.
  */
 export async function toolSessionClose(
+  scp: SCP,
   handle: BridgeContextHandle,
   sessionId: string,
 ): Promise<void> {
-  deprecatedDefaultInstance("toolSessionClose");
-  const bridge = await getBridge();
+  const bridge = await getBridge(scp);
   try {
     await bridge.toolSessionClose(handle, sessionId);
   } catch (error) {

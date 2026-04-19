@@ -12,6 +12,7 @@
 import { mapBridgeError, ValidationError } from "./errors";
 import type { BridgeTransportHandle } from "./internal/bridge";
 import { getBridge } from "./internal/bridge";
+import type { SCP } from "./scp";
 import type { TransportConfig, TransportStatus } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -25,7 +26,7 @@ import type { TransportConfig, TransportStatus } from "./types";
  * `AsyncDisposable` for automatic cleanup.
  *
  * ```typescript
- * await using transport = await Transport.connect({ relayUrl: "wss://relay.example.com" });
+ * await using transport = await Transport.connect(scp, { relayUrl: "wss://relay.example.com" });
  * const status = await transport.status();
  * console.log(status.connected); // true
  * ```
@@ -34,11 +35,15 @@ export class Transport implements AsyncDisposable {
   /** @internal Opaque bridge handle. */
   private readonly _handle: BridgeTransportHandle;
 
+  /** @internal The SCP bridge instance this transport is bound to. */
+  readonly _scp: SCP;
+
   /** Whether the transport has been disconnected. */
   private _disposed = false;
 
-  private constructor(handle: BridgeTransportHandle) {
+  private constructor(handle: BridgeTransportHandle, scp: SCP) {
     this._handle = handle;
+    this._scp = scp;
   }
 
   /**
@@ -47,12 +52,13 @@ export class Transport implements AsyncDisposable {
    * The relay URL must use the `wss://` scheme. Plaintext `ws://` connections
    * are rejected to prevent credential exposure.
    *
+   * @param scp - The `SCP` instance that owns this transport (ADR-048).
    * @param config - Transport configuration with the relay URL.
    * @returns A connected `Transport` instance.
    * @throws {ValidationError} If the relay URL does not use `wss://`.
    * @throws {TransportError} If the connection fails.
    */
-  static async connect(config: TransportConfig): Promise<Transport> {
+  static async connect(scp: SCP, config: TransportConfig): Promise<Transport> {
     if (!config.relayUrl.startsWith("wss://")) {
       throw new ValidationError(
         `Relay URL must use wss:// scheme (got "${config.relayUrl}") — ` +
@@ -62,9 +68,9 @@ export class Transport implements AsyncDisposable {
     }
 
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(scp);
       const handle = await bridge.transportConnect(config.relayUrl);
-      return new Transport(handle);
+      return new Transport(handle, scp);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -77,7 +83,7 @@ export class Transport implements AsyncDisposable {
    */
   async status(): Promise<TransportStatus> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.transportStatus(this._handle);
     } catch (error) {
       throw mapBridgeError(error);
@@ -98,7 +104,7 @@ export class Transport implements AsyncDisposable {
     }
     this._disposed = true;
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       await bridge.transportDisconnect(this._handle);
     } catch (error) {
       throw mapBridgeError(error);

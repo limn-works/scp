@@ -9,8 +9,8 @@
 
 import { mapBridgeError } from "./errors";
 import { getBridge } from "./internal/bridge";
-import { deprecatedDefaultInstance } from "./internal/deprecation";
 import { safeJsonParse } from "./internal/json-utils";
+import type { SCP } from "./scp";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -96,12 +96,12 @@ function parseMetadata(raw: Record<string, unknown>): SessionMetadata {
  * @throws {ContextError} If the capability is not in the ceiling.
  */
 export async function mediaCheckCapability(
+  scp: SCP,
   ceiling: string[],
   capability: string,
 ): Promise<boolean> {
-  deprecatedDefaultInstance("mediaCheckCapability");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.mediaCheckCapability(ceiling, capability);
   } catch (error) {
     throw mapBridgeError(error);
@@ -121,15 +121,15 @@ export async function mediaCheckCapability(
  * @throws {ContextError} If capabilities/participants are empty or capability missing from ceiling.
  */
 export async function mediaInitiateSession(
+  scp: SCP,
   contextId: string,
   ceiling: string[],
   capabilities: string[],
   participants: string[],
   timestamp: number,
 ): Promise<MediaSession> {
-  deprecatedDefaultInstance("mediaInitiateSession");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = bridge.mediaInitiateSession(
       contextId,
       ceiling,
@@ -151,10 +151,9 @@ export async function mediaInitiateSession(
  * @returns Updated MediaSession.
  * @throws {ContextError} If the session is not in the Initiating state.
  */
-export async function mediaActivateSession(sessionJson: string): Promise<MediaSession> {
-  deprecatedDefaultInstance("mediaActivateSession");
+export async function mediaActivateSession(scp: SCP, sessionJson: string): Promise<MediaSession> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = bridge.mediaActivateSession(sessionJson);
     const parsed = safeJsonParse(raw, "mediaActivateSession") as Record<string, unknown>;
     return parseSession(parsed);
@@ -172,12 +171,12 @@ export async function mediaActivateSession(sessionJson: string): Promise<MediaSe
  * @throws {ContextError} If the session has ended.
  */
 export async function mediaJoinSession(
+  scp: SCP,
   sessionJson: string,
   participantDid: string,
 ): Promise<MediaSession> {
-  deprecatedDefaultInstance("mediaJoinSession");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = bridge.mediaJoinSession(sessionJson, participantDid);
     const parsed = safeJsonParse(raw, "mediaJoinSession") as Record<string, unknown>;
     return parseSession(parsed);
@@ -195,12 +194,12 @@ export async function mediaJoinSession(
  * @throws {ContextError} If the session has already ended or timestamp is invalid.
  */
 export async function mediaEndSession(
+  scp: SCP,
   sessionJson: string,
   timestamp: number,
 ): Promise<EndSessionResult> {
-  deprecatedDefaultInstance("mediaEndSession");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = bridge.mediaEndSession(sessionJson, timestamp);
     const parsed = safeJsonParse(raw, "mediaEndSession") as Record<string, unknown>;
     return {
@@ -225,13 +224,13 @@ export async function mediaEndSession(
  * @returns A SignalingResult with session_id and message.
  */
 export async function mediaCreateOffer(
+  scp: SCP,
   sessionId: string,
   sdp: string,
   senderDid: string,
 ): Promise<SignalingResult> {
-  deprecatedDefaultInstance("mediaCreateOffer");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = bridge.mediaCreateOffer(sessionId, sdp, senderDid);
     const parsed = safeJsonParse(raw, "mediaCreateOffer") as Record<string, unknown>;
     return {
@@ -252,13 +251,13 @@ export async function mediaCreateOffer(
  * @returns A SignalingResult with session_id and message.
  */
 export async function mediaCreateAnswer(
+  scp: SCP,
   sessionId: string,
   sdp: string,
   senderDid: string,
 ): Promise<SignalingResult> {
-  deprecatedDefaultInstance("mediaCreateAnswer");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = bridge.mediaCreateAnswer(sessionId, sdp, senderDid);
     const parsed = safeJsonParse(raw, "mediaCreateAnswer") as Record<string, unknown>;
     return {
@@ -280,6 +279,7 @@ export async function mediaCreateAnswer(
  * @returns A SignalingResult with session_id and message.
  */
 export async function mediaCreateIceCandidate(
+  scp: SCP,
   sessionId: string,
   candidate: string,
   senderDid: string,
@@ -288,9 +288,8 @@ export async function mediaCreateIceCandidate(
     sdpMlineIndex?: number;
   },
 ): Promise<SignalingResult> {
-  deprecatedDefaultInstance("mediaCreateIceCandidate");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = bridge.mediaCreateIceCandidate(
       sessionId,
       candidate,
@@ -316,12 +315,12 @@ export async function mediaCreateIceCandidate(
  * @returns A SignalingResult with session_id and message.
  */
 export async function mediaCreateSessionEnd(
+  scp: SCP,
   sessionId: string,
   senderDid: string,
 ): Promise<SignalingResult> {
-  deprecatedDefaultInstance("mediaCreateSessionEnd");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = bridge.mediaCreateSessionEnd(sessionId, senderDid);
     const parsed = safeJsonParse(raw, "mediaCreateSessionEnd") as Record<string, unknown>;
     return {
@@ -340,10 +339,12 @@ export async function mediaCreateSessionEnd(
  * @returns A SendSignalingResult with payload (base64) and messageType.
  * @throws {ValidationError} If the JSON is not a valid signaling message.
  */
-export async function mediaSendSignaling(signalingJson: string): Promise<SendSignalingResult> {
-  deprecatedDefaultInstance("mediaSendSignaling");
+export async function mediaSendSignaling(
+  scp: SCP,
+  signalingJson: string,
+): Promise<SendSignalingResult> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = bridge.mediaSendSignaling(signalingJson);
     const parsed = safeJsonParse(raw, "mediaSendSignaling") as Record<string, unknown>;
     return {
@@ -365,12 +366,12 @@ export async function mediaSendSignaling(signalingJson: string): Promise<SendSig
  * @throws {ContextError} If the sender DID does not match.
  */
 export async function mediaVerifySenderAttribution(
+  scp: SCP,
   signalingJson: string,
   envelopeSenderDid: string,
 ): Promise<boolean> {
-  deprecatedDefaultInstance("mediaVerifySenderAttribution");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.mediaVerifySenderAttribution(signalingJson, envelopeSenderDid);
   } catch (error) {
     throw mapBridgeError(error);

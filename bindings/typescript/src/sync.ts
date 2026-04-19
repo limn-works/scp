@@ -9,7 +9,7 @@
 
 import { mapBridgeError } from "./errors";
 import { getBridge } from "./internal/bridge";
-import { deprecatedDefaultInstance } from "./internal/deprecation";
+import type { SCP } from "./scp";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -34,14 +34,18 @@ export interface SyncPolicy {
 /**
  * Classifies an offline duration into the appropriate recovery tier.
  *
+ * @param scp - The `SCP` wrapper whose bridge instance should own this call.
  * @param lastRelayContact - Unix timestamp (seconds) of last relay contact.
  * @param now - Current Unix timestamp (seconds).
  * @returns `"short"`, `"extended"`, or `"long"`.
  */
-export async function classifyOffline(lastRelayContact: number, now: number): Promise<string> {
-  deprecatedDefaultInstance("classifyOffline");
+export async function classifyOffline(
+  scp: SCP,
+  lastRelayContact: number,
+  now: number,
+): Promise<string> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.syncClassifyOffline(lastRelayContact, now);
   } catch (error) {
     throw mapBridgeError(error);
@@ -51,6 +55,7 @@ export async function classifyOffline(lastRelayContact: number, now: number): Pr
 /**
  * Classifies an offline duration using custom policy thresholds.
  *
+ * @param scp - The `SCP` wrapper whose bridge instance should own this call.
  * @param lastRelayContact - Unix timestamp (seconds) of last relay contact.
  * @param now - Current Unix timestamp (seconds).
  * @param tier1ThresholdSecs - Custom upper bound for short offline tier (seconds).
@@ -58,14 +63,14 @@ export async function classifyOffline(lastRelayContact: number, now: number): Pr
  * @returns `"short"`, `"extended"`, or `"long"`.
  */
 export async function classifyOfflineCustom(
+  scp: SCP,
   lastRelayContact: number,
   now: number,
   tier1ThresholdSecs: number,
   tier2ThresholdSecs: number,
 ): Promise<string> {
-  deprecatedDefaultInstance("classifyOfflineCustom");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.syncClassifyOfflineCustom(
       lastRelayContact,
       now,
@@ -80,12 +85,12 @@ export async function classifyOfflineCustom(
 /**
  * Returns the default sync policy parameters.
  *
+ * @param scp - The `SCP` wrapper whose bridge instance should own this call.
  * @returns A `SyncPolicy` with the default parameters.
  */
-export async function getSyncPolicy(): Promise<SyncPolicy> {
-  deprecatedDefaultInstance("getSyncPolicy");
+export async function getSyncPolicy(scp: SCP): Promise<SyncPolicy> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = bridge.syncGetPolicy();
     return {
       tier1ThresholdSecs: raw.tier_1_threshold_secs,

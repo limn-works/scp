@@ -24,7 +24,7 @@
 
 import { createRequire } from "node:module";
 import { TransportError } from "./errors";
-import { __defaultScpForInternalUse, __getNativeScp, type SCP } from "./scp";
+import { __getNativeScp, type SCP } from "./scp";
 import type { SiteConfig } from "./types";
 import { validateAdmission, validateBroadcastKeyHex, validateSiteConfig } from "./types";
 
@@ -146,23 +146,16 @@ function loadServerAddon(): ServerAddon {
  * instance's class methods (ADR-048). Methods that have not yet been
  * ported onto the `Scp` class fall back to module-level free
  * functions.
- *
- * When `scp` is omitted, the shared process-wide default instance is
- * used — matching the legacy free-function façade behavior.
  */
-function serverApi(scp?: SCP): ServerAddon {
+function serverApi(scp: SCP): ServerAddon {
   // Ensure the native addon is actually installed / loadable before we
   // extract `Scp` class method references — `loadServerAddon` throws
   // the same descriptive `TransportError` on failure, so the error
   // surface remains identical to the pre-ADR-048 path.
   loadServerAddon();
-  const instance = scp ?? __defaultScpForInternalUse();
   // Type-erased native handle — every `Scp` class method shares the
   // `async (...args) => unknown` shape after FFI monomorphization.
-  const native = __getNativeScp(instance) as unknown as Record<
-    string,
-    (...args: never[]) => unknown
-  >;
+  const native = __getNativeScp(scp) as unknown as Record<string, (...args: never[]) => unknown>;
 
   return {
     relayStartInMemory: native.relayStartInMemory as ServerAddon["relayStartInMemory"],
@@ -211,13 +204,13 @@ export class Relay implements AsyncDisposable {
   /**
    * Start a relay with in-memory blob storage on an OS-assigned port.
    *
-   * @param scp Optional {@link SCP} wrapper whose bridge instance should
-   *   own the relay. Defaults to the shared process-wide default
-   *   instance when omitted (ADR-048).
+   * @param scp The {@link SCP} wrapper whose bridge instance should own
+   *   the relay. Required — the legacy process-wide default instance
+   *   fallback was removed in Phase 4 PR 4 (#1549) demolition.
    * @returns A `Relay` whose {@link relayUrl} property contains the
    * WebSocket URL for clients.
    */
-  static async startInMemory(scp?: SCP): Promise<Relay> {
+  static async startInMemory(scp: SCP): Promise<Relay> {
     const api = serverApi(scp);
     const handle = await api.relayStartInMemory();
     return new Relay(handle);
@@ -229,11 +222,11 @@ export class Relay implements AsyncDisposable {
    * Opens (or creates) a redb database at `<dataDir>/blobs.redb`.
    *
    * @param dataDir - Directory for persistent blob storage.
-   * @param scp Optional {@link SCP} wrapper whose bridge instance should
-   *   own the relay. Defaults to the shared process-wide default
-   *   instance when omitted (ADR-048).
+   * @param scp The {@link SCP} wrapper whose bridge instance should own
+   *   the relay. Required — the legacy process-wide default instance
+   *   fallback was removed in Phase 4 PR 4 (#1549) demolition.
    */
-  static async startLocal(dataDir: string, scp?: SCP): Promise<Relay> {
+  static async startLocal(dataDir: string, scp: SCP): Promise<Relay> {
     const api = serverApi(scp);
     const handle = await api.relayStartLocal(dataDir);
     return new Relay(handle);
@@ -308,12 +301,12 @@ export class Node implements AsyncDisposable {
    * Accepts any object with a `did` property (including the `Identity`
    * class from `identityCreate`), keeping the server module decoupled.
    *
+   * @param scp - The {@link SCP} wrapper whose bridge instance should
+   *   own the node. Required — the legacy process-wide default instance
+   *   fallback was removed in Phase 4 PR 4 (#1549) demolition.
    * @param identity - Optional identity object with a `.did` property.
-   * @param scp - Optional {@link SCP} wrapper whose bridge instance
-   *   should own the node. Defaults to the shared process-wide default
-   *   instance when omitted (ADR-048).
    */
-  static async startInMemory(identity?: { did: string }, scp?: SCP): Promise<Node> {
+  static async startInMemory(scp: SCP, identity?: { did: string }): Promise<Node> {
     const api = serverApi(scp);
     const handle = await api.nodeStartInMemory(identity?.did ?? null);
     return new Node(handle);
@@ -332,19 +325,19 @@ export class Node implements AsyncDisposable {
    *
    * No passphrase is required when `identity` is provided.
    *
+   * @param scp - The {@link SCP} wrapper whose bridge instance should
+   *   own the node. Required — the legacy process-wide default instance
+   *   fallback was removed in Phase 4 PR 4 (#1549) demolition.
    * @param dataDir - Directory for persistent storage.
    * @param identity - Optional identity object with a `.did` property.
    * @param passphrase - Passphrase for Argon2id key derivation. Required when
    *   identity is omitted.
-   * @param scp - Optional {@link SCP} wrapper whose bridge instance
-   *   should own the node. Defaults to the shared process-wide default
-   *   instance when omitted (ADR-048).
    */
   static async startLocal(
+    scp: SCP,
     dataDir: string,
     identity?: { did: string },
     passphrase?: string,
-    scp?: SCP,
   ): Promise<Node> {
     const api = serverApi(scp);
     const handle = await api.nodeStartLocal(dataDir, identity?.did ?? null, passphrase ?? null);
@@ -504,11 +497,11 @@ export class Node implements AsyncDisposable {
  * {@link Node.startInMemory}) bind to `127.0.0.1` without TLS.
  *
  * @param relayUrl - The WebSocket URL of the relay (e.g. `ws://127.0.0.1:PORT/scp/v1`).
- * @param scp - Optional {@link SCP} wrapper whose bridge instance
- *   should own the transport. Defaults to the shared process-wide
- *   default instance when omitted (ADR-048).
+ * @param scp - The {@link SCP} wrapper whose bridge instance should
+ *   own the transport. Required — the legacy process-wide default
+ *   instance fallback was removed in Phase 4 PR 4 (#1549) demolition.
  */
-export async function connectLocalTransport(relayUrl: string, scp?: SCP): Promise<void> {
+export async function connectLocalTransport(relayUrl: string, scp: SCP): Promise<void> {
   const api = serverApi(scp);
   await api.transportConnect(relayUrl);
 }
@@ -533,11 +526,11 @@ export async function connectLocalTransport(relayUrl: string, scp?: SCP): Promis
  *
  * @param localDid - A valid `did:dht:` DID string used as the MLS credential
  * identity. Typically the DID of the first identity created in the test.
- * @param scp - Optional {@link SCP} wrapper whose bridge instance
- *   should be configured. Defaults to the shared process-wide default
- *   instance when omitted (ADR-048).
+ * @param scp - The {@link SCP} wrapper whose bridge instance should be
+ *   configured. Required — the legacy process-wide default instance
+ *   fallback was removed in Phase 4 PR 4 (#1549) demolition.
  */
-export function configureLocalTransport(localDid: string, scp?: SCP): void {
+export function configureLocalTransport(localDid: string, scp: SCP): void {
   const api = serverApi(scp);
   api.configureLocalTransport(localDid);
 }

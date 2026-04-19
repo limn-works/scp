@@ -7,16 +7,11 @@
  * multi-identity apps, and per-tenant services can hold distinct
  * instances without sharing state.
  *
- * The free-function façade (`Identity.create`, `Context.create`, etc.)
- * currently operates on the process-wide default instance and emits a
- * one-time `console.warn` on first use (see `internal/deprecation.ts`).
- * Removal target: two release cycles after Phase 4 merge.
- *
  * ```ts
- * import { SCP } from "@limn-works/scp-ts";
+ * import { SCP, Identity } from "@limn-works/scp-ts";
  *
  * const scp = new SCP();                 // fresh in-memory instance
- * const shared = SCP.default();          // shared process-wide default
+ * const identity = await Identity.create(scp);
  * await scp.resume();                    // async — reconnects transport
  * await scp.shutdown(5);                 // graceful shutdown
  *
@@ -38,15 +33,12 @@
  * NOTE: `SCP` is a NAPI-only feature. The WASM bridge
  * does not expose a multi-instance class surface; attempting to
  * construct `SCP` in a browser environment throws `ValidationError`
- * with `SCP-VALID-7005`. WASM callers continue to use the free-function
- * façade (which is a no-op for lifecycle methods on WASM per
- * `internal/wasm.ts`).
+ * with `SCP-VALID-7005`.
  */
 
 import { createRequire } from "node:module";
 
 import { ValidationError } from "./errors";
-import { deprecatedDefaultInstance } from "./internal/deprecation";
 
 /**
  * Shape of the native addon — a subset sufficient to describe the
@@ -73,7 +65,6 @@ type NativeAddon = {
  */
 interface NativeScpCtor {
   new (): NativeScpInstance;
-  default: () => NativeScpInstance;
   withStorage: (configJson: string) => NativeScpInstance;
 }
 
@@ -168,8 +159,7 @@ function nativeScp(): NativeScpCtor {
     throw new ValidationError(
       "SCP class is not available in WASM runtime — the browser build of " +
         "@limn-works/scp-ts does not expose a multi-instance class (ADR-034 / " +
-        "ADR-048). Use @limn-works/scp-sdk-napi in a Node.js or Bun process, " +
-        "or use the free-function façade if your code must run in a browser.",
+        "ADR-048). Use @limn-works/scp-sdk-napi in a Node.js or Bun process.",
       "SCP-VALID-7005",
     );
   }
@@ -325,14 +315,6 @@ export interface ScpOptions {
 // ---------------------------------------------------------------------------
 
 /**
- * Internal marker used by the `SCP.default()` factory to bypass the
- * public `constructor`'s native-SCP initialization path and inject an
- * externally-obtained handle. The marker is a module-local Symbol so
- * it is impossible to forge from outside this module.
- */
-const ADOPT_HANDLE: unique symbol = Symbol("scp.adoptHandle");
-
-/**
  * Module-private symbol for internal accessors that surface the raw
  * native handle to other SDK modules (notably
  * `internal/native.ts`, `server.ts`, `mcp.ts`, `lifecycle.ts`).
@@ -367,47 +349,12 @@ export class SCP {
    *   runtime or missing platform package) — code `SCP-VALID-7005`.
    */
   constructor(options: ScpOptions = {}) {
-    // Internal fast-path used by the `default()` factory to adopt a
-    // pre-existing native handle without invoking the usual
-    // constructor factories. External callers cannot synthesize this
-    // path because `ADOPT_HANDLE` is a module-private symbol.
-    if ((options as { [ADOPT_HANDLE]?: NativeScpInstance })[ADOPT_HANDLE] !== undefined) {
-      this.#native = (options as { [ADOPT_HANDLE]: NativeScpInstance })[ADOPT_HANDLE];
-      return;
-    }
-
     const NativeScp = nativeScp();
     if (options.storage !== undefined) {
       this.#native = NativeScp.withStorage(serializeStorageConfig(options.storage));
     } else {
       this.#native = new NativeScp();
     }
-  }
-
-  /**
-   * Returns an `SCP` wrapping the process-wide default instance.
-   *
-   * Repeated calls return distinct wrapper objects sharing the same
-   * underlying native handle — `instanceId` is stable across calls.
-   *
-   * This is what the deprecated free-function façade uses under the
-   * hood. Prefer explicit construction (`new SCP()`) in new code.
-   *
-   * Emits a one-time `console.warn` on first call per JS runtime so
-   * legacy call sites are visible even when the free-function façade
-   * isn't exercised.
-   *
-   * @deprecated Use `new SCP()` per tenant/identity. `SCP.default()`
-   *   is a legacy scaffold that routes through the shared
-   *   process-wide bridge instance (ADR-048); removal is scheduled
-   *   for two release cycles after the Phase 4 merge.
-   * @throws {ValidationError} If the NAPI addon is unavailable.
-   */
-  static default(): SCP {
-    deprecatedDefaultInstance("SCP.default");
-    const NativeScp = nativeScp();
-    const native = NativeScp.default();
-    return new SCP({ [ADOPT_HANDLE]: native } as ScpOptions);
   }
 
   /**
@@ -520,29 +467,4 @@ export class SCP {
  */
 export function __getNativeScp(scp: SCP): NativeScpInstance {
   return scp[NATIVE_HANDLE];
-}
-
-/**
- * Loads the native NAPI `SCP` class and returns a wrapper around the
- * process-wide default instance without emitting the one-time
- * deprecation warning that {@link SCP.default} prints. Used internally
- * by the free-function façade adapters (`createNativeBridge`,
- * `server.ts`, `mcp.ts`, `lifecycle.ts`) so legacy callers that don't
- * supply an explicit {@link SCP} argument keep working without
- * spamming warnings on every method call.
- *
- * Returns the cached default wrapper, so repeated calls share the same
- * underlying `instanceId`.
- *
- * @internal
- */
-let _defaultWrapper: SCP | null = null;
-export function __defaultScpForInternalUse(): SCP {
-  if (_defaultWrapper !== null) {
-    return _defaultWrapper;
-  }
-  const NativeScp = nativeScp();
-  const native = NativeScp.default();
-  _defaultWrapper = new SCP({ [ADOPT_HANDLE]: native } as ScpOptions);
-  return _defaultWrapper;
 }

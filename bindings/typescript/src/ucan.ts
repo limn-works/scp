@@ -11,7 +11,6 @@
 import type { Context } from "./context";
 import { mapBridgeError } from "./errors";
 import { getBridge } from "./internal/bridge";
-import { deprecatedDefaultInstance } from "./internal/deprecation";
 import type { UcanToken } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -25,15 +24,18 @@ import type { UcanToken } from "./types";
  * delegation chain traversal, attenuation enforcement, nonce replay
  * detection, and capability matching.
  *
+ * Routes through the context's owning `SCP` instance (ADR-048). The
+ * back-compat default-instance fallback was removed in Phase 4 PR 4
+ * (#1549) demolition.
+ *
  * @param ctx - The context the token is presented in.
  * @param token - The encoded UCAN token string (JWT format).
  * @param capability - The required capability URI.
  * @throws {UcanPermissionError} If validation fails.
  */
 export async function validateUcan(ctx: Context, token: string, capability: string): Promise<void> {
-  deprecatedDefaultInstance("validateUcan");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(ctx._scp);
     await bridge.ucanValidate(ctx._handle, token, capability);
   } catch (error) {
     throw mapBridgeError(error);
@@ -45,6 +47,8 @@ export async function validateUcan(ctx: Context, token: string, capability: stri
  *
  * Creates a UCAN token granting the specified capabilities to the member.
  * The token is signed by the context admin's key and scoped to this context.
+ *
+ * Routes through the context's owning `SCP` instance (ADR-048).
  *
  * @param ctx - The context to mint the token for.
  * @param memberDid - The DID of the member receiving the token.
@@ -59,9 +63,8 @@ export async function mintUcan(
   capabilities: readonly string[],
   proofs?: readonly string[],
 ): Promise<UcanToken> {
-  deprecatedDefaultInstance("mintUcan");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(ctx._scp);
     return await bridge.ucanMint(ctx._handle, memberDid, capabilities, proofs);
   } catch (error) {
     throw mapBridgeError(error);
@@ -75,6 +78,8 @@ export async function mintUcan(
  * creator), adds the token to the context's revocation list, and appends a
  * TokenRevoked event to the context's Merkle event log.
  *
+ * Routes through the context's owning `SCP` instance (ADR-048).
+ *
  * @param ctx - The context the token belongs to.
  * @param token - The full encoded JWT string of the token to revoke.
  * @param revokerDid - The DID of the entity requesting the revocation.
@@ -82,9 +87,8 @@ export async function mintUcan(
  * @throws {UcanPermissionError} If revocation fails (unauthorized, malformed, etc.).
  */
 export async function revokeUcan(ctx: Context, token: string, revokerDid: string): Promise<void> {
-  deprecatedDefaultInstance("revokeUcan");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(ctx._scp);
     await bridge.ucanRevoke(ctx._handle, token, revokerDid);
   } catch (error) {
     throw mapBridgeError(error);
@@ -103,6 +107,8 @@ export async function revokeUcan(ctx: Context, token: string, revokerDid: string
  * signing via the delegator's retained `KeyCustody` and enforces
  * attenuation, iss/aud chain validation, and ceiling compliance.
  *
+ * Routes through the context's owning `SCP` instance (ADR-048).
+ *
  * @param ctx - The context to delegate within.
  * @param originalToken - The original token to delegate from (must include `encoded` JWT).
  * @param delegatorDid - The DID of the entity delegating (must match originalToken.audience).
@@ -118,9 +124,8 @@ export async function delegateUcan(
   targetDid: string,
   capabilities: readonly string[],
 ): Promise<UcanToken> {
-  deprecatedDefaultInstance("delegateUcan");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(ctx._scp);
     return await bridge.ucanDelegate(
       ctx._handle,
       delegatorDid,

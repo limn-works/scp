@@ -12,7 +12,7 @@
 import { mapBridgeError } from "./errors";
 import type { Identity } from "./identity";
 import { getBridge } from "./internal/bridge";
-import { deprecatedDefaultInstance } from "./internal/deprecation";
+import type { SCP } from "./scp";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,10 +75,13 @@ export interface ScpIdAuthentication {
  * @throws {ValidationError} If `audience` is empty, exceeds 2048 bytes,
  *   or `ttlSeconds` is 0 or exceeds 300.
  */
-export async function scpidChallenge(audience: string, ttlSeconds = 300): Promise<ScpIdChallenge> {
-  deprecatedDefaultInstance("scpidChallenge");
+export async function scpidChallenge(
+  scp: SCP,
+  audience: string,
+  ttlSeconds = 300,
+): Promise<ScpIdChallenge> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const json = bridge.scpidChallenge(audience, ttlSeconds);
     return JSON.parse(json) as ScpIdChallenge;
   } catch (error) {
@@ -105,9 +108,8 @@ export async function scpidSign(
   signingKeyId: string,
   challenge: ScpIdChallenge,
 ): Promise<ScpIdResponse> {
-  deprecatedDefaultInstance("scpidSign");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(identity._scp);
     const json = bridge.scpidSign(identity.did, signingKeyId, JSON.stringify(challenge));
     return JSON.parse(json) as ScpIdResponse;
   } catch (error) {
@@ -135,12 +137,12 @@ export async function scpidSign(
  * @throws {ValidationError} If either JSON structure is malformed.
  */
 export async function scpidVerify(
+  scp: SCP,
   response: ScpIdResponse,
   challenge: ScpIdChallenge,
 ): Promise<ScpIdAuthentication> {
-  deprecatedDefaultInstance("scpidVerify");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const json = bridge.scpidVerify(JSON.stringify(response), JSON.stringify(challenge));
     return JSON.parse(json) as ScpIdAuthentication;
   } catch (error) {

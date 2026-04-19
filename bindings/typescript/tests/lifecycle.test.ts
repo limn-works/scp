@@ -38,21 +38,25 @@ function napiAvailable(): boolean {
 const describeNapi = napiAvailable() ? describe : describe.skip;
 
 describeNapi("bridge lifecycle (scpSuspend / scpResume)", () => {
-  it("scpSuspend when uninitialized (or already shut down) is a no-op", async () => {
-    // scp_suspend returns Ok(()) in both cases — BridgeInstance::suspend()
-    // short-circuits on is_shutdown().
-    await expect(scpSuspend()).resolves.toBeUndefined();
+  it("scpSuspend on a fresh instance is a no-op", async () => {
+    const scp = new SCP();
+    try {
+      // scp_suspend returns Ok(()) — BridgeInstance::suspend()
+      // short-circuits on is_shutdown() and on uninitialized state.
+      await expect(scpSuspend(scp)).resolves.toBeUndefined();
+    } finally {
+      await scp.shutdown(1);
+    }
   });
 
-  it("scpResume when uninitialized is a no-op; when shut down it rejects", async () => {
-    // Prior tests may have shut the bridge down via napi.shutdown().
-    // BridgeInstance::resume() returns LifecycleError::AlreadyShutDown
-    // in that case, which is correct (shutdown is terminal). When
-    // uninitialized, scp_resume short-circuits to Ok(()).
+  it("scpResume on a fresh instance is a no-op; on shut-down instance rejects", async () => {
+    const scp = new SCP();
     try {
-      await scpResume();
+      await scpResume(scp);
     } catch (err) {
       expect(String(err)).toMatch(/shut down|AlreadyShutDown|SCP-CTX-2000/);
+    } finally {
+      await scp.shutdown(1);
     }
   });
 

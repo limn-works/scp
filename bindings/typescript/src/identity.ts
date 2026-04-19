@@ -11,6 +11,7 @@
 import { IdentityError, mapBridgeError, ValidationError } from "./errors";
 import type { BridgeIdentityHandle } from "./internal/bridge";
 import { getBridge } from "./internal/bridge";
+import type { SCP } from "./scp";
 import type { DIDDocument } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -95,10 +96,14 @@ export class Identity {
   /** @internal Opaque bridge handle — not part of the public API. */
   readonly _handle: BridgeIdentityHandle;
 
-  private constructor(did: string, custodyType: string, handle: BridgeIdentityHandle) {
+  /** @internal The SCP bridge instance this identity is bound to. */
+  readonly _scp: SCP;
+
+  private constructor(did: string, custodyType: string, handle: BridgeIdentityHandle, scp: SCP) {
     this.did = did;
     this.custodyType = custodyType;
     this._handle = handle;
+    this._scp = scp;
   }
 
   /**
@@ -114,12 +119,12 @@ export class Identity {
    * @throws {IdentityError} If identity creation fails.
    * @throws {ValidationError} If the custody type is not recognized.
    */
-  static async create(options: { custody?: CustodyType } = {}): Promise<Identity> {
+  static async create(scp: SCP, options: { custody?: CustodyType } = {}): Promise<Identity> {
     const custody = options.custody ?? "platform";
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(scp);
       const handle = await bridge.identityCreate(custody);
-      return new Identity(handle.did, handle.custodyType, handle);
+      return new Identity(handle.did, handle.custodyType, handle, scp);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -136,11 +141,11 @@ export class Identity {
    * @returns The loaded `Identity` instance.
    * @throws {IdentityError} If the DID format is invalid or loading fails.
    */
-  static async load(did: string): Promise<Identity> {
+  static async load(scp: SCP, did: string): Promise<Identity> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(scp);
       const handle = await bridge.identityLoad(did);
-      return new Identity(handle.did, handle.custodyType, handle);
+      return new Identity(handle.did, handle.custodyType, handle, scp);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -155,9 +160,9 @@ export class Identity {
    * @returns The resolved DID document.
    * @throws {IdentityError} If the DID cannot be resolved.
    */
-  static async resolve(did: string): Promise<DIDDocument> {
+  static async resolve(scp: SCP, did: string): Promise<DIDDocument> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(scp);
       return await bridge.identityResolve(did);
     } catch (error) {
       throw mapBridgeError(error);
@@ -175,9 +180,9 @@ export class Identity {
    */
   async rotateKey(): Promise<Identity> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const handle = await bridge.identityRotateKey(this._handle);
-      return new Identity(handle.did, handle.custodyType, handle);
+      return new Identity(handle.did, handle.custodyType, handle, this._scp);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -194,12 +199,15 @@ export class Identity {
    * @returns A new `Identity` with an agent key.
    * @throws {IdentityError} If creation fails.
    */
-  static async createWithAgentKey(options: { custody?: CustodyType } = {}): Promise<Identity> {
+  static async createWithAgentKey(
+    scp: SCP,
+    options: { custody?: CustodyType } = {},
+  ): Promise<Identity> {
     const custody = options.custody ?? "platform";
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(scp);
       const handle = await bridge.identityCreateWithAgentKey(custody);
-      return new Identity(handle.did, handle.custodyType, handle);
+      return new Identity(handle.did, handle.custodyType, handle, scp);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -213,9 +221,9 @@ export class Identity {
    */
   async addAgentKey(): Promise<Identity> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const handle = await bridge.identityAddAgentKey(this._handle);
-      return new Identity(handle.did, handle.custodyType, handle);
+      return new Identity(handle.did, handle.custodyType, handle, this._scp);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -229,9 +237,9 @@ export class Identity {
    */
   async rotateAgentKey(): Promise<Identity> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const handle = await bridge.identityRotateAgentKey(this._handle);
-      return new Identity(handle.did, handle.custodyType, handle);
+      return new Identity(handle.did, handle.custodyType, handle, this._scp);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -245,9 +253,9 @@ export class Identity {
    */
   async removeAgentKey(): Promise<Identity> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const handle = await bridge.identityRemoveAgentKey(this._handle);
-      return new Identity(handle.did, handle.custodyType, handle);
+      return new Identity(handle.did, handle.custodyType, handle, this._scp);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -264,9 +272,9 @@ export class Identity {
    */
   async migrate(): Promise<Identity> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const handle = await bridge.identityMigrate(this._handle);
-      return new Identity(handle.did, handle.custodyType, handle);
+      return new Identity(handle.did, handle.custodyType, handle, this._scp);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -280,7 +288,7 @@ export class Identity {
    */
   async attestDevice(): Promise<string> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.identityAttestDevice(this.did);
     } catch (error) {
       throw mapBridgeError(error);
@@ -296,7 +304,7 @@ export class Identity {
    */
   async verifyDeviceAttestation(tokenBase64: string): Promise<boolean> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.identityVerifyDeviceAttestation(this.did, tokenBase64);
     } catch (error) {
       throw mapBridgeError(error);
@@ -318,7 +326,7 @@ export class Identity {
     contextIds: string[] = [],
   ): Promise<Record<string, unknown>> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const json = await bridge.identityExecuteRecovery(this.did, tier, contextIds);
       return JSON.parse(json);
     } catch (error) {
@@ -341,7 +349,7 @@ export class Identity {
     contextIds: string[] = [],
   ): Promise<Record<string, unknown>> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const json = await bridge.identityExecuteCustodyMigration(this.did, target, contextIds);
       return JSON.parse(json);
     } catch (error) {
@@ -375,7 +383,7 @@ export class Identity {
     platformId?: string;
   }): Promise<IdentityAttestation> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const fn = (bridge as unknown as Record<string, unknown>).identityCreateLinkAttestation as
         | ((
             did: string,
@@ -400,7 +408,7 @@ export class Identity {
         options.verificationMethod ?? "oauth",
         options.platformId,
       );
-      return IdentityAttestation._fromJson(json);
+      return IdentityAttestation._fromJson(json, this._scp);
     } catch (error) {
       throw error instanceof IdentityError ? error : mapBridgeError(error);
     }
@@ -414,7 +422,7 @@ export class Identity {
    */
   async listAttestations(): Promise<readonly IdentityAttestation[]> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const fn = (bridge as unknown as Record<string, unknown>).identityLinkAttestations as
         | ((did: string) => Promise<string>)
         | undefined;
@@ -426,7 +434,9 @@ export class Identity {
       }
       const json = await fn(this.did);
       const items = JSON.parse(json) as Record<string, unknown>[];
-      return items.map((item) => IdentityAttestation._fromRecord(item, JSON.stringify(item)));
+      return items.map((item) =>
+        IdentityAttestation._fromRecord(item, this._scp, JSON.stringify(item)),
+      );
     } catch (error) {
       throw error instanceof IdentityError ? error : mapBridgeError(error);
     }
@@ -441,7 +451,7 @@ export class Identity {
    */
   async removeAttestation(attestationId: string): Promise<boolean> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const fn = (bridge as unknown as Record<string, unknown>).identityRemoveLinkAttestation as
         | ((did: string, attestationId: string) => Promise<boolean>)
         | undefined;
@@ -614,7 +624,10 @@ export class IdentityAttestation implements IdentityAttestationData {
   /** @internal Raw JSON string from the bridge for roundtrip verification. */
   private readonly _rawJson?: string | undefined;
 
-  constructor(data: IdentityAttestationData, rawJson?: string) {
+  /** @internal The SCP bridge instance this attestation is bound to. */
+  readonly _scp: SCP;
+
+  constructor(data: IdentityAttestationData, scp: SCP, rawJson?: string) {
     if (!Number.isInteger(data.verifiedAt) || data.verifiedAt < 0) {
       throw new ValidationError("verified_at must be a non-negative integer", "SCP-VALID-7005");
     }
@@ -626,6 +639,7 @@ export class IdentityAttestation implements IdentityAttestationData {
     this.revocationStatus = data.revocationStatus;
     this.platformId = data.platformId;
     this._rawJson = rawJson;
+    this._scp = scp;
   }
 
   /**
@@ -643,7 +657,7 @@ export class IdentityAttestation implements IdentityAttestationData {
    */
   async verify(issuerPublicKeyHex: string): Promise<boolean> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const fn = (bridge as unknown as Record<string, unknown>).identityVerifyLinkAttestation as
         | ((json: string, issuerPublicKeyHex: string) => Promise<boolean>)
         | undefined;
@@ -688,13 +702,17 @@ export class IdentityAttestation implements IdentityAttestationData {
   }
 
   /** @internal */
-  static _fromJson(json: string): IdentityAttestation {
+  static _fromJson(json: string, scp: SCP): IdentityAttestation {
     const data = JSON.parse(json) as Record<string, unknown>;
-    return IdentityAttestation._fromRecord(data, json);
+    return IdentityAttestation._fromRecord(data, scp, json);
   }
 
   /** @internal */
-  static _fromRecord(data: Record<string, unknown>, rawJson?: string): IdentityAttestation {
+  static _fromRecord(
+    data: Record<string, unknown>,
+    scp: SCP,
+    rawJson?: string,
+  ): IdentityAttestation {
     // Read from nested `claim` and `evidence` structures when present
     // (full attestation JSON), with fallback to flat keys.
     const claim = (data.claim ?? {}) as Record<string, unknown>;
@@ -729,6 +747,7 @@ export class IdentityAttestation implements IdentityAttestationData {
         revocationStatus,
         platformId,
       },
+      scp,
       rawJson,
     );
   }

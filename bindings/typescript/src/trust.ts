@@ -12,7 +12,7 @@
 import type { Context } from "./context";
 import { mapBridgeError } from "./errors";
 import { getBridge, getBridgeSync } from "./internal/bridge";
-import { deprecatedDefaultInstance } from "./internal/deprecation";
+import type { SCP } from "./scp";
 import type {
   AttestationSummary,
   BehavioralRecord,
@@ -40,9 +40,8 @@ import { encodeConsequenceRules } from "./types";
  * @throws {ContextError} If the context is not active or evaluation fails.
  */
 export async function evaluateTrust(ctx: Context, subjectDid: string): Promise<TrustEvaluation> {
-  deprecatedDefaultInstance("evaluateTrust");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(ctx._scp);
 
     // Query the event log for the subject's participation events.
     const events = await bridge.eventLogQuery(ctx._handle, {
@@ -157,10 +156,12 @@ export interface AggregatedTrustInput {
  * @returns An `AggregatedTrustInput` with all trust layers.
  * @throws {Error} If inputs are malformed or aggregation fails.
  */
-export async function aggregateTrustInput(input: AggregationInput): Promise<AggregatedTrustInput> {
-  deprecatedDefaultInstance("aggregateTrustInput");
+export async function aggregateTrustInput(
+  scp: SCP,
+  input: AggregationInput,
+): Promise<AggregatedTrustInput> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
 
     const resultJson = await bridge.aggregateTrustInput(
       input.contextId,
@@ -238,11 +239,11 @@ function requirementToBridgeJson(requirement: RequireParticipation): Record<stri
  * @throws {ScpError} If the bridge module is not available.
  */
 export function verifyParticipationRequirements(
+  scp: SCP,
   requirements: readonly RequireParticipation[],
   profiles: readonly ParticipationProfile[],
 ): void {
-  deprecatedDefaultInstance("verifyParticipationRequirements");
-  const bridge = getBridgeSync();
+  const bridge = getBridgeSync(scp);
 
   const profileJson = JSON.stringify(profiles.map(profileToBridgeJson));
   const requirementsJson = JSON.stringify(requirements.map(requirementToBridgeJson));

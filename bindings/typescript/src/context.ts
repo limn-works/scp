@@ -15,8 +15,8 @@ import { ContextError, mapBridgeError, ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import type { BridgeContextHandle } from "./internal/bridge";
 import { getBridge, getBridgeSync } from "./internal/bridge";
-import { deprecatedDefaultInstance } from "./internal/deprecation";
 import { safeJsonParse } from "./internal/json-utils";
+import type { SCP } from "./scp";
 import type {
   AssetEntry,
   BatchPublishResult,
@@ -308,10 +308,19 @@ export class Context implements AsyncDisposable {
   /** Whether this context has been left or closed. */
   private _disposed = false;
 
-  private constructor(contextId: string, handle: BridgeContextHandle, identityDid: string) {
+  /** @internal The SCP bridge instance this context is bound to. */
+  readonly _scp: SCP;
+
+  private constructor(
+    contextId: string,
+    handle: BridgeContextHandle,
+    identityDid: string,
+    scp: SCP,
+  ) {
     this.contextId = contextId;
     this._handle = handle;
     this._identityDid = identityDid;
+    this._scp = scp;
   }
 
   /**
@@ -319,8 +328,8 @@ export class Context implements AsyncDisposable {
    *
    * @internal Testing only — not part of the public API.
    */
-  static _fromHandle(handle: BridgeContextHandle, identityDid: string): Context {
-    return new Context(handle.contextId, handle, identityDid);
+  static _fromHandle(handle: BridgeContextHandle, identityDid: string, scp: SCP): Context {
+    return new Context(handle.contextId, handle, identityDid, scp);
   }
 
   /**
@@ -345,7 +354,7 @@ export class Context implements AsyncDisposable {
    */
   static async create(identity: Identity, params: ContextParams): Promise<Context> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(identity._scp);
       const paramsJson = JSON.stringify({
         ceiling: params.ceiling,
         tools: params.tools,
@@ -371,7 +380,7 @@ export class Context implements AsyncDisposable {
       });
 
       const handle = await bridge.contextCreate(identity._handle, paramsJson);
-      return new Context(handle.contextId, handle, identity.did);
+      return new Context(handle.contextId, handle, identity.did, identity._scp);
     } catch (error) {
       throw mapBridgeError(error);
     }
@@ -395,7 +404,7 @@ export class Context implements AsyncDisposable {
   async join(identity: Identity, spendingUcanJwt?: string): Promise<void> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       await bridge.contextJoin(this._handle, identity.did, spendingUcanJwt ?? null);
     } catch (error) {
       throw mapBridgeError(error);
@@ -422,7 +431,7 @@ export class Context implements AsyncDisposable {
   async send(payload: string | Uint8Array, spendingUcanJwt?: string): Promise<void> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const bytes = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
       await bridge.contextSend(this._handle, this._identityDid, bytes, spendingUcanJwt ?? null);
     } catch (error) {
@@ -451,7 +460,7 @@ export class Context implements AsyncDisposable {
     let resolve: (() => void) | null = null;
     let done = false;
 
-    const bridge = await getBridge();
+    const bridge = await getBridge(this._scp);
     try {
       // `contextSubscribe` is async after #1549 Phase 4 PR 1 — the NAPI
       // task is registered against the bridge's JoinSet so shutdown can
@@ -500,7 +509,7 @@ export class Context implements AsyncDisposable {
   async registerTool(definition: ToolDefinition): Promise<string> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.toolRegister(this._handle, definition);
     } catch (error) {
       throw mapBridgeError(error);
@@ -544,7 +553,7 @@ export class Context implements AsyncDisposable {
   ): Promise<unknown> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const resultJson = await bridge.toolInvoke(
         this._handle,
         toolId,
@@ -570,7 +579,7 @@ export class Context implements AsyncDisposable {
   async verifyTool(toolId: string): Promise<ToolVerificationResult> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.toolVerify(this._handle, toolId);
     } catch (error) {
       throw mapBridgeError(error);
@@ -601,7 +610,7 @@ export class Context implements AsyncDisposable {
   ): Promise<string> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.toolInterfaceExpose(this._handle, toolId, targetContextId, rateLimitJson);
     } catch (error) {
       throw mapBridgeError(error);
@@ -621,7 +630,7 @@ export class Context implements AsyncDisposable {
   async acceptToolInterface(interfaceJson: string): Promise<string> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.toolInterfaceAccept(this._handle, interfaceJson);
     } catch (error) {
       throw mapBridgeError(error);
@@ -640,7 +649,7 @@ export class Context implements AsyncDisposable {
   async revokeToolInterface(interfaceIdHex: string): Promise<string> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.toolInterfaceRevoke(this._handle, interfaceIdHex);
     } catch (error) {
       throw mapBridgeError(error);
@@ -660,7 +669,7 @@ export class Context implements AsyncDisposable {
   async memberCount(): Promise<number | null> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextMemberCount(this._handle);
     } catch (error) {
       throw mapBridgeError(error);
@@ -677,7 +686,7 @@ export class Context implements AsyncDisposable {
   async isMember(did: string): Promise<boolean> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextIsMember(this._handle, did);
     } catch (error) {
       throw mapBridgeError(error);
@@ -693,7 +702,7 @@ export class Context implements AsyncDisposable {
   async memberDids(): Promise<readonly string[]> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextMemberDids(this._handle);
     } catch (error) {
       throw mapBridgeError(error);
@@ -710,7 +719,7 @@ export class Context implements AsyncDisposable {
   async memberRole(did: string): Promise<MemberRole | null> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextMemberRole(this._handle, did);
     } catch (error) {
       throw mapBridgeError(error);
@@ -730,7 +739,7 @@ export class Context implements AsyncDisposable {
   async broadcastSubscribe(subscriberDid: string): Promise<void> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       await bridge.broadcastSubscribe(this._handle, subscriberDid);
     } catch (error) {
       throw mapBridgeError(error);
@@ -747,7 +756,7 @@ export class Context implements AsyncDisposable {
   async broadcastUnsubscribe(subscriberDid: string, rotateKeys = false): Promise<void> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       await bridge.broadcastUnsubscribe(this._handle, subscriberDid, rotateKeys);
     } catch (error) {
       throw mapBridgeError(error);
@@ -765,7 +774,7 @@ export class Context implements AsyncDisposable {
   async broadcastPublish(payload: Uint8Array, authorDid?: string): Promise<void> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       await bridge.broadcastPublish(this._handle, authorDid ?? this._identityDid, payload);
     } catch (error) {
       throw mapBridgeError(error);
@@ -799,7 +808,7 @@ export class Context implements AsyncDisposable {
       _validateDeployId(deployId);
     }
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const result = await bridge.broadcastPublishAsset(
         this._handle,
         authorDid ?? this._identityDid,
@@ -840,7 +849,7 @@ export class Context implements AsyncDisposable {
       _validateDeployId(deployId);
     }
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const napiAssets = assets.map((a) => ({
         path: a.path,
         contentType: a.contentType,
@@ -875,7 +884,7 @@ export class Context implements AsyncDisposable {
   async broadcastBlockSubscriber(subscriberDid: string, blockerDid: string): Promise<void> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       await bridge.broadcastBlockSubscriber(this._handle, subscriberDid, blockerDid);
     } catch (error) {
       throw mapBridgeError(error);
@@ -895,7 +904,7 @@ export class Context implements AsyncDisposable {
   async broadcastUnblockSubscriber(subscriberDid: string, unblockerDid: string): Promise<void> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       await bridge.broadcastUnblockSubscriber(this._handle, subscriberDid, unblockerDid);
     } catch (error) {
       throw mapBridgeError(error);
@@ -913,7 +922,7 @@ export class Context implements AsyncDisposable {
   async broadcastHandleKeyRequest(authorDid: string, requesterDid: string): Promise<string> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.broadcastHandleKeyRequest(this._handle, authorDid, requesterDid);
     } catch (error) {
       throw mapBridgeError(error);
@@ -929,7 +938,7 @@ export class Context implements AsyncDisposable {
   async broadcastSubscriberCount(): Promise<number | null> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.broadcastSubscriberCount(this._handle);
     } catch (error) {
       throw mapBridgeError(error);
@@ -946,7 +955,7 @@ export class Context implements AsyncDisposable {
   async broadcastIsSubscriber(did: string): Promise<boolean> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.broadcastIsSubscriber(this._handle, did);
     } catch (error) {
       throw mapBridgeError(error);
@@ -962,7 +971,7 @@ export class Context implements AsyncDisposable {
   async broadcastAdmission(): Promise<BroadcastAdmissionPolicy | null> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.broadcastAdmission(this._handle);
     } catch (error) {
       throw mapBridgeError(error);
@@ -993,7 +1002,7 @@ export class Context implements AsyncDisposable {
     this.assertActive();
     _validateEconomicPolicyJson(policyJson);
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       await bridge.contextSetEconomicPolicy(this._handle, policyJson);
     } catch (error) {
       throw mapBridgeError(error);
@@ -1009,7 +1018,7 @@ export class Context implements AsyncDisposable {
   async getEconomicPolicy(): Promise<string | null> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextGetEconomicPolicy(this._handle);
     } catch (error) {
       throw mapBridgeError(error);
@@ -1030,7 +1039,7 @@ export class Context implements AsyncDisposable {
   async executeGovernanceAction(proposalJson: string): Promise<GovernanceActionResult> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       const raw = await bridge.contextExecuteGovernanceAction(
         this._handle,
         proposalJson,
@@ -1057,7 +1066,7 @@ export class Context implements AsyncDisposable {
   async proposeGovernanceAction(actionJson: string, proposerDid?: string): Promise<string> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextGovernancePropose(
         this._handle,
         actionJson,
@@ -1081,7 +1090,7 @@ export class Context implements AsyncDisposable {
   async approveGovernanceProposal(proposalIdHex: string, voterDid?: string): Promise<string> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextGovernanceApprove(
         this._handle,
         proposalIdHex,
@@ -1103,7 +1112,7 @@ export class Context implements AsyncDisposable {
   async rejectGovernanceProposal(proposalIdHex: string, voterDid?: string): Promise<string> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextGovernanceReject(
         this._handle,
         proposalIdHex,
@@ -1125,7 +1134,7 @@ export class Context implements AsyncDisposable {
   async withdrawGovernanceVote(proposalIdHex: string, voterDid?: string): Promise<string> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextGovernanceWithdraw(
         this._handle,
         proposalIdHex,
@@ -1146,7 +1155,7 @@ export class Context implements AsyncDisposable {
   async getGovernanceProposal(proposalIdHex: string): Promise<string> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextGovernanceGetProposal(this._handle, proposalIdHex);
     } catch (error) {
       throw mapBridgeError(error);
@@ -1162,7 +1171,7 @@ export class Context implements AsyncDisposable {
   async listGovernanceProposals(): Promise<string> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextGovernanceListProposals(this._handle);
     } catch (error) {
       throw mapBridgeError(error);
@@ -1183,7 +1192,7 @@ export class Context implements AsyncDisposable {
   async applyPendingCeilingModification(currentTimestamp: number): Promise<boolean> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextApplyPendingCeilingModification(this._handle, currentTimestamp);
     } catch (error) {
       throw mapBridgeError(error);
@@ -1200,7 +1209,7 @@ export class Context implements AsyncDisposable {
    */
   async finalizeClose(): Promise<void> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       await bridge.contextFinalizeClose(this._handle);
     } catch (error) {
       throw mapBridgeError(error);
@@ -1232,7 +1241,7 @@ export class Context implements AsyncDisposable {
   }): Promise<string> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextCreateGovernanceCheckpoint(
         this._handle,
         params.checkpointSeq,
@@ -1264,7 +1273,7 @@ export class Context implements AsyncDisposable {
   ): Promise<string> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextAddCheckpointCosignature(
         this._handle,
         checkpointJson,
@@ -1294,7 +1303,7 @@ export class Context implements AsyncDisposable {
   async ttlRemaining(): Promise<number | null> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextTtlRemaining(this._handle);
     } catch (error) {
       throw mapBridgeError(error);
@@ -1315,7 +1324,7 @@ export class Context implements AsyncDisposable {
       throw new ContextError("additionalSecs must be a finite positive number", "SCP-CTX-2031");
     }
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextExtendTtl(this._handle, additionalSecs);
     } catch (error) {
       throw mapBridgeError(error);
@@ -1334,7 +1343,7 @@ export class Context implements AsyncDisposable {
   async handleTtlExpiry(): Promise<void> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       await bridge.contextHandleTtlExpiry(this._handle);
     } catch (error) {
       throw mapBridgeError(error);
@@ -1359,7 +1368,7 @@ export class Context implements AsyncDisposable {
       throw new ContextError("extensionSecs must be a finite positive number", "SCP-CTX-2031");
     }
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextProposeTtlExtension(
         this._handle,
         proposerDid ?? this._identityDid,
@@ -1386,7 +1395,7 @@ export class Context implements AsyncDisposable {
       throw new ContextError("newDurationSecs must be a finite positive number", "SCP-CTX-2031");
     }
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       await bridge.contextResetTtlTimer(this._handle, newDurationSecs);
     } catch (error) {
       throw mapBridgeError(error);
@@ -1409,7 +1418,7 @@ export class Context implements AsyncDisposable {
   async export(): Promise<Uint8Array> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextExport(this._handle);
     } catch (error) {
       throw mapBridgeError(error);
@@ -1426,9 +1435,9 @@ export class Context implements AsyncDisposable {
    * @returns The context ID of the imported context.
    * @throws {ContextError} If deserialization, validation, or import fails.
    */
-  static async import(data: Uint8Array): Promise<string> {
+  static async import(scp: SCP, data: Uint8Array): Promise<string> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(scp);
       return await bridge.contextImport(data);
     } catch (error) {
       throw mapBridgeError(error);
@@ -1451,7 +1460,7 @@ export class Context implements AsyncDisposable {
   async drainEvents(): Promise<readonly string[]> {
     this.assertActive();
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       return await bridge.contextDrainEvents(this._handle);
     } catch (error) {
       throw mapBridgeError(error);
@@ -1470,7 +1479,7 @@ export class Context implements AsyncDisposable {
       return;
     }
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       await bridge.contextLeave(this._handle, this._identityDid);
       this._disposed = true;
     } catch (error) {
@@ -1491,7 +1500,7 @@ export class Context implements AsyncDisposable {
       return;
     }
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._scp);
       await bridge.contextClose(this._handle, this._identityDid);
       this._disposed = true;
     } catch (error) {
@@ -1534,10 +1543,9 @@ export class Context implements AsyncDisposable {
  * @param contextId - The context ID to restore.
  * @throws {ContextError} If restoration fails (SCP-CTX-2064).
  */
-export async function restoreContext(contextId: string): Promise<void> {
-  deprecatedDefaultInstance("restoreContext");
+export async function restoreContext(scp: SCP, contextId: string): Promise<void> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     await bridge.contextRestore(contextId);
   } catch (error) {
     throw mapBridgeError(error);
@@ -1553,10 +1561,9 @@ export async function restoreContext(contextId: string): Promise<void> {
  * @returns JSON array of restored context ID strings.
  * @throws {ContextError} If restoration fails (SCP-CTX-2065).
  */
-export async function restoreAllContexts(): Promise<string> {
-  deprecatedDefaultInstance("restoreAllContexts");
+export async function restoreAllContexts(scp: SCP): Promise<string> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return await bridge.contextRestoreAll();
   } catch (error) {
     throw mapBridgeError(error);
@@ -1599,7 +1606,7 @@ export class ScopedHandle {
 
   /** Check whether a given capability is allowed. */
   hasCapability(capability: string): boolean {
-    const bridge = getBridgeSync();
+    const bridge = getBridgeSync(this.context._scp);
     return bridge.checkScopedCapability(this.grantedCapabilities, capability);
   }
 
@@ -1621,12 +1628,12 @@ export class ScopedHandle {
  * This is a synchronous operation -- no I/O is involved.
  */
 export function validateCapabilityDeclaration(
+  scp: SCP,
   declarationJson: string,
   ceilingCapabilities: string[],
   roleCapabilities: string[],
 ): DeclarationValidationResult {
-  deprecatedDefaultInstance("validateCapabilityDeclaration");
-  const bridge = getBridgeSync();
+  const bridge = getBridgeSync(scp);
   const resultJson = bridge.validateCapabilityDeclaration(
     declarationJson,
     ceilingCapabilities,
@@ -1667,6 +1674,7 @@ export interface InvitationEvaluationResult {
  * @throws {ValidationError} If input validation fails.
  */
 export async function evaluateInvitation(
+  scp: SCP,
   paramsJson: string,
   inviterDid: string,
   identityDid: string,
@@ -1674,9 +1682,8 @@ export async function evaluateInvitation(
   spendingJson?: string,
   trustedDids?: readonly string[],
 ): Promise<InvitationEvaluationResult> {
-  deprecatedDefaultInstance("evaluateInvitation");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const trustedDidsJson = trustedDids ? JSON.stringify(trustedDids) : undefined;
     const raw = bridge.evaluateInvitation(
       paramsJson,
@@ -1751,6 +1758,7 @@ export interface MetadataRecord {
  * @returns JSON string of the MetadataRecord.
  */
 export function metadataRecordToJson(
+  scp: SCP,
   contextId: string,
   sequence: number,
   signerDid: string,
@@ -1759,8 +1767,7 @@ export function metadataRecordToJson(
   operational: OperationalMetadata,
   signatureHex: string,
 ): string {
-  deprecatedDefaultInstance("metadataRecordToJson");
-  const bridge = getBridgeSync();
+  const bridge = getBridgeSync(scp);
   return bridge.metadataRecordToJson(
     contextId,
     sequence,
@@ -1778,9 +1785,8 @@ export function metadataRecordToJson(
  * @param jsonStr - JSON string of a MetadataRecord.
  * @returns Parsed MetadataRecord object.
  */
-export function metadataRecordFromJson(jsonStr: string): MetadataRecord {
-  deprecatedDefaultInstance("metadataRecordFromJson");
-  const bridge = getBridgeSync();
+export function metadataRecordFromJson(scp: SCP, jsonStr: string): MetadataRecord {
+  const bridge = getBridgeSync(scp);
   const validated = bridge.metadataRecordFromJson(jsonStr);
   return JSON.parse(validated) as MetadataRecord;
 }
@@ -1798,9 +1804,8 @@ export function metadataRecordFromJson(jsonStr: string): MetadataRecord {
  *   `HandleRegistry`.
  * @returns ContextParams object.
  */
-export function templateGetParams(templateId: string): ContextParams {
-  deprecatedDefaultInstance("templateGetParams");
-  const bridge = getBridgeSync();
+export function templateGetParams(scp: SCP, templateId: string): ContextParams {
+  const bridge = getBridgeSync(scp);
   const result = bridge.templateGetParams(templateId);
   return JSON.parse(result) as ContextParams;
 }
@@ -1814,9 +1819,8 @@ export function templateGetParams(templateId: string): ContextParams {
  * @param params - ContextParams to validate.
  * @returns `null` on success, or a string error message on failure.
  */
-export function validateAgainstTemplate(params: ContextParams): string | null {
-  deprecatedDefaultInstance("validateAgainstTemplate");
-  const bridge = getBridgeSync();
+export function validateAgainstTemplate(scp: SCP, params: ContextParams): string | null {
+  const bridge = getBridgeSync(scp);
   return bridge.validateAgainstTemplate(JSON.stringify(params));
 }
 
@@ -1828,8 +1832,7 @@ export function validateAgainstTemplate(params: ContextParams): string | null {
  * @param params - ContextParams to validate.
  * @returns `null` on success, or a string error message on failure.
  */
-export function validateContextParams(params: ContextParams): string | null {
-  deprecatedDefaultInstance("validateContextParams");
-  const bridge = getBridgeSync();
+export function validateContextParams(scp: SCP, params: ContextParams): string | null {
+  const bridge = getBridgeSync(scp);
   return bridge.validateContextParams(JSON.stringify(params));
 }

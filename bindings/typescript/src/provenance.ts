@@ -9,8 +9,8 @@
 
 import { mapBridgeError } from "./errors";
 import { getBridge } from "./internal/bridge";
-import { deprecatedDefaultInstance } from "./internal/deprecation";
 import { safeJsonParse } from "./internal/json-utils";
+import type { SCP } from "./scp";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -61,15 +61,17 @@ export interface ProvenanceRecord {
  * @returns Quality tier as an integer (0-3).
  * @throws {ValidationError} If sourceType or contextState is invalid.
  */
-export async function evaluateProvenanceQuality(options: {
-  sourceContext?: string;
-  sourceType?: string;
-  contextState?: string;
-  counterparties?: string[];
-}): Promise<number> {
-  deprecatedDefaultInstance("evaluateProvenanceQuality");
+export async function evaluateProvenanceQuality(
+  scp: SCP,
+  options: {
+    sourceContext?: string;
+    sourceType?: string;
+    contextState?: string;
+    counterparties?: string[];
+  },
+): Promise<number> {
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return await bridge.evaluateProvenanceQuality(
       options.sourceContext,
       options.sourceType ?? "persistent",
@@ -100,6 +102,7 @@ export async function evaluateProvenanceQuality(options: {
  * @throws {ValidationError} If sourceType or memoryScope is invalid.
  */
 export async function provenanceAttach(
+  scp: SCP,
   sourceContextId: string,
   sourceType: string,
   memoryScope: string,
@@ -113,9 +116,8 @@ export async function provenanceAttach(
     counterpartyPolicy?: string;
   },
 ): Promise<ProvenanceRecord> {
-  deprecatedDefaultInstance("provenanceAttach");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     const raw = bridge.provenanceAttach(
       sourceContextId,
       sourceType,
@@ -158,12 +160,12 @@ export async function provenanceAttach(
  * @returns `true` if within limit, `false` otherwise.
  */
 export async function provenanceCheckChainDepth(
+  scp: SCP,
   chainDepth: number,
   maxDepth?: number,
 ): Promise<boolean> {
-  deprecatedDefaultInstance("provenanceCheckChainDepth");
   try {
-    const bridge = await getBridge();
+    const bridge = await getBridge(scp);
     return bridge.provenanceCheckChainDepth(chainDepth, maxDepth);
   } catch (error) {
     throw mapBridgeError(error);

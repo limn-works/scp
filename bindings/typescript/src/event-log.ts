@@ -52,7 +52,7 @@ export class EventLog {
    */
   async query(filter?: EventFilter): Promise<readonly Event[]> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._ctx._scp);
       return await bridge.eventLogQuery(this._ctx._handle, filter);
     } catch (error) {
       throw mapBridgeError(error);
@@ -70,7 +70,7 @@ export class EventLog {
    */
   async verify(claim: EventClaim): Promise<Proof> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._ctx._scp);
       return await bridge.eventLogVerify(this._ctx._handle, claim);
     } catch (error) {
       throw mapBridgeError(error);
@@ -87,7 +87,7 @@ export class EventLog {
    */
   async checkpoint(): Promise<Checkpoint> {
     try {
-      const bridge = await getBridge();
+      const bridge = await getBridge(this._ctx._scp);
       // The NAPI Rust function requires (handle, identityDid, epoch).
       // Use the context creator DID and epoch 0 as synthetic defaults
       // (matching the WASM bridge approach).
