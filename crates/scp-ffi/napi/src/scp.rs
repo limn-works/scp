@@ -35,7 +35,7 @@ use crate::mcp::{
     NapiAllowlistState, NapiMcpClientHandle, NapiMcpInvokeResult, NapiMcpServerConfig,
     NapiMcpServerHandle, NapiMcpToolInfo,
 };
-use crate::runtime::{NapiBridgeInstance, StorageConfig, default_bridge_instance};
+use crate::runtime::{NapiBridgeInstance, StorageConfig};
 #[cfg(feature = "server")]
 use crate::server::{NapiNodeHandle, NapiRelayHandle};
 use crate::sync::NapiSyncPolicy;
@@ -197,18 +197,6 @@ impl Scp {
         // This preserves API shape for callers while keeping the
         // constructor panic-free.
         Self::new()
-    }
-
-    /// Returns an `SCP` wrapping the process-wide default instance.
-    ///
-    /// Multiple calls return distinct `SCP` objects, but each wraps the
-    /// same underlying `Arc<NapiBridgeInstance>` — their `instanceId`s
-    /// match, and changes made through one are visible to the other.
-    #[napi(factory, js_name = "default")]
-    pub fn default_instance() -> napi::Result<Self> {
-        Ok(Self {
-            inner: default_bridge_instance()?,
-        })
     }
 
     /// Suspends this bridge instance (mobile backgrounding).

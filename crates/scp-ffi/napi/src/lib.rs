@@ -282,66 +282,8 @@ pub fn scp_version() -> String {
 ///   await scpShutdown(5_000n); // wait up to 5 seconds (5,000 ms)
 /// });
 /// ```
-#[napi]
-pub async fn scp_shutdown(timeout_millis: napi::bindgen_prelude::BigInt) -> napi::Result<()> {
-    let (_sign, timeout_millis, _lossless) = timeout_millis.get_u64();
-    let timeout = Duration::from_millis(timeout_millis);
-
-    // In test builds we intentionally skip shutting down the default
-    // bridge instance — the `OnceLock` is process-global and one shutdown
-    // would poison state shared by every other test in the same binary.
-    #[cfg(not(test))]
-    if let Some(bi) = runtime::default_bridge_instance_raw() {
-        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
-        // Wrap in catch_unwind: during process teardown (e.g., bun test
-        // exit), MLS or tokio state may already be partially dropped,
-        // causing panics in destroy_mls_group or task abort. A panic here
-        // would abort the process with "failed to initiate panic"
-        // (double-panic).
-        let bi_for_catch = std::sync::Arc::clone(bi);
-        let fut = bi_for_catch.shutdown(timeout);
-        match std::panic::AssertUnwindSafe(fut).catch_unwind_await().await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                tracing::debug!("bridge shutdown returned: {e}");
-            }
-            Err(_) => {
-                tracing::error!("NapiBridgeInstance shutdown panicked — cleanup may be incomplete");
-            }
-        }
-    }
-
-    if timeout_millis == 0 {
-        return Ok(());
-    }
-    let deadline = std::time::Instant::now() + timeout;
-    while HANDLE_COUNT.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Ok(())
-}
-
-/// Helper trait to support `catch_unwind` on async futures.
-///
-/// `std::panic::catch_unwind` is sync-only; wrapping a future in
-/// `AssertUnwindSafe` still yields a sync `catch_unwind` guard around the
-/// `Future` polls. We use `futures::FutureExt::catch_unwind` instead for
-/// the async path (already pulled in via workspace `futures`).
-#[cfg(not(test))]
-trait CatchUnwindAwait: core::future::Future + Sized {
-    async fn catch_unwind_await(self) -> Result<Self::Output, Box<dyn std::any::Any + Send>>;
-}
-
-#[cfg(not(test))]
-impl<F> CatchUnwindAwait for std::panic::AssertUnwindSafe<F>
-where
-    F: core::future::Future,
-{
-    async fn catch_unwind_await(self) -> Result<Self::Output, Box<dyn std::any::Any + Send>> {
-        use futures::FutureExt;
-        self.catch_unwind().await
-    }
-}
+// Phase D (#1695): `scp_shutdown` free function deleted. Per-instance
+// shutdown now goes through `SCP.shutdown(timeout_millis)`.
 
 
 // ---------------------------------------------------------------------------
@@ -359,18 +301,8 @@ mod tests {
         assert!(!v.is_empty(), "version string must not be empty");
     }
 
-    #[tokio::test]
-    async fn scp_shutdown_zero_timeout_returns_immediately() {
-        // Must return without hanging even if handles are live.
-        // #1692: `scp_shutdown` takes `napi::bindgen_prelude::BigInt`
-        // (u64 on the wire). Construct a zero-valued BigInt directly.
-        scp_shutdown(napi::bindgen_prelude::BigInt {
-            sign_bit: false,
-            words: vec![0],
-        })
-        .await
-        .expect("scp_shutdown(0) must succeed");
-    }
+    // Phase D (#1695): `scp_shutdown` free function deleted; fast-path
+    // test covered by `SCP.shutdown(0)` via per-instance lifecycle tests.
 
     #[test]
     fn handle_count_increments_and_decrements() {

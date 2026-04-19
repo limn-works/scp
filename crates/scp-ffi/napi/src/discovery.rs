@@ -359,13 +359,13 @@ mod tests {
     fn petname_set_and_resolve() {
         let owner = "did:dht:zNapiTest1".to_owned();
         reset_petname_map_for(&owner);
-        crate::scp::Scp::default_instance().unwrap().petname_set(
+        crate::scp::Scp::new().unwrap().petname_set(
             owner.clone(),
             "did:dht:zAlice".to_owned(),
             "alice".to_owned(),
         )
         .unwrap();
-        let json = crate::scp::Scp::default_instance().unwrap().petname_resolve_did(owner, "alice".to_owned()).unwrap();
+        let json = crate::scp::Scp::new().unwrap().petname_resolve_did(owner, "alice".to_owned()).unwrap();
         let dids: Vec<String> = serde_json::from_str(&json).unwrap();
         assert_eq!(dids.len(), 1);
         assert_eq!(dids[0], "did:dht:zAlice");
@@ -375,8 +375,8 @@ mod tests {
     fn petname_context_set_and_resolve() {
         let owner = "did:dht:zNapiTest2".to_owned();
         reset_petname_map_for(&owner);
-        crate::scp::Scp::default_instance().unwrap().petname_set_context(owner.clone(), "ctx-napi-1".to_owned(), "work".to_owned()).unwrap();
-        let json = crate::scp::Scp::default_instance().unwrap().petname_resolve_context(owner, "work".to_owned()).unwrap();
+        crate::scp::Scp::new().unwrap().petname_set_context(owner.clone(), "ctx-napi-1".to_owned(), "work".to_owned()).unwrap();
+        let json = crate::scp::Scp::new().unwrap().petname_resolve_context(owner, "work".to_owned()).unwrap();
         let ids: Vec<String> = serde_json::from_str(&json).unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], "ctx-napi-1");
@@ -389,7 +389,7 @@ mod tests {
         let ctx = "ctx-napi-handle-1".to_owned();
         reset_handle_registry_for(&ctx);
         let target = r#"{"type": "identity", "did": "did:dht:zNapiAlice"}"#.to_owned();
-        let result = crate::scp::Scp::default_instance().unwrap().handle_register(
+        let result = crate::scp::Scp::new().unwrap().handle_register(
             ctx.clone(),
             "alice".to_owned(),
             target,
@@ -401,7 +401,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["status"], "registered");
 
-        let lookup = crate::scp::Scp::default_instance().unwrap().handle_lookup(ctx, "alice".to_owned(), None).unwrap();
+        let lookup = crate::scp::Scp::new().unwrap().handle_lookup(ctx, "alice".to_owned(), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&lookup).unwrap();
         assert_eq!(parsed["results"].as_array().unwrap().len(), 1);
     }
