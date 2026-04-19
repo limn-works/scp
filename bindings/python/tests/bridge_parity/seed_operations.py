@@ -654,6 +654,8 @@ def _py_ucan_validate_malformed(ctx: OpContext) -> dict[str, Any]:
         identity.did, {"name": "parity-ucan-v", "mode": "encrypted", "ceiling": _UCAN_CEILING}
     )
     try:
+        # SCP-DEFAULT-INSTANCE-OK: parity harness mirrors user-facing Python
+        # caller behavior — the default-instance façade IS what this op tests.
         ctx.scp_core.ucan_validate(
             handle.context_id,
             _MALFORMED_UCAN,
