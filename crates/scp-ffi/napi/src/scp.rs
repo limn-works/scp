@@ -3463,4 +3463,36 @@ impl Scp {
             context_id,
         )
     }
+
+    // -------------------------------------------------------------------
+    // SCPID authentication (§3.11)
+    // -------------------------------------------------------------------
+
+    /// Per-instance equivalent of the free-function `scpid_challenge`.
+    #[napi(js_name = "scpidChallenge")]
+    pub fn scpid_challenge(&self, audience: String, ttl_seconds: u32) -> napi::Result<String> {
+        crate::scpid::scpid_challenge_on(&self.inner, audience, ttl_seconds)
+    }
+
+    /// Per-instance equivalent of the free-function `scpid_sign`.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[napi(js_name = "scpidSign")]
+    pub fn scpid_sign(
+        &self,
+        did: String,
+        signing_key_id: String,
+        challenge_json: String,
+    ) -> napi::Result<String> {
+        crate::scpid::scpid_sign_on(&self.inner, did, signing_key_id, challenge_json)
+    }
+
+    /// Per-instance equivalent of the free-function `scpid_verify`.
+    #[napi(js_name = "scpidVerify")]
+    pub fn scpid_verify(
+        &self,
+        response_json: String,
+        challenge_json: String,
+    ) -> napi::Result<String> {
+        crate::scpid::scpid_verify_on(&self.inner, response_json, challenge_json)
+    }
 }
