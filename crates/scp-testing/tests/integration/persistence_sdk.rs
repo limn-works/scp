@@ -361,18 +361,22 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
 // ---------------------------------------------------------------------------
 //
 // Full end-to-end context_create → context_send → suspend → restore
-// through a user-owned `Scp` FFI handle requires the context-method
-// migration from the free-function façade onto `Scp` (#1549 PR 4+).
-// Until that migration lands, `context_create` etc. resolve against
-// the default global `UniffiBridgeInstance` (in-memory), not a
-// caller's `Scp::with_storage(Sqlite)` instance. The test below is
-// therefore ignored with a clear rationale rather than faked.
+// through a user-owned `Scp` FFI handle is blocked on #1687 (migrate
+// the free-function facade onto `SCP` instance methods). Until #1687
+// lands, `context_create` etc. resolve against the default global
+// `UniffiBridgeInstance` (in-memory), not a caller's
+// `Scp::with_storage(Sqlite)` instance. The test below is therefore
+// ignored with a clear rationale rather than faked.
 #[cfg(feature = "sqlite")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "end-to-end FFI lifecycle through user-owned Scp + context methods \
-            requires #1549 PR 4 migration of context_* free functions onto Scp; \
-            scp-testing has no dep on scp-ffi-uniffi to avoid a workspace cycle. \
-            Until then, machinery is exercised by the tests above."]
+            is blocked on #1687 (migrate free-function facade onto SCP instance \
+            methods). Until that lands, context_create / context_send / \
+            register_local_did resolve against the process-global default \
+            bridge, not the caller-owned Scp; scp-testing has no dep on \
+            scp-ffi-uniffi to avoid a workspace cycle. The underlying machinery \
+            (SqliteStorage + ProtocolRepository + ContextManager) is exercised \
+            by the tests above."]
 async fn ffi_scp_with_sqlite_full_lifecycle() {
     // Placeholder: this test will be implemented in the PR that moves
     // context_create / context_send / register_local_did / suspend /

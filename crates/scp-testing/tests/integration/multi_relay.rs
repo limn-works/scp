@@ -17,9 +17,9 @@
 //!
 //! Full multi-relay routing (send on context A → relay 1; send on
 //! context B → relay 2) requires context-level routing + a live
-//! `TransportManager` per relay, which is not exposed on the caller-
-//! owned `Scp` instance surface until the PR 4+ migration lands. That
-//! test path is marked `#[ignore]` with a clear reason below.
+//! `TransportManager` per relay, which is separate architectural work
+//! tracked in #1688. That test path is marked `#[ignore]` with a clear
+//! reason below.
 //!
 //! Run:
 //! ```sh
@@ -297,10 +297,11 @@ async fn suspend_resume_preserves_pending_urls() {
 /// the tests above.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "per-context multi-relay routing is not implemented in \
-            CoreFields::with_transport (single Arc<TransportManager>). \
-            The multi-URL reconnect property introduced by #1678 is \
-            exercised by `reconnect_transport_if_pending_against_two_relays`; \
-            per-context-to-per-relay routing is separate work tracked outside #1549."]
+            CoreFields::with_transport (single Arc<TransportManager>); \
+            tracked in #1688. The multi-URL reconnect property \
+            introduced by #1678 is exercised by \
+            `reconnect_transport_if_pending_against_two_relays` in this file; \
+            per-context-to-per-relay routing is separate architectural work."]
 async fn context_send_routes_to_correct_relay_per_context() {
     panic!("ignored — see #[ignore] reason above");
 }
