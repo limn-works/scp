@@ -13,10 +13,12 @@ import asyncio
 import enum
 from typing import TYPE_CHECKING
 
-from scp_sdk._deprecation import deprecated_default_instance
+from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
 from scp_sdk.errors import ContextError
 
 if TYPE_CHECKING:
+    import _scp_core
+
     from scp_sdk.context import Context
 
 
@@ -81,14 +83,18 @@ class GovernanceActionResult(enum.Enum):
 async def execute_governance_action(
     context: Context,
     proposal_json: str,
+    scp: _scp_core.SCP | None = None,
 ) -> GovernanceActionResult:
     """Execute a governance action on a context.
 
-    Delegates to ``_scp_core.py_governance_execute``.
+    Delegates to the :class:`_scp_core.SCP` ``governance_execute`` method.
 
     Args:
         context: The context to execute the action on.
         proposal_json: JSON-serialized ``GovernanceProposal``.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Returns:
         A :class:`GovernanceActionResult` describing the outcome.
@@ -99,14 +105,14 @@ async def execute_governance_action(
         RuntimeError: If governance execution fails.
     """
     try:
-        import _scp_core
+        instance = resolve_scp(scp)
     except ImportError as exc:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
             code="SCP-CTX-2001",
         ) from exc
 
-    raw = await asyncio.to_thread(_scp_core.py_governance_execute, context._handle, proposal_json)
+    raw = await asyncio.to_thread(instance.governance_execute, context._handle, proposal_json)
     return GovernanceActionResult.from_bridge(raw)
 
 
@@ -114,6 +120,7 @@ async def execute_governance_action(
 async def propose_ttl_extension(
     context: Context,
     additional_seconds: float,
+    scp: _scp_core.SCP | None = None,
 ) -> GovernanceActionResult:
     """Propose a TTL extension for a context.
 
@@ -123,6 +130,9 @@ async def propose_ttl_extension(
     Args:
         context: The context to extend.
         additional_seconds: Additional time-to-live in seconds.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Returns:
         A :class:`GovernanceActionResult` (expected ``TTL_EXTENDED``).
@@ -134,17 +144,22 @@ async def propose_ttl_extension(
     import json
 
     proposal = json.dumps({"action": {"TtlExtend": {"additional_seconds": additional_seconds}}})
-    return await execute_governance_action(context, proposal)
+    return await execute_governance_action(context, proposal, scp=scp)
 
 
 @deprecated_default_instance
-async def handle_ttl_expiry(context: Context) -> GovernanceActionResult:
+async def handle_ttl_expiry(
+    context: Context, scp: _scp_core.SCP | None = None
+) -> GovernanceActionResult:
     """Handle TTL expiry by executing a context close action.
 
     Convenience wrapper that builds a ``ContextClose`` governance proposal.
 
     Args:
         context: The expired context.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Returns:
         A :class:`GovernanceActionResult` (expected ``CONTEXT_CLOSED``).
@@ -156,13 +171,14 @@ async def handle_ttl_expiry(context: Context) -> GovernanceActionResult:
     import json
 
     proposal = json.dumps({"action": "ContextClose"})
-    return await execute_governance_action(context, proposal)
+    return await execute_governance_action(context, proposal, scp=scp)
 
 
 @deprecated_default_instance
 async def reset_ttl_timer(
     context: Context,
     ttl_seconds: float,
+    scp: _scp_core.SCP | None = None,
 ) -> GovernanceActionResult:
     """Reset the TTL timer for a context.
 
@@ -172,6 +188,9 @@ async def reset_ttl_timer(
     Args:
         context: The context to reset the timer for.
         ttl_seconds: The full TTL duration in seconds.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Returns:
         A :class:`GovernanceActionResult` (expected ``TTL_EXTENDED``).
@@ -180,7 +199,7 @@ async def reset_ttl_timer(
         ContextError: If the bridge is unavailable.
         RuntimeError: If governance execution fails.
     """
-    return await propose_ttl_extension(context, ttl_seconds)
+    return await propose_ttl_extension(context, ttl_seconds, scp=scp)
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +213,7 @@ async def propose_governance_action(
     action_json: str,
     *,
     identity_did: str | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> str:
     """Propose a governance action for voting.
 
@@ -201,12 +221,13 @@ async def propose_governance_action(
     immediately.  For multi-admin models (Threshold, Majority, Unanimity),
     the proposal enters ``Pending`` status and must accumulate votes.
 
-    Delegates to ``_scp_core.py_governance_propose``.
-
     Args:
         context: The context to propose the action on.
         action_json: JSON-serialized ``GovernanceAction``.
         identity_did: DID of the proposer.  Defaults to the context creator.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Returns:
         JSON string with ``proposal_id``, ``status``, and
@@ -218,7 +239,7 @@ async def propose_governance_action(
         RuntimeError: If the proposal fails (SCP-CTX-2041).
     """
     try:
-        import _scp_core
+        instance = resolve_scp(scp)
     except ImportError as exc:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
@@ -226,9 +247,7 @@ async def propose_governance_action(
         ) from exc
 
     did = identity_did or context._creator_did
-    return await asyncio.to_thread(
-        _scp_core.py_governance_propose, context._handle, did, action_json
-    )
+    return await asyncio.to_thread(instance.governance_propose, context._handle, did, action_json)
 
 
 @deprecated_default_instance
@@ -237,17 +256,19 @@ async def approve_governance_proposal(
     proposal_id_hex: str,
     *,
     identity_did: str | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> str:
     """Cast an approval vote on a pending governance proposal.
 
     If the vote pushes the proposal past quorum, the action is auto-executed.
 
-    Delegates to ``_scp_core.py_governance_approve``.
-
     Args:
         context: The context containing the proposal.
         proposal_id_hex: Hex-encoded 32-byte proposal ID.
         identity_did: DID of the voter.  Defaults to the context creator.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Returns:
         JSON string with ``status`` (Pending, Approved, Rejected, etc.).
@@ -257,7 +278,7 @@ async def approve_governance_proposal(
         RuntimeError: If the vote fails (SCP-CTX-2042).
     """
     try:
-        import _scp_core
+        instance = resolve_scp(scp)
     except ImportError as exc:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
@@ -266,7 +287,7 @@ async def approve_governance_proposal(
 
     did = identity_did or context._creator_did
     return await asyncio.to_thread(
-        _scp_core.py_governance_approve, context._handle, did, proposal_id_hex
+        instance.governance_approve, context._handle, did, proposal_id_hex
     )
 
 
@@ -276,15 +297,17 @@ async def reject_governance_proposal(
     proposal_id_hex: str,
     *,
     identity_did: str | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> str:
     """Cast a rejection vote on a pending governance proposal.
-
-    Delegates to ``_scp_core.py_governance_reject``.
 
     Args:
         context: The context containing the proposal.
         proposal_id_hex: Hex-encoded 32-byte proposal ID.
         identity_did: DID of the voter.  Defaults to the context creator.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Returns:
         JSON string with ``status``.
@@ -294,7 +317,7 @@ async def reject_governance_proposal(
         RuntimeError: If the vote fails (SCP-CTX-2043).
     """
     try:
-        import _scp_core
+        instance = resolve_scp(scp)
     except ImportError as exc:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
@@ -303,7 +326,7 @@ async def reject_governance_proposal(
 
     did = identity_did or context._creator_did
     return await asyncio.to_thread(
-        _scp_core.py_governance_reject, context._handle, did, proposal_id_hex
+        instance.governance_reject, context._handle, did, proposal_id_hex
     )
 
 
@@ -313,18 +336,20 @@ async def withdraw_governance_vote(
     proposal_id_hex: str,
     *,
     identity_did: str | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> str:
     """Withdraw a previously cast vote on a pending governance proposal.
 
     No signing key is required -- withdrawal is the voter's privileged
     operation on their own vote.
 
-    Delegates to ``_scp_core.py_governance_withdraw``.
-
     Args:
         context: The context containing the proposal.
         proposal_id_hex: Hex-encoded 32-byte proposal ID.
         identity_did: DID of the voter.  Defaults to the context creator.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Returns:
         JSON string with ``status``.
@@ -334,7 +359,7 @@ async def withdraw_governance_vote(
         RuntimeError: If the withdrawal fails (SCP-CTX-2044).
     """
     try:
-        import _scp_core
+        instance = resolve_scp(scp)
     except ImportError as exc:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
@@ -343,7 +368,7 @@ async def withdraw_governance_vote(
 
     did = identity_did or context._creator_did
     return await asyncio.to_thread(
-        _scp_core.py_governance_withdraw, context._handle, did, proposal_id_hex
+        instance.governance_withdraw, context._handle, did, proposal_id_hex
     )
 
 
@@ -351,14 +376,16 @@ async def withdraw_governance_vote(
 async def get_governance_proposal(
     context: Context,
     proposal_id_hex: str,
+    scp: _scp_core.SCP | None = None,
 ) -> str:
     """Retrieve a single governance proposal by hex-encoded ID.
-
-    Delegates to ``_scp_core.py_governance_get_proposal``.
 
     Args:
         context: The context containing the proposal.
         proposal_id_hex: Hex-encoded 32-byte proposal ID.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Returns:
         JSON string with the full proposal details.
@@ -368,7 +395,7 @@ async def get_governance_proposal(
         RuntimeError: If the proposal is not found (SCP-CTX-2045).
     """
     try:
-        import _scp_core
+        instance = resolve_scp(scp)
     except ImportError as exc:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
@@ -376,18 +403,19 @@ async def get_governance_proposal(
         ) from exc
 
     return await asyncio.to_thread(
-        _scp_core.py_governance_get_proposal, context._handle, proposal_id_hex
+        instance.governance_get_proposal, context._handle, proposal_id_hex
     )
 
 
 @deprecated_default_instance
-async def list_governance_proposals(context: Context) -> str:
+async def list_governance_proposals(context: Context, scp: _scp_core.SCP | None = None) -> str:
     """List all governance proposals for a context.
-
-    Delegates to ``_scp_core.py_governance_list_proposals``.
 
     Args:
         context: The context to list proposals for.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Returns:
         JSON array of proposals.
@@ -397,14 +425,14 @@ async def list_governance_proposals(context: Context) -> str:
         RuntimeError: If listing fails (SCP-CTX-2046).
     """
     try:
-        import _scp_core
+        instance = resolve_scp(scp)
     except ImportError as exc:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
             code="SCP-CTX-2001",
         ) from exc
 
-    return await asyncio.to_thread(_scp_core.py_governance_list_proposals, context._handle)
+    return await asyncio.to_thread(instance.governance_list_proposals, context._handle)
 
 
 # ---------------------------------------------------------------------------
@@ -416,14 +444,16 @@ async def list_governance_proposals(context: Context) -> str:
 async def apply_pending_ceiling_modification(
     context: Context,
     current_timestamp: int,
+    scp: _scp_core.SCP | None = None,
 ) -> bool:
     """Apply a pending ceiling modification if the notification period has elapsed.
-
-    Delegates to ``_scp_core.py_apply_pending_ceiling_modification``.
 
     Args:
         context: The context to apply the modification on.
         current_timestamp: Current Unix timestamp in seconds.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Returns:
         ``True`` if the modification was applied, ``False`` otherwise.
@@ -433,7 +463,7 @@ async def apply_pending_ceiling_modification(
         RuntimeError: If the operation fails (SCP-CTX-2060).
     """
     try:
-        import _scp_core
+        instance = resolve_scp(scp)
     except ImportError as exc:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
@@ -441,21 +471,22 @@ async def apply_pending_ceiling_modification(
         ) from exc
 
     return await asyncio.to_thread(
-        _scp_core.py_apply_pending_ceiling_modification, context._handle, current_timestamp
+        instance.apply_pending_ceiling_modification, context._handle, current_timestamp
     )
 
 
 @deprecated_default_instance
-async def finalize_close(context: Context) -> None:
+async def finalize_close(context: Context, scp: _scp_core.SCP | None = None) -> None:
     """Finalize the cooperative close flow for a context in Closing state.
 
     Transitions the context from ``Closing`` to ``Closed``, destroys keys
     per memory scope, and records a ``ContextClosed`` event.
 
-    Delegates to ``_scp_core.py_finalize_close``.
-
     Args:
         context: The context to finalize (must be in ``Closing`` state).
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Raises:
         ContextError: If the bridge is unavailable.
@@ -463,14 +494,14 @@ async def finalize_close(context: Context) -> None:
             finalization fails (SCP-CTX-2061).
     """
     try:
-        import _scp_core
+        instance = resolve_scp(scp)
     except ImportError as exc:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
             code="SCP-CTX-2001",
         ) from exc
 
-    await asyncio.to_thread(_scp_core.py_finalize_close, context._handle)
+    await asyncio.to_thread(instance.finalize_close, context._handle)
 
 
 @deprecated_default_instance
@@ -484,10 +515,9 @@ async def create_governance_checkpoint(
     state_snapshot_hash_hex: str,
     creator_did: str | None = None,
     creator_signature_hex: str,
+    scp: _scp_core.SCP | None = None,
 ) -> str:
     """Create a governance checkpoint (ADR-031 section 9).
-
-    Delegates to ``_scp_core.py_create_governance_checkpoint``.
 
     Args:
         context: The context to create the checkpoint for.
@@ -498,6 +528,9 @@ async def create_governance_checkpoint(
         state_snapshot_hash_hex: Hex-encoded 32-byte state snapshot hash.
         creator_did: DID of the creator. Defaults to context creator.
         creator_signature_hex: Hex-encoded Ed25519 signature (64 bytes).
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Returns:
         JSON string with the full ``ContextCheckpoint`` object.
@@ -507,7 +540,7 @@ async def create_governance_checkpoint(
         RuntimeError: If checkpoint creation fails (SCP-CTX-2062).
     """
     try:
-        import _scp_core
+        instance = resolve_scp(scp)
     except ImportError as exc:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
@@ -516,7 +549,7 @@ async def create_governance_checkpoint(
 
     did = creator_did or context._creator_did
     return await asyncio.to_thread(
-        _scp_core.py_create_governance_checkpoint,
+        instance.create_governance_checkpoint,
         context._handle,
         checkpoint_seq,
         merkle_root_hex,
@@ -535,16 +568,18 @@ async def add_checkpoint_cosignature(
     *,
     signer_did: str,
     signature_hex: str,
+    scp: _scp_core.SCP | None = None,
 ) -> str:
     """Add a cosignature to an existing governance checkpoint (ADR-031 section 9).
-
-    Delegates to ``_scp_core.py_add_checkpoint_cosignature``.
 
     Args:
         context: The context containing the checkpoint.
         checkpoint_json: JSON-serialized ``ContextCheckpoint``.
         signer_did: DID of the cosigner.
         signature_hex: Hex-encoded Ed25519 signature (64 bytes).
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Returns:
         JSON string with ``attestation_status`` and updated ``checkpoint``.
@@ -554,7 +589,7 @@ async def add_checkpoint_cosignature(
         RuntimeError: If cosignature validation fails (SCP-CTX-2063).
     """
     try:
-        import _scp_core
+        instance = resolve_scp(scp)
     except ImportError as exc:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
@@ -562,7 +597,7 @@ async def add_checkpoint_cosignature(
         ) from exc
 
     return await asyncio.to_thread(
-        _scp_core.py_add_checkpoint_cosignature,
+        instance.add_checkpoint_cosignature,
         context._handle,
         checkpoint_json,
         signer_did,
@@ -571,34 +606,38 @@ async def add_checkpoint_cosignature(
 
 
 @deprecated_default_instance
-async def restore_context(context_id: str) -> None:
+async def restore_context(context_id: str, scp: _scp_core.SCP | None = None) -> None:
     """Restore a single persisted context from storage.
-
-    Delegates to ``_scp_core.py_restore_context``.
 
     Args:
         context_id: The context ID to restore.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Raises:
         ContextError: If the bridge is unavailable.
         RuntimeError: If restoration fails (SCP-CTX-2064).
     """
     try:
-        import _scp_core
+        instance = resolve_scp(scp)
     except ImportError as exc:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
             code="SCP-CTX-2001",
         ) from exc
 
-    await asyncio.to_thread(_scp_core.py_restore_context, context_id)
+    await asyncio.to_thread(instance.restore_context, context_id)
 
 
 @deprecated_default_instance
-async def restore_all_contexts() -> str:
+async def restore_all_contexts(scp: _scp_core.SCP | None = None) -> str:
     """Restore all persisted contexts from storage.
 
-    Delegates to ``_scp_core.py_restore_all_contexts``.
+    Args:
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When ``None``
+            the process-wide default instance is used for back-compat
+            (ADR-048).
 
     Returns:
         JSON array of restored context ID strings.
@@ -608,14 +647,14 @@ async def restore_all_contexts() -> str:
         RuntimeError: If restoration fails (SCP-CTX-2065).
     """
     try:
-        import _scp_core
+        instance = resolve_scp(scp)
     except ImportError as exc:
         raise ContextError(
             "failed to import _scp_core -- is the Rust extension built?",
             code="SCP-CTX-2001",
         ) from exc
 
-    return await asyncio.to_thread(_scp_core.py_restore_all_contexts)
+    return await asyncio.to_thread(instance.restore_all_contexts)
 
 
 __all__ = [

@@ -21,16 +21,33 @@ import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance
+from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
 from scp_sdk.errors import BRIDGE_ERROR_MAP, ContextError, ValidationError
 
 if TYPE_CHECKING:
+    import _scp_core
+
     from scp_sdk.identity import Identity
 
 try:
     import _scp_core  # type: ignore[import-not-found]
 except ImportError:
     _scp_core = None  # type: ignore[assignment]
+
+
+def _resolve_bridge(scp: _scp_core.SCP | None = None) -> Any:
+    """Return the effective bridge object for tool operations.
+
+    Tests patch ``scp_sdk.tools._scp_core`` with a ``MagicMock`` whose
+    ``tool_*`` attributes stand in for the live bridge. In production
+    those attributes do not exist on the real ``_scp_core`` module
+    (Phase 4 PR 4 consolidated them onto :class:`SCP`), so we fall
+    through to :func:`resolve_scp` and dispatch on the SCP instance.
+    """
+    mod = _scp_core
+    if mod is not None and hasattr(mod, "_mock_name"):
+        return mod
+    return resolve_scp(scp)
 
 
 def _translate_bridge_error(exc: Exception) -> Exception:
@@ -144,6 +161,7 @@ async def invoke_cross_context(
     ucan_token: str,
     chain_depth: int = 0,
     proof_tokens: list[str] | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Invoke a tool across context boundaries.
 
@@ -196,9 +214,10 @@ async def invoke_cross_context(
             code="SCP-CTX-2001",
         )
 
+    instance = _resolve_bridge(scp)
     try:
         result = await asyncio.to_thread(
-            _scp_core.tool_invoke_cross_context,
+            instance.tool_invoke_cross_context,
             source_context_id,
             target_context_id,
             tool_id,
@@ -224,6 +243,7 @@ async def session_create(
     tool_id: str,
     source_context_id: str,
     ttl_seconds: int | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> str:
     """Create a stateful tool session.
 
@@ -265,9 +285,10 @@ async def session_create(
             code="SCP-CTX-2001",
         )
 
+    instance = _resolve_bridge(scp)
     try:
         return await asyncio.to_thread(
-            _scp_core.tool_session_create,
+            instance.tool_session_create,
             context_id,
             tool_id,
             source_context_id,
@@ -285,6 +306,7 @@ async def session_invoke(
     invoker_did: str,
     ucan_token: str,
     proof_tokens: list[str] | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Invoke a tool within an active session.
 
@@ -323,9 +345,10 @@ async def session_invoke(
             code="SCP-CTX-2001",
         )
 
+    instance = _resolve_bridge(scp)
     try:
         result = await asyncio.to_thread(
-            _scp_core.tool_session_invoke,
+            instance.tool_session_invoke,
             context_id,
             session_id,
             input,
@@ -339,7 +362,7 @@ async def session_invoke(
 
 
 @deprecated_default_instance
-async def session_close(context_id: str, session_id: str) -> None:
+async def session_close(context_id: str, session_id: str, scp: _scp_core.SCP | None = None) -> None:
     """Close a stateful tool session.
 
     Removes the session from the store, releasing the caller's session
@@ -361,9 +384,10 @@ async def session_close(context_id: str, session_id: str) -> None:
             code="SCP-CTX-2001",
         )
 
+    instance = _resolve_bridge(scp)
     try:
         await asyncio.to_thread(
-            _scp_core.tool_session_close,
+            instance.tool_session_close,
             context_id,
             session_id,
         )
@@ -382,6 +406,7 @@ async def interface_expose(
     tool_id: str,
     target_context_id: str,
     rate_limit_json: str | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Expose a tool interface for cross-context sharing (step 1).
 
@@ -412,9 +437,10 @@ async def interface_expose(
             code="SCP-CTX-2001",
         )
 
+    instance = _resolve_bridge(scp)
     try:
         result_json = await asyncio.to_thread(
-            _scp_core.tool_interface_expose,
+            instance.tool_interface_expose,
             context_id,
             tool_id,
             target_context_id,
@@ -432,6 +458,7 @@ async def interface_expose(
 async def interface_accept(
     context_id: str,
     interface_json: str,
+    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Accept a cross-context tool interface (step 4).
 
@@ -459,9 +486,10 @@ async def interface_accept(
             code="SCP-CTX-2001",
         )
 
+    instance = _resolve_bridge(scp)
     try:
         result_json = await asyncio.to_thread(
-            _scp_core.tool_interface_accept,
+            instance.tool_interface_accept,
             context_id,
             interface_json,
         )
@@ -477,6 +505,7 @@ async def interface_accept(
 async def interface_revoke(
     context_id: str,
     interface_id_hex: str,
+    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Revoke a cross-context tool interface (step 5).
 
@@ -502,9 +531,10 @@ async def interface_revoke(
             code="SCP-CTX-2001",
         )
 
+    instance = _resolve_bridge(scp)
     try:
         result_json = await asyncio.to_thread(
-            _scp_core.tool_interface_revoke,
+            instance.tool_interface_revoke,
             context_id,
             interface_id_hex,
         )

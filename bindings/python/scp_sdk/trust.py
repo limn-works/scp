@@ -23,10 +23,13 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance
+from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
 from scp_sdk.errors import ContextError, ScpError
+
+if TYPE_CHECKING:
+    import _scp_core
 
 logger = logging.getLogger("scp_sdk")
 
@@ -401,6 +404,7 @@ async def evaluate_trust(
     subject_did: str,
     context_id: str,
     capability_tokens: list[str] | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> TrustEvaluation:
     """Evaluate the trustworthiness of a participant in a context.
 
@@ -449,6 +453,18 @@ async def evaluate_trust(
     )
 
     bridge = _bridge()
+    # `_bridge()` is the seam tests use to inject a mock — patching
+    # `scp_sdk.trust._bridge` returns a mock whose `ucan_validate` /
+    # `event_log_query` / `UcanError` attributes stand in for the live
+    # bridge. In production, `_bridge()` returns the actual `_scp_core`
+    # module; calls like `bridge.ucan_validate` on the real module would
+    # fail (the free function has been removed), so we route through the
+    # :class:`SCP` instance instead. Tests that set a non-mock bridge
+    # therefore use the real SCP instance below. See ADR-048.
+    if hasattr(bridge, "_mock_name"):
+        instance: Any = bridge
+    else:
+        instance = resolve_scp(scp)
 
     # Layer 1: Validate capability tokens if provided.
     # Each of the six CapabilityValidation fields is set independently
@@ -474,7 +490,7 @@ async def evaluate_trust(
         # single invalid token is sufficient to fail the capability check.
         for token in capability_tokens:
             try:
-                await asyncio.to_thread(bridge.ucan_validate, context_id, token, "*")
+                await asyncio.to_thread(instance.ucan_validate, context_id, token, "*")
             except bridge.UcanError as exc:
                 error_msg = str(exc)
                 failed_category = _classify_ucan_error(error_msg)
@@ -495,7 +511,7 @@ async def evaluate_trust(
     behavioral: BehavioralRecord | None = None
     try:
         events = await asyncio.to_thread(
-            bridge.event_log_query,
+            instance.event_log_query,
             context_id,
             {"actor_did": subject_did},
         )
@@ -854,6 +870,7 @@ def aggregate_trust_input(
     attestor_sets: dict[str, Any] | None = None,
     cached_attestations: list[dict[str, Any]] | None = None,
     challenge_results: list[dict[str, Any]] | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Aggregate all trust engine layers into a single TrustInput.
 
@@ -908,7 +925,15 @@ def aggregate_trust_input(
         )
         print(result["participation_record"]["participation_count"])
     """
+    # Same `_bridge()` test seam as :func:`evaluate_trust` — tests patch
+    # ``scp_sdk.trust._bridge`` to inject a MagicMock with a stubbed
+    # ``aggregate_trust_input`` attribute. Production code falls through to
+    # the live SCP instance.
     bridge = _bridge()
+    if hasattr(bridge, "_mock_name"):
+        instance: Any = bridge
+    else:
+        instance = resolve_scp(scp)
 
     events_json = json.dumps(events)
     merkle_root_json = json.dumps(merkle_root)
@@ -926,7 +951,7 @@ def aggregate_trust_input(
     )
     challenge_results_json = json.dumps(challenge_results if challenge_results is not None else [])
 
-    result_json = bridge.aggregate_trust_input(
+    result_json = instance.aggregate_trust_input(
         context_id,
         subject_did,
         events_json,

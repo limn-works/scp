@@ -261,128 +261,77 @@ class _MockIdentity:
         self.did = did
 
 
+class _MockSCP:
+    """Test double for :class:`_scp_core.SCP` — lets us observe calls to
+    ``node_start_in_memory`` / ``node_start_local`` without monkey-patching
+    the real (frozen) PyScp class. Migration PR 4 (#1549) added an explicit
+    ``scp: SCP | None`` parameter to every SDK function precisely so tests
+    can inject a stand-in like this.
+    """
+
+    def __init__(self) -> None:
+        self.in_memory_calls: list[tuple[str | None]] = []
+        self.local_calls: list[tuple[str, str | None, str | None]] = []
+
+    def node_start_in_memory(self, identity_did: str | None = None) -> _MockNodeHandle:
+        self.in_memory_calls.append((identity_did,))
+        return _MockNodeHandle()
+
+    def node_start_local(
+        self,
+        data_dir: str,
+        identity_did: str | None = None,
+        passphrase: str | None = None,
+    ) -> _MockNodeHandle:
+        self.local_calls.append((data_dir, identity_did, passphrase))
+        return _MockNodeHandle()
+
+
 @pytest.mark.asyncio
 async def test_start_in_memory_without_identity() -> None:
     """start_in_memory() without identity calls bridge with None."""
-    import _scp_core
-
-    original = _scp_core.py_node_start_in_memory
-    calls: list[tuple[str | None]] = []
-
-    def mock_start(identity_did: str | None = None) -> _MockNodeHandle:
-        calls.append((identity_did,))
-        return _MockNodeHandle()
-
-    _scp_core.py_node_start_in_memory = mock_start
-    try:
-        node = await Node.start_in_memory()
-        assert isinstance(node, Node)
-        assert len(calls) == 1
-        assert calls[0] == (None,)
-    finally:
-        _scp_core.py_node_start_in_memory = original
+    scp = _MockSCP()
+    node = await Node.start_in_memory(scp=scp)  # type: ignore[arg-type]
+    assert isinstance(node, Node)
+    assert scp.in_memory_calls == [(None,)]
 
 
 @pytest.mark.asyncio
 async def test_start_in_memory_with_identity() -> None:
     """start_in_memory(identity) passes identity.did to bridge."""
-    import _scp_core
-
-    original = _scp_core.py_node_start_in_memory
-    calls: list[tuple[str | None]] = []
-
-    def mock_start(identity_did: str | None = None) -> _MockNodeHandle:
-        calls.append((identity_did,))
-        return _MockNodeHandle()
-
-    _scp_core.py_node_start_in_memory = mock_start
-    try:
-        identity = _MockIdentity("did:dht:z6MkPortable")
-        node = await Node.start_in_memory(identity=identity)
-        assert isinstance(node, Node)
-        assert len(calls) == 1
-        assert calls[0] == ("did:dht:z6MkPortable",)
-    finally:
-        _scp_core.py_node_start_in_memory = original
+    scp = _MockSCP()
+    identity = _MockIdentity("did:dht:z6MkPortable")
+    node = await Node.start_in_memory(identity=identity, scp=scp)  # type: ignore[arg-type]
+    assert isinstance(node, Node)
+    assert scp.in_memory_calls == [("did:dht:z6MkPortable",)]
 
 
 @pytest.mark.asyncio
 async def test_start_local_without_identity() -> None:
     """start_local(dir) without identity calls bridge with None."""
-    import _scp_core
-
-    original = _scp_core.py_node_start_local
-    calls: list[tuple[str, str | None, str | None]] = []
-
-    def mock_start(
-        data_dir: str,
-        identity_did: str | None = None,
-        passphrase: str | None = None,
-    ) -> _MockNodeHandle:
-        calls.append((data_dir, identity_did, passphrase))
-        return _MockNodeHandle()
-
-    _scp_core.py_node_start_local = mock_start
-    try:
-        node = await Node.start_local("/tmp/test-dir")
-        assert isinstance(node, Node)
-        assert len(calls) == 1
-        assert calls[0] == ("/tmp/test-dir", None, None)
-    finally:
-        _scp_core.py_node_start_local = original
+    scp = _MockSCP()
+    node = await Node.start_local("/tmp/test-dir", scp=scp)  # type: ignore[arg-type]
+    assert isinstance(node, Node)
+    assert scp.local_calls == [("/tmp/test-dir", None, None)]
 
 
 @pytest.mark.asyncio
 async def test_start_local_with_identity() -> None:
     """start_local(dir, identity) passes identity.did to bridge."""
-    import _scp_core
-
-    original = _scp_core.py_node_start_local
-    calls: list[tuple[str, str | None, str | None]] = []
-
-    def mock_start(
-        data_dir: str,
-        identity_did: str | None = None,
-        passphrase: str | None = None,
-    ) -> _MockNodeHandle:
-        calls.append((data_dir, identity_did, passphrase))
-        return _MockNodeHandle()
-
-    _scp_core.py_node_start_local = mock_start
-    try:
-        identity = _MockIdentity("did:dht:z6MkPersist")
-        node = await Node.start_local("/tmp/test-dir", identity=identity)
-        assert isinstance(node, Node)
-        assert len(calls) == 1
-        assert calls[0] == ("/tmp/test-dir", "did:dht:z6MkPersist", None)
-    finally:
-        _scp_core.py_node_start_local = original
+    scp = _MockSCP()
+    identity = _MockIdentity("did:dht:z6MkPersist")
+    node = await Node.start_local("/tmp/test-dir", identity=identity, scp=scp)  # type: ignore[arg-type]
+    assert isinstance(node, Node)
+    assert scp.local_calls == [("/tmp/test-dir", "did:dht:z6MkPersist", None)]
 
 
 @pytest.mark.asyncio
 async def test_start_local_with_passphrase() -> None:
     """start_local(dir, passphrase=...) passes passphrase to bridge."""
-    import _scp_core
-
-    original = _scp_core.py_node_start_local
-    calls: list[tuple[str, str | None, str | None]] = []
-
-    def mock_start(
-        data_dir: str,
-        identity_did: str | None = None,
-        passphrase: str | None = None,
-    ) -> _MockNodeHandle:
-        calls.append((data_dir, identity_did, passphrase))
-        return _MockNodeHandle()
-
-    _scp_core.py_node_start_local = mock_start
-    try:
-        node = await Node.start_local("/tmp/test-dir", passphrase="my-secret")
-        assert isinstance(node, Node)
-        assert len(calls) == 1
-        assert calls[0] == ("/tmp/test-dir", None, "my-secret")
-    finally:
-        _scp_core.py_node_start_local = original
+    scp = _MockSCP()
+    node = await Node.start_local("/tmp/test-dir", passphrase="my-secret", scp=scp)  # type: ignore[arg-type]
+    assert isinstance(node, Node)
+    assert scp.local_calls == [("/tmp/test-dir", None, "my-secret")]
 
 
 # ---------------------------------------------------------------------------

@@ -14,10 +14,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance
+from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
 from scp_sdk.errors import TransportError
+
+if TYPE_CHECKING:
+    import _scp_core
 
 logger = logging.getLogger("scp_sdk")
 
@@ -87,21 +90,31 @@ class TransportConfig:
     #: Maximum number of reconnection attempts on failure.
     max_retries: int = 3
 
-    async def connect(self) -> None:
+    async def connect(self, scp: _scp_core.SCP | None = None) -> None:
         """Connect to the configured relay.
 
         Establishes a transport connection to :attr:`relay_url`.
+
+        Args:
+            scp: Optional explicit :class:`_scp_core.SCP` instance. When
+                ``None`` the process-wide default instance is used for
+                back-compat (ADR-048).
 
         Raises:
             TransportError: If the connection fails.
         """
         logger.debug("Connecting to relay %s", self.relay_url)
-        bridge = _bridge()
-        await asyncio.to_thread(bridge.transport_connect, self.relay_url)
+        instance = resolve_scp(scp)
+        await asyncio.to_thread(instance.transport_connect, self.relay_url)
         logger.info("Connected to relay %s", self.relay_url)
 
-    async def status(self) -> TransportStatus:
+    async def status(self, scp: _scp_core.SCP | None = None) -> TransportStatus:
         """Query the current transport connection status.
+
+        Args:
+            scp: Optional explicit :class:`_scp_core.SCP` instance. When
+                ``None`` the process-wide default instance is used for
+                back-compat (ADR-048).
 
         Returns:
             A :class:`TransportStatus` with connection state, relay URL,
@@ -110,8 +123,8 @@ class TransportConfig:
         Raises:
             TransportError: If querying transport status fails.
         """
-        bridge = _bridge()
-        raw = await asyncio.to_thread(bridge.transport_status)
+        instance = resolve_scp(scp)
+        raw = await asyncio.to_thread(instance.transport_status)
         return TransportStatus(
             connected=raw.connected,
             relay_url=raw.relay_url,
@@ -125,7 +138,7 @@ class TransportConfig:
 
 
 @deprecated_default_instance
-async def connect_relay(relay_url: str) -> TransportConfig:
+async def connect_relay(relay_url: str, scp: _scp_core.SCP | None = None) -> TransportConfig:
     """Connect to an SCP relay and return the transport configuration.
 
     Convenience function that creates a :class:`TransportConfig` and
@@ -133,6 +146,9 @@ async def connect_relay(relay_url: str) -> TransportConfig:
 
     Args:
         relay_url: The URL of the SCP relay (e.g., ``"wss://relay.example.com"``).
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When
+            ``None`` the process-wide default instance is used for
+            back-compat (ADR-048).
 
     Returns:
         A connected :class:`TransportConfig` instance.
@@ -141,15 +157,21 @@ async def connect_relay(relay_url: str) -> TransportConfig:
         TransportError: If the connection fails.
     """
     config = TransportConfig(relay_url=relay_url)
-    await config.connect()
+    await config.connect(scp=scp)
     return config
 
 
 @deprecated_default_instance
-async def relay_status() -> TransportStatus:
+async def relay_status(scp: _scp_core.SCP | None = None) -> TransportStatus:
     """Query the current transport connection status.
 
-    Module-level convenience that wraps ``_scp_core.transport_status()``.
+    Module-level convenience that wraps the :class:`_scp_core.SCP`
+    ``transport_status`` method.
+
+    Args:
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When
+            ``None`` the process-wide default instance is used for
+            back-compat (ADR-048).
 
     Returns:
         A :class:`TransportStatus` with connection state.
@@ -157,8 +179,8 @@ async def relay_status() -> TransportStatus:
     Raises:
         TransportError: If querying transport status fails.
     """
-    bridge = _bridge()
-    raw = await asyncio.to_thread(bridge.transport_status)
+    instance = resolve_scp(scp)
+    raw = await asyncio.to_thread(instance.transport_status)
     return TransportStatus(
         connected=raw.connected,
         relay_url=raw.relay_url,

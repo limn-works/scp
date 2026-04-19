@@ -57,17 +57,17 @@ def relay():
     py_context_send publishes through the relay.  A second connection
     (transport_connect) is established for relay-based discovery.
     """
-    handle = _scp_core.py_relay_start_in_memory()
+    handle = _scp_core.SCP.default_instance().relay_start_in_memory()
 
     # Create a bootstrap identity for the MLS credential DID.
-    bootstrap = _scp_core.py_identity_create("in_memory")
+    bootstrap = _scp_core.SCP.default_instance().identity_create("in_memory")
 
     # Wire the ContextManager to use a real relay transport provider.
     # Must be called BEFORE any py_context_create (OnceLock — first call wins).
-    _scp_core.configure_relay_transport(handle.relay_url, bootstrap.did)
+    _scp_core.SCP.default_instance().configure_relay_transport(handle.relay_url, bootstrap.did)
 
     # Second connection for relay-based context discovery.
-    _scp_core.transport_connect(handle.relay_url)
+    _scp_core.SCP.default_instance().transport_connect(handle.relay_url)
 
     yield handle
     if not handle.is_shutdown:
@@ -100,7 +100,7 @@ class TestRelayLifecycle:
 
 def _create_identity() -> str:
     """Create an in-memory identity and return the DID string."""
-    handle = _scp_core.py_identity_create("in_memory")
+    handle = _scp_core.SCP.default_instance().identity_create("in_memory")
     return handle.did
 
 
@@ -121,7 +121,7 @@ class TestTwoPartyEncryptedMessaging:
         assert alice_did != bob_did
 
         # Alice creates an encrypted context
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice_did,
             {
                 "ceiling": ["messages:read", "messages:write", "member:invite", "role:assign"],
@@ -133,25 +133,25 @@ class TestTwoPartyEncryptedMessaging:
         assert handle.state == "active"
 
         # Bob joins
-        _scp_core.py_context_join(handle, bob_did)
-        assert _scp_core.py_context_member_count(handle) == 2
-        assert _scp_core.py_context_is_member(handle, bob_did)
-        assert _scp_core.py_context_is_member(handle, alice_did)
+        _scp_core.SCP.default_instance().context_join(handle, bob_did)
+        assert _scp_core.SCP.default_instance().context_member_count(handle) == 2
+        assert _scp_core.SCP.default_instance().context_is_member(handle, bob_did)
+        assert _scp_core.SCP.default_instance().context_is_member(handle, alice_did)
 
-        members = _scp_core.py_context_member_dids(handle)
+        members = _scp_core.SCP.default_instance().context_member_dids(handle)
         assert alice_did in members
         assert bob_did in members
 
         # Alice sends -- exercises the full pipeline:
         # inner envelope creation (Ed25519 signing) -> MLS encryption ->
         # sender key encryption -> outer envelope -> relay publish.
-        _scp_core.py_context_send(handle, alice_did, b"hello from Alice to Bob")
+        _scp_core.SCP.default_instance().context_send(handle, alice_did, b"hello from Alice to Bob")
 
     def test_bob_sends_reply(self) -> None:
         alice_did = _create_identity()
         bob_did = _create_identity()
 
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice_did,
             {
                 "ceiling": ["messages:read", "messages:write", "member:invite", "role:assign"],
@@ -160,13 +160,13 @@ class TestTwoPartyEncryptedMessaging:
             },
         )
 
-        _scp_core.py_context_join(handle, bob_did)
+        _scp_core.SCP.default_instance().context_join(handle, bob_did)
 
         # Alice sends
-        _scp_core.py_context_send(handle, alice_did, b"message from Alice")
+        _scp_core.SCP.default_instance().context_send(handle, alice_did, b"message from Alice")
 
         # Bob replies
-        _scp_core.py_context_send(handle, bob_did, b"reply from Bob")
+        _scp_core.SCP.default_instance().context_send(handle, bob_did, b"reply from Bob")
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +182,7 @@ class TestThreePartyEncryptedMessaging:
         bob_did = _create_identity()
         carol_did = _create_identity()
 
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice_did,
             {
                 "ceiling": ["messages:read", "messages:write", "member:invite", "role:assign"],
@@ -191,14 +191,16 @@ class TestThreePartyEncryptedMessaging:
             },
         )
 
-        _scp_core.py_context_join(handle, bob_did)
-        _scp_core.py_context_join(handle, carol_did)
+        _scp_core.SCP.default_instance().context_join(handle, bob_did)
+        _scp_core.SCP.default_instance().context_join(handle, carol_did)
 
-        assert _scp_core.py_context_member_count(handle) == 3
+        assert _scp_core.SCP.default_instance().context_member_count(handle) == 3
 
         # Each participant sends
         for did, name in [(alice_did, "Alice"), (bob_did, "Bob"), (carol_did, "Carol")]:
-            _scp_core.py_context_send(handle, did, f"{name} says hello".encode())
+            _scp_core.SCP.default_instance().context_send(
+                handle, did, f"{name} says hello".encode()
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +215,7 @@ class TestMultipleMessages:
         alice_did = _create_identity()
         bob_did = _create_identity()
 
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice_did,
             {
                 "ceiling": ["messages:read", "messages:write", "member:invite", "role:assign"],
@@ -222,15 +224,17 @@ class TestMultipleMessages:
             },
         )
 
-        _scp_core.py_context_join(handle, bob_did)
+        _scp_core.SCP.default_instance().context_join(handle, bob_did)
 
         for i in range(5):
-            _scp_core.py_context_send(handle, alice_did, f"message {i}".encode())
+            _scp_core.SCP.default_instance().context_send(
+                handle, alice_did, f"message {i}".encode()
+            )
 
     def test_binary_payload(self) -> None:
         alice_did = _create_identity()
 
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice_did,
             {
                 "ceiling": ["messages:read", "messages:write"],
@@ -241,7 +245,7 @@ class TestMultipleMessages:
 
         # Raw binary (not UTF-8 text)
         binary_payload = bytes([0x00, 0xFF, 0x42, 0xDE, 0xAD, 0xBE, 0xEF])
-        _scp_core.py_context_send(handle, alice_did, binary_payload)
+        _scp_core.SCP.default_instance().context_send(handle, alice_did, binary_payload)
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +294,7 @@ class TestGovernanceWithRelay:
         alice_did = _create_identity()
         bob_did = _create_identity()
 
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice_did,
             {
                 "ceiling": [
@@ -305,10 +309,10 @@ class TestGovernanceWithRelay:
             },
         )
 
-        _scp_core.py_context_join(handle, bob_did)
+        _scp_core.SCP.default_instance().context_join(handle, bob_did)
 
         # Verify Bob is a member
-        initial_role = _scp_core.py_context_member_role(handle, bob_did)
+        initial_role = _scp_core.SCP.default_instance().context_member_role(handle, bob_did)
         assert initial_role is not None
 
         # Change Bob's role via governance proposal
@@ -317,11 +321,11 @@ class TestGovernanceWithRelay:
             alice_did,
             {"ChangeRole": {"did": bob_did, "new_role": "moderator"}},
         )
-        result = _scp_core.py_governance_execute(handle, proposal_json)
+        result = _scp_core.SCP.default_instance().governance_execute(handle, proposal_json)
         assert result is not None
 
         # Verify role changed to moderator
-        new_role = _scp_core.py_context_member_role(handle, bob_did)
+        new_role = _scp_core.SCP.default_instance().context_member_role(handle, bob_did)
         assert new_role is not None
         assert "moderator" in str(new_role).lower()
 
@@ -329,7 +333,7 @@ class TestGovernanceWithRelay:
         alice_did = _create_identity()
         bob_did = _create_identity()
 
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice_did,
             {
                 "ceiling": [
@@ -344,17 +348,17 @@ class TestGovernanceWithRelay:
             },
         )
 
-        _scp_core.py_context_join(handle, bob_did)
-        assert _scp_core.py_context_is_member(handle, bob_did)
+        _scp_core.SCP.default_instance().context_join(handle, bob_did)
+        assert _scp_core.SCP.default_instance().context_is_member(handle, bob_did)
 
         proposal_json = _make_proposal_json(
             handle.context_id,
             alice_did,
             {"RemoveMember": {"did": bob_did, "reason": None}},
         )
-        _scp_core.py_governance_execute(handle, proposal_json)
+        _scp_core.SCP.default_instance().governance_execute(handle, proposal_json)
 
-        assert not _scp_core.py_context_is_member(handle, bob_did)
+        assert not _scp_core.SCP.default_instance().context_is_member(handle, bob_did)
 
     def test_pending_proposal_is_rejected(self) -> None:
         """Governance engine must reject proposals that are not Approved.
@@ -367,7 +371,7 @@ class TestGovernanceWithRelay:
         alice_did = _create_identity()
         bob_did = _create_identity()
 
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice_did,
             {
                 "ceiling": [
@@ -381,7 +385,7 @@ class TestGovernanceWithRelay:
             },
         )
 
-        _scp_core.py_context_join(handle, bob_did)
+        _scp_core.SCP.default_instance().context_join(handle, bob_did)
 
         # Construct a proposal with Pending status -- must be rejected.
         import os
@@ -405,10 +409,10 @@ class TestGovernanceWithRelay:
         )
 
         with pytest.raises(RuntimeError, match="not approved"):
-            _scp_core.py_governance_execute(handle, pending_proposal)
+            _scp_core.SCP.default_instance().governance_execute(handle, pending_proposal)
 
         # Bob's role should be unchanged -- the action was not executed.
-        initial_role = _scp_core.py_context_member_role(handle, bob_did)
+        initial_role = _scp_core.SCP.default_instance().context_member_role(handle, bob_did)
         assert initial_role is not None
 
 
@@ -424,7 +428,7 @@ class TestContextLifecycleWithRelay:
         alice_did = _create_identity()
         bob_did = _create_identity()
 
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice_did,
             {
                 "ceiling": [
@@ -440,23 +444,23 @@ class TestContextLifecycleWithRelay:
         )
 
         # Join
-        _scp_core.py_context_join(handle, bob_did)
-        assert _scp_core.py_context_member_count(handle) == 2
+        _scp_core.SCP.default_instance().context_join(handle, bob_did)
+        assert _scp_core.SCP.default_instance().context_member_count(handle) == 2
 
         # Send
-        _scp_core.py_context_send(handle, alice_did, b"lifecycle test message")
+        _scp_core.SCP.default_instance().context_send(handle, alice_did, b"lifecycle test message")
 
         # Bob leaves
-        _scp_core.py_context_leave(handle, bob_did)
-        assert _scp_core.py_context_member_count(handle) == 1
+        _scp_core.SCP.default_instance().context_leave(handle, bob_did)
+        assert _scp_core.SCP.default_instance().context_member_count(handle) == 1
 
         # Alice closes
-        _scp_core.py_context_close(handle, alice_did)
+        _scp_core.SCP.default_instance().context_close(handle, alice_did)
 
     def test_send_on_closed_context_fails(self) -> None:
         alice_did = _create_identity()
 
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice_did,
             {
                 "ceiling": ["messages:read", "messages:write", "context:close"],
@@ -465,11 +469,11 @@ class TestContextLifecycleWithRelay:
             },
         )
 
-        _scp_core.py_context_close(handle, alice_did)
+        _scp_core.SCP.default_instance().context_close(handle, alice_did)
 
         # Send on closed context must fail
         with pytest.raises(Exception):
-            _scp_core.py_context_send(handle, alice_did, b"should fail")
+            _scp_core.SCP.default_instance().context_send(handle, alice_did, b"should fail")
 
 
 # ---------------------------------------------------------------------------
@@ -483,7 +487,7 @@ class TestEventLogWithRelay:
     def test_event_log_records_creation(self) -> None:
         alice_did = _create_identity()
 
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice_did,
             {
                 "ceiling": ["messages:read"],
@@ -492,5 +496,5 @@ class TestEventLogWithRelay:
             },
         )
 
-        events = _scp_core.event_log_query(handle.context_id)
+        events = _scp_core.SCP.default_instance().event_log_query(handle.context_id)
         assert isinstance(events, list)

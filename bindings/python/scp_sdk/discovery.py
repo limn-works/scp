@@ -10,10 +10,13 @@ See ADR-020 in ``.docs/adrs/phase-4.md`` and spec section 22 (Addressing).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance
+from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
 from scp_sdk.errors import ScpError
+
+if TYPE_CHECKING:
+    import _scp_core
 
 
 def _bridge() -> Any:
@@ -130,7 +133,9 @@ def discover(query: str) -> list[dict[str, Any]]:
 
 
 @deprecated_default_instance
-def petname_set(owner_did: str, target_did: str, name: str) -> None:
+def petname_set(
+    owner_did: str, target_did: str, name: str, scp: _scp_core.SCP | None = None
+) -> None:
     """Assign a petname to a DID within the owner's local namespace.
 
     Args:
@@ -141,12 +146,12 @@ def petname_set(owner_did: str, target_did: str, name: str) -> None:
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    bridge = _bridge()
-    bridge.petname_set(owner_did, target_did, name)
+    instance = resolve_scp(scp)
+    instance.petname_set(owner_did, target_did, name)
 
 
 @deprecated_default_instance
-def petname_remove(owner_did: str, target_did: str) -> None:
+def petname_remove(owner_did: str, target_did: str, scp: _scp_core.SCP | None = None) -> None:
     """Remove a petname from a DID.
 
     Args:
@@ -156,12 +161,14 @@ def petname_remove(owner_did: str, target_did: str) -> None:
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    bridge = _bridge()
-    bridge.petname_remove(owner_did, target_did)
+    instance = resolve_scp(scp)
+    instance.petname_remove(owner_did, target_did)
 
 
 @deprecated_default_instance
-def petname_set_context(owner_did: str, context_id: str, name: str) -> None:
+def petname_set_context(
+    owner_did: str, context_id: str, name: str, scp: _scp_core.SCP | None = None
+) -> None:
     """Assign a petname to a context within the owner's local namespace.
 
     Args:
@@ -172,12 +179,14 @@ def petname_set_context(owner_did: str, context_id: str, name: str) -> None:
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    bridge = _bridge()
-    bridge.petname_set_context(owner_did, context_id, name)
+    instance = resolve_scp(scp)
+    instance.petname_set_context(owner_did, context_id, name)
 
 
 @deprecated_default_instance
-def petname_remove_context(owner_did: str, context_id: str) -> None:
+def petname_remove_context(
+    owner_did: str, context_id: str, scp: _scp_core.SCP | None = None
+) -> None:
     """Remove a petname from a context.
 
     Args:
@@ -187,12 +196,12 @@ def petname_remove_context(owner_did: str, context_id: str) -> None:
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    bridge = _bridge()
-    bridge.petname_remove_context(owner_did, context_id)
+    instance = resolve_scp(scp)
+    instance.petname_remove_context(owner_did, context_id)
 
 
 @deprecated_default_instance
-def petname_resolve_did(owner_did: str, name: str) -> list[str]:
+def petname_resolve_did(owner_did: str, name: str, scp: _scp_core.SCP | None = None) -> list[str]:
     """Resolve a petname to a list of DIDs.
 
     Args:
@@ -205,12 +214,14 @@ def petname_resolve_did(owner_did: str, name: str) -> list[str]:
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    bridge = _bridge()
-    return list(bridge.petname_resolve_did(owner_did, name))
+    instance = resolve_scp(scp)
+    return list(instance.petname_resolve_did(owner_did, name))
 
 
 @deprecated_default_instance
-def petname_resolve_context(owner_did: str, name: str) -> list[str]:
+def petname_resolve_context(
+    owner_did: str, name: str, scp: _scp_core.SCP | None = None
+) -> list[str]:
     """Resolve a petname to a list of context IDs.
 
     Args:
@@ -223,12 +234,14 @@ def petname_resolve_context(owner_did: str, name: str) -> list[str]:
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    bridge = _bridge()
-    return list(bridge.petname_resolve_context(owner_did, name))
+    instance = resolve_scp(scp)
+    return list(instance.petname_resolve_context(owner_did, name))
 
 
 @deprecated_default_instance
-def petname_get_for_did(owner_did: str, target_did: str) -> str | None:
+def petname_get_for_did(
+    owner_did: str, target_did: str, scp: _scp_core.SCP | None = None
+) -> str | None:
     """Get the petname assigned to a DID, if any.
 
     Args:
@@ -241,12 +254,14 @@ def petname_get_for_did(owner_did: str, target_did: str) -> str | None:
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    bridge = _bridge()
-    return bridge.petname_get_for_did(owner_did, target_did)
+    instance = resolve_scp(scp)
+    return instance.petname_get_for_did(owner_did, target_did)
 
 
 @deprecated_default_instance
-def petname_get_for_context(owner_did: str, context_id: str) -> str | None:
+def petname_get_for_context(
+    owner_did: str, context_id: str, scp: _scp_core.SCP | None = None
+) -> str | None:
     """Get the petname assigned to a context, if any.
 
     Args:
@@ -259,8 +274,8 @@ def petname_get_for_context(owner_did: str, context_id: str) -> str | None:
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    bridge = _bridge()
-    return bridge.petname_get_for_context(owner_did, context_id)
+    instance = resolve_scp(scp)
+    return instance.petname_get_for_context(owner_did, context_id)
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +292,7 @@ def handle_register(
     *,
     description: str | None = None,
     tags: list[str] | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Register a handle in a context with discovery tools.
 
@@ -295,10 +311,10 @@ def handle_register(
     Raises:
         ValidationError: If ``target_json`` is malformed.
     """
-    bridge = _bridge()
+    instance = resolve_scp(scp)
     import json
 
-    result = bridge.handle_register(
+    result = instance.handle_register(
         discovery_context_id, handle, target_json, registrant_did, description, tags
     )
     return json.loads(result)
@@ -310,6 +326,7 @@ def handle_lookup(
     handle: str,
     *,
     type_filter: str | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Look up a handle in a context with discovery tools.
 
@@ -321,10 +338,10 @@ def handle_lookup(
     Returns:
         A dict with a ``results`` list of matching handle entries.
     """
-    bridge = _bridge()
+    instance = resolve_scp(scp)
     import json
 
-    result = bridge.handle_lookup(discovery_context_id, handle, type_filter)
+    result = instance.handle_lookup(discovery_context_id, handle, type_filter)
     return json.loads(result)
 
 
@@ -333,6 +350,7 @@ def handle_deregister(
     discovery_context_id: str,
     handle: str,
     did: str,
+    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Deregister a handle from a context with discovery tools.
 
@@ -344,10 +362,10 @@ def handle_deregister(
     Returns:
         A dict with a ``removed`` boolean.
     """
-    bridge = _bridge()
+    instance = resolve_scp(scp)
     import json
 
-    result = bridge.handle_deregister(discovery_context_id, handle, did)
+    result = instance.handle_deregister(discovery_context_id, handle, did)
     return json.loads(result)
 
 
@@ -362,6 +380,7 @@ def address_resolve(
     address: str,
     *,
     known_contexts_json: str | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve a human-readable address via multi-path resolution.
 
@@ -383,10 +402,10 @@ def address_resolve(
     Raises:
         ValidationError: If ``owner_did`` is empty or address parsing fails.
     """
-    bridge = _bridge()
+    instance = resolve_scp(scp)
     import json
 
-    result = bridge.address_resolve(owner_did, address, known_contexts_json)
+    result = instance.address_resolve(owner_did, address, known_contexts_json)
     return json.loads(result)
 
 
@@ -405,6 +424,7 @@ def scope_register(
     *,
     description: str | None = None,
     tags: list[str] | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Register a scope name in a scope registry.
 
@@ -427,10 +447,10 @@ def scope_register(
     Raises:
         ValidationError: If the scope name or relay URLs are invalid.
     """
-    bridge = _bridge()
+    instance = resolve_scp(scp)
     import json
 
-    result = bridge.scope_register(
+    result = instance.scope_register(
         scope_context_id,
         name,
         target_context_id,
@@ -446,6 +466,7 @@ def scope_register(
 def scope_lookup(
     scope_context_id: str,
     name: str,
+    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Look up a scope name in a scope registry.
 
@@ -456,10 +477,10 @@ def scope_lookup(
     Returns:
         A dict with a ``results`` list of matching scope entries.
     """
-    bridge = _bridge()
+    instance = resolve_scp(scp)
     import json
 
-    result = bridge.scope_lookup(scope_context_id, name)
+    result = instance.scope_lookup(scope_context_id, name)
     return json.loads(result)
 
 
@@ -468,6 +489,7 @@ def scope_deregister(
     scope_context_id: str,
     name: str,
     did: str,
+    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Deregister a scope name from a scope registry.
 
@@ -479,10 +501,10 @@ def scope_deregister(
     Returns:
         A dict with a ``removed`` boolean.
     """
-    bridge = _bridge()
+    instance = resolve_scp(scp)
     import json
 
-    result = bridge.scope_deregister(scope_context_id, name, did)
+    result = instance.scope_deregister(scope_context_id, name, did)
     return json.loads(result)
 
 

@@ -11,11 +11,14 @@ See spec section 12 (Bridge System) and ADR-023.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance
+from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
 from scp_sdk.errors import ScpError
 from scp_sdk.types import BridgeMode, ShadowStatus
+
+if TYPE_CHECKING:
+    import _scp_core
 
 
 def _bridge() -> Any:
@@ -113,6 +116,7 @@ def create_shadow(
     platform_handle: str,
     bridge_mode: BridgeMode | str,
     context_id: str = "ctx-shadow",
+    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Create a shadow identity for an external platform participant.
 
@@ -133,9 +137,9 @@ def create_shadow(
         ValidationError: If *bridge_mode* is invalid.
         ContextError: If shadow creation fails.
     """
-    bridge = _bridge()
+    instance = resolve_scp(scp)
     mode_str = bridge_mode.value if isinstance(bridge_mode, BridgeMode) else bridge_mode
-    return dict(bridge.bridge_create_shadow(bridge_id, platform_handle, mode_str, context_id))
+    return dict(instance.bridge_create_shadow(bridge_id, platform_handle, mode_str, context_id))
 
 
 __all__ = [

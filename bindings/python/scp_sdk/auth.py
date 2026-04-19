@@ -22,9 +22,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance
+from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
+
+if TYPE_CHECKING:
+    import _scp_core
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -174,7 +177,11 @@ class ScpIdAuthentication:
 
 
 @deprecated_default_instance
-def scpid_challenge(audience: str, ttl_seconds: int = 300) -> ScpIdChallenge:
+def scpid_challenge(
+    audience: str,
+    ttl_seconds: int = 300,
+    scp: _scp_core.SCP | None = None,
+) -> ScpIdChallenge:
     """Generate an SCPID challenge for a relying party (section 3.11.8).
 
     Args:
@@ -182,6 +189,9 @@ def scpid_challenge(audience: str, ttl_seconds: int = 300) -> ScpIdChallenge:
             (e.g. ``"https://app.example.com"``).
         ttl_seconds: Challenge validity window in seconds (1--300).
             Defaults to 300.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When
+            ``None`` the process-wide default instance is used for
+            back-compat (ADR-048).
 
     Returns:
         A new :class:`ScpIdChallenge`.
@@ -190,9 +200,8 @@ def scpid_challenge(audience: str, ttl_seconds: int = 300) -> ScpIdChallenge:
         scp_sdk.ValidationError: If *audience* is empty, exceeds 2048 bytes,
             or *ttl_seconds* is 0 or exceeds 300.
     """
-    import _scp_core
-
-    challenge_json = _scp_core.scpid_challenge(audience, ttl_seconds)
+    instance = resolve_scp(scp)
+    challenge_json = instance.scpid_challenge(audience, ttl_seconds)
     return ScpIdChallenge.from_json(challenge_json)
 
 
@@ -201,6 +210,7 @@ def scpid_sign(
     identity: Any,
     signing_key_id: str,
     challenge: ScpIdChallenge,
+    scp: _scp_core.SCP | None = None,
 ) -> ScpIdResponse:
     """Sign an SCPID challenge with a registered identity's key (section 3.11.3).
 
@@ -212,6 +222,9 @@ def scpid_sign(
             is registered in the bridge's identity registry.
         signing_key_id: ``"#active"`` or ``"#agent"``.
         challenge: The challenge to sign.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When
+            ``None`` the process-wide default instance is used for
+            back-compat (ADR-048).
 
     Returns:
         A new :class:`ScpIdResponse`.
@@ -221,9 +234,8 @@ def scpid_sign(
         scp_sdk.ValidationError: If *signing_key_id* is invalid or the
             challenge is malformed.
     """
-    import _scp_core
-
-    response_json = _scp_core.scpid_sign(
+    instance = resolve_scp(scp)
+    response_json = instance.scpid_sign(
         identity.did,
         signing_key_id,
         challenge.to_json(),
@@ -235,6 +247,7 @@ def scpid_sign(
 def scpid_verify(
     response: ScpIdResponse,
     challenge: ScpIdChallenge,
+    scp: _scp_core.SCP | None = None,
 ) -> ScpIdAuthentication:
     """Verify a signed SCPID response against the original challenge (section 3.11.4).
 
@@ -245,6 +258,9 @@ def scpid_verify(
     Args:
         response: The signed response from the client.
         challenge: The original challenge issued by the relying party.
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When
+            ``None`` the process-wide default instance is used for
+            back-compat (ADR-048).
 
     Returns:
         An :class:`ScpIdAuthentication` on success.
@@ -255,9 +271,8 @@ def scpid_verify(
             has expired, or any other verification step fails.
         scp_sdk.ValidationError: If either JSON structure is malformed.
     """
-    import _scp_core
-
-    auth_json = _scp_core.scpid_verify(
+    instance = resolve_scp(scp)
+    auth_json = instance.scpid_verify(
         response.to_json(),
         challenge.to_json(),
     )

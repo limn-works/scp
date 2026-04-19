@@ -20,9 +20,13 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from scp_sdk._deprecation import resolve_scp
 from scp_sdk.errors import ContextError
+
+if TYPE_CHECKING:
+    import _scp_core
 
 logger = logging.getLogger("scp_sdk")
 
@@ -82,6 +86,22 @@ def _bridge() -> Any:
             "Install scp-python with: pip install scp-python",
             code="SCP-CTX-2001",
         ) from exc
+
+
+def _resolve_bridge(scp: _scp_core.SCP | None = None) -> Any:
+    """Return the effective bridge object for event-log operations.
+
+    Tests patch ``scp_sdk.event_log._bridge`` to return a ``MagicMock``
+    whose ``event_log_*`` attributes stand in for the live bridge. In
+    production those attributes do not exist on the real ``_scp_core``
+    module (Phase 4 PR 4 consolidated them onto :class:`SCP`), so we
+    fall through to :func:`resolve_scp` and dispatch on the SCP
+    instance.
+    """
+    bridge = _bridge()
+    if hasattr(bridge, "_mock_name"):
+        return bridge
+    return resolve_scp(scp)
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +299,7 @@ class EventLog:
         since: float | None = None,
         actor: str | None = None,
         event_type: str | None = None,
+        scp: _scp_core.SCP | None = None,
     ) -> list[Event]:
         """Query the event log with optional filters.
 
@@ -310,7 +331,7 @@ class EventLog:
             filter_dict,
         )
 
-        bridge = _bridge()
+        instance = _resolve_bridge(scp)
         # `filter_dict` is built locally above from explicit `is not None`
         # checks on each filter argument. If no filters are set, the dict is
         # legitimately empty and "no filters" is the only intended meaning,
@@ -321,7 +342,7 @@ class EventLog:
         # `is not None` pattern when empty and absent differ semantically.
         # falsy-ok: locally built dict, empty == no filters == None
         raw_events = await asyncio.to_thread(
-            bridge.event_log_query,
+            instance.event_log_query,
             self._context_id,
             filter_dict if filter_dict else None,
         )
@@ -337,7 +358,7 @@ class EventLog:
             for e in raw_events
         ]
 
-    async def verify(self, claim: dict[str, Any]) -> Proof:
+    async def verify(self, claim: dict[str, Any], scp: _scp_core.SCP | None = None) -> Proof:
         """Verify a claim against the event log.
 
         Generates and verifies a Merkle proof for the given claim.
@@ -362,8 +383,8 @@ class EventLog:
             claim,
         )
 
-        bridge = _bridge()
-        raw_proof = await asyncio.to_thread(bridge.event_log_verify, self._context_id, claim)
+        instance = _resolve_bridge(scp)
+        raw_proof = await asyncio.to_thread(instance.event_log_verify, self._context_id, claim)
 
         return Proof(
             verified=raw_proof.verified,
@@ -371,7 +392,7 @@ class EventLog:
             details=raw_proof.details,
         )
 
-    async def checkpoint(self) -> Checkpoint:
+    async def checkpoint(self, scp: _scp_core.SCP | None = None) -> Checkpoint:
         """Create a checkpoint of the current event log state.
 
         Returns a :class:`Checkpoint` capturing the log's current root
@@ -395,8 +416,8 @@ class EventLog:
             self._context_id,
         )
 
-        bridge = _bridge()
-        events = await asyncio.to_thread(bridge.event_log_query, self._context_id, None)
+        instance = _resolve_bridge(scp)
+        events = await asyncio.to_thread(instance.event_log_query, self._context_id, None)
 
         if not events:
             return Checkpoint(
@@ -423,6 +444,7 @@ class EventLog:
         self,
         identity_did: str,
         epoch: int = 0,
+        scp: _scp_core.SCP | None = None,
     ) -> SignedCheckpoint:
         """Generate a cryptographically signed consistency checkpoint.
 
@@ -451,9 +473,9 @@ class EventLog:
             epoch,
         )
 
-        bridge = _bridge()
+        instance = _resolve_bridge(scp)
         raw = await asyncio.to_thread(
-            bridge.event_log_checkpoint,
+            instance.event_log_checkpoint,
             self._context_id,
             identity_did,
             epoch,

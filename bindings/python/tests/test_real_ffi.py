@@ -47,17 +47,17 @@ def relay():
     py_context_send publishes through the relay. A second connection
     (transport_connect) is established for relay-based discovery.
     """
-    handle = _scp_core.py_relay_start_in_memory()
+    handle = _scp_core.SCP.default_instance().relay_start_in_memory()
 
     # Create a bootstrap identity for the MLS credential DID.
-    bootstrap = _scp_core.py_identity_create("in_memory")
+    bootstrap = _scp_core.SCP.default_instance().identity_create("in_memory")
 
     # Wire the ContextManager to use a real relay transport provider.
     # Must be called BEFORE any py_context_create (OnceLock — first call wins).
-    _scp_core.configure_relay_transport(handle.relay_url, bootstrap.did)
+    _scp_core.SCP.default_instance().configure_relay_transport(handle.relay_url, bootstrap.did)
 
     # Second connection for relay-based context discovery.
-    _scp_core.transport_connect(handle.relay_url)
+    _scp_core.SCP.default_instance().transport_connect(handle.relay_url)
 
     yield handle
     if not handle.is_shutdown:
@@ -216,7 +216,7 @@ class TestContext:
 
     async def test_create_returns_active(self):
         identity = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             identity.did,
             {
                 "ceiling": ["messages:read", "messages:write"],
@@ -231,7 +231,7 @@ class TestContext:
         alice = await Identity.create(CustodyType.IN_MEMORY)
         bob = await Identity.create(CustodyType.IN_MEMORY)
 
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": [
@@ -246,23 +246,23 @@ class TestContext:
             },
         )
 
-        _scp_core.py_context_join(handle, bob.did)
-        count = _scp_core.py_context_member_count(handle)
+        _scp_core.SCP.default_instance().context_join(handle, bob.did)
+        count = _scp_core.SCP.default_instance().context_member_count(handle)
         assert count == 2
 
-        assert _scp_core.py_context_is_member(handle, bob.did)
-        members = _scp_core.py_context_member_dids(handle)
+        assert _scp_core.SCP.default_instance().context_is_member(handle, bob.did)
+        members = _scp_core.SCP.default_instance().context_member_dids(handle)
         assert bob.did in members
         assert alice.did in members
 
-        _scp_core.py_context_leave(handle, bob.did)
-        count_after = _scp_core.py_context_member_count(handle)
+        _scp_core.SCP.default_instance().context_leave(handle, bob.did)
+        count_after = _scp_core.SCP.default_instance().context_member_count(handle)
         assert count_after == 1
-        assert not _scp_core.py_context_is_member(handle, bob.did)
+        assert not _scp_core.SCP.default_instance().context_is_member(handle, bob.did)
 
     async def test_close(self):
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read", "context:close"],
@@ -271,12 +271,12 @@ class TestContext:
             },
         )
         assert handle.state == "active"
-        _scp_core.py_context_close(handle, alice.did)
+        _scp_core.SCP.default_instance().context_close(handle, alice.did)
         assert handle.state in ("closed", "closing")
 
     async def test_send_message(self):
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read", "messages:write"],
@@ -286,11 +286,11 @@ class TestContext:
         )
         # RelayTransportProvider is configured — send publishes through the relay.
         # Full pipeline: MLS encrypt -> sender key -> outer envelope -> relay publish.
-        _scp_core.py_context_send(handle, alice.did, b"Hello from Python!")
+        _scp_core.SCP.default_instance().context_send(handle, alice.did, b"Hello from Python!")
 
     async def test_drain_events(self):
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read"],
@@ -298,12 +298,12 @@ class TestContext:
                 "governance": "single_admin",
             },
         )
-        events = _scp_core.py_context_drain_events(handle)
+        events = _scp_core.SCP.default_instance().context_drain_events(handle)
         assert isinstance(events, list)
 
     async def test_member_role(self):
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read"],
@@ -311,7 +311,7 @@ class TestContext:
                 "governance": "single_admin",
             },
         )
-        role = _scp_core.py_context_member_role(handle, alice.did)
+        role = _scp_core.SCP.default_instance().context_member_role(handle, alice.did)
         assert role is not None
         assert "admin" in str(role).lower()
 
@@ -326,7 +326,7 @@ class TestTools:
 
     async def test_register_and_verify(self):
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read", "tool:invoke:*", "tool:register"],
@@ -334,7 +334,7 @@ class TestTools:
                 "governance": "single_admin",
             },
         )
-        tool_id = _scp_core.tool_register(
+        tool_id = _scp_core.SCP.default_instance().tool_register(
             handle.context_id,
             {
                 "name": "test_tool",
@@ -361,7 +361,7 @@ class TestTools:
         assert tool_id
         assert len(tool_id) > 0
 
-        result = _scp_core.tool_verify(handle.context_id, tool_id)
+        result = _scp_core.SCP.default_instance().tool_verify(handle.context_id, tool_id)
         assert result.passed
 
 
@@ -376,7 +376,7 @@ class TestUcan:
     async def test_mint_and_revoke(self):
         alice = await Identity.create(CustodyType.IN_MEMORY)
         bob = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read", "messages:write"],
@@ -384,7 +384,7 @@ class TestUcan:
                 "governance": "single_admin",
             },
         )
-        token = _scp_core.ucan_mint(
+        token = _scp_core.SCP.default_instance().ucan_mint(
             handle.context_id,
             bob.did,
             ["messages:read"],
@@ -424,7 +424,7 @@ class TestUcan:
         sig = base64.urlsafe_b64encode(b"test-sig-bytes-0000000000000000").rstrip(b"=").decode()
         test_jwt = f"{header}.{payload}.{sig}"
         try:
-            _scp_core.ucan_revoke(handle.context_id, test_jwt, alice.did)
+            _scp_core.SCP.default_instance().ucan_revoke(handle.context_id, test_jwt, alice.did)
         except Exception:
             pass  # May fail depending on implementation state
 
@@ -439,7 +439,7 @@ class TestEventLog:
 
     async def test_query(self):
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read"],
@@ -447,7 +447,7 @@ class TestEventLog:
                 "governance": "single_admin",
             },
         )
-        events = _scp_core.event_log_query(handle.context_id)
+        events = _scp_core.SCP.default_instance().event_log_query(handle.context_id)
         assert isinstance(events, list)
 
 
@@ -496,12 +496,14 @@ class TestProvenance:
 
     async def test_evaluate_quality(self):
         # SCP-DEFAULT-INSTANCE-OK: pure-function FFI call via _scp_core; no bridge state
-        result = _scp_core.evaluate_provenance_quality(None, "persistent", "active", None)
+        result = _scp_core.SCP.default_instance().evaluate_provenance_quality(
+            None, "persistent", "active", None
+        )
         assert isinstance(result, int)
         assert 0 <= result <= 3
 
     async def test_attach(self):
-        result = _scp_core.provenance_attach(
+        result = _scp_core.SCP.default_instance().provenance_attach(
             "source-ctx",
             "persistent",
             "full",
@@ -513,8 +515,8 @@ class TestProvenance:
         assert isinstance(result, dict)
 
     async def test_chain_depth(self):
-        assert _scp_core.provenance_check_chain_depth(3, 5)
-        assert not _scp_core.provenance_check_chain_depth(6, 5)
+        assert _scp_core.SCP.default_instance().provenance_check_chain_depth(3, 5)
+        assert not _scp_core.SCP.default_instance().provenance_check_chain_depth(6, 5)
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +530,7 @@ class TestTrust:
     async def test_query_score(self):
         """trust_query_score should return a score dict or structured result."""
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read"],
@@ -538,7 +540,9 @@ class TestTrust:
         )
         # trust_query_score may fail without attestation data, but should not crash
         try:
-            result = _scp_core.trust_query_score(alice.did, handle.context_id)
+            result = _scp_core.SCP.default_instance().trust_query_score(
+                alice.did, handle.context_id
+            )
             assert result is not None
         except Exception:
             pass  # Expected without attestation infrastructure
@@ -556,7 +560,7 @@ class TestGovernance:
         """Use py_context_join for membership (governance requires full proposal struct)."""
         alice = await Identity.create(CustodyType.IN_MEMORY)
         bob = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": [
@@ -570,9 +574,9 @@ class TestGovernance:
                 "governance": "single_admin",
             },
         )
-        _scp_core.py_context_join(handle, bob.did)
-        assert _scp_core.py_context_is_member(handle, bob.did)
-        role = _scp_core.py_context_member_role(handle, bob.did)
+        _scp_core.SCP.default_instance().context_join(handle, bob.did)
+        assert _scp_core.SCP.default_instance().context_is_member(handle, bob.did)
+        role = _scp_core.SCP.default_instance().context_member_role(handle, bob.did)
         assert role is not None
 
 
@@ -586,7 +590,7 @@ class TestBroadcast:
 
     async def test_subscribe_and_count(self):
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read", "messages:write"],
@@ -597,17 +601,17 @@ class TestBroadcast:
         )
         bob = await Identity.create(CustodyType.IN_MEMORY)
 
-        _scp_core.py_broadcast_subscribe(handle, bob.did)
-        count = _scp_core.py_broadcast_subscriber_count(handle)
+        _scp_core.SCP.default_instance().broadcast_subscribe(handle, bob.did)
+        count = _scp_core.SCP.default_instance().broadcast_subscriber_count(handle)
         assert count >= 1
-        assert _scp_core.py_broadcast_is_subscriber(handle, bob.did)
+        assert _scp_core.SCP.default_instance().broadcast_is_subscriber(handle, bob.did)
 
-        _scp_core.py_broadcast_unsubscribe(handle, bob.did, False)
-        assert not _scp_core.py_broadcast_is_subscriber(handle, bob.did)
+        _scp_core.SCP.default_instance().broadcast_unsubscribe(handle, bob.did, False)
+        assert not _scp_core.SCP.default_instance().broadcast_is_subscriber(handle, bob.did)
 
     async def test_block_and_unblock(self):
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read", "messages:write"],
@@ -618,22 +622,22 @@ class TestBroadcast:
         )
         bob = await Identity.create(CustodyType.IN_MEMORY)
 
-        _scp_core.py_broadcast_subscribe(handle, bob.did)
-        assert _scp_core.py_broadcast_is_subscriber(handle, bob.did)
+        _scp_core.SCP.default_instance().broadcast_subscribe(handle, bob.did)
+        assert _scp_core.SCP.default_instance().broadcast_is_subscriber(handle, bob.did)
 
         # Block bob from alice's author keys. Per-author blocking does NOT
         # remove from the context-wide subscriber roster (spec §5.14.8),
         # so is_subscriber remains True.
-        _scp_core.py_broadcast_block_subscriber(handle, bob.did, alice.did)
-        assert _scp_core.py_broadcast_is_subscriber(handle, bob.did)
+        _scp_core.SCP.default_instance().broadcast_block_subscriber(handle, bob.did, alice.did)
+        assert _scp_core.SCP.default_instance().broadcast_is_subscriber(handle, bob.did)
 
         # Unblock bob — subscriber status unchanged (was never removed).
-        _scp_core.py_broadcast_unblock_subscriber(handle, bob.did, alice.did)
-        assert _scp_core.py_broadcast_is_subscriber(handle, bob.did)
+        _scp_core.SCP.default_instance().broadcast_unblock_subscriber(handle, bob.did, alice.did)
+        assert _scp_core.SCP.default_instance().broadcast_is_subscriber(handle, bob.did)
 
     async def test_unblock_not_blocked_raises(self):
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read", "messages:write"],
@@ -644,10 +648,12 @@ class TestBroadcast:
         )
         bob = await Identity.create(CustodyType.IN_MEMORY)
 
-        _scp_core.py_broadcast_subscribe(handle, bob.did)
+        _scp_core.SCP.default_instance().broadcast_subscribe(handle, bob.did)
 
         with pytest.raises(RuntimeError):
-            _scp_core.py_broadcast_unblock_subscriber(handle, bob.did, alice.did)
+            _scp_core.SCP.default_instance().broadcast_unblock_subscriber(
+                handle, bob.did, alice.did
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -661,7 +667,7 @@ class TestBroadcastPublishAsset:
     async def test_broadcast_publish_asset_real_ffi(self):
         """Single asset publish returns blob_id and etag through relay."""
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read", "messages:write"],
@@ -671,7 +677,7 @@ class TestBroadcastPublishAsset:
             },
         )
         # Relay transport is configured — publish succeeds.
-        result = _scp_core.py_broadcast_publish_asset(
+        result = _scp_core.SCP.default_instance().broadcast_publish_asset(
             handle,
             alice.did,
             "/index.html",
@@ -690,7 +696,7 @@ class TestBroadcastPublishAsset:
     async def test_broadcast_publish_asset_invalid_path_raises(self):
         """Invalid content path raises an error with 'invalid path' message."""
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read", "messages:write"],
@@ -700,7 +706,7 @@ class TestBroadcastPublishAsset:
             },
         )
         with pytest.raises(Exception, match="invalid path"):
-            _scp_core.py_broadcast_publish_asset(
+            _scp_core.SCP.default_instance().broadcast_publish_asset(
                 handle,
                 alice.did,
                 "no-leading-slash",  # invalid: must start with /
@@ -712,7 +718,7 @@ class TestBroadcastPublishAsset:
     async def test_broadcast_publish_assets_real_ffi(self):
         """Batch publish returns correct count through relay."""
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read", "messages:write"],
@@ -727,7 +733,7 @@ class TestBroadcastPublishAsset:
             ("/app.js", "application/javascript", b"console.log('ok')"),
         ]
         # Relay transport is configured — batch publish succeeds.
-        result = _scp_core.py_broadcast_publish_assets(
+        result = _scp_core.SCP.default_instance().broadcast_publish_assets(
             handle,
             alice.did,
             assets,
@@ -756,7 +762,7 @@ class TestBridgeConnector:
         """bridge_register succeeds when governance_did differs from operator_did."""
         alice = await Identity.create(CustodyType.IN_MEMORY)
         bob = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read"],
@@ -773,7 +779,7 @@ class TestBridgeConnector:
     async def test_register_rejects_self_approval(self):
         """bridge_register fails when governance_did equals operator_did."""
         alice = await Identity.create(CustodyType.IN_MEMORY)
-        handle = _scp_core.py_context_create(
+        handle = _scp_core.SCP.default_instance().context_create(
             alice.did,
             {
                 "ceiling": ["messages:read"],
@@ -800,7 +806,7 @@ class TestBridgeConnector:
         assert result == 1  # ClaimedBridged
 
     async def test_create_shadow(self):
-        result = _scp_core.bridge_create_shadow(
+        result = _scp_core.SCP.default_instance().bridge_create_shadow(
             "bridge-discord-abc", "@user#1234", "relay", "ctx-shadow"
         )
         assert result["shadow_id"]
@@ -857,7 +863,7 @@ class TestExecuteRecovery:
         """execute_recovery with an invalid tier should raise an error."""
         alice = await Identity.create(CustodyType.IN_MEMORY)
         with pytest.raises(_scp_core.IdentityError):
-            _scp_core.identity_execute_recovery(
+            _scp_core.SCP.default_instance().identity_execute_recovery(
                 alice.did,
                 "invalid_tier",
                 [],
@@ -869,7 +875,7 @@ class TestExecuteRecovery:
         rather than crashing."""
         import json
 
-        result = _scp_core.identity_execute_recovery(
+        result = _scp_core.SCP.default_instance().identity_execute_recovery(
             "did:dht:z6MkUnknown000000000000000000",
             "agent",
             [],
@@ -893,7 +899,7 @@ class TestMigrate:
         a descriptive IdentityError if pre-rotation is not yet set up)."""
         alice = await Identity.create(CustodyType.IN_MEMORY)
         try:
-            result = _scp_core.py_identity_migrate(alice._handle)
+            result = _scp_core.SCP.default_instance().identity_migrate(alice._handle)
             # If migration succeeds, the new identity should have a different DID.
             assert result.did != alice.did
         except _scp_core.IdentityError:
@@ -919,7 +925,7 @@ class TestMigrate:
         # It may itself fail (e.g., missing pre-rotation commitment),
         # so we handle that case too.
         try:
-            _scp_core.py_identity_migrate(old_handle)
+            _scp_core.SCP.default_instance().identity_migrate(old_handle)
         except _scp_core.IdentityError:
             # First migrate failed — old_handle DID is still registered.
             # We can't test the "not in registry" path without removing it,
@@ -930,7 +936,7 @@ class TestMigrate:
         # the registry. Calling migrate again with the stale handle should
         # raise IdentityError because the DID is no longer registered.
         with pytest.raises(_scp_core.IdentityError, match="not found in registry"):
-            _scp_core.py_identity_migrate(old_handle)
+            _scp_core.SCP.default_instance().identity_migrate(old_handle)
 
 
 # ---------------------------------------------------------------------------
@@ -943,7 +949,7 @@ class TestScopeRegistry:
 
     def test_scope_register_lookup_deregister(self) -> None:
         """Round-trip: register a scope, look it up, deregister it."""
-        result = _scp_core.scope_register(
+        result = _scp_core.SCP.default_instance().scope_register(
             "test-ctx",
             "my-scope",
             "target-ctx",
@@ -958,25 +964,29 @@ class TestScopeRegistry:
         assert parsed["status"] == "registered"
         assert parsed["entry_id"] is not None
 
-        lookup_result = _scp_core.scope_lookup("test-ctx", "my-scope")
+        lookup_result = _scp_core.SCP.default_instance().scope_lookup("test-ctx", "my-scope")
         lookup = json.loads(lookup_result)
         assert len(lookup["results"]) == 1
         assert lookup["results"][0]["name"] == "my-scope"
         assert lookup["results"][0]["target"]["context_id"] == "target-ctx"
 
-        dereg_result = _scp_core.scope_deregister("test-ctx", "my-scope", "did:dht:zTest")
+        dereg_result = _scp_core.SCP.default_instance().scope_deregister(
+            "test-ctx", "my-scope", "did:dht:zTest"
+        )
         dereg = json.loads(dereg_result)
         assert dereg["removed"] is True
 
         # Verify it's gone
-        lookup_after = json.loads(_scp_core.scope_lookup("test-ctx", "my-scope"))
+        lookup_after = json.loads(
+            _scp_core.SCP.default_instance().scope_lookup("test-ctx", "my-scope")
+        )
         assert len(lookup_after["results"]) == 0
 
     def test_scope_register_conflict(self) -> None:
         """Different DID cannot overwrite an existing scope registration."""
         import json
 
-        _scp_core.scope_register(
+        _scp_core.SCP.default_instance().scope_register(
             "conflict-ctx",
             "taken-scope",
             "target-ctx",
@@ -987,7 +997,7 @@ class TestScopeRegistry:
         )
 
         result = json.loads(
-            _scp_core.scope_register(
+            _scp_core.SCP.default_instance().scope_register(
                 "conflict-ctx",
                 "taken-scope",
                 "other-ctx",
@@ -1005,7 +1015,7 @@ class TestScopeRegistry:
         import json
 
         result = json.loads(
-            _scp_core.scope_register(
+            _scp_core.SCP.default_instance().scope_register(
                 "meta-ctx",
                 "meta-scope",
                 "target-ctx",
@@ -1017,7 +1027,7 @@ class TestScopeRegistry:
         )
         assert result["status"] == "registered"
 
-        lookup = json.loads(_scp_core.scope_lookup("meta-ctx", "meta-scope"))
+        lookup = json.loads(_scp_core.SCP.default_instance().scope_lookup("meta-ctx", "meta-scope"))
         assert len(lookup["results"]) == 1
         entry = lookup["results"][0]
         assert entry["metadata"]["description"] == "A test scope"

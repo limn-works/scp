@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance
+from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
 from scp_sdk.errors import ScpError
+
+if TYPE_CHECKING:
+    import _scp_core
 
 logger = logging.getLogger("scp_sdk")
 
@@ -158,7 +161,11 @@ def evaluate_formula(formula_json: str, metrics: dict[str, int] | None = None) -
 
 
 @deprecated_default_instance
-def budget_remaining(context_id: str, did: str) -> int:
+def budget_remaining(
+    context_id: str,
+    did: str,
+    scp: _scp_core.SCP | None = None,
+) -> int:
     """Query the remaining budget for a member in a context.
 
     Args:
@@ -169,12 +176,17 @@ def budget_remaining(context_id: str, did: str) -> int:
         Remaining budget (smallest currency unit). Returns 0 if no budget
         has been granted.
     """
-    bridge = _bridge()
-    return bridge.economy_budget_remaining(context_id, did)
+    instance = resolve_scp(scp)
+    return instance.economy_budget_remaining(context_id, did)
 
 
 @deprecated_default_instance
-def budget_grant(context_id: str, did: str, amount: int) -> None:
+def budget_grant(
+    context_id: str,
+    did: str,
+    amount: int,
+    scp: _scp_core.SCP | None = None,
+) -> None:
     """Grant spending budget to a member.
 
     Grants are additive: granting 100 twice gives a total limit of 200.
@@ -184,12 +196,17 @@ def budget_grant(context_id: str, did: str, amount: int) -> None:
         did: The member's DID.
         amount: Budget to grant (smallest currency unit).
     """
-    bridge = _bridge()
-    bridge.economy_budget_grant(context_id, did, amount)
+    instance = resolve_scp(scp)
+    instance.economy_budget_grant(context_id, did, amount)
 
 
 @deprecated_default_instance
-def budget_record_spend(context_id: str, did: str, amount: int) -> None:
+def budget_record_spend(
+    context_id: str,
+    did: str,
+    amount: int,
+    scp: _scp_core.SCP | None = None,
+) -> None:
     """Record a spend against a member's budget.
 
     Args:
@@ -200,8 +217,8 @@ def budget_record_spend(context_id: str, did: str, amount: int) -> None:
     Raises:
         ValueError: If no budget exists or the spend exceeds remaining budget.
     """
-    bridge = _bridge()
-    bridge.economy_budget_record_spend(context_id, did, amount)
+    instance = resolve_scp(scp)
+    instance.economy_budget_record_spend(context_id, did, amount)
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +227,12 @@ def budget_record_spend(context_id: str, did: str, amount: int) -> None:
 
 
 @deprecated_default_instance
-def antispam_record(context_id: str, sender_did: str, timestamp: int) -> None:
+def antispam_record(
+    context_id: str,
+    sender_did: str,
+    timestamp: int,
+    scp: _scp_core.SCP | None = None,
+) -> None:
     """Record a message for antispam velocity tracking.
 
     Args:
@@ -218,12 +240,17 @@ def antispam_record(context_id: str, sender_did: str, timestamp: int) -> None:
         sender_did: The sender's DID.
         timestamp: Unix timestamp in seconds.
     """
-    bridge = _bridge()
-    bridge.economy_antispam_record(context_id, sender_did, timestamp)
+    instance = resolve_scp(scp)
+    instance.economy_antispam_record(context_id, sender_did, timestamp)
 
 
 @deprecated_default_instance
-def antispam_velocity(context_id: str, sender_did: str, now: int) -> int:
+def antispam_velocity(
+    context_id: str,
+    sender_did: str,
+    now: int,
+    scp: _scp_core.SCP | None = None,
+) -> int:
     """Query the sender's message velocity within the sliding window.
 
     Args:
@@ -234,8 +261,8 @@ def antispam_velocity(context_id: str, sender_did: str, now: int) -> int:
     Returns:
         Number of messages within the sliding window.
     """
-    bridge = _bridge()
-    return bridge.economy_antispam_velocity(context_id, sender_did, now)
+    instance = resolve_scp(scp)
+    return instance.economy_antispam_velocity(context_id, sender_did, now)
 
 
 @deprecated_default_instance
@@ -247,6 +274,7 @@ def antispam_escalated_cost(
     thresholds: list[tuple[int, int]],
     floor: int | None = None,
     cap: int | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> int:
     """Compute the escalated cost for a sender based on antispam velocity.
 
@@ -262,9 +290,9 @@ def antispam_escalated_cost(
     Returns:
         Escalated cost (smallest currency unit).
     """
-    bridge = _bridge()
+    instance = resolve_scp(scp)
     thresholds_json = json.dumps(thresholds)
-    return bridge.economy_antispam_escalated_cost(
+    return instance.economy_antispam_escalated_cost(
         context_id, sender_did, now, base_cost, thresholds_json, floor, cap
     )
 

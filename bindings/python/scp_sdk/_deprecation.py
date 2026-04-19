@@ -19,9 +19,38 @@ from __future__ import annotations
 import functools
 import warnings
 from collections.abc import Callable
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
+
+if TYPE_CHECKING:
+    import _scp_core
 
 _F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def resolve_scp(scp: _scp_core.SCP | None) -> _scp_core.SCP:
+    """Return *scp* when provided, otherwise the process-wide default instance.
+
+    Called by every SDK function that was previously routed through a free
+    ``_scp_core.py_*`` call. Accepting an optional :class:`_scp_core.SCP`
+    parameter and defaulting to ``SCP.default_instance()`` keeps the
+    existing back-compat surface working while letting new code thread
+    caller-owned instances end-to-end (ADR-048, #1549 Phase 4 PR 4).
+
+    The lookup imports ``_scp_core`` lazily so SDK modules can be imported
+    in pure-Python environments (e.g. the documentation build) that do not
+    link the native extension. Resolution failures surface as the same
+    ``ScpError`` / ``ImportError`` that the :class:`scp_sdk.SCP` wrapper
+    would raise.
+
+    :param scp: An explicit :class:`_scp_core.SCP` instance, or ``None``.
+    :returns: The resolved instance (caller-provided or the shared default).
+    """
+    if scp is not None:
+        return scp
+    import _scp_core
+
+    return _scp_core.SCP.default_instance()
+
 
 # Fully-qualified function names (``module.qualname``) that have already
 # emitted their one-time DeprecationWarning in this interpreter. Keyed by

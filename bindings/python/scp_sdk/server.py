@@ -37,6 +37,7 @@ import asyncio
 from types import TracebackType
 from typing import TYPE_CHECKING
 
+from scp_sdk._deprecation import resolve_scp
 from scp_sdk.context import validate_admission, validate_broadcast_key_hex
 
 if TYPE_CHECKING:
@@ -75,29 +76,35 @@ class Relay:
         return self._handle.is_shutdown  # type: ignore[no-any-return]
 
     @staticmethod
-    async def start_in_memory() -> Relay:
+    async def start_in_memory(scp: _scp_core.SCP | None = None) -> Relay:
         """Start a relay with in-memory blob storage on an OS-assigned port.
 
         Returns a :class:`Relay` whose :attr:`relay_url` property contains
         the WebSocket URL for clients.
-        """
-        import _scp_core
 
-        handle = await asyncio.to_thread(_scp_core.py_relay_start_in_memory)
+        Args:
+            scp: Optional explicit :class:`_scp_core.SCP` instance. When
+                ``None`` the process-wide default instance is used for
+                back-compat (ADR-048).
+        """
+        instance = resolve_scp(scp)
+        handle = await asyncio.to_thread(instance.relay_start_in_memory)
         return Relay(handle)
 
     @staticmethod
-    async def start_local(data_dir: str) -> Relay:
+    async def start_local(data_dir: str, scp: _scp_core.SCP | None = None) -> Relay:
         """Start a relay with redb-backed blob storage on an OS-assigned port.
 
         Opens (or creates) a redb database at ``<data_dir>/blobs.redb``.
 
         Args:
             data_dir: Directory for persistent blob storage.
+            scp: Optional explicit :class:`_scp_core.SCP` instance. When
+                ``None`` the process-wide default instance is used for
+                back-compat (ADR-048).
         """
-        import _scp_core
-
-        handle = await asyncio.to_thread(_scp_core.py_relay_start_local, data_dir)
+        instance = resolve_scp(scp)
+        handle = await asyncio.to_thread(instance.relay_start_local, data_dir)
         return Relay(handle)
 
     async def shutdown(self) -> None:
@@ -165,7 +172,10 @@ class Node:
         return self._handle.is_shutdown  # type: ignore[no-any-return]
 
     @staticmethod
-    async def start_in_memory(identity: Identity | None = None) -> Node:
+    async def start_in_memory(
+        identity: Identity | None = None,
+        scp: _scp_core.SCP | None = None,
+    ) -> Node:
         """Start a full application node with in-memory storage.
 
         When ``identity`` is provided, the node uses that pre-existing identity
@@ -182,11 +192,13 @@ class Node:
                 generating a fresh DID.  The identity must have been created
                 via :meth:`~scp_sdk.identity.Identity.create` in the same
                 process (it must exist in the bridge identity registry).
+            scp: Optional explicit :class:`_scp_core.SCP` instance. When
+                ``None`` the process-wide default instance is used for
+                back-compat (ADR-048).
         """
-        import _scp_core
-
+        instance = resolve_scp(scp)
         did = identity.did if identity is not None else None
-        handle = await asyncio.to_thread(_scp_core.py_node_start_in_memory, did)
+        handle = await asyncio.to_thread(instance.node_start_in_memory, did)
         return Node(handle)
 
     @staticmethod
@@ -194,6 +206,7 @@ class Node:
         data_dir: str,
         identity: Identity | None = None,
         passphrase: str | None = None,
+        scp: _scp_core.SCP | None = None,
     ) -> Node:
         """Start a full application node with file-backed storage.
 
@@ -215,11 +228,13 @@ class Node:
                 generating a fresh one.
             passphrase: Passphrase for Argon2id key derivation (encrypts the
                 key file at rest).  Required when ``identity`` is ``None``.
+            scp: Optional explicit :class:`_scp_core.SCP` instance. When
+                ``None`` the process-wide default instance is used for
+                back-compat (ADR-048).
         """
-        import _scp_core
-
+        instance = resolve_scp(scp)
         did = identity.did if identity is not None else None
-        handle = await asyncio.to_thread(_scp_core.py_node_start_local, data_dir, did, passphrase)
+        handle = await asyncio.to_thread(instance.node_start_local, data_dir, did, passphrase)
         return Node(handle)
 
     async def serve(self, bind_addr: str | None = None) -> str:

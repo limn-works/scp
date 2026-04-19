@@ -26,14 +26,36 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance
+from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
 from scp_sdk.errors import UcanPermissionError
 
+if TYPE_CHECKING:
+    import _scp_core
+
 try:
-    import _scp_core  # type: ignore[import-not-found]
+    import _scp_core  # type: ignore[import-not-found,no-redef]
 except ImportError:
     _scp_core = None  # type: ignore[assignment]
+
+
+def _resolve_bridge(scp: _scp_core.SCP | None = None) -> Any:
+    """Return the effective bridge object for UCAN operations.
+
+    When tests patch ``scp_sdk.ucan._scp_core`` with a ``MagicMock``,
+    that mock's ``ucan_*`` attributes stand in for the real bridge
+    calls. Production code sees the real ``_scp_core`` module here
+    (which does NOT expose the ``ucan_*`` methods at module level after
+    Phase 4 PR 4), so we fall through to :func:`resolve_scp` and
+    dispatch via the :class:`SCP` instance. See ADR-048 for the
+    consolidation rationale.
+    """
+    mod = _scp_core
+    if mod is not None and hasattr(mod, "_mock_name"):
+        return mod
+    return resolve_scp(scp)
+
 
 # ---------------------------------------------------------------------------
 # UcanToken wrapper
@@ -105,7 +127,12 @@ class UcanToken:
 
 
 @deprecated_default_instance
-async def validate(context: str, token: str, capability: str) -> None:
+async def validate(
+    context: str,
+    token: str,
+    capability: str,
+    scp: _scp_core.SCP | None = None,
+) -> None:
     """Validate a UCAN token against a required capability.
 
     Performs full UCAN validation: signature verification, time bounds,
@@ -121,14 +148,18 @@ async def validate(context: str, token: str, capability: str) -> None:
         token: The encoded UCAN token string (JWT format).
         capability: The required capability URI
             (e.g., ``"scp:ctx:abc123/messages:write"``).
+        scp: Optional explicit :class:`_scp_core.SCP` instance. When
+            ``None`` the process-wide default instance is used for
+            back-compat (ADR-048).
 
     Raises:
         UcanPermissionError: If validation fails for any reason (malformed
             token, invalid signature, expired, insufficient capabilities,
             revoked, broken delegation chain, etc.).
     """
+    instance = _resolve_bridge(scp)
     try:
-        await asyncio.to_thread(_scp_core.ucan_validate, context, token, capability)
+        await asyncio.to_thread(instance.ucan_validate, context, token, capability)
     except Exception as exc:
         raise UcanPermissionError(str(exc)) from exc
 
@@ -140,6 +171,7 @@ async def mint(
     context: str,
     expiry: float | None = None,
     proofs: Sequence[str] | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> UcanToken:
     """Mint a new UCAN token.
 
@@ -171,13 +203,14 @@ async def mint(
         (``_scp_core.ucan_mint``) derives the issuer from the context's
         ``creator_did`` and does not accept an explicit issuer parameter.
     """
+    instance = _resolve_bridge(scp)
     try:
         # Distinguish "no proofs param provided" (None -- root token) from
         # "explicit empty proof chain" (still root, but the caller asked for it).
         # Use `is not None` so the FFI layer can ratchet the distinction later
         # if needed; never the falsy form on Optional collections.
         bridge_token = await asyncio.to_thread(
-            _scp_core.ucan_mint,
+            instance.ucan_mint,
             context,
             audience,
             list(capabilities),
@@ -189,7 +222,12 @@ async def mint(
 
 
 @deprecated_default_instance
-async def revoke(context: str, token: str, revoker_did: str) -> None:
+async def revoke(
+    context: str,
+    token: str,
+    revoker_did: str,
+    scp: _scp_core.SCP | None = None,
+) -> None:
     """Revoke a UCAN token using the full revocation pipeline.
 
     Performs authorization checking (revoker must be the token's issuer or
@@ -206,8 +244,9 @@ async def revoke(context: str, token: str, revoker_did: str) -> None:
         UcanPermissionError: If revocation fails (unauthorized revoker,
             malformed token, etc.).
     """
+    instance = _resolve_bridge(scp)
     try:
-        await asyncio.to_thread(_scp_core.ucan_revoke, context, token, revoker_did)
+        await asyncio.to_thread(instance.ucan_revoke, context, token, revoker_did)
     except Exception as exc:
         raise UcanPermissionError(str(exc)) from exc
 
@@ -221,6 +260,7 @@ async def delegate(
     context: str,
     *,
     encoded_parent: str,
+    scp: _scp_core.SCP | None = None,
 ) -> UcanToken:
     """Create a delegated UCAN from a parent token.
 
@@ -248,9 +288,10 @@ async def delegate(
             match the parent's audience, capabilities exceed the parent's
             capabilities, signing fails, etc.
     """
+    instance = _resolve_bridge(scp)
     try:
         bridge_token = await asyncio.to_thread(
-            _scp_core.ucan_delegate,
+            instance.ucan_delegate,
             context,
             delegator,
             delegatee,

@@ -10,10 +10,13 @@ See spec section 24 (Provenance System) and ADR-019.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance
+from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
 from scp_sdk.errors import ScpError
+
+if TYPE_CHECKING:
+    import _scp_core
 
 
 def _bridge() -> Any:
@@ -37,6 +40,7 @@ def evaluate_provenance_quality(
     source_type: str = "persistent",
     context_state: str = "unknown",
     counterparties: list[str] | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> int:
     """Evaluate the provenance quality tier for a data provenance record.
 
@@ -61,8 +65,8 @@ def evaluate_provenance_quality(
     Raises:
         ValidationError: If *source_type* or *context_state* is invalid.
     """
-    bridge = _bridge()
-    return bridge.evaluate_provenance_quality(
+    instance = resolve_scp(scp)
+    return instance.evaluate_provenance_quality(
         source_context,
         source_type,
         context_state,
@@ -80,6 +84,7 @@ def attach(
     actor_did: str,
     *,
     existing_chain_depth: int | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Attach provenance metadata when data crosses a context boundary.
 
@@ -105,9 +110,9 @@ def attach(
     Raises:
         ValidationError: If *source_type* or *memory_scope* is invalid.
     """
-    bridge = _bridge()
+    instance = resolve_scp(scp)
     return dict(
-        bridge.provenance_attach(
+        instance.provenance_attach(
             source_context_id,
             source_type,
             memory_scope,
@@ -124,6 +129,7 @@ def check_chain_depth(
     chain_depth: int,
     *,
     max_depth: int | None = None,
+    scp: _scp_core.SCP | None = None,
 ) -> bool:
     """Check whether a provenance chain depth is within the allowed limit.
 
@@ -134,8 +140,8 @@ def check_chain_depth(
     Returns:
         ``True`` if within limit, ``False`` otherwise.
     """
-    bridge = _bridge()
-    return bridge.provenance_check_chain_depth(chain_depth, max_depth)
+    instance = resolve_scp(scp)
+    return instance.provenance_check_chain_depth(chain_depth, max_depth)
 
 
 __all__ = [
