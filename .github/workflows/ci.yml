@@ -217,7 +217,15 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install tree-sitter tree-sitter-rust
-      - run: python3.12 scripts/check-owned-identity-did.py
+      # Self-test MUST run first: it proves every bypass pattern
+      # (forbidden derive, manual impl, public field, type alias,
+      # wrong visibility, wrong location) is detected before we trust
+      # the scanner on the real tree. If the scanner is weakened, this
+      # step fails loudly.
+      - name: Self-test scanner
+        run: python3.12 scripts/check-owned-identity-did.py --self-test
+      - name: Real scan
+        run: python3.12 scripts/check-owned-identity-did.py
 
   bridge-instance-lifecycle:
     needs: check-draft

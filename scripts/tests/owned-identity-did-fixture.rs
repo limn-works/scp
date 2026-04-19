@@ -1,0 +1,100 @@
+// ---------------------------------------------------------------------------
+// Self-test fixture for scripts/check-owned-identity-did.py.
+//
+// This file is deliberately NOT compiled by cargo — it lives under
+// `scripts/tests/` and is consumed only by the CI AST checker. The
+// scanner runs its `--self-test` against this fixture and asserts every
+// bypass pattern below triggers a distinct enforcement failure.
+//
+// DO NOT add `mod owned_identity_did_fixture;` anywhere. This is never
+// built.
+//
+// The fixture is split into multiple synthetic source files via a
+// sentinel comment:
+//
+//     // @file: <rel-path-under-scp-runtime-src>
+//
+// Each block from one `@file:` line to the next is written to that
+// path in a temp staging tree at self-test time. The required path is
+// `context/supervisor/identity_capability.rs`; a second file at
+// `context/handlers/bad.rs` hosts the wrong-location declaration.
+//
+// Run:
+//   python3.12 scripts/check-owned-identity-did.py --self-test
+//
+// The script asserts every bypass pattern below is caught. If the
+// scanner regresses on any one, the self-test fails with the list of
+// missed patterns.
+// ---------------------------------------------------------------------------
+
+// @file: context/supervisor/identity_capability.rs
+// This file is at the REQUIRED path. Every declaration here bypasses
+// one of the shape constraints (derive / visibility / public field /
+// manual impl / type alias) while sitting at the correct location.
+
+// BYPASS 1: forbidden derive on the struct. The scanner's derive check
+// must flag Clone + Debug + Serialize.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(super) struct OwnedIdentityDid {
+    // BYPASS 2: public tuple-struct field is caught separately; this
+    // one is a NAMED field with pub(crate) visibility. Enforcement E
+    // flags this even though the file otherwise looks correct.
+    pub(crate) inner: [u8; 32],
+}
+
+// BYPASS 3: manual impl Clone for OwnedIdentityDid. Clone is banned in
+// FORBIDDEN_IMPL_TRAITS; the scanner must walk impl_item nodes.
+impl Clone for OwnedIdentityDid {
+    fn clone(&self) -> Self {
+        Self { inner: self.inner }
+    }
+}
+
+// BYPASS 4: manual impl From<Did> for OwnedIdentityDid. From is banned
+// in FORBIDDEN_IMPL_TRAITS because it permits fabrication without the
+// supervisor-blessed constructor.
+struct Did([u8; 32]);
+impl From<Did> for OwnedIdentityDid {
+    fn from(d: Did) -> Self {
+        Self { inner: d.0 }
+    }
+}
+
+// Inherent impl. Allowed — the constructor lives here.
+impl OwnedIdentityDid {
+    #[allow(dead_code)]
+    pub(super) fn issue_for_actor(_: &Did) -> Self {
+        Self { inner: [0; 32] }
+    }
+}
+
+// BYPASS 5: tuple-struct form with `pub(super)` field. The outer
+// struct visibility is correct BUT the inner field is reachable.
+#[allow(dead_code)]
+pub(super) struct OwnedIdentityDidTupleBypass(pub(super) Did);
+
+// The tuple bypass is a separate declaration name. To exercise the
+// public-field check on OwnedIdentityDid itself we use the named
+// form above. (The scanner treats declarations independently; this
+// file has multiple OwnedIdentityDid-related declarations only for
+// fixture coverage — production will have exactly one.)
+
+// @file: context/supervisor/other_bypass.rs
+// Still under the required supervisor module tree, but NOT at the
+// `identity_capability.rs` path. The location check should flag these.
+
+// BYPASS 6: wrong visibility (pub(crate)). Flagged by check (B).
+#[allow(dead_code)]
+pub(crate) struct OwnedIdentityDid {
+    inner: [u8; 32],
+}
+
+// @file: context/handlers/bad.rs
+// Wrong file entirely — handlers must NOT name the type's constructor.
+// The location check (A) must flag this.
+
+// BYPASS 7: type alias. Even at a wrong location the alias is itself
+// illegal regardless of location. Flag (F) triggers first; (A) also
+// triggers.
+#[allow(dead_code)]
+pub(super) type OwnedIdentityDid = [u8; 32];

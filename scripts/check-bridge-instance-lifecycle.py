@@ -44,6 +44,11 @@ the enforcement teeth for commit 6 onward.
 The check also passes silently if none of the three bridge types exist
 yet.
 
+FAIL-LOUD: if the trait `BridgeInstanceCore` cannot be found anywhere
+under the known bridge roots (see BRIDGE_ROOTS below), the check EXITS
+1 with a diagnostic. A silent-pass on a missing trait would let a
+rename or relocation invalidate the gate without detection.
+
 ---------------------------------------------------------------------------
 SCOPE
 ---------------------------------------------------------------------------
@@ -206,9 +211,15 @@ def _types_found_anywhere() -> set[str]:
     return found
 
 
-def _trait_methods_with_defaults(trait_name: str) -> set[str]:
-    """Return the set of method names that have DEFAULT bodies on the
-    given trait, across the bridge source trees.
+def _trait_methods_with_defaults(trait_name: str) -> tuple[set[str], bool]:
+    """Return (defaults, trait_found) for the named trait, across the
+    bridge source trees.
+
+    `defaults` is the set of method names that have DEFAULT bodies (i.e.
+    `function_item` with a `body` child inside the trait body).
+    `trait_found` is True iff at least one `trait <name>` declaration
+    was seen ANYWHERE in the bridge trees — it is independent of
+    whether any method has a default.
 
     A trait method has a default body iff its function_signature_item
     has a `body` child (in tree-sitter Rust grammar, `function_item`
@@ -216,6 +227,7 @@ def _trait_methods_with_defaults(trait_name: str) -> set[str]:
     abstract).
     """
     defaults: set[str] = set()
+    trait_found = False
     for root in BRIDGE_ROOTS:
         if not root.is_dir():
             continue
@@ -228,9 +240,11 @@ def _trait_methods_with_defaults(trait_name: str) -> set[str]:
                 tree = PARSER.parse(source)
 
                 def walk(node) -> None:
+                    nonlocal trait_found
                     if node.type == "trait_item":
                         name_node = node.child_by_field_name("name")
                         if name_node is not None and node_text(name_node, source) == trait_name:
+                            trait_found = True
                             body = node.child_by_field_name("body")
                             if body is not None:
                                 for item in body.children:
@@ -245,7 +259,7 @@ def _trait_methods_with_defaults(trait_name: str) -> set[str]:
                         walk(c)
 
                 walk(tree.root_node)
-    return defaults
+    return (defaults, trait_found)
 
 
 def find_violations() -> list[tuple[str, int, str, str]]:
@@ -300,6 +314,30 @@ def find_violations() -> list[tuple[str, int, str, str]]:
 
 
 def main() -> int:
+    # (1) Locate the BridgeInstanceCore trait anywhere in the bridge
+    # trees. If it is missing entirely, fail loudly — a silent-pass on
+    # "trait moved" is a real risk: the trait could be renamed or
+    # relocated and the lifecycle-override ban would evaporate.
+    trait_defaults, trait_found = _trait_methods_with_defaults(
+        "BridgeInstanceCore"
+    )
+    if not trait_found:
+        sys.stderr.write(
+            f"{C_RED}error:{C_RESET} trait `BridgeInstanceCore` not found "
+            f"in any known bridge path.\n"
+        )
+        sys.stderr.write("Searched roots:\n")
+        for r in BRIDGE_ROOTS:
+            sys.stderr.write(f"  - {r}\n")
+        sys.stderr.write(
+            "\nIf the trait has been renamed or relocated, update\n"
+            "`BRIDGE_ROOTS` in this script AND rename the trait\n"
+            "constant below. Silent-pass behavior on a missing trait\n"
+            "would let the lifecycle-override ban evaporate — we do NOT\n"
+            "tolerate that. See ADR-049 §'BridgeInstance actor integration'.\n"
+        )
+        return 1
+
     present = _types_found_anywhere()
     if not present:
         print(
@@ -309,11 +347,10 @@ def main() -> int:
         )
         return 0
 
-    # Check that all three lifecycle methods have DEFAULT bodies on
+    # (2) Check that all three lifecycle methods have DEFAULT bodies on
     # BridgeInstanceCore. If any is still abstract, the check does not
     # kick in — bridges are REQUIRED to implement the abstract ones,
     # and flagging those as "drift" would be a false positive.
-    trait_defaults = _trait_methods_with_defaults("BridgeInstanceCore")
     missing_defaults = LIFECYCLE_METHODS - trait_defaults
     if missing_defaults:
         print(

@@ -19,13 +19,29 @@ Parses every `.rs` file in scope to a tree-sitter AST and flags:
       aliased imports (`use tokio::task::block_in_place as bip; bip(...)`)
       and re-exported paths. Detection is structural: any identifier
       that resolves to `block_in_place` at a call site is flagged.
+      Also flags fn-pointer rebinds:
+          `let f = tokio::task::block_in_place; f(|| {})`
+      is caught because `f` is tracked through `let_declaration` nodes
+      (including transitive rebinds `let g = f;`).
 
   (2) Method call `.block_on(...)` on any expression. We do NOT resolve
       types; approximation is "any `.block_on(...)` call". Callers opt
       out with an inline allow-list directive (see below).
 
   (3) `Runtime::new()` construction — commonly paired with `.block_on(...)`
-      to build an ad-hoc sync bridge. Flagged the same way.
+      to build an ad-hoc sync bridge. Flagged the same way. Type
+      aliases defeat path.endswith("Runtime"), so the scanner also
+      tracks `type X = Runtime;` and `use ... Runtime as X;` aliases
+      (including transitive `type Y = X;`).
+
+  (4) `macro_rules!` DEFINITIONS whose body text contains
+      `block_in_place` or `.block_on` — a macro that wraps a sync
+      bridge primitive. Flagged so reviewers see the wrapper.
+
+  (5) `macro_invocation` sites whose TOKEN STREAM contains
+      `block_in_place` or `.block_on` — pass-through macros that smuggle
+      the primitive through the caller's token stream. Token-stream
+      approximation; false positives can be allow-listed inline.
 
 ---------------------------------------------------------------------------
 SCOPE
@@ -68,13 +84,23 @@ RATCHET
 ---------------------------------------------------------------------------
 The actor-per-context refactor (ADR-049) deletes ~30 of these sites
 across multiple commits. We cannot fail the build on the current count.
-Instead, a per-crate baseline is kept in
+Instead, a PER-FILE baseline is kept in
 
     ratchet/block-in-place-count.json
 
-The gate FAILS if any crate's count exceeds its baseline; it PASSES if
-the count is equal or lower; a LOWER count is reported as
+The gate FAILS if any file's count exceeds its baseline entry; it
+PASSES if the count is equal or lower; a LOWER count is reported as
 "ratchet can drop" (a future commit should tighten the baseline).
+
+Per-FILE enforcement (not per-crate) is deliberate: a per-crate
+aggregate is gameable — an attacker can delete a legit site and add a
+new one within the same crate without detection. Per-file gating forces
+every new site to land in a file that already carries budget. A file
+missing from the baseline has an implicit budget of 0; any hit in a new
+file fails the gate immediately.
+
+The `crates` map in the ratchet file is informational only (human
+summary); enforcement lives in `files`.
 
 Ratchet baselines count ONLY sites that are NOT allow-listed — an
 allow-listed site is silently ignored in both current and baseline
@@ -178,8 +204,9 @@ class Hit:
     """One offending call site."""
 
     file: str  # repo-relative path
-    line: int  # 1-indexed
-    kind: str  # "block_in_place" | "block_on" | "runtime_new"
+    line: int  # 1-indexed (start)
+    end_line: int  # 1-indexed (end; equals `line` for single-line hits)
+    kind: str  # "block_in_place" | "block_on" | "runtime_new" | "macro_invocation" | "macro_definition"
     snippet: str  # short code excerpt
     allow_reason: str | None  # non-None if allow-listed
 
@@ -189,8 +216,70 @@ class Hit:
 # -----------------------------------------------------------------------------
 
 
+def _cfg_gates_on_test(cfg_body: str) -> bool:
+    """Return True iff a `#[cfg(...)]` body gates on `test` being present.
+
+    Accepts:
+      cfg(test)
+      cfg(all(test, ...))
+      cfg(any(test, ...))
+      cfg(all(test, any(..., ...)))
+      ...
+
+    Rejects:
+      cfg(not(test))                    — production-only; MUST NOT exclude
+      cfg(feature = "test")             — crate feature flag, not cfg(test)
+      cfg(feature = "testing")          — same
+      cfg(all(not(test), feature = X))  — still production-only
+
+    Strategy: strip strings, remove `feature = "..."` predicates, then scan
+    for the bare `test` token. A `test` inside `not(...)` is rejected by
+    substring-checking the normalized form for `not(test)` and for any
+    surrounding `not(` whose matching close paren is after the `test`
+    token.
+    """
+    # Normalize whitespace.
+    s = re.sub(r"\s+", "", cfg_body)
+    # Drop string-valued predicates entirely — `feature = "test"` is NOT
+    # `cfg(test)`. Match both `key="value"` (after whitespace strip) and
+    # `key = "value"` variants. This is conservative: any predicate whose
+    # right-hand side is a quoted string is discarded.
+    s = re.sub(r'[A-Za-z_][A-Za-z0-9_]*="[^"]*"', "", s)
+    # Find the bare `test` token — preceded by `(` or `,` and followed by
+    # `)` or `,`. This rejects `testing` (followed by letters), `feature`
+    # (different name), and similar.
+    for m in re.finditer(r"(?:^|[(,])test(?:[),]|$)", s):
+        test_idx = m.start() + (0 if m.group().startswith("t") else 1)
+        # If any `not(` opens before this position and closes after it,
+        # the `test` token is negated — reject.
+        prefix = s[:test_idx]
+        # Find all `not(` occurrences in the prefix; for each, determine
+        # whether its matching `)` is after `test_idx`.
+        for nm in re.finditer(r"not\(", prefix):
+            open_pos = nm.end() - 1  # the `(` position
+            depth = 1
+            i = open_pos + 1
+            while i < len(s) and depth > 0:
+                if s[i] == "(":
+                    depth += 1
+                elif s[i] == ")":
+                    depth -= 1
+                i += 1
+            close_pos = i - 1
+            if close_pos > test_idx:
+                # `test` is inside this `not(...)`. Not a test gate.
+                break
+        else:
+            # No enclosing `not(...)` — this `test` token is an effective
+            # test gate.
+            return True
+    return False
+
+
 def has_test_cfg_attribute(node, source: bytes) -> bool:
-    """True if the mod_item is preceded by `#[cfg(test)]`.
+    """True if the mod_item is preceded by a cfg attribute that positively
+    gates on `test`. Rejects `cfg(not(test))`, `cfg(feature = "test")`,
+    and other false-positive forms. See `_cfg_gates_on_test`.
 
     Tree-sitter places attribute_item nodes as preceding siblings of the
     mod_item, not as children. Walk back past any intervening comments.
@@ -201,9 +290,15 @@ def has_test_cfg_attribute(node, source: bytes) -> bool:
             text = source[sibling.start_byte : sibling.end_byte].decode(
                 "utf-8", errors="replace"
             )
-            if "cfg(" in text and "test" in text:
-                return True
-            # Non-cfg attribute (e.g. #[allow]): keep walking back.
+            # Extract every cfg(...) body in the attribute (handles
+            # `#[cfg_attr(test, ...)]` too by treating it as a cfg gate
+            # if its first predicate is a test gate).
+            for m in re.finditer(r"cfg(?:_attr)?\((.*)\)", text, flags=re.DOTALL):
+                body = m.group(1)
+                if _cfg_gates_on_test(body):
+                    return True
+            # Non-cfg attribute (e.g. #[allow]) or non-test cfg: keep
+            # walking back.
             sibling = sibling.prev_sibling
             continue
         if sibling.type in ("line_comment", "block_comment"):
@@ -217,32 +312,145 @@ def node_text(node, source: bytes) -> str:
     return source[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
 
 
-def _collect_aliased_block_in_place(root, source: bytes) -> set[str]:
-    """Find `use tokio::task::block_in_place as alias;` imports.
+def _ident_resolves_to_block_in_place(node, source: bytes, aliases: set[str]) -> bool:
+    """True if `node` is an identifier/scoped_identifier whose tail name
+    is `block_in_place` or already in the alias set."""
+    if node is None:
+        return False
+    if node.type == "identifier":
+        return node_text(node, source) in (aliases | {"block_in_place"})
+    if node.type == "scoped_identifier":
+        name_node = node.child_by_field_name("name")
+        if name_node is not None:
+            return node_text(name_node, source) == "block_in_place"
+    return False
 
-    Returns the set of aliases. The real name is ALWAYS flagged — this
-    set captures locally-bound shorter names that defeat a naive grep.
+
+def _collect_aliased_block_in_place(root, source: bytes) -> set[str]:
+    """Find every local name that resolves to `block_in_place`.
+
+    Covers:
+      (1) `use tokio::task::block_in_place as alias;`                    — import alias
+      (2) `let name = tokio::task::block_in_place;`                      — fn-pointer rebind
+      (3) `let name: _ = tokio::task::block_in_place;`                   — same, typed
+      (4) `let name = alias;` where `alias` is already a known alias     — transitive rebind
+
+    The real name `block_in_place` is always flagged; this set captures
+    locally-bound shorter names that defeat a naive grep.
+
+    Transitive rebinds are handled by repeated passes until the set
+    stabilizes — the order of let-bindings and imports matters.
     """
     aliases: set[str] = set()
 
-    def walk(node) -> None:
+    # Pass 1: collect `use ... as NAME` import aliases by regex. This is
+    # grammar-free and robust for grouped/multiline imports.
+    def walk_uses(node) -> None:
         if node.type == "use_declaration":
             txt = node_text(node, source)
-            # Handle multiline and grouped imports by looking at the full
-            # text. The grammar-correct way is to walk scoped_use_list
-            # nodes, but string matching the trailing `as NAME` is robust
-            # and simple.
             for m in re.finditer(
                 r"(?:tokio::task::|task::|::)?block_in_place\s+as\s+([A-Za-z_][A-Za-z0-9_]*)",
                 txt,
             ):
                 aliases.add(m.group(1))
-            # Also catch the "bare" form: `use tokio::task::block_in_place as X;`
-            # which the regex above already covers.
         for c in node.children:
-            walk(c)
+            walk_uses(c)
 
-    walk(root)
+    walk_uses(root)
+
+    # Pass 2+: walk `let_declaration` nodes repeatedly until the alias
+    # set stops growing. This captures transitive rebinds
+    # (let a = block_in_place; let b = a;).
+    def walk_lets(node) -> bool:
+        changed = False
+        if node.type == "let_declaration":
+            pat = node.child_by_field_name("pattern")
+            val = node.child_by_field_name("value")
+            if (
+                pat is not None
+                and pat.type == "identifier"
+                and val is not None
+                and _ident_resolves_to_block_in_place(val, source, aliases)
+            ):
+                name = node_text(pat, source)
+                if name not in aliases:
+                    aliases.add(name)
+                    changed = True
+        for c in node.children:
+            if walk_lets(c):
+                changed = True
+        return changed
+
+    # Fixed-point iteration. Bound at a small iteration count to prevent
+    # pathological files from hanging the check.
+    for _ in range(8):
+        if not walk_lets(root):
+            break
+
+    return aliases
+
+
+def _collect_runtime_aliases(root, source: bytes) -> set[str]:
+    """Find every local name that aliases `Runtime` (or
+    `tokio::runtime::Runtime`).
+
+    Covers:
+      `type R = Runtime;`
+      `type R = tokio::runtime::Runtime;`
+      `use tokio::runtime::Runtime as R;`
+      `type R2 = R;` (transitive) where R is already a known alias
+
+    Returns the set of alias names. The real name `Runtime` is always
+    flagged by the base `_call_is_runtime_new` check; this set captures
+    locally-bound names that would otherwise evade `path.endswith('Runtime')`.
+    """
+    aliases: set[str] = set()
+
+    # Pass 1: `use ... Runtime as NAME` imports.
+    def walk_uses(node) -> None:
+        if node.type == "use_declaration":
+            txt = node_text(node, source)
+            for m in re.finditer(
+                r"(?:tokio::runtime::|runtime::|::)?Runtime\s+as\s+([A-Za-z_][A-Za-z0-9_]*)",
+                txt,
+            ):
+                aliases.add(m.group(1))
+        for c in node.children:
+            walk_uses(c)
+
+    walk_uses(root)
+
+    # Pass 2+: `type X = Runtime;` and transitive aliases.
+    def walk_types(node) -> bool:
+        changed = False
+        if node.type == "type_item":
+            name_node = node.child_by_field_name("name")
+            type_node = node.child_by_field_name("type")
+            if name_node is not None and type_node is not None:
+                rhs_tail: str | None = None
+                if type_node.type == "type_identifier":
+                    rhs_tail = node_text(type_node, source)
+                elif type_node.type == "scoped_type_identifier":
+                    inner_name = type_node.child_by_field_name("name")
+                    if inner_name is not None:
+                        rhs_tail = node_text(inner_name, source)
+                # Match "Runtime" directly or an already-known alias.
+                if rhs_tail is not None and (
+                    rhs_tail == "Runtime" or rhs_tail in aliases
+                ):
+                    name = node_text(name_node, source)
+                    if name not in aliases:
+                        aliases.add(name)
+                        changed = True
+        for c in node.children:
+            if walk_types(c):
+                changed = True
+        return changed
+
+    for _ in range(8):
+        if not walk_types(root):
+            break
+
     return aliases
 
 
@@ -280,8 +488,14 @@ def _call_is_block_on(call_node, source: bytes) -> bool:
     return node_text(field, source) == "block_on"
 
 
-def _call_is_runtime_new(call_node, source: bytes) -> bool:
-    """True if `call_node` is `Runtime::new(...)` or `tokio::runtime::Runtime::new(...)`."""
+def _call_is_runtime_new(
+    call_node, source: bytes, runtime_aliases: set[str]
+) -> bool:
+    """True if `call_node` is `Runtime::new(...)`,
+    `tokio::runtime::Runtime::new(...)`, or `ALIAS::new(...)` where
+    `ALIAS` was bound via `type ALIAS = Runtime;` or
+    `use ... Runtime as ALIAS;`.
+    """
     fn = call_node.child_by_field_name("function")
     if fn is None:
         return False
@@ -294,8 +508,14 @@ def _call_is_runtime_new(call_node, source: bytes) -> bool:
     if node_text(name_node, source) != "new":
         return False
     path_txt = node_text(path_node, source).strip()
-    # Accept either `Runtime::new` or `tokio::runtime::Runtime::new`.
-    return path_txt.endswith("Runtime")
+    # Accept `Runtime::new`, `tokio::runtime::Runtime::new`, and any
+    # `ALIAS::new` where ALIAS is a known runtime alias. The alias
+    # comparison is on the full path_txt (e.g. `R`) AND on its tail
+    # segment (e.g. `m::R` → `R`).
+    if path_txt.endswith("Runtime"):
+        return True
+    tail = path_txt.rsplit("::", 1)[-1]
+    return path_txt in runtime_aliases or tail in runtime_aliases
 
 
 # -----------------------------------------------------------------------------
@@ -335,6 +555,24 @@ def _check_allow_directive(line_text: str) -> tuple[bool, str | None, str | None
 # -----------------------------------------------------------------------------
 
 
+def _macro_body_contains_sync_bridge(node, source: bytes) -> bool:
+    """True if the text of `node` contains `block_in_place` (as an
+    identifier) or `.block_on` (as a method receiver). Used for macro
+    invocations and macro_rules definitions.
+
+    Approximation: string matching over the node's token stream. We
+    check both the bare identifier and the scoped forms. False-positives
+    are acceptable and can be squelched with the inline allow-list
+    directive.
+    """
+    txt = node_text(node, source)
+    if re.search(r"\bblock_in_place\b", txt):
+        return True
+    if re.search(r"\.\s*block_on\b", txt):
+        return True
+    return False
+
+
 def scan_file(rel_path: str) -> tuple[list[Hit], list[str]]:
     """Return (hits, errors) for one file.
 
@@ -347,6 +585,38 @@ def scan_file(rel_path: str) -> tuple[list[Hit], list[str]]:
     source = full_path.read_bytes()
     tree = PARSER.parse(source)
     aliases = _collect_aliased_block_in_place(tree.root_node, source)
+    runtime_aliases = _collect_runtime_aliases(tree.root_node, source)
+
+    def record_hit(node, kind: str, tctx: bool) -> None:
+        if tctx:
+            return
+        line_1 = node.start_point[0] + 1
+        last_line_1 = node.end_point[0] + 1
+        snippet = node_text(node, source).splitlines()[0][:80]
+        # Directive must be on the SAME source line as the call
+        # site's START, or the last line of the call expression for
+        # multiline forms.
+        line_text = _extract_line_text(source, line_1)
+        last_line_text = (
+            _extract_line_text(source, last_line_1) if last_line_1 != line_1 else ""
+        )
+        present1, reason1, err1 = _check_allow_directive(line_text)
+        present2, reason2, err2 = _check_allow_directive(last_line_text)
+        if err1:
+            errors.append(f"{rel_path}:{line_1}: {err1}")
+        if err2:
+            errors.append(f"{rel_path}:{last_line_1}: {err2}")
+        allow_reason = reason1 or reason2
+        hits.append(
+            Hit(
+                file=rel_path,
+                line=line_1,
+                end_line=last_line_1,
+                kind=kind,
+                snippet=snippet,
+                allow_reason=allow_reason if (present1 or present2) else None,
+            )
+        )
 
     def walk(node, in_test: bool) -> None:
         tctx = in_test
@@ -356,47 +626,30 @@ def scan_file(rel_path: str) -> tuple[list[Hit], list[str]]:
             if has_test_cfg_attribute(node, source) or nm == "tests":
                 tctx = True
 
-        if node.type == "call_expression" and not tctx:
-            kind: str | None = None
-            if _call_is_block_in_place(node, source, aliases):
-                kind = "block_in_place"
-            elif _call_is_block_on(node, source):
-                kind = "block_on"
-            elif _call_is_runtime_new(node, source):
-                kind = "runtime_new"
-
-            if kind is not None:
-                line_1 = node.start_point[0] + 1
-                snippet = node_text(node, source).splitlines()[0][:80]
-                # Directive must be on the SAME source line as the call
-                # site's START, not the opening paren. tree-sitter points
-                # call_expression at the identifier.
-                line_text = _extract_line_text(source, line_1)
-                # For multiline calls the directive may live on any line
-                # of the call expression. We accept it on the first or
-                # last line of the call.
-                last_line_1 = node.end_point[0] + 1
-                last_line_text = (
-                    _extract_line_text(source, last_line_1)
-                    if last_line_1 != line_1
-                    else ""
-                )
-                present1, reason1, err1 = _check_allow_directive(line_text)
-                present2, reason2, err2 = _check_allow_directive(last_line_text)
-                if err1:
-                    errors.append(f"{rel_path}:{line_1}: {err1}")
-                if err2:
-                    errors.append(f"{rel_path}:{last_line_1}: {err2}")
-                allow_reason = reason1 or reason2
-                hits.append(
-                    Hit(
-                        file=rel_path,
-                        line=line_1,
-                        kind=kind,
-                        snippet=snippet,
-                        allow_reason=allow_reason if (present1 or present2) else None,
-                    )
-                )
+        if not tctx:
+            if node.type == "call_expression":
+                kind: str | None = None
+                if _call_is_block_in_place(node, source, aliases):
+                    kind = "block_in_place"
+                elif _call_is_block_on(node, source):
+                    kind = "block_on"
+                elif _call_is_runtime_new(node, source, runtime_aliases):
+                    kind = "runtime_new"
+                if kind is not None:
+                    record_hit(node, kind, tctx)
+            elif node.type == "macro_invocation":
+                # Pass-through macros that carry `block_in_place` or
+                # `.block_on` as tokens. Token-stream approximation; false
+                # positives can be allow-listed inline.
+                if _macro_body_contains_sync_bridge(node, source):
+                    record_hit(node, "macro_invocation", tctx)
+            elif node.type in ("macro_definition", "macro_rules_definition"):
+                # `macro_rules! name { ... }` definition whose body wraps
+                # a sync-bridge primitive. Any subsequent invocation will
+                # expand to a hit; also flag the definition so the
+                # wrapper itself is visible.
+                if _macro_body_contains_sync_bridge(node, source):
+                    record_hit(node, "macro_definition", tctx)
 
         for c in node.children:
             walk(c, tctx)
@@ -459,13 +712,32 @@ def crate_of(rel_path: str) -> str:
 # -----------------------------------------------------------------------------
 
 
-def load_baseline() -> dict[str, int]:
+def load_baseline() -> tuple[dict[str, int], dict[str, int]]:
+    """Load the ratchet. Returns (per_file, per_crate_summary).
+
+    Per-file is the authoritative enforcement granularity: any file
+    whose non-allow-listed count exceeds its baseline entry fails the
+    gate. The per-crate summary is informational — an attacker who
+    deletes a legit site and adds a new one within the same crate would
+    leave the crate aggregate unchanged but move detection into a new
+    file, which the per-file gate catches.
+
+    Schema:
+      {
+        "files":   { "crates/x/src/a.rs": 3, ... },   # AUTHORITATIVE
+        "crates":  { "scp-runtime": 36, ... }         # human summary
+      }
+
+    A file missing from `files` has an implicit baseline of 0 — any hit
+    in a new file fails the gate. The `crates` map is tolerated for
+    backward compatibility but is NOT used for enforcement.
+    """
     if not RATCHET_FILE.is_file():
         sys.stderr.write(
             f"{C_RED}error:{C_RESET} ratchet file missing: {RATCHET_FILE}\n"
         )
         sys.stderr.write(
-            "Create it with the current counts per crate. See ADR-049.\n"
+            "Create it with the current per-file counts. See ADR-049.\n"
         )
         sys.exit(2)
     try:
@@ -475,17 +747,25 @@ def load_baseline() -> dict[str, int]:
             f"{C_RED}error:{C_RESET} failed to parse {RATCHET_FILE}: {exc}\n"
         )
         sys.exit(2)
-    crates = data.get("crates", {})
-    if not isinstance(crates, dict):
+    files = data.get("files")
+    if not isinstance(files, dict):
         sys.stderr.write(
-            f"{C_RED}error:{C_RESET} {RATCHET_FILE} missing 'crates' object\n"
+            f"{C_RED}error:{C_RESET} {RATCHET_FILE} missing 'files' object "
+            f"(per-file baseline is required; per-crate aggregate is gameable).\n"
         )
         sys.exit(2)
-    return {str(k): int(v) for k, v in crates.items()}
+    per_file = {str(k): int(v) for k, v in files.items()}
+    crates = data.get("crates", {})
+    per_crate = (
+        {str(k): int(v) for k, v in crates.items()}
+        if isinstance(crates, dict)
+        else {}
+    )
+    return (per_file, per_crate)
 
 
 def do_real_scan(verbose: bool) -> int:
-    baseline = load_baseline()
+    per_file_baseline, per_crate_summary = load_baseline()
     total_hits: list[Hit] = []
     total_errors: list[str] = []
     files = in_scope_files()
@@ -502,11 +782,13 @@ def do_real_scan(verbose: bool) -> int:
             sys.stderr.write(f"  {e}\n")
         return 1
 
-    # Count non-allow-listed hits per crate.
+    # Count non-allow-listed hits per FILE and per crate (summary only).
+    per_file_count: dict[str, int] = {}
     by_crate: dict[str, int] = {}
     for h in total_hits:
         if h.allow_reason is not None:
             continue
+        per_file_count[h.file] = per_file_count.get(h.file, 0) + 1
         c = crate_of(h.file)
         by_crate[c] = by_crate.get(c, 0) + 1
 
@@ -517,28 +799,27 @@ def do_real_scan(verbose: bool) -> int:
         print(f"{C_DIM}allow-listed: {allow_n}{C_RESET}")
         print()
 
-    # Compare to baseline.
-    all_crates: set[str] = set(baseline.keys()) | set(by_crate.keys())
+    # PER-FILE enforcement. Any file whose count exceeds its baseline
+    # fails. Files with a counted drop are reported "can drop". Files in
+    # the baseline with 0 current hits are silently fine (they've been
+    # fully cleaned up).
     fail = False
-    for crate in sorted(all_crates):
-        counted = by_crate.get(crate, 0)
-        base = baseline.get(crate)
-        if base is None:
-            sys.stderr.write(
-                f"  {C_RED}[{crate}]{C_RESET} counted={counted} "
-                f"baseline={C_RED}MISSING{C_RESET} (add to ratchet)\n"
-            )
-            fail = True
-            continue
+    all_files: set[str] = set(per_file_baseline.keys()) | set(
+        per_file_count.keys()
+    )
+    drops: list[tuple[str, int, int]] = []
+    for rel in sorted(all_files):
+        counted = per_file_count.get(rel, 0)
+        base = per_file_baseline.get(rel, 0)  # missing => implicit 0
         if counted > base:
             sys.stderr.write(
-                f"  {C_RED}[{crate}]{C_RESET} counted={counted} "
+                f"  {C_RED}[{rel}]{C_RESET} counted={counted} "
                 f"baseline={base} "
                 f"{C_RED}(+{counted - base}, FAIL){C_RESET}\n"
             )
             sys.stderr.write("    unratcheted sites:\n")
             for h in total_hits:
-                if crate_of(h.file) != crate or h.allow_reason is not None:
+                if h.file != rel or h.allow_reason is not None:
                     continue
                 sys.stderr.write(
                     f"      {C_DIM}{h.file}:{h.line}{C_RESET}  "
@@ -547,15 +828,45 @@ def do_real_scan(verbose: bool) -> int:
                 )
             fail = True
         elif counted < base:
+            drops.append((rel, base, counted))
+
+    # Per-crate summary, for humans. Not used for enforcement — only
+    # reported so reviewers can see the overall trend.
+    if not fail:
+        print(f"{C_DIM}per-crate summary (informational):{C_RESET}")
+        all_crates: set[str] = set(per_crate_summary.keys()) | set(by_crate.keys())
+        for crate in sorted(all_crates):
+            counted = by_crate.get(crate, 0)
+            base = per_crate_summary.get(crate, 0)
+            if counted < base:
+                print(
+                    f"  {C_GREEN}[{crate}]{C_RESET} counted={counted} "
+                    f"baseline_summary={base} "
+                    f"{C_GREEN}(-{base - counted}){C_RESET}"
+                )
+            elif counted == base:
+                print(
+                    f"  {C_GREEN}[{crate}]{C_RESET} counted={counted} "
+                    f"baseline_summary={base} (OK)"
+                )
+            else:
+                # Per-file gate already passed, so crate-level increases
+                # here are fine (e.g. new file with 0 baseline).
+                print(
+                    f"  {C_DIM}[{crate}]{C_RESET} counted={counted} "
+                    f"baseline_summary={base} "
+                    f"{C_DIM}(+{counted - base}, ok — per-file gate is authoritative){C_RESET}"
+                )
+
+    # Report per-file drops so reviewers can tighten the baseline in a
+    # follow-up commit.
+    if drops:
+        print(f"\n{C_GREEN}ratchet can drop for {len(drops)} file(s):{C_RESET}")
+        for rel, base, counted in drops:
             print(
-                f"  {C_GREEN}[{crate}]{C_RESET} counted={counted} "
+                f"  {C_GREEN}[{rel}]{C_RESET} counted={counted} "
                 f"baseline={base} "
-                f"{C_GREEN}(-{base - counted} — ratchet can drop){C_RESET}"
-            )
-        else:
-            print(
-                f"  {C_GREEN}[{crate}]{C_RESET} counted={counted} "
-                f"baseline={base} (OK)"
+                f"{C_GREEN}(-{base - counted}){C_RESET}"
             )
 
     if fail:
@@ -608,6 +919,22 @@ REQUIRED_FIXTURE_PATTERNS: list[tuple[str, str]] = [
     ("block_on", "with_nested_fn:.block_on"),
     # 8. Runtime::new() construction
     ("runtime_new", "runtime_new_then_block_on:Runtime::new"),
+    # 9. fn-pointer rebind: `let f = tokio::task::block_in_place; f(|| ...)`
+    ("block_in_place", "fn_pointer_rebind_block_in_place:fn_ptr"),
+    # 10. Runtime type alias: `type R = Runtime; R::new().block_on(...)`
+    #     — the inner `R::new()` must be caught via alias; the outer
+    #     `.block_on` is ALSO caught but that is Pattern 3-style.
+    ("runtime_new", "runtime_type_alias_block_on:R::new"),
+    # 11. macro_rules! definition wrapping a sync bridge.
+    ("macro_definition", "__macro_rules_defined_at_module_scope:sync_bridge"),
+    # 12. Invocation of a pass-through macro whose TOKEN STREAM carries
+    #     `block_in_place` as an argument — the macro body is clean but
+    #     the invocation site isn't.
+    ("macro_invocation", "macro_invocation_site:block_in_place"),
+    # 13. Production-only module: `#[cfg(not(test))] mod prod_only { ... }`
+    #     must NOT be excluded as test code. The call inside it must be
+    #     caught.
+    ("block_on", "production_only_cfg_not_test:.block_on"),
 ]
 
 
@@ -621,6 +948,28 @@ def _fn_line_ranges(fixture_path: Path) -> dict[str, tuple[int, int]]:
 
     def walk(node) -> None:
         if node.type == "function_item":
+            name = node.child_by_field_name("name")
+            if name is not None:
+                nm = node_text(name, source)
+                ranges[nm] = (node.start_point[0] + 1, node.end_point[0] + 1)
+        for c in node.children:
+            walk(c)
+
+    walk(tree.root_node)
+    return ranges
+
+
+def _mod_line_ranges(fixture_path: Path) -> dict[str, tuple[int, int]]:
+    """Parse the fixture and return {mod_name: (start_line_1, end_line_1)}
+    for every `mod NAME { ... }` item. Used to anchor patterns on
+    modules that are NOT inside a fn (e.g. #[cfg(not(test))] mod prod).
+    """
+    source = fixture_path.read_bytes()
+    tree = PARSER.parse(source)
+    ranges: dict[str, tuple[int, int]] = {}
+
+    def walk(node) -> None:
+        if node.type == "mod_item":
             name = node.child_by_field_name("name")
             if name is not None:
                 nm = node_text(name, source)
@@ -653,38 +1002,51 @@ def do_self_test() -> int:
         return 1
 
     fn_ranges = _fn_line_ranges(FIXTURE_FILE)
+    mod_ranges = _mod_line_ranges(FIXTURE_FILE)
     fixture_bytes = FIXTURE_FILE.read_bytes()
+    fixture_source_lines = fixture_bytes.decode("utf-8", errors="replace").splitlines()
 
-    # Every pattern must match at least one non-allow-listed hit.
+    # Every pattern must match at least one non-allow-listed hit. Unlike
+    # the earlier version, the substring assertion is tied to the hit's
+    # own source range (lines h.line..h.end_line) — NOT the whole fn body.
+    # This closes a weakness where the fixture coincidentally mentioned
+    # `substr` elsewhere in the fn and the assertion passed even if the
+    # hit itself did not carry the pattern.
     missing: list[str] = []
     for expected_kind, descriptor in REQUIRED_FIXTURE_PATTERNS:
-        fn_name, substr = descriptor.split(":", 1)
-        rng = fn_ranges.get(fn_name)
+        anchor, substr = descriptor.split(":", 1)
+        # Anchor may be a fn name OR a mod name. Prefer fn; fall back to
+        # mod. This lets us anchor #[cfg(not(test))] mod patterns.
+        rng = fn_ranges.get(anchor) or mod_ranges.get(anchor)
         if rng is None:
-            missing.append(f"fixture is missing fn {fn_name!r} — pattern {descriptor!r}")
+            missing.append(
+                f"fixture is missing fn/mod {anchor!r} — pattern {descriptor!r}"
+            )
             continue
         start, end = rng
-        # `substr` may appear on the call's start line, its snippet, or
-        # anywhere on a line within the call's source range (multi-line
-        # method chains). We conservatively check every line in the fn
-        # body since the hit is constrained to `start <= h.line <= end`.
-        fixture_text = fixture_bytes.decode("utf-8", errors="replace")
-        all_fixture_lines = fixture_text.splitlines()
-        fn_body_text = "\n".join(
-            all_fixture_lines[start - 1 : end]
-        )  # lines are 1-indexed
+
+        def hit_source_contains(h: Hit, needle: str) -> bool:
+            # Hit's source range is [h.line, h.end_line] inclusive,
+            # 1-indexed. Check whether any line in that range contains
+            # `needle`. This is tight to the hit, not to the fn body.
+            lo = max(1, h.line)
+            hi = min(len(fixture_source_lines), h.end_line)
+            for ln in range(lo, hi + 1):
+                if needle in fixture_source_lines[ln - 1]:
+                    return True
+            return False
 
         matched = any(
             h.kind == expected_kind
             and h.allow_reason is None
             and start <= h.line <= end
-            and substr in fn_body_text
+            and hit_source_contains(h, substr)
             for h in hits
         )
         if not matched:
             missing.append(
-                f"expected {expected_kind} inside fn {fn_name} "
-                f"(lines {start}-{end}) containing {substr!r}"
+                f"expected {expected_kind} inside {anchor} "
+                f"(lines {start}-{end}) with hit source containing {substr!r}"
             )
 
     # Assert the allow-listed fixture sites are tagged, not counted.

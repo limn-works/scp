@@ -1,7 +1,17 @@
 {
-  "_comment": "Ratchet baseline for `tokio::task::block_in_place`, `.block_on(...)`, and `Runtime::new()` call sites in the actor-refactor scope (ADR-049). See scripts/check-block-in-place.py for scope, detection rules, and the inline allow-list directive `// ci-allow: block-on: <reason>`. The gate fails when a crate's count goes UP. Counts drop as the actor refactor replaces sync-in-async bridges with async trait dispatch. Commit 12 of the actor refactor deletes the last of these; baselines will reach zero then. Test code (`**/tests/**` paths and `#[cfg(test)] mod` items) is excluded from counting. Allow-listed sites are excluded from counting and must carry a reason string.",
-  "_updated": "2026-04-19 (actor-per-context commit 3 — initial baseline capture)",
+  "_comment": "Ratchet baseline for `tokio::task::block_in_place`, `.block_on(...)`, `Runtime::new()`, and sync-bridge macro wrappers in the actor-refactor scope (ADR-049). See scripts/check-block-in-place.py for scope, detection rules, and the inline allow-list directive `// ci-allow: block-on: <reason>`. Enforcement is PER-FILE: the gate fails when any file's count goes UP. The previous per-crate-aggregate baseline was gameable — an attacker could delete a legit site and add a new one within the same crate without detection. Per-file baselines close that gap. Test code (`**/tests/**` paths and `#[cfg(test)] mod` items) is excluded from counting. Allow-listed sites are excluded from counting and must carry a reason string.",
+  "_updated": "2026-04-19 (commit 3 remediation — per-file granularity + macro/rebind coverage)",
   "_context": "Pre-refactor state. scp-runtime counts are sync-in-async bridges in ContextManager, MlsCryptoProvider, recovery, trust store, and per-context store. scp-transport counts are in the provider.rs sync-adapter bridge and native/relay_persistence.rs. scp-node has one site in the HTTP/3 request handler (sync trait method, legitimate and will be annotated once post-refactor patterns settle). The actor refactor eliminates every scp-runtime and scp-transport site listed below; the scp-node site may remain and be annotated with `// ci-allow: block-on: <reason>` in a later commit.",
+  "files": {
+    "crates/scp-node/src/http.rs": 1,
+    "crates/scp-runtime/src/context/manager/mod.rs": 2,
+    "crates/scp-runtime/src/context/manager/tools.rs": 6,
+    "crates/scp-runtime/src/identity/recovery.rs": 2,
+    "crates/scp-runtime/src/store/context.rs": 20,
+    "crates/scp-runtime/src/store/trust.rs": 6,
+    "crates/scp-transport/src/native/relay_persistence.rs": 12,
+    "crates/scp-transport/src/provider.rs": 6
+  },
   "crates": {
     "scp-node": 1,
     "scp-runtime": 36,
