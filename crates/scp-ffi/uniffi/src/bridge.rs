@@ -13780,9 +13780,12 @@ mod tests {
         crate::scp::Scp::new()
     }
 
-    fn test_handle() -> Arc<ContextHandle> {
-        // Phase D (#1695): no default instance id; tests use UNSET_INSTANCE_ID.
-        let instance_id = scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID;
+    /// Builds a synthetic `ContextHandle` stamped with `scp`'s own
+    /// `instance_id` so the per-instance handle-affinity check accepts
+    /// it. Phase D (#1695): replaces the old `UNSET_INSTANCE_ID` stamp
+    /// which only worked against the deleted process-wide default.
+    fn test_handle_for(scp: &Arc<crate::scp::Scp>) -> Arc<ContextHandle> {
+        let instance_id = scp.instance_id();
         Arc::new(ContextHandle {
             context_id: "ctx-test".to_owned(),
             state: tokio::sync::Mutex::new(ContextState::Active),
@@ -13801,9 +13804,10 @@ mod tests {
         })
     }
 
-    fn test_identity() -> Arc<Identity> {
-        // Phase D (#1695): no default instance id; tests use UNSET_INSTANCE_ID.
-        let instance_id = scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID;
+    /// Builds a synthetic `Identity` stamped with `scp`'s own
+    /// `instance_id`. Phase D (#1695): see `test_handle_for`.
+    fn test_identity_for(scp: &Arc<crate::scp::Scp>) -> Arc<Identity> {
+        let instance_id = scp.instance_id();
         Arc::new(Identity {
             did: "did:dht:z6MkTestUser".to_owned(),
             custody_type: CustodyMethod::InMemory,
@@ -13821,12 +13825,13 @@ mod tests {
     /// is a required non-optional parameter. See issue #423.
     #[tokio::test]
     async fn tool_invoke_rejects_none_ucan_token() {
-        let result = scp_test()
+        let scp = scp_test();
+        let result = scp
             .tool_invoke(
-                test_handle(),
+                test_handle_for(&scp),
                 "test-tool".to_owned(),
                 "{}".to_owned(),
-                test_identity(),
+                test_identity_for(&scp),
                 None, // No UCAN token
                 None,
                 None, // spending_ucan_jwt
@@ -13845,9 +13850,10 @@ mod tests {
     /// Direct `set_economic_policy` always rejects — must use governance (#728).
     #[test]
     fn set_economic_policy_always_rejects_requires_governance() {
-        // Use the default SCP instance so the handle's instance_id matches.
+        // Phase D (#1695): use a fresh SCP instance and stamp the handle
+        // with its instance_id so the per-instance affinity check accepts it.
         let scp = crate::scp::Scp::new();
-        let handle = test_handle();
+        let handle = test_handle_for(&scp);
 
         // Initially None.
         let result = scp.get_economic_policy(Arc::clone(&handle)).unwrap();
@@ -14128,7 +14134,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_invalid_input_schema_json() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
@@ -14140,7 +14147,7 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test()
+        let err = scp
             .tool_register(handle, def)
             .await
             .expect_err("invalid input_schema_json must be rejected");
@@ -14158,7 +14165,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_invalid_output_schema_json() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
@@ -14170,7 +14178,7 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test()
+        let err = scp
             .tool_register(handle, def)
             .await
             .expect_err("invalid output_schema_json must be rejected");
@@ -14190,7 +14198,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_non_object_input_schema() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
@@ -14202,7 +14211,7 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test()
+        let err = scp
             .tool_register(handle, def)
             .await
             .expect_err("non-object input_schema must be rejected");
@@ -14224,7 +14233,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_non_object_output_schema() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
@@ -14236,7 +14246,7 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test()
+        let err = scp
             .tool_register(handle, def)
             .await
             .expect_err("non-object output_schema must be rejected");
@@ -14260,7 +14270,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_invalid_test_vectors_json() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
@@ -14272,7 +14283,7 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test()
+        let err = scp
             .tool_register(handle, def)
             .await
             .expect_err("non-array test_vectors_json must be rejected");
@@ -14290,7 +14301,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_test_vectors_missing_fields() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         // Array of objects missing required fields for TestVector deserialization.
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
@@ -14303,7 +14315,7 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test()
+        let err = scp
             .tool_register(handle, def)
             .await
             .expect_err("test vectors with missing fields must be rejected");
@@ -14319,7 +14331,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_implementation_hash_wrong_length() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
@@ -14331,7 +14344,7 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test()
+        let err = scp
             .tool_register(handle, def)
             .await
             .expect_err("implementation_hash with wrong length must be rejected");
@@ -14353,7 +14366,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_implementation_hash_too_long() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
@@ -14365,7 +14379,7 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test()
+        let err = scp
             .tool_register(handle, def)
             .await
             .expect_err("implementation_hash with wrong length must be rejected");
@@ -14488,7 +14502,8 @@ mod tests {
     /// stored `ToolRegistration`. Catches the original bug from issue #871.
     #[tokio::test]
     async fn registered_at_is_seconds_epoch() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "timestamp-probe".to_owned(),
             description: "probes registered_at value".to_owned(),
@@ -14502,7 +14517,7 @@ mod tests {
             cost: None,
         };
 
-        let tool_id = scp_test()
+        let tool_id = scp
             .tool_register(handle.clone(), def)
             .await
             .expect("tool_register should succeed");

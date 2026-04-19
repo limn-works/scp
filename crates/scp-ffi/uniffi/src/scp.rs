@@ -5,12 +5,13 @@
 //! [`UniffiBridgeInstance`] — which in turn owns the `ContextManager`,
 //! transport, and bridge-specific registries.
 //!
-//! PR 1 introduces the type and its constructors plus the lifecycle
-//! methods. Later PRs migrate the free-function façade onto methods on
-//! this class; until then free functions continue to operate on the
-//! default instance (`DEFAULT_BRIDGE_INSTANCE` in [`crate::runtime`]).
+//! Phase D (#1695) deleted the process-wide `DEFAULT_BRIDGE_INSTANCE`
+//! that the pre-façade free functions shared; every entry point now
+//! flows through an `Scp`, which mints handles stamped with its own
+//! `instance_id` and rejects cross-instance handle misuse via the
+//! inline `CoreFields::check_handle` call.
 //!
-//! See #1549 Phase 4 remainder plan (PR 1) and ADR-048.
+//! See #1549 Phase 4 remainder plan and ADR-048.
 
 use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
 use scp_ffi_common::error_codes as codes;
@@ -51,11 +52,12 @@ pub struct Scp {
 impl Scp {
     /// Constructs a fresh `SCP` instance with default in-memory state.
     ///
-    /// Unlike [`Self::default_instance`], this bypasses the process-global
-    /// `DEFAULT_BRIDGE_INSTANCE` entirely — each call produces a brand-new
-    /// instance with a fresh monotonic `instance_id`, a fresh
-    /// `CancellationToken`, and an empty `JoinSet`. Handles issued against
-    /// this instance are incompatible with any other instance.
+    /// Each call produces a brand-new instance with a fresh monotonic
+    /// `instance_id`, a fresh `CancellationToken`, and an empty
+    /// `JoinSet`. Handles issued against this instance are incompatible
+    /// with any other instance — the `CoreFields::check_handle` path
+    /// surfaces the mismatch as `ScpError::Permission` with code
+    /// `SCP-PERM-3030`.
     #[uniffi::constructor]
     #[must_use]
     pub fn new() -> Arc<Self> {

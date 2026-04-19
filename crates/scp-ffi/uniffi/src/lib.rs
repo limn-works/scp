@@ -688,10 +688,11 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     fn context_create_returns_active_context() {
         let rt = runtime();
+        let scp = scp_test();
 
         // First create an identity to pass as the context creator.
         let identity = rt
-            .block_on(scp_test().identity_create("in_memory".to_owned()))
+            .block_on(scp.identity_create("in_memory".to_owned()))
             .expect("identity_create failed");
 
         let params = bridge::ContextParams {
@@ -712,7 +713,7 @@ mod tests {
         };
 
         let handle = rt
-            .block_on(scp_test().context_create(identity, params))
+            .block_on(scp.context_create(identity, params))
             .expect("context_create should succeed");
 
         assert_eq!(
@@ -751,9 +752,10 @@ mod tests {
         }
 
         let rt = runtime();
+        let scp = scp_test();
 
         let identity = rt
-            .block_on(scp_test().identity_create("in_memory".to_owned()))
+            .block_on(scp.identity_create("in_memory".to_owned()))
             .expect("identity_create failed");
 
         let params = bridge::ContextParams {
@@ -774,7 +776,7 @@ mod tests {
         };
 
         let handle = rt
-            .block_on(scp_test().context_create(identity, params))
+            .block_on(scp.context_create(identity, params))
             .expect("context_create failed");
 
         let completed = Arc::new(AtomicBool::new(false));
@@ -782,7 +784,7 @@ mod tests {
             completed: Arc::clone(&completed),
         });
 
-        rt.block_on(scp_test().context_subscribe(handle, listener))
+        rt.block_on(scp.context_subscribe(handle, listener))
             .expect("context_subscribe should succeed");
 
         assert!(

@@ -1,39 +1,45 @@
-//! Shared `ContextManager` and per-context UCAN state registry.
+//! Per-instance `UniffiBridgeInstance` and its registries.
 //!
-//! A single `Arc<UniffiBridgeInstance>` is allocated into
-//! [`DEFAULT_BRIDGE_INSTANCE`] the first time a free-function bridge entry
-//! touches bridge state. Bridge functions access its `ContextManager` and
-//! typed registries (UCAN, identity custody, protocol repository) via
-//! [`default_bridge_instance`] / [`bridge_instance`].
+//! Each `Arc<UniffiBridgeInstance>` is owned by the caller via a
+//! `#[derive(uniffi::Object)] Scp` handle. The instance bundles a
+//! shared `ContextManager` and typed registries (UCAN, identity custody,
+//! protocol repository, context handles, MCP servers/clients, identity
+//! link attestations) so lifecycle (`suspend` / `resume` / `shutdown`)
+//! cascades to all of them as a unit.
 //!
 //! # Per-context UCAN state
 //!
 //! The `ContextManager` does not own UCAN revocation lists or nonce trackers.
-//! Those are validation-layer concerns that live in the bridge. A typed
-//! `DashMap<String, UcanContextState>` on [`UniffiBridgeInstance`] owns them,
+//! Those are validation-layer concerns that live on the `UniffiBridgeInstance`.
+//! A typed `Arc<DashMap<String, UcanContextState>>` on the instance owns them,
 //! keyed by context ID. This mirrors the NAPI bridge's `UcanContextState`
 //! pattern (see `crates/scp-ffi/napi/src/runtime.rs`).
 //!
 //! # Lifecycle
 //!
-//! 1. First call to a bridge free function initializes the default
-//!    [`UniffiBridgeInstance`] via [`ensure_bridge_instance`].
-//! 2. Bridge functions call [`context_manager()`] or [`bridge_instance()`]
-//!    and delegate to the manager's async methods or the instance's typed
-//!    registries.
-//! 3. The `UniffiBridgeInstance` is dropped on process exit (static
-//!    `OnceLock`) or permanently deactivated via
-//!    [`UniffiBridgeInstance::shutdown`].
+//! 1. `Scp::new` (or `Scp::with_storage` / `Scp::with_persistence`)
+//!    constructs a fresh `UniffiBridgeInstance`; per-instance setup
+//!    (e.g. `init_context_manager_with_did`, transport setup) happens
+//!    lazily on the first `Scp::identity_create` / `context_create` /
+//!    `context_join` call.
+//! 2. `Scp::method(...)` delegates to methods on
+//!    `UniffiBridgeInstance` (`context_manager_expect`, `with_ucan_state`,
+//!    `ensure_ucan_registered`, `did_resolver`, etc.) — all per-instance,
+//!    no process-wide shared state.
+//! 3. The instance is dropped when the last `Arc` reference is released
+//!    or permanently deactivated via [`UniffiBridgeInstance::shutdown`].
 //!
 //! This replaces the old `DashMap<String, ContextRuntime>` global registry
-//! (deleted as part of issue #387) and the type-erased `Box<dyn Any>` slots
-//! on `BridgeInstance` (deleted as part of #1549 Phase 4 PR 1).
+//! (deleted as part of issue #387), the type-erased `Box<dyn Any>` slots on
+//! `BridgeInstance` (deleted as part of #1549 Phase 4 PR 1), and the
+//! process-wide `DEFAULT_BRIDGE_INSTANCE` façade (deleted as part of
+//! #1549 Phase 4 PR 4 Phase D).
 
 use async_trait::async_trait;
 use scp_ffi_common::bridge_instance::{BridgeInstanceCore, ShutdownError, ShutdownOutcome};
-// Re-export `CoreFields` at `crate::runtime::CoreFields` so the
-// `uniffi_check_handle!` macro can refer to it as
-// `$crate::runtime::CoreFields`.
+// Re-export `CoreFields` at `crate::runtime::CoreFields` so bridge.rs
+// and server.rs can name it in impl blocks without pulling in the full
+// path.
 pub use scp_ffi_common::bridge_instance::CoreFields;
 use scp_ffi_common::bridge_runtime::BridgeInMemoryStorage;
 use scp_ffi_common::error_codes as codes;
