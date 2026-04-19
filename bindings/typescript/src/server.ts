@@ -24,11 +24,17 @@
 
 import { createRequire } from "node:module";
 import { TransportError } from "./errors";
+import { __defaultScpForInternalUse, __getNativeScp, type SCP } from "./scp";
 import type { SiteConfig } from "./types";
 import { validateAdmission, validateBroadcastKeyHex, validateSiteConfig } from "./types";
 
 // ---------------------------------------------------------------------------
 // Native addon access — server operations bypass the Bridge interface
+//
+// Since ADR-048 (#1549 Phase 4 PR 4), relay/node factories dispatch
+// through an `SCP` instance's class methods when one is supplied.
+// Callers that omit the `scp` argument fall back to the shared
+// process-wide default instance, which preserves legacy behavior.
 // ---------------------------------------------------------------------------
 
 /** Shape of the napi-rs relay handle returned by the native addon. */
@@ -135,6 +141,40 @@ function loadServerAddon(): ServerAddon {
   }
 }
 
+/**
+ * Returns a {@link ServerAddon} view backed by the given {@link SCP}
+ * instance's class methods (ADR-048). Methods that have not yet been
+ * ported onto the `Scp` class fall back to module-level free
+ * functions.
+ *
+ * When `scp` is omitted, the shared process-wide default instance is
+ * used — matching the legacy free-function façade behavior.
+ */
+function serverApi(scp?: SCP): ServerAddon {
+  // Ensure the native addon is actually installed / loadable before we
+  // extract `Scp` class method references — `loadServerAddon` throws
+  // the same descriptive `TransportError` on failure, so the error
+  // surface remains identical to the pre-ADR-048 path.
+  loadServerAddon();
+  const instance = scp ?? __defaultScpForInternalUse();
+  // Type-erased native handle — every `Scp` class method shares the
+  // `async (...args) => unknown` shape after FFI monomorphization.
+  const native = __getNativeScp(instance) as unknown as Record<
+    string,
+    (...args: never[]) => unknown
+  >;
+
+  return {
+    relayStartInMemory: native.relayStartInMemory as ServerAddon["relayStartInMemory"],
+    relayStartLocal: native.relayStartLocal as ServerAddon["relayStartLocal"],
+    nodeStartInMemory: native.nodeStartInMemory as ServerAddon["nodeStartInMemory"],
+    nodeStartLocal: native.nodeStartLocal as ServerAddon["nodeStartLocal"],
+    transportConnect: native.transportConnect as ServerAddon["transportConnect"],
+    configureLocalTransport:
+      native.configureLocalTransport as ServerAddon["configureLocalTransport"],
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Relay
 // ---------------------------------------------------------------------------
@@ -171,12 +211,15 @@ export class Relay implements AsyncDisposable {
   /**
    * Start a relay with in-memory blob storage on an OS-assigned port.
    *
+   * @param scp Optional {@link SCP} wrapper whose bridge instance should
+   *   own the relay. Defaults to the shared process-wide default
+   *   instance when omitted (ADR-048).
    * @returns A `Relay` whose {@link relayUrl} property contains the
    * WebSocket URL for clients.
    */
-  static async startInMemory(): Promise<Relay> {
-    const addon = loadServerAddon();
-    const handle = await addon.relayStartInMemory();
+  static async startInMemory(scp?: SCP): Promise<Relay> {
+    const api = serverApi(scp);
+    const handle = await api.relayStartInMemory();
     return new Relay(handle);
   }
 
@@ -186,10 +229,13 @@ export class Relay implements AsyncDisposable {
    * Opens (or creates) a redb database at `<dataDir>/blobs.redb`.
    *
    * @param dataDir - Directory for persistent blob storage.
+   * @param scp Optional {@link SCP} wrapper whose bridge instance should
+   *   own the relay. Defaults to the shared process-wide default
+   *   instance when omitted (ADR-048).
    */
-  static async startLocal(dataDir: string): Promise<Relay> {
-    const addon = loadServerAddon();
-    const handle = await addon.relayStartLocal(dataDir);
+  static async startLocal(dataDir: string, scp?: SCP): Promise<Relay> {
+    const api = serverApi(scp);
+    const handle = await api.relayStartLocal(dataDir);
     return new Relay(handle);
   }
 
@@ -263,10 +309,13 @@ export class Node implements AsyncDisposable {
    * class from `identityCreate`), keeping the server module decoupled.
    *
    * @param identity - Optional identity object with a `.did` property.
+   * @param scp - Optional {@link SCP} wrapper whose bridge instance
+   *   should own the node. Defaults to the shared process-wide default
+   *   instance when omitted (ADR-048).
    */
-  static async startInMemory(identity?: { did: string }): Promise<Node> {
-    const addon = loadServerAddon();
-    const handle = await addon.nodeStartInMemory(identity?.did ?? null);
+  static async startInMemory(identity?: { did: string }, scp?: SCP): Promise<Node> {
+    const api = serverApi(scp);
+    const handle = await api.nodeStartInMemory(identity?.did ?? null);
     return new Node(handle);
   }
 
@@ -287,14 +336,18 @@ export class Node implements AsyncDisposable {
    * @param identity - Optional identity object with a `.did` property.
    * @param passphrase - Passphrase for Argon2id key derivation. Required when
    *   identity is omitted.
+   * @param scp - Optional {@link SCP} wrapper whose bridge instance
+   *   should own the node. Defaults to the shared process-wide default
+   *   instance when omitted (ADR-048).
    */
   static async startLocal(
     dataDir: string,
     identity?: { did: string },
     passphrase?: string,
+    scp?: SCP,
   ): Promise<Node> {
-    const addon = loadServerAddon();
-    const handle = await addon.nodeStartLocal(dataDir, identity?.did ?? null, passphrase ?? null);
+    const api = serverApi(scp);
+    const handle = await api.nodeStartLocal(dataDir, identity?.did ?? null, passphrase ?? null);
     return new Node(handle);
   }
 
@@ -451,10 +504,13 @@ export class Node implements AsyncDisposable {
  * {@link Node.startInMemory}) bind to `127.0.0.1` without TLS.
  *
  * @param relayUrl - The WebSocket URL of the relay (e.g. `ws://127.0.0.1:PORT/scp/v1`).
+ * @param scp - Optional {@link SCP} wrapper whose bridge instance
+ *   should own the transport. Defaults to the shared process-wide
+ *   default instance when omitted (ADR-048).
  */
-export async function connectLocalTransport(relayUrl: string): Promise<void> {
-  const addon = loadServerAddon();
-  await addon.transportConnect(relayUrl);
+export async function connectLocalTransport(relayUrl: string, scp?: SCP): Promise<void> {
+  const api = serverApi(scp);
+  await api.transportConnect(relayUrl);
 }
 
 // ---------------------------------------------------------------------------
@@ -477,8 +533,11 @@ export async function connectLocalTransport(relayUrl: string): Promise<void> {
  *
  * @param localDid - A valid `did:dht:` DID string used as the MLS credential
  * identity. Typically the DID of the first identity created in the test.
+ * @param scp - Optional {@link SCP} wrapper whose bridge instance
+ *   should be configured. Defaults to the shared process-wide default
+ *   instance when omitted (ADR-048).
  */
-export function configureLocalTransport(localDid: string): void {
-  const addon = loadServerAddon();
-  addon.configureLocalTransport(localDid);
+export function configureLocalTransport(localDid: string, scp?: SCP): void {
+  const api = serverApi(scp);
+  api.configureLocalTransport(localDid);
 }

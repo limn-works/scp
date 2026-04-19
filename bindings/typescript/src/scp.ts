@@ -316,6 +316,19 @@ export interface ScpOptions {
 const ADOPT_HANDLE: unique symbol = Symbol("scp.adoptHandle");
 
 /**
+ * Module-private symbol for internal accessors that surface the raw
+ * native handle to other SDK modules (notably
+ * `internal/native.ts`, `server.ts`, `mcp.ts`, `lifecycle.ts`).
+ *
+ * External callers cannot reach this — the Symbol is not exported.
+ * Internal callers import {@link __getNativeScp} from this module to
+ * obtain the raw NAPI `SCP` handle for direct method invocation.
+ *
+ * @internal
+ */
+const NATIVE_HANDLE: unique symbol = Symbol("scp.nativeHandle");
+
+/**
  * Caller-owned SCP instance — the preferred SDK entry point.
  *
  * Each `SCP` wraps an independent native `BridgeInstance`. See
@@ -458,4 +471,57 @@ export class SCP {
     const millis = __clampShutdownMillisForTests(timeoutSecs);
     await this.#native.shutdown(millis);
   }
+
+  /**
+   * Internal accessor exposing the raw native NAPI `SCP` handle.
+   *
+   * The Symbol-keyed getter is used by other SDK modules
+   * (`internal/native.ts`, `server.ts`, `mcp.ts`, `lifecycle.ts`) to
+   * dispatch SDK calls directly against this instance's class methods
+   * rather than the deprecated module-level free functions (ADR-048).
+   * The Symbol is not exported, so external code cannot retrieve the
+   * native handle through this channel.
+   *
+   * @internal
+   */
+  get [NATIVE_HANDLE](): NativeScpInstance {
+    return this.#native;
+  }
+}
+
+/**
+ * Retrieve the raw NAPI `SCP` handle from an {@link SCP} wrapper for
+ * internal routing. Intended for use only by other SDK modules that
+ * need to invoke class methods directly (e.g.
+ * `internal/native.ts::createNativeBridge`).
+ *
+ * @internal
+ */
+export function __getNativeScp(scp: SCP): NativeScpInstance {
+  return scp[NATIVE_HANDLE];
+}
+
+/**
+ * Loads the native NAPI `SCP` class and returns a wrapper around the
+ * process-wide default instance without emitting the one-time
+ * deprecation warning that {@link SCP.default} prints. Used internally
+ * by the free-function façade adapters (`createNativeBridge`,
+ * `server.ts`, `mcp.ts`, `lifecycle.ts`) so legacy callers that don't
+ * supply an explicit {@link SCP} argument keep working without
+ * spamming warnings on every method call.
+ *
+ * Returns the cached default wrapper, so repeated calls share the same
+ * underlying `instanceId`.
+ *
+ * @internal
+ */
+let _defaultWrapper: SCP | null = null;
+export function __defaultScpForInternalUse(): SCP {
+  if (_defaultWrapper !== null) {
+    return _defaultWrapper;
+  }
+  const NativeScp = nativeScp();
+  const native = NativeScp.default();
+  _defaultWrapper = new SCP({ [ADOPT_HANDLE]: native } as ScpOptions);
+  return _defaultWrapper;
 }

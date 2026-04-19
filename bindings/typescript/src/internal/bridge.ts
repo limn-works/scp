@@ -719,6 +719,11 @@ export function getBridgeSync(): Bridge {
  *
  * Subsequent calls return the cached instance — no re-initialization.
  *
+ * The cached native bridge routes every call through the process-wide
+ * default `SCP` instance (ADR-048); callers that need a bespoke bridge
+ * for a specific `SCP` wrapper should use {@link createNativeBridgeFor}
+ * from `./native.js` directly.
+ *
  * @returns The initialized `Bridge` instance.
  */
 export async function getBridge(): Promise<Bridge> {

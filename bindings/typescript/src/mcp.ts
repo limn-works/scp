@@ -18,6 +18,7 @@ import { mapBridgeError, TransportError } from "./errors";
 import { BRIDGE_TARGET } from "./internal/bridge";
 import { deprecatedDefaultInstance } from "./internal/deprecation";
 import { safeJsonParse } from "./internal/json-utils";
+import { __defaultScpForInternalUse, __getNativeScp, type SCP } from "./scp";
 import type { McpClientConfig, McpServerConfig, ToolDefinition } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -76,13 +77,17 @@ interface McpNativeAddon {
   ): Promise<NativeInvokeResult>;
 }
 
-let _mcpAddon: McpNativeAddon | null = null;
-
-async function getMcpAddon(): Promise<McpNativeAddon> {
-  if (_mcpAddon !== null) {
-    return _mcpAddon;
-  }
-
+/**
+ * Returns an MCP view of the native addon, routed through the given
+ * {@link SCP} instance's class methods (ADR-048). Defaults to the
+ * process-wide default instance when `scp` is omitted — matching the
+ * legacy free-function façade behavior.
+ *
+ * Unlike the previous `_mcpAddon` cache, the mapping is cheap: it
+ * extracts bound method references from the `Scp` handle once per call.
+ * The underlying native load is cached in `scp.ts::nativeScp()`.
+ */
+function mcpApi(scp?: SCP): McpNativeAddon {
   if (BRIDGE_TARGET !== "native") {
     throw new TransportError(
       "MCP native bridge is only available in Bun/Node.js environments",
@@ -90,33 +95,23 @@ async function getMcpAddon(): Promise<McpNativeAddon> {
     );
   }
 
-  // Load the native addon using the same pattern as internal/native.ts
-  const { createRequire } = await import("node:module");
-  const req = createRequire(import.meta.url);
+  const instance = scp ?? __defaultScpForInternalUse();
+  // Type-erased native handle — every NAPI `Scp` class method shares
+  // the `async (...args) => unknown` shape after FFI monomorphization.
+  const native = __getNativeScp(instance) as unknown as Record<
+    string,
+    (...args: never[]) => unknown
+  >;
 
-  const platform = process.platform;
-  const arch = process.arch;
-  const platformMap: Record<string, string> = {
-    "linux-x64": "@limn-works/scp-ts-napi-linux-x64-gnu",
-    "linux-arm64": "@limn-works/scp-ts-napi-linux-arm64-gnu",
-    "darwin-x64": "@limn-works/scp-ts-napi-darwin-x64",
-    "darwin-arm64": "@limn-works/scp-ts-napi-darwin-arm64",
-    "win32-x64": "@limn-works/scp-ts-napi-win32-x64-msvc",
+  return {
+    mcpServerCreate: native.mcpServerCreate as McpNativeAddon["mcpServerCreate"],
+    mcpServerStop: native.mcpServerStop as McpNativeAddon["mcpServerStop"],
+    mcpClientConnectStdio: native.mcpClientConnectStdio as McpNativeAddon["mcpClientConnectStdio"],
+    mcpClientConnectSse: native.mcpClientConnectSse as McpNativeAddon["mcpClientConnectSse"],
+    mcpClientDisconnect: native.mcpClientDisconnect as McpNativeAddon["mcpClientDisconnect"],
+    mcpClientListTools: native.mcpClientListTools as McpNativeAddon["mcpClientListTools"],
+    mcpClientInvoke: native.mcpClientInvoke as McpNativeAddon["mcpClientInvoke"],
   };
-
-  const key = `${platform}-${arch}`;
-  const pkg = platformMap[key];
-  if (pkg === undefined) {
-    throw new TransportError(`No native addon for platform ${key}`, "SCP-TRANS-5001");
-  }
-
-  try {
-    _mcpAddon = req(pkg) as unknown as McpNativeAddon;
-  } catch {
-    throw new TransportError(`Failed to load native addon ${pkg} for MCP bridge`, "SCP-TRANS-5001");
-  }
-
-  return _mcpAddon;
 }
 
 // ---------------------------------------------------------------------------
@@ -144,18 +139,27 @@ export interface McpServer extends AsyncDisposable {
  *
  * @param ctx - The SCP context whose tools to expose.
  * @param config - MCP server configuration.
+ * @param scp - Optional {@link SCP} wrapper whose bridge instance
+ *   should own the server. Defaults to the shared process-wide default
+ *   instance when omitted (ADR-048).
  * @returns A handle to the running server.
  * @throws {TransportError} If the server cannot be started.
  */
-export async function serveMcp(ctx: Context, config: McpServerConfig): Promise<McpServer> {
-  deprecatedDefaultInstance("serveMcp");
+export async function serveMcp(
+  ctx: Context,
+  config: McpServerConfig,
+  scp?: SCP,
+): Promise<McpServer> {
+  if (scp === undefined) {
+    deprecatedDefaultInstance("serveMcp");
+  }
   try {
     const host = config.host ?? "127.0.0.1";
     const port = config.port ?? 0;
     const url = `http://${host}:${port}`;
 
     if (BRIDGE_TARGET === "native") {
-      const addon = await getMcpAddon();
+      const addon = mcpApi(scp);
 
       // Determine transport from port: if port is specified, use SSE;
       // otherwise default to stdio.
@@ -229,14 +233,19 @@ export interface McpClient extends AsyncDisposable {
  * bridge function for URL-based connections.
  *
  * @param config - MCP client configuration.
+ * @param scp - Optional {@link SCP} wrapper whose bridge instance
+ *   should own the client. Defaults to the shared process-wide default
+ *   instance when omitted (ADR-048).
  * @returns An MCP client handle.
  * @throws {TransportError} If the connection fails.
  */
-export async function connectMcp(config: McpClientConfig): Promise<McpClient> {
-  deprecatedDefaultInstance("connectMcp");
+export async function connectMcp(config: McpClientConfig, scp?: SCP): Promise<McpClient> {
+  if (scp === undefined) {
+    deprecatedDefaultInstance("connectMcp");
+  }
   try {
     if (BRIDGE_TARGET === "native") {
-      const addon = await getMcpAddon();
+      const addon = mcpApi(scp);
 
       const nativeHandle = await addon.mcpClientConnectSse(config.serverUrl);
       let disconnected = false;
@@ -326,14 +335,20 @@ export async function connectMcp(config: McpClientConfig): Promise<McpClient> {
  *
  * @param command - The command to execute (e.g., `"uvx"`).
  * @param args - Arguments to pass to the command.
+ * @param scp - Optional {@link SCP} wrapper whose bridge instance
+ *   should own the client. Defaults to the shared process-wide default
+ *   instance when omitted (ADR-048).
  * @returns An MCP client handle.
  * @throws {TransportError} If the subprocess fails to start or handshake fails.
  */
 export async function connectMcpStdio(
   command: string,
   args: readonly string[] = [],
+  scp?: SCP,
 ): Promise<McpClient> {
-  deprecatedDefaultInstance("connectMcpStdio");
+  if (scp === undefined) {
+    deprecatedDefaultInstance("connectMcpStdio");
+  }
   try {
     if (BRIDGE_TARGET !== "native") {
       throw new TransportError(
@@ -342,7 +357,7 @@ export async function connectMcpStdio(
       );
     }
 
-    const addon = await getMcpAddon();
+    const addon = mcpApi(scp);
     const nativeHandle = await addon.mcpClientConnectStdio([command, ...args]);
     let disconnected = false;
 
