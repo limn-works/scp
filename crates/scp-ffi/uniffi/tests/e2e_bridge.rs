@@ -316,9 +316,20 @@ async fn context_create_returns_active_context() {
         !handle.context_id().is_empty(),
         "Context ID should be non-empty"
     );
+    // Per commit 509fd2fed, all four FFI bridges now emit spec-compliant
+    // 64-char lowercase hex context IDs (spec §18.4.1), replacing the
+    // old `ctx-<random>` format. Pin the new format so regressions are
+    // caught.
+    let cid = handle.context_id();
+    assert_eq!(
+        cid.len(),
+        64,
+        "Context ID should be 64 lowercase hex chars per §18.4.1, got {cid:?}"
+    );
     assert!(
-        handle.context_id().starts_with("ctx-"),
-        "Context ID should start with ctx-"
+        cid.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "Context ID should be lowercase hex per §18.4.1, got {cid:?}"
     );
     assert_eq!(handle.state().unwrap(), "active");
     assert_eq!(handle.creator_did(), identity.did());
