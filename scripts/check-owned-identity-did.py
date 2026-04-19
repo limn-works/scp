@@ -25,9 +25,16 @@ If the `OwnedIdentityDid` type exists anywhere in `crates/scp-runtime/src/`:
       boundary; `pub` leaks it to downstream crates. See ADR-049
       §"Cross-identity isolation: `OwnedIdentityDid` capability tag".
 
-  (C) The declaration MUST NOT carry `#[derive(...)]` listing ANY of:
+  (C) The declaration MUST NOT carry a `derive(...)` — plain
+      `#[derive(...)]` OR conditional `#[cfg_attr(..., derive(...))]` —
+      listing ANY of:
       Clone, Copy, Serialize, Deserialize, Default, Hash, PartialEq,
       Eq, Borrow, From, Into, Debug, Display, Deref, AsRef.
+      `cfg_attr(..., derive(X))` expands to `#[derive(X)]` at cfg-eval
+      time; the two forms are equivalent as far as the capability
+      boundary is concerned, and the scanner flags them equivalently by
+      extracting every `derive(...)` group from each attribute's text
+      regardless of outer wrapper.
       The intent of each non-derive is documented in ADR-049:
         - Clone/Copy: leaks the capability.
         - Serialize/Deserialize: smuggles it across trust boundaries.
@@ -96,6 +103,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -182,41 +190,201 @@ def _visibility_of(node, source: bytes) -> str:
     return ""
 
 
+def _strip_string_literals(s: str) -> str:
+    """Replace every `"..."` string literal and every `r#"..."#`/`r"..."`
+    raw string literal body with spaces, preserving length. This prevents
+    an accidental match on `derive(...)` text that lives inside a
+    doc-comment attribute's string payload (`#[doc = "derive(X)"]`) or
+    any other attribute whose argument happens to be a string literal
+    mentioning the word `derive`.
+
+    Byte-string literals (`b"..."`) and char literals (`'x'`) are NOT
+    attribute-relevant for `derive` extraction but are handled by the
+    same pass for consistency.
+
+    Length is preserved so that the caller's regex positions still map
+    back into the original attribute text for reporting (not used
+    internally here, but future-proofs the helper).
+    """
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        # Raw string: r"..."   or   r#"..."#  ...  r##"..."##
+        if ch == "r" and i + 1 < n and (s[i + 1] == '"' or s[i + 1] == "#"):
+            # Count hashes.
+            hashes = 0
+            j = i + 1
+            while j < n and s[j] == "#":
+                hashes += 1
+                j += 1
+            if j < n and s[j] == '"':
+                # Scan until closing `"` followed by exactly `hashes` `#`s.
+                k = j + 1
+                closer = '"' + ("#" * hashes)
+                while k < n:
+                    if s[k] == '"' and s[k : k + len(closer)] == closer:
+                        end = k + len(closer)
+                        out.append("r")
+                        out.append(" " * (end - i - 1))
+                        i = end
+                        break
+                    k += 1
+                else:
+                    # Unterminated — just copy.
+                    out.append(ch)
+                    i += 1
+                continue
+        if ch == '"':
+            # Regular string: scan for unescaped `"`.
+            j = i + 1
+            while j < n:
+                if s[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if s[j] == '"':
+                    break
+                j += 1
+            end = min(j + 1, n)
+            out.append('"')
+            out.append(" " * (end - i - 2))
+            out.append('"' if j < n else "")
+            i = end
+            continue
+        if ch == "'":
+            # Char literal: `'x'` or `'\n'` or lifetime `'a`. We only care
+            # about delimited single-quote pairs; lifetimes are fine to
+            # leave as-is (they never contain `derive`). Conservative:
+            # if the next-next char is `'`, treat as char literal.
+            if i + 2 < n and s[i + 2] == "'":
+                out.append("' '")
+                i += 3
+                continue
+            if i + 3 < n and s[i + 1] == "\\" and s[i + 3] == "'":
+                out.append("'  '")
+                i += 4
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _extract_derive_groups(attr_text: str) -> list[str]:
+    """Return the list of derive-identifier names collected from EVERY
+    `derive(...)` group appearing inside a single attribute text,
+    regardless of the outer wrapper.
+
+    Handles:
+      `#[derive(Clone, Debug)]`
+      `#[derive(serde::Serialize)]`
+      `#[cfg_attr(feature = "x", derive(Clone))]`
+      `#[cfg_attr(all(feature = "a", not(feature = "b")), derive(Serialize, Deserialize))]`
+      `#[cfg_attr(feature = "x", derive(Clone), derive(Debug))]`         (pathological — both)
+      `#[cfg_attr(feature = "x", derive(Clone, Debug), allow(dead_code))]` (mixed meta)
+
+    Non-matches (must NOT extract):
+      `#[allow(derive_hash_xor_eq)]`      — `derive_hash_xor_eq` is an ident, not `derive`
+      `#[my_derive(Foo)]`                 — `my_derive` has a word char before `derive`
+      `#[doc = "derive(X)"]`              — `derive(X)` inside a string literal
+
+    Strategy: strip every string literal first (so `derive(X)` inside a
+    doc-comment payload cannot match), then scan for every
+    `\\bderive\\s*\\(` position, then paren-balance from that opening
+    paren to its matching close. Split the inner text on top-level
+    commas (a depth counter suppresses commas nested inside
+    `derive(serde::Serialize)`-style scoped paths that have no inner
+    parens, or any exotic nested groups). For each name, drop any
+    leading `path::` segments to keep only the trait tail.
+    """
+    attr_text = _strip_string_literals(attr_text)
+    names: list[str] = []
+    for m in re.finditer(r"\bderive\s*\(", attr_text):
+        open_idx = m.end() - 1  # position of the `(`
+        depth = 1
+        i = open_idx + 1
+        while i < len(attr_text) and depth > 0:
+            ch = attr_text[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            i += 1
+        if depth != 0:
+            # Truncated / malformed — skip this group rather than
+            # misattribute identifiers. tree-sitter-level malformed
+            # input would fail the parse earlier; this guard is defence
+            # in depth for regex-level edge cases.
+            continue
+        inner = attr_text[open_idx + 1 : i - 1]
+
+        # Split on top-level commas (depth-aware; there shouldn't be
+        # nested parens inside a `derive(...)` group in practice, but
+        # the balanced walker is cheap and future-proof).
+        depth2 = 0
+        buf: list[str] = []
+        current: list[str] = []
+        for ch in inner:
+            if ch == "(" or ch == "[" or ch == "{":
+                depth2 += 1
+                current.append(ch)
+            elif ch == ")" or ch == "]" or ch == "}":
+                depth2 -= 1
+                current.append(ch)
+            elif ch == "," and depth2 == 0:
+                buf.append("".join(current))
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            buf.append("".join(current))
+
+        for raw in buf:
+            name = raw.strip()
+            # Handle paths like `serde::Serialize` — keep only the last
+            # segment.
+            if "::" in name:
+                name = name.rsplit("::", 1)[-1]
+            # Strip generic parameters if somehow present (unusual but
+            # cheap to guard: `Foo<T>` -> `Foo`).
+            if "<" in name:
+                name = name.split("<", 1)[0].strip()
+            if name:
+                names.append(name)
+    return names
+
+
 def _preceding_derives(node, source: bytes) -> list[str]:
-    """Return the union of derive identifiers from every #[derive(...)]
-    attribute that precedes this item, handling comment interleavings.
+    """Return the union of derive identifiers from every attribute that
+    precedes this item, including attributes whose outer wrapper is
+    `#[cfg_attr(..., derive(...))]` (conditional-derive bypass).
+
+    Attribute text scanning is paren-balanced: we walk every
+    `derive(...)` group inside the attribute text regardless of outer
+    wrapper. This catches:
+
+      `#[derive(Clone)]`                               (plain derive)
+      `#[cfg_attr(feature = "x", derive(Clone))]`      (conditional)
+      `#[cfg_attr(all(...), derive(Serialize, Deserialize))]` (nested cfg)
+
+    `cfg_attr` expands at cfg-eval time to its inner attributes; a
+    build configuration that activates the feature gate produces a real
+    `#[derive(...)]`. Treating the conditional form identically to the
+    unconditional form closes the bypass that an outer-wrapper text
+    match missed.
+
+    Comment interleavings are skipped so attributes separated from the
+    item by a doc-comment or blank line are still walked.
     """
     derives: list[str] = []
     sibling = node.prev_sibling
     while sibling is not None:
         if sibling.type == "attribute_item":
             txt = node_text(sibling, source)
-            # Match `#[derive(...)]` and extract identifiers.
-            # Use a simple state machine to avoid regex edge cases with
-            # nested parens (rare in derive lists but possible with
-            # `derive(serde::Serialize)`).
-            stripped = txt.strip()
-            if stripped.startswith("#[derive(") or stripped.startswith(
-                "#![derive("
-            ):
-                # Find the matching close paren.
-                open_idx = stripped.index("(")
-                depth = 1
-                i = open_idx + 1
-                while i < len(stripped) and depth > 0:
-                    if stripped[i] == "(":
-                        depth += 1
-                    elif stripped[i] == ")":
-                        depth -= 1
-                    i += 1
-                inner = stripped[open_idx + 1 : i - 1]
-                for raw in inner.split(","):
-                    name = raw.strip()
-                    # Handle paths like `serde::Serialize` — last segment.
-                    if "::" in name:
-                        name = name.rsplit("::", 1)[-1]
-                    if name:
-                        derives.append(name)
+            derives.extend(_extract_derive_groups(txt))
             sibling = sibling.prev_sibling
             continue
         if sibling.type in ("line_comment", "block_comment"):
@@ -549,6 +717,28 @@ REQUIRED_FIXTURE_FAILURES: list[tuple[str, str]] = [
     ("type_alias", "declared as a `type` alias"),
     ("wrong_visibility", "visibility is"),
     ("wrong_location", "must be declared in"),
+    # Conditional-derive (`#[cfg_attr(..., derive(...))]`) bypass. The
+    # outer attribute is NOT a plain `#[derive(...)]` literal, so a
+    # scanner that prefix-matches on `#[derive(` misses it entirely.
+    # At cfg-eval time the outer wrapper expands to a real derive,
+    # minting the forbidden trait — which is why the scanner must
+    # extract derive identifiers from EVERY `derive(...)` group inside
+    # an attribute's text, regardless of outer wrapper. The fixture
+    # adds two cases (BYPASS 8 simple, BYPASS 9 nested-predicate with
+    # `all(..., not(...))`). Both go through the same
+    # `_extract_derive_groups` code path, so asserting on the nested
+    # case proves the simple case too.
+    #
+    # The substring must match ONLY on the forbidden-derive diagnostic
+    # produced by the nested cfg_attr — NOT on the `Forbidden: ...`
+    # recital that every manual-impl diagnostic emits (which also
+    # contains `Deserialize` as a reserved word). The diagnostic
+    # template `f"{TYPE_NAME} has forbidden derive(s): {', '.join(...)}"`
+    # produces `forbidden derive(s): Deserialize, Serialize.` for
+    # BYPASS 9 when extraction works; the word `Deserialize`
+    # immediately after `derive(s): ` is impossible to produce without
+    # real cfg_attr-inside-derive extraction.
+    ("cfg_attr_derive", "forbidden derive(s): Deserialize"),
 ]
 
 
@@ -647,7 +837,7 @@ def do_self_test() -> int:
         f"fixture triggered {len(REQUIRED_FIXTURE_FAILURES)} distinct "
         f"enforcement modes (derive, manual-impl Clone + From, "
         f"public named field, public tuple field, type alias, "
-        f"wrong visibility, wrong location)."
+        f"wrong visibility, wrong location, cfg_attr conditional derive)."
     )
     return 0
 

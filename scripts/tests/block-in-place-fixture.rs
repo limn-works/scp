@@ -29,8 +29,15 @@
 //   12. invocation of a sync-bridge macro
 //   13. `#[cfg(not(test))] mod prod_only { ... }` — production-only modules
 //       MUST NOT be treated as test code and excluded.
+//   14-16. bare-reference bypasses (tuple literal, return position,
+//       struct field initializer).
+//   17. `pub use tokio::task::block_in_place;` — re-export bypass.
+//   18. `pub(crate) use tokio::task::block_in_place;` — same bypass
+//       family with a different visibility modifier. A private
+//       `use tokio::task::block_in_place;` co-located in the same
+//       mod must NOT be flagged (negative case).
 //
-// Plus two allow-listed sites (14, 15) that demonstrate the inline
+// Plus two allow-listed sites that demonstrate the inline
 // `// ci-allow: block-on: <reason>` directive is honored.
 // ---------------------------------------------------------------------------
 
@@ -217,6 +224,29 @@ fn struct_field_init_bare_ref() -> SyncBridgeConfig {
     SyncBridgeConfig {
         bridge: tokio::task::block_in_place,
     }
+}
+
+// Patterns 17 + 18: `pub use` re-exports of `tokio::task::block_in_place`.
+// A `pub use` forwards the primitive to downstream callers where this
+// scanner has no reach — the re-export itself is the bypass. Every
+// visibility modifier form is treated uniformly (pub, pub(crate),
+// pub(super), pub(in ...)). A PRIVATE `use tokio::task::block_in_place;`
+// without any visibility modifier must NOT be flagged (it only brings
+// the primitive into local scope; the call site, if any, is caught by
+// the call-expression scanner).
+//
+// The mod wrapper gives the self-test a named anchor; the body is never
+// executed and inner names are `#[allow(unused_imports)]` to silence
+// lint noise should this file ever be accidentally compiled.
+#[allow(dead_code, unused_imports)]
+mod pub_reexport_cases {
+    // (17) Flagged: pub re-export.
+    pub use tokio::task::block_in_place;
+    // (18) Flagged: pub(crate) re-export.
+    pub(crate) use tokio::task::block_in_place;
+    // Negative case: private `use` — MUST NOT be flagged. No
+    // visibility modifier, so the primitive stays in this module.
+    use tokio::task::block_in_place;
 }
 
 // Allow-listed site 1: block_on with directive on same line (with reason).

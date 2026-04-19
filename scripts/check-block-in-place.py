@@ -206,7 +206,7 @@ class Hit:
     file: str  # repo-relative path
     line: int  # 1-indexed (start)
     end_line: int  # 1-indexed (end; equals `line` for single-line hits)
-    kind: str  # "block_in_place" | "bare_block_in_place" | "block_on" | "runtime_new" | "macro_invocation" | "macro_definition"
+    kind: str  # "block_in_place" | "bare_block_in_place" | "block_on" | "runtime_new" | "macro_invocation" | "macro_definition" | "pub_reexport_block_in_place"
     snippet: str  # short code excerpt
     allow_reason: str | None  # non-None if allow-listed
 
@@ -630,6 +630,69 @@ def _call_is_runtime_new(
     return path_txt in runtime_aliases or tail in runtime_aliases
 
 
+def _use_decl_is_pub_reexport_of_block_in_place(
+    use_node, source: bytes
+) -> bool:
+    """True if `use_node` is a `use_declaration` that
+
+      (a) carries a `visibility_modifier` DIRECT child (`pub`, `pub(crate)`,
+          `pub(super)`, `pub(in path::to::mod)`), AND
+      (b) imports a symbol whose name is `block_in_place`.
+
+    Covers every `pub`-qualified re-export form that makes the
+    primitive available to callers outside the declaring module:
+
+      pub use tokio::task::block_in_place;
+      pub(crate) use tokio::task::block_in_place;
+      pub(super) use tokio::task::block_in_place;
+      pub(in path::to::mod) use tokio::task::block_in_place;
+      pub use tokio::task::block_in_place as bip;           # re-alias
+      pub use tokio::task::{self, block_in_place};           # grouped
+      pub use tokio::task::{block_in_place, spawn_blocking}; # grouped
+      pub use tokio::task::{block_in_place as bip};          # grouped re-alias
+
+    Private `use tokio::task::block_in_place;` (no visibility modifier)
+    is NOT flagged here — it only brings the primitive into local
+    scope, and a subsequent call site will be caught by
+    `_call_is_block_in_place`. The goal of this check is specifically
+    the re-export path where NO call site exists in the declaring
+    crate yet the primitive is forwarded to callers downstream.
+
+    Detection is structural: we look for any `identifier` descendant
+    of the `use_declaration` subtree whose text is `block_in_place`.
+    Path components (`tokio`, `task`) are different identifiers; tree-
+    sitter exposes them as separate nodes in `scoped_identifier`. A
+    collision would require a user module literally named
+    `block_in_place`, which is pathological and correctly flagged
+    (rename to disambiguate).
+    """
+    # (a) Must have a direct `visibility_modifier` child.
+    has_vis = False
+    for child in use_node.children:
+        if child.type == "visibility_modifier":
+            has_vis = True
+            break
+    if not has_vis:
+        return False
+
+    # (b) Must import a symbol named `block_in_place`. Walk the subtree
+    # and check every identifier leaf.
+    found = False
+
+    def walk(node) -> None:
+        nonlocal found
+        if found:
+            return
+        if node.type == "identifier" and node_text(node, source) == "block_in_place":
+            found = True
+            return
+        for c in node.children:
+            walk(c)
+
+    walk(use_node)
+    return found
+
+
 # -----------------------------------------------------------------------------
 # Line extraction / allow-list
 # -----------------------------------------------------------------------------
@@ -762,6 +825,17 @@ def scan_file(rel_path: str) -> tuple[list[Hit], list[str]]:
                 # wrapper itself is visible.
                 if _macro_body_contains_sync_bridge(node, source):
                     record_hit(node, "macro_definition", tctx)
+            elif node.type == "use_declaration":
+                # `pub`-qualified re-export of `block_in_place`
+                # (including `pub(crate)`, `pub(super)`, `pub(in ...)`,
+                # grouped imports, and `as`-rebinds). A private `use`
+                # only brings the primitive into local scope and is
+                # caught at the call site; a `pub use` forwards it to
+                # callers downstream where this scanner cannot reach,
+                # so the re-export itself must be flagged. See
+                # `_use_decl_is_pub_reexport_of_block_in_place`.
+                if _use_decl_is_pub_reexport_of_block_in_place(node, source):
+                    record_hit(node, "pub_reexport_block_in_place", tctx)
             elif node.type in ("scoped_identifier", "identifier"):
                 # Bare-expression bypass: `block_in_place` (or an alias)
                 # used as a value — in a tuple literal, struct-field
@@ -1075,6 +1149,23 @@ REQUIRED_FIXTURE_PATTERNS: list[tuple[str, str]] = [
     #     category as 14–15 (no call, no direct let) and must be
     #     flagged by the bare-reference walker.
     ("bare_block_in_place", "struct_field_init_bare_ref:tokio::task::block_in_place"),
+    # 17. `pub use tokio::task::block_in_place;` — the re-export
+    #     bypass. The declaring module has no call site, but
+    #     downstream callers inherit the primitive through the
+    #     re-export. Neither the call-site scanner nor the
+    #     bare-reference walker sees this (ancestor walk excludes any
+    #     expression inside a `use_declaration`). The new
+    #     `_use_decl_is_pub_reexport_of_block_in_place` check flags
+    #     the `use_declaration` whole when it carries a visibility
+    #     modifier and the imported symbol name is `block_in_place`.
+    #     Anchored on a dedicated fixture mod so the substring match
+    #     is tight to the `pub use` line.
+    ("pub_reexport_block_in_place", "pub_reexport_cases:pub use tokio::task::block_in_place"),
+    # 18. `pub(crate) use tokio::task::block_in_place;` — same
+    #     bypass family, distinct visibility modifier. The scanner
+    #     treats every `visibility_modifier` form uniformly (pub,
+    #     pub(crate), pub(super), pub(in ...)).
+    ("pub_reexport_block_in_place", "pub_reexport_cases:pub(crate) use tokio::task::block_in_place"),
 ]
 
 

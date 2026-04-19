@@ -83,6 +83,42 @@ impl OwnedIdentityDid {
 #[allow(dead_code)]
 pub(super) struct OwnedIdentityDid(pub(super) Did);
 
+// BYPASS 8: conditional-derive via `cfg_attr` with a single feature
+// predicate. The outer attribute is
+// `#[cfg_attr(feature = "testing", derive(Clone))]` — NOT a
+// `#[derive(Clone)]` literal, so a scanner that only recognizes an
+// attribute whose text starts with `#[derive(` misses it completely.
+// At cfg-eval time the feature activates and this becomes a real
+// `#[derive(Clone)]`, minting the forbidden trait. The scanner MUST
+// scan every attribute's TEXT for a balanced `derive(...)` group,
+// regardless of outer wrapper (cfg_attr, other future wrappers).
+//
+// Kept as a unit struct so NO other enforcement check fires — only
+// the derive check (C) produces a `forbidden derive(s): Clone.`
+// diagnostic. Detection here is proven by transitivity: BYPASS 9
+// uses the same `_extract_derive_groups` code path against a nested
+// cfg_attr predicate and carries the self-test's substring anchor
+// (`forbidden derive(s): Deserialize`). If extraction works for
+// the nested case, it works for this simple case too.
+#[allow(dead_code)]
+#[cfg_attr(feature = "testing", derive(Clone))]
+pub(super) struct OwnedIdentityDid;
+
+// BYPASS 9: conditional-derive with a nested predicate —
+// `cfg_attr(all(feature = "a", not(feature = "b")), derive(Serialize, Deserialize))`.
+// Tests the derive-group extractor against a `cfg_attr` whose first
+// argument is a nested `all(...)` / `not(...)` predicate (paren-
+// balanced with multiple `feature = "..."` strings). The derive group
+// contains two identifiers and must extract BOTH.
+//
+// `Deserialize` is unique to this bypass — no other fixture
+// declaration has `Deserialize` in its derive list — so the
+// self-test asserts the diagnostic contains `Deserialize` to prove
+// the nested form is handled.
+#[allow(dead_code)]
+#[cfg_attr(all(feature = "a", not(feature = "b")), derive(Serialize, Deserialize))]
+pub(super) struct OwnedIdentityDid;
+
 // @file: context/supervisor/other_bypass.rs
 // Still under the required supervisor module tree, but NOT at the
 // `identity_capability.rs` path. The location check should flag these.
