@@ -4792,7 +4792,6 @@ pub fn verify_participation_requirements(
 // aggregate_trust_input (§7.3)
 // ---------------------------------------------------------------------------
 
-
 /// Per-instance equivalent of [`uniffi_append_provenance_event`].
 ///
 /// Appends a provenance event to the UCAN event log on `bi` instead of
@@ -5524,7 +5523,6 @@ fn uniffi_parse_handle_target(
     })
 }
 
-
 // ---------------------------------------------------------------------------
 // Sync — get policy (#428)
 // ---------------------------------------------------------------------------
@@ -6050,8 +6048,6 @@ impl scp_core::context::invitation::TrustOracle for UniffiBridgeTrustOracle {
     }
 }
 
-
-
 // ---------------------------------------------------------------------------
 // SCPID authentication (§3.11)
 // ---------------------------------------------------------------------------
@@ -6384,7 +6380,6 @@ pub fn economy_evaluate_formula(
     Ok(scp_core::economy::evaluate_formula(&formula, &metrics)
         .map(scp_core::economy::Amount::value))
 }
-
 
 // ---------------------------------------------------------------------------
 // Economy helpers
@@ -12882,11 +12877,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `petname_resolve_did`.
-    pub fn petname_resolve_did(
-        &self,
-        owner_did: String,
-        name: String,
-    ) -> Result<String, ScpError> {
+    pub fn petname_resolve_did(&self, owner_did: String, name: String) -> Result<String, ScpError> {
         if owner_did.is_empty() {
             return Err(ScpError::Validation {
                 msg: "owner_did must not be empty".to_owned(),
@@ -13020,15 +13011,15 @@ impl Scp {
             target,
             metadata: Some(scp_core::discovery::HandleMetadata { description, tags }),
         };
-        let mut guard = self
-            .inner
-            .core
-            .handle_registries()
-            .lock()
-            .map_err(|e| ScpError::Validation {
-                msg: format!("handle registry lock poisoned: {e}"),
-                code: codes::VALID_7120.to_owned(),
-            })?;
+        let mut guard =
+            self.inner
+                .core
+                .handle_registries()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("handle registry lock poisoned: {e}"),
+                    code: codes::VALID_7120.to_owned(),
+                })?;
         let registry = guard
             .entry(discovery_context_id.clone())
             .or_insert_with(|| scp_core::discovery::HandleRegistry::new(discovery_context_id));
@@ -13055,23 +13046,21 @@ impl Scp {
             Some("context") => Some(scp_core::discovery::HandleTypeFilter::Context),
             Some(other) => {
                 return Err(ScpError::Validation {
-                    msg: format!(
-                        "invalid type_filter '{other}': expected 'identity' or 'context'"
-                    ),
+                    msg: format!("invalid type_filter '{other}': expected 'identity' or 'context'"),
                     code: codes::VALID_7123.to_owned(),
                 });
             }
             None => None,
         };
-        let guard = self
-            .inner
-            .core
-            .handle_registries()
-            .lock()
-            .map_err(|e| ScpError::Validation {
-                msg: format!("handle registry lock poisoned: {e}"),
-                code: codes::VALID_7120.to_owned(),
-            })?;
+        let guard =
+            self.inner
+                .core
+                .handle_registries()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("handle registry lock poisoned: {e}"),
+                    code: codes::VALID_7120.to_owned(),
+                })?;
         let result = guard.get(&discovery_context_id).map_or_else(
             || scp_core::discovery::HandleLookupResult {
                 results: Vec::new(),
@@ -13096,15 +13085,15 @@ impl Scp {
         handle: String,
         did: String,
     ) -> Result<String, ScpError> {
-        let mut guard = self
-            .inner
-            .core
-            .handle_registries()
-            .lock()
-            .map_err(|e| ScpError::Validation {
-                msg: format!("handle registry lock poisoned: {e}"),
-                code: codes::VALID_7120.to_owned(),
-            })?;
+        let mut guard =
+            self.inner
+                .core
+                .handle_registries()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("handle registry lock poisoned: {e}"),
+                    code: codes::VALID_7120.to_owned(),
+                })?;
         let result = guard.get_mut(&discovery_context_id).map_or_else(
             || scp_core::discovery::HandleDeregisterResult { removed: false },
             |registry| {
@@ -13141,9 +13130,11 @@ impl Scp {
 
         // Validate relay URLs at the FFI boundary
         for url in &relay_urls {
-            scp_ffi_common::validate::validate_relay_url(url).map_err(|e| ScpError::Validation {
-                msg: e.to_string(),
-                code: codes::VALID_7135.to_owned(),
+            scp_ffi_common::validate::validate_relay_url(url).map_err(|e| {
+                ScpError::Validation {
+                    msg: e.to_string(),
+                    code: codes::VALID_7135.to_owned(),
+                }
             })?;
         }
 
@@ -13192,22 +13183,18 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `scope_lookup`.
-    pub fn scope_lookup(
-        &self,
-        scope_context_id: String,
-        name: String,
-    ) -> Result<String, ScpError> {
+    pub fn scope_lookup(&self, scope_context_id: String, name: String) -> Result<String, ScpError> {
         validate_context_id(&scope_context_id)?;
 
-        let guard = self
-            .inner
-            .core
-            .scope_registries()
-            .lock()
-            .map_err(|e| ScpError::Validation {
-                msg: format!("scope registry lock poisoned: {e}"),
-                code: codes::VALID_7130.to_owned(),
-            })?;
+        let guard =
+            self.inner
+                .core
+                .scope_registries()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("scope registry lock poisoned: {e}"),
+                    code: codes::VALID_7130.to_owned(),
+                })?;
 
         let result = match guard.get(&scope_context_id) {
             Some(registry) => registry
@@ -13291,14 +13278,14 @@ impl Scp {
                     code: codes::VALID_7090.to_owned(),
                 })?
             } else {
-                let guard = bi
-                    .core
-                    .handle_registries()
-                    .lock()
-                    .map_err(|e| ScpError::Validation {
-                        msg: format!("handle registry lock poisoned: {e}"),
-                        code: codes::VALID_7120.to_owned(),
-                    })?;
+                let guard =
+                    bi.core
+                        .handle_registries()
+                        .lock()
+                        .map_err(|e| ScpError::Validation {
+                            msg: format!("handle registry lock poisoned: {e}"),
+                            code: codes::VALID_7120.to_owned(),
+                        })?;
                 guard.keys().map(|k| (k.clone(), k.clone())).collect()
             };
 
@@ -13537,10 +13524,7 @@ impl Scp {
     // ----- Context export/import methods -----
 
     /// Per-instance equivalent of the free-function `context_export`.
-    pub async fn context_export(
-        &self,
-        handle: Arc<ContextHandle>,
-    ) -> Result<Vec<u8>, ScpError> {
+    pub async fn context_export(&self, handle: Arc<ContextHandle>) -> Result<Vec<u8>, ScpError> {
         self.inner
             .core
             .check_handle(handle.instance_id())
@@ -13574,10 +13558,12 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let export = scp_core::context::export_import::deserialize_export(&data)
-                    .map_err(|e| ScpError::Context {
-                        msg: format!("invalid export data: {e}"),
-                        code: codes::CTX_2032.to_owned(),
+                let export =
+                    scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
+                        ScpError::Context {
+                            msg: format!("invalid export data: {e}"),
+                            code: codes::CTX_2032.to_owned(),
+                        }
                     })?;
                 let context_id = export.snapshot.context_id.clone();
 
@@ -13630,22 +13616,26 @@ impl Scp {
             })?;
 
         let policy: Option<AutoAcceptPolicy> = match policy_json {
-            Some(ref json) => Some(serde_json::from_str(json).map_err(|e| {
-                ScpError::Validation {
-                    msg: format!("failed to parse auto-accept policy JSON: {e}"),
-                    code: codes::VALID_7010.to_owned(),
-                }
-            })?),
+            Some(ref json) => {
+                Some(
+                    serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                        msg: format!("failed to parse auto-accept policy JSON: {e}"),
+                        code: codes::VALID_7010.to_owned(),
+                    })?,
+                )
+            }
             None => None,
         };
 
         let spending: Option<SpendingContext> = match spending_json {
-            Some(ref json) => Some(serde_json::from_str(json).map_err(|e| {
-                ScpError::Validation {
-                    msg: format!("failed to parse spending context JSON: {e}"),
-                    code: codes::VALID_7010.to_owned(),
-                }
-            })?),
+            Some(ref json) => {
+                Some(
+                    serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                        msg: format!("failed to parse spending context JSON: {e}"),
+                        code: codes::VALID_7010.to_owned(),
+                    })?,
+                )
+            }
             None => None,
         };
 
@@ -13658,17 +13648,19 @@ impl Scp {
         };
         let inviter = scp_identity::DID::from(inviter_did.as_str());
 
-        let decision = self.inner.with_rate_limit_tracker(&identity_did, |tracker| {
-            core_evaluate(
-                &params,
-                &inviter,
-                policy.as_ref(),
-                spending.as_ref(),
-                &oracle,
-                tracker,
-                &scp_core::time::SystemClock,
-            )
-        });
+        let decision = self
+            .inner
+            .with_rate_limit_tracker(&identity_did, |tracker| {
+                core_evaluate(
+                    &params,
+                    &inviter,
+                    policy.as_ref(),
+                    spending.as_ref(),
+                    &oracle,
+                    tracker,
+                    &scp_core::time::SystemClock,
+                )
+            });
 
         match decision {
             Ok(EvaluationDecision::AutoAccept) => Ok("auto_accept".to_owned()),
@@ -13741,16 +13733,17 @@ mod tests {
     /// is a required non-optional parameter. See issue #423.
     #[tokio::test]
     async fn tool_invoke_rejects_none_ucan_token() {
-        let result = scp_test().tool_invoke(
-            test_handle(),
-            "test-tool".to_owned(),
-            "{}".to_owned(),
-            test_identity(),
-            None, // No UCAN token
-            None,
-            None, // spending_ucan_jwt
-        )
-        .await;
+        let result = scp_test()
+            .tool_invoke(
+                test_handle(),
+                "test-tool".to_owned(),
+                "{}".to_owned(),
+                test_identity(),
+                None, // No UCAN token
+                None,
+                None, // spending_ucan_jwt
+            )
+            .await;
 
         let err = result.expect_err("None ucan_token must be rejected");
         match err {
@@ -14059,7 +14052,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp_test()
+            .tool_register(handle, def)
             .await
             .expect_err("invalid input_schema_json must be rejected");
         match err {
@@ -14088,7 +14082,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp_test()
+            .tool_register(handle, def)
             .await
             .expect_err("invalid output_schema_json must be rejected");
         match err {
@@ -14119,7 +14114,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp_test()
+            .tool_register(handle, def)
             .await
             .expect_err("non-object input_schema must be rejected");
         match err {
@@ -14152,7 +14148,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp_test()
+            .tool_register(handle, def)
             .await
             .expect_err("non-object output_schema must be rejected");
         match err {
@@ -14187,7 +14184,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp_test()
+            .tool_register(handle, def)
             .await
             .expect_err("non-array test_vectors_json must be rejected");
         match err {
@@ -14217,7 +14215,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp_test()
+            .tool_register(handle, def)
             .await
             .expect_err("test vectors with missing fields must be rejected");
         match err {
@@ -14244,7 +14243,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp_test()
+            .tool_register(handle, def)
             .await
             .expect_err("implementation_hash with wrong length must be rejected");
         match err {
@@ -14277,7 +14277,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp_test()
+            .tool_register(handle, def)
             .await
             .expect_err("implementation_hash with wrong length must be rejected");
         match err {
@@ -14413,7 +14414,8 @@ mod tests {
             cost: None,
         };
 
-        let tool_id = scp_test().tool_register(handle.clone(), def)
+        let tool_id = scp_test()
+            .tool_register(handle.clone(), def)
             .await
             .expect("tool_register should succeed");
 
@@ -14680,7 +14682,9 @@ mod tests {
     /// `mcp_client_disconnect` must reject unknown handle.
     #[tokio::test]
     async fn mcp_client_disconnect_rejects_unknown_handle() {
-        let result = scp_test().mcp_client_disconnect("mcp-client-nonexistent".to_owned()).await;
+        let result = scp_test()
+            .mcp_client_disconnect("mcp-client-nonexistent".to_owned())
+            .await;
         let err = result.expect_err("unknown handle must be rejected");
         match err {
             ScpError::Transport { ref code, .. } => {
@@ -14693,7 +14697,9 @@ mod tests {
     /// `mcp_client_list_tools` must reject unknown handle.
     #[tokio::test]
     async fn mcp_client_list_tools_rejects_unknown_handle() {
-        let result = scp_test().mcp_client_list_tools("mcp-client-nonexistent".to_owned()).await;
+        let result = scp_test()
+            .mcp_client_list_tools("mcp-client-nonexistent".to_owned())
+            .await;
         let err = result.expect_err("unknown handle must be rejected");
         match err {
             ScpError::Transport { ref code, .. } => {
@@ -14706,14 +14712,15 @@ mod tests {
     /// `mcp_client_invoke` must reject invalid input JSON.
     #[tokio::test]
     async fn mcp_client_invoke_rejects_unknown_handle() {
-        let result = scp_test().mcp_client_invoke(
-            "mcp-client-nonexistent".to_owned(),
-            "test-tool".to_owned(),
-            "{}".to_owned(),
-            "ctx-test".to_owned(),
-            "did:dht:z6MkTestUser".to_owned(),
-        )
-        .await;
+        let result = scp_test()
+            .mcp_client_invoke(
+                "mcp-client-nonexistent".to_owned(),
+                "test-tool".to_owned(),
+                "{}".to_owned(),
+                "ctx-test".to_owned(),
+                "did:dht:z6MkTestUser".to_owned(),
+            )
+            .await;
         let err = result.expect_err("unknown handle must be rejected");
         match err {
             ScpError::Transport { ref code, .. } => {
@@ -14726,7 +14733,9 @@ mod tests {
     /// `mcp_server_stop` must reject unknown handle.
     #[tokio::test]
     async fn mcp_server_stop_rejects_unknown_handle() {
-        let result = scp_test().mcp_server_stop("mcp-server-nonexistent".to_owned()).await;
+        let result = scp_test()
+            .mcp_server_stop("mcp-server-nonexistent".to_owned())
+            .await;
         let err = result.expect_err("unknown handle must be rejected");
         match err {
             ScpError::Transport { ref code, .. } => {
