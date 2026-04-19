@@ -48,7 +48,7 @@
 pub mod context;
 pub mod economy;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use pyo3::prelude::*;
@@ -237,71 +237,6 @@ fn shutdown_runtime(timeout_millis: u64) {
     }
 }
 
-/// Suspends the bridge instance for mobile app backgrounding.
-///
-/// Disconnects transport (clears relay connection) and marks the instance as
-/// suspended. Context state is preserved — the instance remains alive but
-/// inactive. Transport-dependent operations will fail until [`scp_resume`]
-/// is called.
-///
-/// After suspension, callers should call [`scp_resume`] to re-activate,
-/// then re-establish the relay connection via `transport_connect`.
-///
-/// No-op if the instance is already shut down or not initialized.
-///
-/// # Errors
-///
-/// Raises `TransportError` if transport cleanup fails (transport lock is
-/// poisoned).
-#[pyfunction]
-pub fn scp_suspend() -> PyResult<()> {
-    if let Some(bi) = runtime::bridge_instance_raw() {
-        bi.core
-            .suspend()
-            .map_err(|e| crate::error::ScpPyError::transport(format!("suspend failed: {e}")))?;
-    }
-    Ok(())
-}
-
-/// Resumes a suspended bridge instance.
-///
-/// Clears the suspended flag so bridge operations can proceed. The caller
-/// must re-establish the relay connection via `transport_connect` — resume
-/// does not reconnect automatically. Use `transport_status()` to check
-/// the previous relay URL.
-///
-/// No-op if the instance is not initialized.
-///
-/// # Errors
-///
-/// Raises `ContextError` (code `SCP-CTX-2000`) if the instance has been
-/// permanently shut down (`shutdown_runtime` was already called). The
-/// `CTX_2000` code matches the NAPI and `UniFFI` bridges exactly so the
-/// Python SDK wrapper can surface a consistent identifier across runtimes.
-#[pyfunction]
-pub fn scp_resume(py: Python<'_>) -> PyResult<()> {
-    if let Some(bi) = runtime::bridge_instance_raw() {
-        let rt = crate::runtime()?;
-        let bi = Arc::clone(bi);
-        // Release the GIL — `resume` chains async transport reconnect and
-        // persisted-context restoration. Construct ContextError with
-        // explicit CTX_2000 (not the `context()` helper, which defaults to
-        // CTX_2001). Matches NAPI (`scp-ffi/napi/src/lib.rs::scp_resume`)
-        // and UniFFI (`scp-ffi/uniffi/src/lib.rs::scp_resume`) behaviour so
-        // all three bridges emit the same code on shutdown.
-        py.allow_threads(|| {
-            rt.block_on(async move {
-                scp_ffi_common::bridge_instance::BridgeInstanceCore::resume(&*bi).await
-            })
-        })
-        .map_err(|e| crate::error::ScpPyError::ContextError {
-            message: format!("resume failed: {e}"),
-            code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
-        })?;
-    }
-    Ok(())
-}
-
 /// The `_scp_core` Python extension module.
 ///
 /// This is the entry point for the FFI bridge. It initializes the tokio
@@ -327,8 +262,6 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(runtime_is_initialized, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown_runtime, m)?)?;
-    m.add_function(wrap_pyfunction!(scp_suspend, m)?)?;
-    m.add_function(wrap_pyfunction!(scp_resume, m)?)?;
 
     // Step 4b: Register the SCP #[pyclass] (Phase 4 PR 1 — #1549).
     m.add_class::<scp::PyScp>()?;
