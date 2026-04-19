@@ -3453,4 +3453,26 @@ impl Scp {
             tier_2_threshold_secs,
         )
     }
+
+    /// Per-instance equivalent of the free-function `bridge_create_shadow`.
+    ///
+    /// Routes through `&*self.inner` — the shadow identity state is stored
+    /// in this instance's per-context `BridgeContextState`. Free function
+    /// deleted in Phase 4 PR 4 demolition Phase A gap-fill.
+    #[napi(js_name = "bridgeCreateShadow")]
+    pub fn bridge_create_shadow(
+        &self,
+        bridge_id: String,
+        platform_handle: String,
+        bridge_mode: String,
+        context_id: Option<String>,
+    ) -> napi::Result<crate::bridge_connector::NapiShadowIdentity> {
+        crate::bridge_connector::bridge_create_shadow_on(
+            &self.inner,
+            bridge_id,
+            platform_handle,
+            bridge_mode,
+            context_id,
+        )
+    }
 }

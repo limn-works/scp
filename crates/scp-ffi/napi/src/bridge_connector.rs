@@ -222,14 +222,14 @@ pub fn bridge_register(
     })
 }
 
-/// Creates a shadow identity for an external platform participant.
+/// Per-bridge-instance implementation of `bridge_create_shadow`.
 ///
 /// Uses the persistent per-context `ShadowRegistry` and `SenderKeyStore`
-/// from the process-global bridge state registry, ensuring that shadow
-/// identity state and sender keys survive across function calls.
-#[napi]
+/// from `bi`, ensuring shadow identity state and sender keys survive across
+/// calls for a given `Scp` instance.
 #[allow(clippy::needless_pass_by_value)]
-pub fn bridge_create_shadow(
+pub(crate) fn bridge_create_shadow_on(
+    bi: &crate::runtime::NapiBridgeInstance,
     bridge_id: String,
     platform_handle: String,
     bridge_mode: String,
@@ -249,8 +249,8 @@ pub fn bridge_create_shadow(
         timestamp: 0,
     };
 
-    let bi = crate::runtime::bridge_instance()?;
     let mut entry = bi
+        .core
         .bridge_state()
         .entry(ctx_id.clone())
         .or_insert_with(|| BridgeContextState {
@@ -317,7 +317,7 @@ fn parse_shadow_status(s: &str) -> napi::Result<ShadowProvenanceStatus> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use scp_core::bridge::provenance::BridgeTrustLevel;
@@ -426,7 +426,9 @@ mod tests {
     #[test]
     fn create_shadow_returns_observer_role() {
         crate::runtime::init_context_manager_for_test();
-        let result = bridge_create_shadow(
+        let bi = crate::runtime::default_bridge_instance().expect("default bi");
+        let result = bridge_create_shadow_on(
+            &bi,
             "bridge-1".to_owned(),
             "@user".to_owned(),
             "relay".to_owned(),

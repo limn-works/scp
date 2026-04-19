@@ -149,22 +149,17 @@ pub use bridge::{
     discovery_create_query,
     discovery_normalize_address,
     discovery_parse_address,
-    evaluate_invitation,
     evaluate_provenance_quality,
     // Free functions — event log
     // Free functions — governance (#387)
     // Free functions — governance proposal lifecycle (#621)
     // Free functions — identity
-    identity_execute_custody_migration,
-    identity_execute_recovery,
-    identity_migrate,
     // Free functions — MCP (#591)
     mcp_configure_stdio_allowlist,
     mcp_disable_stdio_allowlist,
     mcp_get_stdio_allowlist,
     mcp_reset_stdio_allowlist,
     // Free functions — provenance (#370)
-    provenance_attach,
     provenance_check_chain_depth,
     // Free functions — local DID management (#387)
     // Free functions — app sandboxing (#595)

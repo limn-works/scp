@@ -2389,6 +2389,11 @@ fn spawn_suppression_scoring_task(
 /// calls. Idempotent: subsequent calls are no-ops.
 ///
 /// See #311 for the DID resolver unification design.
+///
+/// Retained for symmetry with [`ensure_did_resolver_initialized_on`]; the
+/// per-instance variant is used by `Scp::identity_create_with_agent_key`.
+/// All other call sites now route through the `_on` variant.
+#[allow(dead_code)]
 fn ensure_did_resolver_initialized(handle: tokio::runtime::Handle) -> Result<(), ScpError> {
     if crate::runtime::did_resolver().is_some() {
         return Ok(());
@@ -4787,277 +4792,13 @@ pub fn verify_participation_requirements(
 // aggregate_trust_input (§7.3)
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Economic policy bridge (§19.3, ADR-033)
-// ---------------------------------------------------------------------------
 
-/// Sets the economic policy for a context (§19.3).
+/// Per-instance equivalent of [`uniffi_append_provenance_event`].
 ///
-/// Rejects direct economic policy mutation — use governance flow instead
-/// (§19.3, #728).
-///
-/// Economic policy changes MUST go through the governance proposal flow
-/// (`SetEconomicPolicy` action) to ensure event logging and the mandatory
-/// 24-hour notification period. Direct setters bypass these controls.
-///
-/// # Errors
-///
-/// Always returns `ScpError::Permission` directing the caller to use governance.
-#[uniffi::export]
-#[allow(clippy::needless_pass_by_value)] // UniFFI requires owned String parameters
-pub fn set_economic_policy(
-    handle: Arc<ContextHandle>,
-    policy_json: String,
-) -> Result<(), ScpError> {
-    crate::uniffi_check_handle!(handle);
-    let _ = (handle, policy_json);
-    Err(ScpError::Permission {
-        msg: "economic policy changes must go through governance \
-              (propose SetEconomicPolicy action). Direct mutation is \
-              not permitted — see spec §19.3"
-            .to_owned(),
-        code: codes::CTX_2013.to_owned(),
-    })
-}
-
-/// Returns the economic policy for a context as a JSON string, or `None`.
-#[uniffi::export]
-pub fn get_economic_policy(handle: Arc<ContextHandle>) -> Result<Option<String>, ScpError> {
-    crate::uniffi_check_handle!(handle);
-    let guard = handle
-        .economic_policy
-        .lock()
-        .map_err(|_| ScpError::Context {
-            msg: "economic_policy lock is poisoned".to_owned(),
-            code: codes::CTX_2012.to_owned(),
-        })?;
-    Ok(guard.clone())
-}
-
-// ---------------------------------------------------------------------------
-// Context export/import (#363)
-// ---------------------------------------------------------------------------
-
-/// Exports a context's full state as serialized `MessagePack` bytes.
-///
-/// Returns the serialized bytes of a `StoredValue<ContextExport>` envelope
-/// (§17.5), suitable for backup, migration, or transfer to another node.
-///
-/// # Errors
-///
-/// Returns `ScpError::Context` if the context does not exist, export fails,
-/// or serialization fails.
-#[uniffi::export]
-pub async fn context_export(handle: Arc<ContextHandle>) -> Result<Vec<u8>, ScpError> {
-    crate::uniffi_check_handle!(handle);
-    let ctx_id = handle.context_id.clone();
-    let creator_did = handle.creator_did.clone();
-    runtime()
-        .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
-            let export = manager
-                .export_context(&ctx_id, scp_identity::DID::from(creator_did))
-                .await
-                .map_err(ScpError::from)?;
-            scp_core::context::export_import::serialize_export(&export).map_err(|e| {
-                ScpError::Context {
-                    msg: format!("export serialization failed: {e}"),
-                    code: codes::CTX_2030.to_owned(),
-                }
-            })
-        })
-        .await
-        .map_err(|e| ScpError::Context {
-            msg: format!("tokio task join error during context export: {e}"),
-            code: codes::CTX_2031.to_owned(),
-        })?
-}
-
-/// Imports a context from serialized `MessagePack` bytes.
-///
-/// The bytes must be a `StoredValue<ContextExport>` envelope (§17.5), as
-/// produced by [`context_export`].
-///
-/// Returns the context ID of the imported context.
-///
-/// # Errors
-///
-/// Returns `ScpError::Context` if deserialization, validation, or import
-/// fails.
-#[uniffi::export]
-pub async fn context_import(data: Vec<u8>) -> Result<String, ScpError> {
-    runtime()
-        .spawn(async move {
-            let export =
-                scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
-                    ScpError::Context {
-                        msg: format!("invalid export data: {e}"),
-                        code: codes::CTX_2032.to_owned(),
-                    }
-                })?;
-            let context_id = export.snapshot.context_id.clone();
-
-            // Ensure the ContextManager is initialized using the exporter's
-            // DID (carried on the envelope) — context_import is a valid
-            // first operation (e.g. a device receiving exported context
-            // data). `init_context_manager_with_did` is idempotent
-            // (`OnceLock`). #1073
-            validate_did(&export.exporter_did.0)?;
-            crate::runtime::init_context_manager_with_did(&export.exporter_did.0);
-
-            let manager = crate::runtime::context_manager()?;
-            manager
-                .import_context(export)
-                .await
-                .map_err(ScpError::from)?;
-            Ok(context_id)
-        })
-        .await
-        .map_err(|e| ScpError::Context {
-            msg: format!("tokio task join error during context import: {e}"),
-            code: codes::CTX_2033.to_owned(),
-        })?
-}
-
-// ---------------------------------------------------------------------------
-// Provenance — attach and chain depth (#370)
-// ---------------------------------------------------------------------------
-
-/// Attaches provenance metadata when data crosses a context boundary.
-///
-/// Records dual events in the event log: `ProvenanceAttached` in the source
-/// context and `ProvenanceReceived` in the target context (issue #586).
-///
-/// Returns a JSON string with the attached provenance record.
-///
-/// See ADR-019 acceptance criteria 2-3, 6.
-#[uniffi::export]
-#[allow(clippy::too_many_arguments)] // UniFFI requires explicit params
-pub fn provenance_attach(
-    source_context_id: String,
-    source_type: String,
-    memory_scope_str: String,
-    members: Vec<String>,
-    target_context_id: String,
-    actor_did: String,
-    existing_chain_depth: Option<u8>,
-) -> Result<String, ScpError> {
-    let st = match source_type.as_str() {
-        "persistent" => scp_core::provenance::SourceType::Persistent,
-        "ephemeral" => scp_core::provenance::SourceType::Ephemeral,
-        "summary" => scp_core::provenance::SourceType::Summary,
-        other => {
-            return Err(ScpError::Validation {
-                msg: format!("invalid source_type '{other}'"),
-                code: codes::VALID_7040.to_owned(),
-            });
-        }
-    };
-    let ms = match memory_scope_str.as_str() {
-        "full" => scp_core::context::MemoryScope::Full,
-        "summary" => scp_core::context::MemoryScope::Summary,
-        "ephemeral" => scp_core::context::MemoryScope::Ephemeral,
-        other => {
-            return Err(ScpError::Validation {
-                msg: format!("invalid memory_scope '{other}'"),
-                code: codes::VALID_7041.to_owned(),
-            });
-        }
-    };
-
-    let source_info = scp_core::provenance::attach::SourceContextInfo {
-        context_id: source_context_id.clone(),
-        source_type: st,
-        memory_scope: ms,
-        members: members.into_iter().map(scp_identity::DID::from).collect(),
-        discovery_method: scp_core::provenance::DiscoveryMethod::OutOfBand,
-        data_age: std::time::Duration::from_secs(0),
-        purpose: None,
-        counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
-    };
-
-    let existing_prov = existing_chain_depth.map(|depth| scp_core::provenance::DataProvenance {
-        source_context: String::new(),
-        source_type: scp_core::provenance::SourceType::Persistent,
-        counterparties: vec![],
-        purpose: None,
-        discovery_method: scp_core::provenance::DiscoveryMethod::OutOfBand,
-        age: std::time::Duration::from_secs(0),
-        memory_scope: scp_core::context::MemoryScope::Full,
-        chain_depth: depth,
-        chain_path: None,
-        payment_amount: None,
-        payment_adapter: None,
-        payment_receipt_id: None,
-    });
-
-    let prov = scp_core::provenance::attach::attach_provenance(
-        &source_info,
-        &target_context_id,
-        existing_prov.as_ref(),
-        None,
-        None,
-    );
-
-    // Compute provenance hash: SHA-256 of JSON-serialized provenance record.
-    let prov_json_bytes = serde_json::to_vec(&prov).map_err(|e| ScpError::Validation {
-        msg: format!("failed to serialize provenance for hashing: {e}"),
-        code: codes::VALID_7053.to_owned(),
-    })?;
-    let prov_hash: [u8; 32] = sha2::Sha256::digest(&prov_json_bytes).into();
-
-    // Record ProvenanceAttached in the source context event log.
-    // Best-effort: log warning if context not found (provenance_attach
-    // can be called without a runtime context, e.g. in unit tests).
-    if let Err(e) = uniffi_append_provenance_event(
-        &source_context_id,
-        &actor_did,
-        scp_event_log::EventType::ProvenanceAttached,
-        &prov_hash,
-    ) {
-        tracing::warn!(
-            context = %source_context_id,
-            error = %e,
-            "failed to append ProvenanceAttached event to source context event log"
-        );
-    }
-
-    // Record ProvenanceReceived in the target context event log.
-    if let Err(e) = uniffi_append_provenance_event(
-        &target_context_id,
-        &actor_did,
-        scp_event_log::EventType::ProvenanceReceived,
-        &prov_hash,
-    ) {
-        tracing::warn!(
-            context = %target_context_id,
-            error = %e,
-            "failed to append ProvenanceReceived event to target context event log"
-        );
-    }
-
-    let result = serde_json::json!({
-        "source_context": prov.source_context,
-        "source_type": format!("{:?}", prov.source_type),
-        "chain_depth": prov.chain_depth,
-        "counterparties": prov.counterparties.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "age_secs": prov.age.as_secs(),
-        "memory_scope": format!("{:?}", prov.memory_scope),
-        "chain_path": prov.chain_path,
-        "purpose": prov.purpose,
-    });
-
-    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
-        msg: format!("failed to serialize provenance: {e}"),
-        code: codes::VALID_7042.to_owned(),
-    })
-}
-
-/// Appends a provenance event to the event log for the given context.
-///
-/// Uses the UCAN state registry's per-context event log, following the
-/// unsigned-event pattern used by `ToolInvoked` in other bridges.
-fn uniffi_append_provenance_event(
+/// Appends a provenance event to the UCAN event log on `bi` instead of
+/// the process-global default bridge instance.
+fn uniffi_append_provenance_event_on(
+    bi: &crate::runtime::UniffiBridgeInstance,
     context_id: &str,
     actor_did: &str,
     event_type: scp_event_log::EventType,
@@ -5068,7 +4809,7 @@ fn uniffi_append_provenance_event(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
 
-    crate::runtime::with_ucan_state(context_id, |state| {
+    bi.with_ucan_state(context_id, |state| {
         let sequence = scp_event_log::tree::event_count(&state.event_log);
         let prev_hash = if state.event_log.leaves().is_empty() {
             scp_event_log::tree::GENESIS_PREV_HASH
@@ -5770,586 +5511,8 @@ pub fn discovery_normalize_address(address: String) -> String {
     scp_core::discovery::normalize_address(&address)
 }
 
-// ---------------------------------------------------------------------------
-// Petname bridge functions (§22.4)
-// ---------------------------------------------------------------------------
-
-use crate::runtime::default_bridge_instance;
+// Shared helper for petname/handle/scope/address_resolve methods on `Scp`.
 use scp_ffi_common::petname_helpers;
-
-/// Sets a petname for a DID.
-#[uniffi::export]
-pub fn petname_set(owner_did: String, target_did: String, name: String) -> Result<(), ScpError> {
-    if owner_did.is_empty() {
-        return Err(ScpError::Validation {
-            msg: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        });
-    }
-    if target_did.is_empty() {
-        return Err(ScpError::Validation {
-            msg: "target_did must not be empty".to_owned(),
-            code: codes::VALID_7111.to_owned(),
-        });
-    }
-    let bi = default_bridge_instance()?;
-    let mut guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpError::Validation {
-            msg: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    let map = guard.entry(owner_did).or_default();
-    map.set_petname(scp_identity::DID::from(target_did.as_str()), name);
-    Ok(())
-}
-
-/// Removes a petname from a DID.
-#[uniffi::export]
-pub fn petname_remove(owner_did: String, target_did: String) -> Result<(), ScpError> {
-    if owner_did.is_empty() {
-        return Err(ScpError::Validation {
-            msg: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        });
-    }
-    let bi = default_bridge_instance()?;
-    let mut guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpError::Validation {
-            msg: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    if let Some(map) = guard.get_mut(&owner_did) {
-        map.remove_petname(&scp_identity::DID::from(target_did.as_str()));
-    }
-    Ok(())
-}
-
-/// Sets a petname for a context.
-#[uniffi::export]
-pub fn petname_set_context(
-    owner_did: String,
-    context_id: String,
-    name: String,
-) -> Result<(), ScpError> {
-    if owner_did.is_empty() {
-        return Err(ScpError::Validation {
-            msg: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        });
-    }
-    if context_id.is_empty() {
-        return Err(ScpError::Validation {
-            msg: "context_id must not be empty".to_owned(),
-            code: codes::VALID_7113.to_owned(),
-        });
-    }
-    let bi = default_bridge_instance()?;
-    let mut guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpError::Validation {
-            msg: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    let map = guard.entry(owner_did).or_default();
-    map.set_context_petname(context_id, name);
-    Ok(())
-}
-
-/// Removes a petname from a context.
-#[uniffi::export]
-pub fn petname_remove_context(owner_did: String, context_id: String) -> Result<(), ScpError> {
-    if owner_did.is_empty() {
-        return Err(ScpError::Validation {
-            msg: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        });
-    }
-    let bi = default_bridge_instance()?;
-    let mut guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpError::Validation {
-            msg: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    if let Some(map) = guard.get_mut(&owner_did) {
-        map.remove_context_petname(&context_id);
-    }
-    Ok(())
-}
-
-/// Resolves a petname to DIDs. Returns a JSON array of DID strings.
-#[uniffi::export]
-pub fn petname_resolve_did(owner_did: String, name: String) -> Result<String, ScpError> {
-    if owner_did.is_empty() {
-        return Err(ScpError::Validation {
-            msg: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        });
-    }
-    let bi = default_bridge_instance()?;
-    let guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpError::Validation {
-            msg: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    let dids: Vec<String> = guard
-        .get(&owner_did)
-        .map(|map| {
-            map.resolve_did(&name)
-                .into_iter()
-                .map(|d| d.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    serde_json::to_string(&dids).map_err(|e| ScpError::Validation {
-        msg: format!("failed to serialize petname resolve result: {e}"),
-        code: codes::VALID_7114.to_owned(),
-    })
-}
-
-/// Resolves a petname to context IDs. Returns a JSON array of strings.
-#[uniffi::export]
-pub fn petname_resolve_context(owner_did: String, name: String) -> Result<String, ScpError> {
-    if owner_did.is_empty() {
-        return Err(ScpError::Validation {
-            msg: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        });
-    }
-    let bi = default_bridge_instance()?;
-    let guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpError::Validation {
-            msg: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    let ids: Vec<String> = guard
-        .get(&owner_did)
-        .map(|map| map.resolve_context(&name))
-        .unwrap_or_default();
-    serde_json::to_string(&ids).map_err(|e| ScpError::Validation {
-        msg: format!("failed to serialize petname resolve result: {e}"),
-        code: codes::VALID_7114.to_owned(),
-    })
-}
-
-/// Gets the petname for a DID.
-#[uniffi::export]
-pub fn petname_get_for_did(
-    owner_did: String,
-    target_did: String,
-) -> Result<Option<String>, ScpError> {
-    if owner_did.is_empty() {
-        return Err(ScpError::Validation {
-            msg: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        });
-    }
-    let bi = default_bridge_instance()?;
-    let guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpError::Validation {
-            msg: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    Ok(guard.get(&owner_did).and_then(|map| {
-        map.petname_for_did(&scp_identity::DID::from(target_did.as_str()))
-            .map(str::to_owned)
-    }))
-}
-
-/// Gets the petname for a context.
-#[uniffi::export]
-pub fn petname_get_for_context(
-    owner_did: String,
-    context_id: String,
-) -> Result<Option<String>, ScpError> {
-    if owner_did.is_empty() {
-        return Err(ScpError::Validation {
-            msg: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        });
-    }
-    let bi = default_bridge_instance()?;
-    let guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpError::Validation {
-            msg: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    Ok(guard
-        .get(&owner_did)
-        .and_then(|map| map.petname_for_context(&context_id).map(str::to_owned)))
-}
-
-// ---------------------------------------------------------------------------
-// Handle registry bridge functions (§22.3.1)
-// ---------------------------------------------------------------------------
-
-/// Registers a handle in a context with discovery tools. Returns JSON result.
-#[uniffi::export]
-#[allow(clippy::too_many_arguments)]
-pub fn handle_register(
-    discovery_context_id: String,
-    handle: String,
-    target_json: String,
-    registrant_did: String,
-    description: Option<String>,
-    tags: Option<Vec<String>>,
-) -> Result<String, ScpError> {
-    let target = uniffi_parse_handle_target(&target_json)?;
-    let params = scp_core::discovery::HandleRegisterParams {
-        handle,
-        target,
-        metadata: Some(scp_core::discovery::HandleMetadata { description, tags }),
-    };
-    let bi = default_bridge_instance()?;
-    let mut guard = bi
-        .core
-        .handle_registries()
-        .lock()
-        .map_err(|e| ScpError::Validation {
-            msg: format!("handle registry lock poisoned: {e}"),
-            code: codes::VALID_7120.to_owned(),
-        })?;
-    let registry = guard
-        .entry(discovery_context_id.clone())
-        .or_insert_with(|| scp_core::discovery::HandleRegistry::new(discovery_context_id));
-    let result = registry.register(
-        &params,
-        &scp_identity::DID::from(registrant_did.as_str()),
-        &scp_primitives::SystemClock,
-    );
-    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
-        msg: format!("failed to serialize handle register result: {e}"),
-        code: codes::VALID_7122.to_owned(),
-    })
-}
-
-/// Looks up a handle in a context with discovery tools. Returns JSON result.
-#[uniffi::export]
-pub fn handle_lookup(
-    discovery_context_id: String,
-    handle: String,
-    type_filter: Option<String>,
-) -> Result<String, ScpError> {
-    let filter = match type_filter.as_deref() {
-        Some("identity") => Some(scp_core::discovery::HandleTypeFilter::Identity),
-        Some("context") => Some(scp_core::discovery::HandleTypeFilter::Context),
-        Some(other) => {
-            return Err(ScpError::Validation {
-                msg: format!("invalid type_filter '{other}': expected 'identity' or 'context'"),
-                code: codes::VALID_7123.to_owned(),
-            });
-        }
-        None => None,
-    };
-    let bi = default_bridge_instance()?;
-    let guard = bi
-        .core
-        .handle_registries()
-        .lock()
-        .map_err(|e| ScpError::Validation {
-            msg: format!("handle registry lock poisoned: {e}"),
-            code: codes::VALID_7120.to_owned(),
-        })?;
-    let result = guard.get(&discovery_context_id).map_or_else(
-        || scp_core::discovery::HandleLookupResult {
-            results: Vec::new(),
-        },
-        |registry| {
-            registry.lookup(&scp_core::discovery::HandleLookupParams {
-                handle,
-                type_filter: filter,
-            })
-        },
-    );
-    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
-        msg: format!("failed to serialize handle lookup result: {e}"),
-        code: codes::VALID_7124.to_owned(),
-    })
-}
-
-/// Deregisters a handle from a context with discovery tools. Returns JSON result.
-#[uniffi::export]
-pub fn handle_deregister(
-    discovery_context_id: String,
-    handle: String,
-    did: String,
-) -> Result<String, ScpError> {
-    let bi = default_bridge_instance()?;
-    let mut guard = bi
-        .core
-        .handle_registries()
-        .lock()
-        .map_err(|e| ScpError::Validation {
-            msg: format!("handle registry lock poisoned: {e}"),
-            code: codes::VALID_7120.to_owned(),
-        })?;
-    let result = guard.get_mut(&discovery_context_id).map_or_else(
-        || scp_core::discovery::HandleDeregisterResult { removed: false },
-        |registry| {
-            registry.deregister(&scp_core::discovery::HandleDeregisterParams {
-                handle,
-                did: scp_identity::DID::from(did.as_str()),
-            })
-        },
-    );
-    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
-        msg: format!("failed to serialize handle deregister result: {e}"),
-        code: codes::VALID_7125.to_owned(),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Scope registry bridge functions (§22.3.5, ADR-043)
-// ---------------------------------------------------------------------------
-
-/// Registers a scope name in a scope registry. Returns JSON result.
-#[uniffi::export]
-#[allow(clippy::too_many_arguments)]
-pub fn scope_register(
-    scope_context_id: String,
-    name: String,
-    target_context_id: String,
-    relay_urls: Vec<String>,
-    registrant_did: String,
-    description: Option<String>,
-    tags: Option<Vec<String>>,
-) -> Result<String, ScpError> {
-    // Validate inputs at the FFI boundary (defense-in-depth)
-    validate_context_id(&scope_context_id)?;
-    validate_context_id(&target_context_id)?;
-    validate_did(&registrant_did)?;
-
-    // Validate relay URLs at the FFI boundary
-    for url in &relay_urls {
-        scp_ffi_common::validate::validate_relay_url(url).map_err(|e| ScpError::Validation {
-            msg: e.to_string(),
-            code: codes::VALID_7135.to_owned(),
-        })?;
-    }
-
-    let params = scp_core::discovery::ScopeRegisterParams {
-        name,
-        target: scp_core::discovery::ScopeTarget {
-            context_id: target_context_id,
-            relay_urls,
-        },
-        metadata: if description.is_some() || tags.is_some() {
-            Some(scp_core::discovery::ScopeMetadata { description, tags })
-        } else {
-            None
-        },
-    };
-
-    let bi = default_bridge_instance()?;
-    let mut guard = bi
-        .core
-        .scope_registries()
-        .lock()
-        .map_err(|e| ScpError::Validation {
-            msg: format!("scope registry lock poisoned: {e}"),
-            code: codes::VALID_7130.to_owned(),
-        })?;
-
-    let registry = guard
-        .entry(scope_context_id.clone())
-        .or_insert_with(|| scp_core::discovery::ScopeRegistry::new(scope_context_id));
-
-    let result = registry
-        .register(
-            &params,
-            &scp_identity::DID::from(registrant_did.as_str()),
-            &scp_primitives::SystemClock,
-        )
-        .map_err(|e| ScpError::Validation {
-            msg: format!("scope registration failed: {e}"),
-            code: codes::VALID_7131.to_owned(),
-        })?;
-
-    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
-        msg: format!("failed to serialize scope register result: {e}"),
-        code: codes::VALID_7132.to_owned(),
-    })
-}
-
-/// Looks up a scope name in a scope registry. Returns JSON result.
-#[uniffi::export]
-pub fn scope_lookup(scope_context_id: String, name: String) -> Result<String, ScpError> {
-    validate_context_id(&scope_context_id)?;
-
-    let bi = default_bridge_instance()?;
-    let guard = bi
-        .core
-        .scope_registries()
-        .lock()
-        .map_err(|e| ScpError::Validation {
-            msg: format!("scope registry lock poisoned: {e}"),
-            code: codes::VALID_7130.to_owned(),
-        })?;
-
-    let result = match guard.get(&scope_context_id) {
-        Some(registry) => registry
-            .lookup(&scp_core::discovery::ScopeLookupParams { name })
-            .map_err(|e| ScpError::Validation {
-                msg: format!("scope lookup failed: {e}"),
-                code: codes::VALID_7133.to_owned(),
-            })?,
-        None => scp_core::discovery::ScopeLookupResult {
-            results: Vec::new(),
-        },
-    };
-
-    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
-        msg: format!("failed to serialize scope lookup result: {e}"),
-        code: codes::VALID_7133.to_owned(),
-    })
-}
-
-/// Deregisters a scope name from a scope registry. Returns JSON result.
-#[uniffi::export]
-pub fn scope_deregister(
-    scope_context_id: String,
-    name: String,
-    did: String,
-) -> Result<String, ScpError> {
-    validate_context_id(&scope_context_id)?;
-    validate_did(&did)?;
-
-    let bi = default_bridge_instance()?;
-    let mut guard = bi
-        .core
-        .scope_registries()
-        .lock()
-        .map_err(|e| ScpError::Validation {
-            msg: format!("scope registry lock poisoned: {e}"),
-            code: codes::VALID_7130.to_owned(),
-        })?;
-
-    let result = match guard.get_mut(&scope_context_id) {
-        Some(registry) => registry
-            .deregister(&scp_core::discovery::ScopeDeregisterParams {
-                name,
-                did: scp_identity::DID::from(did.as_str()),
-            })
-            .map_err(|e| ScpError::Validation {
-                msg: format!("scope deregister failed: {e}"),
-                code: codes::VALID_7134.to_owned(),
-            })?,
-        None => scp_core::discovery::ScopeDeregisterResult { removed: false },
-    };
-
-    serde_json::to_string(&result).map_err(|e| ScpError::Validation {
-        msg: format!("failed to serialize scope deregister result: {e}"),
-        code: codes::VALID_7134.to_owned(),
-    })
-}
-
-/// Resolves a human-readable address via multi-path resolution.
-/// Returns a JSON array of `AddressResolution` objects.
-#[uniffi::export]
-pub fn address_resolve(
-    owner_did: String,
-    address: String,
-    known_contexts_json: Option<String>,
-) -> Result<String, ScpError> {
-    if owner_did.is_empty() {
-        return Err(ScpError::Validation {
-            msg: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        });
-    }
-
-    let bi = default_bridge_instance()?;
-
-    let mut known_contexts: std::collections::HashMap<String, String> =
-        if let Some(ref json) = known_contexts_json {
-            serde_json::from_str(json).map_err(|e| ScpError::Validation {
-                msg: format!("invalid known_contexts_json: {e}"),
-                code: codes::VALID_7090.to_owned(),
-            })?
-        } else {
-            let guard = bi
-                .core
-                .handle_registries()
-                .lock()
-                .map_err(|e| ScpError::Validation {
-                    msg: format!("handle registry lock poisoned: {e}"),
-                    code: codes::VALID_7120.to_owned(),
-                })?;
-            guard.keys().map(|k| (k.clone(), k.clone())).collect()
-        };
-
-    // Merge scope registry contexts for two-hop resolution (§22.3.5).
-    let scope_contexts = petname_helpers::known_contexts_from_scope_registries(&bi.core);
-    for (name, ctx_id) in scope_contexts {
-        known_contexts.entry(name).or_insert(ctx_id);
-    }
-
-    let known_domains: Vec<&str> = Vec::new();
-    let petname_map = {
-        let guard = bi
-            .core
-            .petname_maps()
-            .lock()
-            .map_err(|e| ScpError::Validation {
-                msg: format!("petname lock poisoned: {e}"),
-                code: codes::VALID_7112.to_owned(),
-            })?;
-        guard.get(&owner_did).cloned().unwrap_or_default()
-    };
-
-    let handle = tokio::runtime::Handle::current();
-    let results = tokio::task::block_in_place(|| {
-        handle.block_on(async {
-            let mut resolver = scp_core::discovery::AddressResolver::new();
-            let querier = petname_helpers::LocalHandleQuerier::new(&bi.core);
-            resolver
-                .resolve(
-                    &address,
-                    &petname_map,
-                    &querier,
-                    &known_contexts,
-                    &known_domains,
-                    &scp_primitives::SystemClock,
-                )
-                .await
-                .map_err(|e| ScpError::Validation {
-                    msg: format!("address resolution failed: {e}"),
-                    code: codes::VALID_7091.to_owned(),
-                })
-        })
-    })?;
-
-    let json_results: Vec<serde_json::Value> = results
-        .iter()
-        .map(petname_helpers::address_resolution_to_json)
-        .collect();
-    serde_json::to_string(&json_results).map_err(|e| ScpError::Validation {
-        msg: format!("failed to serialize address resolution results: {e}"),
-        code: codes::VALID_7092.to_owned(),
-    })
-}
 
 /// Parses a [`HandleTarget`] from a JSON string, delegating to `scp-ffi-common`.
 fn uniffi_parse_handle_target(
@@ -6361,304 +5524,6 @@ fn uniffi_parse_handle_target(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Identity — create with agent key (#421)
-// ---------------------------------------------------------------------------
-
-/// Creates a new SCP identity with an agent signing key.
-///
-/// Same as `identity_create` but also generates an `#agent` verification
-/// method keypair in the DID document (ADR-039). The returned `Identity`
-/// has `has_agent_key() == true`.
-///
-/// Only available with `"in_memory"` custody when the
-/// `allow_in_memory_custody` feature is enabled. Production mobile builds
-/// must use `identity_create_with_custody` + `add_agent_key`.
-///
-/// # Arguments
-///
-/// * `custody` — Custody method string (`"in_memory"`).
-///
-/// # Errors
-///
-/// Returns `ScpError::Identity` if the custody method is unsupported or
-/// key generation/DHT publish fails.
-///
-/// See ADR-039 acceptance criterion 4 and SCP-AB-016.
-#[uniffi::export]
-pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Identity>, ScpError> {
-    let custody_method = parse_custody_method(&custody)?;
-
-    runtime()
-        .spawn(async move {
-            match custody_method {
-                CustodyMethod::InMemory => {
-                    #[cfg(not(feature = "allow_in_memory_custody"))]
-                    {
-                        Err(ScpError::Identity {
-                            msg: "\"in_memory\" custody is not available in this build \
-                                      — enable the \"allow_in_memory_custody\" feature for \
-                                      dev/desktop use. Production mobile builds must use \
-                                      \"platform\" custody (Secure Enclave / Android Keystore)."
-                                .to_owned(),
-                            code: codes::IDENT_1008.to_owned(),
-                        })
-                    }
-
-                    #[cfg(feature = "allow_in_memory_custody")]
-                    {
-                        let key_custody =
-                            Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
-                        let dht = DidDht::new();
-                        let (identity, document) = dht
-                            .create_with_agent_key(&key_custody.0)
-                            .await
-                            .map_err(ScpError::from)?;
-
-                        // Initialize the production DID resolver for UCAN validation.
-                        crate::runtime::ensure_bridge_instance();
-                        ensure_did_resolver_initialized(tokio::runtime::Handle::current())?;
-
-                        let handle = Arc::new(Identity {
-                            did: identity.did.clone(),
-                            custody_type: CustodyMethod::InMemory,
-                            core_id: Some(identity),
-                            core_document: Some(document),
-                            in_memory_custody: Some(key_custody),
-                            callback_custody: None,
-                            instance_id: crate::runtime::default_instance_id()?,
-                        });
-                        increment_handle_count();
-                        Ok(handle)
-                    }
-                }
-                CustodyMethod::Platform | CustodyMethod::Software => Err(ScpError::Identity {
-                    msg: format!(
-                        "custody type {custody:?} requires a KeyCustodyProvider — \
-                             use identity_create_with_custody() + add_agent_key() to create \
-                             an identity with an agent key using platform custody"
-                    ),
-                    code: codes::IDENT_1003.to_owned(),
-                }),
-                CustodyMethod::External => Err(ScpError::Identity {
-                    msg: "internal: CustodyMethod::External cannot be used with \
-                                  identity_create_with_agent_key — use identity_load for \
-                                  external DID handles"
-                        .to_owned(),
-                    code: codes::IDENT_1005.to_owned(),
-                }),
-            }
-        })
-        .await
-        .map_err(|e| ScpError::Identity {
-            msg: format!("tokio task join error during identity creation with agent key: {e}"),
-            code: codes::IDENT_1007.to_owned(),
-        })?
-}
-
-// ---------------------------------------------------------------------------
-// Identity — migrate (#421)
-// ---------------------------------------------------------------------------
-
-/// Migrates an identity to a new DID (Layer 2 DID rotation).
-///
-/// Generates a new keypair, creates a new DID, and links the old DID to
-/// the new one via `alsoKnownAs` in the old DID document.
-///
-/// # Arguments
-///
-/// * `identity` — The identity to migrate. Must have retained crypto state
-///   (created via `identity_create` or `identity_create_with_agent_key`,
-///   not via `identity_load`).
-///
-/// # Returns
-///
-/// A new `Identity` handle with the migrated DID.
-///
-/// # Errors
-///
-/// Returns `ScpError::Identity` if the identity has no retained crypto
-/// state, key generation fails, or DHT publish fails.
-///
-/// See ADR-003 acceptance criterion 4b.
-#[uniffi::export]
-pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, ScpError> {
-    crate::uniffi_check_handle!(identity);
-    let core_id = identity
-        .core_id
-        .as_ref()
-        .ok_or_else(|| ScpError::Identity {
-            msg: "identity migration requires retained crypto state — this identity \
-                  was loaded without key material (use identity_create or \
-                  identity_create_with_custody)"
-                .to_owned(),
-            code: codes::IDENT_1009.to_owned(),
-        })?;
-    let core_document = identity
-        .core_document
-        .as_ref()
-        .ok_or_else(|| ScpError::Identity {
-            msg: "identity migration requires a retained DID document".to_owned(),
-            code: codes::IDENT_1009.to_owned(),
-        })?;
-
-    // We need a custody provider to generate new keys.
-    #[cfg(feature = "allow_in_memory_custody")]
-    let in_memory = identity.in_memory_custody.as_ref();
-
-    let old_did = identity.did.clone();
-    let old_identity = core_id.clone();
-    let old_document = core_document.clone();
-    let custody_type = identity.custody_type.clone();
-    let instance_id = identity.instance_id;
-
-    #[cfg(feature = "allow_in_memory_custody")]
-    let custody_arc = in_memory.map(Arc::clone);
-    let callback_custody = identity.callback_custody.as_ref().map(Arc::clone);
-
-    runtime()
-        .spawn(async move {
-            // Determine which custody to use for key generation.
-            #[cfg(feature = "allow_in_memory_custody")]
-            if let Some(ref kc) = custody_arc {
-                let pre_rotation_key =
-                    kc.0.generate_keypair(scp_platform::traits::KeyType::Ed25519)
-                        .await
-                        .map_err(|e| ScpError::Identity {
-                            msg: format!("key generation failed during migration: {e}"),
-                            code: codes::IDENT_1009.to_owned(),
-                        })?;
-
-                let rotated_at = scp_primitives::SystemClock.now_secs();
-
-                let dht = DidDht::new();
-                let (new_identity, new_document, _rotation_event) = dht
-                    .migrate_identity(
-                        &old_identity,
-                        &old_document,
-                        &pre_rotation_key,
-                        &kc.0,
-                        rotated_at,
-                    )
-                    .await
-                    .map_err(ScpError::from)?;
-
-                let new_did = new_identity.did.clone();
-                let has_agent = new_document.has_agent_key();
-                let handle = Arc::new(Identity {
-                    did: new_identity.did.clone(),
-                    custody_type,
-                    core_id: Some(new_identity),
-                    core_document: Some(new_document),
-                    #[cfg(feature = "allow_in_memory_custody")]
-                    in_memory_custody: custody_arc,
-                    callback_custody,
-                    instance_id,
-                });
-                increment_handle_count();
-                let _ = has_agent; // suppress unused warning
-
-                // Migrate attestation and custody registries from old DID to new DID.
-                // The attestation block runs first; when `allow_in_memory_custody` is
-                // enabled, the custody block follows and consumes `new_did`, so the
-                // attestation block must clone. When the feature is disabled, the
-                // custody block is excluded and `new_did` can be moved into attestation.
-                #[cfg(feature = "allow_in_memory_custody")]
-                let attestation_did = new_did.clone();
-                #[cfg(not(feature = "allow_in_memory_custody"))]
-                let attestation_did = new_did;
-                {
-                    let registry = identity_link_attestation_registry();
-                    if let Some((_, attestations)) = registry.remove(&old_did) {
-                        registry.insert(attestation_did, attestations);
-                    }
-                }
-                #[cfg(feature = "allow_in_memory_custody")]
-                {
-                    let registry = identity_custody_registry();
-                    if let Some((_, entry)) = registry.remove(&old_did) {
-                        registry.insert(new_did, entry);
-                    }
-                }
-
-                return Ok(handle);
-            }
-
-            if let Some(ref cc) = callback_custody {
-                let pre_rotation_key = cc
-                    .generate_keypair(scp_platform::traits::KeyType::Ed25519)
-                    .await
-                    .map_err(|e| ScpError::Identity {
-                        msg: format!("key generation failed during migration: {e}"),
-                        code: codes::IDENT_1009.to_owned(),
-                    })?;
-
-                let rotated_at = scp_primitives::SystemClock.now_secs();
-
-                let dht = DidDht::new();
-                let (new_identity, new_document, _rotation_event) = dht
-                    .migrate_identity(
-                        &old_identity,
-                        &old_document,
-                        &pre_rotation_key,
-                        cc.as_ref(),
-                        rotated_at,
-                    )
-                    .await
-                    .map_err(ScpError::from)?;
-
-                let new_did = new_identity.did.clone();
-                let handle = Arc::new(Identity {
-                    did: new_identity.did.clone(),
-                    custody_type,
-                    core_id: Some(new_identity),
-                    core_document: Some(new_document),
-                    #[cfg(feature = "allow_in_memory_custody")]
-                    in_memory_custody: None,
-                    callback_custody: Some(Arc::clone(cc)),
-                    instance_id,
-                });
-                increment_handle_count();
-
-                // Migrate attestation and custody registries from old DID to new DID.
-                // The attestation block runs first; when `allow_in_memory_custody` is
-                // enabled, the custody block follows and consumes `new_did`, so the
-                // attestation block must clone. When the feature is disabled, the
-                // custody block is excluded and `new_did` can be moved into attestation.
-                #[cfg(feature = "allow_in_memory_custody")]
-                let attestation_did = new_did.clone();
-                #[cfg(not(feature = "allow_in_memory_custody"))]
-                let attestation_did = new_did;
-                {
-                    let registry = identity_link_attestation_registry();
-                    if let Some((_, attestations)) = registry.remove(&old_did) {
-                        registry.insert(attestation_did, attestations);
-                    }
-                }
-                #[cfg(feature = "allow_in_memory_custody")]
-                {
-                    let registry = identity_custody_registry();
-                    if let Some((_, entry)) = registry.remove(&old_did) {
-                        registry.insert(new_did, entry);
-                    }
-                }
-
-                return Ok(handle);
-            }
-
-            Err(ScpError::Identity {
-                msg: "identity migration requires a retained custody provider \
-                          (in-memory or callback)"
-                    .to_owned(),
-                code: codes::IDENT_1009.to_owned(),
-            })
-        })
-        .await
-        .map_err(|e| ScpError::Identity {
-            msg: format!("tokio task join error during identity migration: {e}"),
-            code: codes::IDENT_1007.to_owned(),
-        })?
-}
 
 // ---------------------------------------------------------------------------
 // Sync — get policy (#428)
@@ -7185,313 +6050,7 @@ impl scp_core::context::invitation::TrustOracle for UniffiBridgeTrustOracle {
     }
 }
 
-/// Evaluates a context invitation through the sequential pipeline.
-///
-/// Runs the 4-step evaluation pipeline from `scp-core`:
-/// 1. Template validation (rejects template spoofing).
-/// 2. Economic policy check (rejects insufficient spending capability).
-/// 3. Auto-accept evaluation (trust, TTL cap, rate limit).
-/// 4. Falls through to prompt-agent if no auto-accept matches.
-///
-/// Returns `"auto_accept"` or `"prompt_agent"`.
-///
-/// # Errors
-///
-/// Returns `ScpError::Validation` if JSON parsing fails.
-/// Returns `ScpError::Context` if pipeline produces a rejection error
-/// (template spoofing, economic policy failure).
-#[uniffi::export]
-pub fn evaluate_invitation(
-    params_json: String,
-    inviter_did: String,
-    identity_did: String,
-    policy_json: Option<String>,
-    spending_json: Option<String>,
-    trusted_dids: Vec<String>,
-) -> Result<String, ScpError> {
-    use scp_core::context::invitation::{
-        EvaluationDecision, SpendingContext, evaluate_invitation as core_evaluate,
-    };
-    use scp_core::context::policy::AutoAcceptPolicy;
 
-    validate_did(&inviter_did)?;
-    validate_did(&identity_did)?;
-
-    let params: scp_core::context::params::ContextParams = serde_json::from_str(&params_json)
-        .map_err(|e| ScpError::Validation {
-            msg: format!("failed to parse context params JSON: {e}"),
-            code: codes::VALID_7010.to_owned(),
-        })?;
-
-    let policy: Option<AutoAcceptPolicy> = match policy_json {
-        Some(ref json) => Some(
-            serde_json::from_str(json).map_err(|e| ScpError::Validation {
-                msg: format!("failed to parse auto-accept policy JSON: {e}"),
-                code: codes::VALID_7010.to_owned(),
-            })?,
-        ),
-        None => None,
-    };
-
-    let spending: Option<SpendingContext> = match spending_json {
-        Some(ref json) => Some(
-            serde_json::from_str(json).map_err(|e| ScpError::Validation {
-                msg: format!("failed to parse spending context JSON: {e}"),
-                code: codes::VALID_7010.to_owned(),
-            })?,
-        ),
-        None => None,
-    };
-
-    let oracle_dids: Vec<scp_identity::DID> = trusted_dids
-        .into_iter()
-        .map(scp_identity::DID::from)
-        .collect();
-    let oracle = UniffiBridgeTrustOracle {
-        trusted_dids: oracle_dids,
-    };
-    let inviter = scp_identity::DID::from(inviter_did.as_str());
-
-    let decision = crate::runtime::with_rate_limit_tracker(&identity_did, |tracker| {
-        core_evaluate(
-            &params,
-            &inviter,
-            policy.as_ref(),
-            spending.as_ref(),
-            &oracle,
-            tracker,
-            &scp_core::time::SystemClock,
-        )
-    });
-
-    match decision {
-        Ok(EvaluationDecision::AutoAccept) => Ok("auto_accept".to_owned()),
-        Ok(EvaluationDecision::PromptAgent) => Ok("prompt_agent".to_owned()),
-        Err(e) => Err(ScpError::Context {
-            msg: format!("invitation evaluation failed: {e}"),
-            code: codes::CTX_2060.to_owned(),
-        }),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Compromise recovery — FFI exposure for CompromiseRecoveryOrchestrator (#632)
-// ---------------------------------------------------------------------------
-
-/// Executes the compromise recovery protocol for the given DID.
-///
-/// Returns a JSON string with the recovery result.
-///
-/// See spec §9.12 and PR #1080.
-#[uniffi::export]
-pub fn identity_execute_recovery(
-    did: String,
-    tier: String,
-    context_ids: Vec<String>,
-) -> Result<String, ScpError> {
-    use std::collections::HashSet;
-
-    use scp_core::identity::recovery::{
-        CompromiseRecoveryOrchestrator, CompromiseTier, KeyRotationOutcome, PskRotationParams,
-        RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
-        agent_key_rotation_outcome,
-    };
-    use scp_identity::DID;
-
-    validate_did(&did)?;
-    let did_val = DID::from(did.as_str());
-
-    let compromise_tier = match tier.as_str() {
-        "agent" => CompromiseTier::Agent,
-        "active_signing" => CompromiseTier::ActiveSigning,
-        "identity_key" => CompromiseTier::IdentityKey,
-        other => {
-            return Err(ScpError::Identity {
-                msg: format!(
-                    "invalid compromise tier: {other}; expected 'agent', 'active_signing', or 'identity_key'"
-                ),
-                code: codes::IDENT_1020.to_owned(),
-            });
-        }
-    };
-
-    let now_ms = scp_primitives::SystemClock.now_millis();
-
-    let key_rotation = match compromise_tier {
-        CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
-        CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
-        CompromiseTier::IdentityKey => scp_core::identity::recovery::identity_key_rotation_outcome(
-            &did_val,
-            did_val.clone(),
-            now_ms,
-        ),
-    };
-
-    struct UniffiRecoveryBackend;
-    impl RecoveryBackend for UniffiRecoveryBackend {
-        fn mls_update(
-            &self,
-            _context_id: &str,
-            _key_rotation: &KeyRotationOutcome,
-        ) -> Result<(), RecoveryStepError> {
-            Ok(())
-        }
-        fn revoke_ucans(
-            &self,
-            _context_id: &str,
-            _key_rotation: &KeyRotationOutcome,
-        ) -> Result<(), RecoveryStepError> {
-            Ok(())
-        }
-        fn rotate_key_packages(
-            &self,
-            _context_id: &str,
-            _key_rotation: &KeyRotationOutcome,
-        ) -> Result<(), RecoveryStepError> {
-            Ok(())
-        }
-        fn notify_contacts(
-            &self,
-            _did: &DID,
-            _tier: CompromiseTier,
-            _key_rotation: &KeyRotationOutcome,
-            _contacts: &HashSet<DID>,
-        ) -> bool {
-            true
-        }
-        fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
-            true
-        }
-    }
-
-    let orchestrator = CompromiseRecoveryOrchestrator::new(did_val, context_ids);
-    let contacts = HashSet::new();
-    let backend = UniffiRecoveryBackend;
-
-    let rt = crate::runtime();
-
-    let result = rt
-        .block_on(orchestrator.execute_recovery(
-            compromise_tier,
-            &key_rotation,
-            &contacts,
-            None,
-            &backend,
-            &scp_primitives::SystemClock,
-        ))
-        .map_err(|e| ScpError::Identity {
-            msg: format!("recovery failed: {e}"),
-            code: codes::IDENT_1022.to_owned(),
-        })?;
-
-    serde_json::to_string(&result).map_err(|e| ScpError::Identity {
-        msg: format!("failed to serialize recovery result: {e}"),
-        code: codes::IDENT_1023.to_owned(),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Custody migration — FFI exposure for CustodyMigrationOrchestrator (#632)
-// ---------------------------------------------------------------------------
-
-/// Executes the custody migration protocol for the given DID.
-///
-/// Returns a JSON string with the migration result.
-///
-/// See spec §3.2.1.
-#[uniffi::export]
-pub fn identity_execute_custody_migration(
-    did: String,
-    target: String,
-    context_ids: Vec<String>,
-) -> Result<String, ScpError> {
-    use scp_core::identity::custody_migration::{
-        CustodyMigrationBackend, CustodyMigrationOrchestrator, CustodyMigrationRequest,
-        CustodyMigrationTarget,
-    };
-    use scp_identity::DID;
-
-    validate_did(&did)?;
-    let did_val = DID::from(did.as_str());
-
-    let migration_target = match target.as_str() {
-        "platform_managed" => CustodyMigrationTarget::PlatformManaged,
-        "hardware" => CustodyMigrationTarget::Hardware,
-        "software" => CustodyMigrationTarget::Software,
-        "in_memory" => CustodyMigrationTarget::InMemory,
-        other => {
-            return Err(ScpError::Identity {
-                msg: format!(
-                    "invalid custody migration target: {other}; expected 'platform_managed', 'hardware', 'software', or 'in_memory'"
-                ),
-                code: codes::IDENT_1024.to_owned(),
-            });
-        }
-    };
-
-    // Error-returning backend — custody migration requires a real backend
-    // provided via the SDK layer. This placeholder ensures callers get an
-    // actionable error instead of silently succeeding with fake keys.
-    struct NotConfiguredMigrationBackend;
-    impl CustodyMigrationBackend for NotConfiguredMigrationBackend {
-        fn generate_key(&self, _target: CustodyMigrationTarget) -> Result<Vec<u8>, String> {
-            Err(
-                "custody migration backend not configured — provide a real backend via SDK layer"
-                    .to_owned(),
-            )
-        }
-        fn authorize(&self, _request: &CustodyMigrationRequest) -> Result<(), String> {
-            Err(
-                "custody migration backend not configured — provide a real backend via SDK layer"
-                    .to_owned(),
-            )
-        }
-        fn rotate_did_document(
-            &self,
-            _did: &DID,
-            _request: &CustodyMigrationRequest,
-            _context_ids: &[String],
-        ) -> Result<(Vec<String>, Vec<String>), String> {
-            Err(
-                "custody migration backend not configured — provide a real backend via SDK layer"
-                    .to_owned(),
-            )
-        }
-        fn reissue_credentials(
-            &self,
-            _did: &DID,
-            _request: &CustodyMigrationRequest,
-        ) -> Result<(), String> {
-            Err(
-                "custody migration backend not configured — provide a real backend via SDK layer"
-                    .to_owned(),
-            )
-        }
-        fn destroy_old_key(&self, _did: &DID) -> Result<(), String> {
-            Err(
-                "custody migration backend not configured — provide a real backend via SDK layer"
-                    .to_owned(),
-            )
-        }
-    }
-
-    let orchestrator = CustodyMigrationOrchestrator::new(did_val, migration_target, context_ids);
-    let backend = NotConfiguredMigrationBackend;
-
-    let rt = crate::runtime();
-
-    let result = rt
-        .block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock))
-        .map_err(|e| ScpError::Identity {
-            msg: format!("custody migration failed: {e}"),
-            code: codes::IDENT_1025.to_owned(),
-        })?;
-
-    serde_json::to_string(&result).map_err(|e| ScpError::Identity {
-        msg: format!("failed to serialize custody migration result: {e}"),
-        code: codes::IDENT_1026.to_owned(),
-    })
-}
 
 // ---------------------------------------------------------------------------
 // SCPID authentication (§3.11)
@@ -7826,127 +6385,6 @@ pub fn economy_evaluate_formula(
         .map(scp_core::economy::Amount::value))
 }
 
-/// Queries the remaining budget for a member in a context.
-#[uniffi::export]
-pub fn economy_budget_remaining(context_id: String, did: String) -> Result<u64, ScpError> {
-    validate_did(&did)?;
-    let member_did = scp_identity::DID::from(did.as_str());
-    let remaining = crate::runtime::bridge_instance()?
-        .core
-        .with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
-    Ok(remaining.value())
-}
-
-/// Grants spending budget to a member.
-#[uniffi::export]
-pub fn economy_budget_grant(context_id: String, did: String, amount: u64) -> Result<(), ScpError> {
-    validate_did(&did)?;
-    let member_did = scp_identity::DID::from(did.as_str());
-    crate::runtime::bridge_instance()?
-        .core
-        .with_economy_budget_mut(&context_id, |tracker| {
-            tracker.grant(&member_did, scp_core::economy::Amount::new(amount));
-        });
-    Ok(())
-}
-
-/// Records a spend against a member's budget.
-#[uniffi::export]
-pub fn economy_budget_record_spend(
-    context_id: String,
-    did: String,
-    amount: u64,
-) -> Result<(), ScpError> {
-    validate_did(&did)?;
-    let member_did = scp_identity::DID::from(did.as_str());
-    crate::runtime::bridge_instance()?
-        .core
-        .with_economy_budget_mut(&context_id, |tracker| {
-            tracker
-                .record_spend(&member_did, scp_core::economy::Amount::new(amount))
-                .map_err(|e| ScpError::Validation {
-                    msg: format!("{e}"),
-                    code: codes::VALID_7052.to_owned(),
-                })
-        })
-}
-
-/// Records a message for antispam velocity tracking.
-#[uniffi::export]
-pub fn economy_antispam_record(
-    context_id: String,
-    sender_did: String,
-    timestamp: u64,
-) -> Result<(), ScpError> {
-    validate_did(&sender_did)?;
-    let did = scp_identity::DID::from(sender_did.as_str());
-    crate::runtime::bridge_instance()?
-        .core
-        .with_economy_antispam(&context_id, |tracker| {
-            tracker.record_message(&did, timestamp);
-        });
-    Ok(())
-}
-
-/// Queries sender velocity (messages within sliding window).
-#[uniffi::export]
-pub fn economy_antispam_velocity(
-    context_id: String,
-    sender_did: String,
-    now: u64,
-) -> Result<u64, ScpError> {
-    validate_did(&sender_did)?;
-    let did = scp_identity::DID::from(sender_did.as_str());
-    let velocity = crate::runtime::bridge_instance()?
-        .core
-        .with_economy_antispam(&context_id, |tracker| tracker.get_velocity(&did, now));
-    Ok(velocity)
-}
-
-/// Computes escalated cost for a sender based on antispam velocity.
-#[uniffi::export]
-#[allow(clippy::too_many_arguments)]
-pub fn economy_antispam_escalated_cost(
-    context_id: String,
-    sender_did: String,
-    now: u64,
-    base_cost: u64,
-    thresholds_json: String,
-    floor: Option<u64>,
-    cap: Option<u64>,
-) -> Result<u64, ScpError> {
-    validate_did(&sender_did)?;
-    let thresholds: Vec<(u64, u64)> =
-        serde_json::from_str(&thresholds_json).map_err(|e| ScpError::Validation {
-            msg: format!("invalid thresholds JSON: {e}"),
-            code: codes::VALID_7050.to_owned(),
-        })?;
-
-    let config = scp_core::economy::EscalationConfig {
-        thresholds: thresholds
-            .into_iter()
-            .map(|(vel, cost)| scp_core::economy::EscalationThreshold {
-                velocity_threshold: vel,
-                additional_cost: scp_core::economy::Amount::new(cost),
-            })
-            .collect(),
-    };
-
-    let did = scp_identity::DID::from(sender_did.as_str());
-    let cost = crate::runtime::bridge_instance()?
-        .core
-        .with_economy_antispam(&context_id, |tracker| {
-            tracker.compute_escalated_cost(
-                &did,
-                now,
-                scp_core::economy::Amount::new(base_cost),
-                &config,
-                floor.map(scp_core::economy::Amount::new),
-                cap.map(scp_core::economy::Amount::new),
-            )
-        });
-    Ok(cost.value())
-}
 
 // ---------------------------------------------------------------------------
 // Economy helpers
@@ -13696,6 +12134,1551 @@ impl Scp {
             reconnection_dedup_window_secs: policy.reconnection_dedup_window.as_secs(),
         }
     }
+
+    // ===== UniFFI Phase-A gap-fill — state-touching free-fn methods =====
+    //
+    // Migrates the last batch of state-touching free functions to `impl Scp`
+    // methods routing through `&self.inner` so the demolition slice can
+    // finally drop `DEFAULT_BRIDGE_INSTANCE`. Covers:
+    //   - `identity_migrate`, `identity_create_with_agent_key`,
+    //     `identity_execute_recovery`, `identity_execute_custody_migration`
+    //   - `provenance_attach`
+    //   - `petname_*` (8), `handle_*` (3), `scope_*` (3), `address_resolve`
+    //   - `economy_budget_*` (3), `economy_antispam_*` (3)
+    //   - `set_economic_policy`, `get_economic_policy`
+    //   - `context_export`, `context_import`
+    //   - `evaluate_invitation`
+    //
+    // Bodies are preserved verbatim except for `default_bridge_instance()?`
+    // / `crate::runtime::bridge_instance()?` → `&*self.inner` and the inline
+    // handle-affinity check. Free functions are deleted in this same commit.
+    //
+    // Part of #1549 Phase 4 PR 4 demolition Phase A gap-fill.
+
+    /// Per-instance equivalent of the free-function `identity_migrate`.
+    ///
+    /// Rejects any `Identity` whose `instance_id` does not match this
+    /// `SCP`'s.
+    pub async fn identity_migrate(
+        &self,
+        identity: Arc<Identity>,
+    ) -> Result<Arc<Identity>, ScpError> {
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        let core_id = identity
+            .core_id
+            .as_ref()
+            .ok_or_else(|| ScpError::Identity {
+                msg: "identity migration requires retained crypto state — this identity \
+                      was loaded without key material (use identity_create or \
+                      identity_create_with_custody)"
+                    .to_owned(),
+                code: codes::IDENT_1009.to_owned(),
+            })?;
+        let core_document = identity
+            .core_document
+            .as_ref()
+            .ok_or_else(|| ScpError::Identity {
+                msg: "identity migration requires a retained DID document".to_owned(),
+                code: codes::IDENT_1009.to_owned(),
+            })?;
+
+        // We need a custody provider to generate new keys.
+        #[cfg(feature = "allow_in_memory_custody")]
+        let in_memory = identity.in_memory_custody.as_ref();
+
+        let old_did = identity.did.clone();
+        let old_identity = core_id.clone();
+        let old_document = core_document.clone();
+        let custody_type = identity.custody_type.clone();
+        let instance_id = identity.instance_id;
+
+        #[cfg(feature = "allow_in_memory_custody")]
+        let custody_arc = in_memory.map(Arc::clone);
+        let callback_custody = identity.callback_custody.as_ref().map(Arc::clone);
+
+        runtime()
+            .spawn(async move {
+                // Determine which custody to use for key generation.
+                #[cfg(feature = "allow_in_memory_custody")]
+                if let Some(ref kc) = custody_arc {
+                    let pre_rotation_key =
+                        kc.0.generate_keypair(scp_platform::traits::KeyType::Ed25519)
+                            .await
+                            .map_err(|e| ScpError::Identity {
+                                msg: format!("key generation failed during migration: {e}"),
+                                code: codes::IDENT_1009.to_owned(),
+                            })?;
+
+                    let rotated_at = scp_primitives::SystemClock.now_secs();
+
+                    let dht = DidDht::new();
+                    let (new_identity, new_document, _rotation_event) = dht
+                        .migrate_identity(
+                            &old_identity,
+                            &old_document,
+                            &pre_rotation_key,
+                            &kc.0,
+                            rotated_at,
+                        )
+                        .await
+                        .map_err(ScpError::from)?;
+
+                    let new_did = new_identity.did.clone();
+                    let has_agent = new_document.has_agent_key();
+                    let handle = Arc::new(Identity {
+                        did: new_identity.did.clone(),
+                        custody_type,
+                        core_id: Some(new_identity),
+                        core_document: Some(new_document),
+                        #[cfg(feature = "allow_in_memory_custody")]
+                        in_memory_custody: custody_arc,
+                        callback_custody,
+                        instance_id,
+                    });
+                    increment_handle_count();
+                    let _ = has_agent; // suppress unused warning
+
+                    // Migrate attestation and custody registries from old DID to new DID.
+                    // The attestation block runs first; when `allow_in_memory_custody` is
+                    // enabled, the custody block follows and consumes `new_did`, so the
+                    // attestation block must clone. When the feature is disabled, the
+                    // custody block is excluded and `new_did` can be moved into attestation.
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    let attestation_did = new_did.clone();
+                    #[cfg(not(feature = "allow_in_memory_custody"))]
+                    let attestation_did = new_did;
+                    {
+                        let registry = identity_link_attestation_registry();
+                        if let Some((_, attestations)) = registry.remove(&old_did) {
+                            registry.insert(attestation_did, attestations);
+                        }
+                    }
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    {
+                        let registry = identity_custody_registry();
+                        if let Some((_, entry)) = registry.remove(&old_did) {
+                            registry.insert(new_did, entry);
+                        }
+                    }
+
+                    return Ok(handle);
+                }
+
+                if let Some(ref cc) = callback_custody {
+                    let pre_rotation_key = cc
+                        .generate_keypair(scp_platform::traits::KeyType::Ed25519)
+                        .await
+                        .map_err(|e| ScpError::Identity {
+                            msg: format!("key generation failed during migration: {e}"),
+                            code: codes::IDENT_1009.to_owned(),
+                        })?;
+
+                    let rotated_at = scp_primitives::SystemClock.now_secs();
+
+                    let dht = DidDht::new();
+                    let (new_identity, new_document, _rotation_event) = dht
+                        .migrate_identity(
+                            &old_identity,
+                            &old_document,
+                            &pre_rotation_key,
+                            cc.as_ref(),
+                            rotated_at,
+                        )
+                        .await
+                        .map_err(ScpError::from)?;
+
+                    let new_did = new_identity.did.clone();
+                    let handle = Arc::new(Identity {
+                        did: new_identity.did.clone(),
+                        custody_type,
+                        core_id: Some(new_identity),
+                        core_document: Some(new_document),
+                        #[cfg(feature = "allow_in_memory_custody")]
+                        in_memory_custody: None,
+                        callback_custody: Some(Arc::clone(cc)),
+                        instance_id,
+                    });
+                    increment_handle_count();
+
+                    // Migrate attestation and custody registries from old DID to new DID.
+                    // The attestation block runs first; when `allow_in_memory_custody` is
+                    // enabled, the custody block follows and consumes `new_did`, so the
+                    // attestation block must clone. When the feature is disabled, the
+                    // custody block is excluded and `new_did` can be moved into attestation.
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    let attestation_did = new_did.clone();
+                    #[cfg(not(feature = "allow_in_memory_custody"))]
+                    let attestation_did = new_did;
+                    {
+                        let registry = identity_link_attestation_registry();
+                        if let Some((_, attestations)) = registry.remove(&old_did) {
+                            registry.insert(attestation_did, attestations);
+                        }
+                    }
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    {
+                        let registry = identity_custody_registry();
+                        if let Some((_, entry)) = registry.remove(&old_did) {
+                            registry.insert(new_did, entry);
+                        }
+                    }
+
+                    return Ok(handle);
+                }
+
+                Err(ScpError::Identity {
+                    msg: "identity migration requires a retained custody provider \
+                              (in-memory or callback)"
+                        .to_owned(),
+                    code: codes::IDENT_1009.to_owned(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Identity {
+                msg: format!("tokio task join error during identity migration: {e}"),
+                code: codes::IDENT_1007.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function `identity_create_with_agent_key`.
+    ///
+    /// Creates a new SCP identity with an agent signing key. Routes through
+    /// `&*self.inner` so the returned `Identity`'s `instance_id` is stamped
+    /// against this `SCP`.
+    pub async fn identity_create_with_agent_key(
+        &self,
+        custody: String,
+    ) -> Result<Arc<Identity>, ScpError> {
+        let custody_method = parse_custody_method(&custody)?;
+        let bi = Arc::clone(&self.inner);
+
+        runtime()
+            .spawn(async move {
+                match custody_method {
+                    CustodyMethod::InMemory => {
+                        #[cfg(not(feature = "allow_in_memory_custody"))]
+                        {
+                            let _ = &bi;
+                            Err(ScpError::Identity {
+                                msg: "\"in_memory\" custody is not available in this build \
+                                      — enable the \"allow_in_memory_custody\" feature for \
+                                      dev/desktop use. Production mobile builds must use \
+                                      \"platform\" custody (Secure Enclave / Android Keystore)."
+                                    .to_owned(),
+                                code: codes::IDENT_1008.to_owned(),
+                            })
+                        }
+
+                        #[cfg(feature = "allow_in_memory_custody")]
+                        {
+                            let key_custody =
+                                Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+                            let dht = DidDht::new();
+                            let (identity, document) = dht
+                                .create_with_agent_key(&key_custody.0)
+                                .await
+                                .map_err(ScpError::from)?;
+
+                            // Initialize the production DID resolver for UCAN
+                            // validation on this instance.
+                            ensure_did_resolver_initialized_on(
+                                &bi,
+                                tokio::runtime::Handle::current(),
+                            )?;
+
+                            let handle = Arc::new(Identity {
+                                did: identity.did.clone(),
+                                custody_type: CustodyMethod::InMemory,
+                                core_id: Some(identity),
+                                core_document: Some(document),
+                                in_memory_custody: Some(key_custody),
+                                callback_custody: None,
+                                instance_id: bi.core.instance_id(),
+                            });
+                            increment_handle_count();
+                            Ok(handle)
+                        }
+                    }
+                    CustodyMethod::Platform | CustodyMethod::Software => Err(ScpError::Identity {
+                        msg: format!(
+                            "custody type {custody:?} requires a KeyCustodyProvider — \
+                                 use identity_create_with_custody() + add_agent_key() to create \
+                                 an identity with an agent key using platform custody"
+                        ),
+                        code: codes::IDENT_1003.to_owned(),
+                    }),
+                    CustodyMethod::External => Err(ScpError::Identity {
+                        msg: "internal: CustodyMethod::External cannot be used with \
+                                      identity_create_with_agent_key — use identity_load for \
+                                      external DID handles"
+                            .to_owned(),
+                        code: codes::IDENT_1005.to_owned(),
+                    }),
+                }
+            })
+            .await
+            .map_err(|e| ScpError::Identity {
+                msg: format!("tokio task join error during identity creation with agent key: {e}"),
+                code: codes::IDENT_1007.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function `identity_execute_recovery`.
+    ///
+    /// Pure orchestration — takes no handles. Routes through `&self.inner`
+    /// only to preserve API uniformity; the underlying recovery backend is
+    /// a local stub pending SDK-layer wiring.
+    pub fn identity_execute_recovery(
+        &self,
+        did: String,
+        tier: String,
+        context_ids: Vec<String>,
+    ) -> Result<String, ScpError> {
+        use std::collections::HashSet;
+
+        use scp_core::identity::recovery::{
+            CompromiseRecoveryOrchestrator, CompromiseTier, KeyRotationOutcome, PskRotationParams,
+            RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
+            agent_key_rotation_outcome,
+        };
+        use scp_identity::DID;
+
+        validate_did(&did)?;
+        let did_val = DID::from(did.as_str());
+
+        let compromise_tier = match tier.as_str() {
+            "agent" => CompromiseTier::Agent,
+            "active_signing" => CompromiseTier::ActiveSigning,
+            "identity_key" => CompromiseTier::IdentityKey,
+            other => {
+                return Err(ScpError::Identity {
+                    msg: format!(
+                        "invalid compromise tier: {other}; expected 'agent', 'active_signing', or 'identity_key'"
+                    ),
+                    code: codes::IDENT_1020.to_owned(),
+                });
+            }
+        };
+
+        let now_ms = scp_primitives::SystemClock.now_millis();
+
+        let key_rotation = match compromise_tier {
+            CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
+            CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
+            CompromiseTier::IdentityKey => {
+                scp_core::identity::recovery::identity_key_rotation_outcome(
+                    &did_val,
+                    did_val.clone(),
+                    now_ms,
+                )
+            }
+        };
+
+        struct UniffiRecoveryBackend;
+        impl RecoveryBackend for UniffiRecoveryBackend {
+            fn mls_update(
+                &self,
+                _context_id: &str,
+                _key_rotation: &KeyRotationOutcome,
+            ) -> Result<(), RecoveryStepError> {
+                Ok(())
+            }
+            fn revoke_ucans(
+                &self,
+                _context_id: &str,
+                _key_rotation: &KeyRotationOutcome,
+            ) -> Result<(), RecoveryStepError> {
+                Ok(())
+            }
+            fn rotate_key_packages(
+                &self,
+                _context_id: &str,
+                _key_rotation: &KeyRotationOutcome,
+            ) -> Result<(), RecoveryStepError> {
+                Ok(())
+            }
+            fn notify_contacts(
+                &self,
+                _did: &DID,
+                _tier: CompromiseTier,
+                _key_rotation: &KeyRotationOutcome,
+                _contacts: &HashSet<DID>,
+            ) -> bool {
+                true
+            }
+            fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
+                true
+            }
+        }
+
+        let orchestrator = CompromiseRecoveryOrchestrator::new(did_val, context_ids);
+        let contacts = HashSet::new();
+        let backend = UniffiRecoveryBackend;
+
+        let rt = crate::runtime();
+
+        let result = rt
+            .block_on(orchestrator.execute_recovery(
+                compromise_tier,
+                &key_rotation,
+                &contacts,
+                None,
+                &backend,
+                &scp_primitives::SystemClock,
+            ))
+            .map_err(|e| ScpError::Identity {
+                msg: format!("recovery failed: {e}"),
+                code: codes::IDENT_1022.to_owned(),
+            })?;
+
+        serde_json::to_string(&result).map_err(|e| ScpError::Identity {
+            msg: format!("failed to serialize recovery result: {e}"),
+            code: codes::IDENT_1023.to_owned(),
+        })
+    }
+
+    /// Per-instance equivalent of the free-function `identity_execute_custody_migration`.
+    pub fn identity_execute_custody_migration(
+        &self,
+        did: String,
+        target: String,
+        context_ids: Vec<String>,
+    ) -> Result<String, ScpError> {
+        use scp_core::identity::custody_migration::{
+            CustodyMigrationBackend, CustodyMigrationOrchestrator, CustodyMigrationRequest,
+            CustodyMigrationTarget,
+        };
+        use scp_identity::DID;
+
+        validate_did(&did)?;
+        let did_val = DID::from(did.as_str());
+
+        let migration_target = match target.as_str() {
+            "platform_managed" => CustodyMigrationTarget::PlatformManaged,
+            "hardware" => CustodyMigrationTarget::Hardware,
+            "software" => CustodyMigrationTarget::Software,
+            "in_memory" => CustodyMigrationTarget::InMemory,
+            other => {
+                return Err(ScpError::Identity {
+                    msg: format!(
+                        "invalid custody migration target: {other}; expected 'platform_managed', 'hardware', 'software', or 'in_memory'"
+                    ),
+                    code: codes::IDENT_1024.to_owned(),
+                });
+            }
+        };
+
+        // Error-returning backend — custody migration requires a real backend
+        // provided via the SDK layer. This placeholder ensures callers get an
+        // actionable error instead of silently succeeding with fake keys.
+        struct NotConfiguredMigrationBackend;
+        impl CustodyMigrationBackend for NotConfiguredMigrationBackend {
+            fn generate_key(&self, _target: CustodyMigrationTarget) -> Result<Vec<u8>, String> {
+                Err(
+                    "custody migration backend not configured — provide a real backend via SDK layer"
+                        .to_owned(),
+                )
+            }
+            fn authorize(&self, _request: &CustodyMigrationRequest) -> Result<(), String> {
+                Err(
+                    "custody migration backend not configured — provide a real backend via SDK layer"
+                        .to_owned(),
+                )
+            }
+            fn rotate_did_document(
+                &self,
+                _did: &DID,
+                _request: &CustodyMigrationRequest,
+                _context_ids: &[String],
+            ) -> Result<(Vec<String>, Vec<String>), String> {
+                Err(
+                    "custody migration backend not configured — provide a real backend via SDK layer"
+                        .to_owned(),
+                )
+            }
+            fn reissue_credentials(
+                &self,
+                _did: &DID,
+                _request: &CustodyMigrationRequest,
+            ) -> Result<(), String> {
+                Err(
+                    "custody migration backend not configured — provide a real backend via SDK layer"
+                        .to_owned(),
+                )
+            }
+            fn destroy_old_key(&self, _did: &DID) -> Result<(), String> {
+                Err(
+                    "custody migration backend not configured — provide a real backend via SDK layer"
+                        .to_owned(),
+                )
+            }
+        }
+
+        let orchestrator =
+            CustodyMigrationOrchestrator::new(did_val, migration_target, context_ids);
+        let backend = NotConfiguredMigrationBackend;
+
+        let rt = crate::runtime();
+
+        let result = rt
+            .block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock))
+            .map_err(|e| ScpError::Identity {
+                msg: format!("custody migration failed: {e}"),
+                code: codes::IDENT_1025.to_owned(),
+            })?;
+
+        serde_json::to_string(&result).map_err(|e| ScpError::Identity {
+            msg: format!("failed to serialize custody migration result: {e}"),
+            code: codes::IDENT_1026.to_owned(),
+        })
+    }
+
+    /// Per-instance equivalent of the free-function `provenance_attach`.
+    ///
+    /// Appends `ProvenanceAttached` / `ProvenanceReceived` events to the
+    /// source and target context event logs on this instance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn provenance_attach(
+        &self,
+        source_context_id: String,
+        source_type: String,
+        memory_scope_str: String,
+        members: Vec<String>,
+        target_context_id: String,
+        actor_did: String,
+        existing_chain_depth: Option<u8>,
+    ) -> Result<String, ScpError> {
+        let st = match source_type.as_str() {
+            "persistent" => scp_core::provenance::SourceType::Persistent,
+            "ephemeral" => scp_core::provenance::SourceType::Ephemeral,
+            "summary" => scp_core::provenance::SourceType::Summary,
+            other => {
+                return Err(ScpError::Validation {
+                    msg: format!("invalid source_type '{other}'"),
+                    code: codes::VALID_7040.to_owned(),
+                });
+            }
+        };
+        let ms = match memory_scope_str.as_str() {
+            "full" => scp_core::context::MemoryScope::Full,
+            "summary" => scp_core::context::MemoryScope::Summary,
+            "ephemeral" => scp_core::context::MemoryScope::Ephemeral,
+            other => {
+                return Err(ScpError::Validation {
+                    msg: format!("invalid memory_scope '{other}'"),
+                    code: codes::VALID_7041.to_owned(),
+                });
+            }
+        };
+
+        let source_info = scp_core::provenance::attach::SourceContextInfo {
+            context_id: source_context_id.clone(),
+            source_type: st,
+            memory_scope: ms,
+            members: members.into_iter().map(scp_identity::DID::from).collect(),
+            discovery_method: scp_core::provenance::DiscoveryMethod::OutOfBand,
+            data_age: std::time::Duration::from_secs(0),
+            purpose: None,
+            counterparty_policy: scp_core::provenance::CounterpartyPolicy::default(),
+        };
+
+        let existing_prov =
+            existing_chain_depth.map(|depth| scp_core::provenance::DataProvenance {
+                source_context: String::new(),
+                source_type: scp_core::provenance::SourceType::Persistent,
+                counterparties: vec![],
+                purpose: None,
+                discovery_method: scp_core::provenance::DiscoveryMethod::OutOfBand,
+                age: std::time::Duration::from_secs(0),
+                memory_scope: scp_core::context::MemoryScope::Full,
+                chain_depth: depth,
+                chain_path: None,
+                payment_amount: None,
+                payment_adapter: None,
+                payment_receipt_id: None,
+            });
+
+        let prov = scp_core::provenance::attach::attach_provenance(
+            &source_info,
+            &target_context_id,
+            existing_prov.as_ref(),
+            None,
+            None,
+        );
+
+        // Compute provenance hash: SHA-256 of JSON-serialized provenance record.
+        let prov_json_bytes = serde_json::to_vec(&prov).map_err(|e| ScpError::Validation {
+            msg: format!("failed to serialize provenance for hashing: {e}"),
+            code: codes::VALID_7053.to_owned(),
+        })?;
+        let prov_hash: [u8; 32] = sha2::Sha256::digest(&prov_json_bytes).into();
+
+        // Record ProvenanceAttached in the source context event log.
+        if let Err(e) = uniffi_append_provenance_event_on(
+            &self.inner,
+            &source_context_id,
+            &actor_did,
+            scp_event_log::EventType::ProvenanceAttached,
+            &prov_hash,
+        ) {
+            tracing::warn!(
+                context = %source_context_id,
+                error = %e,
+                "failed to append ProvenanceAttached event to source context event log"
+            );
+        }
+
+        // Record ProvenanceReceived in the target context event log.
+        if let Err(e) = uniffi_append_provenance_event_on(
+            &self.inner,
+            &target_context_id,
+            &actor_did,
+            scp_event_log::EventType::ProvenanceReceived,
+            &prov_hash,
+        ) {
+            tracing::warn!(
+                context = %target_context_id,
+                error = %e,
+                "failed to append ProvenanceReceived event to target context event log"
+            );
+        }
+
+        let result = serde_json::json!({
+            "source_context": prov.source_context,
+            "source_type": format!("{:?}", prov.source_type),
+            "chain_depth": prov.chain_depth,
+            "counterparties": prov.counterparties.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "age_secs": prov.age.as_secs(),
+            "memory_scope": format!("{:?}", prov.memory_scope),
+            "chain_path": prov.chain_path,
+            "purpose": prov.purpose,
+        });
+
+        serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+            msg: format!("failed to serialize provenance: {e}"),
+            code: codes::VALID_7042.to_owned(),
+        })
+    }
+
+    // ----- Petname methods -----
+
+    /// Per-instance equivalent of the free-function `petname_set`.
+    pub fn petname_set(
+        &self,
+        owner_did: String,
+        target_did: String,
+        name: String,
+    ) -> Result<(), ScpError> {
+        if owner_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            });
+        }
+        if target_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "target_did must not be empty".to_owned(),
+                code: codes::VALID_7111.to_owned(),
+            });
+        }
+        let mut guard =
+            self.inner
+                .core
+                .petname_maps()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("petname lock poisoned: {e}"),
+                    code: codes::VALID_7112.to_owned(),
+                })?;
+        let map = guard.entry(owner_did).or_default();
+        map.set_petname(scp_identity::DID::from(target_did.as_str()), name);
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the free-function `petname_remove`.
+    pub fn petname_remove(&self, owner_did: String, target_did: String) -> Result<(), ScpError> {
+        if owner_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            });
+        }
+        let mut guard =
+            self.inner
+                .core
+                .petname_maps()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("petname lock poisoned: {e}"),
+                    code: codes::VALID_7112.to_owned(),
+                })?;
+        if let Some(map) = guard.get_mut(&owner_did) {
+            map.remove_petname(&scp_identity::DID::from(target_did.as_str()));
+        }
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the free-function `petname_set_context`.
+    pub fn petname_set_context(
+        &self,
+        owner_did: String,
+        context_id: String,
+        name: String,
+    ) -> Result<(), ScpError> {
+        if owner_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            });
+        }
+        if context_id.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "context_id must not be empty".to_owned(),
+                code: codes::VALID_7113.to_owned(),
+            });
+        }
+        let mut guard =
+            self.inner
+                .core
+                .petname_maps()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("petname lock poisoned: {e}"),
+                    code: codes::VALID_7112.to_owned(),
+                })?;
+        let map = guard.entry(owner_did).or_default();
+        map.set_context_petname(context_id, name);
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the free-function `petname_remove_context`.
+    pub fn petname_remove_context(
+        &self,
+        owner_did: String,
+        context_id: String,
+    ) -> Result<(), ScpError> {
+        if owner_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            });
+        }
+        let mut guard =
+            self.inner
+                .core
+                .petname_maps()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("petname lock poisoned: {e}"),
+                    code: codes::VALID_7112.to_owned(),
+                })?;
+        if let Some(map) = guard.get_mut(&owner_did) {
+            map.remove_context_petname(&context_id);
+        }
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the free-function `petname_resolve_did`.
+    pub fn petname_resolve_did(
+        &self,
+        owner_did: String,
+        name: String,
+    ) -> Result<String, ScpError> {
+        if owner_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            });
+        }
+        let guard = self
+            .inner
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpError::Validation {
+                msg: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        let dids: Vec<String> = guard
+            .get(&owner_did)
+            .map(|map| {
+                map.resolve_did(&name)
+                    .into_iter()
+                    .map(|d| d.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        serde_json::to_string(&dids).map_err(|e| ScpError::Validation {
+            msg: format!("failed to serialize petname resolve result: {e}"),
+            code: codes::VALID_7114.to_owned(),
+        })
+    }
+
+    /// Per-instance equivalent of the free-function `petname_resolve_context`.
+    pub fn petname_resolve_context(
+        &self,
+        owner_did: String,
+        name: String,
+    ) -> Result<String, ScpError> {
+        if owner_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            });
+        }
+        let guard = self
+            .inner
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpError::Validation {
+                msg: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        let ids: Vec<String> = guard
+            .get(&owner_did)
+            .map(|map| map.resolve_context(&name))
+            .unwrap_or_default();
+        serde_json::to_string(&ids).map_err(|e| ScpError::Validation {
+            msg: format!("failed to serialize petname resolve result: {e}"),
+            code: codes::VALID_7114.to_owned(),
+        })
+    }
+
+    /// Per-instance equivalent of the free-function `petname_get_for_did`.
+    pub fn petname_get_for_did(
+        &self,
+        owner_did: String,
+        target_did: String,
+    ) -> Result<Option<String>, ScpError> {
+        if owner_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            });
+        }
+        let guard = self
+            .inner
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpError::Validation {
+                msg: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        Ok(guard.get(&owner_did).and_then(|map| {
+            map.petname_for_did(&scp_identity::DID::from(target_did.as_str()))
+                .map(str::to_owned)
+        }))
+    }
+
+    /// Per-instance equivalent of the free-function `petname_get_for_context`.
+    pub fn petname_get_for_context(
+        &self,
+        owner_did: String,
+        context_id: String,
+    ) -> Result<Option<String>, ScpError> {
+        if owner_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            });
+        }
+        let guard = self
+            .inner
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpError::Validation {
+                msg: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        Ok(guard
+            .get(&owner_did)
+            .and_then(|map| map.petname_for_context(&context_id).map(str::to_owned)))
+    }
+
+    // ----- Handle registry methods -----
+
+    /// Per-instance equivalent of the free-function `handle_register`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_register(
+        &self,
+        discovery_context_id: String,
+        handle: String,
+        target_json: String,
+        registrant_did: String,
+        description: Option<String>,
+        tags: Option<Vec<String>>,
+    ) -> Result<String, ScpError> {
+        let target = uniffi_parse_handle_target(&target_json)?;
+        let params = scp_core::discovery::HandleRegisterParams {
+            handle,
+            target,
+            metadata: Some(scp_core::discovery::HandleMetadata { description, tags }),
+        };
+        let mut guard = self
+            .inner
+            .core
+            .handle_registries()
+            .lock()
+            .map_err(|e| ScpError::Validation {
+                msg: format!("handle registry lock poisoned: {e}"),
+                code: codes::VALID_7120.to_owned(),
+            })?;
+        let registry = guard
+            .entry(discovery_context_id.clone())
+            .or_insert_with(|| scp_core::discovery::HandleRegistry::new(discovery_context_id));
+        let result = registry.register(
+            &params,
+            &scp_identity::DID::from(registrant_did.as_str()),
+            &scp_primitives::SystemClock,
+        );
+        serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+            msg: format!("failed to serialize handle register result: {e}"),
+            code: codes::VALID_7122.to_owned(),
+        })
+    }
+
+    /// Per-instance equivalent of the free-function `handle_lookup`.
+    pub fn handle_lookup(
+        &self,
+        discovery_context_id: String,
+        handle: String,
+        type_filter: Option<String>,
+    ) -> Result<String, ScpError> {
+        let filter = match type_filter.as_deref() {
+            Some("identity") => Some(scp_core::discovery::HandleTypeFilter::Identity),
+            Some("context") => Some(scp_core::discovery::HandleTypeFilter::Context),
+            Some(other) => {
+                return Err(ScpError::Validation {
+                    msg: format!(
+                        "invalid type_filter '{other}': expected 'identity' or 'context'"
+                    ),
+                    code: codes::VALID_7123.to_owned(),
+                });
+            }
+            None => None,
+        };
+        let guard = self
+            .inner
+            .core
+            .handle_registries()
+            .lock()
+            .map_err(|e| ScpError::Validation {
+                msg: format!("handle registry lock poisoned: {e}"),
+                code: codes::VALID_7120.to_owned(),
+            })?;
+        let result = guard.get(&discovery_context_id).map_or_else(
+            || scp_core::discovery::HandleLookupResult {
+                results: Vec::new(),
+            },
+            |registry| {
+                registry.lookup(&scp_core::discovery::HandleLookupParams {
+                    handle,
+                    type_filter: filter,
+                })
+            },
+        );
+        serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+            msg: format!("failed to serialize handle lookup result: {e}"),
+            code: codes::VALID_7124.to_owned(),
+        })
+    }
+
+    /// Per-instance equivalent of the free-function `handle_deregister`.
+    pub fn handle_deregister(
+        &self,
+        discovery_context_id: String,
+        handle: String,
+        did: String,
+    ) -> Result<String, ScpError> {
+        let mut guard = self
+            .inner
+            .core
+            .handle_registries()
+            .lock()
+            .map_err(|e| ScpError::Validation {
+                msg: format!("handle registry lock poisoned: {e}"),
+                code: codes::VALID_7120.to_owned(),
+            })?;
+        let result = guard.get_mut(&discovery_context_id).map_or_else(
+            || scp_core::discovery::HandleDeregisterResult { removed: false },
+            |registry| {
+                registry.deregister(&scp_core::discovery::HandleDeregisterParams {
+                    handle,
+                    did: scp_identity::DID::from(did.as_str()),
+                })
+            },
+        );
+        serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+            msg: format!("failed to serialize handle deregister result: {e}"),
+            code: codes::VALID_7125.to_owned(),
+        })
+    }
+
+    // ----- Scope registry methods -----
+
+    /// Per-instance equivalent of the free-function `scope_register`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scope_register(
+        &self,
+        scope_context_id: String,
+        name: String,
+        target_context_id: String,
+        relay_urls: Vec<String>,
+        registrant_did: String,
+        description: Option<String>,
+        tags: Option<Vec<String>>,
+    ) -> Result<String, ScpError> {
+        // Validate inputs at the FFI boundary (defense-in-depth)
+        validate_context_id(&scope_context_id)?;
+        validate_context_id(&target_context_id)?;
+        validate_did(&registrant_did)?;
+
+        // Validate relay URLs at the FFI boundary
+        for url in &relay_urls {
+            scp_ffi_common::validate::validate_relay_url(url).map_err(|e| ScpError::Validation {
+                msg: e.to_string(),
+                code: codes::VALID_7135.to_owned(),
+            })?;
+        }
+
+        let params = scp_core::discovery::ScopeRegisterParams {
+            name,
+            target: scp_core::discovery::ScopeTarget {
+                context_id: target_context_id,
+                relay_urls,
+            },
+            metadata: if description.is_some() || tags.is_some() {
+                Some(scp_core::discovery::ScopeMetadata { description, tags })
+            } else {
+                None
+            },
+        };
+
+        let mut guard =
+            self.inner
+                .core
+                .scope_registries()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("scope registry lock poisoned: {e}"),
+                    code: codes::VALID_7130.to_owned(),
+                })?;
+
+        let registry = guard
+            .entry(scope_context_id.clone())
+            .or_insert_with(|| scp_core::discovery::ScopeRegistry::new(scope_context_id));
+
+        let result = registry
+            .register(
+                &params,
+                &scp_identity::DID::from(registrant_did.as_str()),
+                &scp_primitives::SystemClock,
+            )
+            .map_err(|e| ScpError::Validation {
+                msg: format!("scope registration failed: {e}"),
+                code: codes::VALID_7131.to_owned(),
+            })?;
+
+        serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+            msg: format!("failed to serialize scope register result: {e}"),
+            code: codes::VALID_7132.to_owned(),
+        })
+    }
+
+    /// Per-instance equivalent of the free-function `scope_lookup`.
+    pub fn scope_lookup(
+        &self,
+        scope_context_id: String,
+        name: String,
+    ) -> Result<String, ScpError> {
+        validate_context_id(&scope_context_id)?;
+
+        let guard = self
+            .inner
+            .core
+            .scope_registries()
+            .lock()
+            .map_err(|e| ScpError::Validation {
+                msg: format!("scope registry lock poisoned: {e}"),
+                code: codes::VALID_7130.to_owned(),
+            })?;
+
+        let result = match guard.get(&scope_context_id) {
+            Some(registry) => registry
+                .lookup(&scp_core::discovery::ScopeLookupParams { name })
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("scope lookup failed: {e}"),
+                    code: codes::VALID_7133.to_owned(),
+                })?,
+            None => scp_core::discovery::ScopeLookupResult {
+                results: Vec::new(),
+            },
+        };
+
+        serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+            msg: format!("failed to serialize scope lookup result: {e}"),
+            code: codes::VALID_7133.to_owned(),
+        })
+    }
+
+    /// Per-instance equivalent of the free-function `scope_deregister`.
+    pub fn scope_deregister(
+        &self,
+        scope_context_id: String,
+        name: String,
+        did: String,
+    ) -> Result<String, ScpError> {
+        validate_context_id(&scope_context_id)?;
+        validate_did(&did)?;
+
+        let mut guard =
+            self.inner
+                .core
+                .scope_registries()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("scope registry lock poisoned: {e}"),
+                    code: codes::VALID_7130.to_owned(),
+                })?;
+
+        let result = match guard.get_mut(&scope_context_id) {
+            Some(registry) => registry
+                .deregister(&scp_core::discovery::ScopeDeregisterParams {
+                    name,
+                    did: scp_identity::DID::from(did.as_str()),
+                })
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("scope deregister failed: {e}"),
+                    code: codes::VALID_7134.to_owned(),
+                })?,
+            None => scp_core::discovery::ScopeDeregisterResult { removed: false },
+        };
+
+        serde_json::to_string(&result).map_err(|e| ScpError::Validation {
+            msg: format!("failed to serialize scope deregister result: {e}"),
+            code: codes::VALID_7134.to_owned(),
+        })
+    }
+
+    // ----- Address resolution -----
+
+    /// Per-instance equivalent of the free-function `address_resolve`.
+    pub fn address_resolve(
+        &self,
+        owner_did: String,
+        address: String,
+        known_contexts_json: Option<String>,
+    ) -> Result<String, ScpError> {
+        if owner_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            });
+        }
+
+        let bi = &*self.inner;
+
+        let mut known_contexts: std::collections::HashMap<String, String> =
+            if let Some(ref json) = known_contexts_json {
+                serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                    msg: format!("invalid known_contexts_json: {e}"),
+                    code: codes::VALID_7090.to_owned(),
+                })?
+            } else {
+                let guard = bi
+                    .core
+                    .handle_registries()
+                    .lock()
+                    .map_err(|e| ScpError::Validation {
+                        msg: format!("handle registry lock poisoned: {e}"),
+                        code: codes::VALID_7120.to_owned(),
+                    })?;
+                guard.keys().map(|k| (k.clone(), k.clone())).collect()
+            };
+
+        // Merge scope registry contexts for two-hop resolution (§22.3.5).
+        let scope_contexts = petname_helpers::known_contexts_from_scope_registries(&bi.core);
+        for (name, ctx_id) in scope_contexts {
+            known_contexts.entry(name).or_insert(ctx_id);
+        }
+
+        let known_domains: Vec<&str> = Vec::new();
+        let petname_map = {
+            let guard = bi
+                .core
+                .petname_maps()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("petname lock poisoned: {e}"),
+                    code: codes::VALID_7112.to_owned(),
+                })?;
+            guard.get(&owner_did).cloned().unwrap_or_default()
+        };
+
+        let handle = tokio::runtime::Handle::current();
+        let results = tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let mut resolver = scp_core::discovery::AddressResolver::new();
+                let querier = petname_helpers::LocalHandleQuerier::new(&bi.core);
+                resolver
+                    .resolve(
+                        &address,
+                        &petname_map,
+                        &querier,
+                        &known_contexts,
+                        &known_domains,
+                        &scp_primitives::SystemClock,
+                    )
+                    .await
+                    .map_err(|e| ScpError::Validation {
+                        msg: format!("address resolution failed: {e}"),
+                        code: codes::VALID_7091.to_owned(),
+                    })
+            })
+        })?;
+
+        let json_results: Vec<serde_json::Value> = results
+            .iter()
+            .map(petname_helpers::address_resolution_to_json)
+            .collect();
+        serde_json::to_string(&json_results).map_err(|e| ScpError::Validation {
+            msg: format!("failed to serialize address resolution results: {e}"),
+            code: codes::VALID_7092.to_owned(),
+        })
+    }
+
+    // ----- Economy budget methods -----
+
+    /// Per-instance equivalent of the free-function `economy_budget_remaining`.
+    pub fn economy_budget_remaining(
+        &self,
+        context_id: String,
+        did: String,
+    ) -> Result<u64, ScpError> {
+        validate_did(&did)?;
+        let member_did = scp_identity::DID::from(did.as_str());
+        let remaining = self
+            .inner
+            .core
+            .with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
+        Ok(remaining.value())
+    }
+
+    /// Per-instance equivalent of the free-function `economy_budget_grant`.
+    pub fn economy_budget_grant(
+        &self,
+        context_id: String,
+        did: String,
+        amount: u64,
+    ) -> Result<(), ScpError> {
+        validate_did(&did)?;
+        let member_did = scp_identity::DID::from(did.as_str());
+        self.inner
+            .core
+            .with_economy_budget_mut(&context_id, |tracker| {
+                tracker.grant(&member_did, scp_core::economy::Amount::new(amount));
+            });
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the free-function `economy_budget_record_spend`.
+    pub fn economy_budget_record_spend(
+        &self,
+        context_id: String,
+        did: String,
+        amount: u64,
+    ) -> Result<(), ScpError> {
+        validate_did(&did)?;
+        let member_did = scp_identity::DID::from(did.as_str());
+        self.inner
+            .core
+            .with_economy_budget_mut(&context_id, |tracker| {
+                tracker
+                    .record_spend(&member_did, scp_core::economy::Amount::new(amount))
+                    .map_err(|e| ScpError::Validation {
+                        msg: format!("{e}"),
+                        code: codes::VALID_7052.to_owned(),
+                    })
+            })
+    }
+
+    // ----- Economy antispam methods -----
+
+    /// Per-instance equivalent of the free-function `economy_antispam_record`.
+    pub fn economy_antispam_record(
+        &self,
+        context_id: String,
+        sender_did: String,
+        timestamp: u64,
+    ) -> Result<(), ScpError> {
+        validate_did(&sender_did)?;
+        let did = scp_identity::DID::from(sender_did.as_str());
+        self.inner
+            .core
+            .with_economy_antispam(&context_id, |tracker| {
+                tracker.record_message(&did, timestamp);
+            });
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the free-function `economy_antispam_velocity`.
+    pub fn economy_antispam_velocity(
+        &self,
+        context_id: String,
+        sender_did: String,
+        now: u64,
+    ) -> Result<u64, ScpError> {
+        validate_did(&sender_did)?;
+        let did = scp_identity::DID::from(sender_did.as_str());
+        let velocity = self
+            .inner
+            .core
+            .with_economy_antispam(&context_id, |tracker| tracker.get_velocity(&did, now));
+        Ok(velocity)
+    }
+
+    /// Per-instance equivalent of the free-function `economy_antispam_escalated_cost`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn economy_antispam_escalated_cost(
+        &self,
+        context_id: String,
+        sender_did: String,
+        now: u64,
+        base_cost: u64,
+        thresholds_json: String,
+        floor: Option<u64>,
+        cap: Option<u64>,
+    ) -> Result<u64, ScpError> {
+        validate_did(&sender_did)?;
+        let thresholds: Vec<(u64, u64)> =
+            serde_json::from_str(&thresholds_json).map_err(|e| ScpError::Validation {
+                msg: format!("invalid thresholds JSON: {e}"),
+                code: codes::VALID_7050.to_owned(),
+            })?;
+
+        let config = scp_core::economy::EscalationConfig {
+            thresholds: thresholds
+                .into_iter()
+                .map(|(vel, cost)| scp_core::economy::EscalationThreshold {
+                    velocity_threshold: vel,
+                    additional_cost: scp_core::economy::Amount::new(cost),
+                })
+                .collect(),
+        };
+
+        let did = scp_identity::DID::from(sender_did.as_str());
+        let cost = self
+            .inner
+            .core
+            .with_economy_antispam(&context_id, |tracker| {
+                tracker.compute_escalated_cost(
+                    &did,
+                    now,
+                    scp_core::economy::Amount::new(base_cost),
+                    &config,
+                    floor.map(scp_core::economy::Amount::new),
+                    cap.map(scp_core::economy::Amount::new),
+                )
+            });
+        Ok(cost.value())
+    }
+
+    // ----- Economic policy methods -----
+
+    /// Per-instance equivalent of the free-function `set_economic_policy`.
+    ///
+    /// Economic policy changes must go through governance — this method
+    /// always returns an error to enforce that invariant.
+    #[allow(clippy::needless_pass_by_value)] // UniFFI owned parameters
+    pub fn set_economic_policy(
+        &self,
+        handle: Arc<ContextHandle>,
+        policy_json: String,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let _ = (handle, policy_json);
+        Err(ScpError::Permission {
+            msg: "economic policy changes must go through governance \
+                  (propose SetEconomicPolicy action). Direct mutation is \
+                  not permitted — see spec §19.3"
+                .to_owned(),
+            code: codes::CTX_2013.to_owned(),
+        })
+    }
+
+    /// Per-instance equivalent of the free-function `get_economic_policy`.
+    pub fn get_economic_policy(
+        &self,
+        handle: Arc<ContextHandle>,
+    ) -> Result<Option<String>, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let guard = handle
+            .economic_policy
+            .lock()
+            .map_err(|_| ScpError::Context {
+                msg: "economic_policy lock is poisoned".to_owned(),
+                code: codes::CTX_2012.to_owned(),
+            })?;
+        Ok(guard.clone())
+    }
+
+    // ----- Context export/import methods -----
+
+    /// Per-instance equivalent of the free-function `context_export`.
+    pub async fn context_export(
+        &self,
+        handle: Arc<ContextHandle>,
+    ) -> Result<Vec<u8>, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let ctx_id = handle.context_id.clone();
+        let creator_did = handle.creator_did.clone();
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let export = manager
+                    .export_context(&ctx_id, scp_identity::DID::from(creator_did))
+                    .await
+                    .map_err(ScpError::from)?;
+                scp_core::context::export_import::serialize_export(&export).map_err(|e| {
+                    ScpError::Context {
+                        msg: format!("export serialization failed: {e}"),
+                        code: codes::CTX_2030.to_owned(),
+                    }
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during context export: {e}"),
+                code: codes::CTX_2031.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function `context_import`.
+    pub async fn context_import(&self, data: Vec<u8>) -> Result<String, ScpError> {
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let export = scp_core::context::export_import::deserialize_export(&data)
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("invalid export data: {e}"),
+                        code: codes::CTX_2032.to_owned(),
+                    })?;
+                let context_id = export.snapshot.context_id.clone();
+
+                // Ensure the ContextManager is initialized using the exporter's
+                // DID (carried on the envelope) — context_import is a valid
+                // first operation (e.g. a device receiving exported context
+                // data). `init_context_manager_with_did` is idempotent
+                // (`OnceLock`). #1073
+                validate_did(&export.exporter_did.0)?;
+                bi.init_context_manager_with_did(&export.exporter_did.0);
+
+                let manager = bi.context_manager_or_error()?;
+                manager
+                    .import_context(export)
+                    .await
+                    .map_err(ScpError::from)?;
+                Ok(context_id)
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during context import: {e}"),
+                code: codes::CTX_2033.to_owned(),
+            })?
+    }
+
+    // ----- Invitation evaluation -----
+
+    /// Per-instance equivalent of the free-function `evaluate_invitation`.
+    pub fn evaluate_invitation(
+        &self,
+        params_json: String,
+        inviter_did: String,
+        identity_did: String,
+        policy_json: Option<String>,
+        spending_json: Option<String>,
+        trusted_dids: Vec<String>,
+    ) -> Result<String, ScpError> {
+        use scp_core::context::invitation::{
+            EvaluationDecision, SpendingContext, evaluate_invitation as core_evaluate,
+        };
+        use scp_core::context::policy::AutoAcceptPolicy;
+
+        validate_did(&inviter_did)?;
+        validate_did(&identity_did)?;
+
+        let params: scp_core::context::params::ContextParams =
+            serde_json::from_str(&params_json).map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse context params JSON: {e}"),
+                code: codes::VALID_7010.to_owned(),
+            })?;
+
+        let policy: Option<AutoAcceptPolicy> = match policy_json {
+            Some(ref json) => Some(serde_json::from_str(json).map_err(|e| {
+                ScpError::Validation {
+                    msg: format!("failed to parse auto-accept policy JSON: {e}"),
+                    code: codes::VALID_7010.to_owned(),
+                }
+            })?),
+            None => None,
+        };
+
+        let spending: Option<SpendingContext> = match spending_json {
+            Some(ref json) => Some(serde_json::from_str(json).map_err(|e| {
+                ScpError::Validation {
+                    msg: format!("failed to parse spending context JSON: {e}"),
+                    code: codes::VALID_7010.to_owned(),
+                }
+            })?),
+            None => None,
+        };
+
+        let oracle_dids: Vec<scp_identity::DID> = trusted_dids
+            .into_iter()
+            .map(scp_identity::DID::from)
+            .collect();
+        let oracle = UniffiBridgeTrustOracle {
+            trusted_dids: oracle_dids,
+        };
+        let inviter = scp_identity::DID::from(inviter_did.as_str());
+
+        let decision = self.inner.with_rate_limit_tracker(&identity_did, |tracker| {
+            core_evaluate(
+                &params,
+                &inviter,
+                policy.as_ref(),
+                spending.as_ref(),
+                &oracle,
+                tracker,
+                &scp_core::time::SystemClock,
+            )
+        });
+
+        match decision {
+            Ok(EvaluationDecision::AutoAccept) => Ok("auto_accept".to_owned()),
+            Ok(EvaluationDecision::PromptAgent) => Ok("prompt_agent".to_owned()),
+            Err(e) => Err(ScpError::Context {
+                msg: format!("invitation evaluation failed: {e}"),
+                code: codes::CTX_2060.to_owned(),
+            }),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -13781,22 +13764,24 @@ mod tests {
     /// Direct `set_economic_policy` always rejects — must use governance (#728).
     #[test]
     fn set_economic_policy_always_rejects_requires_governance() {
+        // Use the default SCP instance so the handle's instance_id matches.
+        let scp = crate::scp::Scp::default_instance().expect("default instance");
         let handle = test_handle();
 
         // Initially None.
-        let result = get_economic_policy(Arc::clone(&handle)).unwrap();
+        let result = scp.get_economic_policy(Arc::clone(&handle)).unwrap();
         assert!(result.is_none());
 
         // Direct set always rejects.
         let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":100,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
-        let result = set_economic_policy(Arc::clone(&handle), json.to_owned());
+        let result = scp.set_economic_policy(Arc::clone(&handle), json.to_owned());
         assert!(
             result.is_err(),
             "direct set must be rejected — use governance"
         );
 
         // Policy should remain None.
-        let result = get_economic_policy(handle).unwrap();
+        let result = scp.get_economic_policy(handle).unwrap();
         assert!(result.is_none());
     }
 
@@ -15152,7 +15137,7 @@ mod tests {
             r#"{"has_spending_ucan":true,"configured_adapters":["x402"],"available_balance":10000}"#
                 .to_owned();
 
-        let result = super::evaluate_invitation(
+        let result = scp_test().evaluate_invitation(
             params_json,
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
@@ -15173,7 +15158,7 @@ mod tests {
         let params = scp_core::context::ContextParams::default();
         let params_json = serde_json::to_string(&params).unwrap();
 
-        let result = super::evaluate_invitation(
+        let result = scp_test().evaluate_invitation(
             params_json,
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
@@ -15190,7 +15175,7 @@ mod tests {
         let params = scp_core::context::ContextParams::default();
         let params_json = serde_json::to_string(&params).unwrap();
 
-        let result = super::evaluate_invitation(
+        let result = scp_test().evaluate_invitation(
             params_json,
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),

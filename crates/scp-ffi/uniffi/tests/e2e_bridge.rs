@@ -35,11 +35,8 @@ use scp_ffi_uniffi::{
     discovery_create_query,
     discovery_normalize_address,
     discovery_parse_address,
-    // Free functions — identity (stateful, not yet migrated to Scp methods)
-    identity_migrate,
     // Free functions — provenance
     evaluate_provenance_quality,
-    provenance_attach,
     provenance_check_chain_depth,
     // Free functions — shutdown
     scp_shutdown,
@@ -237,7 +234,7 @@ async fn identity_migrate_preserves_attestations() {
     // Like rotate_key, migration may fail with InMemoryDhtClient due to
     // isolated DHT instances. Handle both outcomes.
     let migrate_result: Result<std::sync::Arc<scp_ffi_uniffi::Identity>, _> =
-        identity_migrate(identity).await;
+        scp.identity_migrate(identity).await;
     match migrate_result {
         Ok(migrated) => {
             let new_did: String = migrated.did();
@@ -790,16 +787,17 @@ async fn sync_classify_offline_custom_thresholds() {
 #[tokio::test]
 async fn provenance_attach_produces_json() {
     let scp = Scp::new();
-    let result = provenance_attach(
-        "ctx-source".to_owned(),
-        "persistent".to_owned(),
-        "full".to_owned(),
-        vec!["did:dht:z6MkAlice".to_owned(), "did:dht:z6MkBob".to_owned()],
-        "ctx-target".to_owned(),
-        "did:dht:z6MkActor".to_owned(),
-        None,
-    )
-    .unwrap();
+    let result = scp
+        .provenance_attach(
+            "ctx-source".to_owned(),
+            "persistent".to_owned(),
+            "full".to_owned(),
+            vec!["did:dht:z6MkAlice".to_owned(), "did:dht:z6MkBob".to_owned()],
+            "ctx-target".to_owned(),
+            "did:dht:z6MkActor".to_owned(),
+            None,
+        )
+        .unwrap();
 
     assert!(!result.is_empty(), "Provenance JSON should be non-empty");
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -809,16 +807,17 @@ async fn provenance_attach_produces_json() {
 #[tokio::test]
 async fn provenance_attach_increments_chain_depth() {
     let scp = Scp::new();
-    let result = provenance_attach(
-        "ctx-source".to_owned(),
-        "persistent".to_owned(),
-        "full".to_owned(),
-        vec!["did:dht:z6MkAlice".to_owned()],
-        "ctx-target".to_owned(),
-        "did:dht:z6MkActor".to_owned(),
-        Some(2),
-    )
-    .unwrap();
+    let result = scp
+        .provenance_attach(
+            "ctx-source".to_owned(),
+            "persistent".to_owned(),
+            "full".to_owned(),
+            vec!["did:dht:z6MkAlice".to_owned()],
+            "ctx-target".to_owned(),
+            "did:dht:z6MkActor".to_owned(),
+            Some(2),
+        )
+        .unwrap();
 
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
     let depth = parsed["chain_depth"].as_u64().unwrap();
