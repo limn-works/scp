@@ -30,7 +30,7 @@ use crate::error::ScpNapiError;
 use crate::identity::NapiIdentity;
 #[cfg(feature = "allow_in_memory_custody")]
 use crate::identity::OpaqueInMemoryKeyCustody;
-use crate::runtime::context_manager;
+use crate::runtime::{NapiBridgeInstance, context_manager, default_bridge_instance};
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
@@ -241,7 +241,7 @@ impl NapiContextHandle {
     /// Returns an error if the `ContextManager` is not initialised.
     #[napi(getter, js_name = "memberCount")]
     pub fn member_count(&self) -> napi::Result<u32> {
-        let manager = context_manager()?;
+        let manager = context_manager(&bi)?;
         let count = crate::runtime()
             .block_on(manager.member_count(&self.context_id))
             .unwrap_or(0);
@@ -412,7 +412,17 @@ pub async fn context_create(
     identity: &NapiIdentity,
     params_json: String,
 ) -> napi::Result<NapiContextHandle> {
-    crate::napi_check_handle!(identity);
+    let bi = default_bridge_instance()?;
+    context_create_on(&bi, identity, params_json).await
+}
+
+/// Per-bridge-instance implementation of [`context_create`].
+pub(crate) async fn context_create_on(
+    bi: &NapiBridgeInstance,
+    identity: &NapiIdentity,
+    params_json: String,
+) -> napi::Result<NapiContextHandle> {
+    crate::napi_check_handle!(&bi.core, identity);
     validate_did(&identity.inner.did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let params: serde_json::Value = serde_json::from_str(&params_json).map_err(|e| {
@@ -538,14 +548,14 @@ pub async fn context_create(
 
     // Initialize the ContextManager if not already done (first context_create call).
     // Passes the creator DID to MlsCryptoProvider for real MLS encryption (#1294).
-    crate::runtime::init_context_manager(&creator_did);
+    crate::runtime::init_context_manager(bi, &creator_did);
 
     // Derive the context-scoped pseudonym routing ID (§9.10.4, SCP-214 criterion 5).
     // Derived BEFORE create_context so it can be passed to the ContextManager.
     let local_pseudonym = derive_context_pseudonym(identity, &context_id).await;
 
     // Delegate to ContextManager with pseudonym for per-member routing.
-    let manager = context_manager()?;
+    let manager = context_manager(bi)?;
     let core_handle = manager
         .create_context(
             context_id.clone(),
@@ -567,7 +577,7 @@ pub async fn context_create(
     if local_pseudonym.is_some() {
         #[cfg(feature = "allow_in_memory_custody")]
         {
-            let custody_and_key = crate::runtime::with_identity(&creator_did, |e| {
+            let custody_and_key = crate::runtime::with_identity(bi, &creator_did, |e| {
                 Ok((e.custody.clone(), e.identity.active_signing_key))
             })
             .ok();
@@ -575,7 +585,7 @@ pub async fn context_create(
                 && let Ok(sk) = custody.0.export_ed25519_signing_key(&key_handle).await
             {
                 let sender_did = DID(creator_did.clone());
-                if let Ok(mgr) = context_manager() {
+                if let Ok(mgr) = context_manager(bi) {
                     mgr.send_pseudonym_announcement(&core_handle, &sender_did, &sk)
                         .await;
                 }
@@ -603,7 +613,7 @@ pub async fn context_create(
         core_handle: Some(core_handle),
         subscription_cancel: std::sync::Mutex::new(CancellationToken::new()),
         subscription_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        instance_id: crate::runtime::default_instance_id()?,
+        instance_id: bi.instance_id(),
     };
     increment_handle_count();
     Ok(handle)
@@ -628,7 +638,19 @@ pub async fn context_join(
     identity_did: String,
     spending_ucan_jwt: Option<String>,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_join_on(&bi, handle, identity_did, spending_ucan_jwt).await
+}
+
+/// Per-bridge-instance implementation of [`context_join`].
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) async fn context_join_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    identity_did: String,
+    spending_ucan_jwt: Option<String>,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
@@ -659,7 +681,7 @@ pub async fn context_join(
     // first operation (e.g. a device joining a context without creating one).
     // init_context_manager is idempotent (OnceLock — first call wins). #1073
     // Passes the joiner DID to MlsCryptoProvider for real MLS encryption (#1294).
-    crate::runtime::init_context_manager(&identity_did);
+    crate::runtime::init_context_manager(bi, &identity_did);
 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
 
@@ -682,7 +704,7 @@ pub async fn context_join(
     let local_pseudonym: Option<[u8; 32]> = {
         #[cfg(feature = "allow_in_memory_custody")]
         {
-            let custody_and_key = crate::runtime::with_identity(&identity_did, |entry| {
+            let custody_and_key = crate::runtime::with_identity(bi, &identity_did, |entry| {
                 Ok((entry.custody.clone(), entry.identity.identity_key))
             })
             .ok();
@@ -702,7 +724,7 @@ pub async fn context_join(
         }
     };
 
-    let manager = context_manager()?;
+    let manager = context_manager(bi)?;
     manager
         .join_context(
             core_handle,
@@ -720,7 +742,7 @@ pub async fn context_join(
         {
             // Extract custody + key handle from registry (sync), then export
             // the signing key asynchronously — avoids block_on inside async fn.
-            let custody_and_key = crate::runtime::with_identity(&identity_did, |e| {
+            let custody_and_key = crate::runtime::with_identity(bi, &identity_did, |e| {
                 Ok((e.custody.clone(), e.identity.active_signing_key))
             })
             .ok();
@@ -729,7 +751,7 @@ pub async fn context_join(
             {
                 let sender_did = DID(identity_did.clone());
                 if let (Some(mgr), Ok(ann_handle)) =
-                    (context_manager().ok(), handle.require_core_handle())
+                    (context_manager(bi).ok(), handle.require_core_handle())
                 {
                     mgr.send_pseudonym_announcement(ann_handle, &sender_did, &sk)
                         .await;
@@ -752,7 +774,18 @@ pub async fn context_join(
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_leave_on(&bi, handle, identity_did).await
+}
+
+/// Per-bridge-instance implementation of [`context_leave`].
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) async fn context_leave_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    identity_did: String,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
     if state_str != "active" {
         return Err(ScpNapiError::Context {
@@ -773,7 +806,7 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let did = DID(identity_did.clone());
 
-    let manager = context_manager()?;
+    let manager = context_manager(bi)?;
     manager
         .leave_context(core_handle, &did, &did)
         .await
@@ -794,7 +827,17 @@ pub async fn context_leave(handle: &NapiContextHandle, identity_did: String) -> 
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_close_on(&bi, handle, identity_did).await
+}
+
+/// Per-bridge-instance implementation of [`context_close`].
+pub(crate) async fn context_close_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    identity_did: String,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     // Authorization is enforced by the ContextManager (which delegates to
     // ttl::close_context checking the ContextClose capability). No bridge-layer
     // auth check — the ContextManager is authoritative.
@@ -819,7 +862,7 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let did = DID(identity_did.clone());
 
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     manager
         .close_context(core_handle, &did)
         .await
@@ -828,13 +871,12 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
     handle.set_closed().map_err(NapiError::from)?;
 
     // Clean up UCAN state for this context.
-    crate::runtime::remove_context(&handle.context_id);
+    crate::runtime::remove_context(bi, &handle.context_id);
 
-    // Clean up per-context bridge connector state and economy state via BridgeInstance.
-    if let Ok(bi) = crate::runtime::bridge_instance() {
-        bi.remove_bridge_state(&handle.context_id);
-        bi.remove_economy_state(&handle.context_id);
-    }
+    // Clean up per-context bridge connector state and economy state via the
+    // same NapiBridgeInstance's core (not the process-global bridge).
+    bi.core.remove_bridge_state(&handle.context_id);
+    bi.core.remove_economy_state(&handle.context_id);
 
     Ok(())
 }
@@ -855,7 +897,19 @@ pub async fn context_send(
     payload: Vec<u8>,
     spending_ucan_jwt: Option<String>,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_send_on(&bi, handle, identity_did, payload, spending_ucan_jwt).await
+}
+
+/// Per-bridge-instance implementation of [`context_send`].
+pub(crate) async fn context_send_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    identity_did: String,
+    payload: Vec<u8>,
+    spending_ucan_jwt: Option<String>,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.current_state_str().map_err(NapiError::from)?;
@@ -927,7 +981,7 @@ pub async fn context_send(
             })
         })?;
 
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     manager
         .send_message(
             core_handle,
@@ -1015,7 +1069,18 @@ pub async fn context_subscribe(
     identity_did: String,
     on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_subscribe_on(&bi, handle, identity_did, on_message).await
+}
+
+/// Per-bridge-instance implementation of [`context_subscribe`].
+pub(crate) async fn context_subscribe_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    identity_did: String,
+    on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     // Guard: prevent duplicate subscriptions. The AtomicBool is swapped to
     // true on the first call; subsequent calls see `true` and bail.
     // The flag is reset to `false` by the spawned task when it exits (via
@@ -1074,10 +1139,16 @@ pub async fn context_subscribe(
     // `GracefulWithin` while the relay listener continued in the
     // background (Item 2 — review finding).
     //
-    // `bridge_instance()?` returns an error when the bridge is suspended;
-    // `outer_guard`'s `Drop` resets `subscription_active` so the caller
-    // can retry after `resume()` (round 3 bug-catcher finding).
-    let bi_core = crate::runtime::bridge_instance()?;
+    // Refuse to subscribe when the bridge is suspended (recoverable via
+    // `resume()`); `outer_guard`'s `Drop` resets `subscription_active` so
+    // the caller can retry after `resume()` (round 3 bug-catcher finding).
+    if bi.core.is_suspended() {
+        return Err(napi::Error::from(ScpNapiError::Transport {
+            message: "bridge is suspended — call resume() before subscribing".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        }));
+    }
+    let bi_core: &crate::runtime::CoreFields = &bi.core;
     let bridge_cancel = bi_core.cancel_token();
 
     let context_id = handle.context_id.clone();
@@ -1129,6 +1200,11 @@ pub async fn context_subscribe(
     // orphan the task, making shutdown falsely report `GracefulWithin`
     // while the subscription still held onto `transport_mgr`,
     // `ContextManager`, and the cancel_token Arcs.
+    // Capture an owned `Arc<ContextManager>` scoped to this bridge so the
+    // spawned task doesn't need to re-resolve it via a process-global lookup.
+    // Falls back gracefully if the ContextManager is not attached yet; the
+    // spawned task signals completion when so.
+    let manager_for_task = context_manager(bi).ok().cloned();
     let mut tasks = bi_core.task_handle().await;
     // Disarm the outer guard and transfer the flag to the spawned task's
     // inner guard. No intermediate "flag is true but un-guarded" window —
@@ -1151,9 +1227,9 @@ pub async fn context_subscribe(
         let local_pseudonym = if is_broadcast {
             None
         } else {
-            match context_manager() {
-                Ok(mgr) => mgr.local_pseudonym(&context_id).await.ok().flatten(),
-                Err(_) => None,
+            match manager_for_task.as_ref() {
+                Some(mgr) => mgr.local_pseudonym(&context_id).await.ok().flatten(),
+                None => None,
             }
         };
 
@@ -1200,10 +1276,10 @@ pub async fn context_subscribe(
             }
         }
 
-        let manager = match context_manager() {
-            Ok(m) => m.clone(),
-            Err(e) => {
-                tracing::error!(error = %e, "ContextManager not initialized");
+        let manager = match manager_for_task {
+            Some(m) => m,
+            None => {
+                tracing::error!("ContextManager not initialized");
                 on_message.call(
                     Ok(None),
                     napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
@@ -1334,7 +1410,16 @@ pub async fn context_subscribe(
 /// block to prevent orphaned tasks when the consumer abandons iteration.
 #[napi(js_name = "contextCancelSubscription")]
 pub fn context_cancel_subscription(handle: &NapiContextHandle) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_cancel_subscription_on(&bi, handle)
+}
+
+/// Per-bridge-instance implementation of [`context_cancel_subscription`].
+pub(crate) fn context_cancel_subscription_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     if let Ok(token) = handle.subscription_cancel.lock() {
         token.cancel();
     }
@@ -1358,8 +1443,17 @@ pub fn context_cancel_subscription(handle: &NapiContextHandle) -> napi::Result<(
 /// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextMemberCount")]
 pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u32> {
-    crate::napi_check_handle!(handle);
-    let manager = context_manager()?;
+    let bi = default_bridge_instance()?;
+    context_member_count_on(&bi, handle).await
+}
+
+/// Per-bridge-instance implementation of [`context_member_count`].
+pub(crate) async fn context_member_count_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+) -> napi::Result<u32> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let manager = context_manager(&bi)?;
     let count = manager.member_count(&handle.context_id).await.unwrap_or(0);
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
@@ -1374,8 +1468,18 @@ pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u3
 #[napi(js_name = "contextIsMember")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi::Result<bool> {
-    crate::napi_check_handle!(handle);
-    let manager = context_manager()?;
+    let bi = default_bridge_instance()?;
+    context_is_member_on(&bi, handle, did).await
+}
+
+/// Per-bridge-instance implementation of [`context_is_member`].
+pub(crate) async fn context_is_member_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    did: String,
+) -> napi::Result<bool> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let manager = context_manager(&bi)?;
     Ok(manager.is_member(&handle.context_id, &did).await)
 }
 
@@ -1388,8 +1492,17 @@ pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi:
 /// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextMemberDids")]
 pub async fn context_member_dids(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
-    crate::napi_check_handle!(handle);
-    let manager = context_manager()?;
+    let bi = default_bridge_instance()?;
+    context_member_dids_on(&bi, handle).await
+}
+
+/// Per-bridge-instance implementation of [`context_member_dids`].
+pub(crate) async fn context_member_dids_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+) -> napi::Result<Vec<String>> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let manager = context_manager(&bi)?;
     Ok(manager.member_dids(&handle.context_id).await)
 }
 
@@ -1407,8 +1520,18 @@ pub async fn context_member_role(
     handle: &NapiContextHandle,
     did: String,
 ) -> napi::Result<Option<String>> {
-    crate::napi_check_handle!(handle);
-    let manager = context_manager()?;
+    let bi = default_bridge_instance()?;
+    context_member_role_on(&bi, handle, did).await
+}
+
+/// Per-bridge-instance implementation of [`context_member_role`].
+pub(crate) async fn context_member_role_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    did: String,
+) -> napi::Result<Option<String>> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let manager = context_manager(&bi)?;
     Ok(manager
         .member_role(&handle.context_id, &did)
         .await
@@ -1462,8 +1585,17 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
 /// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextDrainEvents")]
 pub async fn context_drain_events(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
-    crate::napi_check_handle!(handle);
-    let manager = context_manager()?;
+    let bi = default_bridge_instance()?;
+    context_drain_events_on(&bi, handle).await
+}
+
+/// Per-bridge-instance implementation of [`context_drain_events`].
+pub(crate) async fn context_drain_events_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+) -> napi::Result<Vec<String>> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let manager = context_manager(&bi)?;
     let events = manager.drain_events(&handle.context_id).await;
     Ok(events.iter().map(format_context_event).collect())
 }
@@ -1488,7 +1620,18 @@ pub async fn access_key_generate(
     member_did: String,
     caller_did: String,
 ) -> napi::Result<()> {
-    let manager = context_manager()?;
+    let bi = default_bridge_instance()?;
+    access_key_generate_on(&bi, context_id, member_did, caller_did).await
+}
+
+/// Per-bridge-instance implementation of [`access_key_generate`].
+pub(crate) async fn access_key_generate_on(
+    bi: &NapiBridgeInstance,
+    context_id: String,
+    member_did: String,
+    caller_did: String,
+) -> napi::Result<()> {
+    let manager = context_manager(&bi)?;
     manager
         .generate_context_access_key(&context_id, &member_did, &caller_did)
         .await
@@ -1511,7 +1654,18 @@ pub async fn access_key_revoke(
     member_did: String,
     caller_did: String,
 ) -> napi::Result<()> {
-    let manager = context_manager()?;
+    let bi = default_bridge_instance()?;
+    access_key_revoke_on(&bi, context_id, member_did, caller_did).await
+}
+
+/// Per-bridge-instance implementation of [`access_key_revoke`].
+pub(crate) async fn access_key_revoke_on(
+    bi: &NapiBridgeInstance,
+    context_id: String,
+    member_did: String,
+    caller_did: String,
+) -> napi::Result<()> {
+    let manager = context_manager(&bi)?;
     manager
         .revoke_context_access_key(&context_id, &member_did, &caller_did)
         .await
@@ -1534,7 +1688,18 @@ pub async fn access_key_restore(
     member_did: String,
     caller_did: String,
 ) -> napi::Result<()> {
-    let manager = context_manager()?;
+    let bi = default_bridge_instance()?;
+    access_key_restore_on(&bi, context_id, member_did, caller_did).await
+}
+
+/// Per-bridge-instance implementation of [`access_key_restore`].
+pub(crate) async fn access_key_restore_on(
+    bi: &NapiBridgeInstance,
+    context_id: String,
+    member_did: String,
+    caller_did: String,
+) -> napi::Result<()> {
+    let manager = context_manager(&bi)?;
     manager
         .restore_context_access_key(&context_id, &member_did, &caller_did)
         .await
@@ -1556,8 +1721,17 @@ pub async fn access_key_restore(
 pub async fn context_broadcast_subscriber_count(
     handle: &NapiContextHandle,
 ) -> napi::Result<Option<u32>> {
-    crate::napi_check_handle!(handle);
-    let manager = context_manager()?;
+    let bi = default_bridge_instance()?;
+    context_broadcast_subscriber_count_on(&bi, handle).await
+}
+
+/// Per-bridge-instance implementation of [`context_broadcast_subscriber_count`].
+pub(crate) async fn context_broadcast_subscriber_count_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+) -> napi::Result<Option<u32>> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let manager = context_manager(&bi)?;
     #[allow(clippy::cast_possible_truncation)]
     Ok(manager
         .broadcast_subscriber_count(&handle.context_id)
@@ -1578,8 +1752,18 @@ pub async fn context_is_broadcast_subscriber(
     handle: &NapiContextHandle,
     did: String,
 ) -> napi::Result<bool> {
-    crate::napi_check_handle!(handle);
-    let manager = context_manager()?;
+    let bi = default_bridge_instance()?;
+    context_is_broadcast_subscriber_on(&bi, handle, did).await
+}
+
+/// Per-bridge-instance implementation of [`context_is_broadcast_subscriber`].
+pub(crate) async fn context_is_broadcast_subscriber_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    did: String,
+) -> napi::Result<bool> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let manager = context_manager(&bi)?;
     Ok(manager
         .is_broadcast_subscriber(&handle.context_id, &did)
         .await)
@@ -1596,8 +1780,17 @@ pub async fn context_is_broadcast_subscriber(
 pub async fn context_broadcast_admission(
     handle: &NapiContextHandle,
 ) -> napi::Result<Option<String>> {
-    crate::napi_check_handle!(handle);
-    let manager = context_manager()?;
+    let bi = default_bridge_instance()?;
+    context_broadcast_admission_on(&bi, handle).await
+}
+
+/// Per-bridge-instance implementation of [`context_broadcast_admission`].
+pub(crate) async fn context_broadcast_admission_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+) -> napi::Result<Option<String>> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let manager = context_manager(&bi)?;
     Ok(manager
         .broadcast_admission(&handle.context_id)
         .await
@@ -1695,9 +1888,19 @@ pub async fn broadcast_subscribe(
     handle: &NapiContextHandle,
     subscriber_did: String,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    broadcast_subscribe_on(&bi, handle, subscriber_did).await
+}
+
+/// Per-bridge-instance implementation of [`broadcast_subscribe`].
+pub(crate) async fn broadcast_subscribe_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    subscriber_did: String,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     let context_id = handle.context_id.clone();
     let did: DID = DID(subscriber_did);
     let timestamp = std::time::SystemTime::now()
@@ -1735,9 +1938,20 @@ pub async fn broadcast_unsubscribe(
     subscriber_did: String,
     rotate_keys: Option<bool>,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    broadcast_unsubscribe_on(&bi, handle, subscriber_did, rotate_keys).await
+}
+
+/// Per-bridge-instance implementation of [`broadcast_unsubscribe`].
+pub(crate) async fn broadcast_unsubscribe_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    subscriber_did: String,
+    rotate_keys: Option<bool>,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     let context_id = handle.context_id.clone();
     let did: DID = DID(subscriber_did);
 
@@ -1767,9 +1981,20 @@ pub async fn broadcast_publish(
     author_did: String,
     payload: Vec<u8>,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    broadcast_publish_on(&bi, handle, author_did, payload).await
+}
+
+/// Per-bridge-instance implementation of [`broadcast_publish`].
+pub(crate) async fn broadcast_publish_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    author_did: String,
+    payload: Vec<u8>,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     let context_id = handle.context_id.clone();
     let author_did = DID(author_did);
 
@@ -1867,9 +2092,21 @@ pub async fn broadcast_publish_asset(
     asset: NapiAssetEntry,
     deploy_id: Option<String>,
 ) -> napi::Result<NapiPublishResult> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    broadcast_publish_asset_on(&bi, handle, author_did, asset, deploy_id).await
+}
+
+/// Per-bridge-instance implementation of [`broadcast_publish_asset`].
+pub(crate) async fn broadcast_publish_asset_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    author_did: String,
+    asset: NapiAssetEntry,
+    deploy_id: Option<String>,
+) -> napi::Result<NapiPublishResult> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     let context_id = handle.context_id.clone();
     let author_did_val = DID(author_did.clone());
 
@@ -2007,7 +2244,19 @@ pub async fn broadcast_publish_assets(
     assets: Vec<NapiAssetEntry>,
     deploy_id: Option<String>,
 ) -> napi::Result<NapiBatchPublishResult> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    broadcast_publish_assets_on(&bi, handle, author_did, assets, deploy_id).await
+}
+
+/// Per-bridge-instance implementation of [`broadcast_publish_assets`].
+pub(crate) async fn broadcast_publish_assets_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    author_did: String,
+    assets: Vec<NapiAssetEntry>,
+    deploy_id: Option<String>,
+) -> napi::Result<NapiBatchPublishResult> {
+    crate::napi_check_handle!(&bi.core, handle);
     const MAX_BATCH_ASSETS: usize = 10_000;
     if assets.len() > MAX_BATCH_ASSETS {
         return Err(NapiError::from(ScpNapiError::Context {
@@ -2020,7 +2269,7 @@ pub async fn broadcast_publish_assets(
     }
 
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     let context_id = handle.context_id.clone();
     let author_did_val = DID(author_did.clone());
 
@@ -2151,10 +2400,21 @@ pub async fn broadcast_block_subscriber(
     subscriber_did: String,
     blocker_did: String,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    broadcast_block_subscriber_on(&bi, handle, subscriber_did, blocker_did).await
+}
+
+/// Per-bridge-instance implementation of [`broadcast_block_subscriber`].
+pub(crate) async fn broadcast_block_subscriber_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    subscriber_did: String,
+    blocker_did: String,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&blocker_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     let context_id = handle.context_id.clone();
     let subscriber: DID = DID(subscriber_did);
     let blocker: DID = DID(blocker_did);
@@ -2183,10 +2443,21 @@ pub async fn broadcast_unblock_subscriber(
     subscriber_did: String,
     unblocker_did: String,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    broadcast_unblock_subscriber_on(&bi, handle, subscriber_did, unblocker_did).await
+}
+
+/// Per-bridge-instance implementation of [`broadcast_unblock_subscriber`].
+pub(crate) async fn broadcast_unblock_subscriber_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    subscriber_did: String,
+    unblocker_did: String,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_did(&subscriber_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&unblocker_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     let context_id = handle.context_id.clone();
     let subscriber: DID = DID(subscriber_did);
     let unblocker: DID = DID(unblocker_did);
@@ -2219,10 +2490,21 @@ pub async fn broadcast_handle_key_request(
     author_did: String,
     requester_did: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    broadcast_handle_key_request_on(&bi, handle, author_did, requester_did).await
+}
+
+/// Per-bridge-instance implementation of [`broadcast_handle_key_request`].
+pub(crate) async fn broadcast_handle_key_request_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    author_did: String,
+    requester_did: String,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_did(&author_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&requester_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     let context_id = handle.context_id.clone();
     let author: DID = DID(author_did);
     let requester: DID = DID(requester_did);
@@ -2263,7 +2545,18 @@ pub async fn context_execute_governance_action(
     action_json: String,
     proposer_did: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_execute_governance_action_on(&bi, handle, action_json, proposer_did).await
+}
+
+/// Per-bridge-instance implementation of [`context_execute_governance_action`].
+pub(crate) async fn context_execute_governance_action_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    action_json: String,
+    proposer_did: String,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid governance action JSON: {e}"),
@@ -2309,7 +2602,7 @@ pub async fn context_execute_governance_action(
         created_at_epoch: None,
     };
 
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     let context_id = handle.context_id.clone();
     let result = manager
         .execute_governance_action(&context_id, &proposal)
@@ -2318,7 +2611,7 @@ pub async fn context_execute_governance_action(
 
     // Re-sync local UCAN role state cache from ContextManager after any
     // governance action that may have modified roles/membership (#560).
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id).await {
+    if let Err(e) = crate::runtime::sync_role_state_from_manager(&bi, &context_id).await {
         tracing::warn!(
             context_id = %context_id,
             action = action_name,
@@ -2436,7 +2729,18 @@ pub async fn context_governance_propose(
     action_json: String,
     proposer_did: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_governance_propose_on(&bi, handle, action_json, proposer_did).await
+}
+
+/// Per-bridge-instance implementation of [`context_governance_propose`].
+pub(crate) async fn context_governance_propose_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    action_json: String,
+    proposer_did: String,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     let action: GovernanceAction = serde_json::from_str(&action_json).map_err(|e| {
         NapiError::from(ScpNapiError::Validation {
             message: format!("invalid governance action JSON: {e}"),
@@ -2460,7 +2764,7 @@ pub async fn context_governance_propose(
         let signing_key = resolve_napi_signing_key(handle).await?;
 
         let did = DID(proposer_did);
-        let manager = context_manager()?;
+        let manager = context_manager(&bi)?;
         let context_id = handle.context_id.clone();
 
         let outcome = manager
@@ -2473,7 +2777,7 @@ pub async fn context_governance_propose(
                 })
             })?;
 
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id).await {
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&bi, &context_id).await {
             tracing::warn!(
                 context_id = %context_id,
                 action = action_name,
@@ -2523,7 +2827,18 @@ pub async fn context_governance_approve(
     proposal_id_hex: String,
     voter_did: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_governance_approve_on(&bi, handle, proposal_id_hex, voter_did).await
+}
+
+/// Per-bridge-instance implementation of [`context_governance_approve`].
+pub(crate) async fn context_governance_approve_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    proposal_id_hex: String,
+    voter_did: String,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
 
     #[cfg(feature = "allow_in_memory_custody")]
@@ -2531,7 +2846,7 @@ pub async fn context_governance_approve(
         let signing_key = resolve_napi_signing_key(handle).await?;
 
         let did = DID(voter_did);
-        let manager = context_manager()?;
+        let manager = context_manager(&bi)?;
         let context_id = handle.context_id.clone();
 
         let status = manager
@@ -2544,7 +2859,7 @@ pub async fn context_governance_approve(
                 })
             })?;
 
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id).await {
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&bi, &context_id).await {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -2585,7 +2900,18 @@ pub async fn context_governance_reject(
     proposal_id_hex: String,
     voter_did: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_governance_reject_on(&bi, handle, proposal_id_hex, voter_did).await
+}
+
+/// Per-bridge-instance implementation of [`context_governance_reject`].
+pub(crate) async fn context_governance_reject_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    proposal_id_hex: String,
+    voter_did: String,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
 
     #[cfg(feature = "allow_in_memory_custody")]
@@ -2593,7 +2919,7 @@ pub async fn context_governance_reject(
         let signing_key = resolve_napi_signing_key(handle).await?;
 
         let did = DID(voter_did);
-        let manager = context_manager()?;
+        let manager = context_manager(&bi)?;
         let context_id = handle.context_id.clone();
 
         let status = manager
@@ -2606,7 +2932,7 @@ pub async fn context_governance_reject(
                 })
             })?;
 
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id).await {
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&bi, &context_id).await {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -2647,10 +2973,21 @@ pub async fn context_governance_withdraw(
     proposal_id_hex: String,
     voter_did: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_governance_withdraw_on(&bi, handle, proposal_id_hex, voter_did).await
+}
+
+/// Per-bridge-instance implementation of [`context_governance_withdraw`].
+pub(crate) async fn context_governance_withdraw_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    proposal_id_hex: String,
+    voter_did: String,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
     let did = DID(voter_did);
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     let context_id = handle.context_id.clone();
 
     let status = manager
@@ -2663,7 +3000,7 @@ pub async fn context_governance_withdraw(
             })
         })?;
 
-    if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id).await {
+    if let Err(e) = crate::runtime::sync_role_state_from_manager(&bi, &context_id).await {
         tracing::warn!(
             context_id = %context_id,
             error = %e,
@@ -2691,10 +3028,20 @@ pub async fn context_governance_get_proposal(
     handle: &NapiContextHandle,
     proposal_id_hex: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_governance_get_proposal_on(&bi, handle, proposal_id_hex).await
+}
+
+/// Per-bridge-instance implementation of [`context_governance_get_proposal`].
+pub(crate) async fn context_governance_get_proposal_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    proposal_id_hex: String,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id.clone();
     let proposal_id = parse_napi_proposal_id(&proposal_id_hex)?;
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
 
     let proposal = manager
         .get_proposal(&context_id, &proposal_id)
@@ -2724,9 +3071,18 @@ pub async fn context_governance_get_proposal(
 /// - Rejects with `SCP-CTX-2046` if listing fails.
 #[napi(js_name = "contextGovernanceListProposals")]
 pub async fn context_governance_list_proposals(handle: &NapiContextHandle) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_governance_list_proposals_on(&bi, handle).await
+}
+
+/// Per-bridge-instance implementation of [`context_governance_list_proposals`].
+pub(crate) async fn context_governance_list_proposals_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id.clone();
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
 
     let proposals = manager.list_proposals(&context_id).await.map_err(|e| {
         NapiError::from(ScpNapiError::Context {
@@ -2759,9 +3115,19 @@ pub async fn context_apply_pending_ceiling_modification(
     handle: &NapiContextHandle,
     current_timestamp: f64,
 ) -> napi::Result<bool> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_apply_pending_ceiling_modification_on(&bi, handle, current_timestamp).await
+}
+
+/// Per-bridge-instance implementation of [`context_apply_pending_ceiling_modification`].
+pub(crate) async fn context_apply_pending_ceiling_modification_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    current_timestamp: f64,
+) -> napi::Result<bool> {
+    crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id.clone();
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let ts = current_timestamp as u64;
@@ -2787,8 +3153,17 @@ pub async fn context_apply_pending_ceiling_modification(
 /// - Rejects with `SCP-CTX-2061` if the context is not in `Closing` state.
 #[napi(js_name = "contextFinalizeClose")]
 pub async fn context_finalize_close(handle: &NapiContextHandle) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
-    let manager = context_manager()?;
+    let bi = default_bridge_instance()?;
+    context_finalize_close_on(&bi, handle).await
+}
+
+/// Per-bridge-instance implementation of [`context_finalize_close`].
+pub(crate) async fn context_finalize_close_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let manager = context_manager(&bi)?;
 
     // Use the handle's actual core_handle (which carries correct ContextParams
     // including memory_scope) instead of constructing one with default params.
@@ -2847,9 +3222,36 @@ pub async fn context_create_governance_checkpoint(
     creator_did: String,
     creator_signature_hex: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_create_governance_checkpoint_on(
+        &bi,
+        handle,
+        checkpoint_seq,
+        merkle_root_hex,
+        event_count,
+        last_event_hash_hex,
+        state_snapshot_hash_hex,
+        creator_did,
+        creator_signature_hex,
+    )
+    .await
+}
+
+/// Per-bridge-instance implementation of [`context_create_governance_checkpoint`].
+pub(crate) async fn context_create_governance_checkpoint_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    checkpoint_seq: f64,
+    merkle_root_hex: String,
+    event_count: f64,
+    last_event_hash_hex: String,
+    state_snapshot_hash_hex: String,
+    creator_did: String,
+    creator_signature_hex: String,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id.clone();
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
 
     let merkle_root = parse_napi_hex_32(&merkle_root_hex, "merkle_root")?;
     let last_event_hash = parse_napi_hex_32(&last_event_hash_hex, "last_event_hash")?;
@@ -2907,9 +3309,22 @@ pub async fn context_add_checkpoint_cosignature(
     signer_did: String,
     signature_hex: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_add_checkpoint_cosignature_on(&bi, handle, checkpoint_json, signer_did, signature_hex)
+        .await
+}
+
+/// Per-bridge-instance implementation of [`context_add_checkpoint_cosignature`].
+pub(crate) async fn context_add_checkpoint_cosignature_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    checkpoint_json: String,
+    signer_did: String,
+    signature_hex: String,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id.clone();
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
 
     let mut checkpoint: scp_core::context::governance::ContextCheckpoint =
         serde_json::from_str(&checkpoint_json).map_err(|e| {
@@ -2956,7 +3371,16 @@ pub async fn context_add_checkpoint_cosignature(
 #[napi(js_name = "contextRestore")]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn context_restore(context_id: String) -> napi::Result<()> {
-    let manager = context_manager()?;
+    let bi = default_bridge_instance()?;
+    context_restore_on(&bi, context_id).await
+}
+
+/// Per-bridge-instance implementation of [`context_restore`].
+pub(crate) async fn context_restore_on(
+    bi: &NapiBridgeInstance,
+    context_id: String,
+) -> napi::Result<()> {
+    let manager = context_manager(&bi)?;
 
     // Load the persisted snapshot to obtain the correct ContextParams (including
     // memory_scope). Using ContextParams::default() would give Ephemeral scope,
@@ -2994,7 +3418,13 @@ pub async fn context_restore(context_id: String) -> napi::Result<()> {
 /// - Rejects with `SCP-CTX-2065` if restoration fails.
 #[napi(js_name = "contextRestoreAll")]
 pub async fn context_restore_all() -> napi::Result<String> {
-    let manager = context_manager()?;
+    let bi = default_bridge_instance()?;
+    context_restore_all_on(&bi).await
+}
+
+/// Per-bridge-instance implementation of [`context_restore_all`].
+pub(crate) async fn context_restore_all_on(bi: &NapiBridgeInstance) -> napi::Result<String> {
+    let manager = context_manager(&bi)?;
 
     let restored = manager.restore_all_contexts().await.map_err(|e| {
         NapiError::from(ScpNapiError::Context {
@@ -3042,9 +3472,18 @@ fn parse_napi_hex_32(hex_str: &str, field_name: &str) -> napi::Result<[u8; 32]> 
 ///   grace period has not expired.
 #[napi(js_name = "contextTombstoneMigrated")]
 pub async fn context_tombstone_migrated(handle: &NapiContextHandle) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_tombstone_migrated_on(&bi, handle).await
+}
+
+/// Per-bridge-instance implementation of [`context_tombstone_migrated`].
+pub(crate) async fn context_tombstone_migrated_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id.clone();
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
 
     manager
         .tombstone_migrated_context(&context_id)
@@ -3070,9 +3509,18 @@ pub async fn context_tombstone_migrated(handle: &NapiContextHandle) -> napi::Res
 /// context is not migrating.
 #[napi(js_name = "contextMigrationState")]
 pub async fn context_migration_state(handle: &NapiContextHandle) -> napi::Result<Option<String>> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_migration_state_on(&bi, handle).await
+}
+
+/// Per-bridge-instance implementation of [`context_migration_state`].
+pub(crate) async fn context_migration_state_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+) -> napi::Result<Option<String>> {
+    crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id.clone();
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
 
     let state = manager.migration_state(&context_id).await;
     match state {
@@ -3103,9 +3551,18 @@ pub async fn context_migration_state(handle: &NapiContextHandle) -> napi::Result
 /// - Rejects with `SCP-CTX-2005` if the context is not active.
 #[napi(js_name = "contextHandleTtlExpiry")]
 pub async fn context_handle_ttl_expiry(handle: &NapiContextHandle) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_handle_ttl_expiry_on(&bi, handle).await
+}
+
+/// Per-bridge-instance implementation of [`context_handle_ttl_expiry`].
+pub(crate) async fn context_handle_ttl_expiry_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     manager
         .handle_ttl_expiry(core_handle)
         .await
@@ -3129,10 +3586,21 @@ pub async fn context_propose_ttl_extension(
     proposer_did: String,
     extension_secs: u32,
 ) -> napi::Result<bool> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_propose_ttl_extension_on(&bi, handle, proposer_did, extension_secs).await
+}
+
+/// Per-bridge-instance implementation of [`context_propose_ttl_extension`].
+pub(crate) async fn context_propose_ttl_extension_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    proposer_did: String,
+    extension_secs: u32,
+) -> napi::Result<bool> {
+    crate::napi_check_handle!(&bi.core, handle);
     let did = DID(proposer_did.clone());
     let duration = std::time::Duration::from_secs(u64::from(extension_secs));
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     let unanimous = manager
         .propose_ttl_extension(&handle.context_id, &did, duration)
         .await
@@ -3153,10 +3621,20 @@ pub async fn context_reset_ttl_timer(
     handle: &NapiContextHandle,
     new_duration_secs: u32,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_reset_ttl_timer_on(&bi, handle, new_duration_secs).await
+}
+
+/// Per-bridge-instance implementation of [`context_reset_ttl_timer`].
+pub(crate) async fn context_reset_ttl_timer_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    new_duration_secs: u32,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let duration = std::time::Duration::from_secs(u64::from(new_duration_secs));
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     manager
         .reset_ttl_timer(&handle.context_id, duration, core_handle.clone())
         .await;
@@ -3178,9 +3656,18 @@ pub async fn context_reset_ttl_timer(
 /// serialization fails.
 #[napi(js_name = "contextExport")]
 pub async fn context_export(handle: &NapiContextHandle) -> napi::Result<Vec<u8>> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_export_on(&bi, handle).await
+}
+
+/// Per-bridge-instance implementation of [`context_export`].
+pub(crate) async fn context_export_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+) -> napi::Result<Vec<u8>> {
+    crate::napi_check_handle!(&bi.core, handle);
     let exporter_did = scp_identity::DID::from(handle.creator_did.clone());
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     let export = manager
         .export_context(&handle.context_id, exporter_did)
         .await
@@ -3205,6 +3692,15 @@ pub async fn context_export(handle: &NapiContextHandle) -> napi::Result<Vec<u8>>
 /// Returns NAPI error if deserialization, validation, or import fails.
 #[napi(js_name = "contextImport")]
 pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    context_import_on(&bi, data).await
+}
+
+/// Per-bridge-instance implementation of [`context_import`].
+pub(crate) async fn context_import_on(
+    bi: &NapiBridgeInstance,
+    data: Vec<u8>,
+) -> napi::Result<String> {
     let export = scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
             message: format!("invalid export data: {e}"),
@@ -3220,9 +3716,9 @@ pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
     // first operation (e.g. a device receiving exported context data).
     // init_context_manager is idempotent (OnceLock — first call wins). #1073
     // Passes the exporter DID to MlsCryptoProvider for real MLS encryption (#1294).
-    crate::runtime::init_context_manager(&export.exporter_did.0);
+    crate::runtime::init_context_manager(&bi, &export.exporter_did.0);
 
-    let manager = context_manager()?;
+    let manager = context_manager(&bi)?;
     manager
         .import_context(export)
         .await
@@ -3250,7 +3746,17 @@ pub fn context_set_economic_policy(
     handle: &mut NapiContextHandle,
     _policy_json: String,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_set_economic_policy_on(&bi, handle, _policy_json)
+}
+
+/// Per-bridge-instance implementation of [`context_set_economic_policy`].
+pub(crate) fn context_set_economic_policy_on(
+    bi: &NapiBridgeInstance,
+    handle: &mut NapiContextHandle,
+    _policy_json: String,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     Err(NapiError::from(ScpNapiError::Permission {
         message: "economic policy changes must go through governance \
                   (propose SetEconomicPolicy action). Direct mutation is \
@@ -3268,7 +3774,16 @@ pub fn context_set_economic_policy(
 /// minted by a different `SCP` bridge instance.
 #[napi(js_name = "contextGetEconomicPolicy")]
 pub fn context_get_economic_policy(handle: &NapiContextHandle) -> napi::Result<Option<String>> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    context_get_economic_policy_on(&bi, handle)
+}
+
+/// Per-bridge-instance implementation of [`context_get_economic_policy`].
+pub(crate) fn context_get_economic_policy_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+) -> napi::Result<Option<String>> {
+    crate::napi_check_handle!(&bi.core, handle);
     Ok(handle.economic_policy.clone())
 }
 
@@ -3282,6 +3797,22 @@ pub fn context_get_economic_policy(handle: &NapiContextHandle) -> napi::Result<O
 /// (string[]), `error` (string | null), and `appDid` (string).
 #[napi]
 pub fn validate_capability_declaration(
+    declaration_json: String,
+    ceiling_capabilities: Vec<String>,
+    role_capabilities: Vec<String>,
+) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    validate_capability_declaration_on(
+        &bi,
+        declaration_json,
+        ceiling_capabilities,
+        role_capabilities,
+    )
+}
+
+/// Per-bridge-instance implementation of [`validate_capability_declaration`].
+pub(crate) fn validate_capability_declaration_on(
+    bi: &NapiBridgeInstance,
     declaration_json: String,
     ceiling_capabilities: Vec<String>,
     role_capabilities: Vec<String>,
@@ -3327,6 +3858,16 @@ pub fn validate_capability_declaration(
 /// Checks whether a given capability is allowed for an app binding.
 #[napi]
 pub fn check_scoped_capability(
+    granted_capabilities: Vec<String>,
+    required_capability: String,
+) -> bool {
+    let bi = default_bridge_instance()?;
+    check_scoped_capability_on(&bi, granted_capabilities, required_capability)
+}
+
+/// Per-bridge-instance implementation of [`check_scoped_capability`].
+pub(crate) fn check_scoped_capability_on(
+    bi: &NapiBridgeInstance,
     granted_capabilities: Vec<String>,
     required_capability: String,
 ) -> bool {
@@ -3396,6 +3937,28 @@ impl scp_core::context::invitation::TrustOracle for NapiBridgeTrustOracle {
 /// @returns `NapiEvaluationResult` with the decision.
 #[napi]
 pub fn evaluate_invitation(
+    params_json: String,
+    inviter_did: String,
+    identity_did: String,
+    policy_json: Option<String>,
+    spending_json: Option<String>,
+    trusted_dids_json: Option<String>,
+) -> napi::Result<NapiEvaluationResult> {
+    let bi = default_bridge_instance()?;
+    evaluate_invitation_on(
+        &bi,
+        params_json,
+        inviter_did,
+        identity_did,
+        policy_json,
+        spending_json,
+        trusted_dids_json,
+    )
+}
+
+/// Per-bridge-instance implementation of [`evaluate_invitation`].
+pub(crate) fn evaluate_invitation_on(
+    bi: &NapiBridgeInstance,
     params_json: String,
     inviter_did: String,
     identity_did: String,
@@ -3513,6 +4076,30 @@ pub fn metadata_record_to_json(
     operational_json: String,
     signature_hex: String,
 ) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    metadata_record_to_json_on(
+        &bi,
+        context_id,
+        sequence,
+        signer_did,
+        timestamp,
+        structural_json,
+        operational_json,
+        signature_hex,
+    )
+}
+
+/// Per-bridge-instance implementation of [`metadata_record_to_json`].
+pub(crate) fn metadata_record_to_json_on(
+    bi: &NapiBridgeInstance,
+    context_id: String,
+    sequence: u32,
+    signer_did: String,
+    timestamp: f64,
+    structural_json: String,
+    operational_json: String,
+    signature_hex: String,
+) -> napi::Result<String> {
     use scp_core::context::metadata::{MetadataRecord, OperationalMetadata, StructuralMetadata};
     use scp_ffi_common::validate::{validate_context_id, validate_did};
 
@@ -3589,6 +4176,15 @@ pub fn metadata_record_to_json(
 /// Returns the validated and re-serialized JSON.
 #[napi]
 pub fn metadata_record_from_json(json_str: String) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    metadata_record_from_json_on(&bi, json_str)
+}
+
+/// Per-bridge-instance implementation of [`metadata_record_from_json`].
+pub(crate) fn metadata_record_from_json_on(
+    bi: &NapiBridgeInstance,
+    json_str: String,
+) -> napi::Result<String> {
     use scp_core::context::metadata::MetadataRecord;
 
     let record: MetadataRecord = serde_json::from_str(&json_str).map_err(|e| {
@@ -3632,6 +4228,15 @@ pub fn metadata_record_from_json(json_str: String) -> napi::Result<String> {
 /// Returns the canonical `ContextParams` for a given template ID as JSON.
 #[napi]
 pub fn template_get_params(template_id: String) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    template_get_params_on(&bi, template_id)
+}
+
+/// Per-bridge-instance implementation of [`template_get_params`].
+pub(crate) fn template_get_params_on(
+    bi: &NapiBridgeInstance,
+    template_id: String,
+) -> napi::Result<String> {
     use scp_core::context::templates::template_params;
 
     let tid = parse_template_id_napi(&template_id)?;
@@ -3649,6 +4254,15 @@ pub fn template_get_params(template_id: String) -> napi::Result<String> {
 /// Returns `null` on success, or a string error message on validation failure.
 #[napi]
 pub fn validate_against_template(params_json: String) -> napi::Result<Option<String>> {
+    let bi = default_bridge_instance()?;
+    validate_against_template_on(&bi, params_json)
+}
+
+/// Per-bridge-instance implementation of [`validate_against_template`].
+pub(crate) fn validate_against_template_on(
+    bi: &NapiBridgeInstance,
+    params_json: String,
+) -> napi::Result<Option<String>> {
     use scp_core::context::templates::validate_against_template;
 
     let params: scp_core::context::ContextParams =
@@ -3670,6 +4284,15 @@ pub fn validate_against_template(params_json: String) -> napi::Result<Option<Str
 /// Returns `null` on success, or a string error message on validation failure.
 #[napi]
 pub fn validate_context_params(params_json: String) -> napi::Result<Option<String>> {
+    let bi = default_bridge_instance()?;
+    validate_context_params_on(&bi, params_json)
+}
+
+/// Per-bridge-instance implementation of [`validate_context_params`].
+pub(crate) fn validate_context_params_on(
+    bi: &NapiBridgeInstance,
+    params_json: String,
+) -> napi::Result<Option<String>> {
     use scp_core::context::templates::validate_context_params;
 
     let params: scp_core::context::ContextParams =
@@ -3744,7 +4367,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn member_count_reflects_actual_membership() {
         crate::runtime::init_context_manager_for_test();
-        let manager = context_manager().expect("manager initialized above");
+        let manager =
+            context_manager(&crate::runtime::default_bridge_instance().expect("default bridge"))
+                .expect("manager initialized above");
         let ctx_id = format!("test-member-count-{}", uuid::Uuid::new_v4());
         let creator = DID("did:key:z6MkCreator".to_owned());
 
@@ -3834,7 +4459,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_change_role() {
         crate::runtime::init_context_manager_for_test();
-        let manager = context_manager().expect("manager initialized above");
+        let manager =
+            context_manager(&crate::runtime::default_bridge_instance().expect("default bridge"))
+                .expect("manager initialized above");
         let ctx_id = format!("napi-sync-role-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator1";
         let params = ContextParams {
@@ -3845,7 +4472,12 @@ mod tests {
             .create_context(ctx_id.clone(), params, DID(creator.to_owned()), None)
             .await
             .unwrap();
-        crate::runtime::register_test_context(&ctx_id, creator);
+        crate::runtime::register_test_context(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+            creator,
+        );
         let new_did = "did:key:z6MkNapiMember1";
         let add = approved_proposal(
             [10u8; 32],
@@ -3860,9 +4492,13 @@ mod tests {
             .execute_governance_action(&ctx_id, &add)
             .await
             .unwrap();
-        crate::runtime::sync_role_state_from_manager(&ctx_id)
-            .await
-            .unwrap();
+        crate::runtime::sync_role_state_from_manager(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+        )
+        .await
+        .unwrap();
         let change = approved_proposal(
             [11u8; 32],
             &ctx_id,
@@ -3876,26 +4512,41 @@ mod tests {
             .execute_governance_action(&ctx_id, &change)
             .await
             .unwrap();
-        crate::runtime::sync_role_state_from_manager(&ctx_id)
-            .await
-            .unwrap();
-        crate::runtime::with_context(&ctx_id, |st| {
-            let assignment = st
-                .role_state
-                .assignments
-                .get(new_did)
-                .expect("member should have an assignment");
-            assert_eq!(assignment.role_name, "observer");
-            Ok(())
-        })
+        crate::runtime::sync_role_state_from_manager(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+        )
+        .await
         .unwrap();
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::with_context(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+            |st| {
+                let assignment = st
+                    .role_state
+                    .assignments
+                    .get(new_did)
+                    .expect("member should have an assignment");
+                assert_eq!(assignment.role_name, "observer");
+                Ok(())
+            },
+        )
+        .unwrap();
+        crate::runtime::remove_context(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_add_member() {
         crate::runtime::init_context_manager_for_test();
-        let manager = context_manager().expect("manager initialized above");
+        let manager =
+            context_manager(&crate::runtime::default_bridge_instance().expect("default bridge"))
+                .expect("manager initialized above");
         let ctx_id = format!("napi-sync-add-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator2";
         let params = ContextParams {
@@ -3906,12 +4557,22 @@ mod tests {
             .create_context(ctx_id.clone(), params, DID(creator.to_owned()), None)
             .await
             .unwrap();
-        crate::runtime::register_test_context(&ctx_id, creator);
+        crate::runtime::register_test_context(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+            creator,
+        );
         let new_did = "did:key:z6MkNapiAdded1";
-        crate::runtime::with_context(&ctx_id, |st| {
-            assert!(!st.role_state.members.contains(new_did));
-            Ok(())
-        })
+        crate::runtime::with_context(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+            |st| {
+                assert!(!st.role_state.members.contains(new_did));
+                Ok(())
+            },
+        )
         .unwrap();
         let add = approved_proposal(
             [12u8; 32],
@@ -3926,28 +4587,43 @@ mod tests {
             .execute_governance_action(&ctx_id, &add)
             .await
             .unwrap();
-        crate::runtime::sync_role_state_from_manager(&ctx_id)
-            .await
-            .unwrap();
-        crate::runtime::with_context(&ctx_id, |st| {
-            assert!(st.role_state.members.contains(new_did));
-            assert_eq!(
-                st.role_state
-                    .assignments
-                    .get(new_did)
-                    .map(|a| a.role_name.as_str()),
-                Some("member")
-            );
-            Ok(())
-        })
+        crate::runtime::sync_role_state_from_manager(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+        )
+        .await
         .unwrap();
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::with_context(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+            |st| {
+                assert!(st.role_state.members.contains(new_did));
+                assert_eq!(
+                    st.role_state
+                        .assignments
+                        .get(new_did)
+                        .map(|a| a.role_name.as_str()),
+                    Some("member")
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        crate::runtime::remove_context(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_remove_member() {
         crate::runtime::init_context_manager_for_test();
-        let manager = context_manager().expect("manager initialized above");
+        let manager =
+            context_manager(&crate::runtime::default_bridge_instance().expect("default bridge"))
+                .expect("manager initialized above");
         let ctx_id = format!("napi-sync-rm-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator3";
         let target = "did:key:z6MkNapiRemTarget";
@@ -3959,7 +4635,12 @@ mod tests {
             .create_context(ctx_id.clone(), params, DID(creator.to_owned()), None)
             .await
             .unwrap();
-        crate::runtime::register_test_context(&ctx_id, creator);
+        crate::runtime::register_test_context(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+            creator,
+        );
         let add = approved_proposal(
             [13u8; 32],
             &ctx_id,
@@ -3973,13 +4654,22 @@ mod tests {
             .execute_governance_action(&ctx_id, &add)
             .await
             .unwrap();
-        crate::runtime::sync_role_state_from_manager(&ctx_id)
-            .await
-            .unwrap();
-        crate::runtime::with_context(&ctx_id, |st| {
-            assert!(st.role_state.members.contains(target));
-            Ok(())
-        })
+        crate::runtime::sync_role_state_from_manager(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+        )
+        .await
+        .unwrap();
+        crate::runtime::with_context(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+            |st| {
+                assert!(st.role_state.members.contains(target));
+                Ok(())
+            },
+        )
         .unwrap();
         let rm = approved_proposal(
             [14u8; 32],
@@ -3994,16 +4684,29 @@ mod tests {
             .execute_governance_action(&ctx_id, &rm)
             .await
             .unwrap();
-        crate::runtime::sync_role_state_from_manager(&ctx_id)
-            .await
-            .unwrap();
-        crate::runtime::with_context(&ctx_id, |st| {
-            assert!(!st.role_state.members.contains(target));
-            assert!(!st.role_state.assignments.contains_key(target));
-            Ok(())
-        })
+        crate::runtime::sync_role_state_from_manager(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+        )
+        .await
         .unwrap();
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::with_context(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+            |st| {
+                assert!(!st.role_state.members.contains(target));
+                assert!(!st.role_state.assignments.contains_key(target));
+                Ok(())
+            },
+        )
+        .unwrap();
+        crate::runtime::remove_context(
+            &crate::runtime::default_bridge_instance().expect("default bridge"),
+            &bi,
+            &ctx_id,
+        );
     }
 
     // -------------------------------------------------------------------
@@ -4200,7 +4903,9 @@ mod tests {
             .await
             .expect("context_create should succeed");
 
-        let manager = context_manager().expect("manager should be initialized");
+        let manager =
+            context_manager(&crate::runtime::default_bridge_instance().expect("default bridge"))
+                .expect("manager should be initialized");
         let stored = manager
             .context_params(&handle.context_id)
             .await

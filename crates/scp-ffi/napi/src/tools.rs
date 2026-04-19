@@ -22,14 +22,15 @@ use crate::error::ScpNapiError;
 ///
 /// Performs the full 11-step ADR-016 validation pipeline.
 fn validate_ucan_for_tool(
+    bi: &crate::runtime::NapiBridgeInstance,
     context_id: &str,
     tool_id: &str,
     identity_did: &str,
     ucan_token: &str,
     proof_resolver: &scp_ffi_common::BridgeProofResolver,
 ) -> Result<(), ScpNapiError> {
-    crate::runtime::with_context(context_id, |rt| {
-        let production_resolver = crate::runtime::did_resolver();
+    crate::runtime::with_context(&bi, context_id, |rt| {
+        let production_resolver = crate::runtime::did_resolver(&bi);
         let did_resolver = scp_ffi_common::DispatchDidResolver::new(
             production_resolver.map(std::convert::AsRef::as_ref),
         );
@@ -211,7 +212,17 @@ pub async fn tool_register(
     handle: &NapiContextHandle,
     definition: NapiToolDefinition,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = crate::runtime::default_bridge_instance()?;
+    tool_register_on(&bi, handle, definition).await
+}
+
+/// Per-bridge-instance implementation of [`tool_register`].
+pub(crate) async fn tool_register_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    definition: NapiToolDefinition,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_tool_name(&definition.name).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.state()?;
@@ -226,7 +237,7 @@ pub async fn tool_register(
     }
 
     // Ensure UCAN state is registered so the tool registry is available.
-    crate::runtime::ensure_registered(handle)?;
+    crate::runtime::ensure_registered(&bi, handle)?;
 
     let context_id = handle.context_id();
 
@@ -267,7 +278,7 @@ pub async fn tool_register(
     };
 
     // Register the tool in the context's tool registry.
-    let registered_id = crate::runtime::with_context(&context_id, |rt| {
+    let registered_id = crate::runtime::with_context(&bi, &context_id, |rt| {
         let (registered_id, _event) = scp_core::context::tools::register_tool(
             &mut rt.tool_registry,
             &rt.role_state,
@@ -345,7 +356,32 @@ pub async fn tool_invoke(
     proof_tokens: Option<Vec<String>>,
     spending_ucan_jwt: Option<String>,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = crate::runtime::default_bridge_instance()?;
+    tool_invoke_on(
+        &bi,
+        handle,
+        tool_id,
+        input_json,
+        identity_did,
+        ucan_token,
+        proof_tokens,
+        spending_ucan_jwt,
+    )
+    .await
+}
+
+/// Per-bridge-instance implementation of [`tool_invoke`].
+pub(crate) async fn tool_invoke_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    tool_id: String,
+    input_json: String,
+    identity_did: String,
+    ucan_token: String,
+    proof_tokens: Option<Vec<String>>,
+    spending_ucan_jwt: Option<String>,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_tool_id(&tool_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_ucan_token(&ucan_token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -365,7 +401,7 @@ pub async fn tool_invoke(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(handle)?;
+    crate::runtime::ensure_registered(&bi, handle)?;
 
     // UCAN authorization (full 11-step ADR-016 pipeline). Bridge-owned
     // because the proof resolver, revocation list, and nonce tracker
@@ -378,6 +414,7 @@ pub async fn tool_invoke(
             })
         })?;
     validate_ucan_for_tool(
+        &bi,
         &context_id,
         &tool_id,
         &identity_did,
@@ -408,7 +445,7 @@ pub async fn tool_invoke(
     let context_id_for_executor = context_id.clone();
     let tool_id_for_executor = tool_id.clone();
     let identity_for_executor = identity_did.clone();
-    let (registry, handler) = crate::runtime::with_context(&context_id, |rt| {
+    let (registry, handler) = crate::runtime::with_context(&bi, &context_id, |rt| {
         Ok((
             rt.tool_registry.clone(),
             rt.tool_handlers.get(&tool_id).cloned(),
@@ -451,7 +488,7 @@ pub async fn tool_invoke(
         })
     })?;
 
-    let manager = crate::runtime::context_manager()?;
+    let manager = crate::runtime::context_manager(&bi)?;
     let invoker_did_typed: scp_primitives::DID = identity_did.into();
     let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
     let outcome = manager
@@ -502,7 +539,17 @@ pub async fn tool_verify(
     handle: &NapiContextHandle,
     tool_id: String,
 ) -> napi::Result<NapiToolVerificationResult> {
-    crate::napi_check_handle!(handle);
+    let bi = crate::runtime::default_bridge_instance()?;
+    tool_verify_on(&bi, handle, tool_id).await
+}
+
+/// Per-bridge-instance implementation of [`tool_verify`].
+pub(crate) async fn tool_verify_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    tool_id: String,
+) -> napi::Result<NapiToolVerificationResult> {
+    crate::napi_check_handle!(&bi.core, handle);
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Tool {
@@ -515,10 +562,10 @@ pub async fn tool_verify(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(handle)?;
+    crate::runtime::ensure_registered(&bi, handle)?;
 
     // Look up the tool and verify against its test vectors (matching PyO3 pattern).
-    let result = crate::runtime::with_context(&context_id, |rt| {
+    let result = crate::runtime::with_context(&bi, &context_id, |rt| {
         let (verification_result, _event) = scp_core::context::tools::verify_tool(
             &rt.tool_registry,
             &tool_id,
@@ -586,7 +633,34 @@ pub async fn tool_invoke_cross_context(
     chain_depth: u8,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(source_handle, target_handle);
+    let bi = crate::runtime::default_bridge_instance()?;
+    tool_invoke_cross_context_on(
+        &bi,
+        source_handle,
+        target_handle,
+        tool_id,
+        input_json,
+        invoker_did,
+        ucan_token,
+        chain_depth,
+        proof_tokens,
+    )
+    .await
+}
+
+/// Per-bridge-instance implementation of [`tool_invoke_cross_context`].
+pub(crate) async fn tool_invoke_cross_context_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    source_handle: &NapiContextHandle,
+    target_handle: &NapiContextHandle,
+    tool_id: String,
+    input_json: String,
+    invoker_did: String,
+    ucan_token: String,
+    chain_depth: u8,
+    proof_tokens: Option<Vec<String>>,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, source_handle, target_handle);
     // Validate both contexts are active.
     let source_state = source_handle.state()?;
     if source_state != "active" {
@@ -615,7 +689,7 @@ pub async fn tool_invoke_cross_context(
 
     // Validate chain depth (context-configurable, default 8 per ADR-043).
     let max_chain_depth = {
-        let mgr = crate::runtime::context_manager()?;
+        let mgr = crate::runtime::context_manager(&bi)?;
         let source_max = mgr
             .context_params(&source_context_id)
             .await
@@ -633,7 +707,7 @@ pub async fn tool_invoke_cross_context(
     }
 
     // Ensure target context UCAN state is registered.
-    crate::runtime::ensure_registered(target_handle)?;
+    crate::runtime::ensure_registered(&bi, target_handle)?;
 
     // Primary authorization: UCAN token validation via the full 11-step
     // ADR-016 pipeline against the TARGET context's ceiling.
@@ -646,6 +720,7 @@ pub async fn tool_invoke_cross_context(
             })
         })?;
     validate_ucan_for_tool(
+        &bi,
         &target_context_id,
         &tool_id,
         &invoker_did,
@@ -661,7 +736,7 @@ pub async fn tool_invoke_cross_context(
         })
     })?;
 
-    let output = crate::runtime::with_context(&target_context_id, |rt| {
+    let output = crate::runtime::with_context(&bi, &target_context_id, |rt| {
         let registration = rt
             .tool_registry
             .get(&tool_id)
@@ -742,7 +817,19 @@ pub async fn tool_session_create(
     source_context_id: String,
     ttl_seconds: Option<u32>,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = crate::runtime::default_bridge_instance()?;
+    tool_session_create_on(&bi, handle, tool_id, source_context_id, ttl_seconds).await
+}
+
+/// Per-bridge-instance implementation of [`tool_session_create`].
+pub(crate) async fn tool_session_create_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    tool_id: String,
+    source_context_id: String,
+    ttl_seconds: Option<u32>,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Tool {
@@ -755,18 +842,18 @@ pub async fn tool_session_create(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(handle)?;
+    crate::runtime::ensure_registered(&bi, handle)?;
 
     // Read context-configured session cap (ADR-043), falling back to default.
     let cap = {
-        let mgr = crate::runtime::context_manager()?;
+        let mgr = crate::runtime::context_manager(&bi)?;
         mgr.context_params(&context_id)
             .await
             .and_then(|p| p.session_cap)
             .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER) as usize
     };
 
-    crate::runtime::with_context(&context_id, |rt| {
+    crate::runtime::with_context(&bi, &context_id, |rt| {
         // Enforce per-caller session cap (context-configured, ADR-043).
         let current = rt.session_store.count_by_source(&source_context_id);
         if current >= cap {
@@ -816,7 +903,30 @@ pub async fn tool_session_invoke(
     ucan_token: String,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = crate::runtime::default_bridge_instance()?;
+    tool_session_invoke_on(
+        &bi,
+        handle,
+        session_id,
+        input_json,
+        invoker_did,
+        ucan_token,
+        proof_tokens,
+    )
+    .await
+}
+
+/// Per-bridge-instance implementation of [`tool_session_invoke`].
+pub(crate) async fn tool_session_invoke_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    session_id: String,
+    input_json: String,
+    invoker_did: String,
+    ucan_token: String,
+    proof_tokens: Option<Vec<String>>,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Tool {
@@ -829,11 +939,11 @@ pub async fn tool_session_invoke(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(handle)?;
+    crate::runtime::ensure_registered(&bi, handle)?;
 
     // Look up the tool_id from the session before UCAN validation so we can
     // validate against the correct tool capability.
-    let tool_id_for_ucan = crate::runtime::with_context(&context_id, |rt| {
+    let tool_id_for_ucan = crate::runtime::with_context(&bi, &context_id, |rt| {
         let session = rt
             .session_store
             .get(&session_id)
@@ -855,6 +965,7 @@ pub async fn tool_session_invoke(
             })
         })?;
     validate_ucan_for_tool(
+        &bi,
         &context_id,
         &tool_id_for_ucan,
         &invoker_did,
@@ -863,7 +974,7 @@ pub async fn tool_session_invoke(
     )
     .map_err(napi::Error::from)?;
 
-    let output = crate::runtime::with_context(&context_id, |rt| {
+    let output = crate::runtime::with_context(&bi, &context_id, |rt| {
         let session = rt
             .session_store
             .get(&session_id)
@@ -954,11 +1065,21 @@ pub async fn tool_session_close(
     handle: &NapiContextHandle,
     session_id: String,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
-    let context_id = handle.context_id();
-    crate::runtime::ensure_registered(handle)?;
+    let bi = crate::runtime::default_bridge_instance()?;
+    tool_session_close_on(&bi, handle, session_id).await
+}
 
-    crate::runtime::with_context(&context_id, |rt| {
+/// Per-bridge-instance implementation of [`tool_session_close`].
+pub(crate) async fn tool_session_close_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    session_id: String,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let context_id = handle.context_id();
+    crate::runtime::ensure_registered(&bi, handle)?;
+
+    crate::runtime::with_context(&bi, &context_id, |rt| {
         if rt.session_store.remove(&session_id).is_none() {
             return Err(ScpNapiError::Tool {
                 message: format!("session '{session_id}' not found"),
@@ -992,7 +1113,19 @@ pub async fn tool_interface_expose(
     target_context_id: String,
     rate_limit_json: Option<String>,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = crate::runtime::default_bridge_instance()?;
+    tool_interface_expose_on(&bi, handle, tool_id, target_context_id, rate_limit_json).await
+}
+
+/// Per-bridge-instance implementation of [`tool_interface_expose`].
+pub(crate) async fn tool_interface_expose_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    tool_id: String,
+    target_context_id: String,
+    rate_limit_json: Option<String>,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     scp_ffi_common::validate::validate_tool_id(&tool_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     scp_ffi_common::validate::validate_context_id(&target_context_id)
@@ -1010,7 +1143,7 @@ pub async fn tool_interface_expose(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(handle)?;
+    crate::runtime::ensure_registered(&bi, handle)?;
 
     let rate_limit = match rate_limit_json {
         Some(ref json) => {
@@ -1026,7 +1159,7 @@ pub async fn tool_interface_expose(
         None => None,
     };
 
-    crate::runtime::with_context(&context_id, |rt| {
+    crate::runtime::with_context(&bi, &context_id, |rt| {
         let context_handle = scp_core::context::ContextHandle::new(
             context_id.clone(),
             scp_core::context::ContextParams::default(),
@@ -1069,7 +1202,17 @@ pub async fn tool_interface_accept(
     handle: &NapiContextHandle,
     interface_json: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = crate::runtime::default_bridge_instance()?;
+    tool_interface_accept_on(&bi, handle, interface_json).await
+}
+
+/// Per-bridge-instance implementation of [`tool_interface_accept`].
+pub(crate) async fn tool_interface_accept_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    interface_json: String,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     let state_str = handle.state()?;
     if state_str != "active" {
         return Err(ScpNapiError::Tool {
@@ -1082,7 +1225,7 @@ pub async fn tool_interface_accept(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(handle)?;
+    crate::runtime::ensure_registered(&bi, handle)?;
 
     let mut interface: scp_core::context::tools::interface::ToolInterface =
         serde_json::from_str(&interface_json).map_err(|e| {
@@ -1092,7 +1235,7 @@ pub async fn tool_interface_accept(
             })
         })?;
 
-    crate::runtime::with_context(&context_id, |rt| {
+    crate::runtime::with_context(&bi, &context_id, |rt| {
         let context_handle = scp_core::context::ContextHandle::new(
             context_id.clone(),
             scp_core::context::ContextParams::default(),
@@ -1132,7 +1275,17 @@ pub async fn tool_interface_revoke(
     handle: &NapiContextHandle,
     interface_id_hex: String,
 ) -> napi::Result<String> {
-    crate::napi_check_handle!(handle);
+    let bi = crate::runtime::default_bridge_instance()?;
+    tool_interface_revoke_on(&bi, handle, interface_id_hex).await
+}
+
+/// Per-bridge-instance implementation of [`tool_interface_revoke`].
+pub(crate) async fn tool_interface_revoke_on(
+    bi: &crate::runtime::NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    interface_id_hex: String,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id();
 
     let interface_id_bytes = hex::decode(&interface_id_hex).map_err(|e| {
@@ -1363,7 +1516,7 @@ mod tests {
             .expect("tool_register should succeed");
 
         // Read the stored registration back and verify registered_at.
-        let registered_at = crate::runtime::with_context(&ctx_id, |rt| {
+        let registered_at = crate::runtime::with_context(&bi, &ctx_id, |rt| {
             let reg = rt
                 .tool_registry
                 .get(&tool_id)
