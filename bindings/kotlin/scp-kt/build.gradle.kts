@@ -49,11 +49,48 @@ if (!hasUniffiBindings) {
 
 tasks.test {
     useJUnitPlatform()
+
+    // JNA needs to find `libscp_ffi_uniffi.{dylib,so,dll}` to load the
+    // UniFFI-generated bindings. The Rust cdylib is built to the
+    // workspace's `target/{debug,release}` directory. Point JNA at
+    // both candidate paths so the tests run without the caller having
+    // to set `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH` manually.
+    //
+    // PersistenceTest and ScpClassTest skip themselves via
+    // `assumeTrue(nativeAvailable)` when the dylib is absent (browser
+    // runtime, fresh checkout without a cargo build yet). This just
+    // lets them run locally after `cargo build -p scp-ffi-uniffi` or
+    // `./scripts/generate-uniffi-kotlin.sh` (which builds the lib).
+    //
+    // Matches CI (`.github/workflows/ci.yml`) which sets
+    // `LD_LIBRARY_PATH` to `target/debug` before `./gradlew test`.
+    // Here we do it structurally in Gradle so local dev matches CI.
+    val workspaceRoot = rootProject.projectDir.parentFile.parentFile
+    val candidates =
+        listOf(
+            "${workspaceRoot}/target/debug",
+            "${workspaceRoot}/target/release",
+        )
+    systemProperty("jna.library.path", candidates.joinToString(File.pathSeparator))
 }
 
 detekt {
     config.setFrom("../detekt.yml")
     buildUponDefaultConfig = true
+}
+
+// Exclude UniFFI-generated bindings from detekt analysis. The generated
+// `src/main/kotlin/works/limn/scp/internal/uniffi/scp/scp.kt` file is
+// produced by `./scripts/generate-uniffi-kotlin.sh` and necessarily
+// violates `LongParameterList` (callback trampolines have ≥6 params by
+// the UniFFI ABI) and other style rules that apply to hand-written
+// code. CI does not generate these bindings before detekt so the issue
+// does not surface there; locally we get false positives on every run.
+//
+// detekt 1.23 deprecated the `build.excludes` YAML key, so the
+// exclusion lives on the Gradle task instead.
+tasks.withType<io.gitlab.arturbosch.detekt.Detekt>().configureEach {
+    exclude("**/internal/uniffi/**")
 }
 
 // ---------------------------------------------------------------------------
