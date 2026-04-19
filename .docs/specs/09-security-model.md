@@ -1518,7 +1518,10 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-CHECKPOINT-V1:"` | Event log checkpoint hash | §11 |
 | `"SCP-EVENT-V1:"` | Event log entry hash | §11 |
 | `"SCP-EXPORT-ENTRY:"` | Context export chain hash | §5.13 |
-| `"SCP-TOOL-REGISTRATION-V1:"` | Tool registration integrity hash | §6.2 |
+| `"SCP-OUTLET-REGISTRATION-V2:"` | Outlet registration integrity hash | §5.4.1 |
+| `"SCP-OUTLET-CHUNK-V1:"` | Outlet stream chunk Merkle leaf/interior tag | §5.4.5 |
+| `"SCP-OUTLET-CHUNK-SIG-V1:"` | Outlet stream per-chunk operator signature | §5.4.5 |
+| `"SCP-OUTLET-CAVEAT-BIND-V1:"` | Outlet stream `caveats_binding` preimage | §5.4.5 |
 | `"SCP-KEY-DESTRUCTION-V1:"` | Key destruction proof | §9.15 |
 | `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
 | `"SCP-RECEIPT-V1:"` | Payment receipt signing | §19.15.5 |

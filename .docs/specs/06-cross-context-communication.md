@@ -118,14 +118,26 @@ Rate limits for cross-context tool interfaces use a sliding window counter with 
 
 #### 6.2.0.3 Chain Amplification Rule
 
-Cross-context outlet calls inherit an `OutletKind` (§5.4.2) from the originating invocation. At each cross-context hop, the runtime enforces:
+Cross-context outlet calls inherit an **`origin_kind`** (an `OutletKind` per §5.4.2) from the outermost caller. At each cross-context hop, the runtime enforces:
 
 - **Query → Query: permitted.** A Query invocation may transitively invoke Query outlets in downstream contexts.
 - **Query → Action: forbidden.** A Query invocation MUST NOT trigger any Action invocation, directly or transitively. The runtime rejects the amplification attempt at the cross-context consent gate (§6.2.0.1) with `OutletErrorClass::Authorization::AmplificationViolation`.
 - **Action → Query: permitted.** An Action invocation may transitively invoke Query outlets.
 - **Action → Action: permitted.** An Action invocation may transitively invoke Action outlets, subject to chain depth.
 
-The rule closes the "free read laundered into paid write" class of attacks: Query is the cacheable, cost-capped tier, and allowing a cached Query to cascade into an Action would let an adversary exercise Action semantics under Query rate limits and Query cache economics.
+The rule closes the "free read laundered into paid write" class of attacks: Query is the cacheable, cost-capped tier, and allowing a Query to cascade into an Action would let an adversary exercise Action semantics under Query rate limits and economics.
+
+**`origin_kind` is bound to the UCAN delegation chain, not to runtime state.** The outermost caller sets `origin_kind` equal to the stem it exercises — `Query` when it exercises `outlet_query:*`, `Action` when it exercises `outlet_call:*`. The stem lives inside a signed UCAN delegation, so the outermost `origin_kind` is not a claim any participant makes at runtime; it is a property of the token. Every cross-context hop propagates `origin_kind` by including it as part of the delegated UCAN's `nb` field (alongside the caveats from §7.3.8). Each hop target, when it validates the incoming UCAN in its full 11-step pipeline (§7.2.1), checks:
+
+```
+incoming.nb.origin_kind  ==  parent.nb.origin_kind
+```
+
+— that is, `origin_kind` is preserved across every delegation step; a child delegation MUST NOT reset or widen it. Narrowing is also forbidden (there is no legitimate reason to narrow `origin_kind` from `Action` to `Query`, and if there were, the amplification rule still rejects the resulting `Query → Action` hop at the target). An `origin_kind` mismatch between a child and its parent is an attenuation violation and returns `OutletErrorClass::Authorization::AttenuationViolation`.
+
+Because `origin_kind` is covered by each hop's UCAN signature, the hop target cannot be tricked into treating a `Query`-originated call as `Action`-originated by a forged claim at the transport layer — forging `origin_kind` would require forging the signed delegation.
+
+The amplification check `origin_kind != Query || hop_kind == Query` MUST be evaluated at the hop target (inside the acceptance path, after UCAN validation and before the outlet is dispatched), not only at the hop source. A malicious source that skipped the check client-side is caught at the target.
 
 #### 6.2.0.4 Chain Depth Split
 
@@ -164,6 +176,10 @@ Context A → Context B tool "schedule_meeting":
 Session state is maintained by the tool's context (Context B), not by the calling agent. Each call in the session is individually governed — Context A's governance permits each outbound call, Context B's governance permits each inbound call. The session does not create a persistent channel; it is a sequence of governed tool calls that share state via an opaque session identifier.
 
 Sessions have an optional TTL set by the tool's context. When set, expired sessions are garbage-collected automatically. Sessions without a TTL persist for the lifetime of the context — appropriate for app-hosted sessions (games, workspaces, collaborative tools) where the context itself is the session's lifecycle boundary. Contexts enforce a per-caller session cap, context-configurable via `ContextParams::session_cap` (default: 1000 concurrent sessions per calling context), to prevent session exhaustion attacks regardless of TTL (§9.2.1, ADR-043). Session state is internal to the tool's context and not visible to the calling context beyond the tool's defined output schema.
+
+**Session chain-amplification binding.** A session inherits the `origin_kind` (§6.2.0.3) of the first call that created it. Every subsequent call routed through the session (identified by `session_id` in the input) is treated by the runtime as carrying the session's recorded `origin_kind`, regardless of any new UCAN presented by the caller or any `origin_kind` claim in a later delegation. Concretely: if a session was opened by a `Query`-originated call, every call through that session is treated as `origin_kind = Query` for amplification-rule purposes, and any attempt to call an Action outlet through the session is rejected with `AmplificationViolation`. This prevents async self-triggered amplification — a `Query`-originated session cannot "mature" into an Action session by the caller later presenting an Action-rooted UCAN.
+
+Sessions store their recorded `origin_kind` alongside the session state. A session opened with `origin_kind = Action` retains Action semantics for its lifetime; a session opened with `origin_kind = Query` retains Query semantics for its lifetime. There is no session upgrade path — re-opening as Action requires a new session with a fresh `session_id`.
 
 ### 6.2.2 Protocol-Level Discovery
 

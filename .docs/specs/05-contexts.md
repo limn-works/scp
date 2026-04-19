@@ -48,15 +48,16 @@ Context creation is a multi-step operation that can fail at any point. The proto
 
 ## 5.3 Capability Ceiling
 
-Every context declares a capability ceiling at creation: the maximum set of things that can happen in this space. This ceiling bounds what tools can do, what roles can grant, and what agents can exercise. Standard capability categories include:
+Every context declares a capability ceiling at creation: the maximum set of things that can happen in this space. This ceiling bounds what outlets can do, what roles can grant, and what agents can exercise. Standard capability categories include:
 
 - **`messaging`** — text and structured data exchange
-- **`tool invocation`** — executing context-registered tools
+- **`outlet:query`** — invoking context-registered Query outlets (§5.4.2)
+- **`outlet:call`** — invoking context-registered Action outlets (§5.4.2)
 - **`media:voice`** — real-time voice communication (§10.9.1)
 - **`media:video`** — real-time video communication (§10.9.1)
 - **`media:screen_share`** — screen sharing (§10.9.1)
 - **`bridging`** — bridge connector participation (§12)
-- **`tool:interface`** — cross-context tool interface exposure (§6.2)
+- **`outlet:interface`** — cross-context outlet interface exposure (§6.2)
 - **`context:child:create`** — creating child contexts (§5.13)
 - **`member:ban`** — governance-level member removal (ban/unban). Gates whether governance can execute `RevokeAccess` / `RestoreAccess` against members (§5.9). Without this capability in the ceiling, governance cannot ban members regardless of governance model.
 
@@ -81,9 +82,11 @@ The following is the complete enumeration of capability categories available for
 |----------|-------------|----------|
 | `messages:read` | Read messages in the context | Role permission |
 | `messages:write` | Send messages to the context | Role permission |
-| `tool:register` | Register new tools in the context | Role permission |
-| `tool:invoke:*` | Invoke any registered tool | Role permission |
-| `tool:invoke:{tool_id}` | Invoke a specific tool (parameterized) | Role permission |
+| `outlet:register` | Register new outlets in the context | Role permission |
+| `outlet:query:*` | Invoke any registered Query outlet (§5.4.2) | Role permission |
+| `outlet:query:{outlet_id}` | Invoke a specific Query outlet (parameterized) | Role permission |
+| `outlet:call:*` | Invoke any registered Action outlet (§5.4.2) | Role permission |
+| `outlet:call:{outlet_id}` | Invoke a specific Action outlet (parameterized) | Role permission |
 | `member:invite` | Invite new members to the context | Role permission |
 | `member:remove` | Remove members from the context | Role permission + governance |
 | `member:ban` | Ban members (revoke read access) | Role permission + governance |
@@ -92,14 +95,14 @@ The following is the complete enumeration of capability categories available for
 | `media:video` | Real-time video communication (§10.9.1) | Role permission |
 | `media:screen_share` | Screen sharing (§10.9.1) | Role permission |
 | `bridging` | Bridge connector participation (§12) | Role permission + governance |
-| `tool:interface` | Cross-context tool interface exposure (§6.2) | Role permission |
+| `outlet:interface` | Cross-context outlet interface exposure (§6.2) | Role permission |
 | `context:child:create` | Create child contexts (§5.13) | Role permission |
 | `governance:propose` | Submit governance proposals (§5.9) | Role permission |
 | `governance:vote` | Vote on governance proposals (§5.9) | Role permission |
 | `context:close` | Close context permanently (§5.4) | Role permission + governance |
 | `metadata:edit` | Edit context operational metadata (§5.7) | Role permission + governance |
 
-**Parameterized categories.** `tool:invoke:{tool_id}` is the only parameterized category — it restricts invocation to a specific tool. `tool:invoke:*` grants invocation of all registered tools. A ceiling containing `tool:invoke:*` implicitly includes all `tool:invoke:{tool_id}` capabilities.
+**Parameterized categories.** `outlet:query:{outlet_id}` and `outlet:call:{outlet_id}` are the parameterized categories — they restrict invocation to a specific outlet. `outlet:query:*` grants invocation of all registered Query outlets; `outlet:call:*` grants invocation of all registered Action outlets. A ceiling containing `outlet:query:*` implicitly includes all `outlet:query:{outlet_id}` capabilities; likewise for `outlet:call:*`. The two stems are independent: `outlet:query:*` does NOT grant any `outlet:call:*` capability (§5.4.2 classification, §6.2.0.3 amplification rule).
 
 **Category validation.** At context creation, the SDK validates that every entry in the ceiling array is a recognized category string (exact match, case-sensitive). Unrecognized categories cause creation to fail with `InvalidCeilingCategory` error. This prevents forward-compatibility issues where an old SDK creates a context with categories it cannot enforce.
 
@@ -190,19 +193,46 @@ OutletCost {
 
 The hash target type is NOT stored in the registration — the operator chooses what constitutes their implementation artifact. The hash provides a change-detection mechanism, not a verification mechanism. Verifiers detect changes (hash differs from registration); they do not verify what the hash covers.
 
-**Signature scope.** The operator signs `SHA-256("SCP-OUTLET-REGISTRATION-V2:" || outlet_id || kind_byte || name || operator_did || schema_hash || implementation_hash || test_vectors_hash || cost_hash || registered_at)` where `kind_byte` is `0x00` for Query and `0x01` for Action, `schema_hash = SHA-256(MessagePack(schema))`, `test_vectors_hash = SHA-256(MessagePack(test_vectors))`, and `cost_hash = SHA-256(MessagePack(cost))` (or `SHA-256(0x00)` if absent). The `V2` suffix and `kind_byte` inclusion together constitute the break from the prior `SCP-TOOL-REGISTRATION-V1` domain; pre-migration signatures are not honored.
+**Signature scope.** The operator signs
+
+```
+SHA-256(
+  "SCP-OUTLET-REGISTRATION-V2:"
+  || BE32(len(outlet_id)) || outlet_id
+  || kind_byte
+  || BE32(len(name)) || name
+  || BE32(len(operator_did)) || operator_did
+  || schema_hash
+  || implementation_hash
+  || test_vectors_hash
+  || cost_hash
+  || registered_at_be
+)
+```
+
+where:
+
+- `kind_byte` is `0x00` for Query and `0x01` for Action (fixed 1-byte width).
+- `BE32(n)` is `n` encoded as a 4-byte big-endian unsigned integer; this length prefix precedes every variable-length field (`outlet_id`, `name`, `operator_did`) so that concatenation is unambiguous and two registrations with different field splits can never produce the same preimage.
+- `schema_hash = SHA-256(MessagePack(schema))` (32 bytes, fixed width).
+- `implementation_hash` is 32 bytes, fixed width.
+- `test_vectors_hash = SHA-256(MessagePack(test_vectors))` (32 bytes).
+- `cost_hash = SHA-256(MessagePack(cost))` (32 bytes), or `SHA-256(0x00)` (32 bytes) if absent. The sentinel preserves fixed width.
+- `registered_at_be` is `registered_at` encoded as a 8-byte big-endian unsigned integer.
+
+The `V2` suffix, the `kind_byte` inclusion, and the mandatory length prefixes on every variable-length field together constitute the break from the prior `SCP-TOOL-REGISTRATION-V1` domain; pre-migration signatures are not honored. The length-prefix requirement closes the "split-shift" preimage-collision class that the unprefixed V1 concatenation admitted (where a suffix of `outlet_id` could be reinterpreted as a prefix of `name`).
 
 ### 5.4.2 Outlet Classification (Query vs Action)
 
 Outlets declare their semantic class at registration time. Classification is structural, not advisory — the runtime enforces it.
 
-**`OutletKind::Query`** — read-only, idempotent, cacheable.
+**`OutletKind::Query`** — read-only, idempotent, cacheable in principle.
 
-- **Structural floor at registration.** `cost == None || cost.amount == 0`. A Query outlet MUST NOT declare a positive per-invocation cost. Declaring a positive cost at registration is a validation failure (`OutletErrorClass::Protocol::QueryCostViolation`). Registrations that fail this check are rejected before they reach the event log.
+- **Structural floor at registration.** `cost == None || cost.amount == 0`. A Query outlet MUST NOT declare a positive per-invocation cost, and `cost.cost_formula` MUST be absent (a dynamic pricing formula on an idempotent read is not coherent). Declaring a positive cost or a pricing formula at registration is a validation failure (`OutletErrorClass::Protocol::QueryCostViolation`). Registrations that fail this check are rejected before they reach the event log.
 - **ReadOnlyInvocation guard at invocation.** The runtime invokes Query outlets through a `ReadOnlyInvocation` handle that denies writes to context state (messages, roles, registry, event log, governance, economic ledgers). Any attempt by an executor to mutate through this handle returns `OutletErrorClass::Protocol::QueryViolation`.
-- **Cacheable.** Query results are stored in a shared per-context operator-signed cache (§5.4.3). Cache invalidation is automatic on `OutletUpdated` (via `implementation_hash`) and on `OutletVerified { integrity_ok: false }`.
-- **Query-with-declared-cost is permitted but capped.** An outlet registered with cost amount `> 0` MUST be `Action`. Operators who want a paid read-only interface (e.g., a metered data lookup) declare it as `Action` and rely on the application layer to advertise semantics. The protocol contract is: a Query invocation incurs at most one charge per `(invoker_did, SHA-256(canonical_jcs(input)), epoch_window)`. Because Query outlets register with zero cost, this contract degenerates to "no charge"; it is stated as a general rule so that future evolution cannot smuggle metered reads in without breaking the invariant.
-- **UCAN stem.** `outlet_query:{outlet_id}` or `outlet_query:*`.
+- **Cacheability.** Query outlets are semantically cacheable (idempotent, invoker-independent result for fixed `(outlet_id, input, implementation_hash)`). A protocol-level shared cache is **deferred** (§5.4.3, discussion [#1698](https://github.com/limn-works/scp/discussions/1698)); every Query invocation currently executes live. The semantic property is stable — when the cache ships, it will not change what Query outlets are, only how the runtime exploits their properties.
+- **Query-with-declared-cost is forbidden.** An outlet registered with cost amount `> 0` MUST be `Action`. Operators who want a paid read-only interface (e.g., a metered data lookup) declare it as `Action` and rely on the application layer to advertise semantics. The protocol contract is: a Query invocation is never billed. This invariant must hold regardless of whether a cache is present, because a future cache must be free to serve any Query to any member without inventing an economic event that did not exist at registration.
+- **UCAN stem.** `outlet_query:{outlet_id}` or `outlet_query:*` (see §5.4.2.1 for parser semantics).
 - **Chain depth (§6.2).** Query cross-context calls use the full `ContextParams::max_chain_depth` budget (default 8, range [1, 255]).
 - **Rate tiers (§6.2.0.2).** Query per-interface default 600/min, per-caller default 100/min.
 
@@ -211,7 +241,7 @@ Outlets declare their semantic class at registration time. Classification is str
 - No structural cost floor; Action outlets may declare any cost.
 - No ReadOnlyInvocation guard; Action executors may mutate context state through SDK-provided handles subject to role and capability checks.
 - Never cached. Each invocation runs fresh.
-- **UCAN stem.** `outlet_call:{outlet_id}` or `outlet_call:*`.
+- **UCAN stem.** `outlet_call:{outlet_id}` or `outlet_call:*` (see §5.4.2.1 for parser semantics).
 - **Chain depth.** Action cross-context calls use `max(1, max_chain_depth / 2)` as their budget. Default 4 when `max_chain_depth` is default 8.
 - **Rate tiers.** Action per-interface default 60/min, per-caller default 10/min (identical to the pre-classification baseline).
 
@@ -219,54 +249,26 @@ Outlets declare their semantic class at registration time. Classification is str
 
 **Chain amplification rule (§6.2).** A Query outlet invocation MUST NOT transitively invoke any Action outlet through cross-context hops. The reverse is permitted — an Action invocation MAY transitively invoke Query outlets. The runtime enforces this at the cross-context consent gate (§6.2.0.1): on every hop, the runtime checks `hop.kind` against the originating request's `kind` and rejects Query→Action amplification with `OutletErrorClass::Authorization::AmplificationViolation`. This prevents a "free" read from being laundered into a paid write.
 
-**Misdeclaration signal.** Any invocation that trips `QueryViolation` at runtime (an executor attempted a write inside a ReadOnlyInvocation) is recorded as an operator-attributable signal: the `OutletVerified` event for that outlet carries `integrity_ok: false` with reason `query_misdeclaration`, the cache for that outlet is purged, and participation records (§7.3.2) attribute the failure to the outlet's `operator_did`.
+**Misdeclaration signal.** Any invocation that trips `QueryViolation` at runtime (an executor attempted a write inside a ReadOnlyInvocation) is recorded as an operator-attributable signal: the `OutletVerified` event for that outlet carries `integrity_ok: false` with reason `query_misdeclaration`, and participation records (§7.3.2) attribute the failure to the outlet's `operator_did`. No cache purge is specified (§5.4.3 is deferred).
 
-### 5.4.3 Query Result Cache
+#### 5.4.2.1 UCAN Capability Stem Parser
 
-Query outlets are cached by a shared, operator-signed, relay-hosted cache. The cache is a membership-gated optimization — relays serve it to subscribers of the context routing ID, and members verify every hit cryptographically.
+The two stems `outlet_query:` and `outlet_call:` are parsed with a fixed two-step algorithm:
 
-**Cache key.**
+1. **Literal prefix match.** The parser accepts only the literal byte sequences `outlet_query:` or `outlet_call:` (case-sensitive, UTF-8). Any other prefix — including abbreviations, trailing-colon variations, or concatenations such as `outlet_query:call:foo` — is a `Capability::parse` failure and MUST NOT be admitted as either stem. The colon is part of the stem, not a separator.
+2. **Opaque suffix with outlet_id validation.** Everything after the prefix is the suffix. The suffix is either `*` (wildcard, matching `Capability::OutletQueryAll` / `OutletCallAll`) or a single outlet_id matching the regex `^[a-z0-9_-]{1,128}$`. No further `:` characters appear in a valid suffix; a colon in the suffix fails parsing (this blocks the `outlet_query:call:foo` parser-differential where a naive split-on-colon implementation would accept it).
 
-```
-cache_key = SHA-256(
-  "SCP-OUTLET-QUERY-CACHE-V1:"
-  || outlet_id
-  || canonical_jcs(input)
-  || implementation_hash
-)
-```
+Bridge and SDK parsers MUST apply this algorithm identically. A conformance test fixture (`tests/conformance/vectors/outlet_capability_parse.json`) enumerates positive and negative parse cases; every bridge must accept/reject each fixture identically.
 
-The invoker DID is NOT in the key: Query results are context-governed and invoker-independent. Including the invoker would partition the cache and defeat its purpose.
+The underscore in the wire form is deliberate: UCAN resource strings historically use `-` or `_` to disambiguate prefix from suffix, and `outlet:query:` (two colons) would require three-way parsing that invites prefix-vs-suffix ambiguity. The SDK-facing display form `outlet:query:{id}` is a pretty-print alias; it round-trips through `Capability::new` and `Capability::to_string` but is not the wire form.
 
-**Cache entry.**
+### 5.4.3 Query Result Cache (Deferred)
 
-```
-QueryCacheEntry {
-  cache_key:          [u8; 32],
-  output_value:       Value,            // MessagePack value matching output_schema
-  expires_at:         u64,              // Unix timestamp (seconds)
-  operator_signature: Ed25519Signature, // operator_did signs
-                                        //   SHA-256("SCP-OUTLET-QUERY-CACHE-SIG-V1:"
-                                        //           || cache_key
-                                        //           || canonical_jcs(output_value)
-                                        //           || expires_at_be)
-}
-```
+A shared operator-signed relay-hosted Query result cache was drafted for this section during the outlet redesign but pulled from the initial scope before merge. Concrete design questions blocked it — notably: relay-side authentication and authorization boundaries for cache reads (the cache must be membership-gated but relays are not membership-aware); the interaction with per-member pseudonym routing (§9.10.4), which prevents the relay from grouping hits on a single routing ID without leaking subscribership; and the billing semantics of a paid Query operator serving an unbounded cached audience. None of those are dead-on-arrival, but none are ready to commit to either.
 
-**Verification on cache hit.** The requesting SDK MUST verify `operator_signature` against the current `operator_did` resolved from the outlet registry BEFORE returning the cached value to the application. A verification failure returns `OutletErrorClass::Protocol::CacheIntegrityFailure` and causes the SDK to fall back to a live invocation. The relay cannot forge cache entries — the operator is the only signer.
+The deferral is tracked in GitHub discussion **[#1698](https://github.com/limn-works/scp/discussions/1698)**. Downstream sections do NOT assume a cache: §5.4.2 marks Query as "cacheable" as a semantic property of the kind, not as a claim that a cache exists; §5.4.5 does not rely on cache-hit paths; §5.14.10 does not allocate an `OutletQueried` event. When the cache ships, it will occupy this section number (§5.4.3) and be added via a new spec revision and ADR. Until then, every Query invocation executes live and records an `OutletInvokedEvent` per §5.4.5.
 
-**TTL.** Per-outlet via the `x-scp-query-ttl-secs` JSON Schema extension on `output_schema`. Default 60 seconds. Range `[0, 86400]` — 0 means uncached, 86400 (24h) is the ceiling to bound divergence. Entries past `expires_at` are purged lazily on read.
-
-**Invalidation.**
-
-- `OutletUpdated` — changes the outlet's `implementation_hash`, which is part of the cache key; entries become unreachable and are garbage-collected.
-- `OutletVerified { integrity_ok: false }` — explicit purge of all entries for the outlet.
-- `OutletDeregistered` — explicit purge.
-- `EpochBoundary` — entries do NOT automatically expire at epoch boundaries; TTL drives expiry. Epoch advances do not alter Query semantics because Query outlets do not access mutable context state.
-
-**Event log shape for cache hits.** A cache hit emits an `OutletQueried` event with `cache_hit: true` and omits `output_hash` (the output is not re-hashed; provenance traces to the underlying cached entry's `cache_key`). A cache miss emits a standard `OutletInvokedEvent` per §5.4.5.
-
-**Amplification considerations.** Because the cache is shared across all members who hold the required UCAN, a single operator signature can serve many members. This is intentional — the cache is an efficiency tool, not an access-control tool. Capability checks still gate who may request the cached value from the relay.
+Implementations MUST NOT silently add a cache layer: a cache-like optimization that is not specified here is a protocol divergence, not an implementation detail, because it changes what `OutletInvokedEvent` records and what the operator signs for. Any local memoization must be fully contained within a single invocation (e.g., a handler's own in-memory cache during its lifetime) and MUST NOT persist state across invocations.
 
 ### 5.4.4 Outlet Error Taxonomy
 
@@ -278,63 +280,110 @@ OutletError {
                                   // SCP-TOOL- prefix registered in sdk-common.md; outlets
                                   // carve out the 6100-6199 sub-block. Bridge linters
                                   // require the prefix and the sub-block.
-  slug:          String,          // tag 2; stable kebab-case identifier,
-                                  // e.g. "query-violation", "handler-panic"
+  slug:          String,          // tag 2; stable kebab-case, `^[a-z][a-z0-9-]{0,63}$`.
+                                  // Finer-grained than `code`: multiple slugs may share
+                                  // the same code (e.g., code SCP-TOOL-6110 carries
+                                  // slugs authorization.expired, authorization.revoked,
+                                  // authorization.missing). Slugs are class-scoped
+                                  // identifiers; never surface as covert channels.
   class:         OutletErrorClass,// tag 3; one of eight root classes (below)
-  message:       String,          // tag 4; human-readable, non-localized; max 1 KiB UTF-8
+  message:       String,          // tag 4; human-readable, non-localized; max 1 KiB UTF-8.
+                                  // See "Message content constraints" below.
   retry:         RetryPolicy,     // tag 5; see below
-  detail:        Option<Value>,   // tag 6; structured additional data, max 4 KiB
-                                  // canonical-JSON encoded
-  related_code:  Option<String>,  // tag 7; cross-reference to another SCP error code
-                                  // when this error wraps or supersedes another
+  detail:        Option<Value>,   // tag 6; typed per-class schema (below). Free-form
+                                  // `detail` is forbidden — a cooperating producer cannot
+                                  // use `detail` as a covert channel.
   source_chain:  Vec<ContextHop>, // tag 8; ordered list of cross-context hops the
-                                  // error traversed (§6.2)
-  i18n_key:      Option<String>,  // tag 9; reverse-DNS key for SDK-side translation
-  trace_id:      Option<[u8; 16]>,// tag 10; OpenTelemetry trace id (§9.11)
+                                  // error traversed (§6.2). See pseudonymization below.
 }
+```
 
+Tags `7`, `9`, and `10` are **reserved for forward-compatible evolution** and are not used in this version of the envelope. They were drafted (`related_code`, `i18n_key`, `trace_id`) and dropped before merge — the cross-reference use case is served by `source_chain.wrapped_code`; localization is an SDK-layer concern that does not belong on the wire; and telemetry `trace_id` is not a protocol-level field (see discussion [#1698](https://github.com/limn-works/scp/discussions/1698)). Any future extension MUST use tags `11+` and MUST round-trip through the `_unknown_fields` forward-compat slot so old SDKs that see the new tag preserve it without interpretation.
+
+```
 OutletErrorClass {
-  Protocol,       // registration/validation/classification violations
+  Protocol,      // registration/validation/classification violations
   Authorization, // UCAN, caveat, role, capability, amplification
-  Input,          // schema, size, type, enum, range
+  Input,         // schema, size, type, enum, range
   Execution,     // timeout, panic, resource-exhaustion, non-determinism
-  Output,         // schema violation, size, non-serializable, redaction
-  Economic,       // budget, insufficient funds, adapter failure, pricing (§19)
+  Output,        // schema violation, size, non-serializable, redaction
+  Economic,      // budget, insufficient funds, adapter failure, pricing (§19)
   Transport,     // relay unavailable, cross-context bridge failure
   Governance,    // deregistered, suspended, revoked, ceiling exceeded
 }
 
 RetryPolicy {
-  Never,                                    // permanent; do not retry
-  Immediate,                                // safe to retry immediately (idempotent)
-  After(Duration),                          // retry after fixed delay
+  Never,                                        // permanent; do not retry
+  Immediate,                                    // safe to retry immediately (idempotent)
+  After(Duration),                              // retry after fixed delay
   WithBackoff { min: Duration, max: Duration }, // exponential within bounds
 }
 
 ContextHop {
-  context_id:   ContextId,
-  hop_index:    u16,       // 0 = origin, increments per cross-context boundary
-  wrapped_code: String,    // code as it was before wrapping at this hop
+  context_id:   ContextId,    // pseudonymized; see "source_chain pseudonymization" below
+  hop_index:    u16,          // 0 = origin, increments per cross-context boundary
+  wrapped_code: String,       // code as it was before wrapping at this hop
 }
 ```
 
-**Code range.** `6100..=6199` within the `SCP-TOOL-` prefix, sub-allocated as:
+**Code range.** `6100..=6199` within the `SCP-TOOL-` prefix, sub-allocated as follows. Distinct runtime conditions within a code share one code and differ by `slug` — the code set is intentionally compact (one to two codes per class, ~15 codes total) so the full taxonomy is memorable and the wire form is not a sprawling enumeration.
 
-- `6100-6109` — Protocol class (query-violation, kind-mismatch, amplification, etc.)
-- `6110-6119` — Authorization class (caveat-violation, amplification, outlet-not-found, etc.)
-- `6120-6129` — Input class
-- `6130-6139` — Execution class (handler-panic, execution-timeout, credit-exhausted, stream-gap)
-- `6140-6149` — Output class
-- `6150-6159` — Economic class
-- `6160-6169` — Transport class
-- `6170-6179` — Governance class
+- `6100-6109` — Protocol class (query/kind/amplification violations; schema/cache violations)
+- `6110-6119` — Authorization class (UCAN, caveat, amplification, missing outlet, adapter denial)
+- `6120-6129` — Input class (schema, size, non-serializable)
+- `6130-6139` — Execution class (handler panic, timeout, credit exhaustion, stream gap)
+- `6140-6149` — Output class (schema, size, non-serializable)
+- `6150-6159` — Economic class (funds, adapter, pricing, budget)
+- `6160-6169` — Transport class (relay, cross-context bridge, rate limit)
+- `6170-6179` — Governance class (deregistered, suspended, ceiling, consequence active)
 - `6180-6199` — reserved
 
 The `SCP-TOOL-` prefix is preserved (not renamed to `SCP-OUTLET-`) because the CI enforcement script `scripts/check-error-codes.sh` indexes prefixes in a closed set — adding a new top-level prefix requires coordinated changes across every language SDK's error surface. Sub-block allocation within the existing prefix is the forward-compatible path.
 
 **Cross-context wrapping.** A cross-context error is not translated — the original `code` is preserved and the wrapping hop appends to `source_chain` with its own `wrapped_code`. The outermost caller sees the innermost reason and the trail of boundaries it crossed. This is the opposite of HTTP-style gateway remapping, which loses causal information.
 
-**Sealed SDK hierarchies.** Each SDK renders `OutletErrorClass` as a sealed type: Python subclass tree under `OutletError`, TypeScript tagged-union class, Swift enum with associated values, Kotlin sealed class. The wire form is the source of truth; SDK types are generated from a shared fixture set round-tripped through all four FFI bridges.
+**Query oracle collapse.** Authorization errors that would reveal whether a specific `outlet_id` exists MUST be collapsed to a single indistinguishable outcome when the caller does not hold a capability that would let them disambiguate. Concretely: a caller who presents a UCAN matching neither `outlet_query:{id}` nor `outlet_call:{id}` receives `SCP-TOOL-6110` with slug `authorization.denied` regardless of whether the outlet is registered, deregistered, or has never existed. The specific sub-errors (`outlet-not-found`, `kind-mismatch`) are observable only by callers who hold at least one stem on the outlet. Without this collapse, a caller who holds no capability can enumerate the outlet registry by probing error codes — a practical oracle against private outlets.
+
+**Per-class `detail` schemas.** `detail` is NOT free-form. Each class defines a typed schema; detail MUST match or be absent. This prevents operators from using `detail` as a covert channel.
+
+| Class | `detail` schema | Example |
+|-------|-----------------|---------|
+| Protocol | `{ rule: string }` — the rule name that was violated | `{ rule: "query-cost-floor" }` |
+| Authorization | `{ capability: string }` — the capability URI that was denied | `{ capability: "outlet_query:foo" }` |
+| Input | `{ field_path: string, violation: string }` — JSON Pointer + violation tag | `{ field_path: "/items/0", violation: "type" }` |
+| Execution | `{ elapsed_ms: u64 }` for timeouts; `{ panic_location: string }` for panics (file:line only, no stack text); `{}` otherwise | `{ elapsed_ms: 30000 }` |
+| Output | `{ field_path: string, violation: string }` same as Input | |
+| Economic | `{ needed: Amount, currency: CurrencyCode }` for InsufficientFunds; `{ adapter_id: PaymentAdapterId }` for adapter errors | `{ needed: 100, currency: "USD" }` |
+| Transport | `{ retry_after_secs: u32 }` for rate limits; `{ relay_url_kind: enum }` (`wss` \| `ws-loopback` \| `unknown`) for relay errors — never a raw URL | `{ retry_after_secs: 30 }` |
+| Governance | `{ action: string }` — the governance action name | `{ action: "outlet-deregistered" }` |
+
+Absent schemas: classes with `{}` detail have detail omitted entirely. An envelope that carries a non-empty `detail` whose shape does not match its class is a **wire-layer rejection** (SDK MUST reject during deserialization), not a runtime error. Schema violations are detected at the receiving SDK boundary so a misbehaving producer cannot smuggle arbitrary data through `detail`.
+
+**Message content constraints.** The `message` field is human-readable prose intended for logs and operator tooling, not for end-user display. Producers MUST NOT include:
+
+- User-identifying data (email addresses, DIDs of members other than the invoker's own, names, account IDs).
+- Internal implementation strings (SQL fragments, stack traces, file paths above the outlet source root, private-network addresses, secret fragments).
+- Raw input values (input echo in error messages is the fastest path to smuggling data out of a constrained context).
+
+SDKs SHOULD apply a lint pass to `message` that redacts recognizable patterns (`/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/` for emails; `/did:(dht|web|key):[A-Za-z0-9._-]+/` for DIDs) before surfacing to developer-facing logs, replacing matches with `[redacted]`. Conformance fixtures include PII-redaction test cases.
+
+**`source_chain` pseudonymization.** A raw `context_id` in a cross-context error trail leaks membership — a caller who sees the actual context IDs of hops they are not a member of learns the existence and identity of those contexts. Each `ContextHop.context_id` MUST be pseudonymized for hops the receiving caller does not have membership in:
+
+```
+ContextHop.context_id_on_wire =
+  HMAC-SHA-256(
+    hop_salt,
+    raw_context_id
+  )
+```
+
+where `hop_salt` is a 32-byte per-context-pair salt established at outlet-interface acceptance (§6.2.0.1) between the two contexts on either side of the hop. The salt is visible to both contexts' members but not to outside observers. A caller who is a member of the target context sees the pseudonymized ID and can cross-reference locally; a caller who is not a member sees an opaque 32-byte value that reveals only the fact of a hop. The outermost caller's own hop (`hop_index == 0`) is the caller's own context and is NOT pseudonymized (the caller is always a member of their own context).
+
+The salt-per-pair design means a single context's ID produces different pseudonyms in different interface relationships — so an observer who sees pseudonyms from multiple hops cannot correlate across interface relationships that the caller is not part of.
+
+**Sealed SDK hierarchies.** Each SDK renders `OutletErrorClass` as a sealed type: Python subclass tree under `OutletError`, TypeScript tagged-union class with a runtime `instanceof` guard per concrete subclass, Swift `enum` with associated values, Kotlin sealed class with data-class children. The wire form is the source of truth; SDK types are generated from a shared fixture set round-tripped through all four FFI bridges. TypeScript conformance explicitly verifies prototype-chain preservation across the napi-rs FFI boundary (`err instanceof AuthorizationError` must hold after the error crosses the bridge).
+
+**Rejected alternatives (for this section).** (1) Free-form `detail`: rejected because it is a covert-channel surface with no benefit over a typed schema. (2) `i18n_key` on the wire: rejected because localization is an SDK-layer concern; bundling translation keys on the wire couples protocol evolution to translation catalog churn. (3) `trace_id` on the wire: rejected because OpenTelemetry trace propagation is a transport-layer concern with its own conventions; duplicating it in the outlet envelope invites divergence. (4) A 35-entry code enumeration: rejected in favor of a ~15-code taxonomy that uses `slug` for fine-grained distinctions. Full enumeration would have created one code per distinguishable runtime condition and made the wire form unmemorable; the compact taxonomy keeps the code set within the 6100-6199 sub-block comfortably and moves variability into `slug`.
 
 ### 5.4.5 Progressive Output (Streaming)
 
@@ -349,25 +398,31 @@ OutletStreamOpen {
   input:            Value,          // MessagePack value matching input_schema
   invoker_did:      DID,
   ucan:             Vec<u8>,        // UCAN JWT bytes; checked ONCE at open
-  caveats_binding:  [u8; 32],       // SHA-256 of the caveat set used at check time
-  chain_depth:      u16,            // inherited from opening call on cross-context hops
+  caveats_binding:  [u8; 32],       // SHA-256 over the effective caveat set; see below
+  chain_depth:      u8,             // inherited from opening call on cross-context hops;
+                                    // matches §24.4 width [0, 255] and ADR-043
   credit_window:    u32,            // initial credit; see backpressure below
   timeout_ms:       u32,            // absolute stream timeout; 0 = use context default
 }
 
 OutletStreamChunk {
-  request_id:   [u8; 16],
-  sequence:     u64,              // strictly monotonic per request_id, starting at 0
-  payload:      ChunkPayload,
+  request_id:  [u8; 16],
+  sequence:    u64,              // strictly monotonic per request_id, starting at 0
+  payload:     ChunkPayload,
+  sig:         Ed25519Signature, // operator's signature; preimage below
 }
 
 ChunkPayload {
-  Data  { value: Value },                                          // matches output_schema
-  Progress { pct: u16, note: Option<String> },                   // pct in [0, 10000] basis points
-  End   { aggregate: Value, provenance: Provenance,
-          execution_time_ms: u64 },                                // matches aggregate_schema or
-                                                                   // defaults to last Data value
-  Error { code: String, message: String, terminal: bool },        // terminal=true = stream over
+  // Tagged union. Canonical JCS encoding MUST place `"type"` as the first field in every
+  // variant (alphabetical key order places it ahead of all other keys used here), so a
+  // canonical-hashed chunk is unambiguously classified before any field is read.
+  { "type": "data",     "value": Value },                           // matches output_schema
+  { "type": "progress", "pct": u16, "note": Option<String> },       // pct in [0, 10000] bp
+  { "type": "end",      "aggregate": Value, "provenance": Provenance,
+                        "execution_time_ms": u64 },                  // matches aggregate_schema
+                                                                     // or defaults to last Data
+  { "type": "error",    "code": String, "message": String,
+                        "terminal": bool },                          // terminal=true closes
 }
 
 OutletStreamCredit {
@@ -376,13 +431,46 @@ OutletStreamCredit {
 }
 ```
 
+**`caveats_binding` preimage.** The binding commits the stream open to the exact set of caveats the UCAN was narrowed to at check time:
+
+```
+caveats_binding = SHA-256(
+  "SCP-OUTLET-CAVEAT-BIND-V1:"
+  || canonical_jcs(effective_caveats)
+)
+```
+
+where `effective_caveats` is the `InvocationCaveats` record (§7.3.8) after all delegation-chain narrowing has been applied. A later attempt to present a different effective caveat set against the same `request_id` is a binding mismatch and is rejected as `OutletErrorClass::Authorization::AttenuationViolation`. The `SCP-OUTLET-CAVEAT-BIND-V1:` separator is registered in §9.18.2.
+
+**Per-chunk operator signature.** Every `OutletStreamChunk.sig` is the operator's Ed25519 signature over
+
+```
+SHA-256(
+  "SCP-OUTLET-CHUNK-SIG-V1:"
+  || request_id                   // 16 bytes, fixed width
+  || sequence_be                  // 8 bytes, big-endian
+  || SHA-256(canonical_jcs(payload))  // 32 bytes
+)
+```
+
+Per-chunk signing closes the **equivocation** gap: without per-chunk signatures, an operator could stream one sequence of chunks to one member and a different sequence to another, then commit a `stream_manifest_hash` that covers only one of the streams. With per-chunk signatures, a mismatch between what a member received and what the committed manifest covers is cryptographically detectable by that member. The `SCP-OUTLET-CHUNK-SIG-V1:` separator is registered in §9.18.2.
+
 **Credit-based backpressure.** Each stream opens with `credit_window` chunks of headroom. The executor may emit up to that many Data/Progress chunks before it must wait for an `OutletStreamCredit` grant. End and Error are terminal and do NOT consume credit — an executor can always close a stream. The default window is `ContextParams::stream_window_default` (default 32). Consumers grant credit as they process chunks. A stream whose credit reaches zero and is not replenished within `stream_credit_stall_secs` (default 30) is cancelled with `OutletErrorClass::Execution::CreditStall`.
 
 **Ordering and gaps.** `sequence` values are strictly monotonic per `request_id`. A receiver that observes a gap (missing sequence) MUST cancel the stream with `OutletErrorClass::Execution::StreamGap` and SHOULD rerun. MLS has no primitive for per-message retransmit and adding one at the SCP layer would require reintroducing a per-recipient unicast channel that MLS deliberately eliminates — so the mitigation is cancel-and-rerun, not retry.
 
 **UCAN check locus.** The UCAN presented in `OutletStreamOpen` is validated exactly once, at open. Every chunk carries the `request_id`; the receiver correlates to the open and does not re-present or re-validate. This prevents UCAN revocation races mid-stream from splitting a stream into authorized and unauthorized halves — a revocation observed during the stream terminates the stream at the next executor checkpoint with `OutletErrorClass::Authorization::RevokedMidStream`, but already-emitted chunks remain authorized.
 
-**Cancellation.** The existing `OutletCancel` message cancels a stream by `request_id`. After a cancel, the executor MUST emit exactly one terminal chunk (`End` or `Error { terminal: true }`) and then stop. A receiver MAY ignore chunks with sequence greater than the terminal chunk's sequence.
+**Cancellation and billing boundary.** The existing `OutletCancel` message cancels a stream by `request_id`. The executor MUST emit exactly one terminal chunk (`End` or `Error { terminal: true }`) within `stream_cancel_ack_secs` (default 5s) of observing the cancel; this terminal chunk is the **cancel-ack**. Its `sequence` is the **cancel-ack sequence**. A receiver MAY ignore chunks with sequence greater than the cancel-ack sequence, but the executor MUST NOT emit Data/Progress chunks with sequence greater than the cancel-ack sequence.
+
+**Billing semantics.** Streaming-native invocation uses an escrow-and-reconcile model so early termination does not leave the economic layer inconsistent.
+
+- **At open** (Action outlets with non-zero cost only): the runtime escrows an upper-bound estimate from the invoker's balance. The estimate is `cost.amount × estimated_chunk_count` where `estimated_chunk_count` is declared in the open, bounded by `credit_window`, bounded again by `max_calls` from the UCAN caveats. For outlets without declared cost or for Query outlets, escrow is zero.
+- **Per chunk**: the operator accrues `cost.amount` per billable chunk (Data chunks; Progress, End, Error are never billed). Chunks beyond the cancel-ack sequence are NOT billed even if they arrive (the operator violated cancel semantics; the invoker does not pay for the violation).
+- **At close** (`End` received or stream terminated): the runtime issues a `PaymentReceipt` (§19.15.5) for the billed amount and refunds the unspent escrow to the invoker. A stream that terminates with `Error { terminal: true }` before any Data chunk refunds the full escrow; the operator does not bill for the failed execution.
+- **Credit-stall cancel**: the stall cancel (`SCP-TOOL-6133`) releases the escrow and the chain-depth slot. The operator is billed for Data chunks already delivered within the stalled window.
+
+The event log records `chunks_billed: u32` separately from `stream_chunk_count`: the total chunk count includes Progress/End/Error, while `chunks_billed` is the count of Data chunks at or below the cancel-ack sequence that were validly delivered.
 
 **Cross-context streaming.** Streams span the §6.2 tool-interface boundary. A shared-member bridge re-encrypts each chunk per-recipient as it crosses. `chain_depth` is set at open and inherited by every chunk (chunks do not recompute or check it). Credit is end-to-end: the originating invoker grants credit that propagates across the bridge.
 
@@ -391,18 +479,41 @@ OutletStreamCredit {
 ```
 OutletInvokedEvent {
   // Existing fields retained (invoker_did, outlet_id, input_hash, ...)
-  stream_chunk_count:    u32,        // number of chunks including terminal
-  stream_manifest_hash:  [u8; 32],   // Merkle root over chunk leaves
-                                     //   leaf_i = SHA-256(canonical_json(chunk_i))
+  stream_chunk_count:     u32,        // total chunks including terminal
+  chunks_billed:          u32,        // Data chunks at or below cancel-ack sequence
+  stream_manifest_hash:   [u8; 32],   // Merkle root over chunk leaves; see below
   stream_terminal_status: StreamTerminalStatus, // Ok | Error(code) | Cancelled
 }
 ```
 
-The SDK retains the chunk leaves and tree shape so that later inclusion proofs (§7.3.1) can prove a specific chunk was part of the recorded stream without replaying all chunks. This is the same primitive as Certificate Transparency's SCT and Bitcoin SPV — a Merkle commitment recorded once, with proofs generated on demand.
+**Chunk manifest leaf construction.** The manifest is a Merkle tree over the ordered chunk sequence using RFC 6962 tag bytes to prevent second-preimage collisions between leaves and interior nodes:
 
-**Classification orthogonality.** Both Query and Action outlets stream. A Query stream is still cacheable — the cache entry's `output_value` is the final `End.aggregate`, not the chunk sequence; a cache hit produces a synthetic one-chunk stream (`Data(aggregate)` + `End(aggregate)`).
+```
+leaf_i = SHA-256(
+  "SCP-OUTLET-CHUNK-V1:"
+  || 0x00                         // RFC 6962 leaf tag
+  || canonical_jcs(chunk_i)       // covers request_id, sequence, payload, sig
+)
 
-**Non-streaming invocation.** A non-streaming invocation is a stream that emits exactly two chunks: `Data(output)` followed by `End(output)`. SDKs MAY present a synchronous `invoke()` surface that collects the stream, but the wire contract is always the streaming form.
+interior = SHA-256(
+  "SCP-OUTLET-CHUNK-V1:"
+  || 0x01                         // RFC 6962 interior tag
+  || left_hash                    // 32 bytes
+  || right_hash                   // 32 bytes
+)
+
+stream_manifest_hash = root of the resulting binary tree
+```
+
+The `SCP-OUTLET-CHUNK-V1:` separator is registered in §9.18.2. The leaf covers the full canonical chunk including `sig`, so a later verifier holding a chunk and a manifest root can prove the operator signed that exact chunk.
+
+**Inclusion proofs.** The `stream_manifest_hash` is a commitment to the chunk sequence. A chunk is provably part of the recorded stream iff a verifier holding the chunk, the chunk's index, and the root can reconstruct a valid Merkle path. The shape of the proof (path structure, verifier algorithm) is deliberately not pinned in this revision — a per-chunk inclusion-proof API on the SDK (a reader calling `outlets.inclusion_proof(invocation_id, chunk_index)` and getting a path back) is **deferred**; the manifest root commitment is the protocol-level invariant, and auditing tools MAY reconstruct proofs off-line by replaying the event log and the retained chunk sequence. The deferral is tracked in discussion [#1698](https://github.com/limn-works/scp/discussions/1698).
+
+**Classification orthogonality.** Both Query and Action outlets stream.
+
+**Non-streaming invocation.** A non-streaming invocation is a stream that emits exactly two chunks: `Data(output)` followed by `End(output)`. SDKs MAY present a synchronous `invoke()` surface that collects the stream into the final `End.aggregate`, but the wire contract is always the streaming form.
+
+**Rejected alternatives (for this section).** (1) A separate `OutletResponse` non-streaming type: rejected because every invocation would need to advertise its response shape (stream vs. one-shot) at registration, and the protocol would fork into two invocation pipelines with almost-but-not-quite identical semantics. Collapsing to streaming with a two-chunk degenerate case is simpler. (2) Per-chunk inclusion-proof API exposed on the SDK surface: deferred per above. The manifest root is sufficient for integrity; a proof API is a convenience over that primitive and can be added without a wire break. (3) Per-chunk UCAN checks: rejected because mid-stream revocation would split a single logical invocation into authorized and unauthorized halves, which is less legible than revoking-at-checkpoint.
 
 ## 5.5 Roles
 
@@ -429,26 +540,26 @@ Every context has a minimum set of built-in roles. Context creators MAY define a
 | Role | Permissions | Description |
 |------|------------|-------------|
 | `admin` | All capabilities in ceiling + `member:invite` + `member:remove` + `role:assign` + `governance:propose` + `governance:vote` + `metadata:edit` | Full control. The context creator is always assigned this role at creation. |
-| `moderator` | `messages:read` + `messages:write` + `tool:invoke:*` + `member:remove` + `governance:propose` | Can moderate content and members but cannot change roles or governance structure. |
-| `member` | `messages:read` + `messages:write` + `tool:invoke:*` | Standard participant. Can read, write, and use tools. |
-| `observer` | `messages:read` | Read-only access. Cannot send messages, invoke tools, or participate in governance. Observers can see all content and membership but cannot create state. |
+| `moderator` | `messages:read` + `messages:write` + `outlet:query:*` + `outlet:call:*` + `member:remove` + `governance:propose` | Can moderate content and members but cannot change roles or governance structure. |
+| `member` | `messages:read` + `messages:write` + `outlet:query:*` + `outlet:call:*` | Standard participant. Can read, write, and invoke outlets. |
+| `observer` | `messages:read` | Read-only access. Cannot send messages, invoke outlets, or participate in governance. Observers can see all content and membership but cannot create state. |
 
 **Observer role permissions (detailed):**
 
 Observers can:
 - Read all messages in the context (subject to memory scope and access key restrictions).
 - View the member list, roles, and context metadata.
-- View tool registrations and their schemas.
+- View outlet registrations and their schemas.
 - View the event log (governance actions, membership changes).
 - Leave the context voluntarily.
 
 Observers cannot:
 - Send messages or reactions.
-- Invoke tools (no `tool:invoke:*` or `tool:invoke:{id}`).
+- Invoke outlets (no `outlet:query:*`, `outlet:query:{id}`, `outlet:call:*`, or `outlet:call:{id}`).
 - Invite members.
 - Propose or vote on governance actions.
 - Modify context metadata.
-- Register or deregister tools.
+- Register or deregister outlets.
 
 **Custom roles.** Context creators define custom roles by specifying a role name (string, max 64 chars, `[a-z0-9_-]`) and a permission set (subset of the ceiling). Custom role permissions MUST be a subset of the ceiling — a custom role cannot grant capabilities beyond the ceiling. Custom roles are stored in the context's role registry (`context/{id}/role/{role_name}` per §17.3) and visible in context metadata.
 

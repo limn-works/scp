@@ -769,7 +769,27 @@ RateWindow {
 - `allowed_adapters`, `allowed_target_dids`: child list MUST be a subset of parent's list; child MAY introduce a list where parent had none.
 - `input_schema`: conservative syntactic narrowing only (see below).
 
-**Conservative JSON Schema narrowing.** The only admissible narrowing keywords are: `enum`, `const`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `required`, and `additionalProperties: false`. Any other keyword appearing newly in the child's `input_schema` triggers `OutletErrorClass::Authorization::AttenuationViolation`. Semantic schema subsumption is undecidable in general; conservative syntactic subsetting is what delegating SDKs can implement correctly and auditors can check by eye.
+**Conservative JSON Schema narrowing.** The only admissible narrowing keywords are: `enum`, `const`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `required`, and `additionalProperties: false`. Any other keyword appearing newly in the child's `input_schema` triggers `OutletErrorClass::Authorization::AttenuationViolation`.
+
+For each admissible keyword the narrowing rule is:
+
+- `enum`: child is admissible iff `child.enum` is a subset of `parent.enum` (set semantics on MessagePack-normalized values).
+- `const`: child is admissible iff `child.const == parent.const`, or parent had no `const`.
+- `minimum`, `minLength`: child is admissible iff `child >= parent`.
+- `maximum`, `maxLength`: child is admissible iff `child <= parent`.
+- `required`: child is admissible iff `child.required` is a superset of `parent.required` (adding required fields narrows; removing them widens).
+- `additionalProperties: false`: admissible iff child sets it to `false` when parent did not (adding this restriction narrows); child MUST NOT relax `false` to `true`.
+- `pattern`: **lexical equality only.** Child is admissible iff `child.pattern == parent.pattern` as UTF-8 byte strings, or parent had no `pattern` and the child introduces one. Regex containment is PSPACE-complete in general and undecidable for the extended regex dialects typical JSON Schema consumers accept; no syntactic subsumption check is safe. Lexical equality preserves the semantic "parent-pattern restriction is still present" without requiring the delegation verifier to implement a regex-containment decision procedure. An operator who wants to strictly narrow a pattern from parent to child uses `enum` or a child-side refinement keyword that IS decidable (e.g., `const` for a single literal).
+
+Semantic schema subsumption is undecidable in general; conservative syntactic subsetting is what delegating SDKs can implement correctly and auditors can check by eye.
+
+**`hours_of_day` mask width assertion.** `hours_of_day` is declared `Option<u32>` for serde compatibility but is semantically a 24-bit bitmask. Both mint and narrow enforce:
+
+```
+assert(hours_of_day & !0x00FF_FFFFu32 == 0u32)
+```
+
+Any value with bits 24..31 set is rejected at mint with `SCP-TOOL-6114` (`caveat-mint-limit-exceeded`, slug `hours-of-day-high-bits-set`) and at narrow with `OutletErrorClass::Authorization::AttenuationViolation`. Without this assertion, a caller could set the high bits of `hours_of_day` to carry ambient data alongside the intended restriction — a covert-channel risk, and a validator-implementation-differential risk if some SDK masked the high bits while another honored them.
 
 **Mint limits.** At token mint time, the issuing SDK MUST enforce the following structural bounds:
 
