@@ -21,6 +21,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { SCP } from "../src/scp";
 
 // ---------------------------------------------------------------------------
 // Guard: load both NAPI and WASM bridges, skip if either is unavailable
@@ -43,12 +44,14 @@ interface ServerAddon {
 let wasmModule: any = null;
 let napiBridge: NativeBridge | null = null;
 let serverAddon: ServerAddon | null = null;
+let scp: SCP | null = null;
 let skipReason = "";
 
 try {
   // Load NAPI bridge
   const { createNativeBridge } = await import("../src/internal/native.js");
-  napiBridge = createNativeBridge();
+  scp = new SCP();
+  napiBridge = createNativeBridge(scp);
 
   // Load NAPI server addon
   const { createRequire } = await import("node:module");
@@ -101,6 +104,9 @@ if (napiBridge === null || serverAddon === null || wasmModule === null) {
   afterAll(async () => {
     if (nodeHandle && !nodeHandle.isShutdown) {
       nodeHandle.shutdown();
+    }
+    if (scp) {
+      await scp.shutdown(1);
     }
   });
 

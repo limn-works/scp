@@ -7,15 +7,26 @@
  * - _fromRecord / _fromJson / _toBridgeRecord round-trip
  */
 
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { ValidationError } from "../src/errors";
 import { IdentityAttestation, RevocationStatus } from "../src/identity";
+import { SCP } from "../src/scp";
 
 // ---------------------------------------------------------------------------
 // IdentityAttestation class tests
 // ---------------------------------------------------------------------------
 
 describe("IdentityAttestation", () => {
+  let scp: SCP;
+
+  beforeEach(() => {
+    scp = new SCP();
+  });
+
+  afterEach(async () => {
+    await scp.shutdown(1);
+  });
+
   const sampleData = {
     id: "abc123",
     platform: "github.com",
@@ -26,7 +37,7 @@ describe("IdentityAttestation", () => {
   };
 
   it("constructs with all required fields", () => {
-    const att = new IdentityAttestation(sampleData);
+    const att = new IdentityAttestation(sampleData, scp);
     expect(att.id).toBe("abc123");
     expect(att.platform).toBe("github.com");
     expect(att.platformHandle).toBe("alice");
@@ -37,7 +48,7 @@ describe("IdentityAttestation", () => {
   });
 
   it("constructs with optional platformId", () => {
-    const att = new IdentityAttestation({ ...sampleData, platformId: "42" });
+    const att = new IdentityAttestation({ ...sampleData, platformId: "42" }, scp);
     expect(att.platformId).toBe("42");
   });
 
@@ -51,7 +62,7 @@ describe("IdentityAttestation", () => {
       revocation_status: "active",
       platform_id: "42",
     };
-    const att = IdentityAttestation._fromRecord(record);
+    const att = IdentityAttestation._fromRecord(record, scp);
     expect(att.platformHandle).toBe("alice");
     expect(att.verificationMethod).toBe("did:dht:z6Mk...#active");
     expect(att.verifiedAt).toBe(1700000000);
@@ -67,7 +78,7 @@ describe("IdentityAttestation", () => {
       verifiedAt: 1700000000,
       revocationStatus: "Active",
     };
-    const att = IdentityAttestation._fromRecord(record);
+    const att = IdentityAttestation._fromRecord(record, scp);
     expect(att.platformHandle).toBe("alice");
     expect(att.revocationStatus.status).toBe("active");
   });
@@ -80,7 +91,7 @@ describe("IdentityAttestation", () => {
       verification_method: "did:dht:z6Mk...#active",
       verified_at: 1700000000,
     };
-    const att = IdentityAttestation._fromRecord(record);
+    const att = IdentityAttestation._fromRecord(record, scp);
     expect(att.revocationStatus.status).toBe("active");
   });
 
@@ -93,7 +104,7 @@ describe("IdentityAttestation", () => {
       verified_at: 1700000000,
       revocation_status: { Revoked: { revoked_at: 1700000100, reason: "test" } },
     });
-    const att = IdentityAttestation._fromJson(json);
+    const att = IdentityAttestation._fromJson(json, scp);
     expect(att.id).toBe("abc123");
     expect(att.revocationStatus.status).toBe("revoked");
     expect(att.revocationStatus.revokedAt).toBe(1700000100);
@@ -101,7 +112,7 @@ describe("IdentityAttestation", () => {
   });
 
   it("_toBridgeRecord produces snake_case keys", () => {
-    const att = new IdentityAttestation(sampleData);
+    const att = new IdentityAttestation(sampleData, scp);
     const rec = att._toBridgeRecord();
     expect(rec.id).toBe("abc123");
     expect(rec.platform).toBe("github.com");
@@ -113,15 +124,15 @@ describe("IdentityAttestation", () => {
   });
 
   it("_toBridgeRecord includes platformId when present", () => {
-    const att = new IdentityAttestation({ ...sampleData, platformId: "99" });
+    const att = new IdentityAttestation({ ...sampleData, platformId: "99" }, scp);
     const rec = att._toBridgeRecord();
     expect(rec.platform_id).toBe("99");
   });
 
   it("round-trips through _toBridgeRecord and _fromRecord", () => {
-    const att = new IdentityAttestation({ ...sampleData, platformId: "99" });
+    const att = new IdentityAttestation({ ...sampleData, platformId: "99" }, scp);
     const rec = att._toBridgeRecord();
-    const roundtrip = IdentityAttestation._fromRecord(rec);
+    const roundtrip = IdentityAttestation._fromRecord(rec, scp);
     expect(roundtrip.id).toBe(att.id);
     expect(roundtrip.platform).toBe(att.platform);
     expect(roundtrip.platformHandle).toBe(att.platformHandle);
@@ -163,22 +174,28 @@ describe("IdentityAttestation", () => {
 
   it("_fromRecord throws ValidationError SCP-VALID-7005 for NaN verified_at", () => {
     expect(() =>
-      IdentityAttestation._fromRecord({
-        id: "abc123",
-        platform: "github.com",
-        platform_handle: "alice",
-        verification_method: "did:dht:z6Mk...#active",
-        verified_at: Number.NaN,
-      }),
+      IdentityAttestation._fromRecord(
+        {
+          id: "abc123",
+          platform: "github.com",
+          platform_handle: "alice",
+          verification_method: "did:dht:z6Mk...#active",
+          verified_at: Number.NaN,
+        },
+        scp,
+      ),
     ).toThrow(ValidationError);
     try {
-      IdentityAttestation._fromRecord({
-        id: "abc123",
-        platform: "github.com",
-        platform_handle: "alice",
-        verification_method: "did:dht:z6Mk...#active",
-        verified_at: Number.NaN,
-      });
+      IdentityAttestation._fromRecord(
+        {
+          id: "abc123",
+          platform: "github.com",
+          platform_handle: "alice",
+          verification_method: "did:dht:z6Mk...#active",
+          verified_at: Number.NaN,
+        },
+        scp,
+      );
     } catch (e) {
       expect(e).toBeInstanceOf(ValidationError);
       expect((e as ValidationError).code).toBe("SCP-VALID-7005");
@@ -187,13 +204,16 @@ describe("IdentityAttestation", () => {
 
   it("_fromRecord throws ValidationError SCP-VALID-7005 for Infinity verified_at", () => {
     try {
-      IdentityAttestation._fromRecord({
-        id: "abc123",
-        platform: "github.com",
-        platform_handle: "alice",
-        verification_method: "did:dht:z6Mk...#active",
-        verified_at: Infinity,
-      });
+      IdentityAttestation._fromRecord(
+        {
+          id: "abc123",
+          platform: "github.com",
+          platform_handle: "alice",
+          verification_method: "did:dht:z6Mk...#active",
+          verified_at: Infinity,
+        },
+        scp,
+      );
       throw new Error("should have thrown");
     } catch (e) {
       expect(e).toBeInstanceOf(ValidationError);
@@ -218,14 +238,17 @@ describe("IdentityAttestation", () => {
   it("IdentityAttestation constructor throws ValidationError for NaN verifiedAt", () => {
     expect(
       () =>
-        new IdentityAttestation({
-          id: "abc123",
-          platform: "github.com",
-          platformHandle: "alice",
-          verificationMethod: "did:dht:z6Mk...#active",
-          verifiedAt: Number.NaN,
-          revocationStatus: RevocationStatus.active(),
-        }),
+        new IdentityAttestation(
+          {
+            id: "abc123",
+            platform: "github.com",
+            platformHandle: "alice",
+            verificationMethod: "did:dht:z6Mk...#active",
+            verifiedAt: Number.NaN,
+            revocationStatus: RevocationStatus.active(),
+          },
+          scp,
+        ),
     ).toThrow(ValidationError);
   });
 
@@ -236,14 +259,17 @@ describe("IdentityAttestation", () => {
   it("IdentityAttestation constructor throws for negative verifiedAt", () => {
     expect(
       () =>
-        new IdentityAttestation({
-          id: "abc123",
-          platform: "github.com",
-          platformHandle: "alice",
-          verificationMethod: "did:dht:z6Mk...#active",
-          verifiedAt: -1,
-          revocationStatus: RevocationStatus.active(),
-        }),
+        new IdentityAttestation(
+          {
+            id: "abc123",
+            platform: "github.com",
+            platformHandle: "alice",
+            verificationMethod: "did:dht:z6Mk...#active",
+            verifiedAt: -1,
+            revocationStatus: RevocationStatus.active(),
+          },
+          scp,
+        ),
     ).toThrow(ValidationError);
   });
 

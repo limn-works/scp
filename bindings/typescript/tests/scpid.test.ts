@@ -13,6 +13,7 @@ import { scpidChallenge, scpidSign, scpidVerify } from "../src/auth";
 import { IdentityError } from "../src/errors";
 import { Identity } from "../src/identity";
 import { _resetBridge, _setBridge } from "../src/internal/bridge";
+import { SCP } from "../src/scp";
 import { createMockBridge } from "./mock-bridge";
 
 // ---------------------------------------------------------------------------
@@ -20,14 +21,17 @@ import { createMockBridge } from "./mock-bridge";
 // ---------------------------------------------------------------------------
 
 let mockBridge: ReturnType<typeof createMockBridge>;
+let scp: SCP;
 
 beforeEach(() => {
+  scp = new SCP();
   mockBridge = createMockBridge();
-  _setBridge(mockBridge);
+  _setBridge(scp, mockBridge);
 });
 
-afterEach(() => {
+afterEach(async () => {
   _resetBridge();
+  await scp.shutdown(1);
 });
 
 // ---------------------------------------------------------------------------
@@ -36,7 +40,7 @@ afterEach(() => {
 
 describe("scpidChallenge", () => {
   it("generates a valid challenge structure", async () => {
-    const challenge = await scpidChallenge("https://example.com", 120);
+    const challenge = await scpidChallenge(scp, "https://example.com", 120);
     expect(challenge.protocol).toBe("scpid/1.0");
     expect(challenge.audience).toBe("https://example.com");
     expect(typeof challenge.nonce).toBe("string");
@@ -47,20 +51,20 @@ describe("scpidChallenge", () => {
   });
 
   it("uses default TTL of 300 seconds", async () => {
-    const challenge = await scpidChallenge("https://example.com");
+    const challenge = await scpidChallenge(scp, "https://example.com");
     expect(challenge.expires_at - challenge.issued_at).toBe(300 * 1000);
   });
 
   it("rejects empty audience", async () => {
-    await expect(scpidChallenge("", 60)).rejects.toThrow();
+    await expect(scpidChallenge(scp, "", 60)).rejects.toThrow();
   });
 
   it("rejects zero TTL", async () => {
-    await expect(scpidChallenge("https://example.com", 0)).rejects.toThrow();
+    await expect(scpidChallenge(scp, "https://example.com", 0)).rejects.toThrow();
   });
 
   it("rejects excessive TTL", async () => {
-    await expect(scpidChallenge("https://example.com", 301)).rejects.toThrow();
+    await expect(scpidChallenge(scp, "https://example.com", 301)).rejects.toThrow();
   });
 });
 
@@ -70,8 +74,8 @@ describe("scpidChallenge", () => {
 
 describe("scpid roundtrip", () => {
   it("challenge -> sign -> verify succeeds", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
-    const challenge = await scpidChallenge("https://example.com", 120);
+    const identity = await Identity.create(scp, { custody: "in_memory" });
+    const challenge = await scpidChallenge(scp, "https://example.com", 120);
 
     const response = await scpidSign(identity, "#active", challenge);
     expect(response.protocol).toBe("scpid/1.0");
@@ -80,27 +84,27 @@ describe("scpid roundtrip", () => {
     expect(response.audience).toBe("https://example.com");
     expect(response.nonce).toBe(challenge.nonce);
 
-    const auth = await scpidVerify(response, challenge);
+    const auth = await scpidVerify(scp, response, challenge);
     expect(auth.did).toBe(identity.did);
     expect(auth.signing_key_id).toBe("#active");
     expect(typeof auth.signed_at).toBe("number");
   });
 
   it("sign rejects invalid signing_key_id", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
-    const challenge = await scpidChallenge("https://example.com", 60);
+    const identity = await Identity.create(scp, { custody: "in_memory" });
+    const challenge = await scpidChallenge(scp, "https://example.com", 60);
 
     await expect(scpidSign(identity, "#owner", challenge)).rejects.toThrow(/SCP-IDENT-1034/);
   });
 
   it("works with #agent signing key", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
-    const challenge = await scpidChallenge("https://agent-service.example.com", 60);
+    const identity = await Identity.create(scp, { custody: "in_memory" });
+    const challenge = await scpidChallenge(scp, "https://agent-service.example.com", 60);
 
     const response = await scpidSign(identity, "#agent", challenge);
     expect(response.signing_key_id).toBe("#agent");
 
-    const auth = await scpidVerify(response, challenge);
+    const auth = await scpidVerify(scp, response, challenge);
     expect(auth.did).toBe(identity.did);
     expect(auth.signing_key_id).toBe("#agent");
   });
@@ -118,12 +122,12 @@ describe("scpidVerify WASM fallback", () => {
       throw new Error("[SCP-IDENT-1033] SCPID verification is not available in the WASM bridge");
     };
     _resetBridge();
-    _setBridge(wasmLikeBridge);
+    _setBridge(scp, wasmLikeBridge);
 
-    const identity = await Identity.create({ custody: "in_memory" });
-    const challenge = await scpidChallenge("https://example.com", 60);
+    const identity = await Identity.create(scp, { custody: "in_memory" });
+    const challenge = await scpidChallenge(scp, "https://example.com", 60);
     const response = await scpidSign(identity, "#active", challenge);
 
-    await expect(scpidVerify(response, challenge)).rejects.toThrow(IdentityError);
+    await expect(scpidVerify(scp, response, challenge)).rejects.toThrow(IdentityError);
   });
 });

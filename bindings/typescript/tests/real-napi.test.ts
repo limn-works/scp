@@ -18,6 +18,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { BridgeMode } from "../src/bridge";
+import { SCP } from "../src/scp";
 
 // ---------------------------------------------------------------------------
 // Guard: skip all tests if the native NAPI binding is unavailable.
@@ -37,12 +38,14 @@ type ServerAddon = {
 
 let bridge: NativeBridge | null = null;
 let serverAddon: ServerAddon | null = null;
+let scp: SCP | null = null;
 let skipReason = "";
 
 try {
   // Attempt to load the native bridge synchronously to detect availability.
   const { createNativeBridge } = await import("../src/internal/native.js");
-  bridge = createNativeBridge();
+  scp = new SCP();
+  bridge = createNativeBridge(scp);
 
   // Load the server addon for relay + transport operations
   const { createRequire } = await import("node:module");

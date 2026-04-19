@@ -14,6 +14,7 @@ import { _validateEconomicPolicyJson, Context } from "../src/context";
 import { ContextError, ValidationError } from "../src/errors";
 import { Identity } from "../src/identity";
 import { _resetBridge, _setBridge } from "../src/internal/bridge";
+import { SCP } from "../src/scp";
 import { defineToolDefinition } from "../src/tools";
 import { Transport } from "../src/transport";
 import type { ConsequenceRule as ConsequenceRuleTypeAlias } from "../src/types";
@@ -25,13 +26,16 @@ import { createMockBridge } from "./mock-bridge";
 // ---------------------------------------------------------------------------
 
 let mockBridge: ReturnType<typeof createMockBridge>;
+let scp: SCP;
 
 beforeEach(() => {
+  scp = new SCP();
   mockBridge = createMockBridge();
 });
 
-afterEach(() => {
+afterEach(async () => {
   _resetBridge();
+  await scp.shutdown(1);
 });
 
 // ---------------------------------------------------------------------------
@@ -514,8 +518,8 @@ describe("Tool runtime (mock bridge)", () => {
   // `spendingUcan` as a named option. Verify the SDK forwards it to
   // the bridge layer when set.
   it("Context.invokeTool forwards options.spendingUcan to the bridge", async () => {
-    _setBridge(mockBridge);
-    const identity = await Identity.create({ custody: "in_memory" });
+    _setBridge(scp, mockBridge);
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const ctx = await Context.create(identity, {
       ceiling: ["tools:register", "tools:invoke"],
     });
@@ -553,8 +557,8 @@ describe("Tool runtime (mock bridge)", () => {
   // C4 (#1606): when no spendingUcan option is passed, the SDK must
   // pass undefined through to the bridge (free-tool path).
   it("Context.invokeTool defaults spendingUcan to undefined for free tools", async () => {
-    _setBridge(mockBridge);
-    const identity = await Identity.create({ custody: "in_memory" });
+    _setBridge(scp, mockBridge);
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const ctx = await Context.create(identity, {
       ceiling: ["tools:register", "tools:invoke"],
     });
@@ -874,7 +878,7 @@ describe("SDK class wiring (type-safe delegation)", () => {
   });
 
   it("Transport.connect rejects non-wss URLs", async () => {
-    await expect(Transport.connect({ relayUrl: "ws://insecure.example.com" })).rejects.toThrow(
+    await expect(Transport.connect(scp, { relayUrl: "ws://insecure.example.com" })).rejects.toThrow(
       ValidationError,
     );
   });
@@ -938,13 +942,14 @@ describe("Trust evaluation runtime (mock bridge)", () => {
 
 describe("Participation verification (mock bridge)", () => {
   it("verifyParticipationRequirements delegates to bridge", () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
     // Import is deferred so the bridge is set before use.
     const { verifyParticipationRequirements } =
       require("../src/trust") as typeof import("../src/trust");
 
     // Mock bridge always returns true — verify no exception thrown.
     verifyParticipationRequirements(
+      scp,
       [
         {
           fact: "ParticipationDuration",
@@ -974,7 +979,7 @@ describe("Participation verification (mock bridge)", () => {
   });
 
   it("constructs correct bridge JSON for ParticipationProfile", () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
 
     // Override mock to capture the JSON arguments.
     let capturedProfileJson = "";
@@ -992,6 +997,7 @@ describe("Participation verification (mock bridge)", () => {
       require("../src/trust") as typeof import("../src/trust");
 
     verifyParticipationRequirements(
+      scp,
       [
         {
           fact: "ToolInvocationCount",
@@ -1455,7 +1461,7 @@ describe("Drain events (mock bridge)", () => {
 
 describe("Context SDK wrapper — TTL, export/import, drain", () => {
   beforeEach(() => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
   });
 
   it("handleTtlExpiry delegates to bridge", async () => {
@@ -1466,7 +1472,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
     );
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     await ctx.handleTtlExpiry();
     expect(mockBridge._contexts.get(handle.contextId)?.state).toBe("expired");
@@ -1480,7 +1486,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
     );
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     const approved = await ctx.proposeTtlExtension(120);
     expect(approved).toBe(true);
@@ -1494,7 +1500,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
     );
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     await expect(ctx.proposeTtlExtension(0)).rejects.toThrow(ContextError);
     await expect(ctx.proposeTtlExtension(-10)).rejects.toThrow(ContextError);
@@ -1508,7 +1514,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
     );
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     await ctx.resetTtlTimer(600);
     expect(mockBridge._contexts.get(handle.contextId)?.ttlSecs).toBe(600);
@@ -1522,7 +1528,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
     );
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     await expect(ctx.resetTtlTimer(0)).rejects.toThrow(ContextError);
     await expect(ctx.resetTtlTimer(-5)).rejects.toThrow(ContextError);
@@ -1536,7 +1542,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
     );
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     await expect(ctx.extendTtl(0)).rejects.toThrow(ContextError);
     await expect(ctx.extendTtl(-10)).rejects.toThrow(ContextError);
@@ -1550,7 +1556,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
     );
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     await expect(ctx.extendTtl(Infinity)).rejects.toThrow(ContextError);
     await expect(ctx.extendTtl(-Infinity)).rejects.toThrow(ContextError);
@@ -1564,7 +1570,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
     );
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     await expect(ctx.proposeTtlExtension(Infinity)).rejects.toThrow(ContextError);
     await expect(ctx.proposeTtlExtension(-Infinity)).rejects.toThrow(ContextError);
@@ -1578,7 +1584,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
     );
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     await expect(ctx.resetTtlTimer(Infinity)).rejects.toThrow(ContextError);
     await expect(ctx.resetTtlTimer(-Infinity)).rejects.toThrow(ContextError);
@@ -1592,7 +1598,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
       identity,
       JSON.stringify({ ceiling: ["messages:read"] }),
     );
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     const exported = await ctx.export();
     expect(exported).toBeInstanceOf(Uint8Array);
@@ -1600,7 +1606,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
   });
 
   it("static import returns context ID", async () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
@@ -1608,10 +1614,10 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
       identity,
       JSON.stringify({ ceiling: ["messages:read"] }),
     );
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     const exported = await ctx.export();
-    const importedId = await Context.import(exported);
+    const importedId = await Context.import(scp, exported);
     expect(importedId).toBe(handle.contextId);
   });
 
@@ -1623,7 +1629,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
       identity,
       JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
     );
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSend(handle, identity.did, new TextEncoder().encode("hello"));
@@ -1643,7 +1649,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
     );
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     await ctx.leave();
 
@@ -1661,7 +1667,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
 
 describe("UCAN delegation (SDK wrapper)", () => {
   beforeEach(() => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
   });
 
   it("delegateUcan delegates to bridge and returns delegated token", async () => {
@@ -1672,7 +1678,7 @@ describe("UCAN delegation (SDK wrapper)", () => {
       admin,
       JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
     );
-    const ctx = Context._fromHandle(handle, admin.did);
+    const ctx = Context._fromHandle(handle, admin.did, scp);
 
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const memberDid = (await mockBridge.identityCreate("in_memory")).did;
@@ -1697,12 +1703,12 @@ describe("UCAN delegation (SDK wrapper)", () => {
 
 describe("Broadcast mutation operations (mock bridge)", () => {
   async function createBroadcastContext() {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, JSON.stringify({ mode: "Broadcast" }));
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
     return { identity, handle, ctx };
   }
 
@@ -1718,12 +1724,12 @@ describe("Broadcast mutation operations (mock bridge)", () => {
   });
 
   it("broadcastSubscribe rejects non-broadcast context", async () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, JSON.stringify({ mode: "Encrypted" }));
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const subscriber = await mockBridge.identityCreate("in_memory");
 
@@ -1871,12 +1877,12 @@ describe("Broadcast mutation operations (mock bridge)", () => {
   });
 
   it("broadcastSubscriberCount returns null for non-broadcast context", async () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, JSON.stringify({ mode: "Encrypted" }));
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     expect(await ctx.broadcastSubscriberCount()).toBeNull();
   });
@@ -1887,12 +1893,12 @@ describe("Broadcast mutation operations (mock bridge)", () => {
   });
 
   it("broadcastAdmission returns null for non-broadcast context", async () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, JSON.stringify({ mode: "Encrypted" }));
-    const ctx = Context._fromHandle(handle, identity.did);
+    const ctx = Context._fromHandle(handle, identity.did, scp);
 
     expect(await ctx.broadcastAdmission()).toBeNull();
   });
@@ -1904,68 +1910,68 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
 describe("Identity SDK wrapper — advanced operations (#428)", () => {
   beforeEach(() => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
   });
 
   it("Identity.create returns identity with DID", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     expect(identity.did).toMatch(/^did:dht:/);
     expect(identity.custodyType).toBe("in_memory");
   });
 
   it("Identity.createWithAgentKey returns identity with DID", async () => {
-    const identity = await Identity.createWithAgentKey({ custody: "in_memory" });
+    const identity = await Identity.createWithAgentKey(scp, { custody: "in_memory" });
     expect(identity.did).toMatch(/^did:dht:/);
     expect(identity.custodyType).toBe("in_memory");
   });
 
   it("identity.addAgentKey returns updated identity with same DID", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const updated = await identity.addAgentKey();
     expect(updated.did).toBe(identity.did);
   });
 
   it("identity.rotateAgentKey returns updated identity with same DID", async () => {
-    const identity = await Identity.createWithAgentKey({ custody: "in_memory" });
+    const identity = await Identity.createWithAgentKey(scp, { custody: "in_memory" });
     const rotated = await identity.rotateAgentKey();
     expect(rotated.did).toBe(identity.did);
   });
 
   it("identity.removeAgentKey returns updated identity with same DID", async () => {
-    const identity = await Identity.createWithAgentKey({ custody: "in_memory" });
+    const identity = await Identity.createWithAgentKey(scp, { custody: "in_memory" });
     const removed = await identity.removeAgentKey();
     expect(removed.did).toBe(identity.did);
   });
 
   it("identity.migrate returns identity with new DID", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const migrated = await identity.migrate();
     expect(migrated.did).toMatch(/^did:dht:/);
     expect(migrated.did).not.toBe(identity.did);
   });
 
   it("identity.attestDevice returns base64 token", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const token = await identity.attestDevice();
     expect(typeof token).toBe("string");
     expect(token.length).toBeGreaterThan(0);
   });
 
   it("identity.verifyDeviceAttestation returns true for valid token", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const token = await identity.attestDevice();
     const isValid = await identity.verifyDeviceAttestation(token);
     expect(isValid).toBe(true);
   });
 
   it("identity.verifyDeviceAttestation returns false for invalid token", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const isValid = await identity.verifyDeviceAttestation("aW52YWxpZA==");
     expect(isValid).toBe(false);
   });
 
   it("identity.executeCustodyMigration returns migration result", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const result = await identity.executeCustodyMigration("hardware");
     expect(result).toBeDefined();
     expect(result.did).toBe(identity.did);
@@ -1976,14 +1982,14 @@ describe("Identity SDK wrapper — advanced operations (#428)", () => {
   });
 
   it("identity.executeCustodyMigration rejects invalid target", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     await expect(identity.executeCustodyMigration("nonexistent" as "hardware")).rejects.toThrow(
       /invalid custody migration target/,
     );
   });
 
   it("identity.executeRecovery returns recovery result", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const result = await identity.executeRecovery("agent", ["ctx-1"]);
     expect(result).toBeDefined();
     expect(result.did).toBe(identity.did);
@@ -1996,7 +2002,7 @@ describe("Identity SDK wrapper — advanced operations (#428)", () => {
   // ---------------------------------------------------------------------------
 
   it("broadcastPublishAsset returns blobId, etag, and deployId", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const ctx = await Context.create(identity, {
       ceiling: ["messages:read", "messages:write"],
       mode: "Broadcast",
@@ -2016,7 +2022,7 @@ describe("Identity SDK wrapper — advanced operations (#428)", () => {
   });
 
   it("broadcastPublishAsset with caller-provided deployId returns it as-is", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const ctx = await Context.create(identity, {
       ceiling: ["messages:read", "messages:write"],
       mode: "Broadcast",
@@ -2034,7 +2040,7 @@ describe("Identity SDK wrapper — advanced operations (#428)", () => {
   });
 
   it("broadcastPublishAssets returns BatchPublishResult with shared deployId", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const ctx = await Context.create(identity, {
       ceiling: ["messages:read", "messages:write"],
       mode: "Broadcast",
@@ -2062,7 +2068,7 @@ describe("Identity SDK wrapper — advanced operations (#428)", () => {
   });
 
   it("auto-generated deployId is a non-empty string", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const ctx = await Context.create(identity, {
       ceiling: ["messages:read", "messages:write"],
       mode: "Broadcast",
@@ -2077,7 +2083,7 @@ describe("Identity SDK wrapper — advanced operations (#428)", () => {
   });
 
   it("broadcastPublishAsset rejects on non-broadcast context", async () => {
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const ctx = await Context.create(identity, {
       ceiling: ["messages:read", "messages:write"],
     });
@@ -2097,12 +2103,13 @@ describe("Identity SDK wrapper — advanced operations (#428)", () => {
 
 describe("Scope registry runtime (mock bridge)", () => {
   it("scope register/lookup/deregister round-trip", async () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
 
     const { scopeRegister, scopeLookup, scopeDeregister } = await import("../src/discovery");
 
     // Register
     const reg = await scopeRegister(
+      scp,
       "test-ctx",
       "my-scope",
       "target-ctx",
@@ -2113,20 +2120,21 @@ describe("Scope registry runtime (mock bridge)", () => {
     expect(reg.entry_id).toBe("scope-1");
 
     // Lookup
-    const lookup = await scopeLookup("test-ctx", "my-scope");
+    const lookup = await scopeLookup(scp, "test-ctx", "my-scope");
     expect(lookup.results).toBeDefined();
     expect(Array.isArray(lookup.results)).toBe(true);
 
     // Deregister
-    const dereg = await scopeDeregister("test-ctx", "my-scope", "did:dht:zTest");
+    const dereg = await scopeDeregister(scp, "test-ctx", "my-scope", "did:dht:zTest");
     expect(dereg.removed).toBe(true);
   });
 
   it("scope register returns typed status values", async () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
     const { scopeRegister } = await import("../src/discovery");
 
     const result = await scopeRegister(
+      scp,
       "test-ctx",
       "my-scope",
       "target-ctx",
@@ -2144,10 +2152,11 @@ describe("Scope registry runtime (mock bridge)", () => {
 
 describe("Invitation evaluation with spending (mock bridge)", () => {
   it("evaluateInvitation accepts spendingJson parameter", async () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
     const { evaluateInvitation } = await import("../src/context");
 
     const result = await evaluateInvitation(
+      scp,
       '{"ceiling":[]}',
       "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
       "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal",
@@ -2160,10 +2169,11 @@ describe("Invitation evaluation with spending (mock bridge)", () => {
   });
 
   it("evaluateInvitation works without spendingJson", async () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
     const { evaluateInvitation } = await import("../src/context");
 
     const result = await evaluateInvitation(
+      scp,
       '{"ceiling":[]}',
       "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
       "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal",
@@ -2197,10 +2207,10 @@ describe("Consequence event types (SDK)", () => {
 
 describe("Trust aggregation with consequence rules (mock bridge)", () => {
   it("aggregateTrustInput accepts typed consequenceRules parameter", async () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
     const { aggregateTrustInput } = await import("../src/trust");
 
-    const result = await aggregateTrustInput({
+    const result = await aggregateTrustInput(scp, {
       contextId: "ctx-consequence-test",
       subjectDid: "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo",
       events: [],
@@ -2256,9 +2266,9 @@ cannot run the full economy enforcement pipeline (ADR-034). Use a native \
         );
       },
     };
-    _setBridge(failClosedBridge);
+    _setBridge(scp, failClosedBridge);
 
-    const identity = await Identity.create();
+    const identity = await Identity.create(scp);
     let captured: unknown = null;
     try {
       await Context.create(identity, {
@@ -2305,9 +2315,9 @@ to join paid contexts.",
         );
       },
     };
-    _setBridge(failClosedBridge);
+    _setBridge(scp, failClosedBridge);
 
-    const identity = await Identity.create();
+    const identity = await Identity.create(scp);
     const ctx = await Context.create(identity, {
       ceiling: [],
       tools: [],
@@ -2349,9 +2359,9 @@ context 'ctx-paid' has an economic policy requiring payment",
         );
       },
     };
-    _setBridge(failClosedBridge);
+    _setBridge(scp, failClosedBridge);
 
-    const identity = await Identity.create();
+    const identity = await Identity.create(scp);
     const ctx = await Context.create(identity, {
       ceiling: [],
       tools: [],
@@ -2390,11 +2400,11 @@ context 'ctx-paid' has an economic policy requiring payment",
 
 describe("Context.create consequenceConfig parameter (C5 / SDK round-trip)", () => {
   it("forwards consequenceConfig to the bridge as a JSON string field", async () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
     const { Identity } = await import("../src/identity");
     const { Context } = await import("../src/context");
 
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const ctx = await Context.create(identity, {
       ceiling: ["messages:read"],
       consequenceConfig: { allowAutomaticAccessRevocation: true },
@@ -2414,11 +2424,11 @@ describe("Context.create consequenceConfig parameter (C5 / SDK round-trip)", () 
   });
 
   it("omits consequenceConfig when caller does not provide one", async () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
     const { Identity } = await import("../src/identity");
     const { Context } = await import("../src/context");
 
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const ctx = await Context.create(identity, {
       ceiling: ["messages:read"],
     });
@@ -2431,12 +2441,12 @@ describe("Context.create consequenceConfig parameter (C5 / SDK round-trip)", () 
   });
 
   it("forwards spendingUcanJwt to the bridge on Context.join", async () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
     const { Identity } = await import("../src/identity");
     const { Context } = await import("../src/context");
 
-    const creator = await Identity.create({ custody: "in_memory" });
-    const joiner = await Identity.create({ custody: "in_memory" });
+    const creator = await Identity.create(scp, { custody: "in_memory" });
+    const joiner = await Identity.create(scp, { custody: "in_memory" });
     const ctx = await Context.create(creator, {
       ceiling: ["messages:read"],
     });
@@ -2454,11 +2464,11 @@ describe("Context.create consequenceConfig parameter (C5 / SDK round-trip)", () 
 
 describe("Context.create consequenceRules typed discriminated union (H15)", () => {
   it("encodes a typed ConsequenceRule[] to the Rust serde wire format", async () => {
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
     const { Identity } = await import("../src/identity");
     const { Context } = await import("../src/context");
 
-    const identity = await Identity.create({ custody: "in_memory" });
+    const identity = await Identity.create(scp, { custody: "in_memory" });
     const rules: ConsequenceRuleTypeAlias[] = [
       {
         trigger: { kind: "MessageVelocity" },

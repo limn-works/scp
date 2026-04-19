@@ -11,6 +11,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { ToolError, ValidationError } from "../src/errors";
 import { _resetBridge, _setBridge } from "../src/internal/bridge";
+import { SCP } from "../src/scp";
 import {
   defineToolDefinition,
   toolInvokeCrossContext,
@@ -100,14 +101,17 @@ describe("defineToolDefinition", () => {
 
 describe("toolInvokeCrossContext", () => {
   let mockBridge: ReturnType<typeof createMockBridge>;
+  let scp: SCP;
 
   beforeEach(async () => {
+    scp = new SCP();
     mockBridge = createMockBridge();
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     _resetBridge();
+    await scp.shutdown(1);
   });
 
   it("invokes a tool across contexts and returns result", async () => {
@@ -128,6 +132,7 @@ describe("toolInvokeCrossContext", () => {
     });
 
     const result = await toolInvokeCrossContext(
+      scp,
       sourceHandle,
       targetHandle,
       toolId,
@@ -158,6 +163,7 @@ describe("toolInvokeCrossContext", () => {
 
     await expect(
       toolInvokeCrossContext(
+        scp,
         sourceHandle,
         targetHandle,
         "tool-test",
@@ -186,6 +192,7 @@ describe("toolInvokeCrossContext", () => {
     });
 
     const result = await toolInvokeCrossContext(
+      scp,
       sourceHandle,
       targetHandle,
       toolId,
@@ -208,6 +215,7 @@ describe("toolInvokeCrossContext", () => {
 
     await expect(
       toolInvokeCrossContext(
+        scp,
         sourceHandle,
         targetHandle,
         "tool-test",
@@ -229,6 +237,7 @@ describe("toolInvokeCrossContext", () => {
 
     await expect(
       toolInvokeCrossContext(
+        scp,
         sourceHandle,
         targetHandle,
         "tool-test",
@@ -254,6 +263,7 @@ describe("toolInvokeCrossContext", () => {
 
     await expect(
       toolInvokeCrossContext(
+        scp,
         sourceHandle,
         targetHandle,
         "tool-test",
@@ -266,6 +276,7 @@ describe("toolInvokeCrossContext", () => {
 
     try {
       await toolInvokeCrossContext(
+        scp,
         sourceHandle,
         targetHandle,
         "tool-test",
@@ -294,6 +305,7 @@ describe("toolInvokeCrossContext", () => {
 
     await expect(
       toolInvokeCrossContext(
+        scp,
         sourceHandle,
         targetHandle,
         "tool-test",
@@ -306,6 +318,7 @@ describe("toolInvokeCrossContext", () => {
 
     try {
       await toolInvokeCrossContext(
+        scp,
         sourceHandle,
         targetHandle,
         "tool-test",
@@ -327,14 +340,17 @@ describe("toolInvokeCrossContext", () => {
 
 describe("toolSessionCreate", () => {
   let mockBridge: ReturnType<typeof createMockBridge>;
+  let scp: SCP;
 
   beforeEach(async () => {
+    scp = new SCP();
     mockBridge = createMockBridge();
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     _resetBridge();
+    await scp.shutdown(1);
   });
 
   it("creates a session and returns a session ID", async () => {
@@ -351,7 +367,7 @@ describe("toolSessionCreate", () => {
       operator: identity.did,
     });
 
-    const result = await toolSessionCreate(handle, toolId, "source-ctx-1");
+    const result = await toolSessionCreate(scp, handle, toolId, "source-ctx-1");
 
     expect(result.sessionId).toBeTruthy();
     expect(typeof result.sessionId).toBe("string");
@@ -371,7 +387,7 @@ describe("toolSessionCreate", () => {
       operator: identity.did,
     });
 
-    const result = await toolSessionCreate(handle, toolId, "source-ctx-1", 300);
+    const result = await toolSessionCreate(scp, handle, toolId, "source-ctx-1", 300);
     expect(result.sessionId).toBeTruthy();
   });
 
@@ -381,7 +397,7 @@ describe("toolSessionCreate", () => {
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, "{}");
 
-    await expect(toolSessionCreate(handle, "tool-test", "source-ctx-1", -1)).rejects.toThrow(
+    await expect(toolSessionCreate(scp, handle, "tool-test", "source-ctx-1", -1)).rejects.toThrow(
       ValidationError,
     );
   });
@@ -392,7 +408,7 @@ describe("toolSessionCreate", () => {
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, "{}");
 
-    await expect(toolSessionCreate(handle, "tool-test", "source-ctx-1", 1.5)).rejects.toThrow(
+    await expect(toolSessionCreate(scp, handle, "tool-test", "source-ctx-1", 1.5)).rejects.toThrow(
       ValidationError,
     );
   });
@@ -400,14 +416,17 @@ describe("toolSessionCreate", () => {
 
 describe("toolSessionInvoke", () => {
   let mockBridge: ReturnType<typeof createMockBridge>;
+  let scp: SCP;
 
   beforeEach(async () => {
+    scp = new SCP();
     mockBridge = createMockBridge();
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     _resetBridge();
+    await scp.shutdown(1);
   });
 
   it("invokes a tool within a session and returns typed result with provenance", async () => {
@@ -424,8 +443,9 @@ describe("toolSessionInvoke", () => {
       operator: identity.did,
     });
 
-    const session = await toolSessionCreate(handle, toolId, "source-ctx-1");
+    const session = await toolSessionCreate(scp, handle, toolId, "source-ctx-1");
     const result = await toolSessionInvoke(
+      scp,
       handle,
       session.sessionId,
       '{"x": 42}',
@@ -461,10 +481,17 @@ describe("toolSessionInvoke", () => {
       operator: identity.did,
     });
 
-    const session = await toolSessionCreate(handle, toolId, "source-ctx-1");
+    const session = await toolSessionCreate(scp, handle, toolId, "source-ctx-1");
 
-    await toolSessionInvoke(handle, session.sessionId, "{}", identity.did, "token");
-    const result2 = await toolSessionInvoke(handle, session.sessionId, "{}", identity.did, "token");
+    await toolSessionInvoke(scp, handle, session.sessionId, "{}", identity.did, "token");
+    const result2 = await toolSessionInvoke(
+      scp,
+      handle,
+      session.sessionId,
+      "{}",
+      identity.did,
+      "token",
+    );
 
     const parsed = JSON.parse(result2.output);
     expect(parsed.call_count).toBe(2);
@@ -473,14 +500,17 @@ describe("toolSessionInvoke", () => {
 
 describe("toolSessionClose", () => {
   let mockBridge: ReturnType<typeof createMockBridge>;
+  let scp: SCP;
 
   beforeEach(async () => {
+    scp = new SCP();
     mockBridge = createMockBridge();
-    _setBridge(mockBridge);
+    _setBridge(scp, mockBridge);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     _resetBridge();
+    await scp.shutdown(1);
   });
 
   it("closes a session successfully", async () => {
@@ -497,12 +527,12 @@ describe("toolSessionClose", () => {
       operator: identity.did,
     });
 
-    const session = await toolSessionCreate(handle, toolId, "source-ctx-1");
-    await toolSessionClose(handle, session.sessionId);
+    const session = await toolSessionCreate(scp, handle, toolId, "source-ctx-1");
+    await toolSessionClose(scp, handle, session.sessionId);
 
     // Subsequent invocation should fail
     await expect(
-      toolSessionInvoke(handle, session.sessionId, "{}", identity.did, "token"),
+      toolSessionInvoke(scp, handle, session.sessionId, "{}", identity.did, "token"),
     ).rejects.toThrow(/SCP-TOOL-6018/);
   });
 
@@ -512,6 +542,8 @@ describe("toolSessionClose", () => {
     // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, "{}");
 
-    await expect(toolSessionClose(handle, "nonexistent-session")).rejects.toThrow(/SCP-TOOL-6021/);
+    await expect(toolSessionClose(scp, handle, "nonexistent-session")).rejects.toThrow(
+      /SCP-TOOL-6021/,
+    );
   });
 });
