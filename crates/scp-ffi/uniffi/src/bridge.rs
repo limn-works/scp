@@ -18067,6 +18067,1047 @@ impl Scp {
         )
         .await
     }
+
+    // ===== UniFFI sub-slice G — transport + MCP + trust + misc =====
+    //
+    // Migrates the transport / MCP / local-DID / trust / sync-policy free
+    // functions (`transport_connect`, `transport_status`,
+    // `transport_disconnect`, `configure_relay_transport`,
+    // `mcp_server_create`, `mcp_server_stop`, `mcp_client_connect_stdio`,
+    // `mcp_client_connect_sse`, `mcp_client_disconnect`,
+    // `mcp_client_list_tools`, `mcp_client_invoke`,
+    // `mcp_configure_stdio_allowlist`, `mcp_disable_stdio_allowlist`,
+    // `mcp_reset_stdio_allowlist`, `mcp_get_stdio_allowlist`,
+    // `register_local_did`, `is_local_did`, `trust_query_score`,
+    // `trust_verify_attestation`, `trust_create_challenge`,
+    // `trust_verify_response`, `verify_participation_requirements`,
+    // `aggregate_trust_input`, `bridge_evaluate_trust`,
+    // `sync_classify_offline`, `sync_classify_offline_custom`,
+    // `sync_get_policy`) to `impl crate::scp::Scp` methods routing through
+    // `&self.inner` (the `UniffiBridgeInstance` owned by the caller).
+    //
+    // Free functions above are retained (they still compile and are still
+    // exported via `#[uniffi::export]`) — the demolition slice at the end
+    // of PR 4 removes them in one shot after every caller is migrated.
+    // Bodies are preserved verbatim except for the
+    // `crate::runtime::bridge_instance()` → `&*self.inner` and
+    // `crate::runtime::init_context_manager_with_*` → `bi.init_context_manager_with_*`
+    // and `crate::runtime::context_manager_expect()` →
+    // `self.inner.context_manager_expect()?` (or `bi.context_manager_expect()?`
+    // inside spawned closures) and `crate::runtime::protocol_repository()` →
+    // `bi.protocol_repository()` swaps and the handle-affinity inline check.
+    //
+    // Purely stateless helpers (`bridge_evaluate_trust`,
+    // `sync_classify_offline`, `sync_classify_offline_custom`,
+    // `sync_get_policy`, `trust_verify_response`, `trust_verify_attestation`,
+    // `trust_create_challenge`, `verify_participation_requirements`) are
+    // exposed as thin delegating methods so SDK callers have a uniform
+    // `scp.method(...)` API surface; the bodies simply forward to the free
+    // functions.
+    //
+    // Part of #1549 Phase 4 PR 4.
+
+    /// Per-instance equivalent of the free-function [`transport_connect`].
+    ///
+    /// Routes through `&*self.inner`. The returned `TransportManager`
+    /// handle's `instance_id` is stamped against this `SCP`'s
+    /// `UniffiBridgeInstance`, so it will be rejected by any other
+    /// `SCP` instance.
+    pub async fn transport_connect(
+        &self,
+        relay_url: String,
+    ) -> Result<Arc<TransportManager>, ScpError> {
+        use scp_transport::native::adapter::NativeRelayAdapter;
+        use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
+
+        validate_relay_url(&relay_url)?;
+
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let sourced = SourcedRelayUrl {
+                    url: relay_url.clone(),
+                    source: RelayUrlSource::Explicit,
+                };
+
+                // Establish a real WebSocket connection to the relay. Cover
+                // traffic auto-starts per adapter via `connect_sourced` with
+                // a profile — `finalize_connection` launches the cover
+                // traffic background task based on the profile's tier.
+                let profile = scp_transport::profile::TransportProfile::platform_default();
+                let mut adapter = NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
+                    .await
+                    .map_err(ScpError::from)?;
+
+                // Extract the suppression event receiver BEFORE moving the
+                // adapter into the TransportManager. The spawned task drains
+                // suppression events and downgrades the relay's reliability
+                // score.
+                let suppression_rx = adapter.take_suppression_receiver();
+
+                // Wrap the adapter in a real TransportManager for multi-relay
+                // support (ADR-012). The manager provides relay set
+                // assignment, reliability scoring, and suppression detection.
+                let manager = scp_transport::TransportManager::new(Box::new(adapter));
+
+                // Install the manager on THIS instance's CoreFields — not on
+                // the process-wide DEFAULT_BRIDGE_INSTANCE.
+                bi.core
+                    .set_transport(std::sync::Arc::new(manager))
+                    .map_err(|e| ScpError::Transport {
+                        msg: e.to_string(),
+                        code: codes::TRANS_5002.to_owned(),
+                    })?;
+
+                // Register the URL on this bridge's pending-reconnect set
+                // so `BridgeInstanceCore::resume` can rebuild the transport
+                // after suspend/resume cycles (#1678).
+                bi.core.add_relay_url(relay_url.clone());
+
+                let handle = Arc::new(TransportManager {
+                    status: std::sync::Mutex::new(TransportStatus {
+                        connected: true,
+                        relay_url: Some(relay_url.clone()),
+                        latency_ms: None,
+                    }),
+                    instance_id: bi.core.instance_id(),
+                });
+                increment_handle_count();
+
+                // Spawn suppression → scoring bridge task.
+                if let Some(rx) = suppression_rx {
+                    spawn_suppression_scoring_task(rx, relay_url);
+                }
+
+                Ok(handle)
+            })
+            .await
+            .map_err(|e| ScpError::Transport {
+                msg: format!("tokio task join error during transport connect: {e}"),
+                code: codes::TRANS_5002.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`transport_status`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `TransportManager`
+    /// whose `instance_id` does not match this `SCP`'s.
+    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    pub async fn transport_status(
+        &self,
+        manager: Arc<TransportManager>,
+    ) -> Result<TransportStatus, ScpError> {
+        self.inner
+            .core
+            .check_handle(manager.instance_id())
+            .map_err(ScpError::from)?;
+        Ok(manager.status())
+    }
+
+    /// Per-instance equivalent of the free-function [`transport_disconnect`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `TransportManager`
+    /// whose `instance_id` does not match this `SCP`'s.
+    pub async fn transport_disconnect(
+        &self,
+        manager: Arc<TransportManager>,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(manager.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                // Clear the transport from THIS instance, dropping all adapters.
+                bi.core.clear_transport().map_err(|e| ScpError::Transport {
+                    msg: e.to_string(),
+                    code: codes::TRANS_5003.to_owned(),
+                })?;
+
+                // Update the handle's status to disconnected and capture the
+                // URL we were connected to before clearing it.
+                let disconnecting_url = {
+                    let mut status_guard =
+                        manager.status.lock().map_err(|_| ScpError::Transport {
+                            msg: "status mutex is poisoned — cannot update transport status"
+                                .to_owned(),
+                            code: codes::TRANS_5003.to_owned(),
+                        })?;
+                    let url = status_guard.relay_url.clone();
+                    status_guard.connected = false;
+                    status_guard.relay_url = None;
+                    status_guard.latency_ms = None;
+                    url
+                };
+
+                // Remove the URL from the bridge's pending-reconnect set so a
+                // subsequent `resume()` does not re-open a URL the caller
+                // explicitly disconnected (#1678).
+                if let Some(ref url) = disconnecting_url {
+                    bi.core.remove_relay_url(url);
+                }
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Transport {
+                msg: format!("tokio task join error during transport disconnect: {e}"),
+                code: codes::TRANS_5003.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`configure_relay_transport`].
+    ///
+    /// Routes through `&*self.inner`. Installs a real `MlsCryptoProvider`
+    /// and `RelayTransportProvider` on this instance's `ContextManager`.
+    pub async fn configure_relay_transport(
+        &self,
+        relay_url: String,
+        local_did: String,
+    ) -> Result<(), ScpError> {
+        validate_relay_url(&relay_url)?;
+        validate_did(&local_did)?;
+
+        let sourced = scp_transport::relay::connection::SourcedRelayUrl {
+            url: relay_url.clone(),
+            source: scp_transport::relay::connection::RelayUrlSource::Explicit,
+        };
+
+        let profile = scp_transport::profile::TransportProfile::platform_default();
+        let adapter =
+            scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
+                .await
+                .map_err(|e| ScpError::Transport {
+                    msg: format!("failed to connect to relay '{relay_url}': {e}"),
+                    code: codes::TRANS_5001.to_owned(),
+                })?;
+
+        self.inner
+            .init_context_manager_with_relay_transport(&local_did, adapter);
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the free-function [`mcp_server_create`].
+    ///
+    /// Routes through `&*self.inner`. The MCP server registry is
+    /// module-level (not per-instance) so the returned opaque handle
+    /// string is globally unique; this method preserves that behaviour.
+    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    pub async fn mcp_server_create(&self, config: McpServerConfig) -> Result<String, ScpError> {
+        validate_did(&config.identity_did)?;
+        validate_transport_mode(&config.transport)?;
+        for ctx_id in &config.context_ids {
+            validate_context_id(ctx_id)?;
+        }
+
+        if config.context_ids.is_empty() {
+            return Err(ScpError::Transport {
+                msg: "context_ids must not be empty".to_owned(),
+                code: codes::TRANS_5011.to_owned(),
+            });
+        }
+
+        let provider = McpUniFfiBridgeProvider {
+            agent_did: config.identity_did.clone(),
+            context_ids: config.context_ids.clone(),
+            tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: config.ucan_token.clone(),
+            agent_proof_tokens: config.proof_tokens.clone(),
+        };
+        let server = scp_mcp::server::McpServer::new(provider);
+        let server = Arc::new(std::sync::Mutex::new(server));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_clone = Arc::clone(&server);
+        let transport_mode = config.transport;
+        let sse_identity_did = config.identity_did;
+        let sse_context_ids = config.context_ids;
+        let sse_ucan_token = config.ucan_token;
+        let sse_proof_tokens = config.proof_tokens;
+
+        let task_handle = runtime().spawn(async move {
+            match transport_mode.as_str() {
+                "stdio" => {
+                    run_mcp_stdio_server_uniffi(server_clone, shutdown_rx).await;
+                }
+                "sse" => {
+                    let provider = McpUniFfiBridgeProvider {
+                        agent_did: sse_identity_did,
+                        context_ids: sse_context_ids,
+                        tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
+                        agent_ucan_token: sse_ucan_token,
+                        agent_proof_tokens: sse_proof_tokens,
+                    };
+                    let sse_server = scp_mcp::server::McpServer::new(provider);
+                    let sse_config = scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        0,
+                    )));
+                    let sse_shutdown = scp_mcp::sse::ShutdownHandle::new();
+                    let sse_shutdown_trigger = sse_shutdown.clone();
+                    tokio::spawn(async move {
+                        let _ = shutdown_rx.await;
+                        sse_shutdown_trigger.shutdown();
+                    });
+                    let result = scp_mcp::sse::run_sse(sse_server, sse_config, sse_shutdown).await;
+                    if let Err(e) = result {
+                        tracing::error!("MCP SSE server error: {e}");
+                    }
+                }
+                _ => {} // Already validated above.
+            }
+        });
+
+        let handle_id = mcp_handle_id("mcp-server");
+        mcp_server_registry().insert(
+            handle_id.clone(),
+            McpServerEntry {
+                shutdown_tx: Some(shutdown_tx),
+                _task_handle: task_handle,
+                stopped: false,
+            },
+        );
+        increment_handle_count();
+
+        Ok(handle_id)
+    }
+
+    /// Per-instance equivalent of the free-function [`mcp_server_stop`].
+    ///
+    /// Routes through the module-level MCP server registry (the registry
+    /// is not per-instance; the opaque handle string is globally unique).
+    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    pub async fn mcp_server_stop(&self, handle: String) -> Result<(), ScpError> {
+        validate_mcp_handle(&handle)?;
+
+        let mut entry =
+            mcp_server_registry()
+                .get_mut(&handle)
+                .ok_or_else(|| ScpError::Transport {
+                    msg: format!("MCP server handle '{handle}' not found"),
+                    code: codes::TRANS_5012.to_owned(),
+                })?;
+
+        if entry.stopped {
+            return Err(ScpError::Transport {
+                msg: format!("MCP server '{handle}' is already stopped"),
+                code: codes::TRANS_5013.to_owned(),
+            });
+        }
+
+        entry.stopped = true;
+        if let Some(tx) = entry.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the free-function [`mcp_client_connect_stdio`].
+    ///
+    /// Routes through the module-level MCP client registry.
+    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    pub async fn mcp_client_connect_stdio(&self, command: Vec<String>) -> Result<String, ScpError> {
+        if command.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "command must be a non-empty list".to_owned(),
+                code: codes::VALID_7034.to_owned(),
+            });
+        }
+
+        let transport = McpStdioTransport::spawn(&command).map_err(|e| ScpError::Transport {
+            msg: format!("failed to connect stdio MCP client: {e}"),
+            code: codes::TRANS_5015.to_owned(),
+        })?;
+
+        let mut client =
+            scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Stdio(transport));
+        client.initialize().map_err(|e| ScpError::Transport {
+            msg: format!("MCP initialize handshake failed: {e}"),
+            code: codes::TRANS_5016.to_owned(),
+        })?;
+
+        let handle_id = mcp_handle_id("mcp-client");
+        mcp_client_registry().insert(
+            handle_id.clone(),
+            McpClientEntry {
+                client: std::sync::Mutex::new(client),
+            },
+        );
+        increment_handle_count();
+
+        Ok(handle_id)
+    }
+
+    /// Per-instance equivalent of the free-function [`mcp_client_connect_sse`].
+    ///
+    /// Routes through the module-level MCP client registry.
+    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    pub async fn mcp_client_connect_sse(&self, url: String) -> Result<String, ScpError> {
+        validate_relay_url(&url)?;
+
+        let transport = McpSseTransport::connect(&url);
+
+        let mut client = scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Sse(transport));
+        client.initialize().map_err(|e| ScpError::Transport {
+            msg: format!("MCP initialize handshake failed: {e}"),
+            code: codes::TRANS_5018.to_owned(),
+        })?;
+
+        let handle_id = mcp_handle_id("mcp-client");
+        mcp_client_registry().insert(
+            handle_id.clone(),
+            McpClientEntry {
+                client: std::sync::Mutex::new(client),
+            },
+        );
+        increment_handle_count();
+
+        Ok(handle_id)
+    }
+
+    /// Per-instance equivalent of the free-function [`mcp_client_disconnect`].
+    ///
+    /// Routes through the module-level MCP client registry.
+    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    pub async fn mcp_client_disconnect(&self, handle: String) -> Result<(), ScpError> {
+        validate_mcp_handle(&handle)?;
+
+        let removed = mcp_client_registry().remove(&handle);
+        if removed.is_none() {
+            return Err(ScpError::Transport {
+                msg: format!("MCP client handle '{handle}' not found"),
+                code: codes::TRANS_5019.to_owned(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the free-function [`mcp_client_list_tools`].
+    ///
+    /// Routes through the module-level MCP client registry.
+    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    pub async fn mcp_client_list_tools(
+        &self,
+        handle: String,
+    ) -> Result<Vec<McpToolInfo>, ScpError> {
+        validate_mcp_handle(&handle)?;
+
+        let entry = mcp_client_registry()
+            .get(&handle)
+            .ok_or_else(|| ScpError::Transport {
+                msg: format!("MCP client handle '{handle}' not found"),
+                code: codes::TRANS_5020.to_owned(),
+            })?;
+
+        let client_guard = entry.client.lock().map_err(|e| ScpError::Transport {
+            msg: format!("client lock poisoned: {e}"),
+            code: codes::TRANS_5021.to_owned(),
+        })?;
+
+        let tools = client_guard.list_tools().map_err(|e| ScpError::Transport {
+            msg: format!("tools/list failed: {e}"),
+            code: codes::TRANS_5022.to_owned(),
+        })?;
+
+        Ok(tools
+            .into_iter()
+            .map(|t| McpToolInfo {
+                name: t.name,
+                description: t.description.unwrap_or_default(),
+                input_schema_json: serde_json::to_string(&t.input_schema)
+                    .unwrap_or_else(|_| "{}".to_owned()),
+            })
+            .collect())
+    }
+
+    /// Per-instance equivalent of the free-function [`mcp_client_invoke`].
+    ///
+    /// Routes through the module-level MCP client registry.
+    #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
+    pub async fn mcp_client_invoke(
+        &self,
+        handle: String,
+        tool_name: String,
+        input_json: String,
+        context_id: String,
+        invoker_did: String,
+    ) -> Result<McpInvokeResult, ScpError> {
+        validate_mcp_handle(&handle)?;
+        validate_tool_name(&tool_name)?;
+        validate_context_id(&context_id)?;
+        validate_did(&invoker_did)?;
+
+        let entry = mcp_client_registry()
+            .get(&handle)
+            .ok_or_else(|| ScpError::Transport {
+                msg: format!("MCP client handle '{handle}' not found"),
+                code: codes::TRANS_5023.to_owned(),
+            })?;
+
+        let input: serde_json::Value =
+            serde_json::from_str(&input_json).map_err(|e| ScpError::Validation {
+                msg: format!("invalid input JSON: {e}"),
+                code: codes::VALID_7021.to_owned(),
+            })?;
+
+        let client_guard = entry.client.lock().map_err(|e| ScpError::Transport {
+            msg: format!("client lock poisoned: {e}"),
+            code: codes::TRANS_5024.to_owned(),
+        })?;
+
+        let result = client_guard
+            .invoke(&tool_name, input, &context_id, &invoker_did)
+            .map_err(|e| ScpError::Transport {
+                msg: format!("tools/call failed: {e}"),
+                code: codes::TRANS_5025.to_owned(),
+            })?;
+
+        let content_json =
+            serde_json::to_string(&result.content).unwrap_or_else(|_| "[]".to_owned());
+
+        Ok(McpInvokeResult {
+            content_json,
+            is_error: result.is_error,
+            source: result.provenance.source,
+            invoked_by: result.provenance.invoked_by,
+            context_id: result.provenance.context,
+            timestamp: result.provenance.timestamp,
+        })
+    }
+
+    /// Per-instance equivalent of the free-function [`mcp_configure_stdio_allowlist`].
+    ///
+    /// The stdio allowlist is process-wide (module-level state) — this
+    /// method exists purely to give the SDK a uniform `scp.method(...)`
+    /// surface.
+    pub fn mcp_configure_stdio_allowlist(
+        &self,
+        additional_binaries: Vec<String>,
+    ) -> Result<(), ScpError> {
+        scp_mcp::allowlist::configure(&additional_binaries).map_err(mcp_allowlist_err)?;
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the free-function [`mcp_disable_stdio_allowlist`].
+    ///
+    /// The stdio allowlist is process-wide (module-level state).
+    pub fn mcp_disable_stdio_allowlist(&self) -> Result<(), ScpError> {
+        scp_mcp::allowlist::disable_enforcement().map_err(mcp_allowlist_err)?;
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the free-function [`mcp_reset_stdio_allowlist`].
+    ///
+    /// The stdio allowlist is process-wide (module-level state).
+    pub fn mcp_reset_stdio_allowlist(&self) -> Result<(), ScpError> {
+        scp_mcp::allowlist::reset().map_err(mcp_allowlist_err)?;
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the free-function [`mcp_get_stdio_allowlist`].
+    ///
+    /// The stdio allowlist is process-wide (module-level state).
+    pub fn mcp_get_stdio_allowlist(&self) -> Result<McpAllowlistState, ScpError> {
+        let state = scp_mcp::allowlist::get_state().map_err(mcp_allowlist_err)?;
+        Ok(McpAllowlistState {
+            allowed: state.allowed,
+            unrestricted: state.unrestricted,
+        })
+    }
+
+    /// Per-instance equivalent of the free-function [`register_local_did`].
+    ///
+    /// Routes through `&*self.inner`. Initializes this instance's
+    /// `ContextManager` if not yet attached (idempotent) and registers
+    /// the DID on the per-instance local-DID set.
+    pub async fn register_local_did(&self, did: String) -> Result<(), ScpError> {
+        validate_did(&did)?;
+        self.inner.init_context_manager_with_did(&did);
+        let manager = self.inner.context_manager_expect()?;
+        manager.register_local_did(did.into()).await;
+        Ok(())
+    }
+
+    /// Per-instance equivalent of the free-function [`is_local_did`].
+    ///
+    /// Routes through `&*self.inner`. Returns `false` if the DID fails
+    /// validation or the instance's `ContextManager` cannot be
+    /// initialized / looked up.
+    pub async fn is_local_did(&self, did: String) -> bool {
+        if validate_did(&did).is_err() {
+            return false;
+        }
+        // Initialize this instance's bridge with this DID as the local
+        // identity. Idempotent — matches the free-function behaviour of
+        // permitting `is_local_did` as the first operation.
+        self.inner.init_context_manager_with_did(&did);
+        let Ok(manager) = self.inner.context_manager_expect() else {
+            return false;
+        };
+        let did_ref: scp_identity::DID = did.into();
+        manager.is_local_did(&did_ref).await
+    }
+
+    /// Per-instance equivalent of the free-function [`trust_query_score`].
+    ///
+    /// Trust event counts are queried from the module-level helper (a
+    /// stateless `(0, 0)` stub today — see `runtime::query_trust_event_counts`).
+    /// The method exists for SDK API uniformity.
+    pub fn trust_query_score(
+        &self,
+        did: String,
+        context_id: String,
+    ) -> Result<TrustScoreResult, ScpError> {
+        if did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "DID must not be empty".to_owned(),
+                code: codes::VALID_7010.to_owned(),
+            });
+        }
+        if context_id.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "context_id must not be empty".to_owned(),
+                code: codes::VALID_7011.to_owned(),
+            });
+        }
+
+        let (message_count, governance_count) =
+            crate::runtime::query_trust_event_counts(&context_id, &did);
+
+        let total = message_count + governance_count;
+        #[allow(clippy::cast_precision_loss)]
+        let composite_score = (1.0 + total as f64).log10().min(1.0);
+
+        Ok(TrustScoreResult {
+            message_count,
+            governance_count,
+            composite_score,
+        })
+    }
+
+    /// Per-instance equivalent of the free-function [`trust_verify_attestation`].
+    ///
+    /// The underlying attestation verification is stateless — this method
+    /// is a thin delegate for SDK API uniformity.
+    pub fn trust_verify_attestation(
+        &self,
+        attestation_json: String,
+    ) -> Result<AttestationVerificationResult, ScpError> {
+        let attestation: scp_core::trust::Attestation = serde_json::from_str(&attestation_json)
+            .map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse attestation JSON: {e}"),
+                code: codes::VALID_7012.to_owned(),
+            })?;
+
+        let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+        let clock = scp_identity::cache::SystemClock;
+
+        match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
+            Ok(()) => Ok(AttestationVerificationResult {
+                valid: true,
+                chain_depth: 1,
+                error_message: String::new(),
+            }),
+            Err(e) => Ok(AttestationVerificationResult {
+                valid: false,
+                chain_depth: 0,
+                error_message: format!("{e}"),
+            }),
+        }
+    }
+
+    /// Per-instance equivalent of the free-function [`trust_create_challenge`].
+    ///
+    /// Stateless helper — uses an ephemeral signing key per call.
+    pub fn trust_create_challenge(&self, target_did: String) -> Result<ChallengeResult, ScpError> {
+        if target_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "target DID must not be empty".to_owned(),
+                code: codes::VALID_7013.to_owned(),
+            });
+        }
+
+        struct EphemeralSigner(ed25519_dalek::SigningKey);
+        impl scp_core::trust::ChallengeSigner for EphemeralSigner {
+            fn sign(&self, data: &[u8]) -> Result<Vec<u8>, scp_core::trust::TrustError> {
+                use ed25519_dalek::Signer;
+                let sig = self.0.sign(data);
+                Ok(sig.to_bytes().to_vec())
+            }
+        }
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let signer = EphemeralSigner(signing_key);
+
+        let request = scp_core::trust::issue_challenge(
+            "did:key:ephemeral-challenger".into(),
+            target_did.into(),
+            scp_core::trust::ChallengeType::schema_validation(),
+            "scp:capability:schema-validation/v1".to_string(),
+            serde_json::json!({}),
+            std::time::Duration::from_mins(5),
+            &signer,
+        )
+        .map_err(|e| ScpError::Validation {
+            msg: format!("challenge creation failed: {e}"),
+            code: codes::VALID_7014.to_owned(),
+        })?;
+
+        let challenge_json = serde_json::to_string(&request).map_err(|e| ScpError::Validation {
+            msg: format!("failed to serialize challenge: {e}"),
+            code: codes::VALID_7015.to_owned(),
+        })?;
+
+        Ok(ChallengeResult {
+            challenge_id: request.challenge_id,
+            challenge_json,
+        })
+    }
+
+    /// Per-instance equivalent of the free-function [`trust_verify_response`].
+    ///
+    /// Stateless helper — uses an ephemeral verification signer per call.
+    pub fn trust_verify_response(
+        &self,
+        challenge_json: String,
+        response_json: String,
+    ) -> Result<bool, ScpError> {
+        let request: scp_core::trust::ChallengeRequest = serde_json::from_str(&challenge_json)
+            .map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse challenge JSON: {e}"),
+                code: codes::VALID_7016.to_owned(),
+            })?;
+
+        let response: scp_core::trust::ChallengeResponse = serde_json::from_str(&response_json)
+            .map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse response JSON: {e}"),
+                code: codes::VALID_7017.to_owned(),
+            })?;
+
+        let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
+        let clock = scp_identity::cache::SystemClock;
+
+        struct EphemeralVerifySigner(ed25519_dalek::SigningKey);
+        impl scp_core::trust::ChallengeSigner for EphemeralVerifySigner {
+            fn sign(&self, data: &[u8]) -> Result<Vec<u8>, scp_core::trust::TrustError> {
+                use ed25519_dalek::Signer;
+                let sig = self.0.sign(data);
+                Ok(sig.to_bytes().to_vec())
+            }
+        }
+
+        let verify_signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let verify_signer = EphemeralVerifySigner(verify_signing_key);
+
+        Ok(scp_core::trust::verify_challenge_response(
+            &request,
+            &response,
+            &resolver,
+            &clock,
+            &verify_signer,
+            None,
+        )
+        .is_ok())
+    }
+
+    /// Per-instance equivalent of the free-function [`verify_participation_requirements`].
+    ///
+    /// Stateless helper that parses both JSON inputs and delegates to the
+    /// scp-core verifier using the current system time.
+    pub fn verify_participation_requirements(
+        &self,
+        profile_json: String,
+        requirements_json: String,
+    ) -> Result<bool, ScpError> {
+        let profiles: Vec<scp_core::trust::ParticipationProfile> =
+            serde_json::from_str(&profile_json).map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse participation profiles JSON: {e}"),
+                code: codes::VALID_7030.to_owned(),
+            })?;
+
+        let requirements: Vec<scp_core::trust::RequireParticipation> =
+            serde_json::from_str(&requirements_json).map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse participation requirements JSON: {e}"),
+                code: codes::VALID_7031.to_owned(),
+            })?;
+
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        scp_core::trust::verify_participation_requirements(current_time, &requirements, &profiles)
+            .map_err(|e| ScpError::Validation {
+                msg: format!("participation admission verification failed: {e}"),
+                code: codes::VALID_7032.to_owned(),
+            })?;
+
+        Ok(true)
+    }
+
+    /// Per-instance equivalent of the free-function [`aggregate_trust_input`].
+    ///
+    /// Routes through `&*self.inner` — trust data is populated against
+    /// THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`),
+    /// falling back to an ephemeral in-memory store when no repository
+    /// is attached.
+    #[allow(clippy::too_many_arguments)]
+    pub fn aggregate_trust_input(
+        &self,
+        context_id: String,
+        subject_did: String,
+        events_json: String,
+        merkle_root_json: String,
+        consequence_rules_json: String,
+        threshold_requirements_json: String,
+        attestor_sets_json: String,
+        cached_attestations_json: String,
+        challenge_results_json: String,
+    ) -> Result<String, ScpError> {
+        if context_id.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "context_id must not be empty".to_owned(),
+                code: codes::VALID_7040.to_owned(),
+            });
+        }
+        if subject_did.is_empty() {
+            return Err(ScpError::Validation {
+                msg: "subject DID must not be empty".to_owned(),
+                code: codes::VALID_7041.to_owned(),
+            });
+        }
+
+        let events: Vec<scp_event_log::Event> =
+            serde_json::from_str(&events_json).map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse events JSON: {e}"),
+                code: codes::VALID_7042.to_owned(),
+            })?;
+
+        let merkle_root_vec: Vec<u8> =
+            serde_json::from_str(&merkle_root_json).map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse merkle_root JSON: {e}"),
+                code: codes::VALID_7043.to_owned(),
+            })?;
+        let merkle_root: [u8; 32] =
+            merkle_root_vec
+                .try_into()
+                .map_err(|v: Vec<u8>| ScpError::Validation {
+                    msg: format!("merkle_root must be exactly 32 bytes, got {}", v.len()),
+                    code: codes::VALID_7044.to_owned(),
+                })?;
+
+        let consequence_rules: Vec<scp_core::trust::ConsequenceRule> =
+            serde_json::from_str(&consequence_rules_json).map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse consequence_rules JSON: {e}"),
+                code: codes::VALID_7045.to_owned(),
+            })?;
+
+        let threshold_requirements: std::collections::HashMap<
+            scp_core::trust::AttestationType,
+            scp_core::trust::ThresholdRequirement,
+        > = serde_json::from_str(&threshold_requirements_json).map_err(|e| {
+            ScpError::Validation {
+                msg: format!("failed to parse threshold_requirements JSON: {e}"),
+                code: codes::VALID_7046.to_owned(),
+            }
+        })?;
+
+        let attestor_sets: std::collections::HashMap<
+            scp_core::trust::AttestationType,
+            Vec<scp_core::trust::AttestorInfo>,
+        > = serde_json::from_str(&attestor_sets_json).map_err(|e| ScpError::Validation {
+            msg: format!("failed to parse attestor_sets JSON: {e}"),
+            code: codes::VALID_7047.to_owned(),
+        })?;
+
+        let cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation> =
+            serde_json::from_str(&cached_attestations_json).map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse cached_attestations JSON: {e}"),
+                code: codes::VALID_7048.to_owned(),
+            })?;
+
+        let challenge_results: Vec<scp_core::trust::ChallengeVerification> =
+            serde_json::from_str(&challenge_results_json).map_err(|e| ScpError::Validation {
+                msg: format!("failed to parse challenge_results JSON: {e}"),
+                code: codes::VALID_7049.to_owned(),
+            })?;
+
+        // Route trust aggregation through THIS instance's
+        // `ProtocolRepository` variant. Falls back to an ephemeral
+        // in-memory store when no repository is attached yet.
+        match self.inner.protocol_repository() {
+            crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
+                let handle = runtime().handle().clone();
+                let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
+                    std::sync::Arc::clone(repo),
+                    handle,
+                );
+                scp_ffi_common::trust_store::populate_and_aggregate(
+                    bridge,
+                    &context_id,
+                    &subject_did,
+                    cached_attestations,
+                    &challenge_results,
+                    &events,
+                    merkle_root,
+                    &consequence_rules,
+                    &threshold_requirements,
+                    &attestor_sets,
+                )
+                .map_err(|e| ScpError::Validation {
+                    msg: e.to_string(),
+                    code: codes::VALID_7052.to_owned(),
+                })
+            }
+            crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
+                let handle = runtime().handle().clone();
+                let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(
+                    std::sync::Arc::clone(repo),
+                    handle,
+                );
+                scp_ffi_common::trust_store::populate_and_aggregate(
+                    bridge,
+                    &context_id,
+                    &subject_did,
+                    cached_attestations,
+                    &challenge_results,
+                    &events,
+                    merkle_root,
+                    &consequence_rules,
+                    &threshold_requirements,
+                    &attestor_sets,
+                )
+                .map_err(|e| ScpError::Validation {
+                    msg: e.to_string(),
+                    code: codes::VALID_7052.to_owned(),
+                })
+            }
+        }
+    }
+
+    /// Per-instance equivalent of the free-function [`bridge_evaluate_trust`].
+    ///
+    /// Pure function — no per-instance state required. Exists for SDK
+    /// API uniformity.
+    pub fn bridge_evaluate_trust(
+        &self,
+        is_bridged: bool,
+        is_native_transport: bool,
+        shadow_status: String,
+    ) -> Result<u8, ScpError> {
+        if !is_bridged {
+            let level =
+                scp_core::bridge::provenance::evaluate_trust_level(None, is_native_transport);
+            return Ok(level as u8);
+        }
+
+        let status = match shadow_status.as_str() {
+            "shadow" => scp_core::bridge::ShadowProvenanceStatus::Shadow,
+            "claimed" => scp_core::bridge::ShadowProvenanceStatus::Claimed,
+            other => {
+                return Err(ScpError::Validation {
+                    msg: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
+                    code: codes::VALID_7051.to_owned(),
+                });
+            }
+        };
+
+        let base = scp_core::provenance::DataProvenance {
+            source_context: String::new(),
+            source_type: scp_core::provenance::SourceType::Persistent,
+            counterparties: vec![],
+            purpose: None,
+            discovery_method: scp_core::provenance::DiscoveryMethod::OutOfBand,
+            age: std::time::Duration::from_secs(0),
+            memory_scope: scp_core::context::MemoryScope::Full,
+            chain_depth: 0,
+            chain_path: None,
+            payment_amount: None,
+            payment_adapter: None,
+            payment_receipt_id: None,
+        };
+
+        let connector = scp_core::bridge::BridgeConnector {
+            bridge_id: String::new(),
+            operator_did: "did:key:unused".into(),
+            platform: String::new(),
+            mode: scp_core::bridge::BridgeMode::Relay,
+            status: scp_core::bridge::BridgeStatus::Active,
+            registration_context: String::new(),
+            registered_at: 0,
+        };
+
+        let shadow = scp_core::bridge::ShadowIdentity {
+            shadow_id: String::new(),
+            platform_handle: String::new(),
+            bridge_id: String::new(),
+            attributed_role: "observer".to_string(),
+            provenance_status: status,
+            created_at: 0,
+        };
+
+        let bp = scp_core::bridge::provenance::mark_bridge_provenance(base, &connector, &shadow);
+        let level =
+            scp_core::bridge::provenance::evaluate_trust_level(Some(&bp), is_native_transport);
+        Ok(level as u8)
+    }
+
+    /// Per-instance equivalent of the free-function [`sync_classify_offline`].
+    ///
+    /// Pure function — no per-instance state required.
+    #[must_use]
+    pub fn sync_classify_offline(&self, last_relay_contact: u64, now: u64) -> String {
+        match scp_core::sync::classify_offline_duration(last_relay_contact, now) {
+            scp_core::sync::OfflineTier::Short => "short".to_string(),
+            scp_core::sync::OfflineTier::Extended => "extended".to_string(),
+            scp_core::sync::OfflineTier::Long => "long".to_string(),
+        }
+    }
+
+    /// Per-instance equivalent of the free-function [`sync_classify_offline_custom`].
+    ///
+    /// Pure function — no per-instance state required.
+    #[must_use]
+    pub fn sync_classify_offline_custom(
+        &self,
+        last_relay_contact: u64,
+        now: u64,
+        tier_1_threshold_secs: u64,
+        tier_2_threshold_secs: u64,
+    ) -> String {
+        let policy = scp_core::sync::SyncPolicy::default()
+            .with_tier_1_threshold_secs(tier_1_threshold_secs)
+            .with_tier_2_threshold_secs(tier_2_threshold_secs);
+
+        match policy.classify_offline_duration(last_relay_contact, now) {
+            scp_core::sync::OfflineTier::Short => "short".to_string(),
+            scp_core::sync::OfflineTier::Extended => "extended".to_string(),
+            scp_core::sync::OfflineTier::Long => "long".to_string(),
+        }
+    }
+
+    /// Per-instance equivalent of the free-function [`sync_get_policy`].
+    ///
+    /// Pure function — returns the default sync policy parameters.
+    #[must_use]
+    pub fn sync_get_policy(&self) -> SyncPolicyResult {
+        let policy = scp_core::sync::SyncPolicy::default();
+
+        #[allow(clippy::cast_possible_truncation)]
+        SyncPolicyResult {
+            tier_1_threshold_secs: policy.tier_1_threshold_secs,
+            tier_2_threshold_secs: policy.tier_2_threshold_secs,
+            gap_timeout_secs: policy.gap_timeout.as_secs(),
+            reorder_buffer_capacity: policy.reorder_buffer_capacity as u32,
+            max_sequential_commits: policy.max_sequential_commits,
+            commit_process_timeout_secs: policy.commit_process_timeout.as_secs(),
+            sender_key_timeout_secs: policy.sender_key_timeout.as_secs(),
+            reconnection_dedup_window_secs: policy.reconnection_dedup_window.as_secs(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
