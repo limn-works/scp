@@ -1124,7 +1124,7 @@ pub(crate) async fn context_subscribe_on(
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     drop(identity_did);
 
-    let Some(transport_mgr) = crate::transport::get_transport_manager() else {
+    let Some(transport_mgr) = crate::transport::get_transport_manager_on(bi) else {
         // `outer_guard` Drop resets the flag.
         return Err(NapiError::from(ScpNapiError::Transport {
             message: "no relay connection — call transportConnect() before subscribing".to_owned(),

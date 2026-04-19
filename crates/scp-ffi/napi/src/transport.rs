@@ -198,16 +198,28 @@ fn has_transport_manager_on(bi: &NapiBridgeInstance) -> bool {
     scp_ffi_common::CoreFields::has_transport(&bi.core)
 }
 
-/// Returns an `Arc` clone of the current transport manager, if one exists.
+/// Per-bridge-instance accessor for the current transport manager.
 ///
-/// Used by `context_subscribe` which needs to move the manager reference
+/// Returns an `Arc` clone if one is configured on `bi.core`, otherwise `None`.
+/// Used by `context_subscribe_on` which needs to move the manager reference
 /// into an async task that outlives any lock guard.
+pub(crate) fn get_transport_manager_on(
+    bi: &NapiBridgeInstance,
+) -> Option<Arc<scp_transport::TransportManager>> {
+    bi.core.get_transport_arc().ok().flatten()
+}
+
+/// Default-bridge shim for [`get_transport_manager_on`].
 ///
-/// Delegates to [`CoreFields::get_transport_arc`].
+/// Retained for call paths that have no `bi` in scope. Resolves the process-
+/// global default bridge instance via
+/// [`crate::runtime::default_bridge_instance`]. New callers should prefer
+/// [`get_transport_manager_on`] with an explicit bridge instance.
+#[allow(dead_code)]
 pub(crate) fn get_transport_manager() -> Option<Arc<scp_transport::TransportManager>> {
-    crate::runtime::bridge_instance()
+    crate::runtime::default_bridge_instance()
         .ok()
-        .and_then(|bi| bi.get_transport_arc().ok().flatten())
+        .and_then(|bi| get_transport_manager_on(&bi))
 }
 
 /// Clears the transport manager (called by [`transport_disconnect`]).
@@ -1066,6 +1078,56 @@ mod tests {
             !status.connected,
             "defense-in-depth: transport_status should report disconnected \
              when the transport manager is absent even if the handle thinks it is connected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-instance transport manager accessor (bug-catcher follow-up, #1549)
+    // -----------------------------------------------------------------------
+    //
+    // Regression: `get_transport_manager()` ignored the `bi` passed through
+    // `context_subscribe_on(bi, ...)` — it always resolved the process-global
+    // `DEFAULT_BRIDGE_INSTANCE`. A subscription spawned against a non-default
+    // `bi` therefore pulled the default bridge's transport manager, leaking
+    // into the wrong JoinSet and breaking multi-instance relay isolation.
+    //
+    // The fix adds `get_transport_manager_on(bi)` which reads the per-instance
+    // transport slot. These tests exercise that accessor directly.
+
+    /// A fresh non-default `NapiBridgeInstance` starts with no transport
+    /// manager attached — `get_transport_manager_on` must return `None` for
+    /// it regardless of the default bridge's state.
+    #[test]
+    fn get_transport_manager_on_returns_none_for_fresh_bi() {
+        let bi = NapiBridgeInstance::new_napi();
+        assert!(
+            get_transport_manager_on(&bi).is_none(),
+            "fresh NapiBridgeInstance must have no transport manager attached"
+        );
+        assert!(
+            !has_transport_manager_on(&bi),
+            "fresh NapiBridgeInstance must report no transport manager via has_transport_manager_on"
+        );
+    }
+
+    /// Two independent `NapiBridgeInstance`s must report their transport
+    /// state independently. This proves the accessor is genuinely
+    /// per-instance (i.e. not routed through any global).
+    #[test]
+    fn get_transport_manager_on_is_per_instance() {
+        let bi_a = NapiBridgeInstance::new_napi();
+        let bi_b = NapiBridgeInstance::new_napi();
+
+        // Neither instance has a transport manager attached.
+        assert!(get_transport_manager_on(&bi_a).is_none());
+        assert!(get_transport_manager_on(&bi_b).is_none());
+
+        // The two instances are distinct allocations.
+        assert_ne!(
+            bi_a.instance_id(),
+            bi_b.instance_id(),
+            "fresh NapiBridgeInstance instances must have distinct ids — otherwise the \
+             per-instance isolation test below is meaningless"
         );
     }
 }

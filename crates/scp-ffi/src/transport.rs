@@ -288,10 +288,7 @@ impl crate::scp::PyScp {
     /// Raises `TransportError` if the URL fails validation or the connection fails.
     #[pyo3(name = "configure_relay_transport")]
     pub fn configure_relay_transport(&self, relay_url: &str, local_did: &str) -> PyResult<()> {
-        // `bi` is implicit here: `init_context_manager_with` operates on the
-        // process-global default bridge instance. Bound to a local for clarity
-        // and to reserve the ergonomic pattern for future per-instance wiring.
-        let _bi = &*self.inner;
+        let bi = &*self.inner;
         validate::validate_relay_url(relay_url)?;
         validate::validate_did(local_did)?;
 
@@ -314,7 +311,9 @@ impl crate::scp::PyScp {
         let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
         let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
             Box::new(crate::runtime::NoOpEventLogProvider);
-        crate::runtime::init_context_manager_with(local_did, crypto, transport, event_log, None);
+        crate::runtime::init_context_manager_with(
+            bi, local_did, crypto, transport, event_log, None,
+        );
 
         Ok(())
     }
@@ -563,7 +562,10 @@ mod tests {
     #[test]
     fn transport_disconnect_is_idempotent() {
         // BridgeInstance must exist for transport operations.
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::ensure_bridge_instance();
+        let bi = crate::runtime::default_bridge_instance()
+            .expect("default bridge instance should initialize");
+        crate::runtime::init_context_manager_for_test(&bi);
         // Disconnecting when not connected should not error.
         let result = default_scp().transport_disconnect();
         assert!(result.is_ok());

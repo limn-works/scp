@@ -103,7 +103,7 @@ fn auto_wire_context_manager(
             let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
                 Box::new(crate::runtime::NoOpEventLogProvider);
             crate::runtime::init_context_manager_with(
-                &did_owned, crypto, transport, event_log, None,
+                bi, &did_owned, crypto, transport, event_log, None,
             );
 
             // Also populate the BridgeInstance transport manager so that
@@ -142,7 +142,7 @@ fn auto_wire_context_manager(
             );
             // Fall back to initializing without transport so that at least
             // the ContextManager exists (with NotConfiguredTransportProvider).
-            crate::runtime::init_context_manager(&did_owned);
+            crate::runtime::init_context_manager(bi, &did_owned);
         }
     }
     // Always register the node's DID as a local DID for defense-in-depth.
@@ -894,7 +894,10 @@ mod tests {
         use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
         // BridgeInstance must exist for transport manager storage.
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::ensure_bridge_instance();
+        let bi_setup = crate::runtime::default_bridge_instance()
+            .expect("default bridge instance should initialize");
+        crate::runtime::init_context_manager_for_test(&bi_setup);
 
         // Start a standalone relay to get a stable WebSocket endpoint.
         let relay = rt().block_on(server::start_relay_in_memory()).unwrap();

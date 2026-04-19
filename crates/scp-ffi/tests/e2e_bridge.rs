@@ -44,7 +44,9 @@ fn setup() {
     });
     // Uses LocalTransportProvider so publish_context succeeds without warning
     // noise (NotConfiguredTransportProvider logs warnings on best-effort publish).
-    runtime::init_context_manager_for_test();
+    runtime::ensure_bridge_instance();
+    let bi = runtime::default_bridge_instance().expect("default bridge instance should initialize");
+    runtime::init_context_manager_for_test(&bi);
 }
 
 /// Returns the default bridge instance.

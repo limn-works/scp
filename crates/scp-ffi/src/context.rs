@@ -1821,7 +1821,7 @@ impl crate::scp::PyScp {
                 member_did: identity_did.to_owned(),
                 last_seen,
             };
-            crate::runtime::register_known_context(&context_id, known);
+            crate::runtime::register_known_context_on(bi, &context_id, known);
         }
 
         // Transition to "active" -- in the full runtime this happens after MLS
@@ -1879,12 +1879,13 @@ impl crate::scp::PyScp {
 
         // Ensure the ContextManager is initialized — context_join is a valid
         // first operation (e.g. a device joining a context without creating one).
-        // init_context_manager is idempotent (OnceLock — first call wins). #1073
+        // init_context_manager is idempotent (CoreFields::set_context_manager
+        // uses OnceLock internally — first call wins). #1073
         // Passes the joiner DID to MlsCryptoProvider for real MLS encryption (#1324).
         #[cfg(test)]
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_context_manager_for_test(bi);
         #[cfg(not(test))]
-        crate::runtime::init_context_manager(identity_did);
+        crate::runtime::init_context_manager(bi, identity_did);
 
         // Delegate join to the shared ContextManager for membership tracking.
         {
@@ -2409,12 +2410,13 @@ impl crate::scp::PyScp {
 
         // Ensure the ContextManager is initialized — context_import is a valid
         // first operation (e.g. a device receiving exported context data).
-        // init_context_manager is idempotent (OnceLock — first call wins). #1073
+        // init_context_manager is idempotent (CoreFields::set_context_manager
+        // uses OnceLock internally — first call wins). #1073
         // Passes the exporter DID to MlsCryptoProvider for real MLS encryption (#1324).
         #[cfg(test)]
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_context_manager_for_test(bi);
         #[cfg(not(test))]
-        crate::runtime::init_context_manager(&export.exporter_did.0);
+        crate::runtime::init_context_manager(bi, &export.exporter_did.0);
 
         let rt = crate::runtime()?;
         let mgr = crate::runtime::context_manager(bi)

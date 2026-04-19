@@ -1,5 +1,8 @@
 # Alignment Reviewer Memory
 
+## Phase 4 PR 4 Façade Deletion Review (2026-04-19)
+See [phase4_facade_delete_review.md](phase4_facade_delete_review.md) — branch `refactor/phase4-facade-delete` landed method-migration half of PR 4 but NOT the demolition (delete _deprecation.py/ts, SCP.default(), DEFAULT_BRIDGE_INSTANCE, opt-in-tag gate). Verdict MISALIGNED. Pattern: branch names can mislead; verify free-fn counts (`#[pyfunction]`, `#[napi]`, `#[uniffi::export]`), `SCP-DEFAULT-INSTANCE-OK` tag count (533 on branch, plan requires 0), and whether SDKs require explicit SCP instance (not `resolve_scp` fallback).
+
 ## SDK Standards Review Round 2 (2026-02-22)
 Second pass after ~38 findings were addressed. 6 of 7 originally tracked issues fixed.
 Remaining issue: security scanning CI jobs only in Rust/Go, missing from Python/TS/Swift/Kotlin/C#/Java.

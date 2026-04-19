@@ -1801,7 +1801,10 @@ mod tests {
             crate::init_runtime().unwrap();
         });
         // BridgeInstance must exist for identity registry access.
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::ensure_bridge_instance();
+        let bi = crate::runtime::default_bridge_instance()
+            .expect("default bridge instance should initialize");
+        crate::runtime::init_context_manager_for_test(&bi);
     }
 
     fn default_scp() -> crate::scp::PyScp {

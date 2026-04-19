@@ -1878,7 +1878,7 @@ impl crate::scp::PyScp {
         let local_context_ids = crate::runtime::context_ids_for_member(bi, identity_did);
 
         // Step 2: Collect contexts from the known-contexts registry.
-        let known = crate::runtime::known_contexts_for_member(identity_did);
+        let known = crate::runtime::known_contexts_for_member_on(bi, identity_did);
 
         // Step 3: Probe relay for known routing IDs (if connected).
         let relay_active_set = probe_relay_for_known_contexts(bi, &known);
@@ -2910,7 +2910,7 @@ mod tests {
     #[test]
     fn known_context_registration_and_lookup() {
         // BridgeInstance must exist for known-context registration.
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_context_manager_for_test(&__bi());
 
         let creator = "did:dht:z6MkCreatorKnownCtx";
         let ctx_id = crate::types::generate_random_id("known-ctx");
@@ -3271,7 +3271,7 @@ mod tests {
 
     #[test]
     fn mcp_registry_stats_returns_consistent_counts() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_context_manager_for_test(&__bi());
         let stats = mcp_registry_stats_for(&__bi());
         // Cannot assert exact values due to parallel tests, but structural
         // invariants must hold: stopped_servers can never exceed total servers.
@@ -3383,7 +3383,7 @@ mod tests {
 
     #[test]
     fn core_registry_stats_includes_all_fields() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_context_manager_for_test(&__bi());
         let stats = crate::runtime::registry_stats(&__bi());
         // Just verify the struct has the expected fields and doesn't panic.
         let _ = stats.contexts;
