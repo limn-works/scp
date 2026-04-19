@@ -707,129 +707,13 @@ impl BridgeInstanceCore for PyBridgeInstance {
     }
 }
 
-/// Default (process-global) `PyBridgeInstance`.
-///
-/// Retained as a `OnceLock` for backward compatibility with the PR 0
-/// flat `#[pyfunction]` API (`py_identity_create`, `py_context_create`, …).
-/// New callers should prefer explicit [`crate::scp::PyScp`] instances.
-///
-/// # Safety: Single-Tenant Fallback
-///
-/// Callers that construct their own `PyScp` instance escape the process-
-/// global pattern entirely. The default instance is retained only so the
-/// flat bridge functions continue to work during the migration.
-pub(crate) static DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<PyBridgeInstance>> = OnceLock::new();
-
-/// Initializes the default [`PyBridgeInstance`] without a `ContextManager`.
-///
-/// Called by [`ensure_bridge_instance`] and (transitively) by
-/// [`init_context_manager`]. The `ContextManager` is attached later via
-/// [`CoreFields::set_context_manager`] once `identity_create` has produced
-/// the local DID and the `MlsCryptoProvider` has been constructed with it.
-///
-/// `PyBridgeInstance` itself carries no DID (spec §12.2.3) — the
-/// authoritative local DID lives inside the `ContextManager`'s
-/// `MlsCryptoProvider`. The instance is created before any identity exists
-/// so that the DID resolver slot (owned by `CoreFields`) is available while
-/// `DidDht::create()` runs.
-///
-/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-fn init_bridge_instance_empty() {
-    if DEFAULT_BRIDGE_INSTANCE.get().is_some() {
-        return;
-    }
-    let _ = DEFAULT_BRIDGE_INSTANCE.get_or_init(|| Arc::new(PyBridgeInstance::new_py()));
-}
-
-/// Returns the raw default `PyBridgeInstance` reference without lifecycle
-/// checks.
-///
-/// Used by lifecycle / shutdown code that must touch the container even
-/// when the `ContextManager` has not been attached yet.
-#[must_use]
-pub fn bridge_instance_raw() -> Option<&'static Arc<PyBridgeInstance>> {
-    DEFAULT_BRIDGE_INSTANCE.get()
-}
-
-/// Returns a reference to the default `PyBridgeInstance`.
-///
-/// # Errors
-///
-/// Returns `ScpPyError::ContextError` if the bridge has not been initialized
-/// via [`init_context_manager`] (which also creates the default instance),
-/// or if the bridge is currently suspended. Shutdown is a warning (not an
-/// error) because shutdown is terminal and operations fail naturally at the
-/// MLS/transport layer.
-pub fn bridge_instance() -> Result<&'static Arc<PyBridgeInstance>, ScpPyError> {
-    let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
-        ScpPyError::context("bridge not initialized — call identity_create first".to_owned())
-    })?;
-    if bi.core.is_suspended() {
-        return Err(ScpPyError::context(
-            "bridge is suspended — call resume() before performing operations".to_owned(),
-        ));
-    }
-    if bi.core.is_shutdown() {
-        tracing::warn!("bridge_instance() called after shutdown — operations may fail");
-    }
-    Ok(bi)
-}
-
-/// Lazily initializes and returns the default `PyBridgeInstance`.
-///
-/// Unlike [`bridge_instance`], this never fails due to "not yet initialized"
-/// — it creates the default instance on first call. Used by shared helpers
-/// that must resolve the default instance regardless of caller order.
-///
-/// # Errors
-///
-/// Returns `ScpPyError::ContextError` if the bridge is currently suspended.
-pub fn default_bridge_instance() -> Result<Arc<PyBridgeInstance>, ScpPyError> {
-    ensure_bridge_instance();
-    let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
-        ScpPyError::context("failed to initialize default bridge instance".to_owned())
-    })?;
-    if bi.core.is_suspended() {
-        return Err(ScpPyError::context(
-            "bridge is suspended — call resume() before performing operations".to_owned(),
-        ));
-    }
-    if bi.core.is_shutdown() {
-        tracing::warn!("default_bridge_instance() called after shutdown — operations may fail");
-    }
-    Ok(Arc::clone(bi))
-}
-
-/// Returns a reference to the default `PyBridgeInstance`'s `CoreFields` for
-/// handle-affinity checks only.
-///
-/// Unlike [`bridge_instance`] / [`default_bridge_instance`], this helper does
-/// NOT return an error when the bridge is suspended — a handle-affinity check
-/// is a pure compare-two-u64 operation that does not touch transport or
-/// `ContextManager` state, so suspending the bridge must not block it. Used
-/// exclusively by the [`crate::pyscp_check_handle!`] macro at FFI entry
-/// points to mirror the NAPI/UniFFI [`bridge_instance_for_affinity`] helpers
-/// (cross-bridge symmetry).
-///
-/// # Errors
-///
-/// Returns `ScpPyError::ContextError` if the default bridge failed to
-/// initialize (very unlikely — [`ensure_bridge_instance`] runs first and is
-/// infallible in practice).
-#[must_use = "the returned CoreFields reference must be used for the affinity check"]
-pub fn bridge_instance_for_affinity() -> Result<&'static CoreFields, ScpPyError> {
-    ensure_bridge_instance();
-    DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .map(|bi| &bi.core)
-        .ok_or_else(|| {
-            ScpPyError::context(
-                "bridge not initialized — call identity_create or \
-                 init_context_manager first"
-                    .to_owned(),
-            )
-        })
-}
+// Phase D (#1695): DEFAULT_BRIDGE_INSTANCE static and default-lookup helpers
+// (`default_bridge_instance`, `bridge_instance`, `bridge_instance_raw`,
+// `bridge_instance_for_affinity`, `ensure_bridge_instance`) have been
+// deleted. All FFI entry points must route through an explicit
+// `&PyBridgeInstance` — typically `&*self.inner` inside a `#[pymethods]
+// impl PyScp` block. Tests construct fresh `PyBridgeInstance::new_py()`
+// instances directly.
 
 // ---------------------------------------------------------------------------
 // ContextManager initialization
@@ -881,20 +765,6 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
     );
 
     bi.core.set_context_manager(cm_arc);
-}
-
-/// Ensures the default [`PyBridgeInstance`] exists (without a `ContextManager`).
-///
-/// Called by [`crate::identity::ensure_did_resolver_initialized`] before
-/// `DidDht::create()` runs, so that the DID resolver slot owned by
-/// `BridgeInstance` is available. The `ContextManager` is attached later
-/// via [`init_context_manager`] once the identity is known and the
-/// `MlsCryptoProvider` has been constructed with it. Per spec §12.2.3
-/// the `BridgeInstance` container has no DID requirement.
-///
-/// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-pub fn ensure_bridge_instance() {
-    init_bridge_instance_empty();
 }
 
 /// Initializes the global [`ContextManager`] with custom providers.
@@ -1608,20 +1478,8 @@ pub fn register_known_context_on(bi: &PyBridgeInstance, context_id: &str, known:
     bi.core.register_known_context(context_id, known);
 }
 
-/// Default-bridge shim for [`register_known_context_on`].
-///
-/// Retained for call sites that have no `bi` in scope. New callers should
-/// prefer [`register_known_context_on`] with an explicit instance.
-pub fn register_known_context(context_id: &str, known: KnownContext) {
-    if let Ok(bi) = bridge_instance() {
-        register_known_context_on(bi, context_id, known);
-    } else {
-        tracing::warn!(
-            "register_known_context called before bridge init — context '{}' not tracked",
-            context_id
-        );
-    }
-}
+// Phase D (#1695): legacy default-bridge free-fn shims deleted. Callers
+// must use the `*_on(bi, ...)` variants with an explicit PyBridgeInstance.
 
 /// Returns all known contexts registered against the supplied
 /// [`PyBridgeInstance`].
@@ -1630,16 +1488,6 @@ pub fn register_known_context(context_id: &str, known: KnownContext) {
 #[must_use]
 pub fn all_known_contexts_on(bi: &PyBridgeInstance) -> Vec<(String, KnownContext)> {
     bi.core.all_known_contexts()
-}
-
-/// Default-bridge shim for [`all_known_contexts_on`].
-///
-/// Returns an empty `Vec` if the default bridge has not been initialized.
-#[must_use]
-pub fn all_known_contexts() -> Vec<(String, KnownContext)> {
-    bridge_instance()
-        .map(|bi| all_known_contexts_on(bi))
-        .unwrap_or_default()
 }
 
 /// Returns known contexts (registered against the supplied
@@ -1652,16 +1500,6 @@ pub fn known_contexts_for_member_on(
     bi.core.known_contexts_for_member(member_did)
 }
 
-/// Default-bridge shim for [`known_contexts_for_member_on`].
-///
-/// Returns an empty `Vec` if the default bridge has not been initialized.
-#[must_use]
-pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)> {
-    bridge_instance()
-        .map(|bi| known_contexts_for_member_on(bi, member_did))
-        .unwrap_or_default()
-}
-
 // ---------------------------------------------------------------------------
 // Invitation rate limit tracker registry (#614)
 // ---------------------------------------------------------------------------
@@ -1669,32 +1507,8 @@ pub fn known_contexts_for_member(member_did: &str) -> Vec<(String, KnownContext)
 // Delegates to the `BridgeInstance`'s `rate_limiters` DashMap.
 // ---------------------------------------------------------------------------
 
-/// Returns a mutable reference to the rate limit tracker for the given
-/// identity DID, creating one if it does not exist.
-///
-/// Delegates to the `BridgeInstance`'s rate-limiter registry. If the bridge
-/// has not been initialized (unusual — identity must be created before
-/// invitation evaluation), falls back to a thread-local default tracker
-/// to preserve the original infallible signature.
-///
-/// The caller passes a closure that receives `&mut RateLimitTracker`.
-pub fn with_rate_limit_tracker<F, T>(identity_did: &str, f: F) -> T
-where
-    F: FnOnce(&mut scp_core::context::invitation::RateLimitTracker) -> T,
-{
-    if let Ok(bi) = bridge_instance() {
-        bi.core.with_rate_limit_tracker(identity_did, f)
-    } else {
-        // Bridge not initialized — use a temporary tracker. This path
-        // should not be hit in normal operation (identity is always
-        // created before invitation evaluation).
-        tracing::warn!(
-            "with_rate_limit_tracker called before bridge init — using ephemeral tracker"
-        );
-        let mut tracker = scp_core::context::invitation::RateLimitTracker::default();
-        f(&mut tracker)
-    }
-}
+// Phase D (#1695): `with_rate_limit_tracker` default-bridge shim deleted.
+// Callers use `bi.core.with_rate_limit_tracker(...)` directly.
 
 // ---------------------------------------------------------------------------
 // Identity registry (SCP-214: KeyCustody wiring)
