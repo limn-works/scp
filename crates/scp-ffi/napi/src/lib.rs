@@ -248,42 +248,11 @@ pub fn scp_version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
 }
 
-/// Shuts down the default bridge instance gracefully.
-///
-/// Awaits in-flight tasks up to `timeout_millis` **milliseconds**, aborts
-/// any remaining tasks when the deadline expires, then clears registries,
-/// disconnects transport, and runs shutdown hooks. Finally waits up to the
-/// same deadline for outstanding opaque FFI handles
-/// (`NapiIdentity`, `NapiContextHandle`, `NapiUcanToken`,
-/// `NapiTransportManager`, …) to be released.
-///
-/// The unit is **milliseconds** and the width is `u64` — unified across
-/// all Rust bridges (NAPI, `UniFFI`, `PyO3`) per #1692 so the Python,
-/// TypeScript, Swift, and Kotlin SDKs can share a single conversion
-/// surface (`timeout_secs: number` in the SDK wrapper is multiplied by
-/// 1000 before crossing FFI). NAPI exposes `u64` as JS `BigInt`, so
-/// TypeScript callers must pass a `bigint` (`scpShutdown(5000n)`).
-///
-/// Returns a `Promise<void>` — call `await scpShutdown(5000n)` from JS.
-/// Pass `0n` to skip both graceful drain and handle-release polling.
-///
-/// **Breaking change (Phase 4 PR 1 / AC5)**: the signature moved from
-/// sync `void` to async `Promise<void>`, and the unit changed from
-/// **seconds** (`u32`) to **milliseconds**. Width later widened to `u64`
-/// (#1692) for cross-bridge parity; a NAPI source-compat break was
-/// accepted because all existing callsites fit easily in `u32`.
-/// Callers migrating away from the free-function façade should switch
-/// to `scp.shutdown(5000n)` on an owned `SCP` instance.
-///
-/// # JS usage
-///
-/// ```js
-/// process.on('beforeExit', async () => {
-///   await scpShutdown(5_000n); // wait up to 5 seconds (5,000 ms)
-/// });
-/// ```
-// Phase D (#1695): `scp_shutdown` free function deleted. Per-instance
-// shutdown now goes through `SCP.shutdown(timeout_millis)`.
+// Phase D (#1695): the `scp_shutdown` free function has been deleted.
+// Per-instance shutdown goes through `SCP.shutdown(timeout_millis)` on a
+// caller-owned `Scp` instance. The timeout unit is milliseconds (`u64`
+// `BigInt` on the wire); pass `0n` to skip both graceful drain and
+// handle-release polling.
 
 
 // ---------------------------------------------------------------------------

@@ -25,13 +25,17 @@ use scp_ffi_common::error_codes as codes;
 
 use napi_derive::napi;
 
-use scp_core::discovery::addressing::{HandleTarget, ParsedAddress};
+#[cfg(test)]
+use scp_core::discovery::addressing::HandleTarget;
+use scp_core::discovery::addressing::ParsedAddress;
 use scp_core::discovery::{DiscoveryQuery, normalize_address, parse_address};
 
-use scp_ffi_common::petname_helpers::{self};
+#[cfg(test)]
+use scp_ffi_common::petname_helpers;
 
 use crate::error::ScpNapiError;
 
+#[cfg(test)]
 fn parse_handle_target(json: &str) -> napi::Result<HandleTarget> {
     petname_helpers::parse_handle_target(json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {

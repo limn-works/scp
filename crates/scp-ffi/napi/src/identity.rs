@@ -43,9 +43,11 @@ use napi_derive::napi;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_identity::{DhtClient, IdentityError};
 use scp_identity::{
-    DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, InMemoryDhtClient,
-    NoOpRelayQuerier, ScpIdentity,
+    DidCache, DidDht, DidDocument, DualLayerResolver, InMemoryDhtClient, NoOpRelayQuerier,
+    ScpIdentity,
 };
+#[cfg(all(test, feature = "allow_in_memory_custody"))]
+use scp_identity::DidMethod;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
 #[cfg(feature = "allow_in_memory_custody")]
@@ -405,7 +407,7 @@ impl NapiIdentity {
             let bi = &self.inner.bi;
 
             // Read attestations BEFORE async operation (entry guaranteed to exist).
-            let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -418,7 +420,7 @@ impl NapiIdentity {
 
             // Update the identity registry with the rotated key handles.
             crate::runtime::register_identity(
-                &bi,
+                bi,
                 &new_identity.did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -477,7 +479,7 @@ impl NapiIdentity {
             let bi = &self.inner.bi;
 
             // Read attestations BEFORE async operation (entry guaranteed to exist).
-            let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -491,7 +493,7 @@ impl NapiIdentity {
             // Update the identity registry with the new key state so that
             // bridge functions (ucan_delegate, etc.) see the updated identity.
             crate::runtime::register_identity(
-                &bi,
+                bi,
                 &new_identity.did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -551,7 +553,7 @@ impl NapiIdentity {
             let bi = &self.inner.bi;
 
             // Read attestations BEFORE async operation (entry guaranteed to exist).
-            let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -564,7 +566,7 @@ impl NapiIdentity {
 
             // Update the identity registry with the rotated key state.
             crate::runtime::register_identity(
-                &bi,
+                bi,
                 &new_identity.did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -624,7 +626,7 @@ impl NapiIdentity {
             let bi = &self.inner.bi;
 
             // Read attestations BEFORE async operation (entry guaranteed to exist).
-            let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -637,7 +639,7 @@ impl NapiIdentity {
 
             // Update the identity registry with the post-removal key state.
             crate::runtime::register_identity(
-                &bi,
+                bi,
                 &new_identity.did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -707,7 +709,7 @@ impl NapiIdentity {
             let bi = &self.inner.bi;
 
             // Read attestations BEFORE async operation (entry guaranteed to exist now).
-            let existing_attestations = crate::runtime::with_identity(&bi, &self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -748,9 +750,9 @@ impl NapiIdentity {
             let new_did = new_identity.did.clone();
 
             // Remove the old identity and register the new one.
-            crate::runtime::remove_identity(&bi, &self.inner.did);
+            crate::runtime::remove_identity(bi, &self.inner.did);
             crate::runtime::register_identity(
-                &bi,
+                bi,
                 &new_did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -928,107 +930,17 @@ pub struct NapiDIDDocument {
 // ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
+//
+// Phase D (#1695): the `identity_remove` and `identity_remove_if_present`
+// free-function exports moved onto `Scp` (see `scp.rs`). The underlying
+// runtime helpers (`remove_identity` / `remove_identity_if_present`) still
+// exist in `runtime.rs` but are now called via the `Scp` methods which pass
+// `&self.inner` explicitly.
 
-/// Removes an identity from the global identity registry.
-///
-/// Drops the retained key material (`InMemoryKeyCustody`) and `ScpIdentity`
-/// for the specified DID. This is the NAPI equivalent of the `PyO3` bridge's
-/// `remove_identity` function.
-///
-/// Call this during DID migration (to clean up the old DID) or when an
-/// identity is no longer needed. Prevents memory leaks of private key
-/// material in long-running processes.
-///
-/// Idempotent: succeeds silently if the DID is not in the registry.
-///
-/// # Arguments
-///
-/// * `did` — The DID string to remove from the registry.
-#[cfg(feature = "allow_in_memory_custody")]
-/// Removes an identity from the global identity registry if present.
-///
-/// Returns `true` if the identity was found and removed, `false` if the DID
-/// was not in the registry. Useful for conditional cleanup where callers need
-/// to know whether the identity existed.
-///
-/// # Arguments
-///
-/// * `did` — The DID string to remove from the registry.
-///
-/// # Returns
-///
-/// `true` if the identity was present and removed, `false` otherwise.
-#[cfg(feature = "allow_in_memory_custody")]
-// ---------------------------------------------------------------------------
-// Device attestation bridge (#362)
-// ---------------------------------------------------------------------------
-
-/// Generates a device attestation token for an identity.
-///
-/// Uses [`InMemoryDeviceAttestation`] to produce a synthetic attestation token,
-/// then attaches it to the identity's DID document.
-///
-/// # Arguments
-///
-/// * `did` -- The DID string of the identity to attest (used for API
-///   consistency; the attestation is generated locally).
-///
-/// # Returns
-///
-/// The attestation token as a base64-encoded string.
-///
-/// # Errors
-///
-/// Rejects if the identity was not created with `identityCreate` (no retained
-/// crypto state) or if attestation generation fails.
-///
-/// See §9.3, issue #362.
-#[cfg(feature = "allow_in_memory_custody")]
-/// Verifies a device attestation token.
-///
-/// Uses [`InMemoryDeviceAttestation`] to check the token format.
-///
-/// # Arguments
-///
-/// * `did` -- The DID string (unused in verification but kept for API
-///   consistency).
-/// * `token_base64` -- The base64-encoded attestation token to verify.
-///
-/// # Returns
-///
-/// `true` if the token is valid, `false` otherwise.
-///
-/// # Errors
-///
-/// Rejects if base64 decoding fails or if verification encounters an error.
-///
-/// See §9.3, issue #362.
-#[cfg(feature = "allow_in_memory_custody")]
-// ---------------------------------------------------------------------------
-// Identity link attestation bridge (§3.5.1, §3.5.2)
-// ---------------------------------------------------------------------------
-
-/// Creates an identity link attestation for an external platform identity.
-///
-/// See spec §3.5.1, §3.5.2.
-#[cfg(feature = "allow_in_memory_custody")]
-/// Lists all identity link attestations for an identity.
-///
-/// See spec §3.5.1.
-#[cfg(feature = "allow_in_memory_custody")]
-/// Removes an identity link attestation by its ID.
-///
-/// Returns `true` if the attestation was found and removed.
-///
-/// See spec §3.5.1.
-#[cfg(feature = "allow_in_memory_custody")]
-// ---------------------------------------------------------------------------
-// Compromise recovery — FFI exposure for CompromiseRecoveryOrchestrator
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Custody migration — FFI exposure for CustodyMigrationOrchestrator
-// ---------------------------------------------------------------------------
+// Phase D (#1695): device attestation, identity link attestation, and
+// compromise recovery free-function façade exports were deleted. Their
+// `Scp` methods in `scp.rs` are now the only entry points — bridge state
+// flows through `&self.inner` rather than the process-global default.
 
 // ---------------------------------------------------------------------------
 // Tests

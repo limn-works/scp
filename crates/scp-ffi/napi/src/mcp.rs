@@ -20,7 +20,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use dashmap::DashMap;
 use napi_derive::napi;
 use scp_mcp::allowlist;
 use scp_mcp::client::{McpClient, McpTransport};
