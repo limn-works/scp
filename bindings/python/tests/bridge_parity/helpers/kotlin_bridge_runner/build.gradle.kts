@@ -28,6 +28,11 @@
 
 plugins {
     kotlin("jvm") version "2.1.10"
+    // kotlinx.serialization compiler plugin — required for @Serializable
+    // data classes used in JSON-RPC frame parsing. Version pinned to the
+    // same Kotlin (2.1.10) compiler above so the plugin and compiler
+    // stay in lock-step.
+    kotlin("plugin.serialization") version "2.1.10"
     application
 }
 
