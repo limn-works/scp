@@ -434,7 +434,7 @@ Identity (DID)
     ├── Graph visibility policies (default + per-identity grants)
     ├── Agent configuration defaults (cross-context preferences)
     ├── Personal annotations on other DIDs
-    ├── Petnames for DIDs and contexts (§22.4)
+    ├── Petnames for DIDs and contexts (§22.4) — per-identity, per `SCP` instance (ADR-048)
     ├── Notification preferences
     ├── Draft attestations (not yet published)
     └── (extensible — any identity-level private data)

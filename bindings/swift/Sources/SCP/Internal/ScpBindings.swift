@@ -593,6 +593,12 @@ public protocol ContextHandleProtocol: AnyObject, Sendable {
     func creatorDid()  -> String
     
     /**
+     * Returns the monotonic identifier of the bridge instance that minted
+     * this handle.
+     */
+    func instanceId()  -> UInt64
+    
+    /**
      * Returns the context's current lifecycle state as a string.
      *
      * One of: `"creating"`, `"active"`, `"closing"`, `"closed"`, `"expired"`,
@@ -684,6 +690,17 @@ open func contextId() -> String  {
 open func creatorDid() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_scp_ffi_uniffi_fn_method_contexthandle_creator_did(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Returns the monotonic identifier of the bridge instance that minted
+     * this handle.
+     */
+open func instanceId() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_contexthandle_instance_id(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -849,6 +866,12 @@ public protocol IdentityProtocol: AnyObject, Sendable {
      * See ADR-039 acceptance criterion 4.
      */
     func hasAgentKey()  -> Bool
+    
+    /**
+     * Returns the monotonic identifier of the bridge instance that minted
+     * this handle.
+     */
+    func instanceId()  -> UInt64
     
     /**
      * Removes the agent signing key from this identity (ADR-039).
@@ -1079,6 +1102,17 @@ open func hasAgentKey() -> Bool  {
 }
     
     /**
+     * Returns the monotonic identifier of the bridge instance that minted
+     * this handle.
+     */
+open func instanceId() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_identity_instance_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Removes the agent signing key from this identity (ADR-039).
      *
      * Removes the `#agent` verification method from the DID document,
@@ -1285,6 +1319,12 @@ public protocol NodeHandleProtocol: AnyObject, Sendable {
      * Returns the HTTP URL of the background server, or `None` if not serving.
      */
     func httpUrl() async  -> String?
+    
+    /**
+     * Returns the monotonic identifier of the bridge instance that minted
+     * this handle.
+     */
+    func instanceId()  -> UInt64
     
     /**
      * Returns `true` if shutdown has already been signaled.
@@ -1496,6 +1536,17 @@ open func httpUrl()async  -> String?  {
 }
     
     /**
+     * Returns the monotonic identifier of the bridge instance that minted
+     * this handle.
+     */
+open func instanceId() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_nodehandle_instance_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Returns `true` if shutdown has already been signaled.
      */
 open func isShutdown() -> Bool  {
@@ -1654,6 +1705,12 @@ public func FfiConverterTypeNodeHandle_lower(_ value: NodeHandle) -> UnsafeMutab
 public protocol RelayHandleProtocol: AnyObject, Sendable {
     
     /**
+     * Returns the monotonic identifier of the bridge instance that minted
+     * this handle.
+     */
+    func instanceId()  -> UInt64
+    
+    /**
      * Returns `true` if shutdown has already been signaled.
      */
     func isShutdown()  -> Bool
@@ -1736,6 +1793,17 @@ open class RelayHandle: RelayHandleProtocol, @unchecked Sendable {
 
     
 
+    
+    /**
+     * Returns the monotonic identifier of the bridge instance that minted
+     * this handle.
+     */
+open func instanceId() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_relayhandle_instance_id(self.uniffiClonePointer(),$0
+    )
+})
+}
     
     /**
      * Returns `true` if shutdown has already been signaled.
@@ -1839,31 +1907,449 @@ public func FfiConverterTypeRelayHandle_lower(_ value: RelayHandle) -> UnsafeMut
 
 
 /**
+ * The SCP instance — a caller-owned handle that wraps a
+ * [`UniffiBridgeInstance`].
+ *
+ * Generated as `class SCP` in both Swift and Kotlin.
+ *
+ * # Swift usage
+ *
+ * ```swift
+ * let scp = SCP()                                // fresh in-memory instance
+ * let shared = try SCP.defaultInstance()         // process-wide default
+ * try await scp.shutdown(timeoutSecs: 5)         // graceful shutdown
+ * ```
+ *
+ * # Kotlin usage
+ *
+ * ```kotlin
+ * val scp = SCP()                                // fresh in-memory instance
+ * val shared = SCP.defaultInstance()             // process-wide default
+ * scp.shutdown(timeoutSecs = 5uL)                // suspend fun, graceful shutdown
+ * ```
+ */
+public protocol ScpProtocol: AnyObject, Sendable {
+    
+    /**
+     * Returns the monotonic identifier for this instance.
+     */
+    func instanceId()  -> UInt64
+    
+    /**
+     * Resumes a suspended bridge instance.
+     *
+     * Clears the suspended flag, then runs any per-bridge async work chained
+     * by the [`BridgeInstanceCore::resume`] override (transport reconnect
+     * from pending relay URLs, persisted-context restoration).
+     *
+     * `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` if the instance has been permanently
+     * shut down.
+     */
+    func resume() async throws 
+    
+    /**
+     * Shuts down this bridge instance with a graceful deadline.
+     *
+     * Awaits in-flight tasks up to `timeout_millis` **milliseconds**,
+     * aborts any remaining tasks, then clears registries and runs
+     * shutdown hooks. Permanent — a shut-down instance cannot be
+     * reused. A second call is a no-op from the caller's perspective
+     * (the underlying `ShutdownError::AlreadyShutDown` is swallowed).
+     *
+     * The unit is **milliseconds** — unified across all Rust bridges
+     * so the Swift and Kotlin SDKs can share a single conversion
+     * surface.
+     */
+    func shutdown(timeoutMillis: UInt64) async throws 
+    
+    /**
+     * Suspends this bridge instance (mobile backgrounding).
+     *
+     * Disconnects transport and flushes context snapshots. Transport-
+     * dependent operations fail until [`Self::resume`] is called.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` if the transport lock is poisoned.
+     */
+    func suspend() throws 
+    
+}
+/**
+ * The SCP instance — a caller-owned handle that wraps a
+ * [`UniffiBridgeInstance`].
+ *
+ * Generated as `class SCP` in both Swift and Kotlin.
+ *
+ * # Swift usage
+ *
+ * ```swift
+ * let scp = SCP()                                // fresh in-memory instance
+ * let shared = try SCP.defaultInstance()         // process-wide default
+ * try await scp.shutdown(timeoutSecs: 5)         // graceful shutdown
+ * ```
+ *
+ * # Kotlin usage
+ *
+ * ```kotlin
+ * val scp = SCP()                                // fresh in-memory instance
+ * val shared = SCP.defaultInstance()             // process-wide default
+ * scp.shutdown(timeoutSecs = 5uL)                // suspend fun, graceful shutdown
+ * ```
+ */
+open class Scp: ScpProtocol, @unchecked Sendable {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_scp_ffi_uniffi_fn_clone_scp(self.pointer, $0) }
+    }
+    /**
+     * Constructs a fresh `SCP` instance with default in-memory state.
+     *
+     * Unlike [`Self::default_instance`], this bypasses the process-global
+     * `DEFAULT_BRIDGE_INSTANCE` entirely — each call produces a brand-new
+     * instance with a fresh monotonic `instance_id`, a fresh
+     * `CancellationToken`, and an empty `JoinSet`. Handles issued against
+     * this instance are incompatible with any other instance.
+     */
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_constructor_scp_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_scp_ffi_uniffi_fn_free_scp(pointer, $0) }
+    }
+
+    
+    /**
+     * Returns an `SCP` wrapping the process-wide default instance.
+     *
+     * Multiple calls return distinct `SCP` objects, but each wraps the
+     * same underlying `Arc<UniffiBridgeInstance>` — their `instance_id`s
+     * match, and changes made through one are visible to the other.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` if the default instance is currently
+     * suspended or permanently shut down.
+     */
+public static func defaultInstance()throws  -> Scp  {
+    return try  FfiConverterTypeScp_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_constructor_scp_default_instance($0
+    )
+})
+}
+    
+    /**
+     * Constructs an `SCP` instance with a persistence provider placeholder.
+     *
+     * PR 1 exposes this constructor so SDK consumers can prepare for the
+     * persistence-enabled path. The current implementation builds a fresh
+     * in-memory instance identical to [`Self::new`]; PR 3 wires the real
+     * `scp_core::context::ContextPersistence` plumbing through.
+     */
+public static func withPersistence() -> Scp  {
+    return try!  FfiConverterTypeScp_lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_constructor_scp_with_persistence($0
+    )
+})
+}
+    
+    /**
+     * Constructs an `SCP` instance with a storage configuration.
+     *
+     * PR 1 accepts the default (in-memory) configuration only. PR 3 adds
+     * filesystem-backed storage via an additional variant on
+     * [`StorageConfig`]. The `config` parameter is forwarded to the inner
+     * constructor; the current match honours only `InMemory`.
+     */
+public static func withStorage(config: StorageConfig) -> Scp  {
+    return try!  FfiConverterTypeScp_lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_constructor_scp_with_storage(
+        FfiConverterTypeStorageConfig_lower(config),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * Returns the monotonic identifier for this instance.
+     */
+open func instanceId() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_scp_instance_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Resumes a suspended bridge instance.
+     *
+     * Clears the suspended flag, then runs any per-bridge async work chained
+     * by the [`BridgeInstanceCore::resume`] override (transport reconnect
+     * from pending relay URLs, persisted-context restoration).
+     *
+     * `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` if the instance has been permanently
+     * shut down.
+     */
+open func resume()async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_resume(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Shuts down this bridge instance with a graceful deadline.
+     *
+     * Awaits in-flight tasks up to `timeout_millis` **milliseconds**,
+     * aborts any remaining tasks, then clears registries and runs
+     * shutdown hooks. Permanent — a shut-down instance cannot be
+     * reused. A second call is a no-op from the caller's perspective
+     * (the underlying `ShutdownError::AlreadyShutDown` is swallowed).
+     *
+     * The unit is **milliseconds** — unified across all Rust bridges
+     * so the Swift and Kotlin SDKs can share a single conversion
+     * surface.
+     */
+open func shutdown(timeoutMillis: UInt64)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_shutdown(
+                    self.uniffiClonePointer(),
+                    FfiConverterUInt64.lower(timeoutMillis)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Suspends this bridge instance (mobile backgrounding).
+     *
+     * Disconnects transport and flushes context snapshots. Transport-
+     * dependent operations fail until [`Self::resume`] is called.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` if the transport lock is poisoned.
+     */
+open func suspend()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_suspend(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeScp: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = Scp
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> Scp {
+        return Scp(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: Scp) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Scp {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: Scp, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeScp_lift(_ pointer: UnsafeMutableRawPointer) throws -> Scp {
+    return try FfiConverterTypeScp.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeScp_lower(_ value: Scp) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeScp.lower(value)
+}
+
+
+
+
+
+
+/**
  * Opaque handle to the transport layer.
  *
- * Exposes connection status and relay URL without leaking connection state.
- * The actual transport (WebSocket, multi-relay routing) is managed internally.
- *
- * Holds a reference to the underlying `NativeRelayAdapter` established by
- * `transport_connect`. The adapter represents a live WebSocket connection
- * to an SCP relay.
+ * Wraps a real [`scp_transport::TransportManager`] that is stored in the
+ * shared [`UniffiBridgeInstance`](crate::runtime::UniffiBridgeInstance).
+ * This handle provides Swift/Kotlin callers with
+ * the full multi-relay API: `addRelay`, `assignRelaySet`, `adapterCount`,
+ * `reliabilityScore`. All operations delegate to the `BridgeInstance`'s
+ * transport slot, so `suspend()` / `shutdown()` lifecycle events
+ * automatically clear the transport.
  *
  * Generated as `class TransportManager` in both Swift and Kotlin.
  *
- * See ADR-005 (Transport Abstraction).
+ * See ADR-005 (Transport Abstraction) and ADR-012 (Multi-transport routing).
  */
 public protocol TransportManagerProtocol: AnyObject, Sendable {
     
     /**
-     * Returns `true` if the transport is currently connected.
+     * Returns the number of adapters registered in the transport manager.
+     */
+    func adapterCount()  -> UInt32
+    
+    /**
+     * Registers an additional relay adapter with the transport manager.
+     *
+     * Connects to the specified relay URL and adds the resulting adapter to
+     * the manager. Returns the total adapter count after adding.
+     *
+     * # Arguments
+     *
+     * * `relay_url` -- The URL of the additional SCP relay to connect to.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` if the URL is invalid or the connection
+     * fails.
+     */
+    func addRelay(relayUrl: String) throws  -> UInt32
+    
+    /**
+     * Assigns a relay set for the given context.
+     *
+     * Delegates to [`scp_transport::TransportManager::assign_relay_set`]
+     * which selects adapters using round-robin spread to minimize overlap.
+     *
+     * # Arguments
+     *
+     * * `context_id` -- The context to assign relays for.
+     *
+     * # Returns
+     *
+     * A list of adapter indices assigned to this context.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` if no adapters are registered.
+     */
+    func assignRelaySet(contextId: String) throws  -> [UInt32]
+    
+    /**
+     * Returns the monotonic identifier of the bridge instance that minted
+     * this handle.
+     */
+    func instanceId()  -> UInt64
+    
+    /**
+     * Returns `true` if the transport is currently connected (has adapters).
      */
     func isConnected()  -> Bool
+    
+    /**
+     * Returns the reliability score for an adapter by index.
+     *
+     * Returns `None` if no score exists for the given adapter index.
+     *
+     * # Arguments
+     *
+     * * `adapter_index` -- The adapter index (0-based) to query.
+     */
+    func reliabilityScore(adapterIndex: UInt32)  -> ReliabilityScoreRecord?
     
     /**
      * Returns the current transport connection status record.
      *
      * Reflects actual connection state: `connected` is `true` only if the
-     * underlying relay adapter is still held.
+     * inner transport manager has at least one adapter registered.
      */
     func status()  -> TransportStatus
     
@@ -1871,16 +2357,17 @@ public protocol TransportManagerProtocol: AnyObject, Sendable {
 /**
  * Opaque handle to the transport layer.
  *
- * Exposes connection status and relay URL without leaking connection state.
- * The actual transport (WebSocket, multi-relay routing) is managed internally.
- *
- * Holds a reference to the underlying `NativeRelayAdapter` established by
- * `transport_connect`. The adapter represents a live WebSocket connection
- * to an SCP relay.
+ * Wraps a real [`scp_transport::TransportManager`] that is stored in the
+ * shared [`UniffiBridgeInstance`](crate::runtime::UniffiBridgeInstance).
+ * This handle provides Swift/Kotlin callers with
+ * the full multi-relay API: `addRelay`, `assignRelaySet`, `adapterCount`,
+ * `reliabilityScore`. All operations delegate to the `BridgeInstance`'s
+ * transport slot, so `suspend()` / `shutdown()` lifecycle events
+ * automatically clear the transport.
  *
  * Generated as `class TransportManager` in both Swift and Kotlin.
  *
- * See ADR-005 (Transport Abstraction).
+ * See ADR-005 (Transport Abstraction) and ADR-012 (Multi-transport routing).
  */
 open class TransportManager: TransportManagerProtocol, @unchecked Sendable {
     fileprivate let pointer: UnsafeMutableRawPointer!
@@ -1935,7 +2422,77 @@ open class TransportManager: TransportManagerProtocol, @unchecked Sendable {
 
     
     /**
-     * Returns `true` if the transport is currently connected.
+     * Returns the number of adapters registered in the transport manager.
+     */
+open func adapterCount() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_transportmanager_adapter_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Registers an additional relay adapter with the transport manager.
+     *
+     * Connects to the specified relay URL and adds the resulting adapter to
+     * the manager. Returns the total adapter count after adding.
+     *
+     * # Arguments
+     *
+     * * `relay_url` -- The URL of the additional SCP relay to connect to.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` if the URL is invalid or the connection
+     * fails.
+     */
+open func addRelay(relayUrl: String)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_transportmanager_add_relay(self.uniffiClonePointer(),
+        FfiConverterString.lower(relayUrl),$0
+    )
+})
+}
+    
+    /**
+     * Assigns a relay set for the given context.
+     *
+     * Delegates to [`scp_transport::TransportManager::assign_relay_set`]
+     * which selects adapters using round-robin spread to minimize overlap.
+     *
+     * # Arguments
+     *
+     * * `context_id` -- The context to assign relays for.
+     *
+     * # Returns
+     *
+     * A list of adapter indices assigned to this context.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Transport` if no adapters are registered.
+     */
+open func assignRelaySet(contextId: String)throws  -> [UInt32]  {
+    return try  FfiConverterSequenceUInt32.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_transportmanager_assign_relay_set(self.uniffiClonePointer(),
+        FfiConverterString.lower(contextId),$0
+    )
+})
+}
+    
+    /**
+     * Returns the monotonic identifier of the bridge instance that minted
+     * this handle.
+     */
+open func instanceId() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_transportmanager_instance_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Returns `true` if the transport is currently connected (has adapters).
      */
 open func isConnected() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -1945,10 +2502,27 @@ open func isConnected() -> Bool  {
 }
     
     /**
+     * Returns the reliability score for an adapter by index.
+     *
+     * Returns `None` if no score exists for the given adapter index.
+     *
+     * # Arguments
+     *
+     * * `adapter_index` -- The adapter index (0-based) to query.
+     */
+open func reliabilityScore(adapterIndex: UInt32) -> ReliabilityScoreRecord?  {
+    return try!  FfiConverterOptionTypeReliabilityScoreRecord.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_transportmanager_reliability_score(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(adapterIndex),$0
+    )
+})
+}
+    
+    /**
      * Returns the current transport connection status record.
      *
      * Reflects actual connection state: `connected` is `true` only if the
-     * underlying relay adapter is still held.
+     * inner transport manager has at least one adapter registered.
      */
 open func status() -> TransportStatus  {
     return try!  FfiConverterTypeTransportStatus_lift(try! rustCall() {
@@ -2049,6 +2623,12 @@ public protocol UcanTokenProtocol: AnyObject, Sendable {
      * Returns the expiry timestamp (seconds since epoch) or `None` if no expiry.
      */
     func expiresAt()  -> UInt64?
+    
+    /**
+     * Returns the monotonic identifier of the bridge instance that minted
+     * this handle.
+     */
+    func instanceId()  -> UInt64
     
     /**
      * Returns the issuer DID.
@@ -2167,6 +2747,17 @@ open func encoded() -> String  {
 open func expiresAt() -> UInt64?  {
     return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
     uniffi_scp_ffi_uniffi_fn_method_ucantoken_expires_at(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Returns the monotonic identifier of the bridge instance that minted
+     * this handle.
+     */
+open func instanceId() -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_ucantoken_instance_id(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -3067,7 +3658,6 @@ public struct ContextParams {
         /**
          * Optional economic policy as a JSON string (spec §19, ADR-033).
          * `None` means no economic policy (free context).
-         */economicPolicy: String?) {
          */economicPolicy: String?, 
         /**
          * Optional consequence rules as a JSON-encoded array (ADR-017, #1531).
@@ -3144,15 +3734,6 @@ extension ContextParams: Equatable, Hashable {
         if lhs.economicPolicy != rhs.economicPolicy {
             return false
         }
-        if lhs.maxNestingDepth != rhs.maxNestingDepth {
-            return false
-        }
-        if lhs.sessionCap != rhs.sessionCap {
-            return false
-        }
-        if lhs.economicPolicy != rhs.economicPolicy {
-            return false
-        }
         if lhs.consequenceRulesJson != rhs.consequenceRulesJson {
             return false
         }
@@ -3200,7 +3781,6 @@ public struct FfiConverterTypeContextParams: FfiConverterRustBuffer {
                 maxChainDepth: FfiConverterOptionUInt8.read(from: &buf), 
                 maxNestingDepth: FfiConverterOptionUInt32.read(from: &buf), 
                 sessionCap: FfiConverterOptionUInt32.read(from: &buf), 
-                economicPolicy: FfiConverterOptionString.read(from: &buf)
                 economicPolicy: FfiConverterOptionString.read(from: &buf), 
                 consequenceRulesJson: FfiConverterOptionString.read(from: &buf), 
                 consequenceConfigJson: FfiConverterOptionString.read(from: &buf)
@@ -4530,6 +5110,152 @@ public func FfiConverterTypePublishResult_lift(_ buf: RustBuffer) throws -> Publ
 #endif
 public func FfiConverterTypePublishResult_lower(_ value: PublishResult) -> RustBuffer {
     return FfiConverterTypePublishResult.lower(value)
+}
+
+
+/**
+ * Per-adapter reliability score record exposed to Swift/Kotlin.
+ *
+ * Contains the key fields from [`scp_transport::scoring::ReliabilityScore`]
+ * needed for relay health monitoring and selection decisions.
+ *
+ * See ADR-012 acceptance criterion 5.
+ */
+public struct ReliabilityScoreRecord {
+    /**
+     * The relay URL this score tracks.
+     */
+    public var relayUrl: String
+    /**
+     * Delivery success rate (0.0 to 1.0).
+     */
+    public var deliverySuccessRate: Double
+    /**
+     * Average latency in milliseconds.
+     */
+    public var averageLatencyMs: UInt64
+    /**
+     * Deletion compliance rate (0.0 to 1.0).
+     */
+    public var deletionComplianceRate: Double
+    /**
+     * Total number of send attempts.
+     */
+    public var totalSends: UInt64
+    /**
+     * Total number of send failures.
+     */
+    public var totalFailures: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The relay URL this score tracks.
+         */relayUrl: String, 
+        /**
+         * Delivery success rate (0.0 to 1.0).
+         */deliverySuccessRate: Double, 
+        /**
+         * Average latency in milliseconds.
+         */averageLatencyMs: UInt64, 
+        /**
+         * Deletion compliance rate (0.0 to 1.0).
+         */deletionComplianceRate: Double, 
+        /**
+         * Total number of send attempts.
+         */totalSends: UInt64, 
+        /**
+         * Total number of send failures.
+         */totalFailures: UInt64) {
+        self.relayUrl = relayUrl
+        self.deliverySuccessRate = deliverySuccessRate
+        self.averageLatencyMs = averageLatencyMs
+        self.deletionComplianceRate = deletionComplianceRate
+        self.totalSends = totalSends
+        self.totalFailures = totalFailures
+    }
+}
+
+#if compiler(>=6)
+extension ReliabilityScoreRecord: Sendable {}
+#endif
+
+
+extension ReliabilityScoreRecord: Equatable, Hashable {
+    public static func ==(lhs: ReliabilityScoreRecord, rhs: ReliabilityScoreRecord) -> Bool {
+        if lhs.relayUrl != rhs.relayUrl {
+            return false
+        }
+        if lhs.deliverySuccessRate != rhs.deliverySuccessRate {
+            return false
+        }
+        if lhs.averageLatencyMs != rhs.averageLatencyMs {
+            return false
+        }
+        if lhs.deletionComplianceRate != rhs.deletionComplianceRate {
+            return false
+        }
+        if lhs.totalSends != rhs.totalSends {
+            return false
+        }
+        if lhs.totalFailures != rhs.totalFailures {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(relayUrl)
+        hasher.combine(deliverySuccessRate)
+        hasher.combine(averageLatencyMs)
+        hasher.combine(deletionComplianceRate)
+        hasher.combine(totalSends)
+        hasher.combine(totalFailures)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReliabilityScoreRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReliabilityScoreRecord {
+        return
+            try ReliabilityScoreRecord(
+                relayUrl: FfiConverterString.read(from: &buf), 
+                deliverySuccessRate: FfiConverterDouble.read(from: &buf), 
+                averageLatencyMs: FfiConverterUInt64.read(from: &buf), 
+                deletionComplianceRate: FfiConverterDouble.read(from: &buf), 
+                totalSends: FfiConverterUInt64.read(from: &buf), 
+                totalFailures: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ReliabilityScoreRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.relayUrl, into: &buf)
+        FfiConverterDouble.write(value.deliverySuccessRate, into: &buf)
+        FfiConverterUInt64.write(value.averageLatencyMs, into: &buf)
+        FfiConverterDouble.write(value.deletionComplianceRate, into: &buf)
+        FfiConverterUInt64.write(value.totalSends, into: &buf)
+        FfiConverterUInt64.write(value.totalFailures, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReliabilityScoreRecord_lift(_ buf: RustBuffer) throws -> ReliabilityScoreRecord {
+    return try FfiConverterTypeReliabilityScoreRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReliabilityScoreRecord_lower(_ value: ReliabilityScoreRecord) -> RustBuffer {
+    return FfiConverterTypeReliabilityScoreRecord.lower(value)
 }
 
 
@@ -6649,6 +7375,112 @@ extension SourceType: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Storage configuration for [`UniffiBridgeInstance`].
+ *
+ * Two variants are supported:
+ * - [`StorageConfig::InMemory`] — encrypted in-memory storage (ephemeral).
+ * - [`StorageConfig::Sqlite`] — SQLCipher-encrypted storage on disk at
+ * `{path}/scp.db`, wired through [`scp_platform::sqlite::SqliteStorage`].
+ *
+ * Kept here (not in `scp-ffi-common`) because each bridge owns its own
+ * storage shape until a shared type lands.
+ *
+ * # `UniFFI` representation
+ *
+ * `#[derive(uniffi::Enum)]` exposes this to Swift and Kotlin as an
+ * associated-value enum. Swift will see `case sqlite(path: String, key:
+ * Data)`; Kotlin `sealed class StorageConfig.Sqlite(path: String, key:
+ * ByteArray)`. The raw key is accepted as a byte array; callers should
+ * zero their copy after the call returns.
+ */
+
+public enum StorageConfig {
+    
+    /**
+     * Encrypted in-memory storage.
+     */
+    case inMemory
+    /**
+     * SQLCipher-encrypted on-disk storage at `{path}/scp.db`.
+     */
+    case sqlite(
+        /**
+         * Directory the database file is created in. Path is passed
+         * through `std::path::PathBuf` on the Rust side.
+         */path: String, 
+        /**
+         * Raw encryption key material (typically 32 bytes).
+         */key: Data
+    )
+}
+
+
+#if compiler(>=6)
+extension StorageConfig: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStorageConfig: FfiConverterRustBuffer {
+    typealias SwiftType = StorageConfig
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StorageConfig {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .inMemory
+        
+        case 2: return .sqlite(path: try FfiConverterString.read(from: &buf), key: try FfiConverterData.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: StorageConfig, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .inMemory:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .sqlite(path,key):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(path, into: &buf)
+            FfiConverterData.write(key, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStorageConfig_lift(_ buf: RustBuffer) throws -> StorageConfig {
+    return try FfiConverterTypeStorageConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStorageConfig_lower(_ value: StorageConfig) -> RustBuffer {
+    return FfiConverterTypeStorageConfig.lower(value)
+}
+
+
+extension StorageConfig: Equatable, Hashable {}
+
+
+
+
+
+
 
 
 
@@ -8409,6 +9241,30 @@ fileprivate struct FfiConverterOptionTypeDataProvenance: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeReliabilityScoreRecord: FfiConverterRustBuffer {
+    typealias SwiftType = ReliabilityScoreRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeReliabilityScoreRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeReliabilityScoreRecord.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeToolCostDefinition: FfiConverterRustBuffer {
     typealias SwiftType = ToolCostDefinition?
 
@@ -8451,6 +9307,31 @@ fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
         case 1: return try FfiConverterSequenceString.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = [UInt32]
+
+    public static func write(_ value: [UInt32], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterUInt32.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt32] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [UInt32]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterUInt32.read(from: &buf))
+        }
+        return seq
     }
 }
 
@@ -9523,12 +10404,11 @@ public func contextIsMember(handle: ContextHandle, did: String)async  -> Bool  {
  * `ScpError::Context` with code `SCP-ECON-12061` if `spending_ucan_jwt` is
  * not a valid UCAN JWT.
  */
-public func contextJoin(handle: ContextHandle, identity: Identity)async throws   {
 public func contextJoin(handle: ContextHandle, identity: Identity, spendingUcanJwt: String?)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_join(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity)
+                uniffi_scp_ffi_uniffi_fn_func_context_join(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterOptionString.lower(spendingUcanJwt)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
@@ -11484,9 +12364,9 @@ public func provenanceUpdateSourceType(provenanceJson: String, newState: String)
  * Ensures the `ContextManager` is initialized (idempotent) since local DID
  * registration is valid before any context exists.
  */
-public func registerLocalDid(did: String)async   {
+public func registerLocalDid(did: String)async throws   {
     return
-        try!  await uniffiRustCallAsync(
+        try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_func_register_local_did(FfiConverterString.lower(did)
                 )
@@ -11495,8 +12375,7 @@ public func registerLocalDid(did: String)async   {
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
             liftFunc: { $0 },
-            errorHandler: nil
-            
+            errorHandler: FfiConverterTypeScpError_lift
         )
 }
 /**
@@ -11657,59 +12536,6 @@ public func scopeRegister(scopeContextId: String, name: String, targetContextId:
 })
 }
 /**
- * Waits for all outstanding FFI handles to be released, then shuts down.
- *
- * Call this from Swift/Kotlin before your process exits or before tearing
- * down the SCP library. It blocks (on a background thread) until either:
- *
- * - All opaque handle objects (`Identity`, `ContextHandle`, `UcanToken`,
- * `TransportManager`) have been garbage-collected / freed, **or**
- * - The `timeout_secs` deadline has elapsed.
- *
- * After this call returns, the tokio runtime may be dropped safely — no
- * outstanding FFI handles remain that could attempt to call into it.
- *
- * The default timeout is 5 seconds (per ADR-021 acceptance criterion 1).
- * Pass `0` to return immediately without waiting.
- *
- * # Thread safety
- *
- * This function is safe to call from any thread. It polls `HANDLE_COUNT`
- * in 10 ms intervals and does not block the tokio runtime.
- *
- * # Example (Swift)
- *
- * ```swift
- * // Call before application exit:
- * scpShutdown(timeoutSecs: 5)
- * ```
- */
-public func scpShutdown(timeoutSecs: UInt64)  {try! rustCall() {
-    uniffi_scp_ffi_uniffi_fn_func_scp_shutdown(
-        FfiConverterUInt64.lower(timeoutSecs),$0
-    )
-}
-}
-/**
- * Suspends the bridge instance for mobile app backgrounding.
- *
- * Disconnects transport (clears the relay connection) and marks the instance
- * as suspended. Context state is preserved — the instance remains alive but
- * inactive. Transport-dependent operations will fail until `scpResume()`
- * is called.
- *
- * No-op if the instance is already shut down or not initialized.
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if transport cleanup fails.
- */
-public func scpSuspend()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_scp_suspend($0
-    )
-}
-}
-/**
  * Resumes a suspended bridge instance.
  *
  * Clears the suspended flag so bridge operations can proceed. The caller
@@ -11722,8 +12548,102 @@ public func scpSuspend()throws   {try rustCallWithError(FfiConverterTypeScpError
  *
  * Returns `ScpError::Context` if the instance has been permanently shut down.
  */
-public func scpResume()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_scp_resume($0
+public func scpResume()async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_scp_resume(
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Waits for all outstanding FFI handles to be released, then shuts down.
+ *
+ * Call this from Swift/Kotlin before your process exits or before tearing
+ * down the SCP library. It blocks (asynchronously) until either:
+ *
+ * - All opaque handle objects (`Identity`, `ContextHandle`, `UcanToken`,
+ * `TransportManager`) have been garbage-collected / freed, **or**
+ * - The `timeout_millis` deadline has elapsed.
+ *
+ * After this call returns, the tokio runtime may be dropped safely — no
+ * outstanding FFI handles remain that could attempt to call into it.
+ *
+ * The unit is **milliseconds** — unified across all Rust bridges so the
+ * Swift, Kotlin, and TypeScript SDKs can share a single conversion
+ * surface (the SDK wrappers multiply by 1000 before crossing FFI). The
+ * default is 5000 ms (per ADR-021 acceptance criterion 1). Pass `0` to
+ * return immediately without waiting.
+ *
+ * # Thread safety
+ *
+ * This function is safe to call from any thread. It polls `HANDLE_COUNT`
+ * in 10 ms intervals on the tokio runtime (via `tokio::time::sleep`) so
+ * the worker is not blocked — critical for mobile apps that run this on
+ * the main event loop.
+ *
+ * **Bug fix (PR 1 post-review):** the previous implementation polled
+ * with `std::thread::sleep`, which blocks the current tokio worker.
+ * Mobile apps invoking `scpShutdown` from the foreground ran the risk
+ * of a frozen UI while tasks drained. The new implementation yields
+ * via `tokio::time::sleep` as every other async bridge function does.
+ *
+ * # Example (Swift)
+ *
+ * ```swift
+ * // Call before application exit:
+ * try await scpShutdown(timeoutMillis: 5_000)
+ * ```
+ */
+public func scpShutdown(timeoutMillis: UInt64)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_scp_shutdown(FfiConverterUInt64.lower(timeoutMillis)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Suspends the bridge instance for mobile app backgrounding.
+ *
+ * Disconnects transport (clears the relay connection) and marks the instance
+ * as suspended. Context state is preserved — the instance remains alive but
+ * inactive. Transport-dependent operations will fail until [`scp_resume`]
+ * is called.
+ *
+ * After suspension, callers should call `scpResume()` to re-activate, then
+ * re-establish the relay connection via `transportConnect()`.
+ *
+ * No-op if the instance is already shut down or not initialized.
+ *
+ * # Example (Swift)
+ *
+ * ```swift
+ * // When the app enters background:
+ * scpSuspend()
+ * // When returning to foreground:
+ * try await scpResume()
+ * try await transportConnect(relayUrl: savedUrl)
+ * ```
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Transport` if transport cleanup fails.
+ */
+public func scpSuspend()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_scp_suspend($0
     )
 }
 }
@@ -12288,9 +13208,9 @@ public func transportConnect(relayUrl: String)async throws  -> TransportManager 
 /**
  * Disconnects from the current SCP relay.
  *
- * Clears the relay adapter from the `TransportManager` handle. After this
- * call, the `TransportManager` reports `connected: false` and the adapter's
- * WebSocket connection is released when the last reference is dropped.
+ * Replaces the inner `TransportManager` with an empty builder, releasing
+ * all adapter connections. After this call, the `TransportManager` reports
+ * `connected: false` and `adapter_count() == 0`.
  *
  * This is idempotent — calling it when already disconnected is a no-op.
  *
@@ -12300,7 +13220,7 @@ public func transportConnect(relayUrl: String)async throws  -> TransportManager 
  *
  * # Errors
  *
- * Returns `ScpError::Transport` if the internal mutex is poisoned.
+ * Returns `ScpError::Transport` if the internal lock is poisoned.
  */
 public func transportDisconnect(manager: TransportManager)async throws   {
     return
@@ -13012,7 +13932,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_provenance_update_source_type() != 33504) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_register_local_did() != 64365) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_register_local_did() != 129) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_relay_start_in_memory() != 43291) {
@@ -13042,10 +13962,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_scope_register() != 44834) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scp_resume() != 11235) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_scp_resume() != 60140) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scp_shutdown() != 6072) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_scp_shutdown() != 29393) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_scp_suspend() != 8123) {
@@ -13087,7 +14007,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_tool_interface_revoke() != 31068) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke() != 40090) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke() != 24933) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke_cross_context() != 26371) {
@@ -13111,7 +14031,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_transport_connect() != 52412) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_transport_disconnect() != 29342) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_transport_disconnect() != 43896) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_transport_status() != 49151) {
@@ -13156,6 +14076,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_creator_did() != 33786) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_instance_id() != 38096) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_state() != 16843) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13172,6 +14095,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_has_agent_key() != 16136) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_instance_id() != 28218) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_remove_agent_key() != 20170) {
@@ -13198,6 +14124,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_http_url() != 26199) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_instance_id() != 64848) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_is_shutdown() != 46152) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13216,6 +14145,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_shutdown() != 24736) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_relayhandle_instance_id() != 15482) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_relayhandle_is_shutdown() != 45597) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13228,10 +14160,37 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_relayhandle_shutdown() != 3484) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_is_connected() != 6252) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_instance_id() != 43175) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_status() != 35920) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_resume() != 62509) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_shutdown() != 65387) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_suspend() != 57088) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_adapter_count() != 31835) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_add_relay() != 27537) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_assign_relay_set() != 25796) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_instance_id() != 1025) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_is_connected() != 58175) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_reliability_score() != 63406) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_status() != 19459) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_audience() != 59140) {
@@ -13246,6 +14205,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_expires_at() != 8024) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_instance_id() != 22133) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_issuer() != 27562) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13253,6 +14215,18 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_token_id() != 51675) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_default_instance() != 7542) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_new() != 42429) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_persistence() != 28565) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 21004) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 4506) {

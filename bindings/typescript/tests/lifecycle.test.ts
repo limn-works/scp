@@ -3,18 +3,41 @@
  *
  * These tests run against the native NAPI bridge. They verify:
  * - suspend without initialization is a no-op
- * - resume without initialization is a no-op
- * - suspend-then-resume succeeds after initialization (via Identity.create)
+ * - resume without initialization is a no-op (uninitialized); rejects if shut down
  *
  * The WASM bridge path is covered by the wasm.ts no-op implementation;
  * because the test target is always "native" (see bridge.test.ts), the
  * WASM no-op is exercised indirectly.
+ *
+ * Skipped at file level when the native NAPI addon is unavailable
+ * (browser runtime, missing platform binary for this OS/arch). Same
+ * pattern as `persistence.test.ts` and `scp-class.test.ts`.
  */
 
 import { describe, expect, it } from "bun:test";
 import { scpResume, scpSuspend } from "../src/lifecycle";
+import { SCP } from "../src/scp";
 
-describe("bridge lifecycle (scpSuspend / scpResume)", () => {
+// Best-effort detection of whether the NAPI addon is available. We
+// attempt a cheap `new SCP()` inside a try/catch — if the addon is
+// structurally unavailable (missing platform optionalDependency), the
+// native bridge loader throws a `TransportError` and we skip. This
+// keeps the test file runnable in environments where the native addon
+// is not published locally (developer machine without a pre-built
+// platform package) without hard-failing the suite.
+function napiAvailable(): boolean {
+  try {
+    const probe = new SCP();
+    probe.shutdown(1).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const describeNapi = napiAvailable() ? describe : describe.skip;
+
+describeNapi("bridge lifecycle (scpSuspend / scpResume)", () => {
   it("scpSuspend when uninitialized (or already shut down) is a no-op", async () => {
     // scp_suspend returns Ok(()) in both cases — BridgeInstance::suspend()
     // short-circuits on is_shutdown().

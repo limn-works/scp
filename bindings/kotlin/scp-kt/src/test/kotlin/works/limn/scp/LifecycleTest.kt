@@ -8,7 +8,9 @@ package works.limn.scp
 
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.test.runTest
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.conformance.ConformanceStubBindings
@@ -36,56 +38,71 @@ class LifecycleTest {
         }
     }
 
-    private fun bridge(): CoroutineBridge {
-        val dispatcher = StandardTestDispatcher()
-        return CoroutineBridge(
-            nativeBindings = ConformanceStubBindings(),
-            ioDispatcher = dispatcher,
-            cpuDispatcher = dispatcher,
-        )
+    // `runTest { }` creates its own `TestCoroutineScheduler` internally,
+    // and `withContext(ioDispatcher)` inside CoroutineBridge.ffiCall /
+    // ffiCallSuspend posts work onto the injected `ioDispatcher`.
+    // `kotlinx-coroutines-test` detects a scheduler mismatch between
+    // the two and throws
+    //   IllegalStateException: Detected use of different schedulers.
+    // The fix documented in the test-coroutines docs is to pass the
+    // bridge's dispatcher to `runTest(dispatcher)` so both sides share
+    // the same `TestCoroutineScheduler`. Other tests in this module
+    // (e.g. IdentityConformanceTest) follow the same pattern.
+    private lateinit var testDispatcher: TestDispatcher
+    private lateinit var bridge: CoroutineBridge
+
+    @BeforeEach
+    fun setUp() {
+        testDispatcher = StandardTestDispatcher()
+        bridge =
+            CoroutineBridge(
+                nativeBindings = ConformanceStubBindings(),
+                ioDispatcher = testDispatcher,
+                cpuDispatcher = testDispatcher,
+            )
     }
 
     @Test
     fun `suspend delegates to bindings_scpSuspend`() =
-        runTest {
+        runTest(testDispatcher) {
             val bindings = RecordingBindings()
-            suspend(bridge(), bindings)
+            suspend(bridge, bindings)
             assertEquals(1, bindings.suspendCalls)
             assertEquals(0, bindings.resumeCalls)
         }
 
     @Test
     fun `resume delegates to bindings_scpResume`() =
-        runTest {
+        runTest(testDispatcher) {
             val bindings = RecordingBindings()
-            resume(bridge(), bindings)
+            resume(bridge, bindings)
             assertEquals(1, bindings.resumeCalls)
             assertEquals(0, bindings.suspendCalls)
         }
 
     @Test
     fun `suspend-then-resume calls both bindings in order`() =
-        runTest {
+        runTest(testDispatcher) {
             val bindings = RecordingBindings()
-            suspend(bridge(), bindings)
-            resume(bridge(), bindings)
+            suspend(bridge, bindings)
+            resume(bridge, bindings)
             assertEquals(1, bindings.suspendCalls)
             assertEquals(1, bindings.resumeCalls)
         }
 
     @Test
     fun `suspend propagates binding errors`() =
-        runTest {
+        runTest(testDispatcher) {
             val bindings = RecordingBindings()
             bindings.throwFromSuspend = IllegalStateException("boom")
-            assertFailsWith<IllegalStateException> { suspend(bridge(), bindings) }
+            assertFailsWith<IllegalStateException> { suspend(bridge, bindings) }
         }
 
     @Test
     fun `resume propagates binding errors`() =
-        runTest {
+        runTest(testDispatcher) {
             val bindings = RecordingBindings()
             bindings.throwFromResume = IllegalStateException("boom")
-            assertFailsWith<IllegalStateException> { resume(bridge(), bindings) }
+            assertFailsWith<IllegalStateException> { resume(bridge, bindings) }
         }
 }
