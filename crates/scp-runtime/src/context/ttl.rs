@@ -1228,12 +1228,13 @@ pub const fn expiry_notification() -> ContextEvent {
     clippy::expect_used,
     clippy::panic,
     clippy::iter_on_single_items,
-    clippy::significant_drop_tightening,
-    // `std::sync::Mutex` is disallowed crate-wide (ADR-049); test mocks use
-    // the sync primitive for clarity.
-    clippy::disallowed_types
+    clippy::significant_drop_tightening
 )]
 mod tests {
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -1246,6 +1247,10 @@ mod tests {
     use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
 
     #[derive(Default)]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     struct MockCrypto {
         mls_destroyed: Mutex<Vec<[u8; 32]>>,
         sender_keys_destroyed: Mutex<Vec<[u8; 32]>>,
@@ -1311,6 +1316,10 @@ mod tests {
     }
 
     #[derive(Default)]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     struct MockTransport {
         connected: AtomicBool,
         deleted: Mutex<Vec<[u8; 32]>>,
@@ -1349,6 +1358,10 @@ mod tests {
     }
 
     #[derive(Default)]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     struct MockEventLog {
         events: Mutex<Vec<([u8; 32], String)>>,
     }
@@ -2043,11 +2056,19 @@ mod tests {
 
     // SCP-066 tests: TtlTimerHandle
 
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     struct MockTimerHandle {
         cancelled: std::sync::atomic::AtomicBool,
         active: std::sync::atomic::AtomicBool,
         reset_dur: std::sync::Mutex<Option<Duration>>,
     }
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     impl MockTimerHandle {
         fn new() -> Self {
             Self {
@@ -2377,6 +2398,10 @@ mod tests {
 
     /// Mock crypto that fails MLS group destruction.
     #[derive(Default)]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     struct FailingMlsCrypto {
         sender_keys_destroyed: Mutex<Vec<[u8; 32]>>,
     }
@@ -2661,6 +2686,10 @@ mod tests {
 
         let callback_invoked = Arc::new(AtomicBool::new(false));
         let callback_invoked_clone = Arc::clone(&callback_invoked);
+        #[allow(
+            clippy::disallowed_types,
+            reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+        )]
         let callback_context_id = Arc::new(Mutex::new(String::new()));
         let callback_context_id_clone = Arc::clone(&callback_context_id);
 
@@ -2788,12 +2817,20 @@ mod tests {
 
     /// Mock crypto that fails MLS destruction a configurable number of times,
     /// then succeeds. Used to verify partial cleanup state between retries.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     struct TransientFailCrypto {
         remaining_failures: Mutex<u32>,
         mls_destroyed: Mutex<Vec<[u8; 32]>>,
         sender_keys_destroyed: Mutex<Vec<[u8; 32]>>,
     }
 
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     impl TransientFailCrypto {
         fn new(fail_count: u32) -> Self {
             Self {

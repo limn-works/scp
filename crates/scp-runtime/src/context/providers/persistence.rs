@@ -11,13 +11,11 @@
 //!
 //! [`ContextPersistence`]: crate::context::manager::ContextPersistence
 
-// `std::sync::Mutex` is disallowed crate-wide (ADR-049 actor-per-context).
-// The sync `ContextPersistence` trait cannot use `tokio::sync::Mutex`. The
-// actor refactor replaces this provider with an async trait; that work lands
-// in commits 4-12 of the actor PR. Until then, preserve the current shape.
-#![allow(clippy::disallowed_types)]
-
 use std::collections::HashMap;
+#[allow(
+    clippy::disallowed_types,
+    reason = "sync `ContextPersistence` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 use std::sync::Mutex;
 
 use crate::context::manager::{ContextPersistence, ContextSnapshot};
@@ -50,10 +48,22 @@ pub use crate::store::context::ProtocolRepositoryContextBridge;
 /// );
 /// ```
 pub struct InMemoryPersistence {
+    #[allow(
+        clippy::disallowed_types,
+        reason = "sync `ContextPersistence` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     contexts: Mutex<HashMap<String, ContextSnapshot>>,
+    #[allow(
+        clippy::disallowed_types,
+        reason = "sync `ContextPersistence` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     broadcasts: Mutex<HashMap<String, BroadcastContextSnapshot>>,
 }
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "sync `ContextPersistence` trait upstream; `tokio::sync::Mutex` is not usable at a sync trait boundary. Deleted in commits 4-12 of ADR-049 (actor refactor) per plan §Commit ladder; see `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 impl InMemoryPersistence {
     /// Creates a new empty in-memory persistence provider.
     #[must_use]

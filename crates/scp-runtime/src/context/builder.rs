@@ -711,12 +711,13 @@ pub async fn create_context(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::significant_drop_tightening,
-    // `std::sync::Mutex` is disallowed crate-wide (ADR-049); test mocks use
-    // the sync primitive for clarity.
-    clippy::disallowed_types
+    clippy::significant_drop_tightening
 )]
 mod tests {
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -729,6 +730,10 @@ mod tests {
     /// Tracks which operations were called and allows injecting failures at
     /// specific steps.
     #[derive(Default)]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     struct MockCryptoProvider {
         fail_validate_identity: AtomicBool,
         fail_create_mls: AtomicBool,
@@ -837,6 +842,10 @@ mod tests {
     }
 
     #[derive(Default)]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     struct MockTransportProvider {
         connected: AtomicBool,
         fail_publish: AtomicBool,
@@ -886,6 +895,10 @@ mod tests {
     }
 
     #[derive(Default)]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     struct MockEventLogProvider {
         fail_init: AtomicBool,
         fail_append: AtomicBool,

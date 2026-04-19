@@ -1,7 +1,3 @@
-// Test-only module. `std::sync::Mutex` is disallowed crate-wide
-// (ADR-049); tests may use sync primitives for mock state.
-#![allow(clippy::disallowed_types)]
-
 use super::*;
 
 // -----------------------------------------------------------------------
@@ -5202,6 +5198,10 @@ async fn migration_destination_has_migration_source_metadata() {
 /// `remove_member` on the crypto provider.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn test_remove_member_sender_key_before_mls_removal() {
     use std::sync::Arc;
 
@@ -5942,6 +5942,10 @@ async fn test_participation_decay_clears_caches() {
 
 /// `RotateContentKeys` in encrypted mode advances the MLS epoch.
 #[tokio::test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn test_rotate_content_keys_advances_epoch() {
     use std::sync::Arc;
 
@@ -6869,6 +6873,10 @@ async fn event_log_entries_feed_consequence_evaluation() {
 
 /// After removing one member, remaining members' sender keys are still available (#1541).
 #[tokio::test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn remaining_members_keys_after_removal() {
     let crypto = MockCrypto::default();
     let sender_keys_removed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -6999,6 +7007,10 @@ async fn broadcast_rotation_calls_rotate_author_keys() {
 
 /// Encrypted `RotateContentKeys` updates MLS epoch counter (#1548).
 #[tokio::test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn encrypted_rotation_updates_epoch_counter() {
     let epochs = Arc::new(std::sync::Mutex::new(Vec::<[u8; 32]>::new()));
     let crypto = MockCrypto {
@@ -8127,6 +8139,10 @@ fn ucan_spending_capability_checked_on_tool_invoke() {
 /// Verifies that the crypto provider's `advance_epoch` is actually called and
 /// that the `ContentKeysRotated` event is emitted.
 #[tokio::test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn encrypted_rotation_advance_epoch_called() {
     let epochs = Arc::new(std::sync::Mutex::new(Vec::<[u8; 32]>::new()));
     let crypto = MockCrypto {
@@ -8988,6 +9004,10 @@ async fn test_broadcast_rotation_rotates_author_keys() {
 
 /// Encrypted `RotateContentKeys` increments epoch via `advance_epoch` (#1548).
 #[tokio::test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn test_encrypted_rotation_increments_epoch() {
     let epochs = Arc::new(std::sync::Mutex::new(Vec::<[u8; 32]>::new()));
     let crypto = MockCrypto {
@@ -14639,6 +14659,10 @@ async fn test_governance_close_decays_participation() {
 /// payment adapter, no persistent storage. Returns the manager + a
 /// shared transport sent-buffer handle so the caller can capture
 /// encrypted bytes after `send_message`.
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 fn h17_h16_make_manager() -> (
     ContextManager,
     std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
@@ -14667,6 +14691,10 @@ fn h17_h16_make_manager() -> (
 ///   * Alice's `ContextHandle`
 ///   * the captured sent buffer
 ///   * `bob_manager` for delivery + assertions
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn h17_setup_alice_and_bob(
     context_id: &str,
     bob_consequence_rules: Vec<super::ConsequenceRule>,

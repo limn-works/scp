@@ -18,14 +18,11 @@
 //! [`ContextCryptoProvider`]: scp_protocol::context::builder::ContextCryptoProvider
 //! [`ContextManager`]: crate::context::manager::ContextManager
 
-// `std::sync::Mutex` is disallowed crate-wide (ADR-049 actor-per-context).
-// `MlsCryptoProvider` itself is scheduled for deletion in commit 12 of the
-// actor PR — the actor owns MLS state. These Mutex fields are the exact
-// primitives the actor eliminates. Until the deletion lands, preserve the
-// current shape; do not migrate piecemeal.
-#![allow(clippy::disallowed_types)]
-
 use std::collections::HashMap;
+#[allow(
+    clippy::disallowed_types,
+    reason = "`MlsCryptoProvider` itself is deleted in commit 12 of ADR-049 (actor refactor); all Mutex fields are the exact primitives the actor replaces. See plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 use std::sync::Mutex;
 
 use openmls::prelude::*;
@@ -266,26 +263,50 @@ pub struct MlsCryptoProvider {
     /// The local member's DID (e.g., `"did:dht:z6Mk..."`).
     local_did: String,
     /// Per-context crypto state, keyed by the 32-byte context ID.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "`MlsCryptoProvider` itself is deleted in commit 12 of ADR-049 (actor refactor) — the actor owns per-context MLS state. This field is the exact primitive the actor replaces; do not migrate piecemeal. See plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     contexts: Mutex<HashMap<[u8; 32], ContextCryptoState>>,
     /// Broadcast keys for broadcast-mode contexts.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "`MlsCryptoProvider` itself is deleted in commit 12 of ADR-049 (actor refactor); broadcast keys move to per-broadcast-context actor state (`ContextModeState::Broadcast`). See plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     broadcast_keys: Mutex<HashMap<[u8; 32], SenderKey>>,
     /// X25519 wrapping public key for sender key HPKE (§9.16.1).
     /// Published in the MLS `LeafNode` `scp_wrapping_key` extension.
     /// Behind a `Mutex` so it can be restored from a persisted snapshot
     /// via [`ContextCryptoProvider::restore_crypto_state`] (which takes `&self`).
+    #[allow(
+        clippy::disallowed_types,
+        reason = "`MlsCryptoProvider` itself is deleted in commit 12 of ADR-049 (actor refactor); wrapping key storage migrates to per-identity `ArcSwap<Option<Vec<u8>>>` on the supervisor. See plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     wrapping_public_key: Mutex<[u8; 32]>,
     /// X25519 wrapping secret key for sender key HPKE (§9.16.1).
     /// Used to open HPKE-sealed sender key responses. Wrapped in
     /// [`Zeroizing`] so key material is zeroed on drop.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "`MlsCryptoProvider` itself is deleted in commit 12 of ADR-049 (actor refactor); wrapping secret-key storage migrates to per-identity `ArcSwap<Option<Zeroizing<Vec<u8>>>>` on the supervisor. See plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     wrapping_secret_key: Mutex<Zeroizing<[u8; 32]>>,
     /// Pending key package state for Welcome-based joins (§5.12.3).
     /// `prepare_key_package_for_join` replaces any previous entry;
     /// `join_from_welcome` takes it. `Option` enforces the single-entry
     /// invariant at the type level.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "`MlsCryptoProvider` itself is deleted in commit 12 of ADR-049 (actor refactor); pending-join state splits into `PerContextState.welcome_scratchpad` + `KeyPackageStoreActor.reserved`. See plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     pending_joins: Mutex<Option<PendingJoinState>>,
 }
 
 #[allow(clippy::significant_drop_tightening)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "`MlsCryptoProvider` itself is deleted in commit 12 of ADR-049 (actor refactor); all Mutex uses here are the exact primitives the actor replaces. See plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 impl MlsCryptoProvider {
     /// Creates a new production crypto provider for the given local DID.
     ///

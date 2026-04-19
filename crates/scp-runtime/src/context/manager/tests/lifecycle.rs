@@ -1,7 +1,3 @@
-// Test-only module. `std::sync::Mutex` is disallowed crate-wide
-// (ADR-049); tests may use sync primitives for mock state.
-#![allow(clippy::disallowed_types)]
-
 use super::*;
 
 // -----------------------------------------------------------------------
@@ -512,6 +508,10 @@ async fn concurrent_joins_and_sends_do_not_corrupt_state() {
 /// `tokio::sync::Mutex`. After the panicking task is caught, subsequent
 /// operations on the same manager must succeed.
 #[tokio::test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn panic_does_not_poison_mutex() {
     use std::sync::Arc;
 
@@ -569,6 +569,10 @@ async fn panic_does_not_poison_mutex() {
 
 /// Mock `ContextPersistence` that stores snapshots in `HashMap`s.
 #[derive(Default)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 struct MockContextPersistence {
     contexts: std::sync::Mutex<HashMap<String, super::ContextSnapshot>>,
     broadcasts: std::sync::Mutex<HashMap<String, BroadcastContextSnapshot>>,
@@ -688,6 +692,10 @@ fn context_persistence_is_object_safe() {
 /// SCP-PERSIST-024: persist-drop-restore roundtrip verifies all fields.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn persist_drop_restore_roundtrip() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
@@ -834,6 +842,10 @@ async fn persist_drop_restore_roundtrip() {
 /// SCP-PERSIST-025: `executed_proposals` preserved across restart.
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // DashMap lock pattern adds verbosity
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn restore_preserves_executed_proposals() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
@@ -957,6 +969,10 @@ async fn restore_preserves_executed_proposals() {
 
 /// SCP-PERSIST-025: TTL timer re-spawned after restore with remaining TTL.
 #[tokio::test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn restore_respawns_ttl_timer() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
@@ -1061,6 +1077,10 @@ async fn restore_respawns_ttl_timer() {
 
 /// SCP-PERSIST-025: `restore_all_contexts` lists and restores each.
 #[tokio::test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn restore_all_contexts_restores_persisted() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
@@ -1152,6 +1172,10 @@ async fn restore_all_contexts_restores_persisted() {
 
 /// `restore_context` rejects duplicate context registration.
 #[tokio::test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn restore_context_rejects_duplicate() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
@@ -1262,6 +1286,10 @@ async fn restore_context_rejects_duplicate() {
 
 /// §23.11: Grace entry with epoch > MLS epoch triggers `needs_reconnect`.
 #[tokio::test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
     use crate::crypto::mls::epoch_grace::GraceEntry;
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
@@ -1380,6 +1408,10 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
 
 /// §23.11: Consistent grace entries do NOT set `needs_reconnect`.
 #[tokio::test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn restore_context_no_reconnect_when_grace_consistent() {
     use crate::crypto::mls::epoch_grace::GraceEntry;
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
@@ -1507,6 +1539,10 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
 /// spending UCAN to be reused.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn restore_preserves_spending_nonce_tracker_across_restart() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
     use scp_protocol::crypto::ucan::UcanError;
@@ -3489,6 +3525,10 @@ async fn import_context_clamps_cooldown_until() {
 /// path. Budgets are authoritative there and MUST survive a restart —
 /// the C3 wipe policy applies only to `import_context`.
 #[tokio::test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn restore_context_preserves_budget_tracker() {
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
     use scp_protocol::economy::types::Amount;
@@ -3568,6 +3608,10 @@ async fn restore_context_preserves_budget_tracker() {
 /// regression (e.g., the user toggled `allow_automatic_access_revocation`
 /// off between snapshots) MUST not silently load `RevokeAccess` rules.
 #[tokio::test]
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn restore_context_validates_consequence_rules() {
     use scp_protocol::context::AccessScope;
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};

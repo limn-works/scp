@@ -448,11 +448,6 @@ fn unix_now_secs() -> u64 {
 }
 
 #[cfg(test)]
-#[allow(
-    // `std::sync::Mutex` is disallowed crate-wide (ADR-049); test mocks use
-    // the sync primitive for clarity.
-    clippy::disallowed_types
-)]
 mod tests {
     use super::*;
 
@@ -732,6 +727,10 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used)]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     fn callback_fires_on_time_expiry() {
         use std::sync::{Arc, Mutex};
 
@@ -756,6 +755,10 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used)]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     fn callback_fires_on_capacity_eviction() {
         use std::sync::{Arc, Mutex};
 
@@ -782,6 +785,10 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used)]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
     fn callback_not_fired_when_nothing_expires() {
         use std::sync::{Arc, Mutex};
 

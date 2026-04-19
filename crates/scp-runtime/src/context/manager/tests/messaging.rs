@@ -1,7 +1,3 @@
-// Test-only module. `std::sync::Mutex` is disallowed crate-wide
-// (ADR-049); tests may use sync primitives for mock state.
-#![allow(clippy::disallowed_types)]
-
 use super::*;
 use scp_protocol::context::governance::{AccessScope, GovernanceAction};
 
@@ -361,6 +357,10 @@ async fn report_degraded_mode_noop_for_exact() {
 /// Returns `(manager, handle, sent_buffer)` where `sent_buffer` is a
 /// shared handle to the transport's sent-messages buffer for inspecting
 /// encrypted bytes after `send_message`.
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn setup_two_member_verified_context() -> (
     ContextManager,
     ContextHandle,
@@ -416,6 +416,10 @@ async fn setup_two_member_verified_context() -> (
 }
 
 /// Returns the last message captured by a transport sent-messages buffer.
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 fn last_sent(sent: &Arc<std::sync::Mutex<Vec<Vec<u8>>>>) -> Vec<u8> {
     sent.lock()
         .unwrap()
@@ -2343,11 +2347,19 @@ enum AdapterCall {
     },
 }
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 struct RecordingPaymentAdapter {
     calls: Arc<std::sync::Mutex<Vec<AdapterCall>>>,
     next_auth_id: std::sync::atomic::AtomicU8,
 }
 
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 impl RecordingPaymentAdapter {
     fn new() -> Self {
         Self {
@@ -3640,6 +3652,10 @@ fn role_name_max_length_matches_doc() {
 /// Mirrors `setup_two_member_verified_context` but parameterised so H5
 /// tests can inject `OrderedMockEventLog`, `ClockedMockEventLog`, and
 /// `FailingAppendEventLog` instances.
+#[allow(
+    clippy::disallowed_types,
+    reason = "Test-only mock state; actor refactor does not migrate test scaffolding. See ADR-049 §'Disallowed types / methods via clippy.toml' and plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+)]
 async fn setup_two_member_context_with(
     event_log: Box<dyn ContextEventLogProvider>,
     clock: Option<Arc<dyn scp_primitives::Clock>>,
