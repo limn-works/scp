@@ -62,7 +62,7 @@ Concurrent sagas against the same actor are **serialized** — at most one `saga
 
 ### 4. Migration carries a commitment, not a bearer artifact
 
-Migration's `SagaPreparedState` stores `handover_commitment = SHA-256(handover_envelope ‖ nonce)` in the journal. The actual `CustodyHandover` (bearer artifact) stays in `PerContextState.saga_pending` with `Zeroizing`-wrapped bytes and rolls back on snapshot recovery if the actor crashes. The journal alone cannot replay a migration Commit — crash recovery requires both the journal and the surviving actor-local state.
+Migration's `SagaPreparedState` stores `handover_commitment = SHA-256(domain_separator ‖ handover_envelope ‖ nonce)` in the journal, constructed per spec §9.4.3 (16+-byte per-saga-type domain separator, 32-byte OsRng nonce, nonce-reuse forbidden). The actual `CustodyHandover` (bearer artifact) stays in `PerContextState.saga_pending` with `Zeroizing`-wrapped bytes and rolls back on snapshot recovery if the actor crashes. The journal alone cannot replay a migration Commit — crash recovery requires both the journal and the surviving actor-local state.
 
 ### 5. `OwnedIdentityDid` via module visibility, not `pub(crate)`
 
