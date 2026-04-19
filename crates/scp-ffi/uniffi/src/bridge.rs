@@ -2354,36 +2354,13 @@ fn spawn_suppression_scoring_task(
 // See ADR-021 acceptance criterion 2.
 // ---------------------------------------------------------------------------
 
-/// Creates a new DID identity with the specified custody method.
-///
-/// # Arguments
-///
-/// * `custody` — The custody type string. Accepted values depend on the build
-///   configuration:
-///   - `"platform"` — always accepted; requires a wired `KeyCustodyProvider`.
-///   - `"software"` — always accepted; requires a wired `KeyCustodyProvider`.
-///   - `"in_memory"` — **only** accepted when the `allow_in_memory_custody`
-///     feature is enabled at compile time. Returns `ScpError::Identity` with
-///     code `SCP-IDENT-1008` otherwise. Stores key material in unprotected heap
-///     memory; suitable for testing and development but NOT for production use
-///     on mobile devices.
-///
-/// # Returns
-///
-/// An `Identity` handle with the new DID and custody type.
-///
-/// # Errors
-///
-/// Returns `ScpError::Identity` if key generation or DID creation fails.
-/// Returns `ScpError::Identity` with code `SCP-IDENT-1008` if `"in_memory"` is
-/// requested but the `allow_in_memory_custody` feature is not enabled.
-/// Returns `ScpError::Validation` if the custody string is not recognized.
-///
 // Phase D (#1695): `ensure_did_resolver_initialized` free-function helper
 // deleted along with the process-wide `DEFAULT_BRIDGE_INSTANCE`. Every
 // call site now routes through the per-instance
 // [`ensure_did_resolver_initialized_on`] helper, which stores the resolver
-// on the caller's own `UniffiBridgeInstance::did_resolver` slot.
+// on the caller's own `UniffiBridgeInstance::did_resolver` slot. The
+// companion `identity_create` free function moved earlier in the same
+// demolition to `Scp::identity_create` (PR 4 sub-slice B).
 
 // ---------------------------------------------------------------------------
 // Free functions — device attestation (#419)
@@ -7873,7 +7850,11 @@ impl Scp {
         // Re-sync role state from ContextManager after governance execution (#796).
         // Governance actions may modify roles/membership; without this sync the
         // Swift/Kotlin SDKs see stale role state for UCAN/tool capability checks.
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        if let Err(e) = self
+            .inner
+            .sync_role_state_from_manager(&handle.context_id)
+            .await
+        {
             tracing::warn!(
                 context_id = %handle.context_id,
                 action = action_name,
@@ -7952,7 +7933,11 @@ impl Scp {
                 code: codes::CTX_2041.to_owned(),
             })??;
 
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        if let Err(e) = self
+            .inner
+            .sync_role_state_from_manager(&handle.context_id)
+            .await
+        {
             tracing::warn!(
                 context_id = %handle.context_id,
                 action = action_name,
@@ -8000,7 +7985,11 @@ impl Scp {
                 code: codes::CTX_2042.to_owned(),
             })?;
 
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        if let Err(e) = self
+            .inner
+            .sync_role_state_from_manager(&handle.context_id)
+            .await
+        {
             tracing::warn!(
                 context_id = %handle.context_id,
                 error = %e,
@@ -8047,7 +8036,11 @@ impl Scp {
                 code: codes::CTX_2043.to_owned(),
             })?;
 
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        if let Err(e) = self
+            .inner
+            .sync_role_state_from_manager(&handle.context_id)
+            .await
+        {
             tracing::warn!(
                 context_id = %handle.context_id,
                 error = %e,
@@ -8093,7 +8086,11 @@ impl Scp {
                 code: codes::CTX_2044.to_owned(),
             })?;
 
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        if let Err(e) = self
+            .inner
+            .sync_role_state_from_manager(&handle.context_id)
+            .await
+        {
             tracing::warn!(
                 context_id = %handle.context_id,
                 error = %e,
@@ -10973,6 +10970,7 @@ impl Scp {
             code: codes::VALID_7011.to_owned(),
         })?;
 
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 use scp_core::crypto::ucan::validate::parse_ucan;
@@ -10985,15 +10983,15 @@ impl Scp {
                 // Parse the token to extract the issuer DID for authorization.
                 let parsed = parse_ucan(&token).map_err(ScpError::from)?;
 
-                // Ensure UCAN state is registered for this context.
-                crate::runtime::ensure_ucan_registered(
+                // Ensure UCAN state is registered for this context on this instance.
+                bi.ensure_ucan_registered(
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
                 );
 
                 // Execute the full revocation pipeline within the UCAN state closure.
-                crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                bi.with_ucan_state(&handle.context_id, |ucan_state| {
                     let authorizer = BridgeRevocationAuthorizer {
                         issuer_did: parsed.payload.iss.clone(),
                         creator_did: ucan_state.creator_did.clone(),

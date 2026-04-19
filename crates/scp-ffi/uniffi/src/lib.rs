@@ -76,39 +76,15 @@ pub mod scp;
 #[cfg(feature = "server")]
 pub mod server;
 
-// Handle-affinity macro for every `#[uniffi::export]` entry that accepts a
-// handle with a stored `instance_id`.
-//
-// Resolves `bridge_instance_for_affinity` internally and checks each
-// `$handle.instance_id()` against the core's. Round 5 simplifier review
-// dropped the explicit `$core` parameter after confirming all 175 call
-// sites across the three bridges passed the same
-// `bridge_instance_for_affinity()?` value. If a future per-instance
-// `Scp::method` needs to target `&self.inner.core`, add a second macro
-// arm rather than re-expanding the default one.
-//
-// `$handle` must carry an inherent `instance_id(&self) -> u64` method.
-//
-// Usage:
-//
-// ```ignore
-// uniffi_check_handle!(handle);
-// uniffi_check_handle!(identity, context_handle);
-// ```
-#[macro_export]
-macro_rules! uniffi_check_handle {
-    ($($handle:expr),+ $(,)?) => {{
-        // `CoreFields` has an inherent `check_handle` method, so the
-        // trait need not be in scope. Mirrors the PyO3 bridge's
-        // `pyscp_check_handle!` pattern.
-        let __core = $crate::runtime::bridge_instance_for_affinity()?;
-        $(
-            __core
-                .check_handle($handle.instance_id())
-                .map_err($crate::ScpError::from)?;
-        )+
-    }};
-}
+// Phase D (#1695): `uniffi_check_handle!` macro deleted along with
+// `DEFAULT_BRIDGE_INSTANCE` and `bridge_instance_for_affinity`. Every call
+// site has been migrated to an `Scp` method that performs the check
+// inline with `self.inner.core.check_handle(handle.instance_id())`, so
+// the affinity compare routes against the caller's own bridge instance
+// instead of a shared default. There are no remaining callers of the
+// macro in the bridge surface; a handle passed to a method on a different
+// `Scp` will surface the same `SCP-PERM-3030` `HandleAffinityError`
+// through that inline check.
 
 // Re-export all bridge public items so UniFFI can find them at the crate root.
 pub use bridge::{
