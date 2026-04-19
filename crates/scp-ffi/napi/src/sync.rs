@@ -14,6 +14,7 @@ use scp_ffi_common::error_codes as codes;
 use scp_core::sync::{OfflineTier, SyncPolicy, classify_offline_duration};
 
 use crate::error::ScpNapiError;
+use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -65,6 +66,20 @@ fn validate_non_negative_timestamp(value: i64, name: &str) -> napi::Result<u64> 
 /// Returns `"short"`, `"extended"`, or `"long"`.
 #[napi]
 pub fn sync_classify_offline(last_relay_contact: i64, now: i64) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    sync_classify_offline_on(&bi, last_relay_contact, now)
+}
+
+/// Per-bridge-instance implementation of [`sync_classify_offline`].
+///
+/// Pure function — takes `_bi` only to preserve the `_on` helper shape used
+/// by the rest of the NAPI bridge. Offline-tier classification does not
+/// touch any per-bridge state.
+pub(crate) fn sync_classify_offline_on(
+    _bi: &NapiBridgeInstance,
+    last_relay_contact: i64,
+    now: i64,
+) -> napi::Result<String> {
     let last = validate_non_negative_timestamp(last_relay_contact, "last_relay_contact")?;
     let current = validate_non_negative_timestamp(now, "now")?;
     Ok(match classify_offline_duration(last, current) {
@@ -78,6 +93,19 @@ pub fn sync_classify_offline(last_relay_contact: i64, now: i64) -> napi::Result<
 #[must_use]
 #[napi]
 pub fn sync_get_policy() -> NapiSyncPolicy {
+    sync_get_policy_impl()
+}
+
+/// Per-bridge-instance implementation of [`sync_get_policy`].
+///
+/// Pure function — takes `_bi` only for `_on` helper shape symmetry.
+#[must_use]
+pub(crate) fn sync_get_policy_on(_bi: &NapiBridgeInstance) -> NapiSyncPolicy {
+    sync_get_policy_impl()
+}
+
+#[must_use]
+fn sync_get_policy_impl() -> NapiSyncPolicy {
     let policy = SyncPolicy::default();
 
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
@@ -98,6 +126,26 @@ pub fn sync_get_policy() -> NapiSyncPolicy {
 /// Returns `"short"`, `"extended"`, or `"long"`.
 #[napi]
 pub fn sync_classify_offline_custom(
+    last_relay_contact: i64,
+    now: i64,
+    tier_1_threshold_secs: i64,
+    tier_2_threshold_secs: i64,
+) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    sync_classify_offline_custom_on(
+        &bi,
+        last_relay_contact,
+        now,
+        tier_1_threshold_secs,
+        tier_2_threshold_secs,
+    )
+}
+
+/// Per-bridge-instance implementation of [`sync_classify_offline_custom`].
+///
+/// Pure function — takes `_bi` only to preserve the `_on` helper shape.
+pub(crate) fn sync_classify_offline_custom_on(
+    _bi: &NapiBridgeInstance,
     last_relay_contact: i64,
     now: i64,
     tier_1_threshold_secs: i64,

@@ -28,6 +28,7 @@ use scp_mcp::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 use scp_mcp::server::ContextProvider;
 
 use crate::error::ScpNapiError;
+use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -163,9 +164,14 @@ pub(crate) struct McpClientEntry {
 /// Fallback empty MCP server registry for when the default
 /// `NapiBridgeInstance` has not been initialized yet. Mirrors the
 /// `PyO3` `EMPTY_SERVER_REGISTRY` fallback pattern.
+//
+// Retained alongside the `*_on` helpers until the Phase 4 demolition slice
+// removes the free-function entry points and their fallback.
+#[allow(dead_code)]
 static EMPTY_SERVER_REGISTRY: OnceLock<DashMap<String, McpServerEntry>> = OnceLock::new();
 
 /// Fallback empty MCP client registry.
+#[allow(dead_code)]
 static EMPTY_CLIENT_REGISTRY: OnceLock<DashMap<String, McpClientEntry>> = OnceLock::new();
 
 /// Returns a reference to the default bridge instance's MCP server registry.
@@ -174,6 +180,9 @@ static EMPTY_CLIENT_REGISTRY: OnceLock<DashMap<String, McpClientEntry>> = OnceLo
 /// typed `mcp_server_registry` field on [`crate::runtime::NapiBridgeInstance`]
 /// in #1549 Phase 4 PR 2 commit 4. Falls back to an empty registry when the
 /// default instance has not been initialized yet.
+//
+// Retained until demolition slice; free functions migrated to `_on` helpers.
+#[allow(dead_code)]
 fn mcp_server_registry() -> &'static DashMap<String, McpServerEntry> {
     crate::runtime::default_bridge_instance_raw().map_or_else(
         || EMPTY_SERVER_REGISTRY.get_or_init(DashMap::new),
@@ -182,6 +191,9 @@ fn mcp_server_registry() -> &'static DashMap<String, McpServerEntry> {
 }
 
 /// Returns a reference to the default bridge instance's MCP client registry.
+//
+// Retained until demolition slice; free functions migrated to `_on` helpers.
+#[allow(dead_code)]
 fn mcp_client_registry() -> &'static DashMap<String, McpClientEntry> {
     crate::runtime::default_bridge_instance_raw().map_or_else(
         || EMPTY_CLIENT_REGISTRY.get_or_init(DashMap::new),
@@ -513,6 +525,16 @@ async fn run_mcp_stdio_server(
 #[napi]
 #[allow(clippy::unused_async)]
 pub async fn mcp_server_create(config: NapiMcpServerConfig) -> napi::Result<NapiMcpServerHandle> {
+    let bi = default_bridge_instance()?;
+    mcp_server_create_on(&bi, config).await
+}
+
+/// Per-bridge-instance implementation of [`mcp_server_create`].
+#[allow(clippy::unused_async)]
+pub(crate) async fn mcp_server_create_on(
+    bi: &NapiBridgeInstance,
+    config: NapiMcpServerConfig,
+) -> napi::Result<NapiMcpServerHandle> {
     if config.transport != "stdio" && config.transport != "sse" {
         return Err(ScpNapiError::Transport {
             message: format!(
@@ -579,12 +601,12 @@ pub async fn mcp_server_create(config: NapiMcpServerConfig) -> napi::Result<Napi
         stopped: false,
     };
 
-    mcp_server_registry().insert(handle_id.clone(), entry);
+    bi.mcp_server_registry().insert(handle_id.clone(), entry);
     crate::increment_handle_count();
 
     Ok(NapiMcpServerHandle {
         handle_id,
-        instance_id: crate::runtime::default_instance_id()?,
+        instance_id: bi.instance_id(),
     })
 }
 
@@ -592,8 +614,19 @@ pub async fn mcp_server_create(config: NapiMcpServerConfig) -> napi::Result<Napi
 #[napi]
 #[allow(clippy::unused_async)]
 pub async fn mcp_server_stop(handle: &NapiMcpServerHandle) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
-    let mut entry = mcp_server_registry()
+    let bi = default_bridge_instance()?;
+    mcp_server_stop_on(&bi, handle).await
+}
+
+/// Per-bridge-instance implementation of [`mcp_server_stop`].
+#[allow(clippy::unused_async)]
+pub(crate) async fn mcp_server_stop_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiMcpServerHandle,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let mut entry = bi
+        .mcp_server_registry()
         .get_mut(&handle.handle_id)
         .ok_or_else(|| {
             napi::Error::from(ScpNapiError::Transport {
@@ -619,7 +652,7 @@ pub async fn mcp_server_stop(handle: &NapiMcpServerHandle) -> napi::Result<()> {
     drop(entry);
 
     // Remove the server entry from the registry to prevent memory leak (#1165).
-    mcp_server_registry().remove(&handle.handle_id);
+    bi.mcp_server_registry().remove(&handle.handle_id);
 
     Ok(())
 }
@@ -631,6 +664,16 @@ pub async fn mcp_server_stop(handle: &NapiMcpServerHandle) -> napi::Result<()> {
 #[napi]
 #[allow(clippy::unused_async)]
 pub async fn mcp_client_connect_stdio(command: Vec<String>) -> napi::Result<NapiMcpClientHandle> {
+    let bi = default_bridge_instance()?;
+    mcp_client_connect_stdio_on(&bi, command).await
+}
+
+/// Per-bridge-instance implementation of [`mcp_client_connect_stdio`].
+#[allow(clippy::unused_async)]
+pub(crate) async fn mcp_client_connect_stdio_on(
+    bi: &NapiBridgeInstance,
+    command: Vec<String>,
+) -> napi::Result<NapiMcpClientHandle> {
     if command.is_empty() {
         return Err(ScpNapiError::Transport {
             message: "command must be a non-empty list".to_owned(),
@@ -659,12 +702,12 @@ pub async fn mcp_client_connect_stdio(command: Vec<String>) -> napi::Result<Napi
         client: Mutex::new(client),
     };
 
-    mcp_client_registry().insert(handle_id.clone(), entry);
+    bi.mcp_client_registry().insert(handle_id.clone(), entry);
     crate::increment_handle_count();
 
     Ok(NapiMcpClientHandle {
         handle_id,
-        instance_id: crate::runtime::default_instance_id()?,
+        instance_id: bi.instance_id(),
     })
 }
 
@@ -672,6 +715,16 @@ pub async fn mcp_client_connect_stdio(command: Vec<String>) -> napi::Result<Napi
 #[napi]
 #[allow(clippy::unused_async)]
 pub async fn mcp_client_connect_sse(url: String) -> napi::Result<NapiMcpClientHandle> {
+    let bi = default_bridge_instance()?;
+    mcp_client_connect_sse_on(&bi, url).await
+}
+
+/// Per-bridge-instance implementation of [`mcp_client_connect_sse`].
+#[allow(clippy::unused_async)]
+pub(crate) async fn mcp_client_connect_sse_on(
+    bi: &NapiBridgeInstance,
+    url: String,
+) -> napi::Result<NapiMcpClientHandle> {
     let transport = SseMcpTransport::connect(&url);
 
     let mut client = McpClient::new(McpClientTransportWrapper::Sse(transport));
@@ -687,12 +740,12 @@ pub async fn mcp_client_connect_sse(url: String) -> napi::Result<NapiMcpClientHa
         client: Mutex::new(client),
     };
 
-    mcp_client_registry().insert(handle_id.clone(), entry);
+    bi.mcp_client_registry().insert(handle_id.clone(), entry);
     crate::increment_handle_count();
 
     Ok(NapiMcpClientHandle {
         handle_id,
-        instance_id: crate::runtime::default_instance_id()?,
+        instance_id: bi.instance_id(),
     })
 }
 
@@ -700,8 +753,18 @@ pub async fn mcp_client_connect_sse(url: String) -> napi::Result<NapiMcpClientHa
 #[napi]
 #[allow(clippy::unused_async)]
 pub async fn mcp_client_disconnect(handle: &NapiMcpClientHandle) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
-    let removed = mcp_client_registry().remove(&handle.handle_id);
+    let bi = default_bridge_instance()?;
+    mcp_client_disconnect_on(&bi, handle).await
+}
+
+/// Per-bridge-instance implementation of [`mcp_client_disconnect`].
+#[allow(clippy::unused_async)]
+pub(crate) async fn mcp_client_disconnect_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiMcpClientHandle,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let removed = bi.mcp_client_registry().remove(&handle.handle_id);
     if removed.is_none() {
         return Err(ScpNapiError::Transport {
             message: format!("MCP client handle '{}' not found", handle.handle_id),
@@ -718,8 +781,19 @@ pub async fn mcp_client_disconnect(handle: &NapiMcpClientHandle) -> napi::Result
 pub async fn mcp_client_list_tools(
     handle: &NapiMcpClientHandle,
 ) -> napi::Result<Vec<NapiMcpToolInfo>> {
-    crate::napi_check_handle!(handle);
-    let entry = mcp_client_registry()
+    let bi = default_bridge_instance()?;
+    mcp_client_list_tools_on(&bi, handle).await
+}
+
+/// Per-bridge-instance implementation of [`mcp_client_list_tools`].
+#[allow(clippy::unused_async)]
+pub(crate) async fn mcp_client_list_tools_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiMcpClientHandle,
+) -> napi::Result<Vec<NapiMcpToolInfo>> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let entry = bi
+        .mcp_client_registry()
         .get(&handle.handle_id)
         .ok_or_else(|| {
             napi::Error::from(ScpNapiError::Transport {
@@ -764,8 +838,24 @@ pub async fn mcp_client_invoke(
     context_id: String,
     invoker_did: String,
 ) -> napi::Result<NapiMcpInvokeResult> {
-    crate::napi_check_handle!(handle);
-    let entry = mcp_client_registry()
+    let bi = default_bridge_instance()?;
+    mcp_client_invoke_on(&bi, handle, tool_name, input_json, context_id, invoker_did).await
+}
+
+/// Per-bridge-instance implementation of [`mcp_client_invoke`].
+#[allow(clippy::unused_async)]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) async fn mcp_client_invoke_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiMcpClientHandle,
+    tool_name: String,
+    input_json: String,
+    context_id: String,
+    invoker_did: String,
+) -> napi::Result<NapiMcpInvokeResult> {
+    crate::napi_check_handle!(&bi.core, handle);
+    let entry = bi
+        .mcp_client_registry()
         .get(&handle.handle_id)
         .ok_or_else(|| {
             napi::Error::from(ScpNapiError::Transport {
@@ -872,6 +962,21 @@ pub struct NapiAllowlistState {
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn mcp_configure_stdio_allowlist(additional_binaries: Vec<String>) -> napi::Result<()> {
+    let bi = default_bridge_instance()?;
+    mcp_configure_stdio_allowlist_on(&bi, additional_binaries)
+}
+
+/// Per-bridge-instance implementation of [`mcp_configure_stdio_allowlist`].
+///
+/// The stdio allowlist is currently a process-global singleton inside
+/// `scp-mcp::allowlist`, so the `bi` argument is carried for API symmetry
+/// today but does not scope state. When the allowlist is moved onto
+/// [`NapiBridgeInstance`] the wiring here will already be in place.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn mcp_configure_stdio_allowlist_on(
+    _bi: &NapiBridgeInstance,
+    additional_binaries: Vec<String>,
+) -> napi::Result<()> {
     allowlist::configure(&additional_binaries).map_err(|e| napi::Error::from(allowlist_err(e)))?;
     Ok(())
 }
@@ -886,6 +991,13 @@ pub fn mcp_configure_stdio_allowlist(additional_binaries: Vec<String>) -> napi::
 /// Throws if the allowlist lock is poisoned.
 #[napi]
 pub fn mcp_disable_stdio_allowlist() -> napi::Result<()> {
+    let bi = default_bridge_instance()?;
+    mcp_disable_stdio_allowlist_on(&bi)
+}
+
+/// Per-bridge-instance implementation of [`mcp_disable_stdio_allowlist`].
+/// See [`mcp_configure_stdio_allowlist_on`] for `bi` rationale.
+pub(crate) fn mcp_disable_stdio_allowlist_on(_bi: &NapiBridgeInstance) -> napi::Result<()> {
     allowlist::disable_enforcement().map_err(|e| napi::Error::from(allowlist_err(e)))?;
     Ok(())
 }
@@ -900,6 +1012,13 @@ pub fn mcp_disable_stdio_allowlist() -> napi::Result<()> {
 /// Throws if the allowlist lock is poisoned.
 #[napi]
 pub fn mcp_reset_stdio_allowlist() -> napi::Result<()> {
+    let bi = default_bridge_instance()?;
+    mcp_reset_stdio_allowlist_on(&bi)
+}
+
+/// Per-bridge-instance implementation of [`mcp_reset_stdio_allowlist`].
+/// See [`mcp_configure_stdio_allowlist_on`] for `bi` rationale.
+pub(crate) fn mcp_reset_stdio_allowlist_on(_bi: &NapiBridgeInstance) -> napi::Result<()> {
     allowlist::reset().map_err(|e| napi::Error::from(allowlist_err(e)))?;
     Ok(())
 }
@@ -915,6 +1034,15 @@ pub fn mcp_reset_stdio_allowlist() -> napi::Result<()> {
 /// Throws if the allowlist lock is poisoned.
 #[napi]
 pub fn mcp_get_stdio_allowlist() -> napi::Result<NapiAllowlistState> {
+    let bi = default_bridge_instance()?;
+    mcp_get_stdio_allowlist_on(&bi)
+}
+
+/// Per-bridge-instance implementation of [`mcp_get_stdio_allowlist`].
+/// See [`mcp_configure_stdio_allowlist_on`] for `bi` rationale.
+pub(crate) fn mcp_get_stdio_allowlist_on(
+    _bi: &NapiBridgeInstance,
+) -> napi::Result<NapiAllowlistState> {
     let state = allowlist::get_state().map_err(|e| napi::Error::from(allowlist_err(e)))?;
     Ok(NapiAllowlistState {
         allowed: state.allowed,

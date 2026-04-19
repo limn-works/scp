@@ -22,6 +22,7 @@ use scp_core::identity::{
 use scp_identity::SigningKeyId;
 
 use crate::error::ScpNapiError;
+use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
 
 // ---------------------------------------------------------------------------
 // Bridge functions
@@ -41,6 +42,23 @@ use crate::error::ScpNapiError;
 // ttl_seconds is u32 — idiomatic for JS platforms (max valid TTL is 300s).
 // PyO3/UniFFI bridges use u64 to match `Duration::from_secs` parameter type.
 pub fn scpid_challenge(audience: String, ttl_seconds: u32) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    scpid_challenge_on(&bi, audience, ttl_seconds)
+}
+
+/// Per-bridge-instance implementation of [`scpid_challenge`].
+///
+/// SCPID challenge generation is a pure operation over the audience and TTL
+/// — it does not touch bridge-instance state today. The `bi` parameter is
+/// accepted to match the uniform `_on` pattern used elsewhere so callers in
+/// [`crate::scp::Scp`] can route through their own instance, in anticipation
+/// of per-instance challenge-tracking (replay windows, nonce registries).
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn scpid_challenge_on(
+    _bi: &NapiBridgeInstance,
+    audience: String,
+    ttl_seconds: u32,
+) -> napi::Result<String> {
     let challenge = core_challenge(&audience, Duration::from_secs(u64::from(ttl_seconds)))
         .map_err(|e| ScpNapiError::Validation {
             message: e.to_string(),
@@ -73,6 +91,18 @@ pub fn scpid_sign(
     signing_key_id: String,
     challenge_json: String,
 ) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    scpid_sign_on(&bi, did, signing_key_id, challenge_json)
+}
+
+/// Per-bridge-instance implementation of [`scpid_sign`].
+#[cfg(feature = "allow_in_memory_custody")]
+pub(crate) fn scpid_sign_on(
+    bi: &NapiBridgeInstance,
+    did: String,
+    signing_key_id: String,
+    challenge_json: String,
+) -> napi::Result<String> {
     let key_id = parse_signing_key_id(&signing_key_id)?;
 
     let challenge: ScpIdChallenge =
@@ -81,7 +111,7 @@ pub fn scpid_sign(
             code: codes::IDENT_1038.to_owned(),
         })?;
 
-    Ok(crate::runtime::with_identity(&did, |entry| {
+    Ok(crate::runtime::with_identity(bi, &did, |entry| {
         let key_handle = match key_id {
             SigningKeyId::Active => entry.identity.active_signing_key,
             SigningKeyId::Agent => {
@@ -133,6 +163,16 @@ pub fn scpid_sign(
 /// ```
 #[napi]
 pub fn scpid_verify(response_json: String, challenge_json: String) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    scpid_verify_on(&bi, response_json, challenge_json)
+}
+
+/// Per-bridge-instance implementation of [`scpid_verify`].
+pub(crate) fn scpid_verify_on(
+    bi: &NapiBridgeInstance,
+    response_json: String,
+    challenge_json: String,
+) -> napi::Result<String> {
     let response: ScpIdResponse =
         serde_json::from_str(&response_json).map_err(|e| ScpNapiError::Validation {
             message: format!("invalid response JSON: {e}"),
@@ -145,7 +185,7 @@ pub fn scpid_verify(response_json: String, challenge_json: String) -> napi::Resu
             code: codes::IDENT_1038.to_owned(),
         })?;
 
-    let resolver = crate::runtime::did_resolver().ok_or_else(|| ScpNapiError::Identity {
+    let resolver = crate::runtime::did_resolver(bi).ok_or_else(|| ScpNapiError::Identity {
         message: "DID resolver not initialized — create an identity with \
                       identityCreate before calling scpidVerify"
             .to_owned(),

@@ -1017,7 +1017,7 @@ pub fn init_context_manager_with_relay_transport(
 /// `ProtocolRepositoryTrustBridge` backed by the configured storage (either
 /// encrypted in-memory or SQLCipher-on-disk).
 #[must_use]
-pub fn protocol_repository(bi: &NapiBridgeInstance) -> &ProtocolRepoVariant {
+pub const fn protocol_repository(bi: &NapiBridgeInstance) -> &ProtocolRepoVariant {
     &bi.protocol_repository
 }
 
@@ -1027,6 +1027,10 @@ pub fn protocol_repository(bi: &NapiBridgeInstance) -> &ProtocolRepoVariant {
 /// Delegates to [`scp_ffi_common::bridge_runtime::build_event_log_provider`].
 /// Returns both the event log provider and the underlying `ProtocolRepository`
 /// (for registration in `NapiBridgeInstance`).
+//
+// Retained alongside the `_on` variants used by per-bridge initialization
+// paths. Deleted in the Phase 4 demolition slice.
+#[allow(dead_code)]
 pub(crate) fn build_event_log_provider() -> (
     Box<dyn ContextEventLogProvider>,
     Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
@@ -1822,7 +1826,8 @@ mod tests {
         // being called (possibly by other tests) before asserting.
         init_context_manager_for_test();
 
-        let cm = context_manager().expect("context_manager should be initialized");
+        let bi = default_bridge_instance().expect("default bridge");
+        let cm = context_manager(&bi).expect("context_manager should be initialized");
         let core = bridge_instance().expect("bridge_instance should be initialized");
 
         // Both should point to the same ContextManager allocation.

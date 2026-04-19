@@ -30,6 +30,7 @@ use scp_core::provenance::evaluate::{SourceContextState, evaluate_quality, updat
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 
 use crate::error::ScpNapiError;
+use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
 
 // ---------------------------------------------------------------------------
 // Bridge functions
@@ -42,6 +43,21 @@ use crate::error::ScpNapiError;
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn evaluate_provenance_quality(
+    source_context: Option<String>,
+    source_type: String,
+    context_state: String,
+    counterparties: Option<Vec<String>>,
+) -> napi::Result<u32> {
+    let bi = default_bridge_instance()?;
+    evaluate_provenance_quality_on(&bi, source_context, source_type, context_state, counterparties)
+        .await
+}
+
+/// Per-bridge-instance implementation of [`evaluate_provenance_quality`].
+#[allow(clippy::unused_async)]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) async fn evaluate_provenance_quality_on(
+    _bi: &NapiBridgeInstance,
     source_context: Option<String>,
     source_type: String,
     context_state: String,
@@ -84,6 +100,38 @@ pub async fn evaluate_provenance_quality(
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)] // napi-rs requires explicit params
 pub fn provenance_attach(
+    source_context_id: String,
+    source_type: String,
+    memory_scope: String,
+    members: Vec<String>,
+    target_context_id: String,
+    actor_did: String,
+    existing_chain_depth: Option<u32>,
+    discovery_method: Option<String>,
+    purpose: Option<String>,
+    counterparty_policy: Option<String>,
+) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    provenance_attach_on(
+        &bi,
+        source_context_id,
+        source_type,
+        memory_scope,
+        members,
+        target_context_id,
+        actor_did,
+        existing_chain_depth,
+        discovery_method,
+        purpose,
+        counterparty_policy,
+    )
+}
+
+/// Per-bridge-instance implementation of [`provenance_attach`].
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)] // napi-rs requires explicit params
+pub(crate) fn provenance_attach_on(
+    bi: &NapiBridgeInstance,
     source_context_id: String,
     source_type: String,
     memory_scope: String,
@@ -156,6 +204,7 @@ pub fn provenance_attach(
     // Best-effort: log warning if context not found (provenance_attach
     // can be called without a runtime context, e.g. in unit tests).
     if let Err(e) = append_provenance_event(
+        bi,
         &source_context_id,
         &actor_did,
         scp_event_log::EventType::ProvenanceAttached,
@@ -170,6 +219,7 @@ pub fn provenance_attach(
 
     // Record ProvenanceReceived in the target context event log.
     if let Err(e) = append_provenance_event(
+        bi,
         &target_context_id,
         &actor_did,
         scp_event_log::EventType::ProvenanceReceived,
@@ -223,6 +273,16 @@ pub fn provenance_check_chain_depth(
     chain_depth: u32,
     max_depth: Option<u32>,
 ) -> napi::Result<bool> {
+    let bi = default_bridge_instance()?;
+    provenance_check_chain_depth_on(&bi, chain_depth, max_depth)
+}
+
+/// Per-bridge-instance implementation of [`provenance_check_chain_depth`].
+pub(crate) fn provenance_check_chain_depth_on(
+    _bi: &NapiBridgeInstance,
+    chain_depth: u32,
+    max_depth: Option<u32>,
+) -> napi::Result<bool> {
     let depth = u8::try_from(chain_depth).map_err(|_| {
         napi::Error::from_reason(format!(
             "chain_depth {chain_depth} exceeds u8 range (max 255)"
@@ -258,6 +318,16 @@ pub fn provenance_check_chain_depth(
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn provenance_redact_counterparties(provenance_json: String) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    provenance_redact_counterparties_on(&bi, provenance_json)
+}
+
+/// Per-bridge-instance implementation of [`provenance_redact_counterparties`].
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn provenance_redact_counterparties_on(
+    _bi: &NapiBridgeInstance,
+    provenance_json: String,
+) -> napi::Result<String> {
     let mut prov: DataProvenance = serde_json::from_str(&provenance_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid provenance JSON: {e}"),
@@ -283,6 +353,17 @@ pub fn provenance_redact_counterparties(provenance_json: String) -> napi::Result
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn provenance_pseudonymize_counterparties(
+    provenance_json: String,
+    pseudonym_key_hex: String,
+) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    provenance_pseudonymize_counterparties_on(&bi, provenance_json, pseudonym_key_hex)
+}
+
+/// Per-bridge-instance implementation of [`provenance_pseudonymize_counterparties`].
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn provenance_pseudonymize_counterparties_on(
+    _bi: &NapiBridgeInstance,
     provenance_json: String,
     pseudonym_key_hex: String,
 ) -> napi::Result<String> {
@@ -321,6 +402,17 @@ pub fn provenance_update_source_type(
     provenance_json: String,
     new_state: String,
 ) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    provenance_update_source_type_on(&bi, provenance_json, new_state)
+}
+
+/// Per-bridge-instance implementation of [`provenance_update_source_type`].
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn provenance_update_source_type_on(
+    _bi: &NapiBridgeInstance,
+    provenance_json: String,
+    new_state: String,
+) -> napi::Result<String> {
     let mut prov: DataProvenance = serde_json::from_str(&provenance_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid provenance JSON: {e}"),
@@ -349,6 +441,7 @@ pub fn provenance_update_source_type(
 ///
 /// Follows the unsigned-event pattern used by `ToolInvoked` in the MCP bridge.
 fn append_provenance_event(
+    bi: &NapiBridgeInstance,
     context_id: &str,
     actor_did: &str,
     event_type: scp_event_log::EventType,
@@ -359,7 +452,7 @@ fn append_provenance_event(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
 
-    crate::runtime::with_context(context_id, |state| {
+    crate::runtime::with_context(bi, context_id, |state| {
         let sequence = scp_event_log::tree::event_count(&state.core.event_log);
         let prev_hash = if state.core.event_log.leaves().is_empty() {
             scp_event_log::tree::GENESIS_PREV_HASH

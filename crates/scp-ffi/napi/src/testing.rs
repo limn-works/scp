@@ -19,7 +19,7 @@ use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams, c
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
 
 use crate::error::ScpNapiError;
-use crate::runtime::default_bridge_instance;
+use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
 
 // ---------------------------------------------------------------------------
 // Shared network
@@ -44,17 +44,28 @@ use crate::runtime::default_bridge_instance;
 /// All nodes created via `fullstack_create_node` on the same instance share
 /// the same `KeyExchange` so Welcome messages and sender keys can be
 /// exchanged between them.
+//
+// Retained alongside `with_network_on` until the Phase 4 demolition slice.
+#[allow(dead_code)]
 fn with_network<F, R>(f: F) -> napi::Result<R>
 where
     F: FnOnce(&FullStackNetwork) -> R,
 {
     let bi = default_bridge_instance()?;
+    Ok(with_network_on(&bi, f))
+}
+
+/// Per-bridge-instance implementation of [`with_network`].
+fn with_network_on<F, R>(bi: &NapiBridgeInstance, f: F) -> R
+where
+    F: FnOnce(&FullStackNetwork) -> R,
+{
     let mut guard = bi
         .network()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let network = guard.get_or_insert_with(FullStackNetwork::new);
-    Ok(f(network))
+    f(network)
 }
 
 /// Returns a permissive key resolver that always returns `None`.
@@ -112,9 +123,17 @@ impl NapiFullStackNode {
 /// sender key exchange between them.
 #[napi]
 pub fn fullstack_create_node(did: String) -> napi::Result<NapiFullStackNode> {
-    let instance_id = crate::runtime::default_instance_id()
-        .unwrap_or(scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID);
-    with_network(|network| {
+    let bi = default_bridge_instance()?;
+    Ok(fullstack_create_node_on(&bi, did))
+}
+
+/// Per-bridge-instance implementation of [`fullstack_create_node`].
+pub(crate) fn fullstack_create_node_on(
+    bi: &NapiBridgeInstance,
+    did: String,
+) -> NapiFullStackNode {
+    let instance_id = bi.instance_id();
+    with_network_on(bi, |network| {
         let node = network.create_node(&did, permissive_key_resolver());
         NapiFullStackNode {
             inner: node,
@@ -131,12 +150,17 @@ pub fn fullstack_create_node(did: String) -> napi::Result<NapiFullStackNode> {
 #[napi]
 pub fn fullstack_reset_network() -> napi::Result<()> {
     let bi = default_bridge_instance()?;
+    fullstack_reset_network_on(&bi);
+    Ok(())
+}
+
+/// Per-bridge-instance implementation of [`fullstack_reset_network`].
+pub(crate) fn fullstack_reset_network_on(bi: &NapiBridgeInstance) {
     let mut guard = bi
         .network()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *guard = None;
-    Ok(())
 }
 
 /// Creates an encrypted context owned by the given node.
@@ -146,6 +170,21 @@ pub fn fullstack_reset_network() -> napi::Result<()> {
 /// `governance` (string) fields.
 #[napi]
 pub fn fullstack_create_context(
+    node: &NapiFullStackNode,
+    context_id: String,
+    ceiling_json: String,
+) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    fullstack_create_context_on(&bi, node, context_id, ceiling_json)
+}
+
+/// Per-bridge-instance implementation of [`fullstack_create_context`].
+///
+/// The operation runs entirely on the caller-supplied `NapiFullStackNode`
+/// — `bi` is carried for `_on` helper shape symmetry and will be used when
+/// the test harness moves context registration onto the bridge instance.
+pub(crate) fn fullstack_create_context_on(
+    _bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,
     context_id: String,
     ceiling_json: String,
@@ -219,6 +258,17 @@ pub fn fullstack_add_member(
     context_id: String,
     member_did: String,
 ) -> napi::Result<()> {
+    let bi = default_bridge_instance()?;
+    fullstack_add_member_on(&bi, node, context_id, member_did)
+}
+
+/// Per-bridge-instance implementation of [`fullstack_add_member`].
+pub(crate) fn fullstack_add_member_on(
+    _bi: &NapiBridgeInstance,
+    node: &NapiFullStackNode,
+    context_id: String,
+    member_did: String,
+) -> napi::Result<()> {
     let rt = crate::runtime();
 
     let handle = {
@@ -253,6 +303,16 @@ pub fn fullstack_add_member(
 /// `fullstack_remove_member` calls on this node.
 #[napi]
 pub fn fullstack_join_from_welcome(
+    node: &NapiFullStackNode,
+    context_id: String,
+) -> napi::Result<()> {
+    let bi = default_bridge_instance()?;
+    fullstack_join_from_welcome_on(&bi, node, context_id)
+}
+
+/// Per-bridge-instance implementation of [`fullstack_join_from_welcome`].
+pub(crate) fn fullstack_join_from_welcome_on(
+    _bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,
     context_id: String,
 ) -> napi::Result<()> {
@@ -342,6 +402,17 @@ pub fn fullstack_sync_sender_keys(
     node_b: &NapiFullStackNode,
     context_id: String,
 ) -> napi::Result<()> {
+    let bi = default_bridge_instance()?;
+    fullstack_sync_sender_keys_on(&bi, node_a, node_b, context_id)
+}
+
+/// Per-bridge-instance implementation of [`fullstack_sync_sender_keys`].
+pub(crate) fn fullstack_sync_sender_keys_on(
+    _bi: &NapiBridgeInstance,
+    node_a: &NapiFullStackNode,
+    node_b: &NapiFullStackNode,
+    context_id: String,
+) -> napi::Result<()> {
     let ctx_bytes = context_id_bytes(&context_id);
     let did_a = node_a.inner.did.to_string();
     let did_b = node_b.inner.did.to_string();
@@ -392,6 +463,17 @@ pub fn fullstack_sync_sender_keys(
 /// by the node's `CapturingTransport` and returned here.
 #[napi]
 pub fn fullstack_send_message(
+    node: &NapiFullStackNode,
+    context_id: String,
+    payload: Buffer,
+) -> napi::Result<Buffer> {
+    let bi = default_bridge_instance()?;
+    fullstack_send_message_on(&bi, node, context_id, payload)
+}
+
+/// Per-bridge-instance implementation of [`fullstack_send_message`].
+pub(crate) fn fullstack_send_message_on(
+    _bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,
     context_id: String,
     payload: Buffer,
@@ -452,6 +534,18 @@ pub fn fullstack_decrypt_message(
     ciphertext: Buffer,
     sender_did: String,
 ) -> napi::Result<Buffer> {
+    let bi = default_bridge_instance()?;
+    fullstack_decrypt_message_on(&bi, node, context_id, ciphertext, sender_did)
+}
+
+/// Per-bridge-instance implementation of [`fullstack_decrypt_message`].
+pub(crate) fn fullstack_decrypt_message_on(
+    _bi: &NapiBridgeInstance,
+    node: &NapiFullStackNode,
+    context_id: String,
+    ciphertext: Buffer,
+    sender_did: String,
+) -> napi::Result<Buffer> {
     let ctx_bytes = context_id_bytes(&context_id);
     let plaintext = node
         .inner
@@ -472,6 +566,17 @@ pub fn fullstack_decrypt_message(
 /// new messages (MLS forward secrecy).
 #[napi]
 pub fn fullstack_remove_member(
+    node: &NapiFullStackNode,
+    context_id: String,
+    member_did: String,
+) -> napi::Result<()> {
+    let bi = default_bridge_instance()?;
+    fullstack_remove_member_on(&bi, node, context_id, member_did)
+}
+
+/// Per-bridge-instance implementation of [`fullstack_remove_member`].
+pub(crate) fn fullstack_remove_member_on(
+    _bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,
     context_id: String,
     member_did: String,

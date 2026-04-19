@@ -1024,21 +1024,22 @@ mod tests {
     fn revocation_persists_across_with_context_calls() {
         use crate::runtime;
 
+        let bi = runtime::default_bridge_instance().expect("default bridge");
         // Use a unique context ID per test to avoid cross-test interference.
         let context_id = format!("ctx-revoke-persist-{}", uuid::Uuid::new_v4());
 
         // Manually register a context in the runtime registry.
-        runtime::register_test_context(&context_id, "did:dht:zCreator");
+        runtime::register_test_context(&bi, &context_id, "did:dht:zCreator");
 
         // First call: revoke a CID.
-        runtime::with_context(&context_id, |rt| {
+        runtime::with_context(&bi, &context_id, |rt| {
             rt.core.revocation_list.revoke("revoked-cid-123".to_owned());
             Ok(())
         })
         .unwrap();
 
         // Second call: verify the revocation persists.
-        let is_revoked = runtime::with_context(&context_id, |rt| {
+        let is_revoked = runtime::with_context(&bi, &context_id, |rt| {
             Ok(rt.core.revocation_list.is_revoked("revoked-cid-123"))
         })
         .unwrap();
@@ -1049,7 +1050,7 @@ mod tests {
         );
 
         // Unrevoked CIDs should not be affected.
-        let other_revoked = runtime::with_context(&context_id, |rt| {
+        let other_revoked = runtime::with_context(&bi, &context_id, |rt| {
             Ok(rt.core.revocation_list.is_revoked("other-cid-456"))
         })
         .unwrap();
@@ -1068,8 +1069,9 @@ mod tests {
     fn nonce_replay_detected_across_with_context_calls() {
         use crate::runtime;
 
+        let bi = runtime::default_bridge_instance().expect("default bridge");
         let context_id = format!("ctx-nonce-persist-{}", uuid::Uuid::new_v4());
-        runtime::register_test_context(&context_id, "did:dht:zCreator");
+        runtime::register_test_context(&bi, &context_id, "did:dht:zCreator");
 
         let now_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1080,7 +1082,7 @@ mod tests {
         let expiry = now_secs + 3600;
 
         // First call: record the nonce — should succeed.
-        let first_result = runtime::with_context(&context_id, |rt| {
+        let first_result = runtime::with_context(&bi, &context_id, |rt| {
             rt.core
                 .nonce_tracker
                 .check_and_record(&nonce, expiry)
@@ -1092,7 +1094,7 @@ mod tests {
         assert!(first_result.is_ok(), "first nonce use should succeed");
 
         // Second call: replay the same nonce — should fail.
-        let second_result = runtime::with_context(&context_id, |rt| {
+        let second_result = runtime::with_context(&bi, &context_id, |rt| {
             rt.core
                 .nonce_tracker
                 .check_and_record(&nonce, expiry)
@@ -1108,7 +1110,7 @@ mod tests {
 
         // A different nonce should succeed.
         let different_nonce = format!("{}-bbccddee22334455bbccddee22334455", now_millis + 1);
-        let third_result = runtime::with_context(&context_id, |rt| {
+        let third_result = runtime::with_context(&bi, &context_id, |rt| {
             rt.core
                 .nonce_tracker
                 .check_and_record(&different_nonce, expiry)
@@ -1129,9 +1131,10 @@ mod tests {
         use crate::runtime;
         use std::cell::RefCell;
 
+        let bi = runtime::default_bridge_instance().expect("default bridge");
         let context_id = format!("ctx-revoke-wire-{}", uuid::Uuid::new_v4());
         let creator_did = "did:dht:zCreator";
-        runtime::register_test_context(&context_id, creator_did);
+        runtime::register_test_context(&bi, &context_id, creator_did);
 
         // Build a deterministic token string for revocation.
         let test_token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
@@ -1143,7 +1146,7 @@ mod tests {
         let issuer_did = parsed.payload.iss;
 
         // Simulate the full revocation pipeline via revoke_ucan.
-        runtime::with_context(&context_id, |rt| {
+        runtime::with_context(&bi, &context_id, |rt| {
             let authorizer = BridgeRevocationAuthorizer {
                 issuer_did: issuer_did.clone(),
                 creator_did: rt.core.creator_did.clone(),
@@ -1170,7 +1173,7 @@ mod tests {
 
         // Verify revocation is detected by the checker.
         let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(test_token);
-        let checker_says_revoked = runtime::with_context(&context_id, |rt| {
+        let checker_says_revoked = runtime::with_context(&bi, &context_id, |rt| {
             let checker = BridgeRevocationChecker {
                 revocation_list: &rt.core.revocation_list,
             };
@@ -1184,7 +1187,7 @@ mod tests {
         );
 
         // Verify a TokenRevoked event was appended to the event log.
-        let event_count = runtime::with_context(&context_id, |rt| {
+        let event_count = runtime::with_context(&bi, &context_id, |rt| {
             Ok(scp_event_log::tree::event_count(&rt.core.event_log))
         })
         .unwrap();
@@ -1199,9 +1202,10 @@ mod tests {
         use crate::runtime;
         use std::cell::RefCell;
 
+        let bi = runtime::default_bridge_instance().expect("default bridge");
         let context_id = format!("ctx-revoke-unauth-{}", uuid::Uuid::new_v4());
         let creator_did = "did:dht:zCreator";
-        runtime::register_test_context(&context_id, creator_did);
+        runtime::register_test_context(&bi, &context_id, creator_did);
 
         let test_token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
             eyJpc3MiOiJkaWQ6ZGh0OnpDcmVhdG9yIiwiYXVkIjoiZGlkOmRodDp6TWVtYmVyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ.\
@@ -1212,7 +1216,7 @@ mod tests {
         let issuer_did = parsed.payload.iss;
 
         // Attempt revocation by an unauthorized DID (not issuer, not creator).
-        let result = runtime::with_context(&context_id, |rt| {
+        let result = runtime::with_context(&bi, &context_id, |rt| {
             let authorizer = BridgeRevocationAuthorizer {
                 issuer_did: issuer_did.clone(),
                 creator_did: rt.core.creator_did.clone(),
@@ -1285,8 +1289,11 @@ mod tests {
         let did_a = identity_a.did.clone();
         let did_b = identity_b.did.clone();
 
+        let bi = runtime::default_bridge_instance().expect("default bridge");
+
         // Register both in the global identity registry.
         runtime::register_identity(
+            &bi,
             &did_a,
             runtime::NapiIdentityEntry {
                 identity: identity_a,
@@ -1296,6 +1303,7 @@ mod tests {
             },
         );
         runtime::register_identity(
+            &bi,
             &did_b,
             runtime::NapiIdentityEntry {
                 identity: identity_b,
@@ -1307,7 +1315,7 @@ mod tests {
 
         // Look up identity A — must get A's DID, not B's.
         let looked_up_did_a =
-            runtime::with_identity(&did_a, |entry| Ok(entry.identity.did.clone())).unwrap();
+            runtime::with_identity(&bi, &did_a, |entry| Ok(entry.identity.did.clone())).unwrap();
         assert_eq!(
             looked_up_did_a, did_a,
             "registry must return identity A's DID for A's DID"
@@ -1315,7 +1323,7 @@ mod tests {
 
         // Look up identity B — must get B's DID, not A's.
         let looked_up_did_b =
-            runtime::with_identity(&did_b, |entry| Ok(entry.identity.did.clone())).unwrap();
+            runtime::with_identity(&bi, &did_b, |entry| Ok(entry.identity.did.clone())).unwrap();
         assert_eq!(
             looked_up_did_b, did_b,
             "registry must return identity B's DID for B's DID"
@@ -1324,10 +1332,10 @@ mod tests {
         // Cross-check: the custody Arc pointers must be different,
         // confirming different key material is returned for each DID.
         let custody_ptr_a =
-            runtime::with_identity(&did_a, |entry| Ok(Arc::as_ptr(&entry.custody) as usize))
+            runtime::with_identity(&bi, &did_a, |entry| Ok(Arc::as_ptr(&entry.custody) as usize))
                 .unwrap();
         let custody_ptr_b =
-            runtime::with_identity(&did_b, |entry| Ok(Arc::as_ptr(&entry.custody) as usize))
+            runtime::with_identity(&bi, &did_b, |entry| Ok(Arc::as_ptr(&entry.custody) as usize))
                 .unwrap();
         assert_ne!(
             custody_ptr_a, custody_ptr_b,
@@ -1336,8 +1344,8 @@ mod tests {
         );
 
         // Clean up: remove both identities from the registry.
-        runtime::remove_identity(&did_a);
-        runtime::remove_identity(&did_b);
+        runtime::remove_identity(&bi, &did_a);
+        runtime::remove_identity(&bi, &did_b);
     }
 
     #[cfg(feature = "allow_in_memory_custody")]
@@ -1361,8 +1369,11 @@ mod tests {
         let (identity, doc) = rt.block_on(dht.create(&custody.0)).unwrap();
         let did = identity.did.clone();
 
+        let bi = runtime::default_bridge_instance().expect("default bridge");
+
         // Register the identity.
         runtime::register_identity(
+            &bi,
             &did,
             runtime::NapiIdentityEntry {
                 identity,
@@ -1374,16 +1385,16 @@ mod tests {
 
         // Verify it is present.
         assert!(
-            runtime::with_identity(&did, |_| Ok(())).is_ok(),
+            runtime::with_identity(&bi, &did, |_| Ok(())).is_ok(),
             "identity should be found after registration"
         );
 
         // Remove it.
-        runtime::remove_identity(&did);
+        runtime::remove_identity(&bi, &did);
 
         // Verify it is gone.
         assert!(
-            runtime::with_identity(&did, |_| Ok(())).is_err(),
+            runtime::with_identity(&bi, &did, |_| Ok(())).is_err(),
             "identity should not be found after remove_identity"
         );
     }
@@ -1409,8 +1420,11 @@ mod tests {
         let (identity, doc) = rt.block_on(dht.create(&custody.0)).unwrap();
         let did = identity.did.clone();
 
+        let bi = runtime::default_bridge_instance().expect("default bridge");
+
         // Register the identity.
         runtime::register_identity(
+            &bi,
             &did,
             runtime::NapiIdentityEntry {
                 identity,
@@ -1422,13 +1436,13 @@ mod tests {
 
         // First removal should return true.
         assert!(
-            runtime::remove_identity_if_present(&did),
+            runtime::remove_identity_if_present(&bi, &did),
             "remove_identity_if_present should return true for present identity"
         );
 
         // Second removal should return false.
         assert!(
-            !runtime::remove_identity_if_present(&did),
+            !runtime::remove_identity_if_present(&bi, &did),
             "remove_identity_if_present should return false for absent identity"
         );
     }

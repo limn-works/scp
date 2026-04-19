@@ -69,6 +69,11 @@ fn map_transport_lock_error(e: TransportLockError) -> ScpNapiError {
 ///
 /// Returns `ScpNapiError::Transport` if the lock is poisoned or the bridge
 /// is not initialized.
+//
+// Retained alongside `set_transport_manager_on` until the Phase 4 demolition
+// slice deletes the free-function transport entry points. Tests still exercise
+// this path; suppress the unused-function lint rather than delete prematurely.
+#[allow(dead_code)]
 fn set_transport_manager(manager: scp_transport::TransportManager) -> napi::Result<()> {
     // Try existing bridge instance first; fall back to lazy creation
     // from the existing ContextManager.
@@ -128,6 +133,9 @@ pub(crate) fn set_transport_manager_arc(
 ///
 /// Returns `ScpNapiError::Transport` if the lock is poisoned, no
 /// transport manager has been initialized, or the bridge is not initialized.
+//
+// Retained alongside `with_transport_manager_on` until demolition slice.
+#[allow(dead_code)]
 pub(crate) fn with_transport_manager<T>(
     f: impl FnOnce(&scp_transport::TransportManager) -> napi::Result<T>,
 ) -> napi::Result<T> {
@@ -156,6 +164,9 @@ pub(crate) fn with_transport_manager_on<T>(
 ///
 /// Returns `ScpNapiError::Transport` if the lock is poisoned, no
 /// transport manager has been initialized, or the manager is in use.
+//
+// Retained alongside `with_transport_manager_mut_on` until demolition slice.
+#[allow(dead_code)]
 pub(crate) fn with_transport_manager_mut<T>(
     f: impl FnOnce(&mut scp_transport::TransportManager) -> napi::Result<T>,
 ) -> napi::Result<T> {
@@ -175,6 +186,9 @@ pub(crate) fn with_transport_manager_mut_on<T>(
 }
 
 /// Returns `true` if a transport manager has been initialized.
+//
+// Retained alongside `has_transport_manager_on` until demolition slice.
+#[allow(dead_code)]
 fn has_transport_manager() -> bool {
     crate::runtime::bridge_instance().is_ok_and(scp_ffi_common::CoreFields::has_transport)
 }
@@ -204,6 +218,9 @@ pub(crate) fn get_transport_manager() -> Option<Arc<scp_transport::TransportMana
 ///
 /// Returns `ScpNapiError::Transport` if the lock is poisoned or the bridge
 /// is not initialized.
+//
+// Retained alongside `clear_transport_manager_on` until demolition slice.
+#[allow(dead_code)]
 fn clear_transport_manager() -> napi::Result<()> {
     let bi = crate::runtime::bridge_instance()?;
     bi.clear_transport()

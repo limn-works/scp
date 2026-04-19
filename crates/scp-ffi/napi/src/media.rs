@@ -23,6 +23,7 @@ use scp_media::signaling::{
 };
 
 use crate::error::ScpNapiError;
+use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -93,6 +94,19 @@ fn session_to_json(session: &MediaSession) -> napi::Result<String> {
 /// Returns `true` if the capability is present.
 #[napi]
 pub fn media_check_capability(ceiling: Vec<String>, capability: String) -> napi::Result<bool> {
+    let bi = default_bridge_instance()?;
+    media_check_capability_on(&bi, ceiling, capability)
+}
+
+/// Per-bridge-instance implementation of [`media_check_capability`].
+///
+/// Media capability validation is pure — the `bi` parameter is carried for
+/// `_on` helper shape symmetry with the rest of the bridge.
+pub(crate) fn media_check_capability_on(
+    _bi: &NapiBridgeInstance,
+    ceiling: Vec<String>,
+    capability: String,
+) -> napi::Result<bool> {
     let cap = parse_media_capability(&capability)?;
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
@@ -108,6 +122,20 @@ pub fn media_check_capability(ceiling: Vec<String>, capability: String) -> napi:
 #[napi]
 #[allow(clippy::too_many_arguments)]
 pub fn media_initiate_session(
+    context_id: String,
+    ceiling: Vec<String>,
+    capabilities: Vec<String>,
+    participants: Vec<String>,
+    timestamp: f64,
+) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    media_initiate_session_on(&bi, context_id, ceiling, capabilities, participants, timestamp)
+}
+
+/// Per-bridge-instance implementation of [`media_initiate_session`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn media_initiate_session_on(
+    _bi: &NapiBridgeInstance,
     context_id: String,
     ceiling: Vec<String>,
     capabilities: Vec<String>,
@@ -147,6 +175,15 @@ pub fn media_initiate_session(
 /// Takes a JSON string representing the session and returns the updated session.
 #[napi]
 pub fn media_activate_session(session_json: String) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    media_activate_session_on(&bi, session_json)
+}
+
+/// Per-bridge-instance implementation of [`media_activate_session`].
+pub(crate) fn media_activate_session_on(
+    _bi: &NapiBridgeInstance,
+    session_json: String,
+) -> napi::Result<String> {
     let mut session: MediaSession = serde_json::from_str(&session_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid session JSON: {e}"),
@@ -163,6 +200,16 @@ pub fn media_activate_session(session_json: String) -> napi::Result<String> {
 /// Takes a JSON string and returns the updated session.
 #[napi]
 pub fn media_join_session(session_json: String, participant_did: String) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    media_join_session_on(&bi, session_json, participant_did)
+}
+
+/// Per-bridge-instance implementation of [`media_join_session`].
+pub(crate) fn media_join_session_on(
+    _bi: &NapiBridgeInstance,
+    session_json: String,
+    participant_did: String,
+) -> napi::Result<String> {
     let mut session: MediaSession = serde_json::from_str(&session_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid session JSON: {e}"),
@@ -179,6 +226,16 @@ pub fn media_join_session(session_json: String, participant_did: String) -> napi
 /// Returns a JSON string with `session` and `metadata` keys.
 #[napi]
 pub fn media_end_session(session_json: String, timestamp: f64) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    media_end_session_on(&bi, session_json, timestamp)
+}
+
+/// Per-bridge-instance implementation of [`media_end_session`].
+pub(crate) fn media_end_session_on(
+    _bi: &NapiBridgeInstance,
+    session_json: String,
+    timestamp: f64,
+) -> napi::Result<String> {
     let mut session: MediaSession = serde_json::from_str(&session_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid session JSON: {e}"),
@@ -230,6 +287,17 @@ pub fn media_create_offer(
     sdp: String,
     sender_did: String,
 ) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    media_create_offer_on(&bi, session_id, sdp, sender_did)
+}
+
+/// Per-bridge-instance implementation of [`media_create_offer`].
+pub(crate) fn media_create_offer_on(
+    _bi: &NapiBridgeInstance,
+    session_id: String,
+    sdp: String,
+    sender_did: String,
+) -> napi::Result<String> {
     let (sid, msg) = create_offer(&session_id, sdp, sender_did.into());
     let msg_json = String::from_utf8(serialize_signaling(&msg).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
@@ -261,6 +329,17 @@ pub fn media_create_offer(
 /// Returns a JSON string with `session_id` and `message` keys.
 #[napi]
 pub fn media_create_answer(
+    session_id: String,
+    sdp: String,
+    sender_did: String,
+) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    media_create_answer_on(&bi, session_id, sdp, sender_did)
+}
+
+/// Per-bridge-instance implementation of [`media_create_answer`].
+pub(crate) fn media_create_answer_on(
+    _bi: &NapiBridgeInstance,
     session_id: String,
     sdp: String,
     sender_did: String,
@@ -297,6 +376,20 @@ pub fn media_create_answer(
 #[napi]
 #[allow(clippy::too_many_arguments)]
 pub fn media_create_ice_candidate(
+    session_id: String,
+    candidate: String,
+    sender_did: String,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u32>,
+) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    media_create_ice_candidate_on(&bi, session_id, candidate, sender_did, sdp_mid, sdp_mline_index)
+}
+
+/// Per-bridge-instance implementation of [`media_create_ice_candidate`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn media_create_ice_candidate_on(
+    _bi: &NapiBridgeInstance,
     session_id: String,
     candidate: String,
     sender_did: String,
@@ -342,6 +435,16 @@ pub fn media_create_ice_candidate(
 /// Returns a JSON string with `session_id` and `message` keys.
 #[napi]
 pub fn media_create_session_end(session_id: String, sender_did: String) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    media_create_session_end_on(&bi, session_id, sender_did)
+}
+
+/// Per-bridge-instance implementation of [`media_create_session_end`].
+pub(crate) fn media_create_session_end_on(
+    _bi: &NapiBridgeInstance,
+    session_id: String,
+    sender_did: String,
+) -> napi::Result<String> {
     let (sid, msg) = create_session_end(&session_id, sender_did.into());
     let msg_json = String::from_utf8(serialize_signaling(&msg).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
@@ -373,6 +476,15 @@ pub fn media_create_session_end(session_id: String, sender_did: String) -> napi:
 /// Returns a JSON string with `payload` (base64) and `message_type` keys.
 #[napi]
 pub fn media_send_signaling(signaling_json: String) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    media_send_signaling_on(&bi, signaling_json)
+}
+
+/// Per-bridge-instance implementation of [`media_send_signaling`].
+pub(crate) fn media_send_signaling_on(
+    _bi: &NapiBridgeInstance,
+    signaling_json: String,
+) -> napi::Result<String> {
     let msg = deserialize_signaling(signaling_json.as_bytes()).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid signaling JSON: {e}"),
@@ -404,6 +516,16 @@ pub fn media_send_signaling(signaling_json: String) -> napi::Result<String> {
 /// Returns `true` if valid.
 #[napi]
 pub fn media_verify_sender_attribution(
+    signaling_json: String,
+    envelope_sender_did: String,
+) -> napi::Result<bool> {
+    let bi = default_bridge_instance()?;
+    media_verify_sender_attribution_on(&bi, signaling_json, envelope_sender_did)
+}
+
+/// Per-bridge-instance implementation of [`media_verify_sender_attribution`].
+pub(crate) fn media_verify_sender_attribution_on(
+    _bi: &NapiBridgeInstance,
     signaling_json: String,
     envelope_sender_did: String,
 ) -> napi::Result<bool> {

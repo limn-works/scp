@@ -19,6 +19,10 @@ use napi::Error as NapiError;
 use napi_derive::napi;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
 use scp_ffi_common::error_codes as codes;
+use scp_identity::DidMethod as _;
+use scp_primitives::Clock as _;
+
+use napi::bindgen_prelude::Buffer;
 
 use crate::context::{
     NapiAssetEntry, NapiBatchPublishResult, NapiContextHandle, NapiEvaluationResult, NapiMessage,
@@ -27,9 +31,15 @@ use crate::context::{
 use crate::error::{ScpNapiError, validate_custody_type};
 use crate::event_log::{NapiCheckpoint, NapiEvent, NapiProof};
 use crate::identity::NapiIdentity;
+use crate::mcp::{
+    NapiAllowlistState, NapiMcpClientHandle, NapiMcpInvokeResult, NapiMcpServerConfig,
+    NapiMcpServerHandle, NapiMcpToolInfo,
+};
 use crate::runtime::{NapiBridgeInstance, StorageConfig, default_bridge_instance};
 #[cfg(feature = "server")]
 use crate::server::{NapiNodeHandle, NapiRelayHandle};
+use crate::sync::NapiSyncPolicy;
+use crate::testing::NapiFullStackNode;
 use crate::tools::{NapiToolDefinition, NapiToolVerificationResult};
 use crate::transport::{NapiReliabilityScore, NapiTransportManager, NapiTransportStatus};
 use crate::trust::{NapiAttestationVerificationResult, NapiChallengeResult, NapiTrustScoreResult};
@@ -666,6 +676,7 @@ impl Scp {
     /// Per-instance equivalent of `identity_create_link_attestation`.
     #[cfg(feature = "allow_in_memory_custody")]
     #[napi(js_name = "identityCreateLinkAttestation")]
+    #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
     pub async fn identity_create_link_attestation(
         &self,
         did: String,
@@ -803,6 +814,7 @@ impl Scp {
     /// Exposed on `Scp` for API symmetry so the demolition slice can drop
     /// the free function without leaving callers stranded.
     #[napi(js_name = "identityVerifyLinkAttestation")]
+    #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
     pub async fn identity_verify_link_attestation(
         &self,
         attestation_json: String,
@@ -1675,7 +1687,7 @@ impl Scp {
         identity: &NapiIdentity,
         params_json: String,
     ) -> napi::Result<NapiContextHandle> {
-        crate::context::context_create_on(&*self.inner, identity, params_json).await
+        crate::context::context_create_on(&self.inner, identity, params_json).await
     }
 
     /// Per-instance equivalent of the free-function `context_join`.
@@ -1686,7 +1698,7 @@ impl Scp {
         identity_did: String,
         spending_ucan_jwt: Option<String>,
     ) -> napi::Result<()> {
-        crate::context::context_join_on(&*self.inner, handle, identity_did, spending_ucan_jwt).await
+        crate::context::context_join_on(&self.inner, handle, identity_did, spending_ucan_jwt).await
     }
 
     /// Per-instance equivalent of the free-function `context_leave`.
@@ -1696,7 +1708,7 @@ impl Scp {
         handle: &NapiContextHandle,
         identity_did: String,
     ) -> napi::Result<()> {
-        crate::context::context_leave_on(&*self.inner, handle, identity_did).await
+        crate::context::context_leave_on(&self.inner, handle, identity_did).await
     }
 
     /// Per-instance equivalent of the free-function `context_close`.
@@ -1706,7 +1718,7 @@ impl Scp {
         handle: &NapiContextHandle,
         identity_did: String,
     ) -> napi::Result<()> {
-        crate::context::context_close_on(&*self.inner, handle, identity_did).await
+        crate::context::context_close_on(&self.inner, handle, identity_did).await
     }
 
     /// Per-instance equivalent of the free-function `context_send`.
@@ -1719,7 +1731,7 @@ impl Scp {
         spending_ucan_jwt: Option<String>,
     ) -> napi::Result<()> {
         crate::context::context_send_on(
-            &*self.inner,
+            &self.inner,
             handle,
             identity_did,
             payload,
@@ -1736,19 +1748,19 @@ impl Scp {
         identity_did: String,
         on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
     ) -> napi::Result<()> {
-        crate::context::context_subscribe_on(&*self.inner, handle, identity_did, on_message).await
+        crate::context::context_subscribe_on(&self.inner, handle, identity_did, on_message).await
     }
 
     /// Per-instance equivalent of the free-function `context_cancel_subscription`.
     #[napi(js_name = "contextCancelSubscription")]
     pub fn context_cancel_subscription(&self, handle: &NapiContextHandle) -> napi::Result<()> {
-        crate::context::context_cancel_subscription_on(&*self.inner, handle)
+        crate::context::context_cancel_subscription_on(&self.inner, handle)
     }
 
     /// Per-instance equivalent of the free-function `context_member_count`.
     #[napi(js_name = "contextMemberCount")]
     pub async fn context_member_count(&self, handle: &NapiContextHandle) -> napi::Result<u32> {
-        crate::context::context_member_count_on(&*self.inner, handle).await
+        crate::context::context_member_count_on(&self.inner, handle).await
     }
 
     /// Per-instance equivalent of the free-function `context_is_member`.
@@ -1758,7 +1770,7 @@ impl Scp {
         handle: &NapiContextHandle,
         did: String,
     ) -> napi::Result<bool> {
-        crate::context::context_is_member_on(&*self.inner, handle, did).await
+        crate::context::context_is_member_on(&self.inner, handle, did).await
     }
 
     /// Per-instance equivalent of the free-function `context_member_dids`.
@@ -1767,7 +1779,7 @@ impl Scp {
         &self,
         handle: &NapiContextHandle,
     ) -> napi::Result<Vec<String>> {
-        crate::context::context_member_dids_on(&*self.inner, handle).await
+        crate::context::context_member_dids_on(&self.inner, handle).await
     }
 
     /// Per-instance equivalent of the free-function `context_member_role`.
@@ -1777,7 +1789,7 @@ impl Scp {
         handle: &NapiContextHandle,
         did: String,
     ) -> napi::Result<Option<String>> {
-        crate::context::context_member_role_on(&*self.inner, handle, did).await
+        crate::context::context_member_role_on(&self.inner, handle, did).await
     }
 
     /// Per-instance equivalent of the free-function `context_drain_events`.
@@ -1786,7 +1798,7 @@ impl Scp {
         &self,
         handle: &NapiContextHandle,
     ) -> napi::Result<Vec<String>> {
-        crate::context::context_drain_events_on(&*self.inner, handle).await
+        crate::context::context_drain_events_on(&self.inner, handle).await
     }
 
     /// Per-instance equivalent of the free-function `access_key_generate`.
@@ -1797,7 +1809,7 @@ impl Scp {
         member_did: String,
         caller_did: String,
     ) -> napi::Result<()> {
-        crate::context::access_key_generate_on(&*self.inner, context_id, member_did, caller_did)
+        crate::context::access_key_generate_on(&self.inner, context_id, member_did, caller_did)
             .await
     }
 
@@ -1809,7 +1821,7 @@ impl Scp {
         member_did: String,
         caller_did: String,
     ) -> napi::Result<()> {
-        crate::context::access_key_revoke_on(&*self.inner, context_id, member_did, caller_did).await
+        crate::context::access_key_revoke_on(&self.inner, context_id, member_did, caller_did).await
     }
 
     /// Per-instance equivalent of the free-function `access_key_restore`.
@@ -1820,7 +1832,7 @@ impl Scp {
         member_did: String,
         caller_did: String,
     ) -> napi::Result<()> {
-        crate::context::access_key_restore_on(&*self.inner, context_id, member_did, caller_did)
+        crate::context::access_key_restore_on(&self.inner, context_id, member_did, caller_did)
             .await
     }
 
@@ -1830,7 +1842,7 @@ impl Scp {
         &self,
         handle: &NapiContextHandle,
     ) -> napi::Result<Option<u32>> {
-        crate::context::context_broadcast_subscriber_count_on(&*self.inner, handle).await
+        crate::context::context_broadcast_subscriber_count_on(&self.inner, handle).await
     }
 
     /// Per-instance equivalent of the free-function `context_is_broadcast_subscriber`.
@@ -1840,7 +1852,7 @@ impl Scp {
         handle: &NapiContextHandle,
         did: String,
     ) -> napi::Result<bool> {
-        crate::context::context_is_broadcast_subscriber_on(&*self.inner, handle, did).await
+        crate::context::context_is_broadcast_subscriber_on(&self.inner, handle, did).await
     }
 
     /// Per-instance equivalent of the free-function `context_broadcast_admission`.
@@ -1849,7 +1861,7 @@ impl Scp {
         &self,
         handle: &NapiContextHandle,
     ) -> napi::Result<Option<String>> {
-        crate::context::context_broadcast_admission_on(&*self.inner, handle).await
+        crate::context::context_broadcast_admission_on(&self.inner, handle).await
     }
 
     /// Per-instance equivalent of the free-function `broadcast_subscribe`.
@@ -1859,7 +1871,7 @@ impl Scp {
         handle: &NapiContextHandle,
         subscriber_did: String,
     ) -> napi::Result<()> {
-        crate::context::broadcast_subscribe_on(&*self.inner, handle, subscriber_did).await
+        crate::context::broadcast_subscribe_on(&self.inner, handle, subscriber_did).await
     }
 
     /// Per-instance equivalent of the free-function `broadcast_unsubscribe`.
@@ -1870,7 +1882,7 @@ impl Scp {
         subscriber_did: String,
         rotate_keys: Option<bool>,
     ) -> napi::Result<()> {
-        crate::context::broadcast_unsubscribe_on(&*self.inner, handle, subscriber_did, rotate_keys)
+        crate::context::broadcast_unsubscribe_on(&self.inner, handle, subscriber_did, rotate_keys)
             .await
     }
 
@@ -1882,7 +1894,7 @@ impl Scp {
         author_did: String,
         payload: Vec<u8>,
     ) -> napi::Result<()> {
-        crate::context::broadcast_publish_on(&*self.inner, handle, author_did, payload).await
+        crate::context::broadcast_publish_on(&self.inner, handle, author_did, payload).await
     }
 
     /// Per-instance equivalent of the free-function `broadcast_publish_asset`.
@@ -1895,7 +1907,7 @@ impl Scp {
         deploy_id: Option<String>,
     ) -> napi::Result<NapiPublishResult> {
         crate::context::broadcast_publish_asset_on(
-            &*self.inner,
+            &self.inner,
             handle,
             author_did,
             asset,
@@ -1914,7 +1926,7 @@ impl Scp {
         deploy_id: Option<String>,
     ) -> napi::Result<NapiBatchPublishResult> {
         crate::context::broadcast_publish_assets_on(
-            &*self.inner,
+            &self.inner,
             handle,
             author_did,
             assets,
@@ -1932,7 +1944,7 @@ impl Scp {
         blocker_did: String,
     ) -> napi::Result<()> {
         crate::context::broadcast_block_subscriber_on(
-            &*self.inner,
+            &self.inner,
             handle,
             subscriber_did,
             blocker_did,
@@ -1949,7 +1961,7 @@ impl Scp {
         unblocker_did: String,
     ) -> napi::Result<()> {
         crate::context::broadcast_unblock_subscriber_on(
-            &*self.inner,
+            &self.inner,
             handle,
             subscriber_did,
             unblocker_did,
@@ -1966,7 +1978,7 @@ impl Scp {
         requester_did: String,
     ) -> napi::Result<String> {
         crate::context::broadcast_handle_key_request_on(
-            &*self.inner,
+            &self.inner,
             handle,
             author_did,
             requester_did,
@@ -1983,7 +1995,7 @@ impl Scp {
         proposer_did: String,
     ) -> napi::Result<String> {
         crate::context::context_execute_governance_action_on(
-            &*self.inner,
+            &self.inner,
             handle,
             action_json,
             proposer_did,
@@ -2000,7 +2012,7 @@ impl Scp {
         proposer_did: String,
     ) -> napi::Result<String> {
         crate::context::context_governance_propose_on(
-            &*self.inner,
+            &self.inner,
             handle,
             action_json,
             proposer_did,
@@ -2017,7 +2029,7 @@ impl Scp {
         voter_did: String,
     ) -> napi::Result<String> {
         crate::context::context_governance_approve_on(
-            &*self.inner,
+            &self.inner,
             handle,
             proposal_id_hex,
             voter_did,
@@ -2034,7 +2046,7 @@ impl Scp {
         voter_did: String,
     ) -> napi::Result<String> {
         crate::context::context_governance_reject_on(
-            &*self.inner,
+            &self.inner,
             handle,
             proposal_id_hex,
             voter_did,
@@ -2051,7 +2063,7 @@ impl Scp {
         voter_did: String,
     ) -> napi::Result<String> {
         crate::context::context_governance_withdraw_on(
-            &*self.inner,
+            &self.inner,
             handle,
             proposal_id_hex,
             voter_did,
@@ -2066,7 +2078,7 @@ impl Scp {
         handle: &NapiContextHandle,
         proposal_id_hex: String,
     ) -> napi::Result<String> {
-        crate::context::context_governance_get_proposal_on(&*self.inner, handle, proposal_id_hex)
+        crate::context::context_governance_get_proposal_on(&self.inner, handle, proposal_id_hex)
             .await
     }
 
@@ -2076,7 +2088,7 @@ impl Scp {
         &self,
         handle: &NapiContextHandle,
     ) -> napi::Result<String> {
-        crate::context::context_governance_list_proposals_on(&*self.inner, handle).await
+        crate::context::context_governance_list_proposals_on(&self.inner, handle).await
     }
 
     /// Per-instance equivalent of the free-function `context_apply_pending_ceiling_modification`.
@@ -2087,7 +2099,7 @@ impl Scp {
         current_timestamp: f64,
     ) -> napi::Result<bool> {
         crate::context::context_apply_pending_ceiling_modification_on(
-            &*self.inner,
+            &self.inner,
             handle,
             current_timestamp,
         )
@@ -2097,11 +2109,12 @@ impl Scp {
     /// Per-instance equivalent of the free-function `context_finalize_close`.
     #[napi(js_name = "contextFinalizeClose")]
     pub async fn context_finalize_close(&self, handle: &NapiContextHandle) -> napi::Result<()> {
-        crate::context::context_finalize_close_on(&*self.inner, handle).await
+        crate::context::context_finalize_close_on(&self.inner, handle).await
     }
 
     /// Per-instance equivalent of the free-function `context_create_governance_checkpoint`.
     #[napi(js_name = "contextCreateGovernanceCheckpoint")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn context_create_governance_checkpoint(
         &self,
         handle: &NapiContextHandle,
@@ -2114,7 +2127,7 @@ impl Scp {
         creator_signature_hex: String,
     ) -> napi::Result<String> {
         crate::context::context_create_governance_checkpoint_on(
-            &*self.inner,
+            &self.inner,
             handle,
             checkpoint_seq,
             merkle_root_hex,
@@ -2137,7 +2150,7 @@ impl Scp {
         signature_hex: String,
     ) -> napi::Result<String> {
         crate::context::context_add_checkpoint_cosignature_on(
-            &*self.inner,
+            &self.inner,
             handle,
             checkpoint_json,
             signer_did,
@@ -2149,19 +2162,19 @@ impl Scp {
     /// Per-instance equivalent of the free-function `context_restore`.
     #[napi(js_name = "contextRestore")]
     pub async fn context_restore(&self, context_id: String) -> napi::Result<()> {
-        crate::context::context_restore_on(&*self.inner, context_id).await
+        crate::context::context_restore_on(&self.inner, context_id).await
     }
 
     /// Per-instance equivalent of the free-function `context_restore_all`.
     #[napi(js_name = "contextRestoreAll")]
     pub async fn context_restore_all(&self) -> napi::Result<String> {
-        crate::context::context_restore_all_on(&*self.inner).await
+        crate::context::context_restore_all_on(&self.inner).await
     }
 
     /// Per-instance equivalent of the free-function `context_tombstone_migrated`.
     #[napi(js_name = "contextTombstoneMigrated")]
     pub async fn context_tombstone_migrated(&self, handle: &NapiContextHandle) -> napi::Result<()> {
-        crate::context::context_tombstone_migrated_on(&*self.inner, handle).await
+        crate::context::context_tombstone_migrated_on(&self.inner, handle).await
     }
 
     /// Per-instance equivalent of the free-function `context_migration_state`.
@@ -2170,13 +2183,13 @@ impl Scp {
         &self,
         handle: &NapiContextHandle,
     ) -> napi::Result<Option<String>> {
-        crate::context::context_migration_state_on(&*self.inner, handle).await
+        crate::context::context_migration_state_on(&self.inner, handle).await
     }
 
     /// Per-instance equivalent of the free-function `context_handle_ttl_expiry`.
     #[napi(js_name = "contextHandleTtlExpiry")]
     pub async fn context_handle_ttl_expiry(&self, handle: &NapiContextHandle) -> napi::Result<()> {
-        crate::context::context_handle_ttl_expiry_on(&*self.inner, handle).await
+        crate::context::context_handle_ttl_expiry_on(&self.inner, handle).await
     }
 
     /// Per-instance equivalent of the free-function `context_propose_ttl_extension`.
@@ -2188,7 +2201,7 @@ impl Scp {
         extension_secs: u32,
     ) -> napi::Result<bool> {
         crate::context::context_propose_ttl_extension_on(
-            &*self.inner,
+            &self.inner,
             handle,
             proposer_did,
             extension_secs,
@@ -2203,29 +2216,30 @@ impl Scp {
         handle: &NapiContextHandle,
         new_duration_secs: u32,
     ) -> napi::Result<()> {
-        crate::context::context_reset_ttl_timer_on(&*self.inner, handle, new_duration_secs).await
+        crate::context::context_reset_ttl_timer_on(&self.inner, handle, new_duration_secs).await
     }
 
     /// Per-instance equivalent of the free-function `context_export`.
     #[napi(js_name = "contextExport")]
     pub async fn context_export(&self, handle: &NapiContextHandle) -> napi::Result<Vec<u8>> {
-        crate::context::context_export_on(&*self.inner, handle).await
+        crate::context::context_export_on(&self.inner, handle).await
     }
 
     /// Per-instance equivalent of the free-function `context_import`.
     #[napi(js_name = "contextImport")]
     pub async fn context_import(&self, data: Vec<u8>) -> napi::Result<String> {
-        crate::context::context_import_on(&*self.inner, data).await
+        crate::context::context_import_on(&self.inner, data).await
     }
 
     /// Per-instance equivalent of the free-function `context_set_economic_policy`.
     #[napi(js_name = "contextSetEconomicPolicy")]
+    #[allow(clippy::used_underscore_binding)] // param exists for API surface; body rejects all calls
     pub fn context_set_economic_policy(
         &self,
         handle: &mut NapiContextHandle,
         _policy_json: String,
     ) -> napi::Result<()> {
-        crate::context::context_set_economic_policy_on(&*self.inner, handle, _policy_json)
+        crate::context::context_set_economic_policy_on(&self.inner, handle, _policy_json)
     }
 
     /// Per-instance equivalent of the free-function `context_get_economic_policy`.
@@ -2234,7 +2248,7 @@ impl Scp {
         &self,
         handle: &NapiContextHandle,
     ) -> napi::Result<Option<String>> {
-        crate::context::context_get_economic_policy_on(&*self.inner, handle)
+        crate::context::context_get_economic_policy_on(&self.inner, handle)
     }
 
     /// Per-instance equivalent of the free-function `validate_capability_declaration`.
@@ -2246,7 +2260,7 @@ impl Scp {
         role_capabilities: Vec<String>,
     ) -> napi::Result<String> {
         crate::context::validate_capability_declaration_on(
-            &*self.inner,
+            &self.inner,
             declaration_json,
             ceiling_capabilities,
             role_capabilities,
@@ -2254,14 +2268,17 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `check_scoped_capability`.
+    ///
+    /// This operation is pure — it does not touch any bridge-instance state —
+    /// so the method forwards to a shared inner helper with no `bi` argument.
     #[napi(js_name = "checkScopedCapability")]
+    #[must_use] 
     pub fn check_scoped_capability(
         &self,
         granted_capabilities: Vec<String>,
         required_capability: String,
     ) -> bool {
-        crate::context::check_scoped_capability_on(
-            &*self.inner,
+        crate::context::check_scoped_capability_inner(
             granted_capabilities,
             required_capability,
         )
@@ -2279,7 +2296,7 @@ impl Scp {
         trusted_dids_json: Option<String>,
     ) -> napi::Result<NapiEvaluationResult> {
         crate::context::evaluate_invitation_on(
-            &*self.inner,
+            &self.inner,
             params_json,
             inviter_did,
             identity_did,
@@ -2291,6 +2308,7 @@ impl Scp {
 
     /// Per-instance equivalent of the free-function `metadata_record_to_json`.
     #[napi(js_name = "metadataRecordToJson")]
+    #[allow(clippy::too_many_arguments)]
     pub fn metadata_record_to_json(
         &self,
         context_id: String,
@@ -2302,7 +2320,7 @@ impl Scp {
         signature_hex: String,
     ) -> napi::Result<String> {
         crate::context::metadata_record_to_json_on(
-            &*self.inner,
+            &self.inner,
             context_id,
             sequence,
             signer_did,
@@ -2316,25 +2334,25 @@ impl Scp {
     /// Per-instance equivalent of the free-function `metadata_record_from_json`.
     #[napi(js_name = "metadataRecordFromJson")]
     pub fn metadata_record_from_json(&self, json_str: String) -> napi::Result<String> {
-        crate::context::metadata_record_from_json_on(&*self.inner, json_str)
+        crate::context::metadata_record_from_json_on(&self.inner, json_str)
     }
 
     /// Per-instance equivalent of the free-function `template_get_params`.
     #[napi(js_name = "templateGetParams")]
     pub fn template_get_params(&self, template_id: String) -> napi::Result<String> {
-        crate::context::template_get_params_on(&*self.inner, template_id)
+        crate::context::template_get_params_on(&self.inner, template_id)
     }
 
     /// Per-instance equivalent of the free-function `validate_against_template`.
     #[napi(js_name = "validateAgainstTemplate")]
     pub fn validate_against_template(&self, params_json: String) -> napi::Result<Option<String>> {
-        crate::context::validate_against_template_on(&*self.inner, params_json)
+        crate::context::validate_against_template_on(&self.inner, params_json)
     }
 
     /// Per-instance equivalent of the free-function `validate_context_params`.
     #[napi(js_name = "validateContextParams")]
     pub fn validate_context_params(&self, params_json: String) -> napi::Result<Option<String>> {
-        crate::context::validate_context_params_on(&*self.inner, params_json)
+        crate::context::validate_context_params_on(&self.inner, params_json)
     }
 
     // ===== sub-slice C: tools =====
@@ -2346,11 +2364,12 @@ impl Scp {
         handle: &NapiContextHandle,
         definition: NapiToolDefinition,
     ) -> napi::Result<String> {
-        crate::tools::tool_register_on(&*self.inner, handle, definition).await
+        crate::tools::tool_register_on(&self.inner, handle, definition).await
     }
 
     /// Per-instance equivalent of the free-function `tool_invoke`.
     #[napi(js_name = "toolInvoke")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn tool_invoke(
         &self,
         handle: &NapiContextHandle,
@@ -2362,7 +2381,7 @@ impl Scp {
         spending_ucan_jwt: Option<String>,
     ) -> napi::Result<String> {
         crate::tools::tool_invoke_on(
-            &*self.inner,
+            &self.inner,
             handle,
             tool_id,
             input_json,
@@ -2381,11 +2400,12 @@ impl Scp {
         handle: &NapiContextHandle,
         tool_id: String,
     ) -> napi::Result<NapiToolVerificationResult> {
-        crate::tools::tool_verify_on(&*self.inner, handle, tool_id).await
+        crate::tools::tool_verify_on(&self.inner, handle, tool_id).await
     }
 
     /// Per-instance equivalent of the free-function `tool_invoke_cross_context`.
     #[napi(js_name = "toolInvokeCrossContext")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn tool_invoke_cross_context(
         &self,
         source_handle: &NapiContextHandle,
@@ -2398,7 +2418,7 @@ impl Scp {
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<String> {
         crate::tools::tool_invoke_cross_context_on(
-            &*self.inner,
+            &self.inner,
             source_handle,
             target_handle,
             tool_id,
@@ -2421,7 +2441,7 @@ impl Scp {
         ttl_seconds: Option<u32>,
     ) -> napi::Result<String> {
         crate::tools::tool_session_create_on(
-            &*self.inner,
+            &self.inner,
             handle,
             tool_id,
             source_context_id,
@@ -2442,7 +2462,7 @@ impl Scp {
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<String> {
         crate::tools::tool_session_invoke_on(
-            &*self.inner,
+            &self.inner,
             handle,
             session_id,
             input_json,
@@ -2460,7 +2480,7 @@ impl Scp {
         handle: &NapiContextHandle,
         session_id: String,
     ) -> napi::Result<()> {
-        crate::tools::tool_session_close_on(&*self.inner, handle, session_id).await
+        crate::tools::tool_session_close_on(&self.inner, handle, session_id).await
     }
 
     /// Per-instance equivalent of the free-function `tool_interface_expose`.
@@ -2473,7 +2493,7 @@ impl Scp {
         rate_limit_json: Option<String>,
     ) -> napi::Result<String> {
         crate::tools::tool_interface_expose_on(
-            &*self.inner,
+            &self.inner,
             handle,
             tool_id,
             target_context_id,
@@ -2489,7 +2509,7 @@ impl Scp {
         handle: &NapiContextHandle,
         interface_json: String,
     ) -> napi::Result<String> {
-        crate::tools::tool_interface_accept_on(&*self.inner, handle, interface_json).await
+        crate::tools::tool_interface_accept_on(&self.inner, handle, interface_json).await
     }
 
     /// Per-instance equivalent of the free-function `tool_interface_revoke`.
@@ -2499,7 +2519,7 @@ impl Scp {
         handle: &NapiContextHandle,
         interface_id_hex: String,
     ) -> napi::Result<String> {
-        crate::tools::tool_interface_revoke_on(&*self.inner, handle, interface_id_hex).await
+        crate::tools::tool_interface_revoke_on(&self.inner, handle, interface_id_hex).await
     }
 
     // ====================================================================
@@ -2954,5 +2974,491 @@ impl Scp {
         passphrase: Option<String>,
     ) -> napi::Result<NapiNodeHandle> {
         crate::server::node_start_local_on(&self.inner, data_dir, identity_did, passphrase).await
+    }
+
+    // ====================================================================
+    // #1549 Phase 4 PR 4 — sub-slice E: mcp/testing/media/provenance/sync
+    // operations on SCP.
+    //
+    // Each method delegates to the per-bridge-instance `_on` helpers in
+    // [`crate::mcp`] / [`crate::testing`] / [`crate::media`] /
+    // [`crate::provenance`] / [`crate::sync`], routing through `&*self.inner`
+    // so operations are scoped to this `SCP`'s bridge instance rather than
+    // the process-wide default. Free functions are retained until the
+    // demolition slice deletes them.
+    // ====================================================================
+
+    // -------------------------------------------------------------------
+    // MCP
+    // -------------------------------------------------------------------
+
+    /// Per-instance equivalent of the free-function `mcp_server_create`.
+    #[napi(js_name = "mcpServerCreate")]
+    pub async fn mcp_server_create(
+        &self,
+        config: NapiMcpServerConfig,
+    ) -> napi::Result<NapiMcpServerHandle> {
+        crate::mcp::mcp_server_create_on(&self.inner, config).await
+    }
+
+    /// Per-instance equivalent of the free-function `mcp_server_stop`.
+    #[napi(js_name = "mcpServerStop")]
+    pub async fn mcp_server_stop(&self, handle: &NapiMcpServerHandle) -> napi::Result<()> {
+        crate::mcp::mcp_server_stop_on(&self.inner, handle).await
+    }
+
+    /// Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
+    #[napi(js_name = "mcpClientConnectStdio")]
+    pub async fn mcp_client_connect_stdio(
+        &self,
+        command: Vec<String>,
+    ) -> napi::Result<NapiMcpClientHandle> {
+        crate::mcp::mcp_client_connect_stdio_on(&self.inner, command).await
+    }
+
+    /// Per-instance equivalent of the free-function `mcp_client_connect_sse`.
+    #[napi(js_name = "mcpClientConnectSse")]
+    pub async fn mcp_client_connect_sse(
+        &self,
+        url: String,
+    ) -> napi::Result<NapiMcpClientHandle> {
+        crate::mcp::mcp_client_connect_sse_on(&self.inner, url).await
+    }
+
+    /// Per-instance equivalent of the free-function `mcp_client_disconnect`.
+    #[napi(js_name = "mcpClientDisconnect")]
+    pub async fn mcp_client_disconnect(&self, handle: &NapiMcpClientHandle) -> napi::Result<()> {
+        crate::mcp::mcp_client_disconnect_on(&self.inner, handle).await
+    }
+
+    /// Per-instance equivalent of the free-function `mcp_client_list_tools`.
+    #[napi(js_name = "mcpClientListTools")]
+    pub async fn mcp_client_list_tools(
+        &self,
+        handle: &NapiMcpClientHandle,
+    ) -> napi::Result<Vec<NapiMcpToolInfo>> {
+        crate::mcp::mcp_client_list_tools_on(&self.inner, handle).await
+    }
+
+    /// Per-instance equivalent of the free-function `mcp_client_invoke`.
+    #[napi(js_name = "mcpClientInvoke")]
+    pub async fn mcp_client_invoke(
+        &self,
+        handle: &NapiMcpClientHandle,
+        tool_name: String,
+        input_json: String,
+        context_id: String,
+        invoker_did: String,
+    ) -> napi::Result<NapiMcpInvokeResult> {
+        crate::mcp::mcp_client_invoke_on(
+            &self.inner,
+            handle,
+            tool_name,
+            input_json,
+            context_id,
+            invoker_did,
+        )
+        .await
+    }
+
+    /// Per-instance equivalent of the free-function `mcp_configure_stdio_allowlist`.
+    #[napi(js_name = "mcpConfigureStdioAllowlist")]
+    pub fn mcp_configure_stdio_allowlist(
+        &self,
+        additional_binaries: Vec<String>,
+    ) -> napi::Result<()> {
+        crate::mcp::mcp_configure_stdio_allowlist_on(&self.inner, additional_binaries)
+    }
+
+    /// Per-instance equivalent of the free-function `mcp_disable_stdio_allowlist`.
+    #[napi(js_name = "mcpDisableStdioAllowlist")]
+    pub fn mcp_disable_stdio_allowlist(&self) -> napi::Result<()> {
+        crate::mcp::mcp_disable_stdio_allowlist_on(&self.inner)
+    }
+
+    /// Per-instance equivalent of the free-function `mcp_reset_stdio_allowlist`.
+    #[napi(js_name = "mcpResetStdioAllowlist")]
+    pub fn mcp_reset_stdio_allowlist(&self) -> napi::Result<()> {
+        crate::mcp::mcp_reset_stdio_allowlist_on(&self.inner)
+    }
+
+    /// Per-instance equivalent of the free-function `mcp_get_stdio_allowlist`.
+    #[napi(js_name = "mcpGetStdioAllowlist")]
+    pub fn mcp_get_stdio_allowlist(&self) -> napi::Result<NapiAllowlistState> {
+        crate::mcp::mcp_get_stdio_allowlist_on(&self.inner)
+    }
+
+    // -------------------------------------------------------------------
+    // Testing (full-stack E2E harness)
+    // -------------------------------------------------------------------
+
+    /// Per-instance equivalent of the free-function `fullstack_create_node`.
+    #[napi(js_name = "fullstackCreateNode")]
+    #[must_use]
+    pub fn fullstack_create_node(&self, did: String) -> NapiFullStackNode {
+        crate::testing::fullstack_create_node_on(&self.inner, did)
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_reset_network`.
+    #[napi(js_name = "fullstackResetNetwork")]
+    pub fn fullstack_reset_network(&self) {
+        crate::testing::fullstack_reset_network_on(&self.inner);
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_create_context`.
+    #[napi(js_name = "fullstackCreateContext")]
+    pub fn fullstack_create_context(
+        &self,
+        node: &NapiFullStackNode,
+        context_id: String,
+        ceiling_json: String,
+    ) -> napi::Result<String> {
+        crate::testing::fullstack_create_context_on(&self.inner, node, context_id, ceiling_json)
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_add_member`.
+    #[napi(js_name = "fullstackAddMember")]
+    pub fn fullstack_add_member(
+        &self,
+        node: &NapiFullStackNode,
+        context_id: String,
+        member_did: String,
+    ) -> napi::Result<()> {
+        crate::testing::fullstack_add_member_on(&self.inner, node, context_id, member_did)
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_join_from_welcome`.
+    #[napi(js_name = "fullstackJoinFromWelcome")]
+    pub fn fullstack_join_from_welcome(
+        &self,
+        node: &NapiFullStackNode,
+        context_id: String,
+    ) -> napi::Result<()> {
+        crate::testing::fullstack_join_from_welcome_on(&self.inner, node, context_id)
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_sync_sender_keys`.
+    #[napi(js_name = "fullstackSyncSenderKeys")]
+    pub fn fullstack_sync_sender_keys(
+        &self,
+        node_a: &NapiFullStackNode,
+        node_b: &NapiFullStackNode,
+        context_id: String,
+    ) -> napi::Result<()> {
+        crate::testing::fullstack_sync_sender_keys_on(&self.inner, node_a, node_b, context_id)
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_send_message`.
+    #[napi(js_name = "fullstackSendMessage")]
+    pub fn fullstack_send_message(
+        &self,
+        node: &NapiFullStackNode,
+        context_id: String,
+        payload: Buffer,
+    ) -> napi::Result<Buffer> {
+        crate::testing::fullstack_send_message_on(&self.inner, node, context_id, payload)
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_decrypt_message`.
+    #[napi(js_name = "fullstackDecryptMessage")]
+    pub fn fullstack_decrypt_message(
+        &self,
+        node: &NapiFullStackNode,
+        context_id: String,
+        ciphertext: Buffer,
+        sender_did: String,
+    ) -> napi::Result<Buffer> {
+        crate::testing::fullstack_decrypt_message_on(
+            &self.inner,
+            node,
+            context_id,
+            ciphertext,
+            sender_did,
+        )
+    }
+
+    /// Per-instance equivalent of the free-function `fullstack_remove_member`.
+    #[napi(js_name = "fullstackRemoveMember")]
+    pub fn fullstack_remove_member(
+        &self,
+        node: &NapiFullStackNode,
+        context_id: String,
+        member_did: String,
+    ) -> napi::Result<()> {
+        crate::testing::fullstack_remove_member_on(&self.inner, node, context_id, member_did)
+    }
+
+    // -------------------------------------------------------------------
+    // Media
+    // -------------------------------------------------------------------
+
+    /// Per-instance equivalent of the free-function `media_check_capability`.
+    #[napi(js_name = "mediaCheckCapability")]
+    pub fn media_check_capability(
+        &self,
+        ceiling: Vec<String>,
+        capability: String,
+    ) -> napi::Result<bool> {
+        crate::media::media_check_capability_on(&self.inner, ceiling, capability)
+    }
+
+    /// Per-instance equivalent of the free-function `media_initiate_session`.
+    #[napi(js_name = "mediaInitiateSession")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn media_initiate_session(
+        &self,
+        context_id: String,
+        ceiling: Vec<String>,
+        capabilities: Vec<String>,
+        participants: Vec<String>,
+        timestamp: f64,
+    ) -> napi::Result<String> {
+        crate::media::media_initiate_session_on(
+            &self.inner,
+            context_id,
+            ceiling,
+            capabilities,
+            participants,
+            timestamp,
+        )
+    }
+
+    /// Per-instance equivalent of the free-function `media_activate_session`.
+    #[napi(js_name = "mediaActivateSession")]
+    pub fn media_activate_session(&self, session_json: String) -> napi::Result<String> {
+        crate::media::media_activate_session_on(&self.inner, session_json)
+    }
+
+    /// Per-instance equivalent of the free-function `media_join_session`.
+    #[napi(js_name = "mediaJoinSession")]
+    pub fn media_join_session(
+        &self,
+        session_json: String,
+        participant_did: String,
+    ) -> napi::Result<String> {
+        crate::media::media_join_session_on(&self.inner, session_json, participant_did)
+    }
+
+    /// Per-instance equivalent of the free-function `media_end_session`.
+    #[napi(js_name = "mediaEndSession")]
+    pub fn media_end_session(
+        &self,
+        session_json: String,
+        timestamp: f64,
+    ) -> napi::Result<String> {
+        crate::media::media_end_session_on(&self.inner, session_json, timestamp)
+    }
+
+    /// Per-instance equivalent of the free-function `media_create_offer`.
+    #[napi(js_name = "mediaCreateOffer")]
+    pub fn media_create_offer(
+        &self,
+        session_id: String,
+        sdp: String,
+        sender_did: String,
+    ) -> napi::Result<String> {
+        crate::media::media_create_offer_on(&self.inner, session_id, sdp, sender_did)
+    }
+
+    /// Per-instance equivalent of the free-function `media_create_answer`.
+    #[napi(js_name = "mediaCreateAnswer")]
+    pub fn media_create_answer(
+        &self,
+        session_id: String,
+        sdp: String,
+        sender_did: String,
+    ) -> napi::Result<String> {
+        crate::media::media_create_answer_on(&self.inner, session_id, sdp, sender_did)
+    }
+
+    /// Per-instance equivalent of the free-function `media_create_ice_candidate`.
+    #[napi(js_name = "mediaCreateIceCandidate")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn media_create_ice_candidate(
+        &self,
+        session_id: String,
+        candidate: String,
+        sender_did: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u32>,
+    ) -> napi::Result<String> {
+        crate::media::media_create_ice_candidate_on(
+            &self.inner,
+            session_id,
+            candidate,
+            sender_did,
+            sdp_mid,
+            sdp_mline_index,
+        )
+    }
+
+    /// Per-instance equivalent of the free-function `media_create_session_end`.
+    #[napi(js_name = "mediaCreateSessionEnd")]
+    pub fn media_create_session_end(
+        &self,
+        session_id: String,
+        sender_did: String,
+    ) -> napi::Result<String> {
+        crate::media::media_create_session_end_on(&self.inner, session_id, sender_did)
+    }
+
+    /// Per-instance equivalent of the free-function `media_send_signaling`.
+    #[napi(js_name = "mediaSendSignaling")]
+    pub fn media_send_signaling(&self, signaling_json: String) -> napi::Result<String> {
+        crate::media::media_send_signaling_on(&self.inner, signaling_json)
+    }
+
+    /// Per-instance equivalent of the free-function `media_verify_sender_attribution`.
+    #[napi(js_name = "mediaVerifySenderAttribution")]
+    pub fn media_verify_sender_attribution(
+        &self,
+        signaling_json: String,
+        envelope_sender_did: String,
+    ) -> napi::Result<bool> {
+        crate::media::media_verify_sender_attribution_on(
+            &self.inner,
+            signaling_json,
+            envelope_sender_did,
+        )
+    }
+
+    // -------------------------------------------------------------------
+    // Provenance
+    // -------------------------------------------------------------------
+
+    /// Per-instance equivalent of the free-function `evaluate_provenance_quality`.
+    #[napi(js_name = "evaluateProvenanceQuality")]
+    pub async fn evaluate_provenance_quality(
+        &self,
+        source_context: Option<String>,
+        source_type: String,
+        context_state: String,
+        counterparties: Option<Vec<String>>,
+    ) -> napi::Result<u32> {
+        crate::provenance::evaluate_provenance_quality_on(
+            &self.inner,
+            source_context,
+            source_type,
+            context_state,
+            counterparties,
+        )
+        .await
+    }
+
+    /// Per-instance equivalent of the free-function `provenance_attach`.
+    #[napi(js_name = "provenanceAttach")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn provenance_attach(
+        &self,
+        source_context_id: String,
+        source_type: String,
+        memory_scope: String,
+        members: Vec<String>,
+        target_context_id: String,
+        actor_did: String,
+        existing_chain_depth: Option<u32>,
+        discovery_method: Option<String>,
+        purpose: Option<String>,
+        counterparty_policy: Option<String>,
+    ) -> napi::Result<String> {
+        crate::provenance::provenance_attach_on(
+            &self.inner,
+            source_context_id,
+            source_type,
+            memory_scope,
+            members,
+            target_context_id,
+            actor_did,
+            existing_chain_depth,
+            discovery_method,
+            purpose,
+            counterparty_policy,
+        )
+    }
+
+    /// Per-instance equivalent of the free-function `provenance_check_chain_depth`.
+    #[napi(js_name = "provenanceCheckChainDepth")]
+    pub fn provenance_check_chain_depth(
+        &self,
+        chain_depth: u32,
+        max_depth: Option<u32>,
+    ) -> napi::Result<bool> {
+        crate::provenance::provenance_check_chain_depth_on(&self.inner, chain_depth, max_depth)
+    }
+
+    /// Per-instance equivalent of the free-function `provenance_redact_counterparties`.
+    #[napi(js_name = "provenanceRedactCounterparties")]
+    pub fn provenance_redact_counterparties(
+        &self,
+        provenance_json: String,
+    ) -> napi::Result<String> {
+        crate::provenance::provenance_redact_counterparties_on(&self.inner, provenance_json)
+    }
+
+    /// Per-instance equivalent of the free-function `provenance_pseudonymize_counterparties`.
+    #[napi(js_name = "provenancePseudonymizeCounterparties")]
+    pub fn provenance_pseudonymize_counterparties(
+        &self,
+        provenance_json: String,
+        pseudonym_key_hex: String,
+    ) -> napi::Result<String> {
+        crate::provenance::provenance_pseudonymize_counterparties_on(
+            &self.inner,
+            provenance_json,
+            pseudonym_key_hex,
+        )
+    }
+
+    /// Per-instance equivalent of the free-function `provenance_update_source_type`.
+    #[napi(js_name = "provenanceUpdateSourceType")]
+    pub fn provenance_update_source_type(
+        &self,
+        provenance_json: String,
+        new_state: String,
+    ) -> napi::Result<String> {
+        crate::provenance::provenance_update_source_type_on(
+            &self.inner,
+            provenance_json,
+            new_state,
+        )
+    }
+
+    // -------------------------------------------------------------------
+    // Sync / offline classification
+    // -------------------------------------------------------------------
+
+    /// Per-instance equivalent of the free-function `sync_classify_offline`.
+    #[napi(js_name = "syncClassifyOffline")]
+    pub fn sync_classify_offline(
+        &self,
+        last_relay_contact: i64,
+        now: i64,
+    ) -> napi::Result<String> {
+        crate::sync::sync_classify_offline_on(&self.inner, last_relay_contact, now)
+    }
+
+    /// Per-instance equivalent of the free-function `sync_get_policy`.
+    #[napi(js_name = "syncGetPolicy")]
+    #[must_use] 
+    pub fn sync_get_policy(&self) -> NapiSyncPolicy {
+        crate::sync::sync_get_policy_on(&self.inner)
+    }
+
+    /// Per-instance equivalent of the free-function `sync_classify_offline_custom`.
+    #[napi(js_name = "syncClassifyOfflineCustom")]
+    pub fn sync_classify_offline_custom(
+        &self,
+        last_relay_contact: i64,
+        now: i64,
+        tier_1_threshold_secs: i64,
+        tier_2_threshold_secs: i64,
+    ) -> napi::Result<String> {
+        crate::sync::sync_classify_offline_custom_on(
+            &self.inner,
+            last_relay_contact,
+            now,
+            tier_1_threshold_secs,
+            tier_2_threshold_secs,
+        )
     }
 }

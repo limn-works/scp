@@ -98,13 +98,14 @@ pub(crate) fn ensure_did_resolver_initialized_on(bi: &crate::runtime::NapiBridge
     // (on `SCP` A) publishes to the same DHT Bob (on `SCP` B) reads from.
     // The client is `init`'d at most once per process regardless of how many
     // `SCP` instances exist.
-    let dht_client = if let Some(existing) = crate::runtime::shared_dht_client() {
-        Arc::clone(existing)
-    } else {
-        let client = Arc::new(InMemoryDhtClient::new());
-        crate::runtime::init_shared_dht_client(Arc::clone(&client));
-        client
-    };
+    let dht_client = crate::runtime::shared_dht_client().map_or_else(
+        || {
+            let client = Arc::new(InMemoryDhtClient::new());
+            crate::runtime::init_shared_dht_client(Arc::clone(&client));
+            client
+        },
+        Arc::clone,
+    );
 
     let relay_querier = Arc::new(NoOpRelayQuerier);
     let cache = Arc::new(DidCache::new());
@@ -125,6 +126,10 @@ pub(crate) fn ensure_did_resolver_initialized_on(bi: &crate::runtime::NapiBridge
 /// Retained for the legacy free-function façade paths. Routes through
 /// [`crate::runtime::default_bridge_instance`] so the behaviour matches
 /// the prior process-global path exactly.
+//
+// Retained until the Phase 4 demolition slice removes the remaining
+// free-function identity façade entries.
+#[allow(dead_code)]
 fn ensure_did_resolver_initialized() {
     if let Ok(bi) = crate::runtime::default_bridge_instance() {
         ensure_did_resolver_initialized_on(&bi);
@@ -1364,8 +1369,7 @@ pub fn identity_remove(did: String) {
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub fn identity_remove_if_present(did: String) -> bool {
     crate::runtime::default_bridge_instance()
-        .map(|bi| crate::runtime::remove_identity_if_present(&bi, &did))
-        .unwrap_or(false)
+        .is_ok_and(|bi| crate::runtime::remove_identity_if_present(&bi, &did))
 }
 
 // ---------------------------------------------------------------------------

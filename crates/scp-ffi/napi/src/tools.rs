@@ -29,8 +29,8 @@ fn validate_ucan_for_tool(
     ucan_token: &str,
     proof_resolver: &scp_ffi_common::BridgeProofResolver,
 ) -> Result<(), ScpNapiError> {
-    crate::runtime::with_context(&bi, context_id, |rt| {
-        let production_resolver = crate::runtime::did_resolver(&bi);
+    crate::runtime::with_context(bi, context_id, |rt| {
+        let production_resolver = crate::runtime::did_resolver(bi);
         let did_resolver = scp_ffi_common::DispatchDidResolver::new(
             production_resolver.map(std::convert::AsRef::as_ref),
         );
@@ -217,6 +217,7 @@ pub async fn tool_register(
 }
 
 /// Per-bridge-instance implementation of [`tool_register`].
+#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn tool_register_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -237,7 +238,7 @@ pub(crate) async fn tool_register_on(
     }
 
     // Ensure UCAN state is registered so the tool registry is available.
-    crate::runtime::ensure_registered(&bi, handle)?;
+    crate::runtime::ensure_registered(bi, handle)?;
 
     let context_id = handle.context_id();
 
@@ -278,7 +279,7 @@ pub(crate) async fn tool_register_on(
     };
 
     // Register the tool in the context's tool registry.
-    let registered_id = crate::runtime::with_context(&bi, &context_id, |rt| {
+    let registered_id = crate::runtime::with_context(bi, &context_id, |rt| {
         let (registered_id, _event) = scp_core::context::tools::register_tool(
             &mut rt.tool_registry,
             &rt.role_state,
@@ -371,6 +372,7 @@ pub async fn tool_invoke(
 }
 
 /// Per-bridge-instance implementation of [`tool_invoke`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn tool_invoke_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -401,7 +403,7 @@ pub(crate) async fn tool_invoke_on(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(&bi, handle)?;
+    crate::runtime::ensure_registered(bi, handle)?;
 
     // UCAN authorization (full 11-step ADR-016 pipeline). Bridge-owned
     // because the proof resolver, revocation list, and nonce tracker
@@ -414,7 +416,7 @@ pub(crate) async fn tool_invoke_on(
             })
         })?;
     validate_ucan_for_tool(
-        &bi,
+        bi,
         &context_id,
         &tool_id,
         &identity_did,
@@ -445,7 +447,7 @@ pub(crate) async fn tool_invoke_on(
     let context_id_for_executor = context_id.clone();
     let tool_id_for_executor = tool_id.clone();
     let identity_for_executor = identity_did.clone();
-    let (registry, handler) = crate::runtime::with_context(&bi, &context_id, |rt| {
+    let (registry, handler) = crate::runtime::with_context(bi, &context_id, |rt| {
         Ok((
             rt.tool_registry.clone(),
             rt.tool_handlers.get(&tool_id).cloned(),
@@ -488,7 +490,7 @@ pub(crate) async fn tool_invoke_on(
         })
     })?;
 
-    let manager = crate::runtime::context_manager(&bi)?;
+    let manager = crate::runtime::context_manager(bi)?;
     let invoker_did_typed: scp_primitives::DID = identity_did.into();
     let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
     let outcome = manager
@@ -544,6 +546,7 @@ pub async fn tool_verify(
 }
 
 /// Per-bridge-instance implementation of [`tool_verify`].
+#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn tool_verify_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -562,10 +565,10 @@ pub(crate) async fn tool_verify_on(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(&bi, handle)?;
+    crate::runtime::ensure_registered(bi, handle)?;
 
     // Look up the tool and verify against its test vectors (matching PyO3 pattern).
-    let result = crate::runtime::with_context(&bi, &context_id, |rt| {
+    let result = crate::runtime::with_context(bi, &context_id, |rt| {
         let (verification_result, _event) = scp_core::context::tools::verify_tool(
             &rt.tool_registry,
             &tool_id,
@@ -649,6 +652,7 @@ pub async fn tool_invoke_cross_context(
 }
 
 /// Per-bridge-instance implementation of [`tool_invoke_cross_context`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn tool_invoke_cross_context_on(
     bi: &crate::runtime::NapiBridgeInstance,
     source_handle: &NapiContextHandle,
@@ -689,7 +693,7 @@ pub(crate) async fn tool_invoke_cross_context_on(
 
     // Validate chain depth (context-configurable, default 8 per ADR-043).
     let max_chain_depth = {
-        let mgr = crate::runtime::context_manager(&bi)?;
+        let mgr = crate::runtime::context_manager(bi)?;
         let source_max = mgr
             .context_params(&source_context_id)
             .await
@@ -707,7 +711,7 @@ pub(crate) async fn tool_invoke_cross_context_on(
     }
 
     // Ensure target context UCAN state is registered.
-    crate::runtime::ensure_registered(&bi, target_handle)?;
+    crate::runtime::ensure_registered(bi, target_handle)?;
 
     // Primary authorization: UCAN token validation via the full 11-step
     // ADR-016 pipeline against the TARGET context's ceiling.
@@ -720,7 +724,7 @@ pub(crate) async fn tool_invoke_cross_context_on(
             })
         })?;
     validate_ucan_for_tool(
-        &bi,
+        bi,
         &target_context_id,
         &tool_id,
         &invoker_did,
@@ -736,7 +740,7 @@ pub(crate) async fn tool_invoke_cross_context_on(
         })
     })?;
 
-    let output = crate::runtime::with_context(&bi, &target_context_id, |rt| {
+    let output = crate::runtime::with_context(bi, &target_context_id, |rt| {
         let registration = rt
             .tool_registry
             .get(&tool_id)
@@ -842,18 +846,18 @@ pub(crate) async fn tool_session_create_on(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(&bi, handle)?;
+    crate::runtime::ensure_registered(bi, handle)?;
 
     // Read context-configured session cap (ADR-043), falling back to default.
     let cap = {
-        let mgr = crate::runtime::context_manager(&bi)?;
+        let mgr = crate::runtime::context_manager(bi)?;
         mgr.context_params(&context_id)
             .await
             .and_then(|p| p.session_cap)
             .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER) as usize
     };
 
-    crate::runtime::with_context(&bi, &context_id, |rt| {
+    crate::runtime::with_context(bi, &context_id, |rt| {
         // Enforce per-caller session cap (context-configured, ADR-043).
         let current = rt.session_store.count_by_source(&source_context_id);
         if current >= cap {
@@ -917,6 +921,7 @@ pub async fn tool_session_invoke(
 }
 
 /// Per-bridge-instance implementation of [`tool_session_invoke`].
+#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn tool_session_invoke_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -939,11 +944,11 @@ pub(crate) async fn tool_session_invoke_on(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(&bi, handle)?;
+    crate::runtime::ensure_registered(bi, handle)?;
 
     // Look up the tool_id from the session before UCAN validation so we can
     // validate against the correct tool capability.
-    let tool_id_for_ucan = crate::runtime::with_context(&bi, &context_id, |rt| {
+    let tool_id_for_ucan = crate::runtime::with_context(bi, &context_id, |rt| {
         let session = rt
             .session_store
             .get(&session_id)
@@ -965,7 +970,7 @@ pub(crate) async fn tool_session_invoke_on(
             })
         })?;
     validate_ucan_for_tool(
-        &bi,
+        bi,
         &context_id,
         &tool_id_for_ucan,
         &invoker_did,
@@ -974,7 +979,7 @@ pub(crate) async fn tool_session_invoke_on(
     )
     .map_err(napi::Error::from)?;
 
-    let output = crate::runtime::with_context(&bi, &context_id, |rt| {
+    let output = crate::runtime::with_context(bi, &context_id, |rt| {
         let session = rt
             .session_store
             .get(&session_id)
@@ -1070,6 +1075,7 @@ pub async fn tool_session_close(
 }
 
 /// Per-bridge-instance implementation of [`tool_session_close`].
+#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn tool_session_close_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1077,9 +1083,9 @@ pub(crate) async fn tool_session_close_on(
 ) -> napi::Result<()> {
     crate::napi_check_handle!(&bi.core, handle);
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(&bi, handle)?;
+    crate::runtime::ensure_registered(bi, handle)?;
 
-    crate::runtime::with_context(&bi, &context_id, |rt| {
+    crate::runtime::with_context(bi, &context_id, |rt| {
         if rt.session_store.remove(&session_id).is_none() {
             return Err(ScpNapiError::Tool {
                 message: format!("session '{session_id}' not found"),
@@ -1118,6 +1124,7 @@ pub async fn tool_interface_expose(
 }
 
 /// Per-bridge-instance implementation of [`tool_interface_expose`].
+#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn tool_interface_expose_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1143,7 +1150,7 @@ pub(crate) async fn tool_interface_expose_on(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(&bi, handle)?;
+    crate::runtime::ensure_registered(bi, handle)?;
 
     let rate_limit = match rate_limit_json {
         Some(ref json) => {
@@ -1159,7 +1166,7 @@ pub(crate) async fn tool_interface_expose_on(
         None => None,
     };
 
-    crate::runtime::with_context(&bi, &context_id, |rt| {
+    crate::runtime::with_context(bi, &context_id, |rt| {
         let context_handle = scp_core::context::ContextHandle::new(
             context_id.clone(),
             scp_core::context::ContextParams::default(),
@@ -1207,6 +1214,7 @@ pub async fn tool_interface_accept(
 }
 
 /// Per-bridge-instance implementation of [`tool_interface_accept`].
+#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn tool_interface_accept_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1225,7 +1233,7 @@ pub(crate) async fn tool_interface_accept_on(
     }
 
     let context_id = handle.context_id();
-    crate::runtime::ensure_registered(&bi, handle)?;
+    crate::runtime::ensure_registered(bi, handle)?;
 
     let mut interface: scp_core::context::tools::interface::ToolInterface =
         serde_json::from_str(&interface_json).map_err(|e| {
@@ -1235,7 +1243,7 @@ pub(crate) async fn tool_interface_accept_on(
             })
         })?;
 
-    crate::runtime::with_context(&bi, &context_id, |rt| {
+    crate::runtime::with_context(bi, &context_id, |rt| {
         let context_handle = scp_core::context::ContextHandle::new(
             context_id.clone(),
             scp_core::context::ContextParams::default(),
@@ -1280,6 +1288,7 @@ pub async fn tool_interface_revoke(
 }
 
 /// Per-bridge-instance implementation of [`tool_interface_revoke`].
+#[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn tool_interface_revoke_on(
     bi: &crate::runtime::NapiBridgeInstance,
     handle: &NapiContextHandle,
@@ -1493,6 +1502,7 @@ mod tests {
     async fn registered_at_is_seconds_epoch() {
         use crate::context::NapiContextHandle;
 
+        let bi = crate::runtime::default_bridge_instance().expect("default bridge");
         let ctx_id = format!("ctx-napi-ts-test-{}", std::process::id());
         let creator_did = "did:dht:z6MkNapiTsTest";
 
@@ -1532,6 +1542,6 @@ mod tests {
         );
 
         // Clean up global state.
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 }
