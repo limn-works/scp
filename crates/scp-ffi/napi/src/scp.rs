@@ -155,8 +155,14 @@ impl Scp {
                 }));
             }
         };
+        let inner = NapiBridgeInstance::with_storage_napi(storage).map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: e.to_string(),
+                code: codes::VALID_7005.to_owned(),
+            })
+        })?;
         Ok(Self {
-            inner: Arc::new(NapiBridgeInstance::with_storage_napi(storage)),
+            inner: Arc::new(inner),
         })
     }
 
