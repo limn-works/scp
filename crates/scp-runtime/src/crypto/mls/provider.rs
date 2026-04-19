@@ -18,6 +18,13 @@
 //! [`ContextCryptoProvider`]: scp_protocol::context::builder::ContextCryptoProvider
 //! [`ContextManager`]: crate::context::manager::ContextManager
 
+// `std::sync::Mutex` is disallowed crate-wide (ADR-049 actor-per-context).
+// `MlsCryptoProvider` itself is scheduled for deletion in commit 12 of the
+// actor PR — the actor owns MLS state. These Mutex fields are the exact
+// primitives the actor eliminates. Until the deletion lands, preserve the
+// current shape; do not migrate piecemeal.
+#![allow(clippy::disallowed_types)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

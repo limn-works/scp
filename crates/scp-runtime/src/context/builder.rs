@@ -711,7 +711,10 @@ pub async fn create_context(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::significant_drop_tightening
+    clippy::significant_drop_tightening,
+    // `std::sync::Mutex` is disallowed crate-wide (ADR-049); test mocks use
+    // the sync primitive for clarity.
+    clippy::disallowed_types
 )]
 mod tests {
     use std::sync::Mutex;

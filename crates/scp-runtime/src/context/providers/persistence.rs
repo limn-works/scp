@@ -11,6 +11,12 @@
 //!
 //! [`ContextPersistence`]: crate::context::manager::ContextPersistence
 
+// `std::sync::Mutex` is disallowed crate-wide (ADR-049 actor-per-context).
+// The sync `ContextPersistence` trait cannot use `tokio::sync::Mutex`. The
+// actor refactor replaces this provider with an async trait; that work lands
+// in commits 4-12 of the actor PR. Until then, preserve the current shape.
+#![allow(clippy::disallowed_types)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

@@ -32,6 +32,13 @@
 //!
 //! See ADR-008 (context creation), spec section 9.9 (event log).
 
+// `std::sync::Mutex` is disallowed crate-wide (ADR-049 actor-per-context).
+// This file is a sync `ContextEventLogProvider` trait impl — the trait is
+// sync upstream, so `tokio::sync::Mutex` is not usable here. The actor
+// refactor replaces this provider with an async trait; that work lands in
+// commits 4-12 of the actor PR. Until then, preserve the current shape.
+#![allow(clippy::disallowed_types)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};

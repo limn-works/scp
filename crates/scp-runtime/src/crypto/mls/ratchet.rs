@@ -207,6 +207,11 @@ pub fn serialize_mls_message(message: &MlsMessageOut) -> Result<Vec<u8>, MlsErro
 }
 
 #[cfg(test)]
+#[allow(
+    // `std::sync::Mutex` is disallowed crate-wide (ADR-049); test mocks use
+    // the sync primitive for clarity.
+    clippy::disallowed_types
+)]
 mod tests {
     use super::*;
     use crate::crypto::mls::credential::ScpCredential;

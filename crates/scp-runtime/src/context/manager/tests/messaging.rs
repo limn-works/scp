@@ -1,3 +1,7 @@
+// Test-only module. `std::sync::Mutex` is disallowed crate-wide
+// (ADR-049); tests may use sync primitives for mock state.
+#![allow(clippy::disallowed_types)]
+
 use super::*;
 use scp_protocol::context::governance::{AccessScope, GovernanceAction};
 

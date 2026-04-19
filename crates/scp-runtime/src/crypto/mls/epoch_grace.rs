@@ -448,6 +448,11 @@ fn unix_now_secs() -> u64 {
 }
 
 #[cfg(test)]
+#[allow(
+    // `std::sync::Mutex` is disallowed crate-wide (ADR-049); test mocks use
+    // the sync primitive for clarity.
+    clippy::disallowed_types
+)]
 mod tests {
     use super::*;
 

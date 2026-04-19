@@ -28,6 +28,11 @@
 //!
 //! See ADR-029 in `.docs/adrs/phase-6.md`.
 
+// `std::sync::Mutex` is disallowed crate-wide (ADR-049 actor-per-context).
+// The tracking map here is sync-only and out of scope for the actor
+// refactor (it is not per-context state). See ADR-049 § "Out of scope".
+#![allow(clippy::disallowed_types)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 

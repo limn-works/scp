@@ -1,0 +1,26 @@
+{
+  "_comment": "Ratchet baseline for `tokio::task::block_in_place`, `.block_on(...)`, and `Runtime::new()` call sites in the actor-refactor scope (ADR-049). See scripts/check-block-in-place.py for scope, detection rules, and the inline allow-list directive `// ci-allow: block-on: <reason>`. The gate fails when a crate's count goes UP. Counts drop as the actor refactor replaces sync-in-async bridges with async trait dispatch. Commit 12 of the actor refactor deletes the last of these; baselines will reach zero then. Test code (`**/tests/**` paths and `#[cfg(test)] mod` items) is excluded from counting. Allow-listed sites are excluded from counting and must carry a reason string.",
+  "_updated": "2026-04-19 (actor-per-context commit 3 — initial baseline capture)",
+  "_context": "Pre-refactor state. scp-runtime counts are sync-in-async bridges in ContextManager, MlsCryptoProvider, recovery, trust store, and per-context store. scp-transport counts are in the provider.rs sync-adapter bridge and native/relay_persistence.rs. scp-node has one site in the HTTP/3 request handler (sync trait method, legitimate and will be annotated once post-refactor patterns settle). The actor refactor eliminates every scp-runtime and scp-transport site listed below; the scp-node site may remain and be annotated with `// ci-allow: block-on: <reason>` in a later commit.",
+  "crates": {
+    "scp-node": 1,
+    "scp-runtime": 36,
+    "scp-transport": 18
+  },
+  "_breakdown": {
+    "scp-node": [
+      "crates/scp-node/src/http.rs:1541 — HTTP/3 RequestHandler sync trait method (block_on)"
+    ],
+    "scp-runtime": [
+      "crates/scp-runtime/src/context/manager/mod.rs:2328-2329 (1 block_in_place + 1 block_on)",
+      "crates/scp-runtime/src/context/manager/tools.rs:322-353, 398-401 (2 block_in_place + 4 block_on)",
+      "crates/scp-runtime/src/identity/recovery.rs:782-784 (1 block_in_place + 1 block_on)",
+      "crates/scp-runtime/src/store/context.rs:944-1109 (10 block_in_place + 10 block_on — RwLock-backed per-context store sync bridge)",
+      "crates/scp-runtime/src/store/trust.rs:273-336 (6 block_on via stored Handle)"
+    ],
+    "scp-transport": [
+      "crates/scp-transport/src/provider.rs:135-187 (3 block_in_place + 3 block_on)",
+      "crates/scp-transport/src/native/relay_persistence.rs:141-251 (6 block_in_place + 6 block_on)"
+    ]
+  }
+}

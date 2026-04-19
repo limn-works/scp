@@ -1,3 +1,9 @@
+// Test-only module. `std::sync::Mutex` is disallowed crate-wide (ADR-049),
+// but test mocks and call-tracking state use the sync primitive for clarity
+// — these mocks model synchronous external systems and run outside any
+// actor. The actor refactor does not migrate test scaffolding.
+#![allow(clippy::disallowed_types)]
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 // AtomicUsize / AtomicU64 are referenced via fully-qualified paths inside

@@ -1228,7 +1228,10 @@ pub const fn expiry_notification() -> ContextEvent {
     clippy::expect_used,
     clippy::panic,
     clippy::iter_on_single_items,
-    clippy::significant_drop_tightening
+    clippy::significant_drop_tightening,
+    // `std::sync::Mutex` is disallowed crate-wide (ADR-049); test mocks use
+    // the sync primitive for clarity.
+    clippy::disallowed_types
 )]
 mod tests {
     use std::sync::Mutex;

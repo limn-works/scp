@@ -177,6 +177,60 @@ jobs:
       - uses: actions/checkout@v5
       - run: bash scripts/check-handle-affinity.sh
 
+  # ── Actor-refactor enforcement (ADR-049) ────────────────────────────
+  # Gates introduced by the actor-per-context refactor. Each script is
+  # documented in its own file header; see .docs/adrs/ADR-049-actor-per-context.md
+  # for the bigger picture.
+
+  block-in-place:
+    needs: check-draft
+    name: Actor / block-in-place AST check + ratchet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install tree-sitter tree-sitter-rust
+      # Self-test MUST run first: it proves the scanner catches every
+      # known bypass pattern before we trust it on the real tree.
+      - name: Self-test scanner
+        run: python3.12 scripts/check-block-in-place.py --self-test
+      - name: Real scan
+        run: python3.12 scripts/check-block-in-place.py
+
+  deleted-primitives:
+    needs: check-draft
+    name: Actor / deleted primitives ban
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: bash scripts/check-deleted-primitives.sh
+
+  owned-identity-did:
+    needs: check-draft
+    name: Actor / OwnedIdentityDid capability check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install tree-sitter tree-sitter-rust
+      - run: python3.12 scripts/check-owned-identity-did.py
+
+  bridge-instance-lifecycle:
+    needs: check-draft
+    name: Actor / BridgeInstance lifecycle drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install tree-sitter tree-sitter-rust
+      - run: python3.12 scripts/check-bridge-instance-lifecycle.py
+
   wasm-protocol:
     needs: check-draft
     name: WASM / protocol
