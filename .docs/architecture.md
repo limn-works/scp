@@ -788,9 +788,10 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 - `append_event` appends a named event. **Cancel-safe:** persists first, commits to in-memory chain only after durable write succeeds. Returns `Err` on persist failure; in-memory chain never advances speculatively. A cancelled `append_event` either completes durably (in-memory advances) or leaves both persisted and in-memory unchanged — never one without the other.
 - `destroy_event_log` is for rollback — idempotent.
 
-**`SagaJournal`** (scp-runtime/context/supervisor) — `Send + Sync`, async methods. Full contract in §17.16.1 (durability, partial-write detectability, fail-closed construction, secret-bearing overwrite) and §9.4.3 (commitment + bearer discipline).
-- `append` — durable append per saga identifier. Cancel-hostile; `load_unresolved` is the sole post-cancel recovery signal.
-- `load_unresolved` — latest entry per unresolved saga. Cancel-safe.
+**`SagaJournal`** (scp-runtime/context/supervisor) — `Send + Sync`, async methods. Full contract in §17.16.1 and §9.4.3 (commitment + bearer discipline).
+- Construction — fail-closed if the backing storage cannot durably flush or cannot provide at-rest encryption for secret-bearing saga types (§9.4.3).
+- `append` — durable append per saga identifier; persisted format MUST make partial writes detectable on reload (e.g., length prefix plus checksum). Cancel-hostile; `load_unresolved` is the sole post-cancel recovery signal.
+- `load_unresolved` — latest entry per unresolved saga; skips or reconciles any torn-write entries detected on scan. Cancel-safe.
 - `mark_resolved` — terminal marker; synchronously overwrites on-disk evidence for secret-bearing sagas. Cancel-hostile for secret-bearing sagas (overwrite MUST complete on the next process start before the journal reopens).
 
 **`ColdTierProvider`** (scp-core/event_log) — `Send + Sync`, async methods.
