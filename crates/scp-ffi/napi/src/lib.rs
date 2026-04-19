@@ -83,8 +83,11 @@ use napi_derive::napi;
 /// [`pyscp_check_handle!`](../../scp_ffi/macro.pyscp_check_handle.html)
 /// for cross-bridge symmetry.
 ///
-/// Resolves [`bridge_instance_for_affinity`](crate::runtime::bridge_instance_for_affinity)
-/// internally and checks each `$handle.instance_id` against the core's.
+/// The caller passes a [`CoreFields`](crate::runtime::CoreFields) reference
+/// as the first argument (typically `&self.inner.core` on an `Scp` method,
+/// or `&bi.core` where `bi` is a `&NapiBridgeInstance` already in scope).
+/// The macro then checks that each supplied `$handle.instance_id()`
+/// matches the core's `instance_id`.
 ///
 /// `$handle` must carry an inherent `instance_id(&self) -> u64` method
 /// (`HandleInstance` in the runtime module).
@@ -92,27 +95,25 @@ use napi_derive::napi;
 /// Raises [`crate::error::ScpNapiError::Permission`] with error code
 /// `SCP-PERM-3030` on mismatch.
 ///
-/// Round 5 simplifier review dropped the explicit `$core` parameter
-/// after confirming all 175 call sites across the three bridges passed
-/// the same `bridge_instance_for_affinity()?` value. If a future
-/// per-instance `Scp::method` needs to target `&self.inner.core`, add a
-/// second macro arm rather than re-expanding the default one.
+/// Sub-slice A of #1549 Phase 4 PR 4 reintroduced the explicit `$core`
+/// parameter so per-`NapiBridgeInstance` call paths can flow their own
+/// core through without routing via the process-global default.
+/// Sub-slices B-E update every call site.
+///
+/// The affinity check is never blocked by transient lifecycle state
+/// (e.g., a suspended bridge) because it is a pure `u64` comparison that
+/// does not touch transport or `ContextManager` state.
 ///
 /// Usage:
 ///
 /// ```ignore
-/// napi_check_handle!(handle);
-/// napi_check_handle!(identity, context_handle);
+/// napi_check_handle!(&scp.inner.core, handle);
+/// napi_check_handle!(&bi.core, identity, context_handle);
 /// ```
 #[macro_export]
 macro_rules! napi_check_handle {
-    ($($handle:expr),+ $(,)?) => {{
-        // Method resolution on `check_handle` auto-derefs through `&T`,
-        // `&Arc<T>`, `Arc<T>`, and `CoreFields` directly. `CoreFields`
-        // has an inherent `check_handle` method, so the trait need not
-        // be in scope. Mirrors the PyO3 bridge's `pyscp_check_handle!`
-        // pattern.
-        let __core = $crate::runtime::bridge_instance_for_affinity()?;
+    ($core:expr, $($handle:expr),+ $(,)?) => {{
+        let __core: &$crate::runtime::CoreFields = $core;
         $(
             __core
                 .check_handle($crate::runtime::HandleInstance::instance_id($handle))
