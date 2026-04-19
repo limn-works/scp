@@ -66,7 +66,7 @@ def test_sqlite_construction_creates_database_file() -> None:
             )
             assert scp.instance_id > 0
         finally:
-            scp.shutdown(timeout=1.0)
+            asyncio.run(scp.shutdown(timeout=1.0))
 
 
 def test_sqlite_lifecycle_roundtrip() -> None:
@@ -80,7 +80,7 @@ def test_sqlite_lifecycle_roundtrip() -> None:
             # does not require pytest-asyncio.
             asyncio.run(scp.resume())
         finally:
-            scp.shutdown(timeout=1.0)
+            asyncio.run(scp.shutdown(timeout=1.0))
 
 
 def test_sqlite_reopen_with_same_path_and_key_succeeds() -> None:
@@ -96,7 +96,7 @@ def test_sqlite_reopen_with_same_path_and_key_succeeds() -> None:
 
         scp1 = SCP(storage=config)
         id1 = scp1.instance_id
-        scp1.shutdown(timeout=1.0)
+        asyncio.run(scp1.shutdown(timeout=1.0))
 
         # Fresh Python object, same underlying database file.
         scp2 = SCP(storage=config)
@@ -107,7 +107,7 @@ def test_sqlite_reopen_with_same_path_and_key_succeeds() -> None:
                 f"two SCP constructions (got {id1} then {id2})"
             )
         finally:
-            scp2.shutdown(timeout=1.0)
+            asyncio.run(scp2.shutdown(timeout=1.0))
 
 
 def test_sqlite_rejects_mismatched_key() -> None:
@@ -119,7 +119,7 @@ def test_sqlite_rejects_mismatched_key() -> None:
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         scp1 = SCP(storage={"type": "sqlite", "path": tmpdir, "key": _SQLITE_KEY})
-        scp1.shutdown(timeout=1.0)
+        asyncio.run(scp1.shutdown(timeout=1.0))
 
         wrong_key = b"\x11" * 32
         # The underlying SqliteStorage::new returns an error; the bridge
@@ -130,13 +130,13 @@ def test_sqlite_rejects_mismatched_key() -> None:
         # that the fallback did NOT corrupt the original DB is more
         # valuable than asserting construction raises.
         scp2 = SCP(storage={"type": "sqlite", "path": tmpdir, "key": wrong_key})
-        scp2.shutdown(timeout=1.0)
+        asyncio.run(scp2.shutdown(timeout=1.0))
 
         # Reopen with the correct key — the original encrypted state
         # must still be intact (not overwritten by the mismatched-key
         # attempt).
         scp3 = SCP(storage={"type": "sqlite", "path": tmpdir, "key": _SQLITE_KEY})
-        scp3.shutdown(timeout=1.0)
+        asyncio.run(scp3.shutdown(timeout=1.0))
 
 
 def test_sqlite_missing_path_field_raises() -> None:

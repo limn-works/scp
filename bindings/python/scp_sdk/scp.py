@@ -20,9 +20,10 @@ Example usage::
         # scp.instance_id is a monotonic u64 unique per process.
         ...
 
-    # Explicit in-memory storage config.
+    # Explicit in-memory storage config. `shutdown` is async
+    # (PR #1690 retro Fix 6) — await it from a coroutine.
     scp = SCP(storage={"type": "in_memory"})
-    scp.shutdown(timeout=5.0)
+    await scp.shutdown(timeout=5.0)
 
     # SQLCipher-encrypted on-disk storage (Phase 4 PR 3, #1549).
     scp = SCP(storage={
@@ -31,9 +32,14 @@ Example usage::
         "key": b"\\x00" * 32,
     })
 
-    # `resume` is async — it awaits transport reconnect (#1678).
+    # `resume` and `shutdown` are async — they await the tokio runtime.
     scp.suspend()
     await scp.resume()
+    await scp.shutdown()
+
+    # Async context-manager form — automatic graceful shutdown on scope exit.
+    async with SCP() as scp:
+        ...
 
     # Shared process-wide default (deprecated — prefer explicit construction).
     default = SCP.default()
@@ -235,7 +241,31 @@ class SCP:
         """
         await asyncio.to_thread(self._native.resume)
 
-    def shutdown(self, timeout: float = 5.0) -> None:
+    @staticmethod
+    def _shutdown_millis(timeout: float) -> int:
+        """Clamp ``timeout`` (seconds, float) into a ``u64`` milliseconds
+        value usable by the PyO3 bridge.
+
+        Extracted so the sync ``__exit__`` path and the async ``shutdown``
+        path share the same numeric contract without duplicating the
+        NaN / infinity / overflow handling.
+        """
+        # u64::MAX milliseconds — matches the Rust-side PyO3 bridge type.
+        u64_max = 0xFFFFFFFF_FFFFFFFF
+        # Order matters: isinf(+) must be caught BEFORE !isfinite, otherwise
+        # math.inf collapses to the NaN/negative abort branch. NaN is not
+        # orderable, so explicitly testing isfinite()==False is the only
+        # reliable way to trap it.
+        if math.isinf(timeout) and timeout > 0:
+            return u64_max
+        if not math.isfinite(timeout) or timeout <= 0:
+            # NaN, negative, negative-infinity, or zero → immediate abort.
+            return 0
+        if timeout * 1000 > u64_max:
+            return u64_max
+        return round(timeout * 1000)
+
+    async def shutdown(self, timeout: float = 5.0) -> None:
         """Shut down this instance with a graceful deadline.
 
         Drains in-flight tasks within ``timeout`` seconds, aborts any
@@ -251,30 +281,25 @@ class SCP:
         truncation — we were dropping up to 0.999 ms of caller budget
         per call before the round 2 review).
 
+        This method is async — the underlying PyO3 bridge runs a
+        ``block_on`` around the tokio runtime's graceful-shutdown path
+        (it may wait up to ``timeout`` seconds for in-flight tasks), so
+        we dispatch the blocking call to a worker thread via
+        :func:`asyncio.to_thread`. Blocking this on the event loop would
+        freeze every other coroutine for the shutdown window. Matches
+        the async ``resume`` and ``suspend`` surfaces on the Python
+        binding (PR #1690 retro, api-design MAJOR).
+
         :param timeout: Maximum seconds to wait for in-flight tasks
             (float — fractional seconds are preserved to millisecond
             resolution before crossing the FFI boundary).
         :raises ContextError: If the tokio runtime is unavailable.
         """
-        # u64::MAX milliseconds — matches the Rust-side PyO3 bridge type.
-        u64_max = 0xFFFFFFFF_FFFFFFFF
-        # Order matters: isinf(+) must be caught BEFORE !isfinite, otherwise
-        # math.inf collapses to the NaN/negative abort branch. NaN is not
-        # orderable, so explicitly testing isfinite()==False is the only
-        # reliable way to trap it.
-        if math.isinf(timeout) and timeout > 0:
-            millis = u64_max
-        elif not math.isfinite(timeout) or timeout <= 0:
-            # NaN, negative, negative-infinity, or zero → immediate abort.
-            millis = 0
-        elif timeout * 1000 > u64_max:
-            millis = u64_max
-        else:
-            millis = round(timeout * 1000)
-        self._native.shutdown(millis)
+        millis = self._shutdown_millis(timeout)
+        await asyncio.to_thread(self._native.shutdown, millis)
 
     def __enter__(self) -> SCP:
-        """Enter the context-manager scope — returns ``self``."""
+        """Enter the synchronous context-manager scope — returns ``self``."""
         return self
 
     def __exit__(
@@ -283,8 +308,30 @@ class SCP:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        """Shut down on scope exit using the default 5-second timeout."""
-        self.shutdown()
+        """Shut down synchronously on ``with``-scope exit.
+
+        Calls ``_native.shutdown`` directly — the PyO3 bridge already
+        runs ``block_on`` internally, so the sync path is correct here.
+        Async callers should use :meth:`__aexit__` / ``async with``.
+        """
+        self._native.shutdown(self._shutdown_millis(5.0))
+
+    async def __aenter__(self) -> SCP:
+        """Enter the asynchronous context-manager scope — returns ``self``."""
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """Shut down asynchronously on ``async with`` scope exit.
+
+        Awaits :meth:`shutdown` so the event loop keeps running while
+        the tokio runtime drains in-flight tasks.
+        """
+        await self.shutdown()
 
     def __repr__(self) -> str:
         """Developer-facing repr including the native ``instance_id``."""
