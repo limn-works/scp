@@ -410,6 +410,15 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         self.ucan_registry.clear();
         #[cfg(feature = "allow_in_memory_custody")]
         self.identity_registry.clear();
+        // Release the SQLite advisory lock on `{dir}/scp.db.lock` for the
+        // `Sqlite` variant. Other `Arc<SqliteStorage>` holders
+        // (`CoreFields::persistence`, `ContextManager`) keep the storage
+        // struct alive until the `NapiBridgeInstance` drops, but the
+        // advisory lock must be released now so that a subsequent
+        // `new SCP({ storage: { type: 'sqlite', path, key } })` against
+        // the same directory does not fail with "already open by another
+        // SCP instance". The `InMemory` variant's `close()` is a no-op.
+        self.protocol_repository.close();
         // Clear MCP registries so server shutdown senders and client
         // connections drop, allowing background tasks to terminate cleanly.
         // Migrated off `crate::mcp::clear_registries` (called by a

@@ -328,6 +328,34 @@ impl ProtocolRepoVariant {
             }
         }
     }
+
+    /// Releases persistent resources held by the variant.
+    ///
+    /// For [`ProtocolRepoVariant::Sqlite`] this walks the
+    /// `Arc<ProtocolRepository<Arc<SqliteStorage>>>` chain to reach
+    /// the `SqliteStorage` and calls
+    /// [`scp_platform::sqlite::SqliteStorage::close`] — releasing the
+    /// advisory lock on `{dir}/scp.db.lock` even when other `Arc`
+    /// holders (`CoreFields::persistence`, `ContextManager`) keep the
+    /// storage struct alive until the bridge instance drops.
+    /// [`ProtocolRepoVariant::InMemory`] has no persistent resources
+    /// and the call is a no-op.
+    ///
+    /// Called from `bridge_specific_shutdown` on the NAPI + `UniFFI`
+    /// bridges so that `SCP.shutdown()` at the SDK surface releases
+    /// the lock without requiring the caller to drop the `SCP` handle
+    /// itself.
+    pub fn close(&self) {
+        match self {
+            Self::InMemory(_) => {}
+            Self::Sqlite(repo) => {
+                // `ProtocolRepository<S>::storage()` returns `&S` — here
+                // `&Arc<SqliteStorage>` — and `SqliteStorage::close()` is
+                // `&self`, so the `Arc` deref gives us the call we need.
+                repo.storage().close();
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

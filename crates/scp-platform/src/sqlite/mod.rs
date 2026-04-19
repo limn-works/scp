@@ -58,9 +58,17 @@ pub struct SqliteStorage {
     // corruption that can occur when two `rusqlite` handles share the same
     // database file without coordinating access. See red-hat RED-1002.
     //
-    // Dropping the struct drops the File, which releases the flock(2) /
-    // LockFileEx lock automatically.
-    _lock_file: File,
+    // Held in `Mutex<Option<File>>` so [`close`](Self::close) can take the
+    // `File` out and drop it explicitly — releasing the flock(2) /
+    // LockFileEx lock even when outer `Arc<SqliteStorage>` references
+    // persist past shutdown (FFI bridge instances hold the storage through
+    // several Arc chains: `StorageProvider`, `CoreFields::persistence`,
+    // `ContextManager::persistence`, event-log repository). Without an
+    // explicit release path, the advisory lock outlived `SCP.shutdown()`
+    // in the Python and NAPI bridges, causing "already open by another
+    // SCP instance" errors on same-process reopen. Dropping the struct
+    // still releases the lock automatically for non-shutdown paths.
+    lock_file: Mutex<Option<File>>,
 }
 
 impl SqliteStorage {
@@ -164,8 +172,43 @@ impl SqliteStorage {
 
         Ok(Self {
             conn: Mutex::new(conn),
-            _lock_file: lock_file,
+            lock_file: Mutex::new(Some(lock_file)),
         })
+    }
+
+    /// Explicitly releases the advisory exclusive lock on `{dir}/scp.db.lock`.
+    ///
+    /// Idempotent — a second call is a no-op. Safe to call while
+    /// outstanding `Arc<SqliteStorage>` references are still alive;
+    /// subsequent `Storage` operations continue to work through the
+    /// cached `SQLCipher` connection but the lock is no longer held.
+    ///
+    /// The FFI bridges (`PyBridgeInstance`, `NapiBridgeInstance`,
+    /// `UniffiBridgeInstance`) invoke this from their
+    /// `bridge_specific_shutdown` so that `SCP.shutdown()` at the SDK
+    /// surface releases the advisory lock even when the caller still
+    /// holds the `scp` handle. Without this, the lock outlived
+    /// `shutdown()` and a subsequent `new SCP({ storage: sqlite })`
+    /// against the same directory failed with "already open by another
+    /// SCP instance" (observed on Python / TS persistence tests).
+    ///
+    /// Poisoned mutex → best-effort: recover the guard via
+    /// [`PoisonError::into_inner`] and still release the lock. A
+    /// poisoned lock-file mutex would otherwise silently skip the
+    /// release, leaving the advisory lock held until the
+    /// `SqliteStorage` is finally dropped. Since the only other
+    /// access point is `new()` (one-shot, via the constructor) and
+    /// the mutex is only ever taken to move a `File` out on
+    /// shutdown, there is no invariant that poisoning could
+    /// violate — recovery is sound.
+    pub fn close(&self) {
+        let mut guard = match self.lock_file.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Taking drops the `File` when the local goes out of scope,
+        // which releases the flock(2) / LockFileEx lock.
+        let _ = guard.take();
     }
 }
 
@@ -424,5 +467,37 @@ mod tests {
         drop(first);
         SqliteStorage::new(tmp.path(), &key)
             .expect("fresh open after drop of prior instance must succeed");
+    }
+
+    /// `close()` must release the advisory lock even while the
+    /// `SqliteStorage` value is still alive. The FFI bridges rely on
+    /// this to make `SCP.shutdown()` release the `scp.db.lock` flock
+    /// without requiring the SDK caller to drop the `SCP` handle: a
+    /// `BridgeInstance` holds the storage through multiple Arc chains
+    /// (`StorageProvider`, `CoreFields::persistence`, `ContextManager`,
+    /// event-log repository), so drop-on-shutdown is not available and
+    /// the lock must be released by explicit call.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    fn close_releases_advisory_lock_while_instance_alive() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = [0u8; 32];
+
+        let first = SqliteStorage::new(tmp.path(), &key).expect("first open must succeed");
+
+        // Explicit close releases the lock even though `first` is still alive.
+        first.close();
+
+        // Re-open while `first` is in scope must now succeed — this is the
+        // behavior `SCP.shutdown()` relies on in the Python and NAPI
+        // bridges.
+        let second =
+            SqliteStorage::new(tmp.path(), &key).expect("re-open after close must succeed");
+
+        // `close()` is idempotent — a second call is a no-op.
+        first.close();
+
+        drop(second);
+        drop(first);
     }
 }

@@ -302,6 +302,24 @@ impl StorageProvider {
         let storage = SqliteStorage::new(path, key)?;
         Ok(Self::Sqlite(Arc::new(storage)))
     }
+
+    /// Releases any persistent resources held by the variant.
+    ///
+    /// For [`StorageProvider::Sqlite`] this delegates to
+    /// [`SqliteStorage::close`] to release the advisory lock on
+    /// `scp.db.lock` even when outer `Arc<SqliteStorage>` references
+    /// remain alive. [`StorageProvider::InMemoryEncrypted`] has no
+    /// persistent resources and the call is a no-op.
+    ///
+    /// Called from `bridge_specific_shutdown` on the `PyO3` bridge so
+    /// that `SCP.shutdown()` on a `StorageConfig::Sqlite` instance
+    /// releases the lock at the SDK surface.
+    pub fn close(&self) {
+        match self {
+            Self::InMemoryEncrypted(_) => {}
+            Self::Sqlite(storage) => storage.close(),
+        }
+    }
 }
 
 impl Storage for StorageProvider {
@@ -720,9 +738,20 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // Clear the identity registry so held `Arc<FfiKeyCustody>` entries
         // drop, triggering `Zeroizing` on key material.
         self.identity_registry.clear();
-        // `storage_provider` is `OnceLock` — we cannot clear it. The
-        // `Arc<EncryptingAdapter>` is released when the `PyBridgeInstance`
-        // is dropped.
+        // `storage_provider` is `OnceLock` — we cannot clear the slot, but
+        // the `Sqlite` variant holds an advisory lock on
+        // `{dir}/scp.db.lock` that must be released at shutdown so
+        // `SCP(storage=...)` against the same path succeeds after a prior
+        // `SCP.shutdown()`. `StorageProvider::close()` delegates to
+        // `SqliteStorage::close()` which drops the `File` inside the
+        // lock-file mutex without dropping the `Arc<SqliteStorage>`
+        // (other Arc holders — `CoreFields::persistence`,
+        // `ContextManager::persistence` — keep the storage struct alive
+        // until the `PyBridgeInstance` itself drops). The
+        // `InMemoryEncrypted` variant's `close()` is a no-op.
+        if let Some(provider) = self.storage_provider.get() {
+            provider.close();
+        }
         // Clear the typed per-context FFI state registry so per-context
         // `ToolRegistry`, `EventLog`, receive channel senders, and
         // registered tool handlers drop.

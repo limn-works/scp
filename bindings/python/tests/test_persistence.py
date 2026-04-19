@@ -115,26 +115,28 @@ def test_sqlite_rejects_mismatched_key() -> None:
 
     Guards against silent downgrade — if the wrong key were accepted
     and a fresh empty database was opened in its place, callers would
-    silently lose access to persisted state.
+    silently lose access to persisted state. After commit
+    ``9fa80e13c`` (`fix(ffi): propagate SqliteStorage::new failure
+    from with_storage`) the bridge surfaces the `SQLCipher` key
+    mismatch as a ``ValidationError`` (``SCP-VALID-7005``) rather than
+    silently returning an in-memory instance.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         scp1 = SCP(storage={"type": "sqlite", "path": tmpdir, "key": _SQLITE_KEY})
         asyncio.run(scp1.shutdown(timeout=1.0))
 
+        # Wrong key must RAISE — `SqliteStorage::new` fails at the
+        # `PRAGMA key` / WAL-mode step because SQLCipher rejects the
+        # key as "file is not a database". The PyO3 bridge wraps that
+        # in `ScpPyError::Validation` → `scp_sdk.ValidationError`.
         wrong_key = b"\x11" * 32
-        # The underlying SqliteStorage::new returns an error; the bridge
-        # currently logs and falls back to an in-memory-only instance
-        # (documented in `with_storage_py`). Construction therefore
-        # succeeds, but the persistence provider on the returned
-        # instance is not wired to the mismatched-key database. Asserting
-        # that the fallback did NOT corrupt the original DB is more
-        # valuable than asserting construction raises.
-        scp2 = SCP(storage={"type": "sqlite", "path": tmpdir, "key": wrong_key})
-        asyncio.run(scp2.shutdown(timeout=1.0))
+        with pytest.raises(_scp_core.ValidationError):
+            SCP(storage={"type": "sqlite", "path": tmpdir, "key": wrong_key})
 
         # Reopen with the correct key — the original encrypted state
-        # must still be intact (not overwritten by the mismatched-key
-        # attempt).
+        # must still be intact (the failed mismatched-key attempt
+        # must not have corrupted or truncated the original
+        # encrypted database file).
         scp3 = SCP(storage={"type": "sqlite", "path": tmpdir, "key": _SQLITE_KEY})
         asyncio.run(scp3.shutdown(timeout=1.0))
 
