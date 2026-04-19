@@ -103,10 +103,29 @@ class SCP internal constructor(
      * Dispatched on [kotlinx.coroutines.Dispatchers.IO] via the supplied
      * [CoroutineBridge].
      *
+     * Renamed from `suspend()` in #1693 to avoid shadowing the Kotlin
+     * `suspend` coroutine modifier keyword. Tooling (IDE refactors,
+     * documentation generators, code-gen consumers) trip over the shadow
+     * even though the function name is contextually legal at the call site.
+     *
      * @throws uniffi.scp.ScpException.Transport if the transport lock is poisoned.
      */
-    suspend fun suspend(bridge: CoroutineBridge) {
+    suspend fun suspendInstance(bridge: CoroutineBridge) {
         bridge.ffiCall { inner.suspend() }
+    }
+
+    /**
+     * Deprecated shim for the pre-#1693 method name. Delegates to
+     * [suspendInstance]; removal target is the demolition slice of the
+     * #1549 Phase 4 façade deletion.
+     */
+    @Deprecated(
+        message = "Renamed to avoid Kotlin 'suspend' keyword shadow; use suspendInstance() (#1693).",
+        replaceWith = ReplaceWith("suspendInstance(bridge)"),
+        level = DeprecationLevel.WARNING,
+    )
+    suspend fun suspend(bridge: CoroutineBridge) {
+        suspendInstance(bridge)
     }
 
     /**

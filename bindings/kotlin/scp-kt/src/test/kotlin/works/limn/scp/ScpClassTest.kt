@@ -136,13 +136,13 @@ class ScpClassTest {
         }
 
     @Test
-    fun `suspend-then-resume round-trips via CoroutineBridge`() =
+    fun `suspendInstance-then-resume round-trips via CoroutineBridge`() =
         runTest {
             val scp = SCP()
             createdInstances += scp
             val bridge = bridge()
 
-            scp.suspend(bridge)
+            scp.suspendInstance(bridge)
             scp.resume(bridge)
             assertTrue(true)
         }

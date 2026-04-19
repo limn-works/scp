@@ -1,10 +1,15 @@
 // Lifecycle.kt — Kotlin SDK bridge lifecycle wrapper
 //
-// Wraps the UniFFI scp_suspend / scp_resume functions as Kotlin suspend
-// helpers. Bindings are injected via LifecycleBindings so tests can stub
-// the FFI layer.
+// Wraps the UniFFI `Scp.suspend` / `Scp.resume` instance methods on the
+// process-wide default instance as Kotlin suspend helpers. Bindings are
+// injected via LifecycleBindings so tests can stub the FFI layer.
 //
-// Provenance: scp-ffi-uniffi lib.rs (scp_suspend / scp_resume).
+// Since #1549 Phase 4 PR 4 (ADR-048), the default bindings route through
+// `uniffi.scp.Scp.defaultInstance().suspend()` / `.resume()` instead of the
+// deprecated free-function façade (`uniffi.scp.scpSuspend()` /
+// `uniffi.scp.scpResume()`), matching the Swift / TS SDK migrations.
+//
+// Provenance: scp-ffi-uniffi src/scp.rs (`Scp::suspend`, `Scp::resume`).
 
 @file:Suppress("MatchingDeclarationName")
 
@@ -33,24 +38,30 @@ interface LifecycleBindings {
 }
 
 /**
- * Namespace object for default bindings; the generated UniFFI functions are
- * global, and this object lets SDK callers choose between the real bindings
- * and an injected stub for tests.
+ * Namespace object for default bindings; lets SDK callers choose between
+ * the real UniFFI-backed bindings and an injected stub for tests.
+ *
+ * Since #1549 Phase 4 PR 4, the default implementation routes through the
+ * process-wide default `Scp` instance (`Scp.defaultInstance()`) instead of
+ * the deprecated free-function façade — matching the Swift / TS SDK
+ * migrations.
  */
 object LifecycleBridge {
     /**
-     * Default bindings — delegate to the UniFFI-generated `scpSuspend` /
-     * `scpResume` top-level functions. The `internal/` package is generated
-     * at build time (see `scripts/generate-uniffi-kotlin.sh`); tests
-     * injecting a stub should supply their own [LifecycleBindings] instead.
+     * Default bindings — delegate to the UniFFI-generated `Scp` class
+     * methods on the process-wide default instance
+     * (`uniffi.scp.Scp.defaultInstance()`). The `internal/` package is
+     * generated at build time (see `scripts/generate-uniffi-kotlin.sh`);
+     * tests injecting a stub should supply their own [LifecycleBindings]
+     * instead.
      */
     val default: LifecycleBindings = object : LifecycleBindings {
         override fun scpSuspend() {
-            uniffi.scp.scpSuspend()
+            uniffi.scp.Scp.defaultInstance().suspend()
         }
 
         override suspend fun scpResume() {
-            uniffi.scp.scpResume()
+            uniffi.scp.Scp.defaultInstance().resume()
         }
     }
 }
@@ -76,10 +87,10 @@ object LifecycleBridge {
 @Deprecated(
     message = (
         "Operates on the default SCP instance. Construct an explicit `SCP` and call " +
-            "`scp.suspend(bridge)` instead. Removal target: two release cycles after " +
+            "`scp.suspendInstance(bridge)` instead. Removal target: two release cycles after " +
             "Phase 4 merge (ADR-048)."
     ),
-    replaceWith = ReplaceWith("scp.suspend(bridge)"),
+    replaceWith = ReplaceWith("scp.suspendInstance(bridge)"),
     level = DeprecationLevel.WARNING,
 )
 suspend fun suspend(

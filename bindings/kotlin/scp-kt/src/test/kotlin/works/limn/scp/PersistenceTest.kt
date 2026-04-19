@@ -131,7 +131,7 @@ class PersistenceTest {
             val scp = SCP.withSqlite(dir.toFile(), sqliteKey)
             createdInstances += scp
 
-            scp.suspend(bridge)
+            scp.suspendInstance(bridge)
             scp.resume(bridge)
             // Reaching here means both suspend and resume completed
             // without raising — the SQLite-backed path composes with
