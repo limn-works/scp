@@ -1574,3 +1574,71 @@ Relative to Encrypted contexts, Broadcast contexts have the following security p
 **Changed:** Confidentiality via per-author broadcast key (not MLS). No MLS `membership_tag` (authentication is signature-only). No MLS forward secrecy (mitigated by key epoch rotation on block events). Public `routing_id` (SHA-256 of context_id, not HKDF-derived). Author identity visible to relays in the outer envelope (authors are public figures in a broadcast context — this is a feature, not a leak).
 
 See §9.5, §9.8, §9.9, and §9.10 for the full broadcast security analysis.
+
+## 5.15 Runtime Concurrency Model
+
+SCP runtimes serialize all mutation of a single context's state through exactly one owning computation. Implementations MAY use any concurrency primitive that delivers the properties below; the reference implementation uses one actor task per context. Protocol observers may depend on these properties.
+
+### 5.15.1 Single-Context Serialization
+
+For any given context, operations execute in a total order. No two operations on the same context observe or mutate state concurrently. The total order is determined by the arrival order of operations at the context's owning computation.
+
+Operations on different contexts are independent and MAY run in parallel, bounded only by the runtime's scheduling model.
+
+Runtimes apply backpressure when a single context's operation queue grows unbounded. The specific limit is implementation-defined; callers observe backpressure as a context-busy error and SHOULD implement retry with backoff.
+
+### 5.15.2 Context State Variants
+
+A context's state is mode-specific. An encrypted context carries MLS group state and sender keys; a broadcast context carries per-author broadcast keys, subscriber list, and author blocks. Mode is fixed at creation; a context never changes mode.
+
+### 5.15.3 Caller-Visible Persistence Guarantee
+
+Operations fall into two persistence tiers:
+
+**Sync-persisted** — the caller's acknowledgment implies durable commit. A process crash immediately after the ack does not roll back the operation. Sync-persisted operations:
+
+- MLS epoch advance, sender-key rotation, MLS member removal
+- Any operation that transitions a member's authorization downward: UCAN issuance/attenuation/revocation, role assignment/demotion/block, content-access key revocation, wrapping-key rotation
+- Event log append (chain integrity)
+- Saga phase transitions and per-actor saga-state transitions (§5.15.4)
+- KeyPackage consumption (Welcome idempotency)
+
+**Coalesced-persisted** — state MAY be persisted up to 50 ms after mutation. A process crash within this window rolls state back to the last persisted snapshot. Implementations MAY persist more aggressively but MUST NOT coalesce beyond 50 ms.
+
+Coalesced rollback applies to: participation counters, velocity trackers, incremental cache updates, in-flight send-sequence assignments. Send-sequence monotonicity is preserved across rollback by the reservation protocol in §5.15.7.
+
+**Authorization-state persistence invariant** (normative): any operation that transitions a member's authorization downward MUST be sync-persisted. Rollback would re-grant authority intended to be removed.
+
+### 5.15.4 Cross-Context Operations Use Sagas
+
+Operations spanning 2+ contexts — standing-pair creation, cross-context tool invocation, context migration (§5.11A), broadcast hosting handshake (§5.14) — execute as coordinated sagas driven by a supervisor that never allows contexts to await each other directly. Phase states are:
+
+```
+Initiated → PreparingA → PreparingB → Committing → Committed
+                                    ↘
+                                     Aborting → Aborted
+                                    ↘
+                                     NeedsRepair
+```
+
+Each phase transition is synchronously persisted to a durable journal before the next phase begins. On process restart the supervisor replays unresolved journal entries.
+
+Concurrent sagas against the same context are serialized. A context accepts at most one pending saga at a time; a second Prepare while one is pending is rejected with a saga-busy error.
+
+Commit retry budget: three retries (500 ms / 1 s / 2 s delays), then terminal `NeedsRepair` requiring operator action or process restart. No indefinite retry loop.
+
+Secret-bearing sagas (migration custody handovers) journal only a commitment (hash of the bearer envelope with a nonce), never the bearer bytes. The bearer remains in actor-local state protected by zeroization-on-drop. The journal alone cannot replay a secret-bearing Commit; crash recovery requires both the journal and the surviving actor state.
+
+### 5.15.5 Governance is Single-Context
+
+All governance actions in ADR-031 run single-context. Governance never requires cross-context coordination; if it appears to, that is a spec bug to be surfaced.
+
+### 5.15.6 Identity Scope
+
+Per-identity resources (KeyPackage pool, wrapping keys, recovery state) are owned at the identity level, not the context level. An operation executing in a context context-of-X identity-of-A MAY read A's per-identity state and MUST NOT read any other identity's per-identity state directly. Cross-identity operations (migration, federation) execute as sagas.
+
+### 5.15.7 Send-Sequence Reservation
+
+An implementation that assigns monotonically increasing send-sequence numbers MUST guarantee that a failed send (including a cancellation or panic after sequence assignment but before transmit) does not consume the sequence number. The reference implementation uses an RAII reservation guard: on drop without commit, the sequence is returned to the pool.
+
+See ADR-049 for implementation details and rejected alternatives.

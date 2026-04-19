@@ -700,9 +700,12 @@ Every subsystem in the table below is injected through a trait. Callers never co
 | Transport | `TransportAdapter` | `scp-transport/src/traits.rs` | Full | Nothing — native relay, Nostr, Matrix, Hyperswarm, libp2p, WebSocket, WebRTC, custom. |
 | DID method | `DidMethod` | `scp-core/src/identity/mod.rs` | Full | Nothing — did:dht (primary), did:web (fallback), or custom method. |
 | DHT client | `DhtClient` | `scp-core/src/identity/dht_client.rs` | Full | Nothing — pkarr (production), in-memory (testing), or custom BEP44 client. |
-| Context crypto | `ContextCryptoProvider` | `scp-core/src/context/builder.rs` | Partial | MLS is protocol-fundamental; the OpenMLS implementation is swappable but any replacement must implement RFC 9420 with the SCP ciphersuite. |
-| Context transport | `ContextTransportProvider` | `scp-core/src/context/builder.rs` | Full | Nothing — wraps transport for context-scoped operations. |
-| Context event log | `ContextEventLogProvider` | `scp-core/src/context/builder.rs` | Full | Nothing — in-memory, SQLite, custom backend. |
+| MLS primitives | `MlsBackend` | `scp-runtime/src/crypto/mls/` | Partial | MLS is protocol-fundamental; the OpenMLS implementation is swappable but any replacement must implement RFC 9420 with the SCP ciphersuite. |
+| HPKE primitives | `HpkeBackend` | `scp-runtime/src/crypto/` | Full | Nothing — any RFC 9180 implementation with the SCP suite. |
+| OpenMLS storage | `OpenMlsStorageAdapter` | `scp-runtime/src/crypto/mls/storage.rs` | Full | Nothing — wraps OpenMLS's sync StorageProvider over an async Storage backend. |
+| Context transport | `ContextTransportProvider` | `scp-runtime/src/context/builder.rs` | Full | Nothing — wraps transport for context-scoped operations. |
+| Context event log | `ContextEventLogProvider` | `scp-runtime/src/context/builder.rs` | Full | Nothing — in-memory, SQLite, custom backend. |
+| Saga journal | `SagaJournal` | `scp-runtime/src/context/supervisor/` | Full | Nothing — durable append-only coordinator log for cross-context sagas. |
 | Cold-tier storage | `ColdTierProvider` | `scp-core/src/event_log/tiered_storage.rs` | Full | Nothing — relay-hosted cold storage, local archive, custom. |
 | Payment rail | `PaymentAdapter` | `scp-core/src/economy/adapter.rs` | Full | Nothing — x402, Lightning, SPL, Stripe, test ledger. |
 
@@ -752,20 +755,34 @@ Each replaceable trait imposes invariants that every implementation must uphold.
 - `publish` enforces monotonic sequence number semantics — a publish with `seq` less than or equal to the existing sequence is a no-op.
 - `resolve` returns `Option<DhtRecord>` (value bytes + signature + sequence number).
 
-**`ContextCryptoProvider`** (scp-core/context) — `Send + Sync`, synchronous methods.
-- Wraps MLS group creation/destruction, sender key generation/destruction, broadcast key initialization, member add/remove, key package validation, sender key distribution, and message encryption.
-- Rollback methods (`destroy_mls_group`, `destroy_sender_key`) are idempotent.
-- `validate_creator_identity` is read-only — zero side effects.
+**`MlsBackend`** (scp-runtime/crypto/mls) — `Send + Sync`, async methods (via `#[async_trait]`). Replaces the deleted `ContextCryptoProvider` (ADR-049).
+- Stateless MLS primitives: `create_group`, `add_member_raw`, `remove_member_raw`, `encrypt`, `decrypt`, `process_commit`, `advance_epoch`, `validate_key_package`, `generate_key_package`, `join_from_welcome`.
+- Methods take `&mut ScpMlsGroup` (or equivalent) as an explicit parameter; the trait owns no state.
+- Orchestration (seal/open envelopes, rotate_sender_key, execute_revoke, etc.) lives in handler functions on `&mut PerContextState`, NOT in the trait.
 
-**`ContextTransportProvider`** (scp-core/context) — `Send + Sync`, synchronous methods.
+**`HpkeBackend`** (scp-runtime/crypto) — `Send + Sync`, async methods. Replaces the deleted `ContextCryptoProvider` HPKE surface.
+- Three methods: `seal`, `unseal`, `generate_wrapping_keypair`.
+- Used by sender-key distribution; independent of `MlsBackend` so tests may mock one without the other.
+
+**`OpenMlsStorageAdapter`** (scp-runtime/crypto/mls/storage) — `Send + Sync`, async methods.
+- Bridges OpenMLS's sync `StorageProvider` trait to SCP's async `Storage`.
+- Each read/write wraps `spawn_blocking` so the upstream sync trait does not pin async worker threads.
+- Per-actor `OpenMlsBackend` instances share the underlying adapter; OpenMLS namespaces keys by MLS `group_id`, preventing cross-actor collision.
+
+**`ContextTransportProvider`** (scp-runtime/context) — `Send + Sync`, async methods (except `is_connected`).
 - `is_connected` returns a boolean — no side effects.
 - `publish_context` and `delete_published` are scoped by context ID.
 - `send_message` delivers encrypted payloads through the transport layer.
 
-**`ContextEventLogProvider`** (scp-core/context) — `Send + Sync`, synchronous methods.
+**`ContextEventLogProvider`** (scp-runtime/context) — `Send + Sync`, async methods.
 - `init_event_log` creates an empty Merkle event log for a context.
-- `append_event` appends a named event. `append_context_event` is a convenience wrapper returning `ContextError`.
+- `append_event` appends a named event. Cancel-safe: persists first, commits to in-memory chain only after durable write succeeds. Returns `Err` on persist failure; in-memory chain never advances speculatively.
 - `destroy_event_log` is for rollback — idempotent.
+
+**`SagaJournal`** (scp-runtime/context/supervisor) — `Send + Sync`, async methods. See §17.9.
+- `append` — durable append-only per saga identifier.
+- `load_unresolved` — latest entry per unresolved saga for crash-recovery replay.
+- `mark_resolved` — terminal state marker; synchronously overwrites on-disk evidence for secret-bearing sagas.
 
 **`ColdTierProvider`** (scp-core/event_log) — `Send + Sync`, async methods.
 - Fetches Merkle inclusion proofs for cold-tier events from relay storage.

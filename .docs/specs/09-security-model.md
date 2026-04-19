@@ -244,6 +244,36 @@ Key principles:
 
 **Observability is the immune system.** The protocol provides verifiable event logs, participation records, tool verification results, challenge-response outcomes, and attestation freshness data. These are the immune system's sensory apparatus. The actual immune response is an evolving network of agents and governance tools that consume this data and get better over time.
 
+### 9.4.1 Isolation Boundaries Enforced by Construction
+
+Wherever possible, isolation boundaries SHOULD be enforced by the language's visibility or type-checking rules rather than by documentation or external lint checks. Construction-time enforcement survives refactoring, aliased imports, and re-exports; after-the-fact checks are weaker and must be actively maintained.
+
+Specific isolation boundaries in the runtime:
+
+- **Per-context state ownership.** A context's state is owned by exactly one computation and is not shareable. Handler code mutates state only through the owning computation. No mechanism exposes one context's state to another context's handler.
+- **Cross-identity capability restriction.** Operations that read per-identity state (wrapping keys, KeyPackage pool, recovery state) are reachable only via a capability proof that identifies the requesting identity. The capability proof is issued at actor construction and cannot be constructed or copied by handler code. An operation executing in an actor owned by identity A can read only A's per-identity state; any read of another identity's state requires a saga (§5.15.4).
+- **Capability is unduplicable.** The capability proof is not copyable, cloneable, or serializable by any API; implementations MUST prevent all three. Unsafe escapes (e.g. via raw-pointer conversion, transmute) MUST be forbidden in the module that defines the capability.
+- **No API returns per-identity state given an arbitrary DID.** The only supervisor API that returns per-identity state takes the capability proof as a parameter. Callers cannot pass another identity's DID and receive that identity's state.
+
+### 9.4.2 Authorization-State Persistence Invariant
+
+Any operation that transitions a member's authorization downward MUST be synchronously persisted before the operation's acknowledgment is visible to any observer (caller ack, network send, readable event log entry). A process crash between the mutation and the acknowledgment MUST NOT restore the pre-mutation authorization.
+
+Operations covered: UCAN issuance/attenuation/revocation, role assignment/demotion, blocklist updates, content-access key revocation, MLS member removal, wrapping-key rotation.
+
+Coalesced persistence (§5.15.3) MUST NOT be used for any of these. Rollback from a coalesced crash would re-grant authority that was meant to be removed, creating a window where a revoked attacker can replay actions.
+
+### 9.4.3 Saga Journal Secret Handling
+
+The cross-context saga coordinator writes phase transitions to a durable journal (§5.15.4). Saga evidence carried in journal entries is classified as **secret-bearing** or **public**. Bearer artifacts (migration custody handovers, unrevoked proof tokens that would authorize action on their own) are secret-bearing.
+
+Requirements:
+
+- Secret-bearing sagas MUST journal only a commitment — a hash of the bearer envelope with a nonce — never the bearer bytes. The bearer remains in actor-local state and MUST be zeroized when it leaves memory.
+- In-memory journal entries MUST be zeroized on drop.
+- Storage backends for the journal MUST declare an at-rest encryption posture. Backends without at-rest encryption MUST refuse to host secret-bearing saga types; the runtime's journal construction fails closed against mismatched backends.
+- Marking a secret-bearing saga resolved MUST synchronously overwrite the on-disk evidence bytes before the operation returns, not at next compaction.
+
 ## 9.5 Cryptographic Primitive Specification
 
 The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. This eliminates downgrade attacks and simplifies implementation.
