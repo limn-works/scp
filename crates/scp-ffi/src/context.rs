@@ -1703,8 +1703,12 @@ impl crate::scp::PyScp {
         // for embedding in scp://context/<id> URIs.
         let context_id = crate::types::generate_context_id();
 
-        let handle =
-            PyContextHandle::new(bi, context_id.clone(), identity_did.to_owned(), parsed.clone());
+        let handle = PyContextHandle::new(
+            bi,
+            context_id.clone(),
+            identity_did.to_owned(),
+            parsed.clone(),
+        );
 
         // Register FFI-specific state (ToolRegistry, EventLog, RoleState, RevocationList)
         // in the global FFI state registry so that tools/UCAN/event_log bridge functions

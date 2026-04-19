@@ -1228,9 +1228,13 @@ mod tests {
             cost: None,
         };
 
-        let tool_id = tool_register_on(&crate::runtime::default_bridge_instance().unwrap(), &handle, definition)
-            .await
-            .expect("tool_register should succeed");
+        let tool_id = tool_register_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            &handle,
+            definition,
+        )
+        .await
+        .expect("tool_register should succeed");
 
         // Read the stored registration back and verify registered_at.
         let registered_at = crate::runtime::with_context(&bi, &ctx_id, |rt| {

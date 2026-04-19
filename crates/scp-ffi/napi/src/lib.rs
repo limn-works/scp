@@ -285,7 +285,6 @@ pub fn scp_version() -> String {
 // Phase D (#1695): `scp_shutdown` free function deleted. Per-instance
 // shutdown now goes through `SCP.shutdown(timeout_millis)`.
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

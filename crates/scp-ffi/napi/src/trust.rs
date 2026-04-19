@@ -408,19 +408,31 @@ mod tests {
 
     #[test]
     fn trust_query_score_validates_empty_did() {
-        let result = trust_query_score_on(&crate::runtime::default_bridge_instance().unwrap(), String::new(), "ctx".to_owned());
+        let result = trust_query_score_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            String::new(),
+            "ctx".to_owned(),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn trust_query_score_validates_empty_context() {
-        let result = trust_query_score_on(&crate::runtime::default_bridge_instance().unwrap(), "did:key:test".to_owned(), String::new());
+        let result = trust_query_score_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            "did:key:test".to_owned(),
+            String::new(),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn trust_query_score_returns_zeros_for_unknown_context() {
-        let result = trust_query_score_on(&crate::runtime::default_bridge_instance().unwrap(), "did:key:test".to_owned(), "nonexistent-ctx".to_owned());
+        let result = trust_query_score_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            "did:key:test".to_owned(),
+            "nonexistent-ctx".to_owned(),
+        );
         assert!(result.is_ok());
         let score = result.unwrap();
         assert_eq!(score.message_count, 0);
@@ -475,7 +487,8 @@ mod tests {
 
     #[test]
     fn aggregate_trust_input_rejects_empty_context() {
-        let result = aggregate_trust_input_on(&crate::runtime::default_bridge_instance().unwrap(), 
+        let result = aggregate_trust_input_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
             String::new(),
             "did:key:test".to_owned(),
             "[]".to_owned(),
@@ -491,7 +504,8 @@ mod tests {
 
     #[test]
     fn aggregate_trust_input_rejects_invalid_events_json() {
-        let result = aggregate_trust_input_on(&crate::runtime::default_bridge_instance().unwrap(), 
+        let result = aggregate_trust_input_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
             "ctx-1".to_owned(),
             "did:key:test".to_owned(),
             "not json".to_owned(),

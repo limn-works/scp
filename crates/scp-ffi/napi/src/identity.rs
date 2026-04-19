@@ -57,7 +57,6 @@ use std::fmt;
 use crate::error::ScpNapiError;
 use crate::{decrement_handle_count, increment_handle_count};
 
-
 /// Ensures the production DID resolver is initialized on the given bridge
 /// instance (idempotent). #311
 ///
@@ -1038,7 +1037,6 @@ pub struct NapiDIDDocument {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
 #[cfg(test)]
 #[cfg(feature = "allow_in_memory_custody")]
 #[allow(clippy::expect_used, clippy::panic)]

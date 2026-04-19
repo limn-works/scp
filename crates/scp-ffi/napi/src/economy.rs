@@ -478,44 +478,90 @@ mod tests {
     #[test]
     fn budget_remaining_empty_context_returns_zero() {
         crate::runtime::init_context_manager_for_test();
-        let result = economy_budget_remaining_on(&crate::runtime::default_bridge_instance().unwrap(), "test-ctx".to_owned(), "did:key:test".to_owned());
+        let result = economy_budget_remaining_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            "test-ctx".to_owned(),
+            "did:key:test".to_owned(),
+        );
         assert_eq!(result.unwrap(), 0);
     }
 
     #[test]
     fn budget_grant_and_spend() {
         crate::runtime::init_context_manager_for_test();
-        economy_budget_grant_on(&crate::runtime::default_bridge_instance().unwrap(), "napi-econ-ctx".to_owned(), "did:key:alice".to_owned(), 1000).unwrap();
-        let r = economy_budget_remaining_on(&crate::runtime::default_bridge_instance().unwrap(), "napi-econ-ctx".to_owned(), "did:key:alice".to_owned())
-            .unwrap();
+        economy_budget_grant_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            "napi-econ-ctx".to_owned(),
+            "did:key:alice".to_owned(),
+            1000,
+        )
+        .unwrap();
+        let r = economy_budget_remaining_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            "napi-econ-ctx".to_owned(),
+            "did:key:alice".to_owned(),
+        )
+        .unwrap();
         assert_eq!(r, 1000);
 
-        economy_budget_record_spend_on(&crate::runtime::default_bridge_instance().unwrap(), "napi-econ-ctx".to_owned(), "did:key:alice".to_owned(), 400)
-            .unwrap();
-        let r = economy_budget_remaining_on(&crate::runtime::default_bridge_instance().unwrap(), "napi-econ-ctx".to_owned(), "did:key:alice".to_owned())
-            .unwrap();
+        economy_budget_record_spend_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            "napi-econ-ctx".to_owned(),
+            "did:key:alice".to_owned(),
+            400,
+        )
+        .unwrap();
+        let r = economy_budget_remaining_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            "napi-econ-ctx".to_owned(),
+            "did:key:alice".to_owned(),
+        )
+        .unwrap();
         assert_eq!(r, 600);
     }
 
     #[test]
     fn antispam_velocity_starts_at_zero() {
         crate::runtime::init_context_manager_for_test();
-        let v =
-            economy_antispam_velocity_on(&crate::runtime::default_bridge_instance().unwrap(), "napi-spam-ctx".to_owned(), "did:key:bob".to_owned(), 1000);
+        let v = economy_antispam_velocity_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            "napi-spam-ctx".to_owned(),
+            "did:key:bob".to_owned(),
+            1000,
+        );
         assert_eq!(v.unwrap(), 0);
     }
 
     #[test]
     fn budget_validates_empty_inputs() {
-        assert!(economy_budget_remaining_on(&crate::runtime::default_bridge_instance().unwrap(), String::new(), "did:key:x".to_owned()).is_err());
-        assert!(economy_budget_remaining_on(&crate::runtime::default_bridge_instance().unwrap(), "ctx".to_owned(), String::new()).is_err());
+        assert!(
+            economy_budget_remaining_on(
+                &crate::runtime::default_bridge_instance().unwrap(),
+                String::new(),
+                "did:key:x".to_owned()
+            )
+            .is_err()
+        );
+        assert!(
+            economy_budget_remaining_on(
+                &crate::runtime::default_bridge_instance().unwrap(),
+                "ctx".to_owned(),
+                String::new()
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn budget_grant_rejects_negative_amount() {
         crate::runtime::init_context_manager_for_test();
-        let err =
-            economy_budget_grant_on(&crate::runtime::default_bridge_instance().unwrap(), "ctx".to_owned(), "did:key:alice".to_owned(), -1).unwrap_err();
+        let err = economy_budget_grant_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            "ctx".to_owned(),
+            "did:key:alice".to_owned(),
+            -1,
+        )
+        .unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"
@@ -525,8 +571,13 @@ mod tests {
     #[test]
     fn budget_record_spend_rejects_negative_amount() {
         crate::runtime::init_context_manager_for_test();
-        let err = economy_budget_record_spend_on(&crate::runtime::default_bridge_instance().unwrap(), "ctx".to_owned(), "did:key:alice".to_owned(), -100)
-            .unwrap_err();
+        let err = economy_budget_record_spend_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            "ctx".to_owned(),
+            "did:key:alice".to_owned(),
+            -100,
+        )
+        .unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"
@@ -536,8 +587,13 @@ mod tests {
     #[test]
     fn antispam_record_rejects_negative_timestamp() {
         crate::runtime::init_context_manager_for_test();
-        let err =
-            economy_antispam_record_on(&crate::runtime::default_bridge_instance().unwrap(), "ctx".to_owned(), "did:key:bob".to_owned(), -1).unwrap_err();
+        let err = economy_antispam_record_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            "ctx".to_owned(),
+            "did:key:bob".to_owned(),
+            -1,
+        )
+        .unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"
@@ -547,8 +603,13 @@ mod tests {
     #[test]
     fn antispam_velocity_rejects_negative_now() {
         crate::runtime::init_context_manager_for_test();
-        let err =
-            economy_antispam_velocity_on(&crate::runtime::default_bridge_instance().unwrap(), "ctx".to_owned(), "did:key:bob".to_owned(), -1).unwrap_err();
+        let err = economy_antispam_velocity_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            "ctx".to_owned(),
+            "did:key:bob".to_owned(),
+            -1,
+        )
+        .unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"

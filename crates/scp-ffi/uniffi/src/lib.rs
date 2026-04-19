@@ -175,7 +175,7 @@ pub use bridge::{
 };
 // Feature-gated re-exports — only available with allow_in_memory_custody.
 #[cfg(feature = "allow_in_memory_custody")]
-pub use bridge::{scpid_sign};
+pub use bridge::scpid_sign;
 // Re-export shutdown function defined in this module.
 // (scp_shutdown is defined here and exported via #[uniffi::export] above.)
 

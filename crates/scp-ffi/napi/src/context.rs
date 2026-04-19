@@ -3502,23 +3502,33 @@ mod tests {
 
         // Initially None.
         assert!(
-            context_get_economic_policy_on(&crate::runtime::default_bridge_instance().unwrap(), &handle)
-                .expect("handle is default-instance")
-                .is_none()
+            context_get_economic_policy_on(
+                &crate::runtime::default_bridge_instance().unwrap(),
+                &handle
+            )
+            .expect("handle is default-instance")
+            .is_none()
         );
 
         // Direct set always rejects — must use governance (#728).
         let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":null,"per_tool_invoke":100,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkTest"}"#;
-        let result = context_set_economic_policy_on(&crate::runtime::default_bridge_instance().unwrap(), &mut handle, json.to_owned());
+        let result = context_set_economic_policy_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            &mut handle,
+            json.to_owned(),
+        );
         assert!(
             result.is_err(),
             "direct set must be rejected — use governance"
         );
         // Policy should remain unchanged.
         assert!(
-            context_get_economic_policy_on(&crate::runtime::default_bridge_instance().unwrap(), &handle)
-                .expect("handle is default-instance")
-                .is_none()
+            context_get_economic_policy_on(
+                &crate::runtime::default_bridge_instance().unwrap(),
+                &handle
+            )
+            .expect("handle is default-instance")
+            .is_none()
         );
     }
 
@@ -3808,7 +3818,8 @@ mod tests {
             r#"{"has_spending_ucan":true,"configured_adapters":["x402"],"available_balance":10000}"#
                 .to_owned();
 
-        let result = super::evaluate_invitation_on(&crate::runtime::default_bridge_instance().unwrap(), 
+        let result = super::evaluate_invitation_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
             params_json,
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
@@ -3827,7 +3838,8 @@ mod tests {
         let params = scp_core::context::ContextParams::default();
         let params_json = serde_json::to_string(&params).unwrap();
 
-        let result = super::evaluate_invitation_on(&crate::runtime::default_bridge_instance().unwrap(), 
+        let result = super::evaluate_invitation_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
             params_json,
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
@@ -3844,7 +3856,8 @@ mod tests {
         let params = scp_core::context::ContextParams::default();
         let params_json = serde_json::to_string(&params).unwrap();
 
-        let result = super::evaluate_invitation_on(&crate::runtime::default_bridge_instance().unwrap(), 
+        let result = super::evaluate_invitation_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
             params_json,
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
@@ -3870,7 +3883,9 @@ mod tests {
     async fn context_create_threads_consequence_rules_and_config() {
         crate::runtime::init_context_manager_for_test();
 
-        let identity = crate::scp::Scp::new().unwrap().identity_create("in_memory".to_owned())
+        let identity = crate::scp::Scp::new()
+            .unwrap()
+            .identity_create("in_memory".to_owned())
             .await
             .expect("identity_create should succeed");
 
@@ -3894,9 +3909,13 @@ mod tests {
         })
         .to_string();
 
-        let handle = super::context_create_on(&crate::runtime::default_bridge_instance().unwrap(), &identity, params_json)
-            .await
-            .expect("context_create should succeed");
+        let handle = super::context_create_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            &identity,
+            params_json,
+        )
+        .await
+        .expect("context_create should succeed");
 
         let bi = crate::runtime::default_bridge_instance().expect("default bridge");
         let manager = context_manager(&bi).expect("manager should be initialized");
@@ -3925,7 +3944,9 @@ mod tests {
     async fn context_create_rejects_revoke_access_when_config_disallows() {
         crate::runtime::init_context_manager_for_test();
 
-        let identity = crate::scp::Scp::new().unwrap().identity_create("in_memory".to_owned())
+        let identity = crate::scp::Scp::new()
+            .unwrap()
+            .identity_create("in_memory".to_owned())
             .await
             .expect("identity_create should succeed");
 
@@ -3948,7 +3969,12 @@ mod tests {
         })
         .to_string();
 
-        let result = super::context_create_on(&crate::runtime::default_bridge_instance().unwrap(), &identity, params_json).await;
+        let result = super::context_create_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            &identity,
+            params_json,
+        )
+        .await;
         assert!(
             result.is_err(),
             "RevokeAccess rule must be rejected when config.allow_automatic_access_revocation is false"
@@ -3962,7 +3988,9 @@ mod tests {
     async fn context_join_rejects_malformed_spending_ucan_jwt() {
         crate::runtime::init_context_manager_for_test();
 
-        let identity = crate::scp::Scp::new().unwrap().identity_create("in_memory".to_owned())
+        let identity = crate::scp::Scp::new()
+            .unwrap()
+            .identity_create("in_memory".to_owned())
             .await
             .expect("identity_create should succeed");
 
@@ -3972,11 +4000,16 @@ mod tests {
             "governance": "single_admin",
         })
         .to_string();
-        let handle = super::context_create_on(&crate::runtime::default_bridge_instance().unwrap(), &identity, params_json)
-            .await
-            .expect("context_create should succeed");
+        let handle = super::context_create_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            &identity,
+            params_json,
+        )
+        .await
+        .expect("context_create should succeed");
 
-        let result = super::context_join_on(&crate::runtime::default_bridge_instance().unwrap(), 
+        let result = super::context_join_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
             &handle,
             identity.inner.did.clone(),
             Some("not.a.jwt".to_owned()),
@@ -4001,7 +4034,9 @@ mod tests {
     async fn context_join_accepts_none_spending_ucan_jwt() {
         crate::runtime::init_context_manager_for_test();
 
-        let identity = crate::scp::Scp::new().unwrap().identity_create("in_memory".to_owned())
+        let identity = crate::scp::Scp::new()
+            .unwrap()
+            .identity_create("in_memory".to_owned())
             .await
             .expect("identity_create should succeed");
 
@@ -4011,14 +4046,24 @@ mod tests {
             "governance": "single_admin",
         })
         .to_string();
-        let handle = super::context_create_on(&crate::runtime::default_bridge_instance().unwrap(), &identity, params_json)
-            .await
-            .expect("context_create should succeed");
+        let handle = super::context_create_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            &identity,
+            params_json,
+        )
+        .await
+        .expect("context_create should succeed");
 
         // Same identity rejoining is fine for the smoke check — the
         // important assertion is that the bridge reaches the manager
         // instead of erroring on parameter handling.
-        let result = super::context_join_on(&crate::runtime::default_bridge_instance().unwrap(), &handle, identity.inner.did.clone(), None).await;
+        let result = super::context_join_on(
+            &crate::runtime::default_bridge_instance().unwrap(),
+            &handle,
+            identity.inner.did.clone(),
+            None,
+        )
+        .await;
         // Manager may or may not error depending on duplicate-member rules.
         // We only verify the bridge accepted the call shape (no
         // SCP-ECON-12061 / SCP-VALID parsing failure).
