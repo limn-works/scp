@@ -2157,21 +2157,6 @@ struct McpRegistryStats {
     clients: usize,
 }
 
-/// Returns MCP registry entry counts (default bridge instance).
-fn mcp_registry_stats() -> McpRegistryStats {
-    let servers = server_registry().len();
-    let stopped_servers = server_registry()
-        .iter()
-        .filter(|entry| entry.value().stopped)
-        .count();
-    let clients = client_registry().len();
-    McpRegistryStats {
-        servers,
-        stopped_servers,
-        clients,
-    }
-}
-
 /// Returns MCP registry entry counts for the given bridge instance
 /// (Phase 4 PR 4 sub-slice D).
 fn mcp_registry_stats_for(bi: &crate::runtime::PyBridgeInstance) -> McpRegistryStats {
@@ -2189,31 +2174,8 @@ fn mcp_registry_stats_for(bi: &crate::runtime::PyBridgeInstance) -> McpRegistryS
     }
 }
 
-/// Removes stopped MCP server entries from the default bridge instance's
+/// Removes stopped MCP server entries from the given bridge instance's
 /// registry.
-///
-/// Returns the number of entries removed. Stopped servers (where
-/// `py_mcp_server_stop` was called but the entry was not removed) are
-/// cleaned up to prevent indefinite accumulation in long-running
-/// processes.
-fn cleanup_stopped_servers() -> usize {
-    let mut removed = 0;
-    let keys_to_remove: Vec<String> = server_registry()
-        .iter()
-        .filter(|entry| entry.value().stopped)
-        .map(|entry| entry.key().clone())
-        .collect();
-
-    for key in keys_to_remove {
-        if server_registry().remove(&key).is_some() {
-            removed += 1;
-        }
-    }
-    removed
-}
-
-/// Per-instance variant of [`cleanup_stopped_servers`]
-/// (Phase 4 PR 4 sub-slice D).
 fn cleanup_stopped_servers_for(bi: &crate::runtime::PyBridgeInstance) -> usize {
     let registry = server_registry_of(bi);
     let mut removed = 0;
