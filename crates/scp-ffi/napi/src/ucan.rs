@@ -51,6 +51,7 @@ use crate::decrement_handle_count;
 use crate::error::ScpNapiError;
 #[cfg(feature = "allow_in_memory_custody")]
 use crate::increment_handle_count;
+use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
 
 // ---------------------------------------------------------------------------
 // NapiUcanTokenData — UCAN token metadata record
@@ -230,13 +231,36 @@ pub async fn ucan_validate(
     presenting_agent_did: Option<String>,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    ucan_validate_on(
+        &bi,
+        handle,
+        token,
+        capability,
+        presenting_agent_did,
+        proof_tokens,
+    )
+    .await
+}
+
+/// Per-bridge-instance implementation of [`ucan_validate`].
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Option<Vec>
+pub(crate) async fn ucan_validate_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    token: String,
+    capability: String,
+    presenting_agent_did: Option<String>,
+    proof_tokens: Option<Vec<String>>,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_ucan_token(&token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_capability_uri(&capability).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
-    crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     // Step 1: Parse the UCAN token using scp-core's parser.
     let parsed_token = parse_ucan(&token).map_err(ScpNapiError::from)?;
@@ -267,10 +291,10 @@ pub async fn ucan_validate(
     // and nonce tracker from the runtime registry. This ensures:
     // - Revoked tokens are rejected across calls (persistent RevocationList).
     // - Replayed nonces are detected across calls (persistent NonceTracker).
-    crate::runtime::with_context(&context_id, |rt| {
+    crate::runtime::with_context(bi, &context_id, |rt| {
         // Build validation context using persistent runtime state.
         // Use production DID resolver when available (#311), fallback to string-only.
-        let production_resolver = crate::runtime::did_resolver();
+        let production_resolver = crate::runtime::did_resolver(bi);
         let did_resolver =
             DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
         let revocation_checker = BridgeRevocationChecker {
@@ -337,7 +361,21 @@ pub async fn ucan_mint(
     capabilities: Vec<String>,
     proofs: Option<Vec<String>>,
 ) -> napi::Result<NapiUcanToken> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    ucan_mint_on(&bi, handle, member_did, capabilities, proofs).await
+}
+
+/// Per-bridge-instance implementation of [`ucan_mint`].
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec/Option<Vec>
+#[allow(clippy::unused_async)] // napi requires async for Promise return type
+pub(crate) async fn ucan_mint_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    member_did: String,
+    capabilities: Vec<String>,
+    proofs: Option<Vec<String>>,
+) -> napi::Result<NapiUcanToken> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_did(&member_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     if let Some(ref tokens) = proofs {
         for t in tokens {
@@ -348,7 +386,7 @@ pub async fn ucan_mint(
     // In-memory custody is only available when `allow_in_memory_custody` is enabled.
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
-        let _ = (&handle, &member_did, &capabilities, &proofs);
+        let _ = (bi, &handle, &member_did, &capabilities, &proofs);
         Err(napi::Error::from(ScpNapiError::Permission {
             message: "UCAN minting requires key custody -- the in_memory custody path                       is not available in this build. Enable allow_in_memory_custody                       for dev/desktop use.".to_owned(),
             code: codes::PERM_3023.to_owned(),
@@ -434,7 +472,7 @@ pub async fn ucan_mint(
         Ok(NapiUcanToken {
             data,
             encoded: token.encoded,
-            instance_id: crate::runtime::default_instance_id()?,
+            instance_id: bi.instance_id(),
         })
     }
 }
@@ -482,7 +520,30 @@ pub async fn ucan_delegate(
     parent_token: String,
     capabilities: Vec<String>,
 ) -> napi::Result<NapiUcanToken> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    ucan_delegate_on(
+        &bi,
+        handle,
+        delegator_did,
+        delegatee_did,
+        parent_token,
+        capabilities,
+    )
+    .await
+}
+
+/// Per-bridge-instance implementation of [`ucan_delegate`].
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+pub(crate) async fn ucan_delegate_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    delegator_did: String,
+    delegatee_did: String,
+    parent_token: String,
+    capabilities: Vec<String>,
+) -> napi::Result<NapiUcanToken> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_did(&delegator_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&delegatee_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_ucan_token(&parent_token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -493,6 +554,7 @@ pub async fn ucan_delegate(
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
         let _ = (
+            bi,
             &handle,
             &delegator_did,
             &delegatee_did,
@@ -576,7 +638,7 @@ pub async fn ucan_delegate(
         // Ed25519 key, NOT the context creator's key. The previous code used
         // `handle.signing_key` (the context creator's key), which would produce
         // tokens with invalid signatures when the delegator is not the creator.
-        let token = crate::runtime::with_identity(&delegator_did, |entry| {
+        let token = crate::runtime::with_identity(bi, &delegator_did, |entry| {
             let params = DelegateParams {
                 parent_token: &parsed_parent,
                 delegator_did: &delegator_did,
@@ -617,7 +679,7 @@ pub async fn ucan_delegate(
         Ok(NapiUcanToken {
             data,
             encoded: token.encoded,
-            instance_id: crate::runtime::default_instance_id()?,
+            instance_id: bi.instance_id(),
         })
     }
 }
@@ -656,17 +718,30 @@ pub async fn ucan_revoke(
     token: String,
     revoker_did: String,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    ucan_revoke_on(&bi, handle, token, revoker_did).await
+}
+
+/// Per-bridge-instance implementation of [`ucan_revoke`].
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+pub(crate) async fn ucan_revoke_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    token: String,
+    revoker_did: String,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, handle);
     validate_ucan_token(&token).map_err(ScpNapiError::from)?;
     validate_did(&revoker_did).map_err(ScpNapiError::from)?;
 
-    crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     // Parse the token to extract the issuer DID for authorization.
     let parsed = parse_ucan(&token).map_err(ScpNapiError::from)?;
 
     let context_id = handle.context_id();
-    crate::runtime::with_context(&context_id, |rt| {
+    crate::runtime::with_context(bi, &context_id, |rt| {
         use std::cell::RefCell;
 
         let authorizer = BridgeRevocationAuthorizer {

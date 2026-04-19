@@ -241,6 +241,7 @@ impl NapiContextHandle {
     /// Returns an error if the `ContextManager` is not initialised.
     #[napi(getter, js_name = "memberCount")]
     pub fn member_count(&self) -> napi::Result<u32> {
+        let bi = default_bridge_instance()?;
         let manager = context_manager(&bi)?;
         let count = crate::runtime()
             .block_on(manager.member_count(&self.context_id))

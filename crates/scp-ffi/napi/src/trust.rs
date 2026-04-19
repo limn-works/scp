@@ -16,9 +16,9 @@ use scp_ffi_common::error_codes as codes;
 use std::sync::Arc;
 
 use napi_derive::napi;
-use scp_ffi_common::trust_store::InMemoryFfiTrustStore;
 
 use crate::error::ScpNapiError;
+use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -73,6 +73,16 @@ fn validation_error(msg: &str) -> napi::Error {
 /// Queries participation-based trust data for a DID within a context.
 #[napi]
 pub fn trust_query_score(did: String, context_id: String) -> napi::Result<NapiTrustScoreResult> {
+    let bi = default_bridge_instance()?;
+    trust_query_score_on(&bi, did, context_id)
+}
+
+/// Per-bridge-instance implementation of [`trust_query_score`].
+pub(crate) fn trust_query_score_on(
+    bi: &NapiBridgeInstance,
+    did: String,
+    context_id: String,
+) -> napi::Result<NapiTrustScoreResult> {
     if did.is_empty() {
         return Err(validation_error("DID must not be empty"));
     }
@@ -81,7 +91,7 @@ pub fn trust_query_score(did: String, context_id: String) -> napi::Result<NapiTr
     }
 
     let (message_count, governance_count) =
-        crate::runtime::query_trust_event_counts(&context_id, &did);
+        crate::runtime::query_trust_event_counts(bi, &context_id, &did);
 
     let total = message_count + governance_count;
     #[allow(clippy::cast_precision_loss)]
@@ -99,6 +109,18 @@ pub fn trust_query_score(did: String, context_id: String) -> napi::Result<NapiTr
 /// revocation status.
 #[napi]
 pub fn trust_verify_attestation(
+    attestation_json: String,
+) -> napi::Result<NapiAttestationVerificationResult> {
+    let bi = default_bridge_instance()?;
+    trust_verify_attestation_on(&bi, attestation_json)
+}
+
+/// Per-bridge-instance implementation of [`trust_verify_attestation`].
+///
+/// Pure verification — the bridge instance is unused but accepted for API
+/// symmetry with the other `_on` helpers in this module.
+pub(crate) fn trust_verify_attestation_on(
+    _bi: &NapiBridgeInstance,
     attestation_json: String,
 ) -> napi::Result<NapiAttestationVerificationResult> {
     let attestation: scp_core::trust::Attestation = serde_json::from_str(&attestation_json)
@@ -124,6 +146,18 @@ pub fn trust_verify_attestation(
 /// Creates a challenge request for capability verification.
 #[napi]
 pub fn trust_create_challenge(target_did: String) -> napi::Result<NapiChallengeResult> {
+    let bi = default_bridge_instance()?;
+    trust_create_challenge_on(&bi, target_did)
+}
+
+/// Per-bridge-instance implementation of [`trust_create_challenge`].
+///
+/// Pure construction — the bridge instance is unused but accepted for API
+/// symmetry with the other `_on` helpers in this module.
+pub(crate) fn trust_create_challenge_on(
+    _bi: &NapiBridgeInstance,
+    target_did: String,
+) -> napi::Result<NapiChallengeResult> {
     if target_did.is_empty() {
         return Err(validation_error("target DID must not be empty"));
     }
@@ -163,6 +197,19 @@ pub fn trust_create_challenge(target_did: String) -> napi::Result<NapiChallengeR
 /// Verifies a challenge response against its original challenge request.
 #[napi]
 pub fn trust_verify_response(challenge_json: String, response_json: String) -> napi::Result<bool> {
+    let bi = default_bridge_instance()?;
+    trust_verify_response_on(&bi, challenge_json, response_json)
+}
+
+/// Per-bridge-instance implementation of [`trust_verify_response`].
+///
+/// Pure verification — the bridge instance is unused but accepted for API
+/// symmetry with the other `_on` helpers in this module.
+pub(crate) fn trust_verify_response_on(
+    _bi: &NapiBridgeInstance,
+    challenge_json: String,
+    response_json: String,
+) -> napi::Result<bool> {
     let request: scp_core::trust::ChallengeRequest = serde_json::from_str(&challenge_json)
         .map_err(|e| validation_error(&format!("failed to parse challenge JSON: {e}")))?;
 
@@ -210,6 +257,19 @@ pub fn verify_participation_requirements(
     profile_json: String,
     requirements_json: String,
 ) -> napi::Result<bool> {
+    let bi = default_bridge_instance()?;
+    verify_participation_requirements_on(&bi, profile_json, requirements_json)
+}
+
+/// Per-bridge-instance implementation of [`verify_participation_requirements`].
+///
+/// Pure verification — the bridge instance is unused but accepted for API
+/// symmetry with the other `_on` helpers in this module.
+pub(crate) fn verify_participation_requirements_on(
+    _bi: &NapiBridgeInstance,
+    profile_json: String,
+    requirements_json: String,
+) -> napi::Result<bool> {
     let profiles: Vec<scp_core::trust::ParticipationProfile> = serde_json::from_str(&profile_json)
         .map_err(|e| {
             validation_error(&format!("failed to parse participation profiles JSON: {e}"))
@@ -249,6 +309,35 @@ pub fn verify_participation_requirements(
 #[napi]
 #[allow(clippy::too_many_arguments)]
 pub fn aggregate_trust_input(
+    context_id: String,
+    subject_did: String,
+    events_json: String,
+    merkle_root_json: String,
+    consequence_rules_json: String,
+    threshold_requirements_json: String,
+    attestor_sets_json: String,
+    cached_attestations_json: String,
+    challenge_results_json: String,
+) -> napi::Result<String> {
+    let bi = default_bridge_instance()?;
+    aggregate_trust_input_on(
+        &bi,
+        context_id,
+        subject_did,
+        events_json,
+        merkle_root_json,
+        consequence_rules_json,
+        threshold_requirements_json,
+        attestor_sets_json,
+        cached_attestations_json,
+        challenge_results_json,
+    )
+}
+
+/// Per-bridge-instance implementation of [`aggregate_trust_input`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn aggregate_trust_input_on(
+    bi: &NapiBridgeInstance,
     context_id: String,
     subject_did: String,
     events_json: String,
@@ -306,13 +395,13 @@ pub fn aggregate_trust_input(
             validation_error(&format!("failed to parse challenge_results JSON: {e}"))
         })?;
 
-    // Use persistent storage if the global ProtocolRepository is initialized,
-    // otherwise fall back to an ephemeral in-memory store. See issue #502.
-    // Dispatches over `ProtocolRepoVariant` so SQLite-backed bridges route
-    // trust attestations into the same SQLCipher database as context
-    // snapshots and event log entries.
-    match crate::runtime::protocol_repository() {
-        Some(crate::runtime::ProtocolRepoVariant::InMemory(repo)) => {
+    // Route trust aggregation through the bridge instance's `ProtocolRepoVariant`
+    // so SQLite-backed bridges store trust attestations in the same SQLCipher
+    // database as context snapshots and event log entries. Falls back to an
+    // ephemeral in-memory store if the variant dispatch yields `None`
+    // (e.g. a test bridge with no repository). See issue #502.
+    match crate::runtime::protocol_repository(bi) {
+        crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
             let handle = crate::runtime().handle().clone();
             let bridge =
                 scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
@@ -330,7 +419,7 @@ pub fn aggregate_trust_input(
             )
             .map_err(|e| validation_error(&e.to_string()))
         }
-        Some(crate::runtime::ProtocolRepoVariant::Sqlite(repo)) => {
+        crate::runtime::ProtocolRepoVariant::Sqlite(repo) => {
             let handle = crate::runtime().handle().clone();
             let bridge =
                 scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
@@ -348,19 +437,6 @@ pub fn aggregate_trust_input(
             )
             .map_err(|e| validation_error(&e.to_string()))
         }
-        None => scp_ffi_common::trust_store::populate_and_aggregate(
-            InMemoryFfiTrustStore::new(),
-            &context_id,
-            &subject_did,
-            cached_attestations,
-            &challenge_results,
-            &events,
-            merkle_root,
-            &consequence_rules,
-            &threshold_requirements,
-            &attestor_sets,
-        )
-        .map_err(|e| validation_error(&e.to_string())),
     }
 }
 

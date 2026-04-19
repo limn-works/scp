@@ -13,6 +13,7 @@ use scp_primitives::Clock;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
+use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
 
 // ---------------------------------------------------------------------------
 // NapiEvent — protocol event record
@@ -85,8 +86,19 @@ pub async fn event_log_query(
     handle: &NapiContextHandle,
     filter_json: Option<String>,
 ) -> napi::Result<Vec<NapiEvent>> {
-    crate::napi_check_handle!(handle);
-    crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+    let bi = default_bridge_instance()?;
+    event_log_query_on(&bi, handle, filter_json).await
+}
+
+/// Per-bridge-instance implementation of [`event_log_query`].
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+pub(crate) async fn event_log_query_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    filter_json: Option<String>,
+) -> napi::Result<Vec<NapiEvent>> {
+    crate::napi_check_handle!(&bi.core, handle);
+    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     let filter: Option<serde_json::Value> = match filter_json {
         Some(ref json_str) => {
@@ -119,7 +131,7 @@ pub async fn event_log_query(
     let context_id_str = handle.context_id();
     let ctx_id_bytes = scp_core::context::context_id_bytes(&context_id_str);
 
-    let manager_entries = crate::runtime::context_manager()
+    let manager_entries = crate::runtime::context_manager(bi)
         .ok()
         .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten());
 
@@ -154,7 +166,7 @@ pub async fn event_log_query(
     }
 
     // Fallback: read from the per-context UCAN state event log.
-    let (event_count, merkle_root_hex) = crate::runtime::with_context(&context_id_str, |rt| {
+    let (event_count, merkle_root_hex) = crate::runtime::with_context(bi, &context_id_str, |rt| {
         let count = scp_event_log::tree::event_count(&rt.core.event_log);
         let root = scp_event_log::tree::root(&rt.core.event_log);
         Ok((count, hex::encode(root)))
@@ -219,13 +231,25 @@ pub async fn event_log_query(
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-#[allow(clippy::too_many_lines)] // Proof generation with match arms is inherently verbose.
 pub async fn event_log_verify(
     handle: &NapiContextHandle,
     claim_json: String,
 ) -> napi::Result<NapiProof> {
-    crate::napi_check_handle!(handle);
-    crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+    let bi = default_bridge_instance()?;
+    event_log_verify_on(&bi, handle, claim_json).await
+}
+
+/// Per-bridge-instance implementation of [`event_log_verify`].
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
+#[allow(clippy::too_many_lines)] // Proof generation with match arms is inherently verbose.
+pub(crate) async fn event_log_verify_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    claim_json: String,
+) -> napi::Result<NapiProof> {
+    crate::napi_check_handle!(&bi.core, handle);
+    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     let claim: serde_json::Value =
         serde_json::from_str(&claim_json).map_err(|e| ScpNapiError::Validation {
@@ -249,11 +273,11 @@ pub async fn event_log_verify(
     // tree that tracks lifecycle events. The UCAN-state EventLog starts
     // empty; this populates it from the authoritative MerkleEventLogProvider.
     let ctx_id_bytes = scp_core::context::context_id_bytes(&context_id);
-    if let Some(entries) = crate::runtime::context_manager()
+    if let Some(entries) = crate::runtime::context_manager(bi)
         .ok()
         .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten())
     {
-        crate::runtime::with_context(&context_id, |rt| {
+        crate::runtime::with_context(bi, &context_id, |rt| {
             let existing_leaves = rt.core.event_log.leaves();
             let existing_count = existing_leaves.len();
 
@@ -293,7 +317,7 @@ pub async fn event_log_verify(
                 })
                 .map_err(napi::Error::from)?;
 
-            let (verified, details_json) = crate::runtime::with_context(&context_id, |rt| {
+            let (verified, details_json) = crate::runtime::with_context(bi, &context_id, |rt| {
                 let proof = scp_event_log::proof::prove_inclusion(&rt.core.event_log, leaf_index)
                     .map_err(|e| ScpNapiError::Context {
                     message: format!("inclusion proof failed: {e}"),
@@ -351,7 +375,7 @@ pub async fn event_log_verify(
                 })
             })?;
 
-            let (verified, details_json) = crate::runtime::with_context(&context_id, |rt| {
+            let (verified, details_json) = crate::runtime::with_context(bi, &context_id, |rt| {
                 let proof = scp_event_log::proof::prove_absence(&rt.core.event_log, &event_hash)
                     .map_err(|e| ScpNapiError::Context {
                         message: format!("absence proof failed: {e}"),
@@ -463,10 +487,22 @@ pub fn event_log_checkpoint(
     identity: &crate::identity::NapiIdentity,
     epoch: f64,
 ) -> napi::Result<NapiCheckpoint> {
-    crate::napi_check_handle!(handle, identity);
+    let bi = default_bridge_instance()?;
+    event_log_checkpoint_on(&bi, handle, identity, epoch)
+}
+
+/// Per-bridge-instance implementation of [`event_log_checkpoint`].
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned types
+pub(crate) fn event_log_checkpoint_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    identity: &crate::identity::NapiIdentity,
+    epoch: f64,
+) -> napi::Result<NapiCheckpoint> {
+    crate::napi_check_handle!(&bi.core, handle, identity);
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
-        let _ = (&handle, &identity, &epoch);
+        let _ = (bi, &handle, &identity, &epoch);
         Err(napi::Error::from(ScpNapiError::Permission {
             message: "event log checkpoint requires key custody -- the in_memory custody path \
                        is not available in this build. Enable allow_in_memory_custody \
@@ -478,7 +514,7 @@ pub fn event_log_checkpoint(
 
     #[cfg(feature = "allow_in_memory_custody")]
     {
-        crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+        crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
         let custody = identity.inner.in_memory_custody.as_ref().ok_or_else(|| {
             napi::Error::from(ScpNapiError::Permission {
@@ -501,7 +537,7 @@ pub fn event_log_checkpoint(
         let sender_did = scp_identity::DID(identity.inner.did.clone());
         let epoch_u64 = validate_non_negative_epoch(epoch)?;
 
-        let checkpoint = crate::runtime::with_context(&context_id, |rt| {
+        let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {
             let signer = scp_core::event_log::KeyCustodySigner {
                 custody: &custody.0,
                 key: &scp_id.active_signing_key,
@@ -570,10 +606,22 @@ pub fn event_log_checkpoint_by_did(
     did: String,
     epoch: f64,
 ) -> napi::Result<NapiCheckpoint> {
-    crate::napi_check_handle!(handle);
+    let bi = default_bridge_instance()?;
+    event_log_checkpoint_by_did_on(&bi, handle, did, epoch)
+}
+
+/// Per-bridge-instance implementation of [`event_log_checkpoint_by_did`].
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned types
+pub(crate) fn event_log_checkpoint_by_did_on(
+    bi: &NapiBridgeInstance,
+    handle: &NapiContextHandle,
+    did: String,
+    epoch: f64,
+) -> napi::Result<NapiCheckpoint> {
+    crate::napi_check_handle!(&bi.core, handle);
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
-        let _ = (&handle, &did, &epoch);
+        let _ = (bi, &handle, &did, &epoch);
         Err(napi::Error::from(ScpNapiError::Permission {
             message: "event log checkpoint requires key custody -- the in_memory custody path \
                        is not available in this build. Enable allow_in_memory_custody \
@@ -585,9 +633,9 @@ pub fn event_log_checkpoint_by_did(
 
     #[cfg(feature = "allow_in_memory_custody")]
     {
-        crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+        crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
-        let (scp_id, custody) = crate::runtime::with_identity(&did, |entry| {
+        let (scp_id, custody) = crate::runtime::with_identity(bi, &did, |entry| {
             Ok((
                 entry.identity.clone(),
                 std::sync::Arc::clone(&entry.custody),
@@ -599,7 +647,7 @@ pub fn event_log_checkpoint_by_did(
         let sender_did = scp_identity::DID(did);
         let epoch_u64 = validate_non_negative_epoch(epoch)?;
 
-        let checkpoint = crate::runtime::with_context(&context_id, |rt| {
+        let checkpoint = crate::runtime::with_context(bi, &context_id, |rt| {
             let signer = scp_core::event_log::KeyCustodySigner {
                 custody: &custody.0,
                 key: &scp_id.active_signing_key,

@@ -20,8 +20,20 @@ use napi_derive::napi;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
 use scp_ffi_common::error_codes as codes;
 
+use crate::context::{
+    NapiAssetEntry, NapiBatchPublishResult, NapiContextHandle, NapiEvaluationResult, NapiMessage,
+    NapiPublishResult,
+};
 use crate::error::{ScpNapiError, validate_custody_type};
+use crate::event_log::{NapiCheckpoint, NapiEvent, NapiProof};
+use crate::identity::NapiIdentity;
 use crate::runtime::{NapiBridgeInstance, StorageConfig, default_bridge_instance};
+#[cfg(feature = "server")]
+use crate::server::{NapiNodeHandle, NapiRelayHandle};
+use crate::tools::{NapiToolDefinition, NapiToolVerificationResult};
+use crate::transport::{NapiReliabilityScore, NapiTransportManager, NapiTransportStatus};
+use crate::trust::{NapiAttestationVerificationResult, NapiChallengeResult, NapiTrustScoreResult};
+use crate::ucan::NapiUcanToken;
 
 /// The SCP instance — a caller-owned handle that wraps a
 /// [`NapiBridgeInstance`].
@@ -2488,5 +2500,459 @@ impl Scp {
         interface_id_hex: String,
     ) -> napi::Result<String> {
         crate::tools::tool_interface_revoke_on(&*self.inner, handle, interface_id_hex).await
+    }
+
+    // ====================================================================
+    // #1549 Phase 4 PR 4 — sub-slice D: ucan/event-log/transport/economy/
+    // trust/server operations on SCP.
+    //
+    // Each method delegates to the per-bridge-instance `_on` helpers in
+    // [`crate::ucan`] / [`crate::event_log`] / [`crate::transport`] /
+    // [`crate::economy`] / [`crate::trust`] / [`crate::server`], routing
+    // through `&*self.inner` so operations are scoped to this `SCP`'s
+    // bridge instance rather than the process-wide default. Free functions
+    // are retained until the demolition slice deletes them.
+    // ====================================================================
+
+    // -------------------------------------------------------------------
+    // UCAN
+    // -------------------------------------------------------------------
+
+    /// Per-instance equivalent of the free-function `ucan_validate`.
+    #[napi(js_name = "ucanValidate")]
+    pub async fn ucan_validate(
+        &self,
+        handle: &NapiContextHandle,
+        token: String,
+        capability: String,
+        presenting_agent_did: Option<String>,
+        proof_tokens: Option<Vec<String>>,
+    ) -> napi::Result<()> {
+        crate::ucan::ucan_validate_on(
+            &self.inner,
+            handle,
+            token,
+            capability,
+            presenting_agent_did,
+            proof_tokens,
+        )
+        .await
+    }
+
+    /// Per-instance equivalent of the free-function `ucan_mint`.
+    #[napi(js_name = "ucanMint")]
+    pub async fn ucan_mint(
+        &self,
+        handle: &NapiContextHandle,
+        member_did: String,
+        capabilities: Vec<String>,
+        proofs: Option<Vec<String>>,
+    ) -> napi::Result<NapiUcanToken> {
+        crate::ucan::ucan_mint_on(&self.inner, handle, member_did, capabilities, proofs).await
+    }
+
+    /// Per-instance equivalent of the free-function `ucan_delegate`.
+    #[napi(js_name = "ucanDelegate")]
+    pub async fn ucan_delegate(
+        &self,
+        handle: &NapiContextHandle,
+        delegator_did: String,
+        delegatee_did: String,
+        parent_token: String,
+        capabilities: Vec<String>,
+    ) -> napi::Result<NapiUcanToken> {
+        crate::ucan::ucan_delegate_on(
+            &self.inner,
+            handle,
+            delegator_did,
+            delegatee_did,
+            parent_token,
+            capabilities,
+        )
+        .await
+    }
+
+    /// Per-instance equivalent of the free-function `ucan_revoke`.
+    #[napi(js_name = "ucanRevoke")]
+    pub async fn ucan_revoke(
+        &self,
+        handle: &NapiContextHandle,
+        token: String,
+        revoker_did: String,
+    ) -> napi::Result<()> {
+        crate::ucan::ucan_revoke_on(&self.inner, handle, token, revoker_did).await
+    }
+
+    // -------------------------------------------------------------------
+    // Event log
+    // -------------------------------------------------------------------
+
+    /// Per-instance equivalent of the free-function `event_log_query`.
+    #[napi(js_name = "eventLogQuery")]
+    pub async fn event_log_query(
+        &self,
+        handle: &NapiContextHandle,
+        filter_json: Option<String>,
+    ) -> napi::Result<Vec<NapiEvent>> {
+        crate::event_log::event_log_query_on(&self.inner, handle, filter_json).await
+    }
+
+    /// Per-instance equivalent of the free-function `event_log_verify`.
+    #[napi(js_name = "eventLogVerify")]
+    pub async fn event_log_verify(
+        &self,
+        handle: &NapiContextHandle,
+        claim_json: String,
+    ) -> napi::Result<NapiProof> {
+        crate::event_log::event_log_verify_on(&self.inner, handle, claim_json).await
+    }
+
+    /// Per-instance equivalent of the free-function `event_log_checkpoint`.
+    #[napi(js_name = "eventLogCheckpoint")]
+    pub fn event_log_checkpoint(
+        &self,
+        handle: &NapiContextHandle,
+        identity: &NapiIdentity,
+        epoch: f64,
+    ) -> napi::Result<NapiCheckpoint> {
+        crate::event_log::event_log_checkpoint_on(&self.inner, handle, identity, epoch)
+    }
+
+    /// Per-instance equivalent of the free-function `event_log_checkpoint_by_did`.
+    #[napi(js_name = "eventLogCheckpointByDid")]
+    pub fn event_log_checkpoint_by_did(
+        &self,
+        handle: &NapiContextHandle,
+        did: String,
+        epoch: f64,
+    ) -> napi::Result<NapiCheckpoint> {
+        crate::event_log::event_log_checkpoint_by_did_on(&self.inner, handle, did, epoch)
+    }
+
+    // -------------------------------------------------------------------
+    // Transport
+    // -------------------------------------------------------------------
+
+    /// Per-instance equivalent of the free-function `transport_connect`.
+    #[napi(js_name = "transportConnect")]
+    pub async fn transport_connect(&self, relay_url: String) -> napi::Result<NapiTransportManager> {
+        crate::transport::transport_connect_on(&self.inner, relay_url).await
+    }
+
+    /// Per-instance equivalent of the free-function `transport_status`.
+    #[napi(js_name = "transportStatus")]
+    pub async fn transport_status(
+        &self,
+        manager: &NapiTransportManager,
+    ) -> napi::Result<NapiTransportStatus> {
+        crate::transport::transport_status_on(&self.inner, manager).await
+    }
+
+    /// Per-instance equivalent of the free-function `transport_disconnect`.
+    #[napi(js_name = "transportDisconnect")]
+    pub async fn transport_disconnect(&self, manager: &NapiTransportManager) -> napi::Result<()> {
+        crate::transport::transport_disconnect_on(&self.inner, manager).await
+    }
+
+    /// Per-instance equivalent of the free-function `configure_local_transport`.
+    #[napi(js_name = "configureLocalTransport")]
+    pub fn configure_local_transport(&self, local_did: String) -> napi::Result<()> {
+        crate::transport::configure_local_transport_on(&self.inner, local_did)
+    }
+
+    /// Per-instance equivalent of the free-function `configure_relay_transport`.
+    #[napi(js_name = "configureRelayTransport")]
+    pub async fn configure_relay_transport(
+        &self,
+        relay_url: String,
+        local_did: String,
+    ) -> napi::Result<()> {
+        crate::transport::configure_relay_transport_on(&self.inner, relay_url, local_did).await
+    }
+
+    /// Per-instance equivalent of the free-function `transport_add_relay`.
+    #[napi(js_name = "transportAddRelay")]
+    pub async fn transport_add_relay(&self, relay_url: String) -> napi::Result<u32> {
+        crate::transport::transport_add_relay_on(&self.inner, relay_url).await
+    }
+
+    /// Per-instance equivalent of the free-function `transport_assign_relay_set`.
+    #[napi(js_name = "transportAssignRelaySet")]
+    pub fn transport_assign_relay_set(&self, context_id: String) -> napi::Result<Vec<u32>> {
+        crate::transport::transport_assign_relay_set_on(&self.inner, context_id)
+    }
+
+    /// Per-instance equivalent of the free-function `transport_adapter_count`.
+    #[napi(js_name = "transportAdapterCount")]
+    pub fn transport_adapter_count(&self) -> napi::Result<u32> {
+        crate::transport::transport_adapter_count_on(&self.inner)
+    }
+
+    /// Per-instance equivalent of the free-function `transport_reliability`.
+    #[napi(js_name = "transportReliability")]
+    pub fn transport_reliability(
+        &self,
+        adapter_index: u32,
+    ) -> napi::Result<Option<NapiReliabilityScore>> {
+        crate::transport::transport_reliability_on(&self.inner, adapter_index)
+    }
+
+    // -------------------------------------------------------------------
+    // Economy
+    // -------------------------------------------------------------------
+
+    /// Per-instance equivalent of the free-function `economy_estimate_cost`.
+    #[napi(js_name = "economyEstimateCost")]
+    pub fn economy_estimate_cost(
+        &self,
+        policy_json: String,
+        action_type: String,
+        metrics_json: String,
+    ) -> napi::Result<i64> {
+        crate::economy::economy_estimate_cost_on(
+            &self.inner,
+            policy_json,
+            action_type,
+            metrics_json,
+        )
+    }
+
+    /// Per-instance equivalent of the free-function `economy_policy_requires_payment`.
+    #[napi(js_name = "economyPolicyRequiresPayment")]
+    pub fn economy_policy_requires_payment(&self, policy_json: String) -> napi::Result<bool> {
+        crate::economy::economy_policy_requires_payment_on(&self.inner, policy_json)
+    }
+
+    /// Per-instance equivalent of the free-function `economy_auto_accept_blocked`.
+    #[napi(js_name = "economyAutoAcceptBlocked")]
+    pub fn economy_auto_accept_blocked(&self, policy_json: String) -> napi::Result<bool> {
+        crate::economy::economy_auto_accept_blocked_on(&self.inner, policy_json)
+    }
+
+    /// Per-instance equivalent of the free-function `economy_check_policy_lock`.
+    #[napi(js_name = "economyCheckPolicyLock")]
+    pub fn economy_check_policy_lock(&self, policy_json: String) -> napi::Result<bool> {
+        crate::economy::economy_check_policy_lock_on(&self.inner, policy_json)
+    }
+
+    /// Per-instance equivalent of the free-function `economy_validate_policy_change`.
+    #[napi(js_name = "economyValidatePolicyChange")]
+    pub fn economy_validate_policy_change(
+        &self,
+        current_policy_json: String,
+        proposed_policy_json: String,
+    ) -> napi::Result<bool> {
+        crate::economy::economy_validate_policy_change_on(
+            &self.inner,
+            current_policy_json,
+            proposed_policy_json,
+        )
+    }
+
+    /// Per-instance equivalent of the free-function `economy_evaluate_formula`.
+    #[napi(js_name = "economyEvaluateFormula")]
+    pub fn economy_evaluate_formula(
+        &self,
+        formula_json: String,
+        metrics_json: String,
+    ) -> napi::Result<i64> {
+        crate::economy::economy_evaluate_formula_on(&self.inner, formula_json, metrics_json)
+    }
+
+    /// Per-instance equivalent of the free-function `economy_budget_remaining`.
+    #[napi(js_name = "economyBudgetRemaining")]
+    pub fn economy_budget_remaining(&self, context_id: String, did: String) -> napi::Result<i64> {
+        crate::economy::economy_budget_remaining_on(&self.inner, context_id, did)
+    }
+
+    /// Per-instance equivalent of the free-function `economy_budget_grant`.
+    #[napi(js_name = "economyBudgetGrant")]
+    pub fn economy_budget_grant(
+        &self,
+        context_id: String,
+        did: String,
+        amount: i64,
+    ) -> napi::Result<()> {
+        crate::economy::economy_budget_grant_on(&self.inner, context_id, did, amount)
+    }
+
+    /// Per-instance equivalent of the free-function `economy_budget_record_spend`.
+    #[napi(js_name = "economyBudgetRecordSpend")]
+    pub fn economy_budget_record_spend(
+        &self,
+        context_id: String,
+        did: String,
+        amount: i64,
+    ) -> napi::Result<()> {
+        crate::economy::economy_budget_record_spend_on(&self.inner, context_id, did, amount)
+    }
+
+    /// Per-instance equivalent of the free-function `economy_antispam_record`.
+    #[napi(js_name = "economyAntispamRecord")]
+    pub fn economy_antispam_record(
+        &self,
+        context_id: String,
+        sender_did: String,
+        timestamp: i64,
+    ) -> napi::Result<()> {
+        crate::economy::economy_antispam_record_on(&self.inner, context_id, sender_did, timestamp)
+    }
+
+    /// Per-instance equivalent of the free-function `economy_antispam_velocity`.
+    #[napi(js_name = "economyAntispamVelocity")]
+    pub fn economy_antispam_velocity(
+        &self,
+        context_id: String,
+        sender_did: String,
+        now: i64,
+    ) -> napi::Result<i64> {
+        crate::economy::economy_antispam_velocity_on(&self.inner, context_id, sender_did, now)
+    }
+
+    /// Per-instance equivalent of the free-function `economy_antispam_escalated_cost`.
+    #[napi(js_name = "economyAntispamEscalatedCost")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn economy_antispam_escalated_cost(
+        &self,
+        context_id: String,
+        sender_did: String,
+        now: i64,
+        base_cost: i64,
+        thresholds_json: String,
+        floor: Option<i64>,
+        cap: Option<i64>,
+    ) -> napi::Result<i64> {
+        crate::economy::economy_antispam_escalated_cost_on(
+            &self.inner,
+            context_id,
+            sender_did,
+            now,
+            base_cost,
+            thresholds_json,
+            floor,
+            cap,
+        )
+    }
+
+    // -------------------------------------------------------------------
+    // Trust
+    // -------------------------------------------------------------------
+
+    /// Per-instance equivalent of the free-function `trust_query_score`.
+    #[napi(js_name = "trustQueryScore")]
+    pub fn trust_query_score(
+        &self,
+        did: String,
+        context_id: String,
+    ) -> napi::Result<NapiTrustScoreResult> {
+        crate::trust::trust_query_score_on(&self.inner, did, context_id)
+    }
+
+    /// Per-instance equivalent of the free-function `trust_verify_attestation`.
+    #[napi(js_name = "trustVerifyAttestation")]
+    pub fn trust_verify_attestation(
+        &self,
+        attestation_json: String,
+    ) -> napi::Result<NapiAttestationVerificationResult> {
+        crate::trust::trust_verify_attestation_on(&self.inner, attestation_json)
+    }
+
+    /// Per-instance equivalent of the free-function `trust_create_challenge`.
+    #[napi(js_name = "trustCreateChallenge")]
+    pub fn trust_create_challenge(&self, target_did: String) -> napi::Result<NapiChallengeResult> {
+        crate::trust::trust_create_challenge_on(&self.inner, target_did)
+    }
+
+    /// Per-instance equivalent of the free-function `trust_verify_response`.
+    #[napi(js_name = "trustVerifyResponse")]
+    pub fn trust_verify_response(
+        &self,
+        challenge_json: String,
+        response_json: String,
+    ) -> napi::Result<bool> {
+        crate::trust::trust_verify_response_on(&self.inner, challenge_json, response_json)
+    }
+
+    /// Per-instance equivalent of the free-function `verify_participation_requirements`.
+    #[napi(js_name = "verifyParticipationRequirements")]
+    pub fn verify_participation_requirements(
+        &self,
+        profile_json: String,
+        requirements_json: String,
+    ) -> napi::Result<bool> {
+        crate::trust::verify_participation_requirements_on(
+            &self.inner,
+            profile_json,
+            requirements_json,
+        )
+    }
+
+    /// Per-instance equivalent of the free-function `aggregate_trust_input`.
+    #[napi(js_name = "aggregateTrustInput")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn aggregate_trust_input(
+        &self,
+        context_id: String,
+        subject_did: String,
+        events_json: String,
+        merkle_root_json: String,
+        consequence_rules_json: String,
+        threshold_requirements_json: String,
+        attestor_sets_json: String,
+        cached_attestations_json: String,
+        challenge_results_json: String,
+    ) -> napi::Result<String> {
+        crate::trust::aggregate_trust_input_on(
+            &self.inner,
+            context_id,
+            subject_did,
+            events_json,
+            merkle_root_json,
+            consequence_rules_json,
+            threshold_requirements_json,
+            attestor_sets_json,
+            cached_attestations_json,
+            challenge_results_json,
+        )
+    }
+
+    // -------------------------------------------------------------------
+    // Server (feature-gated)
+    // -------------------------------------------------------------------
+
+    /// Per-instance equivalent of the free-function `relay_start_in_memory`.
+    #[cfg(feature = "server")]
+    #[napi(js_name = "relayStartInMemory")]
+    pub async fn relay_start_in_memory(&self) -> napi::Result<NapiRelayHandle> {
+        crate::server::relay_start_in_memory_on(&self.inner).await
+    }
+
+    /// Per-instance equivalent of the free-function `relay_start_local`.
+    #[cfg(feature = "server")]
+    #[napi(js_name = "relayStartLocal")]
+    pub async fn relay_start_local(&self, data_dir: String) -> napi::Result<NapiRelayHandle> {
+        crate::server::relay_start_local_on(&self.inner, data_dir).await
+    }
+
+    /// Per-instance equivalent of the free-function `node_start_in_memory`.
+    #[cfg(feature = "server")]
+    #[napi(js_name = "nodeStartInMemory")]
+    pub async fn node_start_in_memory(
+        &self,
+        identity_did: Option<String>,
+    ) -> napi::Result<NapiNodeHandle> {
+        crate::server::node_start_in_memory_on(&self.inner, identity_did).await
+    }
+
+    /// Per-instance equivalent of the free-function `node_start_local`.
+    #[cfg(feature = "server")]
+    #[napi(js_name = "nodeStartLocal")]
+    pub async fn node_start_local(
+        &self,
+        data_dir: String,
+        identity_did: Option<String>,
+        passphrase: Option<String>,
+    ) -> napi::Result<NapiNodeHandle> {
+        crate::server::node_start_local_on(&self.inner, data_dir, identity_did, passphrase).await
     }
 }

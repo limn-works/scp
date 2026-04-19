@@ -28,6 +28,7 @@ use napi_derive::napi;
 use scp_ffi_common::validate::{validate_context_id, validate_relay_url};
 
 use crate::error::ScpNapiError;
+use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
@@ -74,7 +75,8 @@ fn set_transport_manager(manager: scp_transport::TransportManager) -> napi::Resu
     let bi = if let Ok(bi) = crate::runtime::bridge_instance() {
         bi
     } else {
-        if let Ok(cm) = crate::runtime::context_manager() {
+        let default_bi = crate::runtime::default_bridge_instance()?;
+        if let Ok(cm) = crate::runtime::context_manager(&default_bi) {
             crate::runtime::attach_context_manager_to_bridge(cm.clone());
         } else {
             crate::runtime::ensure_bridge_instance();
@@ -82,6 +84,19 @@ fn set_transport_manager(manager: scp_transport::TransportManager) -> napi::Resu
         crate::runtime::bridge_instance()?
     };
     bi.set_transport(Arc::new(manager))
+        .map_err(|e| napi::Error::from(map_transport_lock_error(e)))
+}
+
+/// Per-bridge-instance implementation of [`set_transport_manager`].
+///
+/// Stores the transport manager on the given [`NapiBridgeInstance`]'s core
+/// fields rather than the process-global default.
+fn set_transport_manager_on(
+    bi: &NapiBridgeInstance,
+    manager: scp_transport::TransportManager,
+) -> napi::Result<()> {
+    bi.core
+        .set_transport(Arc::new(manager))
         .map_err(|e| napi::Error::from(map_transport_lock_error(e)))
 }
 
@@ -121,6 +136,16 @@ pub(crate) fn with_transport_manager<T>(
         .map_err(|e| napi::Error::from(map_transport_lock_error(e)))?
 }
 
+/// Per-bridge-instance implementation of [`with_transport_manager`].
+pub(crate) fn with_transport_manager_on<T>(
+    bi: &NapiBridgeInstance,
+    f: impl FnOnce(&scp_transport::TransportManager) -> napi::Result<T>,
+) -> napi::Result<T> {
+    bi.core
+        .with_transport(f)
+        .map_err(|e| napi::Error::from(map_transport_lock_error(e)))?
+}
+
 /// Executes a closure with a mutable reference to the `TransportManager`.
 ///
 /// Delegates to [`CoreFields::with_transport_mut`]. Requires exclusive
@@ -139,9 +164,24 @@ pub(crate) fn with_transport_manager_mut<T>(
         .map_err(|e| napi::Error::from(map_transport_lock_error(e)))?
 }
 
+/// Per-bridge-instance implementation of [`with_transport_manager_mut`].
+pub(crate) fn with_transport_manager_mut_on<T>(
+    bi: &NapiBridgeInstance,
+    f: impl FnOnce(&mut scp_transport::TransportManager) -> napi::Result<T>,
+) -> napi::Result<T> {
+    bi.core
+        .with_transport_mut(f)
+        .map_err(|e| napi::Error::from(map_transport_lock_error(e)))?
+}
+
 /// Returns `true` if a transport manager has been initialized.
 fn has_transport_manager() -> bool {
     crate::runtime::bridge_instance().is_ok_and(scp_ffi_common::CoreFields::has_transport)
+}
+
+/// Per-bridge-instance implementation of [`has_transport_manager`].
+fn has_transport_manager_on(bi: &NapiBridgeInstance) -> bool {
+    scp_ffi_common::CoreFields::has_transport(&bi.core)
 }
 
 /// Returns an `Arc` clone of the current transport manager, if one exists.
@@ -167,6 +207,13 @@ pub(crate) fn get_transport_manager() -> Option<Arc<scp_transport::TransportMana
 fn clear_transport_manager() -> napi::Result<()> {
     let bi = crate::runtime::bridge_instance()?;
     bi.clear_transport()
+        .map_err(|e| napi::Error::from(map_transport_lock_error(e)))
+}
+
+/// Per-bridge-instance implementation of [`clear_transport_manager`].
+fn clear_transport_manager_on(bi: &NapiBridgeInstance) -> napi::Result<()> {
+    bi.core
+        .clear_transport()
         .map_err(|e| napi::Error::from(map_transport_lock_error(e)))
 }
 
@@ -298,6 +345,15 @@ impl Drop for NapiTransportManager {
 ///   protocol mismatch, timeout, authentication failure) in the full runtime.
 #[napi]
 pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportManager> {
+    let bi = default_bridge_instance()?;
+    transport_connect_on(&bi, relay_url).await
+}
+
+/// Per-bridge-instance implementation of [`transport_connect`].
+pub(crate) async fn transport_connect_on(
+    bi: &NapiBridgeInstance,
+    relay_url: String,
+) -> napi::Result<NapiTransportManager> {
     validate_relay_url(&relay_url).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     // Transport-layer validation enforces ws:// restrictions: loopback
@@ -326,20 +382,17 @@ pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportM
             let suppression_rx = adapter.take_suppression_receiver();
 
             // Wrap the adapter in a TransportManager for multi-relay support,
-            // then store it in the process-global state. Same pattern as the
+            // then store it on the bridge instance. Same pattern as the
             // PyO3 bridge's `py_transport_connect`.
             // Cover traffic is already running — `connect_sourced` with a
             // profile auto-starts it via `finalize_connection` (#1532 AC6).
             let manager = scp_transport::TransportManager::new(Box::new(adapter));
-            set_transport_manager(manager)?;
+            set_transport_manager_on(bi, manager)?;
 
             // Register the URL on the bridge's pending-reconnect set so
             // `BridgeInstanceCore::resume` can rebuild the transport after
-            // suspend/resume cycles (#1678). NAPI's `bridge_instance()`
-            // already returns `&'static CoreFields`.
-            if let Ok(core) = crate::runtime::bridge_instance() {
-                core.add_relay_url(relay_url.clone());
-            }
+            // suspend/resume cycles (#1678).
+            bi.core.add_relay_url(relay_url.clone());
 
             // Spawn suppression → scoring bridge task.
             if let Some(rx) = suppression_rx {
@@ -352,7 +405,7 @@ pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportM
                     relay_url: Some(relay_url),
                     latency_ms: Some(latency),
                 }),
-                instance_id: crate::runtime::default_instance_id()?,
+                instance_id: bi.instance_id(),
             };
             increment_handle_count();
             Ok(handle)
@@ -382,13 +435,23 @@ pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportM
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn transport_status(manager: &NapiTransportManager) -> napi::Result<NapiTransportStatus> {
-    crate::napi_check_handle!(manager);
+    let bi = default_bridge_instance()?;
+    transport_status_on(&bi, manager).await
+}
+
+/// Per-bridge-instance implementation of [`transport_status`].
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+pub(crate) async fn transport_status_on(
+    bi: &NapiBridgeInstance,
+    manager: &NapiTransportManager,
+) -> napi::Result<NapiTransportStatus> {
+    crate::napi_check_handle!(&bi.core, manager);
     let mut status = manager.status();
     // Defense-in-depth: verify the transport manager is actually alive,
     // not just what the manager's local status believes. If the transport
     // manager has been dropped (e.g., disconnect was called without
     // updating the manager), report disconnected.
-    if status.connected && !has_transport_manager() {
+    if status.connected && !has_transport_manager_on(bi) {
         status.connected = false;
     }
     Ok(status)
@@ -410,7 +473,17 @@ pub async fn transport_status(manager: &NapiTransportManager) -> napi::Result<Na
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Result<()> {
-    crate::napi_check_handle!(manager);
+    let bi = default_bridge_instance()?;
+    transport_disconnect_on(&bi, manager).await
+}
+
+/// Per-bridge-instance implementation of [`transport_disconnect`].
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
+pub(crate) async fn transport_disconnect_on(
+    bi: &NapiBridgeInstance,
+    manager: &NapiTransportManager,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, manager);
     let mut s = manager.status.lock().map_err(|_| ScpNapiError::Transport {
         message: "transport status lock is poisoned".to_owned(),
         code: codes::TRANS_5002.to_owned(),
@@ -434,12 +507,10 @@ pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Resul
     drop(s);
 
     // Drop the transport manager, closing all WebSocket connections.
-    clear_transport_manager()?;
+    clear_transport_manager_on(bi)?;
 
-    if let Some(ref url) = disconnecting_url
-        && let Ok(core) = crate::runtime::bridge_instance()
-    {
-        core.remove_relay_url(url);
+    if let Some(ref url) = disconnecting_url {
+        bi.core.remove_relay_url(url);
     }
 
     Ok(())
@@ -465,9 +536,18 @@ pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Resul
 /// Returns an error only if `local_did` fails DID format validation.
 #[napi(js_name = "configureLocalTransport")]
 pub fn configure_local_transport(local_did: String) -> napi::Result<()> {
+    let bi = default_bridge_instance()?;
+    configure_local_transport_on(&bi, local_did)
+}
+
+/// Per-bridge-instance implementation of [`configure_local_transport`].
+pub(crate) fn configure_local_transport_on(
+    bi: &NapiBridgeInstance,
+    local_did: String,
+) -> napi::Result<()> {
     scp_ffi_common::validate::validate_did(&local_did)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    crate::runtime::init_context_manager_with_local_transport(&local_did);
+    crate::runtime::init_context_manager_with_local_transport(bi, &local_did);
     Ok(())
 }
 
@@ -501,6 +581,16 @@ pub fn configure_local_transport(local_did: String) -> napi::Result<()> {
 /// - Returns an error if the relay connection fails.
 #[napi(js_name = "configureRelayTransport")]
 pub async fn configure_relay_transport(relay_url: String, local_did: String) -> napi::Result<()> {
+    let bi = default_bridge_instance()?;
+    configure_relay_transport_on(&bi, relay_url, local_did).await
+}
+
+/// Per-bridge-instance implementation of [`configure_relay_transport`].
+pub(crate) async fn configure_relay_transport_on(
+    bi: &NapiBridgeInstance,
+    relay_url: String,
+    local_did: String,
+) -> napi::Result<()> {
     validate_relay_url(&relay_url).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     scp_ffi_common::validate::validate_did(&local_did)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -519,7 +609,7 @@ pub async fn configure_relay_transport(relay_url: String, local_did: String) -> 
                 code: codes::TRANS_5001.to_owned(),
             })?;
 
-    crate::runtime::init_context_manager_with_relay_transport(&local_did, adapter);
+    crate::runtime::init_context_manager_with_relay_transport(bi, &local_did, adapter);
     Ok(())
 }
 
@@ -574,6 +664,15 @@ pub struct NapiReliabilityScore {
 /// - Rejects with `SCP-TRANS-5003` if a subscription is active.
 #[napi]
 pub async fn transport_add_relay(relay_url: String) -> napi::Result<u32> {
+    let bi = default_bridge_instance()?;
+    transport_add_relay_on(&bi, relay_url).await
+}
+
+/// Per-bridge-instance implementation of [`transport_add_relay`].
+pub(crate) async fn transport_add_relay_on(
+    bi: &NapiBridgeInstance,
+    relay_url: String,
+) -> napi::Result<u32> {
     validate_relay_url(&relay_url).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let sourced = scp_transport::relay::connection::SourcedRelayUrl {
@@ -597,7 +696,7 @@ pub async fn transport_add_relay(relay_url: String) -> napi::Result<u32> {
     // downgrades the relay's reliability score (#1533 AC5).
     let suppression_rx = adapter.take_suppression_receiver();
 
-    let count = with_transport_manager_mut(|manager| {
+    let count = with_transport_manager_mut_on(bi, |manager| {
         let _eviction = manager.add_adapter(Box::new(adapter));
         #[allow(clippy::cast_possible_truncation)]
         Ok(manager.adapter_count() as u32)
@@ -632,8 +731,17 @@ pub async fn transport_add_relay(relay_url: String) -> napi::Result<u32> {
 /// - Rejects with `SCP-TRANS-5002` if relay set assignment fails.
 #[napi]
 pub fn transport_assign_relay_set(context_id: String) -> napi::Result<Vec<u32>> {
+    let bi = default_bridge_instance()?;
+    transport_assign_relay_set_on(&bi, context_id)
+}
+
+/// Per-bridge-instance implementation of [`transport_assign_relay_set`].
+pub(crate) fn transport_assign_relay_set_on(
+    bi: &NapiBridgeInstance,
+    context_id: String,
+) -> napi::Result<Vec<u32>> {
     validate_context_id(&context_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    with_transport_manager(|manager| {
+    with_transport_manager_on(bi, |manager| {
         manager
             .assign_relay_set(&context_id)
             .map(|indices| {
@@ -664,7 +772,13 @@ pub fn transport_assign_relay_set(context_id: String) -> napi::Result<Vec<u32>> 
 /// initialized.
 #[napi]
 pub fn transport_adapter_count() -> napi::Result<u32> {
-    with_transport_manager(|manager| {
+    let bi = default_bridge_instance()?;
+    transport_adapter_count_on(&bi)
+}
+
+/// Per-bridge-instance implementation of [`transport_adapter_count`].
+pub(crate) fn transport_adapter_count_on(bi: &NapiBridgeInstance) -> napi::Result<u32> {
+    with_transport_manager_on(bi, |manager| {
         #[allow(clippy::cast_possible_truncation)]
         Ok(manager.adapter_count() as u32)
     })
@@ -685,7 +799,16 @@ pub fn transport_adapter_count() -> napi::Result<u32> {
 /// initialized.
 #[napi]
 pub fn transport_reliability(adapter_index: u32) -> napi::Result<Option<NapiReliabilityScore>> {
-    with_transport_manager(|manager| {
+    let bi = default_bridge_instance()?;
+    transport_reliability_on(&bi, adapter_index)
+}
+
+/// Per-bridge-instance implementation of [`transport_reliability`].
+pub(crate) fn transport_reliability_on(
+    bi: &NapiBridgeInstance,
+    adapter_index: u32,
+) -> napi::Result<Option<NapiReliabilityScore>> {
+    with_transport_manager_on(bi, |manager| {
         Ok(manager
             .get_reliability_score(adapter_index as usize)
             .map(|score| {

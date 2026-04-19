@@ -22,6 +22,7 @@ use scp_ffi_common::validate::{validate_context_id, validate_deploy_id, validate
 use scp_node::NodeError;
 
 use crate::error::ScpNapiError;
+use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
@@ -64,7 +65,12 @@ fn node_err(e: NodeError) -> NapiError {
 ///
 /// Best-effort: logs a warning if the relay connection fails rather than
 /// blocking node startup.
-async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zeroizing<String>) {
+async fn auto_wire_context_manager(
+    bi: &NapiBridgeInstance,
+    did: &str,
+    relay_url: &str,
+    bridge_token: Zeroizing<String>,
+) {
     let sourced = scp_transport::relay::connection::SourcedRelayUrl {
         url: relay_url.to_owned(),
         source: scp_transport::relay::connection::RelayUrlSource::Explicit,
@@ -79,7 +85,7 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
     .await
     {
         Ok(adapter) => {
-            crate::runtime::init_context_manager_with_relay_transport(did, adapter);
+            crate::runtime::init_context_manager_with_relay_transport(bi, did, adapter);
 
             // Also populate the BridgeInstance transport manager so that
             // broadcast publish, context subscribe, and discovery probing
@@ -118,11 +124,11 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
             );
             // Fall back to initializing without transport so that at least
             // the ContextManager exists (with NotConfiguredTransportProvider).
-            crate::runtime::init_context_manager(did);
+            crate::runtime::init_context_manager(bi, did);
         }
     }
     // Always register the node's DID as a local DID for defense-in-depth.
-    if let Ok(mgr) = crate::runtime::context_manager() {
+    if let Ok(mgr) = crate::runtime::context_manager(bi) {
         mgr.register_local_did(did.to_owned().into()).await;
     }
 }
@@ -287,7 +293,8 @@ impl NapiNodeHandle {
         }
 
         // Resolve broadcast key: explicit or auto-lookup from ContextManager.
-        let mgr = crate::runtime::context_manager()?;
+        let bi = default_bridge_instance()?;
+        let mgr = crate::runtime::context_manager(&bi)?;
         let resolved = server::resolve_broadcast_key(
             broadcast_key_hex,
             author_did,
@@ -453,13 +460,13 @@ impl Drop for NapiNodeHandle {
 /// - The DID is not found in the identity registry.
 #[cfg(feature = "allow_in_memory_custody")]
 #[allow(clippy::type_complexity)]
-fn build_node_identity(did: &str) -> napi::Result<NodeIdentity> {
+fn build_node_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result<NodeIdentity> {
     use std::sync::Arc;
 
     use scp_identity::{DidCache, InMemoryDhtClient};
     use scp_platform::traits::KeyCustody;
 
-    crate::runtime::with_identity(did, |entry| {
+    crate::runtime::with_identity(bi, did, |entry| {
         let custody_clone = Arc::clone(&entry.custody);
 
         // Hand-rolled sign_fn because `OpaqueInMemoryKeyCustody` does not
@@ -509,7 +516,7 @@ fn build_node_identity(did: &str) -> napi::Result<NodeIdentity> {
 }
 
 #[cfg(not(feature = "allow_in_memory_custody"))]
-fn build_node_identity(_did: &str) -> napi::Result<NodeIdentity> {
+fn build_node_identity(_bi: &NapiBridgeInstance, _did: &str) -> napi::Result<NodeIdentity> {
     Err(NapiError::from_reason(
         "identity portability requires in-memory custody — enable allow_in_memory_custody",
     ))
@@ -531,11 +538,19 @@ fn build_node_identity(_did: &str) -> napi::Result<NodeIdentity> {
 /// ```
 #[napi]
 pub async fn relay_start_in_memory() -> napi::Result<NapiRelayHandle> {
+    let bi = default_bridge_instance()?;
+    relay_start_in_memory_on(&bi).await
+}
+
+/// Per-bridge-instance implementation of [`relay_start_in_memory`].
+pub(crate) async fn relay_start_in_memory_on(
+    bi: &NapiBridgeInstance,
+) -> napi::Result<NapiRelayHandle> {
     let relay = server::start_relay_in_memory().await.map_err(server_err)?;
     increment_handle_count();
     Ok(NapiRelayHandle {
         inner: relay,
-        instance_id: crate::runtime::default_instance_id()?,
+        instance_id: bi.instance_id(),
     })
 }
 
@@ -551,13 +566,22 @@ pub async fn relay_start_in_memory() -> napi::Result<NapiRelayHandle> {
 /// ```
 #[napi]
 pub async fn relay_start_local(data_dir: String) -> napi::Result<NapiRelayHandle> {
+    let bi = default_bridge_instance()?;
+    relay_start_local_on(&bi, data_dir).await
+}
+
+/// Per-bridge-instance implementation of [`relay_start_local`].
+pub(crate) async fn relay_start_local_on(
+    bi: &NapiBridgeInstance,
+    data_dir: String,
+) -> napi::Result<NapiRelayHandle> {
     let relay = server::start_relay_local(std::path::Path::new(&data_dir))
         .await
         .map_err(server_err)?;
     increment_handle_count();
     Ok(NapiRelayHandle {
         inner: relay,
-        instance_id: crate::runtime::default_instance_id()?,
+        instance_id: bi.instance_id(),
     })
 }
 
@@ -589,10 +613,19 @@ pub async fn relay_start_local(data_dir: String) -> napi::Result<NapiRelayHandle
 /// ```
 #[napi]
 pub async fn node_start_in_memory(identity_did: Option<String>) -> napi::Result<NapiNodeHandle> {
+    let bi = default_bridge_instance()?;
+    node_start_in_memory_on(&bi, identity_did).await
+}
+
+/// Per-bridge-instance implementation of [`node_start_in_memory`].
+pub(crate) async fn node_start_in_memory_on(
+    bi: &NapiBridgeInstance,
+    identity_did: Option<String>,
+) -> napi::Result<NapiNodeHandle> {
     let node_identity = match identity_did {
         Some(ref did) => {
             validate_did(did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-            Some(build_node_identity(did)?)
+            Some(build_node_identity(bi, did)?)
         }
         None => None,
     };
@@ -610,12 +643,12 @@ pub async fn node_start_in_memory(identity_did: Option<String>) -> napi::Result<
     let did = node.identity().did().to_owned();
     let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
     let bridge_token = node.bridge_token_hex();
-    auto_wire_context_manager(&did, &relay_url, bridge_token).await;
+    auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
 
     increment_handle_count();
     Ok(NapiNodeHandle {
         inner: RunningNode::InMemory(node),
-        instance_id: crate::runtime::default_instance_id()?,
+        instance_id: bi.instance_id(),
     })
 }
 
@@ -647,10 +680,21 @@ pub async fn node_start_local(
     identity_did: Option<String>,
     passphrase: Option<String>,
 ) -> napi::Result<NapiNodeHandle> {
+    let bi = default_bridge_instance()?;
+    node_start_local_on(&bi, data_dir, identity_did, passphrase).await
+}
+
+/// Per-bridge-instance implementation of [`node_start_local`].
+pub(crate) async fn node_start_local_on(
+    bi: &NapiBridgeInstance,
+    data_dir: String,
+    identity_did: Option<String>,
+    passphrase: Option<String>,
+) -> napi::Result<NapiNodeHandle> {
     let node_identity = match identity_did {
         Some(ref did) => {
             validate_did(did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-            Some(build_node_identity(did)?)
+            Some(build_node_identity(bi, did)?)
         }
         None => None,
     };
@@ -668,12 +712,12 @@ pub async fn node_start_local(
     let did = node.identity().did().to_owned();
     let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
     let bridge_token = node.bridge_token_hex();
-    auto_wire_context_manager(&did, &relay_url, bridge_token).await;
+    auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
 
     increment_handle_count();
     Ok(NapiNodeHandle {
         inner: RunningNode::Filesystem(node),
-        instance_id: crate::runtime::default_instance_id()?,
+        instance_id: bi.instance_id(),
     })
 }
 
