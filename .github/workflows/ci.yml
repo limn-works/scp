@@ -350,7 +350,9 @@ jobs:
         run: |
           source .venv/bin/activate
           cd bindings/python
-          PYTHONPATH=. pytest tests/ -v
+          # Parity tests require Bun/Kotlin/Swift runners that are not
+          # available in this job — they run in dedicated parity jobs below.
+          PYTHONPATH=. pytest tests/ -v -m "not parity"
 
   # ── TypeScript ──────────────────────────────────────────────────────
   typescript-check:
