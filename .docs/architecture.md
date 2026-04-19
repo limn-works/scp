@@ -262,8 +262,8 @@ scp/
 │   │   ├── economy/           # Economic governance, pricing, spend auth (§19)
 │   │   └── sync/              # Offline/sync strategy (§23)
 │   │
-│   ├── scp-runtime/           # Async orchestration (ContextManager, MLS, providers)
-│   │   ├── context/           # ContextManager, builder, persistence bridges
+│   ├── scp-runtime/           # Async orchestration (Supervisor + per-context actors, MLS, providers; ADR-049)
+│   │   ├── context/           # Supervisor, ContextActor, saga coordinator, persistence bridges
 │   │   ├── crypto/            # MLS wrapper (OpenMLS), UCAN minting, key protocol
 │   │   ├── identity/          # SCPID, custody migration, recovery
 │   │   ├── store/             # ProtocolRepository — typed domain storage (§17.4)
@@ -663,7 +663,7 @@ Layer 0 ─ scp-primitives            Pure utility crate (time, encoding, hashin
            │                          Zero SCP dependencies — leaf crates.
            │
 Layer 1 ─ scp-protocol              Pure sync protocol types (no tokio, wasm32-compatible).
-           │  scp-runtime             Async orchestration (ContextManager, MLS, providers).
+           │  scp-runtime             Async orchestration (Supervisor + per-context actors, MLS, providers; ADR-049).
            │  scp-core                Facade re-exporting scp-protocol + scp-runtime.
            │  scp-identity            DID, DHT, document, key management.
            │  scp-event-log           Merkle event log.
@@ -942,7 +942,7 @@ agent.invoke({"input": "Schedule a meeting with Bob"})
 Python (scp_sdk/)              PyO3 (crates/scp-ffi/pyo3/)  Rust (scp-core/)
 
 scp.Identity.create()    →    py_identity_create()     →    Identity::create()
-scp.Context.create()     →    py_context_create()      →    ContextManager::create()
+scp.Context.create()     →    py_context_create()      →    Supervisor::create_context()
 ctx.send()               →    py_context_send()        →    Context::send()
 ctx.invoke()             →    py_tool_invoke()         →    Context::invoke_tool()
 ```
