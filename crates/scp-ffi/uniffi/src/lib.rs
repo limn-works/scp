@@ -180,11 +180,15 @@ pub use bridge::scpid_sign;
 // (scp_shutdown is defined here and exported via #[uniffi::export] above.)
 
 // Server startup re-exports — only available with the `server` feature.
+//
+// Phase D (#1695): the `relay_start_in_memory` / `relay_start_local` /
+// `node_start_in_memory` / `node_start_local` free functions have been
+// deleted — every startup path now goes through
+// `Scp::relay_start_in_memory`, `Scp::relay_start_local`,
+// `Scp::node_start_in_memory`, and `Scp::node_start_local` so the returned
+// handles' `instance_id` stamps against the caller's `Scp`.
 #[cfg(feature = "server")]
-pub use server::{
-    NodeHandle, RelayHandle, node_start_in_memory, node_start_local, relay_start_in_memory,
-    relay_start_local,
-};
+pub use server::{NodeHandle, RelayHandle};
 
 // `SCP` — caller-owned bridge instance, exposed to Swift and Kotlin.
 pub use runtime::StorageConfig;

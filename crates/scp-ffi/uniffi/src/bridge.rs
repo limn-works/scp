@@ -11669,6 +11669,55 @@ impl Scp {
         )
     }
 
+    /// Per-instance equivalent of the free-function `relay_start_in_memory`.
+    ///
+    /// Starts a new in-memory relay server and returns a `RelayHandle`
+    /// whose `instance_id` is stamped against this `Scp`. Phase D (#1695)
+    /// replaces the old free function that looked up `DEFAULT_BRIDGE_INSTANCE`
+    /// for the handle's `instance_id`.
+    #[cfg(feature = "server")]
+    pub async fn relay_start_in_memory(&self) -> Result<Arc<crate::server::RelayHandle>, ScpError> {
+        crate::server::relay_start_in_memory_on(&self.inner).await
+    }
+
+    /// Per-instance equivalent of the free-function `relay_start_local`.
+    ///
+    /// Starts a new redb-backed relay at `data_dir/blobs.redb`.
+    #[cfg(feature = "server")]
+    pub async fn relay_start_local(
+        &self,
+        data_dir: String,
+    ) -> Result<Arc<crate::server::RelayHandle>, ScpError> {
+        crate::server::relay_start_local_on(&self.inner, data_dir).await
+    }
+
+    /// Per-instance equivalent of the free-function `node_start_in_memory`.
+    ///
+    /// Starts an in-memory application node. If `identity` is supplied, it
+    /// must have been minted by this `Scp` (cross-instance handles are
+    /// rejected via the `CoreFields::check_handle` inside the helper).
+    #[cfg(feature = "server")]
+    pub async fn node_start_in_memory(
+        &self,
+        identity: Option<Arc<Identity>>,
+    ) -> Result<Arc<crate::server::NodeHandle>, ScpError> {
+        crate::server::node_start_in_memory_on(&self.inner, identity).await
+    }
+
+    /// Per-instance equivalent of the free-function `node_start_local`.
+    ///
+    /// Starts a file-backed application node at `data_dir`. If `identity`
+    /// is supplied, it must have been minted by this `Scp`.
+    #[cfg(feature = "server")]
+    pub async fn node_start_local(
+        &self,
+        data_dir: String,
+        identity: Option<Arc<Identity>>,
+        passphrase: Option<String>,
+    ) -> Result<Arc<crate::server::NodeHandle>, ScpError> {
+        crate::server::node_start_local_on(&self.inner, data_dir, identity, passphrase).await
+    }
+
     /// Per-instance equivalent of the free-function [`trust_query_score`].
     ///
     /// Trust event counts are queried from the module-level helper (a
