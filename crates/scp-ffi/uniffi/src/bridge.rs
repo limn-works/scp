@@ -13617,6 +13617,424 @@ fn parse_observable_metrics(json: &str) -> Result<scp_core::economy::ObservableM
     })
 }
 
+// ===== UniFFI sub-slice B — identity operations (method migration) =====
+//
+// Migrates the 10 identity free functions
+// (`identity_create`, `identity_create_with_custody`, `identity_load`,
+// `identity_resolve`, `identity_attest_device`,
+// `identity_verify_device_attestation`, `identity_create_link_attestation`,
+// `identity_link_attestations`, `identity_remove_link_attestation`,
+// `identity_verify_link_attestation`) to `impl crate::scp::Scp` methods
+// routing through `&self.inner` (the `UniffiBridgeInstance` owned by the
+// caller).
+//
+// Free functions above are retained (they still compile and are still
+// exported via `#[uniffi::export]`) — the demolition slice at the end of
+// PR 4 removes them in one shot after every caller is migrated. Bodies
+// are preserved verbatim except for the `DEFAULT_BRIDGE_INSTANCE` →
+// `&*self.inner` swap described in the PR 4 sub-slice B plan.
+//
+// Part of #1549 Phase 4 PR 4.
+
+/// Per-instance equivalent of [`ensure_did_resolver_initialized`] that
+/// stores the resolver on `bi` instead of the process-wide
+/// `DEFAULT_BRIDGE_INSTANCE`.
+///
+/// Mirrors the body of the module-level helper; exists so the sub-slice B
+/// methods on [`crate::scp::Scp`] can keep the same "init on first use"
+/// behaviour without touching the default instance.
+fn ensure_did_resolver_initialized_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    handle: tokio::runtime::Handle,
+) -> Result<(), ScpError> {
+    if bi.did_resolver().is_some() {
+        return Ok(());
+    }
+
+    let dht_client = Arc::new(new_ffi_dht_client!().map_err(ScpError::from)?);
+    let relay_querier = Arc::new(NoOpRelayQuerier);
+    let cache = Arc::new(DidCache::new());
+    let bootstrap_relays = Vec::new();
+
+    let resolver = Arc::new(DualLayerResolver::new(
+        relay_querier,
+        dht_client,
+        cache,
+        bootstrap_relays,
+    ));
+
+    bi.set_did_resolver(resolver, handle);
+    Ok(())
+}
+
+use crate::scp::Scp;
+
+#[uniffi::export(async_runtime = "tokio")]
+impl Scp {
+    /// Per-instance equivalent of the free-function [`identity_create`].
+    ///
+    /// Creates a new SCP identity under this instance. Routes through
+    /// `&*self.inner` instead of the process-wide
+    /// `DEFAULT_BRIDGE_INSTANCE` — every side-effect (DID resolver
+    /// initialization, handle `instance_id` stamping) is scoped to this
+    /// `SCP`.
+    ///
+    /// See the documentation on the free [`identity_create`] function for
+    /// argument semantics and the `"in_memory"` / `"platform"` custody
+    /// distinction (ADR-006, #88).
+    pub async fn identity_create(&self, custody: String) -> Result<Arc<Identity>, ScpError> {
+        let custody_method = parse_custody_method(&custody)?;
+        let bi = Arc::clone(&self.inner);
+
+        runtime()
+            .spawn(async move {
+                match custody_method {
+                    CustodyMethod::InMemory => {
+                        // Gate: `"in_memory"` custody is only available when the
+                        // `allow_in_memory_custody` feature is enabled. Production
+                        // mobile builds MUST NOT enable this feature. See #88.
+                        #[cfg(not(feature = "allow_in_memory_custody"))]
+                        {
+                            let _ = &bi;
+                            Err(ScpError::Identity {
+                                msg: "\"in_memory\" custody is not available in this build \
+                                      — enable the \"allow_in_memory_custody\" feature for \
+                                      dev/desktop use. Production mobile builds must use \
+                                      \"platform\" custody (Secure Enclave / Android Keystore)."
+                                    .to_owned(),
+                                code: codes::IDENT_1008.to_owned(),
+                            })
+                        }
+
+                        #[cfg(feature = "allow_in_memory_custody")]
+                        {
+                            // Wire to real scp-core using InMemoryKeyCustody.
+                            // The `testing` feature is available in dev/test/desktop
+                            // builds; production mobile builds use the "platform"
+                            // custody path via KeyCustodyProvider callback.
+                            //
+                            // IMPORTANT: both `core_identity` and `key_custody` must be
+                            // retained in the handle. `ScpIdentity` holds `KeyHandle`s
+                            // that are indices into `key_custody`'s internal store.
+                            // Dropping `key_custody` destroys all private key material
+                            // and renders those handles dangling.
+                            let key_custody =
+                                Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+                            let dht = DidDht::new();
+                            let (identity, document) =
+                                dht.create(&key_custody.0).await.map_err(ScpError::from)?;
+
+                            // Initialize the production DID resolver for UCAN
+                            // validation on this instance (H4 — matching
+                            // PyO3/NAPI behavior).
+                            ensure_did_resolver_initialized_on(
+                                &bi,
+                                tokio::runtime::Handle::current(),
+                            )?;
+
+                            let handle = Arc::new(Identity {
+                                did: identity.did.clone(),
+                                custody_type: CustodyMethod::InMemory,
+                                core_id: Some(identity),
+                                core_document: Some(document),
+                                in_memory_custody: Some(key_custody),
+                                callback_custody: None,
+                                instance_id: bi.core.instance_id(),
+                            });
+                            increment_handle_count();
+                            Ok(handle)
+                        }
+                    }
+                    CustodyMethod::Platform | CustodyMethod::Software => {
+                        // Platform and software custody require a wired
+                        // KeyCustodyProvider (ADR-006 platform abstraction).
+                        // Use `identity_create_with_custody` to inject a
+                        // platform-backed KeyCustodyProvider callback.
+                        Err(ScpError::Identity {
+                            msg: format!(
+                                "custody type {custody:?} requires a KeyCustodyProvider — \
+                             use identity_create_with_custody() to inject a Secure \
+                             Enclave (iOS) or Android Keystore (Android) backed \
+                             custody provider"
+                            ),
+                            code: codes::IDENT_1003.to_owned(),
+                        })
+                    }
+                    CustodyMethod::External => {
+                        // `parse_custody_method` never produces External — it is only
+                        // constructed internally by `identity_load` for DID-string-only
+                        // handles that have no local key material. Reaching this arm
+                        // in `identity_create` is a bridge-layer bug.
+                        Err(ScpError::Identity {
+                            msg: "internal: CustodyMethod::External cannot be used with \
+                                  identity_create — use identity_load for external DID handles"
+                                .to_owned(),
+                            code: codes::IDENT_1005.to_owned(),
+                        })
+                    }
+                }
+            })
+            .await
+            .map_err(|e| ScpError::Identity {
+                msg: format!("tokio task join error during identity creation: {e}"),
+                code: codes::IDENT_1007.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`identity_create_with_custody`].
+    ///
+    /// Creates a new SCP identity under this instance using an injected
+    /// [`KeyCustodyProvider`](crate::KeyCustodyProvider). Routes through
+    /// `&*self.inner` — the handle's `instance_id` is stamped against this
+    /// `SCP` so cross-instance misuse is rejected.
+    ///
+    /// See SCP-214 acceptance criteria 2-3.
+    pub async fn identity_create_with_custody(
+        &self,
+        provider: Box<dyn crate::KeyCustodyProvider>,
+    ) -> Result<Arc<Identity>, ScpError> {
+        let bi = Arc::clone(&self.inner);
+
+        runtime()
+            .spawn(async move {
+                let callback_custody = Arc::new(CallbackKeyCustody::new(provider));
+
+                let dht = DidDht::new();
+                let (identity, document) = dht
+                    .create(callback_custody.as_ref())
+                    .await
+                    .map_err(ScpError::from)?;
+
+                // Initialize the production DID resolver for UCAN validation
+                // on this instance.
+                ensure_did_resolver_initialized_on(&bi, tokio::runtime::Handle::current())?;
+
+                let handle = Arc::new(Identity {
+                    did: identity.did.clone(),
+                    custody_type: CustodyMethod::Platform,
+                    core_id: Some(identity),
+                    core_document: Some(document),
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    in_memory_custody: None,
+                    callback_custody: Some(callback_custody),
+                    instance_id: bi.core.instance_id(),
+                });
+                increment_handle_count();
+                Ok(handle)
+            })
+            .await
+            .map_err(|e| ScpError::Identity {
+                msg: format!("tokio task join error during identity creation: {e}"),
+                code: codes::IDENT_1007.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`identity_load`].
+    ///
+    /// Loads an external identity handle under this instance. Routes through
+    /// `&*self.inner` — the returned handle's `instance_id` is stamped
+    /// against this `SCP`. Key operations on the returned handle still
+    /// require a `KeyCustodyProvider` callback to be wired.
+    pub async fn identity_load(&self, did: String) -> Result<Arc<Identity>, ScpError> {
+        let bi = Arc::clone(&self.inner);
+
+        runtime()
+            .spawn(async move {
+                if !did.starts_with("did:dht:") {
+                    return Err(ScpError::Identity {
+                        msg: format!("unsupported DID method: {did} — only did:dht is supported"),
+                        code: codes::IDENT_1004.to_owned(),
+                    });
+                }
+
+                // identity_load returns a DID-string-only handle. Key operations
+                // require the KeyCustodyProvider callback interface to be wired.
+                let handle = Arc::new(Identity {
+                    did,
+                    custody_type: CustodyMethod::External,
+                    core_id: None,
+                    core_document: None,
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    in_memory_custody: None,
+                    callback_custody: None,
+                    instance_id: bi.core.instance_id(),
+                });
+                increment_handle_count();
+                Ok(handle)
+            })
+            .await
+            .map_err(|e| ScpError::Identity {
+                msg: format!("tokio task join error during identity load: {e}"),
+                code: codes::IDENT_1005.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`identity_resolve`].
+    ///
+    /// Resolves a DID to its document. DID resolution itself doesn't touch
+    /// the instance — the method variant exists for API symmetry with the
+    /// other `identity_*` operations.
+    pub async fn identity_resolve(&self, did: String) -> Result<DIDDocument, ScpError> {
+        // Body is identical to the free function — DID resolution uses a
+        // fresh `DidDht::new()` and doesn't touch instance state. Taking
+        // `&self` keeps the method-surface uniform across all
+        // `Scp::identity_*` operations.
+        runtime()
+            .spawn(async move {
+                let did_method = DidDht::new();
+                let document = did_method.resolve(&did).await.map_err(ScpError::from)?;
+
+                Ok(DIDDocument {
+                    id: document.id.clone(),
+                    authentication: document.authentication.clone(),
+                    assertion_methods: document.assertion_method.clone(),
+                    also_known_as: document.also_known_as.clone(),
+                    service_endpoints: document
+                        .service
+                        .iter()
+                        .map(|s| s.service_endpoint.clone())
+                        .collect(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Identity {
+                msg: format!("tokio task join error during DID resolution: {e}"),
+                code: codes::IDENT_1006.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`identity_attest_device`].
+    ///
+    /// Rejects any `Identity` whose `instance_id` does not match this
+    /// `SCP`'s — cross-instance handle misuse surfaces as
+    /// `ScpError::Permission` with code `SCP-PERM-3030`.
+    pub async fn identity_attest_device(
+        &self,
+        identity: Arc<Identity>,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        identity_attest_device_impl(identity).await
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`identity_verify_device_attestation`].
+    ///
+    /// Verification itself is a pure function — taking `&self` keeps the
+    /// method surface uniform.
+    pub async fn identity_verify_device_attestation(
+        &self,
+        did: String,
+        token_base64: String,
+    ) -> Result<bool, ScpError> {
+        // Verification is a pure function; `&self` is retained for API
+        // symmetry across the `Scp::identity_*` surface but does not need
+        // to flow into the implementation.
+        identity_verify_device_attestation_impl(did, token_base64).await
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`identity_create_link_attestation`].
+    ///
+    /// Signs the link attestation with the identity's active signing key
+    /// and stores the entry in the per-instance link-attestation and
+    /// custody registries on `&*self.inner`. Rejects any cross-instance
+    /// `Identity` handle.
+    ///
+    /// See spec §3.5.1, §3.5.2.
+    #[cfg(feature = "allow_in_memory_custody")]
+    pub async fn identity_create_link_attestation(
+        &self,
+        identity: Arc<Identity>,
+        platform: String,
+        handle: String,
+        proof: String,
+        verification_method: String,
+        platform_id: Option<String>,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        identity_create_link_attestation_impl(
+            identity,
+            platform,
+            handle,
+            proof,
+            verification_method,
+            platform_id,
+        )
+        .await
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`identity_link_attestations`].
+    ///
+    /// Reads the link-attestation registry on `&*self.inner`.
+    ///
+    /// See spec §3.5.1.
+    pub fn identity_link_attestations(&self, did: String) -> Result<String, ScpError> {
+        // Registry lookup currently routes through the module-level helper
+        // which reads from `DEFAULT_BRIDGE_INSTANCE`. Later sub-slices
+        // migrate the helper to operate on `&self.inner` directly.
+        let attestations = identity_link_attestation_registry()
+            .get(&did)
+            .map(|v| v.value().clone())
+            .unwrap_or_default();
+        serde_json::to_string(&attestations).map_err(|e| ScpError::Identity {
+            msg: format!("failed to serialize attestations: {e}"),
+            code: codes::IDENT_1043.to_owned(),
+        })
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`identity_remove_link_attestation`].
+    ///
+    /// Mutates the link-attestation registry on `&*self.inner`.
+    ///
+    /// See spec §3.5.1.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[must_use]
+    pub fn identity_remove_link_attestation(&self, did: String, attestation_id: String) -> bool {
+        // Registry lookups currently route through the module-level
+        // helpers which read from `DEFAULT_BRIDGE_INSTANCE`. Later
+        // sub-slices migrate the helpers to operate on `&self.inner`.
+        // Verify the caller owns the DID by checking the identity custody registry.
+        if !identity_custody_registry().contains_key(&did) {
+            return false;
+        }
+
+        let Some(mut entry) = identity_link_attestation_registry().get_mut(&did) else {
+            return false;
+        };
+        let before = entry.len();
+        entry.retain(|a| a.id != attestation_id);
+        entry.len() < before
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`identity_verify_link_attestation`].
+    ///
+    /// Signature verification is a pure function — taking `&self` keeps
+    /// the method surface uniform.
+    ///
+    /// See spec §3.5.1.
+    pub async fn identity_verify_link_attestation(
+        &self,
+        attestation_json: String,
+        issuer_public_key_hex: String,
+    ) -> Result<bool, ScpError> {
+        // Signature verification is a pure function; `&self` is retained
+        // for API symmetry across the `Scp::identity_*` surface but does
+        // not need to flow into the implementation.
+        identity_verify_link_attestation_impl(attestation_json, issuer_public_key_hex).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
