@@ -271,7 +271,10 @@ impl Scp {
     ///
     /// See [`crate::identity::identity_create`] for argument semantics.
     #[napi(js_name = "identityCreate")]
-    pub async fn identity_create(&self, custody: String) -> napi::Result<crate::identity::NapiIdentity> {
+    pub async fn identity_create(
+        &self,
+        custody: String,
+    ) -> napi::Result<crate::identity::NapiIdentity> {
         use crate::identity::{NapiIdentityInner, ensure_did_resolver_initialized_on};
 
         validate_custody_type(&custody).map_err(NapiError::from)?;
@@ -686,7 +689,9 @@ impl Scp {
         .map_err(|e| {
             let code = match &e {
                 scp_ffi_common::attestation::AttestationBuildError::InvalidMethod(_)
-                | scp_ffi_common::attestation::AttestationBuildError::ClockError => codes::IDENT_1040,
+                | scp_ffi_common::attestation::AttestationBuildError::ClockError => {
+                    codes::IDENT_1040
+                }
                 _ => codes::IDENT_1041,
             };
             NapiError::from(ScpNapiError::Identity {
@@ -795,8 +800,8 @@ impl Scp {
 
         let _ = &self.inner;
 
-        let attestation: IdentityLinkAttestation =
-            serde_json::from_str(&attestation_json).map_err(|e| {
+        let attestation: IdentityLinkAttestation = serde_json::from_str(&attestation_json)
+            .map_err(|e| {
                 NapiError::from(ScpNapiError::Identity {
                     message: format!("failed to parse attestation JSON: {e}"),
                     code: codes::IDENT_1044.to_owned(),
@@ -1201,11 +1206,7 @@ impl Scp {
 
     /// Per-instance equivalent of `petname_resolve_context`.
     #[napi(js_name = "petnameResolveContext")]
-    pub fn petname_resolve_context(
-        &self,
-        owner_did: String,
-        name: String,
-    ) -> napi::Result<String> {
+    pub fn petname_resolve_context(&self, owner_did: String, name: String) -> napi::Result<String> {
         if owner_did.is_empty() {
             return Err(NapiError::from(ScpNapiError::Validation {
                 message: "owner_did must not be empty".to_owned(),
@@ -1295,12 +1296,13 @@ impl Scp {
         use scp_core::discovery::handles::{HandleMetadata, HandleRegisterParams, HandleRegistry};
         use scp_identity::DID;
 
-        let target = scp_ffi_common::petname_helpers::parse_handle_target(&target_json).map_err(|e| {
-            NapiError::from(ScpNapiError::Validation {
-                message: e.message,
-                code: codes::VALID_7126.to_owned(),
-            })
-        })?;
+        let target =
+            scp_ffi_common::petname_helpers::parse_handle_target(&target_json).map_err(|e| {
+                NapiError::from(ScpNapiError::Validation {
+                    message: e.message,
+                    code: codes::VALID_7126.to_owned(),
+                })
+            })?;
         let params = HandleRegisterParams {
             handle,
             target,
@@ -1574,8 +1576,7 @@ impl Scp {
         known_contexts_json: Option<String>,
     ) -> napi::Result<String> {
         use scp_ffi_common::petname_helpers::{
-            LocalHandleQuerier, address_resolution_to_json,
-            known_contexts_from_scope_registries,
+            LocalHandleQuerier, address_resolution_to_json, known_contexts_from_scope_registries,
         };
 
         if owner_did.is_empty() {
@@ -1585,23 +1586,23 @@ impl Scp {
             }));
         }
         let core = &self.inner.core;
-        let mut known_contexts: HashMap<String, String> = if let Some(ref json) = known_contexts_json
-        {
-            serde_json::from_str(json).map_err(|e| {
-                NapiError::from(ScpNapiError::Validation {
-                    message: format!("invalid known_contexts_json: {e}"),
-                    code: codes::VALID_7090.to_owned(),
-                })
-            })?
-        } else {
-            let guard = core.handle_registries().lock().map_err(|e| {
-                NapiError::from(ScpNapiError::Validation {
-                    message: format!("handle registry lock poisoned: {e}"),
-                    code: codes::VALID_7120.to_owned(),
-                })
-            })?;
-            guard.keys().map(|k| (k.clone(), k.clone())).collect()
-        };
+        let mut known_contexts: HashMap<String, String> =
+            if let Some(ref json) = known_contexts_json {
+                serde_json::from_str(json).map_err(|e| {
+                    NapiError::from(ScpNapiError::Validation {
+                        message: format!("invalid known_contexts_json: {e}"),
+                        code: codes::VALID_7090.to_owned(),
+                    })
+                })?
+            } else {
+                let guard = core.handle_registries().lock().map_err(|e| {
+                    NapiError::from(ScpNapiError::Validation {
+                        message: format!("handle registry lock poisoned: {e}"),
+                        code: codes::VALID_7120.to_owned(),
+                    })
+                })?;
+                guard.keys().map(|k| (k.clone(), k.clone())).collect()
+            };
 
         let scope_contexts = known_contexts_from_scope_registries(core);
         for (name, ctx_id) in scope_contexts {

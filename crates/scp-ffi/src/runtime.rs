@@ -2006,11 +2006,7 @@ pub fn register_context(
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found, or
 /// propagates any error returned by the closure `f`.
-pub fn with_context<T, F>(
-    bi: &PyBridgeInstance,
-    context_id: &str,
-    f: F,
-) -> Result<T, ScpPyError>
+pub fn with_context<T, F>(bi: &PyBridgeInstance, context_id: &str, f: F) -> Result<T, ScpPyError>
 where
     F: FnOnce(&mut FfiBridgeState) -> Result<T, ScpPyError>,
 {
@@ -2076,11 +2072,7 @@ pub fn registry_stats(bi: &PyBridgeInstance) -> RegistryStats {
 ///
 /// Returns `(0, 0)` if the context is not registered.
 #[must_use]
-pub fn query_trust_event_counts(
-    bi: &PyBridgeInstance,
-    context_id: &str,
-    _did: &str,
-) -> (u64, u64) {
+pub fn query_trust_event_counts(bi: &PyBridgeInstance, context_id: &str, _did: &str) -> (u64, u64) {
     let map = ffi_state_registry(bi);
     match map.get(context_id) {
         Some(entry) => {
@@ -2275,7 +2267,10 @@ mod tests {
     fn remove_identity_if_present_returns_false_when_not_found() {
         init_context_manager_for_test();
         let bi = bridge_instance().unwrap();
-        assert!(!remove_identity_if_present(bi, "did:dht:z6MkNotPresent9999"));
+        assert!(!remove_identity_if_present(
+            bi,
+            "did:dht:z6MkNotPresent9999"
+        ));
     }
 
     #[test]
@@ -2318,8 +2313,7 @@ mod tests {
         let creator = "did:dht:z6MkFfiFind";
         register_context(bi, &ctx_id, creator, &[]).unwrap();
 
-        let creator_did =
-            with_ffi_state(bi, &ctx_id, |st| Ok(st.creator_did.clone())).unwrap();
+        let creator_did = with_ffi_state(bi, &ctx_id, |st| Ok(st.creator_did.clone())).unwrap();
         assert_eq!(creator_did, creator);
 
         remove_context(bi, &ctx_id);
@@ -2355,8 +2349,7 @@ mod tests {
 
         register_context(bi, &ctx_id, creator, &user_ceiling).unwrap();
 
-        let ceiling =
-            with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
+        let ceiling = with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
 
         // Compound resources must have underscores joining their segments.
         assert!(
@@ -2400,8 +2393,7 @@ mod tests {
 
         register_context(bi, &ctx_id, creator, &[]).unwrap();
 
-        let ceiling =
-            with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
+        let ceiling = with_ffi_state(bi, &ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
 
         // Default ceiling must include tool_invoke:* (not tool:invoke:*).
         assert!(

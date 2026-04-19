@@ -1212,9 +1212,7 @@ pub(crate) struct NapiIdentityEntry {
 /// The registry is a typed `Arc<DashMap<String, NapiIdentityEntry>>` field
 /// on [`NapiBridgeInstance`].
 #[cfg(feature = "allow_in_memory_custody")]
-pub(crate) fn identity_registry(
-    bi: &NapiBridgeInstance,
-) -> &DashMap<String, NapiIdentityEntry> {
+pub(crate) fn identity_registry(bi: &NapiBridgeInstance) -> &DashMap<String, NapiIdentityEntry> {
     bi.identity_registry.as_ref()
 }
 
@@ -1228,11 +1226,7 @@ pub(crate) fn identity_registry(
 /// Overwrites any existing entry for the same DID (idempotent — supports
 /// key rotation where the same DID gets new key material).
 #[cfg(feature = "allow_in_memory_custody")]
-pub(crate) fn register_identity(
-    bi: &NapiBridgeInstance,
-    did: &str,
-    entry: NapiIdentityEntry,
-) {
+pub(crate) fn register_identity(bi: &NapiBridgeInstance, did: &str, entry: NapiIdentityEntry) {
     identity_registry(bi).insert(did.to_owned(), entry);
 }
 
@@ -1357,9 +1351,7 @@ pub struct UcanContextState {
 ///
 /// The registry is a typed `Arc<DashMap<String, UcanContextState>>` field
 /// on [`NapiBridgeInstance`].
-pub(crate) fn ucan_registry(
-    bi: &NapiBridgeInstance,
-) -> &DashMap<String, UcanContextState> {
+pub(crate) fn ucan_registry(bi: &NapiBridgeInstance) -> &DashMap<String, UcanContextState> {
     bi.ucan_registry.as_ref()
 }
 
