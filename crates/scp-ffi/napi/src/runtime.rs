@@ -43,6 +43,7 @@ use scp_core::store::context::ProtocolRepositoryEventLogBridge;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
+use scp_platform::sqlite::SqliteStorage;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
@@ -79,6 +80,55 @@ pub enum StorageConfig {
         /// Raw encryption key material (32 bytes recommended).
         key: zeroize::Zeroizing<Vec<u8>>,
     },
+}
+
+/// Protocol repository variant: an `Arc<ProtocolRepository<_>>` whose inner
+/// `Storage` matches the bridge's configured persistence backend.
+///
+/// Before this variant existed, `NapiBridgeInstance::protocol_repository` was
+/// always `Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>`,
+/// even when the bridge was constructed with [`StorageConfig::Sqlite`]. That
+/// meant the Merkle event log — which uses the protocol repository as its
+/// backing `EventLogPersistence` — silently ran against an ephemeral
+/// in-memory store, while context snapshots correctly landed in `SQLite`. On
+/// restart the event log would be empty even though the rest of the state
+/// survived, producing a split-brain the caller had no way to detect.
+///
+/// The enum dispatches the event log bridge and the trust bridge onto the
+/// real backing store for each variant, so `SCP({storage: sqlite})` now
+/// persists *both* snapshots and Merkle event log entries to the same
+/// `SQLCipher` database.
+pub enum ProtocolRepoVariant {
+    /// Encrypted in-memory repository. Event log and trust aggregation are
+    /// backed by an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
+    /// per-instance AES-256-GCM key. Data is lost when the instance drops.
+    InMemory(Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>),
+    /// SQLCipher-backed repository. Event log and trust aggregation share the
+    /// same `Arc<SqliteStorage>` that backs `CoreFields::persistence`, so
+    /// context snapshots, trust attestations, and event log entries all
+    /// survive restart and share a single `SQLCipher` connection.
+    Sqlite(Arc<ProtocolRepository<Arc<SqliteStorage>>>),
+}
+
+impl ProtocolRepoVariant {
+    /// Constructs a [`ContextEventLogProvider`] backed by this repository.
+    ///
+    /// The bridge is retained by `Arc` inside [`MerkleEventLogProvider`], so
+    /// subsequent `append` calls persist entries through the backing store
+    /// that was configured at instance-construction time.
+    #[must_use]
+    pub fn event_log_provider(&self) -> Box<dyn ContextEventLogProvider> {
+        match self {
+            Self::InMemory(repo) => {
+                let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(repo));
+                Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+            }
+            Self::Sqlite(repo) => {
+                let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(repo));
+                Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+            }
+        }
+    }
 }
 
 /// NAPI-specific concrete bridge instance.
@@ -122,10 +172,14 @@ pub struct NapiBridgeInstance {
 
     /// Protocol repository used for trust aggregation + event log persistence.
     ///
-    /// Previously stored type-erased in `CoreFields::protocol_repository`.
-    /// Wrapped in `Arc` for cheap clones into the `MerkleEventLogProvider`.
-    pub(crate) protocol_repository:
-        Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
+    /// Previously stored type-erased in `CoreFields::protocol_repository`,
+    /// then as a concrete `Arc<ProtocolRepository<EncryptingAdapter<...>>>`
+    /// regardless of configured storage. Now a variant so that
+    /// [`StorageConfig::Sqlite`] also routes event log entries and trust
+    /// attestations into the `SQLCipher` database.
+    ///
+    /// See [`ProtocolRepoVariant`] for the dispatch details.
+    pub(crate) protocol_repository: ProtocolRepoVariant,
 
     // -----------------------------------------------------------------
     // #1549 Phase 4 PR 2 commit 1 — additive typed fields replacing
@@ -172,7 +226,7 @@ impl NapiBridgeInstance {
             ucan_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             identity_registry: Arc::new(DashMap::new()),
-            protocol_repository,
+            protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
@@ -195,7 +249,7 @@ impl NapiBridgeInstance {
             ucan_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             identity_registry: Arc::new(DashMap::new()),
-            protocol_repository,
+            protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
@@ -228,18 +282,28 @@ impl NapiBridgeInstance {
                 match scp_platform::sqlite::SqliteStorage::new(&path, &key) {
                     Ok(storage) => {
                         let arc_storage = Arc::new(storage);
-                        let repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                        // The same `Arc<SqliteStorage>` backs BOTH the
+                        // context-snapshot persistence bridge AND the
+                        // Merkle event log + trust aggregation repository.
+                        // This is the fix for the split-brain where
+                        // `with_storage(Sqlite)` used to persist snapshots
+                        // but silently fall back to in-memory storage for
+                        // event log entries.
+                        let persistence_repo =
+                            Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
                         let persistence: Arc<dyn ContextPersistence + Send + Sync> = Arc::new(
-                            scp_core::store::context::ProtocolRepositoryContextBridge::new(repo),
+                            scp_core::store::context::ProtocolRepositoryContextBridge::new(
+                                persistence_repo,
+                            ),
                         );
-                        // `arc_storage` itself is not retained beyond the
-                        // persistence bridge — NAPI does not have a
-                        // storage_provider slot on NapiBridgeInstance
-                        // today. Extending it is a later commit; the
-                        // persistence path is the load-bearing one.
+                        let event_log_repo =
+                            Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
                         drop(arc_storage);
                         drop(key);
-                        Self::with_persistence_napi_arc(persistence)
+                        Self::with_persistence_napi_arc_and_repo(
+                            persistence,
+                            ProtocolRepoVariant::Sqlite(event_log_repo),
+                        )
                     }
                     Err(e) => {
                         tracing::error!(
@@ -263,10 +327,18 @@ impl NapiBridgeInstance {
     /// `init_context_manager*` via
     /// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`],
     /// avoiding duplicate `SqliteStorage` connections to the same database.
+    /// Constructs a `NapiBridgeInstance` with both the
+    /// [`ContextPersistence`] provider and the [`ProtocolRepoVariant`]
+    /// explicitly configured.
+    ///
+    /// `with_storage_napi(StorageConfig::Sqlite)` uses this so the event log
+    /// repository and the snapshot persistence bridge share a single
+    /// `Arc<SqliteStorage>`.
     #[must_use]
-    fn with_persistence_napi_arc(persistence: Arc<dyn ContextPersistence + Send + Sync>) -> Self {
-        let (_event_log, protocol_repository) =
-            scp_ffi_common::bridge_runtime::build_event_log_provider();
+    fn with_persistence_napi_arc_and_repo(
+        persistence: Arc<dyn ContextPersistence + Send + Sync>,
+        protocol_repository: ProtocolRepoVariant,
+    ) -> Self {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
             ucan_registry: Arc::new(DashMap::new()),
@@ -963,14 +1035,14 @@ pub fn init_context_manager_with_relay_transport(
     bi.core.set_context_manager(cm_arc);
 }
 
-/// Returns the default-instance `ProtocolRepository` if initialized.
+/// Returns the default-instance `ProtocolRepoVariant` if initialized.
 ///
 /// Used by the trust aggregation bridge to construct a
-/// `ProtocolRepositoryTrustBridge` backed by persistent (in-process) storage.
-/// Returns `None` if the default bridge has not been initialized.
+/// `ProtocolRepositoryTrustBridge` backed by the configured storage (either
+/// encrypted in-memory or SQLCipher-on-disk). Returns `None` if the default
+/// bridge has not been initialized.
 #[must_use]
-pub fn protocol_repository()
--> Option<&'static Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>> {
+pub fn protocol_repository() -> Option<&'static ProtocolRepoVariant> {
     DEFAULT_BRIDGE_INSTANCE
         .get()
         .map(|bi| &bi.protocol_repository)
@@ -990,18 +1062,17 @@ pub(crate) fn build_event_log_provider() -> (
 }
 
 /// Builds an event log provider that reuses the already-registered
-/// `ProtocolRepository` in the default `NapiBridgeInstance`.
+/// `ProtocolRepoVariant` in the default `NapiBridgeInstance`.
 ///
 /// Called by `init_context_manager*` after the default bridge was created
 /// by `ensure_bridge_instance`. Reusing the repository is critical — a fresh
 /// repository would have a different encryption key, rendering any already
-/// persisted event log entries unreadable.
+/// persisted event log entries unreadable. When the bridge is SQLite-backed,
+/// this returns an event log provider that writes into the same `SQLCipher`
+/// database as context snapshots.
 fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProvider>> {
     let bi = DEFAULT_BRIDGE_INSTANCE.get()?;
-    let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(&bi.protocol_repository));
-    Some(Box::new(MerkleEventLogProvider::with_persistence(
-        Arc::new(bridge),
-    )))
+    Some(bi.protocol_repository.event_log_provider())
 }
 
 // `bridge_lifecycle_serial` (and its backing `BRIDGE_LIFECYCLE_SERIAL`
@@ -1836,9 +1907,26 @@ mod tests {
             bi.identity_registry.is_empty(),
             "identity_registry must start empty"
         );
-        // protocol_repository is a live `Arc` — no panic on access.
-        let _repo: &Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>> =
-            &bi.protocol_repository;
+        // protocol_repository is a live variant — default construction is
+        // the in-memory variant.
+        assert!(
+            matches!(&bi.protocol_repository, ProtocolRepoVariant::InMemory(_)),
+            "default NapiBridgeInstance must use in-memory protocol repository"
+        );
+    }
+
+    #[test]
+    fn test_with_storage_sqlite_uses_sqlite_variant() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bi = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+            path: tmp.path().to_path_buf(),
+            key: zeroize::Zeroizing::new(vec![0x11u8; 32]),
+        });
+        assert!(
+            matches!(&bi.protocol_repository, ProtocolRepoVariant::Sqlite(_)),
+            "with_storage(Sqlite) must produce ProtocolRepoVariant::Sqlite so event log \
+             entries persist to the same `SQLCipher` database as context snapshots"
+        );
     }
 
     #[test]

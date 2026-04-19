@@ -52,6 +52,7 @@ use scp_core::store::context::ProtocolRepositoryEventLogBridge;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
+use scp_platform::sqlite::SqliteStorage;
 
 // ---------------------------------------------------------------------------
 // UniffiBridgeInstance — per-bridge concrete bridge instance (#1549 Phase 4 PR 1)
@@ -87,6 +88,55 @@ pub enum StorageConfig {
         /// Raw encryption key material (typically 32 bytes).
         key: Vec<u8>,
     },
+}
+
+/// Protocol repository variant: an `Arc<ProtocolRepository<_>>` whose inner
+/// `Storage` matches the bridge's configured persistence backend.
+///
+/// Before this variant existed, `UniffiBridgeInstance::protocol_repository`
+/// was always `Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>`,
+/// even when the bridge was constructed with [`StorageConfig::Sqlite`]. That
+/// meant the Merkle event log — which uses the protocol repository as its
+/// backing `EventLogPersistence` — silently ran against an ephemeral
+/// in-memory store, while context snapshots correctly landed in `SQLite`. On
+/// restart the event log would be empty even though the rest of the state
+/// survived, producing a split-brain the caller had no way to detect.
+///
+/// The enum dispatches the event log bridge and the trust bridge onto the
+/// real backing store for each variant, so `SCP({storage: sqlite})` now
+/// persists *both* snapshots and Merkle event log entries to the same
+/// `SQLCipher` database.
+pub enum ProtocolRepoVariant {
+    /// Encrypted in-memory repository. Event log and trust aggregation are
+    /// backed by an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
+    /// per-instance AES-256-GCM key. Data is lost when the instance drops.
+    InMemory(Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>),
+    /// SQLCipher-backed repository. Event log and trust aggregation share the
+    /// same `Arc<SqliteStorage>` that backs `CoreFields::persistence`, so
+    /// context snapshots, trust attestations, and event log entries all
+    /// survive restart and share a single `SQLCipher` connection.
+    Sqlite(Arc<ProtocolRepository<Arc<SqliteStorage>>>),
+}
+
+impl ProtocolRepoVariant {
+    /// Constructs a [`ContextEventLogProvider`] backed by this repository.
+    ///
+    /// The bridge is retained by `Arc` inside [`MerkleEventLogProvider`], so
+    /// subsequent `append` calls persist entries through the backing store
+    /// that was configured at instance-construction time.
+    #[must_use]
+    pub fn event_log_provider(&self) -> Box<dyn ContextEventLogProvider> {
+        match self {
+            Self::InMemory(repo) => {
+                let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(repo));
+                Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+            }
+            Self::Sqlite(repo) => {
+                let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(repo));
+                Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+            }
+        }
+    }
 }
 
 /// `UniFFI`-specific concrete bridge instance.
@@ -141,10 +191,14 @@ pub struct UniffiBridgeInstance {
 
     /// Protocol repository used for trust aggregation + event log persistence.
     ///
-    /// Previously stored type-erased in `CoreFields::protocol_repository`.
-    /// Wrapped in `Arc` for cheap clones into the `MerkleEventLogProvider`.
-    pub(crate) protocol_repository:
-        Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
+    /// Previously stored type-erased in `CoreFields::protocol_repository`,
+    /// then as a concrete `Arc<ProtocolRepository<EncryptingAdapter<...>>>`
+    /// regardless of configured storage. Now a variant so that
+    /// [`StorageConfig::Sqlite`] also routes event log entries and trust
+    /// attestations into the `SQLCipher` database.
+    ///
+    /// See [`ProtocolRepoVariant`] for the dispatch details.
+    pub(crate) protocol_repository: ProtocolRepoVariant,
 
     // -----------------------------------------------------------------
     // #1549 Phase 4 PR 2 commit 1 — additive typed fields replacing
@@ -200,7 +254,7 @@ impl UniffiBridgeInstance {
             ucan_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             identity_custody_registry: Arc::new(DashMap::new()),
-            protocol_repository,
+            protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
             context_handle_registry: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
@@ -226,7 +280,7 @@ impl UniffiBridgeInstance {
             ucan_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             identity_custody_registry: Arc::new(DashMap::new()),
-            protocol_repository,
+            protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
             identity_link_attestation_registry: Arc::new(DashMap::new()),
             context_handle_registry: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
@@ -258,15 +312,24 @@ impl UniffiBridgeInstance {
                 match scp_platform::sqlite::SqliteStorage::new(&path_buf, &key) {
                     Ok(storage) => {
                         let arc_storage = Arc::new(storage);
-                        let repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                        // The same `Arc<SqliteStorage>` backs BOTH the
+                        // context-snapshot persistence bridge AND the
+                        // Merkle event log + trust aggregation repository.
+                        // This is the fix for the split-brain where
+                        // `with_storage(Sqlite)` used to persist snapshots
+                        // but silently fall back to in-memory storage for
+                        // event log entries.
+                        let persistence_repo =
+                            Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
                         let persistence: Arc<
                             dyn scp_core::context::manager::ContextPersistence + Send + Sync,
                         > = Arc::new(
-                            scp_core::store::context::ProtocolRepositoryContextBridge::new(repo),
+                            scp_core::store::context::ProtocolRepositoryContextBridge::new(
+                                persistence_repo,
+                            ),
                         );
-                        // `arc_storage` is already held by the bridge via
-                        // the repo clone above; dropping it here just
-                        // decrements the local reference count.
+                        let event_log_repo =
+                            Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
                         drop(arc_storage);
                         // `key` is a `Vec<u8>` crossing the UniFFI
                         // boundary — we cannot zero the caller's copy,
@@ -275,7 +338,10 @@ impl UniffiBridgeInstance {
                         let mut key_owned = key;
                         zeroize::Zeroize::zeroize(&mut key_owned);
                         drop(key_owned);
-                        Self::with_persistence_uniffi_arc(persistence)
+                        Self::with_persistence_uniffi_arc_and_repo(
+                            persistence,
+                            ProtocolRepoVariant::Sqlite(event_log_repo),
+                        )
                     }
                     Err(e) => {
                         tracing::error!(
@@ -301,12 +367,18 @@ impl UniffiBridgeInstance {
     /// `init_context_manager*` via
     /// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`],
     /// avoiding duplicate `SqliteStorage` connections to the same database.
+    /// Constructs a `UniffiBridgeInstance` with both the
+    /// [`ContextPersistence`] provider and the [`ProtocolRepoVariant`]
+    /// explicitly configured.
+    ///
+    /// `with_storage_uniffi(StorageConfig::Sqlite)` uses this so the event
+    /// log repository and the snapshot persistence bridge share a single
+    /// `Arc<SqliteStorage>`.
     #[must_use]
-    fn with_persistence_uniffi_arc(
+    fn with_persistence_uniffi_arc_and_repo(
         persistence: Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>,
+        protocol_repository: ProtocolRepoVariant,
     ) -> Self {
-        let (_event_log, protocol_repository) =
-            scp_ffi_common::bridge_runtime::build_event_log_provider();
         Self {
             core: CoreFields::with_persistence_arc(persistence),
             ucan_registry: Arc::new(DashMap::new()),
@@ -358,11 +430,9 @@ impl UniffiBridgeInstance {
         &self.identity_custody_registry
     }
 
-    /// Returns a reference to the protocol repository.
+    /// Returns a reference to the protocol repository variant.
     #[must_use]
-    pub const fn protocol_repository(
-        &self,
-    ) -> &Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>> {
+    pub const fn protocol_repository(&self) -> &ProtocolRepoVariant {
         &self.protocol_repository
     }
 
@@ -878,17 +948,16 @@ fn build_context_manager(
 }
 
 /// Builds an event log provider that reuses the already-registered
-/// `ProtocolRepository` on the default [`UniffiBridgeInstance`].
+/// `ProtocolRepoVariant` on the default [`UniffiBridgeInstance`].
 ///
 /// Reusing the repository is critical — a fresh repository would have a
 /// different encryption key, rendering any already persisted event log
-/// entries unreadable.
+/// entries unreadable. When the bridge is SQLite-backed, this returns an
+/// event log provider that writes into the same `SQLCipher` database as
+/// context snapshots.
 fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProvider>> {
     let bi = DEFAULT_BRIDGE_INSTANCE.get()?;
-    let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(&bi.protocol_repository));
-    Some(Box::new(MerkleEventLogProvider::with_persistence(
-        Arc::new(bridge),
-    )))
+    Some(bi.protocol_repository.event_log_provider())
 }
 
 /// Returns a reference to the shared `ContextManager` on the default bridge
@@ -1019,13 +1088,13 @@ pub fn init_context_manager_with_relay_transport(
     bi.core.set_context_manager(cm_arc);
 }
 
-/// Returns the default instance's `ProtocolRepository`, if initialized.
+/// Returns the default instance's `ProtocolRepoVariant`, if initialized.
 ///
 /// Used by the trust aggregation bridge to construct a
-/// `ProtocolRepositoryTrustBridge` backed by persistent (in-process) storage.
+/// `ProtocolRepositoryTrustBridge` backed by the configured storage (either
+/// encrypted in-memory or SQLCipher-on-disk).
 #[must_use]
-pub fn protocol_repository()
--> Option<&'static Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>> {
+pub fn protocol_repository() -> Option<&'static ProtocolRepoVariant> {
     DEFAULT_BRIDGE_INSTANCE
         .get()
         .map(|bi| &bi.protocol_repository)
@@ -1246,6 +1315,34 @@ mod tests {
             },
         );
         assert_eq!(bi.ucan_registry().len(), 1);
+    }
+
+    #[test]
+    fn test_with_storage_sqlite_uses_sqlite_variant() {
+        // Regression test for the event log split-brain bug: before this
+        // variant existed, `with_storage(Sqlite)` persisted context
+        // snapshots to SQLCipher but Merkle event log entries only to the
+        // ephemeral in-memory repo. This asserts that the variant now
+        // routes to SQLite so both paths share one database.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bi = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
+            path: tmp.path().to_string_lossy().into_owned(),
+            key: vec![0x11u8; 32],
+        });
+        assert!(
+            matches!(bi.protocol_repository(), ProtocolRepoVariant::Sqlite(_)),
+            "with_storage(Sqlite) must produce ProtocolRepoVariant::Sqlite so event log \
+             entries persist to the same `SQLCipher` database as context snapshots"
+        );
+    }
+
+    #[test]
+    fn test_new_uniffi_uses_in_memory_variant() {
+        let bi = UniffiBridgeInstance::new_uniffi();
+        assert!(
+            matches!(bi.protocol_repository(), ProtocolRepoVariant::InMemory(_)),
+            "default UniffiBridgeInstance must use in-memory protocol repository"
+        );
     }
 
     #[test]

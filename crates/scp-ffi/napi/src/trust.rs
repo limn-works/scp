@@ -308,24 +308,47 @@ pub fn aggregate_trust_input(
 
     // Use persistent storage if the global ProtocolRepository is initialized,
     // otherwise fall back to an ephemeral in-memory store. See issue #502.
-    if let Some(repo) = crate::runtime::protocol_repository() {
-        let handle = crate::runtime().handle().clone();
-        let bridge = scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
-        scp_ffi_common::trust_store::populate_and_aggregate(
-            bridge,
-            &context_id,
-            &subject_did,
-            cached_attestations,
-            &challenge_results,
-            &events,
-            merkle_root,
-            &consequence_rules,
-            &threshold_requirements,
-            &attestor_sets,
-        )
-        .map_err(|e| validation_error(&e.to_string()))
-    } else {
-        scp_ffi_common::trust_store::populate_and_aggregate(
+    // Dispatches over `ProtocolRepoVariant` so SQLite-backed bridges route
+    // trust attestations into the same SQLCipher database as context
+    // snapshots and event log entries.
+    match crate::runtime::protocol_repository() {
+        Some(crate::runtime::ProtocolRepoVariant::InMemory(repo)) => {
+            let handle = crate::runtime().handle().clone();
+            let bridge =
+                scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
+            scp_ffi_common::trust_store::populate_and_aggregate(
+                bridge,
+                &context_id,
+                &subject_did,
+                cached_attestations,
+                &challenge_results,
+                &events,
+                merkle_root,
+                &consequence_rules,
+                &threshold_requirements,
+                &attestor_sets,
+            )
+            .map_err(|e| validation_error(&e.to_string()))
+        }
+        Some(crate::runtime::ProtocolRepoVariant::Sqlite(repo)) => {
+            let handle = crate::runtime().handle().clone();
+            let bridge =
+                scp_core::trust::ProtocolRepositoryTrustBridge::new(Arc::clone(repo), handle);
+            scp_ffi_common::trust_store::populate_and_aggregate(
+                bridge,
+                &context_id,
+                &subject_did,
+                cached_attestations,
+                &challenge_results,
+                &events,
+                merkle_root,
+                &consequence_rules,
+                &threshold_requirements,
+                &attestor_sets,
+            )
+            .map_err(|e| validation_error(&e.to_string()))
+        }
+        None => scp_ffi_common::trust_store::populate_and_aggregate(
             InMemoryFfiTrustStore::new(),
             &context_id,
             &subject_did,
@@ -337,7 +360,7 @@ pub fn aggregate_trust_input(
             &threshold_requirements,
             &attestor_sets,
         )
-        .map_err(|e| validation_error(&e.to_string()))
+        .map_err(|e| validation_error(&e.to_string())),
     }
 }
 
