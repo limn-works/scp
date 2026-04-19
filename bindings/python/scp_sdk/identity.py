@@ -2,7 +2,13 @@
 
 Provides the :class:`Identity` class (async-first with sync convenience
 wrappers) and the :class:`DIDDocument` dataclass.  All operations
-delegate to the ``_scp_core`` PyO3 bridge layer.
+delegate to the ``_scp_core`` PyO3 bridge layer via an explicit
+:class:`scp_sdk.SCP` instance.
+
+After #1549 Phase 4 PR 4, every function and method that touches bridge
+state requires an explicit :class:`scp_sdk.SCP` argument — the
+process-wide default instance façade has been removed. Callers
+construct one :class:`scp_sdk.SCP` per tenant/identity/test.
 
 See ``.docs/adrs/phase-3.md`` ADR-014 acceptance criterion 1 for the
 canonical API design and ADR-013 acceptance criterion 2 for the bridge
@@ -15,13 +21,12 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import resolve_scp
 from scp_sdk.errors import IdentityError, ValidationError
 from scp_sdk.sync import run_sync
 from scp_sdk.types import CustodyType
 
 if TYPE_CHECKING:
-    import _scp_core
+    from scp_sdk.scp import SCP
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +95,8 @@ class Identity:
 
     Example::
 
-        identity = await Identity.create()
+        scp = SCP()
+        identity = await Identity.create(scp)
         print(identity.did)           # "did:dht:z6Mk..."
         print(identity.custody_type)  # CustodyType.FILE
 
@@ -132,12 +138,13 @@ class Identity:
     @classmethod
     async def create(
         cls,
+        scp: SCP,
         custody: CustodyType | str = CustodyType.FILE,
-        scp: _scp_core.SCP | None = None,
     ) -> Identity:
         """Create a new SCP identity with the specified key custody method.
 
         Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
             custody: Key custody type.  Accepts a
                 :class:`~scp_sdk.types.CustodyType` enum member or a raw
                 string.  Valid values:
@@ -151,9 +158,6 @@ class Identity:
                 - :attr:`CustodyType.IN_MEMORY` / ``"in_memory"`` --
                   ephemeral in-memory key store, suitable for testing or
                   short-lived agents.
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Returns:
             A new :class:`Identity` instance.
@@ -163,20 +167,18 @@ class Identity:
             scp_sdk.ValidationError: If *custody* is not a recognised
                 value.
         """
-        instance = resolve_scp(scp)
+        native = scp._native
         custody_str = custody.value if isinstance(custody, CustodyType) else custody
-        handle = await asyncio.to_thread(instance.identity_create, custody_str)
+        handle = await asyncio.to_thread(native.identity_create, custody_str)
         return cls(handle)
 
     @classmethod
-    async def load(cls, did: str, scp: _scp_core.SCP | None = None) -> Identity:
+    async def load(cls, scp: SCP, did: str) -> Identity:
         """Load an existing identity from storage.
 
         Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
             did: The DID string to load (e.g. ``"did:dht:z6Mk..."``).
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Returns:
             The loaded :class:`Identity` instance.
@@ -185,8 +187,8 @@ class Identity:
             scp_sdk.IdentityError: If the DID format is unsupported or
                 the identity cannot be found in storage.
         """
-        instance = resolve_scp(scp)
-        handle = await asyncio.to_thread(instance.identity_load, did)
+        native = scp._native
+        handle = await asyncio.to_thread(native.identity_load, did)
         return cls(handle)
 
     # -- Sync convenience wrappers -------------------------------------------
@@ -194,8 +196,8 @@ class Identity:
     @classmethod
     def create_sync(
         cls,
+        scp: SCP,
         custody: CustodyType | str = CustodyType.FILE,
-        scp: _scp_core.SCP | None = None,
     ) -> Identity:
         """Synchronous convenience wrapper for :meth:`create`.
 
@@ -203,25 +205,25 @@ class Identity:
         event loop.  Safe in scripts, notebooks, and nested async
         contexts.
         """
-        return run_sync(cls.create(custody, scp=scp))
+        return run_sync(cls.create(scp, custody))
 
     @classmethod
-    def load_sync(cls, did: str, scp: _scp_core.SCP | None = None) -> Identity:
+    def load_sync(cls, scp: SCP, did: str) -> Identity:
         """Synchronous convenience wrapper for :meth:`load`.
 
         Uses :func:`scp_sdk.sync.run_sync` with a dedicated background
         event loop.  Safe in scripts, notebooks, and nested async
         contexts.
         """
-        return run_sync(cls.load(did, scp=scp))
+        return run_sync(cls.load(scp, did))
 
     # -- Async instance methods ----------------------------------------------
 
     @classmethod
     async def create_with_agent_key(
         cls,
+        scp: SCP,
         custody: CustodyType | str = CustodyType.FILE,
-        scp: _scp_core.SCP | None = None,
     ) -> Identity:
         """Create a new SCP identity with an agent signing key (ADR-039).
 
@@ -229,12 +231,10 @@ class Identity:
         ``#agent`` verification method in the DID document.
 
         Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
             custody: Key custody type.  Accepts a
                 :class:`~scp_sdk.types.CustodyType` enum member or a
                 raw string (``"file"``, ``"platform"``, ``"in_memory"``).
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Returns:
             A new :class:`Identity` instance with an agent key.
@@ -242,16 +242,19 @@ class Identity:
         Raises:
             scp_sdk.IdentityError: If key generation or DID creation fails.
         """
-        instance = resolve_scp(scp)
+        native = scp._native
         custody_str = custody.value if isinstance(custody, CustodyType) else custody
-        handle = await asyncio.to_thread(instance.identity_create_with_agent_key, custody_str)
+        handle = await asyncio.to_thread(native.identity_create_with_agent_key, custody_str)
         return cls(handle)
 
-    async def add_agent_key(self, scp: _scp_core.SCP | None = None) -> Identity:
+    async def add_agent_key(self, scp: SCP) -> Identity:
         """Add an agent signing key to this identity (ADR-039).
 
         Generates a new Ed25519 keypair for the ``#agent`` verification
         method, updates the DID document, and publishes to the DHT.
+
+        Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
 
         Returns:
             A new :class:`Identity` with the agent key added.
@@ -260,15 +263,18 @@ class Identity:
             scp_sdk.IdentityError: If the identity already has an agent key
                 or key generation fails.
         """
-        instance = resolve_scp(scp)
-        handle = await asyncio.to_thread(instance.identity_add_agent_key, self._handle)
+        native = scp._native
+        handle = await asyncio.to_thread(native.identity_add_agent_key, self._handle)
         return Identity(handle)
 
-    async def rotate_agent_key(self, scp: _scp_core.SCP | None = None) -> Identity:
+    async def rotate_agent_key(self, scp: SCP) -> Identity:
         """Rotate the agent signing key for this identity (ADR-039).
 
         Generates a new Ed25519 keypair, retires the old ``#agent`` key,
         and installs the new key as ``#agent``.
+
+        Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
 
         Returns:
             A new :class:`Identity` with the rotated agent key.
@@ -277,15 +283,18 @@ class Identity:
             scp_sdk.IdentityError: If the identity has no agent key or
                 key generation fails.
         """
-        instance = resolve_scp(scp)
-        handle = await asyncio.to_thread(instance.identity_rotate_agent_key, self._handle)
+        native = scp._native
+        handle = await asyncio.to_thread(native.identity_rotate_agent_key, self._handle)
         return Identity(handle)
 
-    async def remove_agent_key(self, scp: _scp_core.SCP | None = None) -> Identity:
+    async def remove_agent_key(self, scp: SCP) -> Identity:
         """Remove the agent signing key from this identity (ADR-039).
 
         Removes the ``#agent`` verification method from the DID document
         and publishes the update.
+
+        Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
 
         Returns:
             A new :class:`Identity` with the agent key removed.
@@ -293,16 +302,19 @@ class Identity:
         Raises:
             scp_sdk.IdentityError: If the identity has no agent key.
         """
-        instance = resolve_scp(scp)
-        handle = await asyncio.to_thread(instance.identity_remove_agent_key, self._handle)
+        native = scp._native
+        handle = await asyncio.to_thread(native.identity_remove_agent_key, self._handle)
         return Identity(handle)
 
-    async def migrate(self, scp: _scp_core.SCP | None = None) -> Identity:
+    async def migrate(self, scp: SCP) -> Identity:
         """Migrate this identity to a new DID (Layer 2 rotation).
 
         Creates a new DID using the pre-rotation key as the new
         Identity Key. The old DID document is updated with an
         ``alsoKnownAs`` pointing to the new DID.
+
+        Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
 
         Returns:
             A new :class:`Identity` with the new DID string.
@@ -311,12 +323,15 @@ class Identity:
             scp_sdk.IdentityError: If the identity is not in the
                 registry or migration fails.
         """
-        instance = resolve_scp(scp)
-        handle = await asyncio.to_thread(instance.identity_migrate, self._handle)
+        native = scp._native
+        handle = await asyncio.to_thread(native.identity_migrate, self._handle)
         return Identity(handle)
 
-    async def attest_device(self, scp: _scp_core.SCP | None = None) -> str:
+    async def attest_device(self, scp: SCP) -> str:
         """Generate a device attestation token for this identity.
+
+        Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
 
         Returns:
             The attestation token as a base64-encoded string.
@@ -325,20 +340,21 @@ class Identity:
             scp_sdk.IdentityError: If attestation generation fails or the
                 ``allow_in_memory_custody`` feature is not compiled in.
         """
-        instance = resolve_scp(scp)
-        if not hasattr(instance, "identity_attest_device"):
+        native = scp._native
+        if not hasattr(native, "identity_attest_device"):
             raise IdentityError(
                 "Device attestation requires the 'allow_in_memory_custody' feature",
                 "SCP-IDENT-1050",
             )
-        return await asyncio.to_thread(instance.identity_attest_device, self.did)
+        return await asyncio.to_thread(native.identity_attest_device, self.did)
 
     async def verify_device_attestation(
-        self, token_base64: str, scp: _scp_core.SCP | None = None
+        self, scp: SCP, token_base64: str
     ) -> bool:
         """Verify a device attestation token.
 
         Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
             token_base64: The base64-encoded attestation token to verify.
 
         Returns:
@@ -348,22 +364,25 @@ class Identity:
             scp_sdk.IdentityError: If verification fails or the
                 ``allow_in_memory_custody`` feature is not compiled in.
         """
-        instance = resolve_scp(scp)
-        if not hasattr(instance, "identity_verify_device_attestation"):
+        native = scp._native
+        if not hasattr(native, "identity_verify_device_attestation"):
             raise IdentityError(
                 "Device attestation verification requires the 'allow_in_memory_custody' feature",
                 "SCP-IDENT-1051",
             )
         return await asyncio.to_thread(
-            instance.identity_verify_device_attestation, self.did, token_base64
+            native.identity_verify_device_attestation, self.did, token_base64
         )
 
-    async def rotate_key(self, scp: _scp_core.SCP | None = None) -> Identity:
+    async def rotate_key(self, scp: SCP) -> Identity:
         """Rotate this identity's active signing key.
 
         Generates a new signing key and updates the DID document.  The
         DID string remains the same -- only the active signing key
         changes (Layer 1 rotation).
+
+        Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
 
         Returns:
             An updated :class:`Identity` with the rotated key.
@@ -371,14 +390,15 @@ class Identity:
         Raises:
             scp_sdk.IdentityError: If key rotation fails.
         """
-        instance = resolve_scp(scp)
-        handle = await asyncio.to_thread(instance.identity_rotate_key, self._handle)
+        native = scp._native
+        handle = await asyncio.to_thread(native.identity_rotate_key, self._handle)
         return Identity(handle)
 
-    async def resolve(self, did: str, scp: _scp_core.SCP | None = None) -> DIDDocument:
+    async def resolve(self, scp: SCP, did: str) -> DIDDocument:
         """Resolve a DID to its document.
 
         Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
             did: The DID string to resolve (e.g. ``"did:dht:z6Mk..."``).
 
         Returns:
@@ -387,17 +407,17 @@ class Identity:
         Raises:
             scp_sdk.IdentityError: If the DID cannot be resolved.
         """
-        instance = resolve_scp(scp)
-        bridge_doc = await asyncio.to_thread(instance.identity_resolve, did)
+        native = scp._native
+        bridge_doc = await asyncio.to_thread(native.identity_resolve, did)
         return _bridge_doc_to_dataclass(bridge_doc)
 
     # -- Recovery and custody migration ---------------------------------------
 
     async def execute_recovery(
         self,
+        scp: SCP,
         tier: str,
         context_ids: list[str] | None = None,
-        scp: _scp_core.SCP | None = None,
     ) -> dict:
         """Execute the compromise recovery protocol for this identity.
 
@@ -406,13 +426,11 @@ class Identity:
         contact notification, and PSK re-encryption.
 
         Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
             tier: Compromise tier. One of ``"agent"``,
                 ``"active_signing"``, or ``"identity_key"``.
             context_ids: Context IDs where this DID is a member.
                 Defaults to an empty list.
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Returns:
             A dict with recovery outcome fields including
@@ -424,11 +442,11 @@ class Identity:
         """
         import json
 
-        instance = resolve_scp(scp)
+        native = scp._native
         # Use `is not None` -- never the falsy form -- so callers can ratchet
         # the empty-vs-absent distinction at the FFI boundary later if needed.
         result_json = await asyncio.to_thread(
-            instance.identity_execute_recovery,
+            native.identity_execute_recovery,
             self.did,
             tier,
             context_ids if context_ids is not None else [],
@@ -437,9 +455,9 @@ class Identity:
 
     async def execute_custody_migration(
         self,
+        scp: SCP,
         target: str,
         context_ids: list[str] | None = None,
-        scp: _scp_core.SCP | None = None,
     ) -> dict:
         """Execute the custody migration protocol for this identity.
 
@@ -448,14 +466,12 @@ class Identity:
         reissuance, and old key destruction.
 
         Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
             target: Target custody type. One of
                 ``"platform_managed"``, ``"hardware"``,
                 ``"software"``, or ``"in_memory"``.
             context_ids: Context IDs where this DID is a member.
                 Defaults to an empty list.
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Returns:
             A dict with migration outcome fields including
@@ -468,11 +484,11 @@ class Identity:
         """
         import json
 
-        instance = resolve_scp(scp)
+        native = scp._native
         # Use `is not None` -- never the falsy form -- so callers can ratchet
         # the empty-vs-absent distinction at the FFI boundary later if needed.
         result_json = await asyncio.to_thread(
-            instance.identity_execute_custody_migration,
+            native.identity_execute_custody_migration,
             self.did,
             target,
             context_ids if context_ids is not None else [],
@@ -483,11 +499,11 @@ class Identity:
 
     async def create_attestation(
         self,
+        scp: SCP,
         platform: str,
         handle: str,
         proof: str,
         platform_id: str | None = None,
-        scp: _scp_core.SCP | None = None,
     ) -> IdentityAttestation:
         """Create an identity link attestation for an external platform (§3.5).
 
@@ -496,6 +512,7 @@ class Identity:
         signed challenge token, DNS TXT record value, or OAuth token).
 
         Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
             platform: Platform identifier (e.g. ``"github.com"``,
                 ``"x.com"``, ``"linkedin.com"``).
             handle: Platform-specific handle or username.
@@ -503,9 +520,6 @@ class Identity:
             platform_id: Optional platform-assigned unique identifier
                 (e.g. numeric user ID). If not provided, only the
                 handle is recorded.
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Returns:
             The created :class:`IdentityAttestation`.
@@ -514,14 +528,14 @@ class Identity:
             scp_sdk.IdentityError: If attestation creation fails or
                 the bridge function is not available.
         """
-        instance = resolve_scp(scp)
-        if not hasattr(instance, "create_identity_link_attestation"):
+        native = scp._native
+        if not hasattr(native, "create_identity_link_attestation"):
             raise IdentityError(
                 "Identity link attestation creation is not yet available in the bridge",
                 "SCP-ATTEST-9010",
             )
         result_json = await asyncio.to_thread(
-            instance.create_identity_link_attestation,
+            native.create_identity_link_attestation,
             self.did,
             platform,
             handle,
@@ -533,38 +547,13 @@ class Identity:
         data = json.loads(result_json)
         return IdentityAttestation._from_dict(data)
 
-    @property
-    def attestations(self) -> list[IdentityAttestation]:
-        """List all identity link attestations for this identity.
-
-        This is a synchronous property that makes a live call to the
-        bridge layer on every access. For the async variant, use
-        :meth:`list_attestations`.
-
-        Returns:
-            A list of :class:`IdentityAttestation` objects.
-
-        Raises:
-            scp_sdk.IdentityError: If the bridge function is not
-                available.
-            RuntimeError: If called from an async context (use
-                ``await identity.list_attestations()`` instead).
-        """
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            pass  # no running loop — safe
-        else:
-            raise RuntimeError(
-                "Identity.attestations cannot be used from an async context. "
-                "Use 'await identity.list_attestations()' instead."
-            )
-        return run_sync(self.list_attestations())
-
     async def list_attestations(
-        self, scp: _scp_core.SCP | None = None
+        self, scp: SCP
     ) -> list[IdentityAttestation]:
         """List all identity link attestations for this identity (async).
+
+        Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
 
         Returns:
             A list of :class:`IdentityAttestation` objects.
@@ -573,8 +562,8 @@ class Identity:
             scp_sdk.IdentityError: If listing fails or the bridge
                 function is not available.
         """
-        instance = resolve_scp(scp)
-        if not hasattr(instance, "identity_link_attestations"):
+        native = scp._native
+        if not hasattr(native, "identity_link_attestations"):
             raise IdentityError(
                 "Identity link attestation listing is not yet available in the bridge",
                 "SCP-ATTEST-9011",
@@ -582,14 +571,14 @@ class Identity:
         import json
 
         result_json = await asyncio.to_thread(
-            instance.identity_link_attestations,
+            native.identity_link_attestations,
             self.did,
         )
         items = json.loads(result_json)
         return [IdentityAttestation._from_dict(item) for item in items]
 
     async def remove_attestation(
-        self, attestation_id: str, scp: _scp_core.SCP | None = None
+        self, scp: SCP, attestation_id: str
     ) -> bool:
         """Remove an identity link attestation by ID.
 
@@ -598,10 +587,8 @@ class Identity:
         can detect stale attestations.
 
         Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
             attestation_id: The deterministic attestation ID to remove.
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Returns:
             ``True`` if the attestation was found and removed,
@@ -611,22 +598,22 @@ class Identity:
             scp_sdk.IdentityError: If removal fails or the bridge
                 function is not available.
         """
-        instance = resolve_scp(scp)
-        if not hasattr(instance, "remove_identity_link_attestation"):
+        native = scp._native
+        if not hasattr(native, "remove_identity_link_attestation"):
             raise IdentityError(
                 "Identity link attestation removal is not yet available in the bridge",
                 "SCP-ATTEST-9012",
             )
         return await asyncio.to_thread(
-            instance.remove_identity_link_attestation,
+            native.remove_identity_link_attestation,
             self.did,
             attestation_id,
         )
 
     async def renew_attestation(
         self,
+        scp: SCP,
         attestation: IdentityAttestation,
-        scp: _scp_core.SCP | None = None,
     ) -> IdentityAttestation:
         """Renew an identity link attestation with a fresh ``verified_at``.
 
@@ -635,10 +622,8 @@ class Identity:
         must be re-verified by the platform.
 
         Args:
+            scp: The :class:`scp_sdk.SCP` instance that owns this identity.
             attestation: The attestation to renew.
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Returns:
             A new :class:`IdentityAttestation` with updated
@@ -648,8 +633,8 @@ class Identity:
             scp_sdk.IdentityError: If renewal fails or the bridge
                 function is not available.
         """
-        instance = resolve_scp(scp)
-        if not hasattr(instance, "identity_renew_attestation"):
+        native = scp._native
+        if not hasattr(native, "identity_renew_attestation"):
             raise IdentityError(
                 "Identity link attestation renewal is not yet available in the bridge",
                 "SCP-ATTEST-9013",
@@ -657,7 +642,7 @@ class Identity:
         import json
 
         result_json = await asyncio.to_thread(
-            instance.identity_renew_attestation,
+            native.identity_renew_attestation,
             self.did,
             attestation.id,
         )

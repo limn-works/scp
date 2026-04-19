@@ -5,36 +5,25 @@ from its relay (preserving context state) and clear the suspended flag,
 respectively.  Use when backgrounding a mobile/desktop app, then call
 :func:`resume` plus :func:`scp_sdk.connect_relay` to rejoin.
 
-Both functions delegate to the ``_scp_core`` PyO3 bridge layer
-(`scp_suspend`, `scp_resume`).  They are no-ops when the bridge has
-not been initialized.
+Both functions delegate to methods on an explicit :class:`scp_sdk.SCP`
+instance (``suspend`` / ``resume``). After #1549 Phase 4 PR 4 the
+default-instance façade is gone — callers thread an explicit
+:class:`scp_sdk.SCP` through every operation.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from typing import TYPE_CHECKING
 
-from scp_sdk._deprecation import deprecated_default_instance
-from scp_sdk.errors import ContextError, ScpError, TransportError
+from scp_sdk.errors import ContextError, TransportError
 
-
-def _bridge() -> Any:
-    """Return the ``_scp_core`` extension module, imported lazily."""
-    try:
-        import _scp_core  # type: ignore[import-not-found]
-
-        return _scp_core
-    except ImportError as exc:
-        raise ScpError(
-            "The _scp_core extension module is not installed. "
-            "Install scp-python with: pip install scp-python",
-            code="SCP-UNKNOWN-0001",
-        ) from exc
+if TYPE_CHECKING:
+    from scp_sdk.scp import SCP
 
 
-@deprecated_default_instance
-def suspend() -> None:
-    """Suspend the bridge instance for backgrounding.
+def suspend(scp: SCP) -> None:
+    """Suspend the given bridge instance for backgrounding.
 
     Disconnects the transport (clearing the relay connection) and marks
     the instance as suspended.  Context state is preserved — the
@@ -45,15 +34,14 @@ def suspend() -> None:
     and then re-establish the relay connection via
     :func:`scp_sdk.connect_relay`.
 
-    No-op if the bridge is already shut down or has not been
-    initialized.
+    Args:
+        scp: The :class:`scp_sdk.SCP` instance to suspend.
 
     Raises:
         TransportError: If transport cleanup fails.
     """
-    bridge = _bridge()
     try:
-        bridge.scp_suspend()
+        scp._native.suspend()
     except Exception as exc:  # PyO3 raises ScpTransportError
         raise TransportError(
             f"suspend failed: {exc}",
@@ -61,24 +49,27 @@ def suspend() -> None:
         ) from exc
 
 
-@deprecated_default_instance
-def resume() -> None:
+async def resume(scp: SCP) -> None:
     """Resume a suspended bridge instance.
 
-    Clears the suspended flag so bridge operations can proceed.  The
-    caller must re-establish the relay connection via
-    :func:`scp_sdk.connect_relay` — resume does not reconnect
-    automatically.
+    Clears the suspended flag so bridge operations can proceed.  As of
+    Phase 4 PR 3 (#1678) the bridge also reconnects the transport to
+    every relay URL the instance was subscribed to at suspend time —
+    callers no longer need to re-invoke :func:`scp_sdk.connect_relay`
+    manually.
 
-    No-op if the bridge is not initialized.
+    Delegates to the SDK wrapper's :meth:`SCP.resume` which already runs
+    the blocking FFI call in :func:`asyncio.to_thread`.
+
+    Args:
+        scp: The :class:`scp_sdk.SCP` instance to resume.
 
     Raises:
         ContextError: If the bridge has been permanently shut down
             (``shutdown_runtime`` was already called).
     """
-    bridge = _bridge()
     try:
-        bridge.scp_resume()
+        await asyncio.to_thread(scp._native.resume)
     except Exception as exc:  # PyO3 raises ScpContextError
         # The PyO3 bridge emits SCP-CTX-2000 for resume failures (matching
         # the NAPI and UniFFI bridges — see `scp-ffi/src/lib.rs::scp_resume`).

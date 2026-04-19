@@ -1,15 +1,15 @@
 """SDK-level :class:`SCP` entry point for the Python SDK.
 
 See ADR-048 ("SCP multi-instance bridge + check-handle-affinity gate")
-for the design rationale. The :class:`SCP` class is the preferred way to
-build against the SCP protocol from Python — each :class:`SCP` instance
-owns an independent ``BridgeInstance`` (registries, transport, context
-manager), so tests, multi-identity apps, and per-tenant services can hold
-distinct instances without sharing state.
+for the design rationale. The :class:`SCP` class is the only public way
+to build against the SCP protocol from Python — each :class:`SCP`
+instance owns an independent ``BridgeInstance`` (registries, transport,
+context manager), so tests, multi-identity apps, and per-tenant services
+can hold distinct instances without sharing state.
 
-The free-function façade (``scp_sdk.identity_create(...)``,
-``scp_sdk.context_create(...)``, etc.) is deprecated and delegates to a
-shared process-global default instance. See :mod:`scp_sdk._deprecation`.
+The free-function façade that used to delegate to a process-global
+default instance was removed in Phase 4 PR 4 (#1549). Every SDK
+function now requires an explicit :class:`SCP` argument.
 
 Example usage::
 
@@ -34,29 +34,18 @@ Example usage::
     # `resume` is async — it awaits transport reconnect (#1678).
     scp.suspend()
     await scp.resume()
-
-    # Shared process-wide default (deprecated — prefer explicit construction).
-    default = SCP.default()
 """
 
 from __future__ import annotations
 
 import asyncio
 import math
-import warnings
 from types import TracebackType
 from typing import Any
 
 from scp_sdk.errors import ScpError
 
 __all__ = ["SCP"]
-
-# Sentinel tracking whether `SCP.default()` has already emitted its
-# one-time DeprecationWarning. Module-level state keyed by nothing (there
-# is exactly one default instance per process) — matches the
-# `_deprecation._emitted` one-time-per-interpreter contract for the
-# free-function façade.
-_default_deprecation_emitted = False
 
 
 def _native_cls() -> Any:
@@ -147,46 +136,6 @@ class SCP:
             self._native = cls.with_storage(storage)
         else:
             self._native = cls()
-
-    @classmethod
-    def default(cls) -> SCP:
-        """Return an :class:`SCP` wrapping the process-wide default instance.
-
-        Repeated calls yield distinct Python objects sharing the same
-        underlying native handle — :attr:`instance_id` is stable across
-        calls. This is what the deprecated free-function façade
-        (``scp_sdk.identity_create``, etc.) uses under the hood.
-
-        Prefer constructing :class:`SCP` explicitly in new code. The
-        default-instance path is scheduled for removal two release cycles
-        after Phase 4 merge (ADR-048).
-
-        Emits a one-time :class:`DeprecationWarning` on first call per
-        interpreter so legacy call sites are visible even when the
-        free-function façade isn't exercised.
-
-        :returns: An :class:`SCP` handle on the shared default instance.
-        :raises ContextError: If the default instance is currently
-            suspended.
-        """
-        global _default_deprecation_emitted
-        if not _default_deprecation_emitted:
-            _default_deprecation_emitted = True
-            warnings.warn(
-                (
-                    "SCP.default() returns the shared process-wide bridge "
-                    "instance and is deprecated — construct an explicit "
-                    "scp_sdk.SCP() per tenant/identity instead. Removal "
-                    "target: two release cycles after Phase 4 merge "
-                    "(ADR-048)."
-                ),
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        native_cls = _native_cls()
-        instance = cls.__new__(cls)
-        instance._native = native_cls.default_instance()
-        return instance
 
     @property
     def instance_id(self) -> int:
