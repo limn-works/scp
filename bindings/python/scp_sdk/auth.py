@@ -24,10 +24,8 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
-
 if TYPE_CHECKING:
-    import _scp_core
+    from scp_sdk.scp import SCP
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -176,22 +174,19 @@ class ScpIdAuthentication:
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
 def scpid_challenge(
+    scp: SCP,
     audience: str,
     ttl_seconds: int = 300,
-    scp: _scp_core.SCP | None = None,
 ) -> ScpIdChallenge:
     """Generate an SCPID challenge for a relying party (section 3.11.8).
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns this bridge state.
         audience: URI identifying the relying party
             (e.g. ``"https://app.example.com"``).
         ttl_seconds: Challenge validity window in seconds (1--300).
             Defaults to 300.
-        scp: Optional explicit :class:`_scp_core.SCP` instance. When
-            ``None`` the process-wide default instance is used for
-            back-compat (ADR-048).
 
     Returns:
         A new :class:`ScpIdChallenge`.
@@ -200,17 +195,16 @@ def scpid_challenge(
         scp_sdk.ValidationError: If *audience* is empty, exceeds 2048 bytes,
             or *ttl_seconds* is 0 or exceeds 300.
     """
-    instance = resolve_scp(scp)
-    challenge_json = instance.scpid_challenge(audience, ttl_seconds)
+    native = scp._native
+    challenge_json = native.scpid_challenge(audience, ttl_seconds)
     return ScpIdChallenge.from_json(challenge_json)
 
 
-@deprecated_default_instance
 def scpid_sign(
+    scp: SCP,
     identity: Any,
     signing_key_id: str,
     challenge: ScpIdChallenge,
-    scp: _scp_core.SCP | None = None,
 ) -> ScpIdResponse:
     """Sign an SCPID challenge with a registered identity's key (section 3.11.3).
 
@@ -218,13 +212,11 @@ def scpid_sign(
     appropriate signing key, and produces a signed SCPID response.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns this bridge state.
         identity: An :class:`~scp_sdk.identity.Identity` instance whose DID
             is registered in the bridge's identity registry.
         signing_key_id: ``"#active"`` or ``"#agent"``.
         challenge: The challenge to sign.
-        scp: Optional explicit :class:`_scp_core.SCP` instance. When
-            ``None`` the process-wide default instance is used for
-            back-compat (ADR-048).
 
     Returns:
         A new :class:`ScpIdResponse`.
@@ -234,8 +226,8 @@ def scpid_sign(
         scp_sdk.ValidationError: If *signing_key_id* is invalid or the
             challenge is malformed.
     """
-    instance = resolve_scp(scp)
-    response_json = instance.scpid_sign(
+    native = scp._native
+    response_json = native.scpid_sign(
         identity.did,
         signing_key_id,
         challenge.to_json(),
@@ -243,11 +235,10 @@ def scpid_sign(
     return ScpIdResponse.from_json(response_json)
 
 
-@deprecated_default_instance
 def scpid_verify(
+    scp: SCP,
     response: ScpIdResponse,
     challenge: ScpIdChallenge,
-    scp: _scp_core.SCP | None = None,
 ) -> ScpIdAuthentication:
     """Verify a signed SCPID response against the original challenge (section 3.11.4).
 
@@ -256,11 +247,9 @@ def scpid_verify(
     verification pipeline.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns this bridge state.
         response: The signed response from the client.
         challenge: The original challenge issued by the relying party.
-        scp: Optional explicit :class:`_scp_core.SCP` instance. When
-            ``None`` the process-wide default instance is used for
-            back-compat (ADR-048).
 
     Returns:
         An :class:`ScpIdAuthentication` on success.
@@ -271,8 +260,8 @@ def scpid_verify(
             has expired, or any other verification step fails.
         scp_sdk.ValidationError: If either JSON structure is malformed.
     """
-    instance = resolve_scp(scp)
-    auth_json = instance.scpid_verify(
+    native = scp._native
+    auth_json = native.scpid_verify(
         response.to_json(),
         challenge.to_json(),
     )

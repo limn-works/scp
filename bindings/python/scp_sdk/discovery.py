@@ -12,15 +12,22 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
 from scp_sdk.errors import ScpError
 
 if TYPE_CHECKING:
-    import _scp_core
+    from scp_sdk.scp import SCP
 
 
 def _bridge() -> Any:
-    """Return the ``_scp_core`` extension module, imported lazily."""
+    """Return the ``_scp_core`` extension module, imported lazily.
+
+    Used for pure discovery helpers (``discovery_parse_address``,
+    ``discovery_create_query``, ``discovery_normalize_address``,
+    ``context_discover``) that do not require an :class:`SCP` instance.
+    Stateful operations (petname, handle, scope, address_resolve)
+    take an explicit :class:`scp_sdk.SCP` and dispatch on its
+    ``_native`` handle.
+    """
     try:
         import _scp_core  # type: ignore[import-not-found]
 
@@ -33,7 +40,6 @@ def _bridge() -> Any:
         ) from exc
 
 
-@deprecated_default_instance
 def parse_address(address: str) -> dict[str, Any]:
     """Parse an SCP address string into its components.
 
@@ -60,7 +66,6 @@ def parse_address(address: str) -> dict[str, Any]:
     return dict(result)
 
 
-@deprecated_default_instance
 def create_query(
     *,
     capabilities: list[str] | None = None,
@@ -81,7 +86,6 @@ def create_query(
     return bridge.discovery_create_query(capabilities, keywords, min_history_secs)
 
 
-@deprecated_default_instance
 def normalize_address(address: str) -> str:
     """Normalize an address string per SCP addressing rules.
 
@@ -97,14 +101,14 @@ def normalize_address(address: str) -> str:
     return bridge.discovery_normalize_address(address)
 
 
-@deprecated_default_instance
-def discover(query: str) -> list[dict[str, Any]]:
+def discover(scp: SCP, query: str) -> list[dict[str, Any]]:
     """Discover contexts from a DID string or ``scp://`` URI.
 
     Detects whether the query is a DID or an ``scp://`` URI and delegates
     to the appropriate core discovery function.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the discovery state.
         query: A DID string (e.g., ``"did:dht:z6Mk..."``) or an
             ``scp://`` URI.
 
@@ -118,8 +122,8 @@ def discover(query: str) -> list[dict[str, Any]]:
         ValidationError: If the query is neither a DID nor an
             ``scp://`` URI.
     """
-    bridge = _bridge()
-    raw = bridge.context_discover(query)
+    native = scp._native
+    raw = native.context_discover(query)
     if isinstance(raw, str):
         import json
 
@@ -132,13 +136,11 @@ def discover(query: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
-def petname_set(
-    owner_did: str, target_did: str, name: str, scp: _scp_core.SCP | None = None
-) -> None:
+def petname_set(scp: SCP, owner_did: str, target_did: str, name: str) -> None:
     """Assign a petname to a DID within the owner's local namespace.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the petname map.
         owner_did: DID of the identity that owns this petname map.
         target_did: DID to assign the petname to.
         name: The petname string.
@@ -146,32 +148,28 @@ def petname_set(
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    instance = resolve_scp(scp)
-    instance.petname_set(owner_did, target_did, name)
+    scp._native.petname_set(owner_did, target_did, name)
 
 
-@deprecated_default_instance
-def petname_remove(owner_did: str, target_did: str, scp: _scp_core.SCP | None = None) -> None:
+def petname_remove(scp: SCP, owner_did: str, target_did: str) -> None:
     """Remove a petname from a DID.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the petname map.
         owner_did: DID of the identity that owns this petname map.
         target_did: DID to remove the petname from.
 
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    instance = resolve_scp(scp)
-    instance.petname_remove(owner_did, target_did)
+    scp._native.petname_remove(owner_did, target_did)
 
 
-@deprecated_default_instance
-def petname_set_context(
-    owner_did: str, context_id: str, name: str, scp: _scp_core.SCP | None = None
-) -> None:
+def petname_set_context(scp: SCP, owner_did: str, context_id: str, name: str) -> None:
     """Assign a petname to a context within the owner's local namespace.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the petname map.
         owner_did: DID of the identity that owns this petname map.
         context_id: Context ID to assign the petname to.
         name: The petname string.
@@ -179,32 +177,28 @@ def petname_set_context(
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    instance = resolve_scp(scp)
-    instance.petname_set_context(owner_did, context_id, name)
+    scp._native.petname_set_context(owner_did, context_id, name)
 
 
-@deprecated_default_instance
-def petname_remove_context(
-    owner_did: str, context_id: str, scp: _scp_core.SCP | None = None
-) -> None:
+def petname_remove_context(scp: SCP, owner_did: str, context_id: str) -> None:
     """Remove a petname from a context.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the petname map.
         owner_did: DID of the identity that owns this petname map.
         context_id: Context ID to remove the petname from.
 
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    instance = resolve_scp(scp)
-    instance.petname_remove_context(owner_did, context_id)
+    scp._native.petname_remove_context(owner_did, context_id)
 
 
-@deprecated_default_instance
-def petname_resolve_did(owner_did: str, name: str, scp: _scp_core.SCP | None = None) -> list[str]:
+def petname_resolve_did(scp: SCP, owner_did: str, name: str) -> list[str]:
     """Resolve a petname to a list of DIDs.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the petname map.
         owner_did: DID of the identity that owns this petname map.
         name: The petname to resolve.
 
@@ -214,17 +208,14 @@ def petname_resolve_did(owner_did: str, name: str, scp: _scp_core.SCP | None = N
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    instance = resolve_scp(scp)
-    return list(instance.petname_resolve_did(owner_did, name))
+    return list(scp._native.petname_resolve_did(owner_did, name))
 
 
-@deprecated_default_instance
-def petname_resolve_context(
-    owner_did: str, name: str, scp: _scp_core.SCP | None = None
-) -> list[str]:
+def petname_resolve_context(scp: SCP, owner_did: str, name: str) -> list[str]:
     """Resolve a petname to a list of context IDs.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the petname map.
         owner_did: DID of the identity that owns this petname map.
         name: The petname to resolve.
 
@@ -234,17 +225,14 @@ def petname_resolve_context(
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    instance = resolve_scp(scp)
-    return list(instance.petname_resolve_context(owner_did, name))
+    return list(scp._native.petname_resolve_context(owner_did, name))
 
 
-@deprecated_default_instance
-def petname_get_for_did(
-    owner_did: str, target_did: str, scp: _scp_core.SCP | None = None
-) -> str | None:
+def petname_get_for_did(scp: SCP, owner_did: str, target_did: str) -> str | None:
     """Get the petname assigned to a DID, if any.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the petname map.
         owner_did: DID of the identity that owns this petname map.
         target_did: DID to look up.
 
@@ -254,17 +242,14 @@ def petname_get_for_did(
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    instance = resolve_scp(scp)
-    return instance.petname_get_for_did(owner_did, target_did)
+    return scp._native.petname_get_for_did(owner_did, target_did)
 
 
-@deprecated_default_instance
-def petname_get_for_context(
-    owner_did: str, context_id: str, scp: _scp_core.SCP | None = None
-) -> str | None:
+def petname_get_for_context(scp: SCP, owner_did: str, context_id: str) -> str | None:
     """Get the petname assigned to a context, if any.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the petname map.
         owner_did: DID of the identity that owns this petname map.
         context_id: Context ID to look up.
 
@@ -274,8 +259,7 @@ def petname_get_for_context(
     Raises:
         ValidationError: If ``owner_did`` is empty.
     """
-    instance = resolve_scp(scp)
-    return instance.petname_get_for_context(owner_did, context_id)
+    return scp._native.petname_get_for_context(owner_did, context_id)
 
 
 # ---------------------------------------------------------------------------
@@ -283,8 +267,8 @@ def petname_get_for_context(
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
 def handle_register(
+    scp: SCP,
     discovery_context_id: str,
     handle: str,
     target_json: str,
@@ -292,11 +276,11 @@ def handle_register(
     *,
     description: str | None = None,
     tags: list[str] | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Register a handle in a context with discovery tools.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the registry.
         discovery_context_id: ID of the context.
         handle: The handle string to register.
         target_json: JSON string describing the target. Must have a
@@ -311,26 +295,25 @@ def handle_register(
     Raises:
         ValidationError: If ``target_json`` is malformed.
     """
-    instance = resolve_scp(scp)
     import json
 
-    result = instance.handle_register(
+    result = scp._native.handle_register(
         discovery_context_id, handle, target_json, registrant_did, description, tags
     )
     return json.loads(result)
 
 
-@deprecated_default_instance
 def handle_lookup(
+    scp: SCP,
     discovery_context_id: str,
     handle: str,
     *,
     type_filter: str | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Look up a handle in a context with discovery tools.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the registry.
         discovery_context_id: ID of the context.
         handle: The handle string to look up.
         type_filter: Optional filter: ``"identity"`` or ``"context"``.
@@ -338,23 +321,22 @@ def handle_lookup(
     Returns:
         A dict with a ``results`` list of matching handle entries.
     """
-    instance = resolve_scp(scp)
     import json
 
-    result = instance.handle_lookup(discovery_context_id, handle, type_filter)
+    result = scp._native.handle_lookup(discovery_context_id, handle, type_filter)
     return json.loads(result)
 
 
-@deprecated_default_instance
 def handle_deregister(
+    scp: SCP,
     discovery_context_id: str,
     handle: str,
     did: str,
-    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Deregister a handle from a context with discovery tools.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the registry.
         discovery_context_id: ID of the context.
         handle: The handle string to deregister.
         did: DID of the registrant requesting deregistration.
@@ -362,10 +344,9 @@ def handle_deregister(
     Returns:
         A dict with a ``removed`` boolean.
     """
-    instance = resolve_scp(scp)
     import json
 
-    result = instance.handle_deregister(discovery_context_id, handle, did)
+    result = scp._native.handle_deregister(discovery_context_id, handle, did)
     return json.loads(result)
 
 
@@ -374,13 +355,12 @@ def handle_deregister(
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
 def address_resolve(
+    scp: SCP,
     owner_did: str,
     address: str,
     *,
     known_contexts_json: str | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> list[dict[str, Any]]:
     """Resolve a human-readable address via multi-path resolution.
 
@@ -388,6 +368,7 @@ def address_resolve(
     and domain layers per the resolution pipeline (spec section 22.8).
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the registries.
         owner_did: DID of the identity whose petname map to consult.
         address: The address string to resolve
             (e.g., ``"alice@cooking-community"``).
@@ -402,10 +383,9 @@ def address_resolve(
     Raises:
         ValidationError: If ``owner_did`` is empty or address parsing fails.
     """
-    instance = resolve_scp(scp)
     import json
 
-    result = instance.address_resolve(owner_did, address, known_contexts_json)
+    result = scp._native.address_resolve(owner_did, address, known_contexts_json)
     return json.loads(result)
 
 
@@ -414,8 +394,8 @@ def address_resolve(
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
 def scope_register(
+    scp: SCP,
     scope_context_id: str,
     name: str,
     target_context_id: str,
@@ -424,7 +404,6 @@ def scope_register(
     *,
     description: str | None = None,
     tags: list[str] | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Register a scope name in a scope registry.
 
@@ -432,6 +411,7 @@ def scope_register(
     The target is context-only by construction (no identity variant).
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the registry.
         scope_context_id: ID of the context hosting the scope registry.
         name: Scope name to register (``[a-z0-9-]``, max 64 chars).
         target_context_id: Context ID the scope name resolves to.
@@ -447,10 +427,9 @@ def scope_register(
     Raises:
         ValidationError: If the scope name or relay URLs are invalid.
     """
-    instance = resolve_scp(scp)
     import json
 
-    result = instance.scope_register(
+    result = scp._native.scope_register(
         scope_context_id,
         name,
         target_context_id,
@@ -462,38 +441,37 @@ def scope_register(
     return json.loads(result)
 
 
-@deprecated_default_instance
 def scope_lookup(
+    scp: SCP,
     scope_context_id: str,
     name: str,
-    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Look up a scope name in a scope registry.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the registry.
         scope_context_id: ID of the context hosting the scope registry.
         name: The scope name to look up.
 
     Returns:
         A dict with a ``results`` list of matching scope entries.
     """
-    instance = resolve_scp(scp)
     import json
 
-    result = instance.scope_lookup(scope_context_id, name)
+    result = scp._native.scope_lookup(scope_context_id, name)
     return json.loads(result)
 
 
-@deprecated_default_instance
 def scope_deregister(
+    scp: SCP,
     scope_context_id: str,
     name: str,
     did: str,
-    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Deregister a scope name from a scope registry.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the registry.
         scope_context_id: ID of the context hosting the scope registry.
         name: The scope name to deregister.
         did: DID of the registrant requesting deregistration.
@@ -501,10 +479,9 @@ def scope_deregister(
     Returns:
         A dict with a ``removed`` boolean.
     """
-    instance = resolve_scp(scp)
     import json
 
-    result = instance.scope_deregister(scope_context_id, name, did)
+    result = scp._native.scope_deregister(scope_context_id, name, did)
     return json.loads(result)
 
 

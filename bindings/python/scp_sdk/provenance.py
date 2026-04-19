@@ -12,35 +12,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance, resolve_scp
-from scp_sdk.errors import ScpError
-
 if TYPE_CHECKING:
-    import _scp_core
+    from scp_sdk.scp import SCP
 
 
-def _bridge() -> Any:
-    """Return the ``_scp_core`` extension module, imported lazily."""
-    try:
-        import _scp_core  # type: ignore[import-not-found]
-
-        return _scp_core
-    except ImportError as exc:
-        raise ScpError(
-            "The _scp_core extension module is not installed. "
-            "Install scp-python with: pip install scp-python",
-            code="SCP-UNKNOWN-0001",
-        ) from exc
-
-
-@deprecated_default_instance
 def evaluate_provenance_quality(
+    scp: SCP,
     *,
     source_context: str | None = None,
     source_type: str = "persistent",
     context_state: str = "unknown",
     counterparties: list[str] | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> int:
     """Evaluate the provenance quality tier for a data provenance record.
 
@@ -52,6 +34,7 @@ def evaluate_provenance_quality(
     - ``3`` -- Persistent, verifiable.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the provenance state.
         source_context: Source context ID (optional).
         source_type: ``"persistent"``, ``"ephemeral"``, or ``"summary"``.
         context_state: ``"active"``, ``"closed_with_summary_verified"``,
@@ -65,8 +48,7 @@ def evaluate_provenance_quality(
     Raises:
         ValidationError: If *source_type* or *context_state* is invalid.
     """
-    instance = resolve_scp(scp)
-    return instance.evaluate_provenance_quality(
+    return scp._native.evaluate_provenance_quality(
         source_context,
         source_type,
         context_state,
@@ -74,8 +56,8 @@ def evaluate_provenance_quality(
     )
 
 
-@deprecated_default_instance
 def attach(
+    scp: SCP,
     source_context_id: str,
     source_type: str,
     memory_scope: str,
@@ -84,7 +66,6 @@ def attach(
     actor_did: str,
     *,
     existing_chain_depth: int | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> dict[str, Any]:
     """Attach provenance metadata when data crosses a context boundary.
 
@@ -96,6 +77,7 @@ def attach(
     ``memory_scope``, ``chain_path``, ``purpose``.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the provenance state.
         source_context_id: ID of the source context.
         source_type: ``"persistent"``, ``"ephemeral"``, or ``"summary"``.
         memory_scope: ``"full"``, ``"summary"``, or ``"ephemeral"``.
@@ -110,9 +92,8 @@ def attach(
     Raises:
         ValidationError: If *source_type* or *memory_scope* is invalid.
     """
-    instance = resolve_scp(scp)
     return dict(
-        instance.provenance_attach(
+        scp._native.provenance_attach(
             source_context_id,
             source_type,
             memory_scope,
@@ -124,24 +105,23 @@ def attach(
     )
 
 
-@deprecated_default_instance
 def check_chain_depth(
+    scp: SCP,
     chain_depth: int,
     *,
     max_depth: int | None = None,
-    scp: _scp_core.SCP | None = None,
 ) -> bool:
     """Check whether a provenance chain depth is within the allowed limit.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the provenance state.
         chain_depth: The current chain depth to check.
         max_depth: Optional custom maximum depth (default: 3).
 
     Returns:
         ``True`` if within limit, ``False`` otherwise.
     """
-    instance = resolve_scp(scp)
-    return instance.provenance_check_chain_depth(chain_depth, max_depth)
+    return scp._native.provenance_check_chain_depth(chain_depth, max_depth)
 
 
 __all__ = [
