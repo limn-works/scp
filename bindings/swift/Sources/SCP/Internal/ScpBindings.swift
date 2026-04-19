@@ -2104,13 +2104,19 @@ public static func withPersistence() -> Scp  {
     /**
      * Constructs an `SCP` instance with a storage configuration.
      *
-     * PR 1 accepts the default (in-memory) configuration only. PR 3 adds
-     * filesystem-backed storage via an additional variant on
-     * [`StorageConfig`]. The `config` parameter is forwarded to the inner
-     * constructor; the current match honours only `InMemory`.
+     * `StorageConfig::Sqlite` opens a `SQLCipher`-encrypted database at
+     * `{path}/scp.db` via [`scp_platform::sqlite::SqliteStorage`].
+     *
+     * # Errors
+     *
+     * Returns [`ScpError::Validation`] with code `SCP-VALID-7005` if the
+     * `SQLite` database cannot be opened (bad key, permission denied,
+     * corrupt file). Previously this condition logged an error and
+     * silently fell back to an in-memory instance — a split-brain that
+     * produced a working-looking `Scp` whose writes vanished on drop.
      */
-public static func withStorage(config: StorageConfig) -> Scp  {
-    return try!  FfiConverterTypeScp_lift(try! rustCall() {
+public static func withStorage(config: StorageConfig)throws  -> Scp  {
+    return try  FfiConverterTypeScp_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_constructor_scp_with_storage(
         FfiConverterTypeStorageConfig_lower(config),$0
     )
@@ -9860,12 +9866,13 @@ public func bridgeRegister(contextId: String, operatorDid: String, governanceDid
 /**
  * Returns the broadcast admission policy for a context.
  *
- * Returns the policy as a string: `"Open"` or `"Gated"`.
- * Returns `None` if the context is not a broadcast context.
+ * Returns `Ok(Some(policy))` with the policy as a string (`"Open"` or
+ * `"Gated"`), `Ok(None)` if the context is not a broadcast context, and
+ * `Err(ScpError)` for handle-affinity or bridge-not-initialized errors.
  */
-public func broadcastAdmission(handle: ContextHandle)async  -> String?  {
+public func broadcastAdmission(handle: ContextHandle)async throws  -> String?  {
     return
-        try!  await uniffiRustCallAsync(
+        try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_func_broadcast_admission(FfiConverterTypeContextHandle_lower(handle)
                 )
@@ -9874,8 +9881,7 @@ public func broadcastAdmission(handle: ContextHandle)async  -> String?  {
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionString.lift,
-            errorHandler: nil
-            
+            errorHandler: FfiConverterTypeScpError_lift
         )
 }
 /**
@@ -9928,10 +9934,13 @@ public func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, 
 }
 /**
  * Returns `true` if the given DID is a broadcast subscriber.
+ *
+ * Returns `Err(ScpError)` if the handle is foreign or the bridge is not
+ * initialized; do not silently collapse those conditions into `false`.
  */
-public func broadcastIsSubscriber(handle: ContextHandle, did: String)async  -> Bool  {
+public func broadcastIsSubscriber(handle: ContextHandle, did: String)async throws  -> Bool  {
     return
-        try!  await uniffiRustCallAsync(
+        try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_func_broadcast_is_subscriber(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(did)
                 )
@@ -9940,8 +9949,7 @@ public func broadcastIsSubscriber(handle: ContextHandle, did: String)async  -> B
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
-            errorHandler: nil
-            
+            errorHandler: FfiConverterTypeScpError_lift
         )
 }
 /**
@@ -10063,11 +10071,15 @@ public func broadcastSubscribe(handle: ContextHandle, subscriberDid: String)asyn
 /**
  * Returns the number of broadcast subscribers for a context.
  *
- * Returns `None` if the context is not registered or not a broadcast context.
+ * Returns `Ok(None)` if the context is not a broadcast context. Returns
+ * `Err(ScpError)` if the handle is foreign or the bridge is not
+ * initialized — callers must not silently collapse these into a
+ * missing-context signal (PR #1690 retro: commit 14's hard-error
+ * contract).
  */
-public func broadcastSubscriberCount(handle: ContextHandle)async  -> UInt64?  {
+public func broadcastSubscriberCount(handle: ContextHandle)async throws  -> UInt64?  {
     return
-        try!  await uniffiRustCallAsync(
+        try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_func_broadcast_subscriber_count(FfiConverterTypeContextHandle_lower(handle)
                 )
@@ -10076,8 +10088,7 @@ public func broadcastSubscriberCount(handle: ContextHandle)async  -> UInt64?  {
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionUInt64.lift,
-            errorHandler: nil
-            
+            errorHandler: FfiConverterTypeScpError_lift
         )
 }
 /**
@@ -10370,10 +10381,13 @@ public func contextImport(data: Data)async throws  -> String  {
 }
 /**
  * Returns `true` if the given DID is a member of the context.
+ *
+ * Returns `Err(ScpError)` for handle-affinity or bridge-not-initialized
+ * errors — callers must not silently collapse those into `false`.
  */
-public func contextIsMember(handle: ContextHandle, did: String)async  -> Bool  {
+public func contextIsMember(handle: ContextHandle, did: String)async throws  -> Bool  {
     return
-        try!  await uniffiRustCallAsync(
+        try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_func_context_is_member(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(did)
                 )
@@ -10382,8 +10396,7 @@ public func contextIsMember(handle: ContextHandle, did: String)async  -> Bool  {
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
-            errorHandler: nil
-            
+            errorHandler: FfiConverterTypeScpError_lift
         )
 }
 /**
@@ -10448,11 +10461,13 @@ public func contextLeave(handle: ContextHandle, identity: Identity)async throws 
 /**
  * Returns the current member count for a context.
  *
- * Returns `None` if the context is not registered.
+ * Returns `Ok(None)` if the context is not registered; `Err(ScpError)`
+ * for handle-affinity or bridge-not-initialized errors — these are
+ * programmer / lifecycle bugs, not a missing-context signal.
  */
-public func contextMemberCount(handle: ContextHandle)async  -> UInt64?  {
+public func contextMemberCount(handle: ContextHandle)async throws  -> UInt64?  {
     return
-        try!  await uniffiRustCallAsync(
+        try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_func_context_member_count(FfiConverterTypeContextHandle_lower(handle)
                 )
@@ -10461,16 +10476,19 @@ public func contextMemberCount(handle: ContextHandle)async  -> UInt64?  {
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionUInt64.lift,
-            errorHandler: nil
-            
+            errorHandler: FfiConverterTypeScpError_lift
         )
 }
 /**
  * Returns all member DIDs for a context.
+ *
+ * Returns `Err(ScpError)` for handle-affinity or bridge-not-initialized
+ * errors — callers must not silently collapse those into an empty list,
+ * which would look like "context has no members" to the caller.
  */
-public func contextMemberDids(handle: ContextHandle)async  -> [String]  {
+public func contextMemberDids(handle: ContextHandle)async throws  -> [String]  {
     return
-        try!  await uniffiRustCallAsync(
+        try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_func_context_member_dids(FfiConverterTypeContextHandle_lower(handle)
                 )
@@ -10479,18 +10497,19 @@ public func contextMemberDids(handle: ContextHandle)async  -> [String]  {
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceString.lift,
-            errorHandler: nil
-            
+            errorHandler: FfiConverterTypeScpError_lift
         )
 }
 /**
  * Returns the role assignment for a specific member as a JSON string.
  *
- * Returns `None` if the member is not found or the context is not registered.
+ * Returns `Ok(None)` if the member is not found or the context is not
+ * registered; `Err(ScpError)` for handle-affinity or bridge-not-
+ * initialized errors.
  */
-public func contextMemberRole(handle: ContextHandle, did: String)async  -> String?  {
+public func contextMemberRole(handle: ContextHandle, did: String)async throws  -> String?  {
     return
-        try!  await uniffiRustCallAsync(
+        try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_func_context_member_role(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(did)
                 )
@@ -10499,8 +10518,7 @@ public func contextMemberRole(handle: ContextHandle, did: String)async  -> Strin
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionString.lift,
-            errorHandler: nil
-            
+            errorHandler: FfiConverterTypeScpError_lift
         )
 }
 /**
@@ -13581,7 +13599,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_bridge_register() != 24353) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_admission() != 35635) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_admission() != 44476) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_block_subscriber() != 14388) {
@@ -13590,7 +13608,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_handle_key_request() != 49269) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_is_subscriber() != 6475) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_is_subscriber() != 30801) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_publish() != 54635) {
@@ -13605,7 +13623,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_subscribe() != 51819) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_subscriber_count() != 44888) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_subscriber_count() != 62075) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_unblock_subscriber() != 7203) {
@@ -13638,7 +13656,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_context_import() != 61429) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_is_member() != 64785) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_is_member() != 30898) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_join() != 30234) {
@@ -13647,13 +13665,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_context_leave() != 33485) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_count() != 37326) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_count() != 63824) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_dids() != 8361) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_dids() != 45966) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_role() != 16107) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_role() != 28300) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_propose_ttl_extension() != 19380) {
@@ -14226,7 +14244,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_persistence() != 28565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 21004) {
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 21217) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 4506) {
