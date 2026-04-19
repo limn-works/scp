@@ -40,7 +40,7 @@
 use scp_ffi_common::error_codes as codes;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 use pyo3::prelude::*;
@@ -2286,11 +2286,10 @@ pub fn register_mcp(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
 
-    /// Test helper: acquires the default bridge instance.
-    /// Phase 4 PR 4 (#1549) moved runtime helpers to take `&PyBridgeInstance`.
+    /// Test helper: constructs a fresh bridge instance.
+    /// Phase D (#1695) deleted the process-global default.
     fn __bi() -> std::sync::Arc<crate::runtime::PyBridgeInstance> {
-        crate::runtime::default_bridge_instance()
-            .expect("default bridge instance (ensure ensure_bridge_instance() has been called)")
+        std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py())
     }
 
     // -----------------------------------------------------------------------
@@ -2853,25 +2852,27 @@ mod tests {
             last_seen: 1_700_000_000,
         };
 
-        crate::runtime::register_known_context(&ctx_id, known);
+        let bi = __bi();
+        crate::runtime::register_known_context_on(&bi, &ctx_id, known);
 
         // Should be discoverable by member DID.
-        let found = crate::runtime::known_contexts_for_member(creator);
+        let found = crate::runtime::known_contexts_for_member_on(&bi, creator);
         assert!(
             found.iter().any(|(id, _)| id == &ctx_id),
             "known context should be found by member DID"
         );
 
         // Should not be found for a different DID.
-        let not_found = crate::runtime::known_contexts_for_member("did:dht:z6MkSomeoneElse");
+        let not_found =
+            crate::runtime::known_contexts_for_member_on(&bi, "did:dht:z6MkSomeoneElse");
         assert!(
             !not_found.iter().any(|(id, _)| id == &ctx_id),
             "known context should not be found for a different DID"
         );
 
         // Cleanup: remove_context also removes from known-contexts.
-        crate::runtime::remove_context(&__bi(), &ctx_id);
-        let after_remove = crate::runtime::known_contexts_for_member(creator);
+        crate::runtime::remove_context(&bi, &ctx_id);
+        let after_remove = crate::runtime::known_contexts_for_member_on(&bi, creator);
         assert!(
             !after_remove.iter().any(|(id, _)| id == &ctx_id),
             "known context should be removed after remove_context"

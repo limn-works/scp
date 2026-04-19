@@ -467,8 +467,8 @@ pub fn register_provenance(_m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
 
-    fn default_scp() -> PyResult<crate::scp::PyScp> {
-        crate::scp::PyScp::default_instance()
+    fn default_scp() -> crate::scp::PyScp {
+        crate::scp::PyScp::new()
     }
 
     #[test]
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn check_chain_depth_within_limit() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp().unwrap();
+        let scp = default_scp();
         assert!(scp.provenance_check_chain_depth(0, None));
         assert!(scp.provenance_check_chain_depth(8, None)); // default is 8 (ADR-043)
     }
@@ -548,7 +548,7 @@ mod tests {
     #[test]
     fn check_chain_depth_exceeds_limit() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp().unwrap();
+        let scp = default_scp();
         assert!(!scp.provenance_check_chain_depth(9, None)); // 9 > default 8
         assert!(!scp.provenance_check_chain_depth(2, Some(1)));
     }
@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn redact_counterparties_removes_dids() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp().unwrap();
+        let scp = default_scp();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",
@@ -582,7 +582,7 @@ mod tests {
     #[test]
     fn pseudonymize_counterparties_produces_deterministic_pseudonyms() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp().unwrap();
+        let scp = default_scp();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",
@@ -617,7 +617,7 @@ mod tests {
     #[test]
     fn update_source_type_changes_type() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp().unwrap();
+        let scp = default_scp();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",
@@ -642,7 +642,7 @@ mod tests {
     #[test]
     fn update_source_type_preserves_on_unknown() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp().unwrap();
+        let scp = default_scp();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Summary",
@@ -667,14 +667,14 @@ mod tests {
     #[test]
     fn redact_counterparties_invalid_json_fails() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp().unwrap();
+        let scp = default_scp();
         assert!(scp.provenance_redact_counterparties("not json").is_err());
     }
 
     #[test]
     fn pseudonymize_counterparties_invalid_hex_fails() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp().unwrap();
+        let scp = default_scp();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",
@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn update_source_type_invalid_state_fails() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp().unwrap();
+        let scp = default_scp();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",

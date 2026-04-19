@@ -29,7 +29,7 @@ use pyo3::Python;
 ///
 /// Phase 4 PR 4 demolition (#1549): the free-function `scp_suspend` /
 /// `scp_resume` exports were deleted — tests now drive the default `SCP`
-/// instance through `PyScp::default_instance().suspend()` / `.resume()`.
+/// instance through `PyScp::new().suspend()` / `.resume()`.
 #[test]
 fn scp_suspend_resume_roundtrip() {
     // `PyScp::resume` releases the GIL while driving the async
@@ -47,7 +47,7 @@ fn scp_suspend_resume_roundtrip() {
         // `default_instance` also materialises the process-wide
         // `DEFAULT_BRIDGE_INSTANCE` if it hasn't been initialised yet. Every
         // subsequent call returns the same underlying `Arc<PyBridgeInstance>`.
-        let scp = PyScp::default_instance().expect("default SCP instance");
+        let scp = PyScp::new();
 
         // Case 1: suspend/resume on a freshly-initialised instance must
         // succeed.

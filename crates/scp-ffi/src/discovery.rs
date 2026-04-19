@@ -55,19 +55,15 @@ use crate::error::ScpPyError;
 // Test-only reset helpers
 // ---------------------------------------------------------------------------
 
+// Phase D (#1695): petname / handle-registry reset helpers are no-ops now
+// that the default bridge instance is gone. The underlying tests still call
+// them for historical reasons but should construct fresh `PyBridgeInstance`
+// instances to guarantee isolation.
 #[cfg(test)]
-fn reset_petname_map_for(owner_did: &str) {
-    if let Ok(bi) = crate::runtime::default_bridge_instance() {
-        petname_helpers::reset_petname_map_for(&bi.core, owner_did);
-    }
-}
+fn reset_petname_map_for(_owner_did: &str) {}
 
 #[cfg(test)]
-fn reset_handle_registry_for(context_id: &str) {
-    if let Ok(bi) = crate::runtime::default_bridge_instance() {
-        petname_helpers::reset_handle_registry_for(&bi.core, context_id);
-    }
-}
+fn reset_handle_registry_for(_context_id: &str) {}
 
 // ---------------------------------------------------------------------------
 // Bridge functions
@@ -1228,7 +1224,7 @@ mod tests {
     use super::*;
 
     fn default_scp() -> crate::scp::PyScp {
-        crate::scp::PyScp::default_instance().expect("default SCP instance")
+        crate::scp::PyScp::new()
     }
 
     #[test]

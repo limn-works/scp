@@ -4831,7 +4831,6 @@ mod tests {
         // Ensure the default bridge instance exists so the affinity check
         // passes and the governance-rejection path is what errors (not
         // `SCP-PERM-3030`).
-        crate::runtime::ensure_bridge_instance();
         let mut handle = PyContextHandle::new(
             &*__bi(),
             "ctx-econ-1".to_owned(),
@@ -4840,7 +4839,7 @@ mod tests {
         );
 
         let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
-        let scp = crate::scp::PyScp::default_instance().expect("default instance");
+        let scp = crate::scp::PyScp::new();
         let result = scp.set_economic_policy(&mut handle, json);
         assert!(
             result.is_err(),
@@ -4855,14 +4854,13 @@ mod tests {
         // stamps the handle with a real instance id (not `UNSET_INSTANCE_ID`).
         // Without this, `pyscp_check_handle!` inside `get_economic_policy`
         // would reject the handle with `SCP-PERM-3030`.
-        crate::runtime::ensure_bridge_instance();
         let handle = PyContextHandle::new(
             &*__bi(),
             "ctx-econ-3".to_owned(),
             "did:test:creator".to_owned(),
             default_params(),
         );
-        let scp = crate::scp::PyScp::default_instance().expect("default instance");
+        let scp = crate::scp::PyScp::new();
         let result = scp
             .get_economic_policy(&handle)
             .expect("handle is default-instance");
@@ -4871,7 +4869,6 @@ mod tests {
 
     #[test]
     fn get_economic_policy_some() {
-        crate::runtime::ensure_bridge_instance();
         let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
         let handle = PyContextHandle::new(
             &*__bi(),
@@ -4882,7 +4879,7 @@ mod tests {
                 ..default_params()
             },
         );
-        let scp = crate::scp::PyScp::default_instance().expect("default instance");
+        let scp = crate::scp::PyScp::new();
         let result = scp
             .get_economic_policy(&handle)
             .expect("handle is default-instance");

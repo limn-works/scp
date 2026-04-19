@@ -42,17 +42,14 @@ fn setup() {
         // like py_event_log_query when storage is available.
         _scp_core::init_runtime().unwrap();
     });
-    // Uses LocalTransportProvider so publish_context succeeds without warning
-    // noise (NotConfiguredTransportProvider logs warnings on best-effort publish).
-    runtime::ensure_bridge_instance();
-    let bi = runtime::default_bridge_instance().expect("default bridge instance should initialize");
-    runtime::init_context_manager_for_test(&bi);
 }
 
-/// Returns the default bridge instance.
-/// Phase 4 PR 4 (#1549) moved runtime helpers to take `&PyBridgeInstance`.
+/// Returns a fresh bridge instance with a test ContextManager attached.
+/// Phase D (#1695): tests no longer share a process-global default.
 fn __bi() -> Arc<PyBridgeInstance> {
-    runtime::default_bridge_instance().expect("default bridge instance (setup() must run first)")
+    let bi = Arc::new(PyBridgeInstance::new_py());
+    runtime::init_context_manager_for_test(&bi);
+    bi
 }
 
 /// Creates a tokio runtime for async operations in tests.
@@ -380,7 +377,7 @@ fn tool_register_and_verify() {
         let tv_list = PyList::new(py, &[tv]).unwrap();
         reg.set_item("test_vectors", tv_list).unwrap();
 
-        let scp = _scp_core::scp::PyScp::default_instance().unwrap();
+        let scp = _scp_core::scp::PyScp::new();
         let tool_id = scp.tool_register(&ctx_id, &reg.as_borrowed()).unwrap();
         assert!(tool_id.contains("test_tool"));
 
@@ -403,7 +400,7 @@ fn tool_register_rejects_invalid_context() {
         schema.set_item("output_schema", PyDict::new(py)).unwrap();
         reg.set_item("schema", schema).unwrap();
 
-        let scp = _scp_core::scp::PyScp::default_instance().unwrap();
+        let scp = _scp_core::scp::PyScp::new();
         let result = scp.tool_register("nonexistent-ctx", &reg.as_borrowed());
         assert!(result.is_err());
     });
@@ -424,7 +421,7 @@ fn tool_register_rejects_empty_name() {
         schema.set_item("output_schema", PyDict::new(py)).unwrap();
         reg.set_item("schema", schema).unwrap();
 
-        let scp = _scp_core::scp::PyScp::default_instance().unwrap();
+        let scp = _scp_core::scp::PyScp::new();
         let result = scp.tool_register(&ctx_id, &reg.as_borrowed());
         assert!(result.is_err());
     });
@@ -441,7 +438,7 @@ fn tool_register_rejects_empty_name() {
 #[test]
 fn ucan_mint_rejects_empty_context() {
     setup();
-    let scp = _scp_core::scp::PyScp::default_instance().unwrap();
+    let scp = _scp_core::scp::PyScp::new();
     let result = scp.ucan_mint(
         "",
         "did:key:someone",
@@ -464,8 +461,7 @@ fn event_log_query_empty_returns_empty() {
         // Event log starts empty when context is created via ContextManager
         // (not via py_context_create which appends events). Query should
         // succeed and return an empty list.
-        let events = _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        let events = _scp_core::scp::PyScp::new()
             .event_log_query(py, &ctx_id, None)
             .unwrap();
         assert!(events.is_empty());
@@ -495,8 +491,7 @@ fn event_log_query_with_appended_event() {
         .unwrap();
 
         // Now query should return a LogSummary.
-        let events = _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        let events = _scp_core::scp::PyScp::new()
             .event_log_query(py, &ctx_id, None)
             .unwrap();
         assert!(!events.is_empty());
@@ -512,8 +507,7 @@ fn event_log_query_with_filter() {
         let filter = PyDict::new(py);
         filter.set_item("limit", 1).unwrap();
 
-        let events = _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        let events = _scp_core::scp::PyScp::new()
             .event_log_query(py, &ctx_id, Some(&filter.as_borrowed()))
             .unwrap();
         assert!(events.len() <= 1);
@@ -546,8 +540,7 @@ fn event_log_verify_inclusion_proof_after_append() {
         claim.set_item("type", "inclusion").unwrap();
         claim.set_item("leaf_index", 0).unwrap();
 
-        let proof = _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        let proof = _scp_core::scp::PyScp::new()
             .event_log_verify(py, &ctx_id, &claim.as_borrowed())
             .unwrap();
         assert!(proof.verified);
@@ -559,8 +552,7 @@ fn event_log_verify_inclusion_proof_after_append() {
 fn event_log_query_invalid_context_fails() {
     setup();
     Python::with_gil(|py| {
-        let result = _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        let result = _scp_core::scp::PyScp::new()
             .event_log_query(py, "nonexistent", None);
         assert!(result.is_err());
     });
@@ -655,8 +647,7 @@ fn discovery_context_discover_invalid_query_fails() {
 #[test]
 fn provenance_evaluate_quality_returns_tier() {
     setup();
-    let q = _scp_core::scp::PyScp::default_instance()
-        .unwrap()
+    let q = _scp_core::scp::PyScp::new()
         .evaluate_provenance_quality(
             Some("ctx-source".to_owned()),
             "persistent",
@@ -670,8 +661,7 @@ fn provenance_evaluate_quality_returns_tier() {
 #[test]
 fn provenance_evaluate_quality_invalid_source_type() {
     setup();
-    let r = _scp_core::scp::PyScp::default_instance()
-        .unwrap()
+    let r = _scp_core::scp::PyScp::new()
         .evaluate_provenance_quality(None, "invalid_type", "active", None);
     assert!(r.is_err());
 }
@@ -680,8 +670,7 @@ fn provenance_evaluate_quality_invalid_source_type() {
 fn provenance_attach_returns_dict() {
     setup();
     Python::with_gil(|py| {
-        let r = _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        let r = _scp_core::scp::PyScp::new()
             .provenance_attach(
                 py,
                 "ctx-source".to_owned(),
@@ -714,8 +703,7 @@ fn provenance_attach_returns_dict() {
 fn provenance_attach_increments_chain_depth() {
     setup();
     Python::with_gil(|py| {
-        let r = _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        let r = _scp_core::scp::PyScp::new()
             .provenance_attach(
                 py,
                 "ctx-s2".to_owned(),
@@ -741,13 +729,11 @@ fn provenance_attach_increments_chain_depth() {
 fn provenance_check_chain_depth_within_limit() {
     setup();
     assert!(
-        _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        _scp_core::scp::PyScp::new()
             .provenance_check_chain_depth(0, None)
     );
     assert!(
-        _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        _scp_core::scp::PyScp::new()
             .provenance_check_chain_depth(3, None)
     );
 }
@@ -757,19 +743,16 @@ fn provenance_check_chain_depth_exceeds_limit() {
     setup();
     // Default is now 8 (ADR-043), so depth 4 is within default.
     assert!(
-        _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        _scp_core::scp::PyScp::new()
             .provenance_check_chain_depth(4, None)
     );
     // Depth 9 exceeds default of 8.
     assert!(
-        !_scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        !_scp_core::scp::PyScp::new()
             .provenance_check_chain_depth(9, None)
     );
     assert!(
-        !_scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        !_scp_core::scp::PyScp::new()
             .provenance_check_chain_depth(2, Some(1))
     );
 }
@@ -778,8 +761,7 @@ fn provenance_check_chain_depth_exceeds_limit() {
 fn provenance_attach_rejects_invalid_memory_scope() {
     setup();
     Python::with_gil(|py| {
-        let r = _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        let r = _scp_core::scp::PyScp::new()
             .provenance_attach(
                 py,
                 "ctx".to_owned(),
@@ -889,8 +871,7 @@ fn bridge_register_rejects_self_approval() {
 fn bridge_create_shadow_returns_dict() {
     setup();
     Python::with_gil(|py| {
-        let r = _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        let r = _scp_core::scp::PyScp::new()
             .bridge_create_shadow(py, "bridge-d", "@user#1234", "relay", "ctx-sh")
             .unwrap();
         let d = r.bind(py);
@@ -981,8 +962,7 @@ fn sync_get_policy_returns_dict() {
 fn trust_query_score_returns_valid_dict() {
     setup();
     Python::with_gil(|py| {
-        let r = _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        let r = _scp_core::scp::PyScp::new()
             .trust_query_score(py, "did:key:test", "ctx-trust")
             .unwrap();
         let d = r.bind(py);
@@ -1001,8 +981,7 @@ fn trust_query_score_validates_empty_did() {
     setup();
     Python::with_gil(|py| {
         assert!(
-            _scp_core::scp::PyScp::default_instance()
-                .unwrap()
+            _scp_core::scp::PyScp::new()
                 .trust_query_score(py, "", "ctx-valid")
                 .is_err()
         );
@@ -1067,7 +1046,7 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
 
         // Register a tool using the helper.
         let reg = build_tool_reg(py, "cross_domain_tool", &did_a);
-        let scp = _scp_core::scp::PyScp::default_instance().unwrap();
+        let scp = _scp_core::scp::PyScp::new();
         let tool_id = scp.tool_register(&ctx_id, &reg.as_borrowed()).unwrap();
         assert!(!tool_id.is_empty());
 
@@ -1091,8 +1070,7 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
         })
         .unwrap();
 
-        let events = _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        let events = _scp_core::scp::PyScp::new()
             .event_log_query(py, &ctx_id, None)
             .unwrap();
         assert!(!events.is_empty());
@@ -1104,8 +1082,7 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
         scp.ucan_revoke(&ctx_id, dummy, &did_a).unwrap();
 
         // Evaluate provenance.
-        let q = _scp_core::scp::PyScp::default_instance()
-            .unwrap()
+        let q = _scp_core::scp::PyScp::new()
             .evaluate_provenance_quality(Some(ctx_id), "persistent", "active", None)
             .unwrap();
         assert!(q <= 3);

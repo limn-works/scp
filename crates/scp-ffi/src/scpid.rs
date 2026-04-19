@@ -270,14 +270,14 @@ mod tests {
     use scp_identity::resolver::DualLayerResolver;
     use scp_identity::{DidCache, InMemoryDhtClient, NoOpRelayQuerier};
 
-    fn default_scp() -> PyResult<crate::scp::PyScp> {
-        crate::scp::PyScp::default_instance()
+    fn default_scp() -> crate::scp::PyScp {
+        crate::scp::PyScp::new()
     }
 
     #[test]
     fn challenge_returns_valid_json() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp().unwrap();
+        let scp = default_scp();
         let json = scp
             .scpid_challenge("https://example.com".to_owned(), 60)
             .unwrap();
@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn challenge_rejects_zero_ttl() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp().unwrap();
+        let scp = default_scp();
         let result = scp.scpid_challenge("https://example.com".to_owned(), 0);
         assert!(result.is_err());
     }
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn challenge_rejects_excessive_ttl() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp().unwrap();
+        let scp = default_scp();
         let result = scp.scpid_challenge("https://example.com".to_owned(), 301);
         assert!(result.is_err());
     }
@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn challenge_rejects_empty_audience() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp().unwrap();
+        let scp = default_scp();
         let result = scp.scpid_challenge(String::new(), 60);
         assert!(result.is_err());
     }

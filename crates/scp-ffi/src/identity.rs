@@ -1794,15 +1794,10 @@ mod tests {
             pyo3::prepare_freethreaded_python();
             crate::init_runtime().unwrap();
         });
-        // BridgeInstance must exist for identity registry access.
-        crate::runtime::ensure_bridge_instance();
-        let bi = crate::runtime::default_bridge_instance()
-            .expect("default bridge instance should initialize");
-        crate::runtime::init_context_manager_for_test(&bi);
     }
 
     fn default_scp() -> crate::scp::PyScp {
-        crate::scp::PyScp::default_instance().expect("default SCP instance")
+        crate::scp::PyScp::new()
     }
 
     /// Verifies that `PyScp::identity_migrate` succeeds end-to-end.
@@ -1820,7 +1815,7 @@ mod tests {
 
         Python::with_gil(|py| {
             let scp = default_scp();
-            let bi = crate::runtime::default_bridge_instance().unwrap();
+            let bi = Arc::clone(&scp.inner);
             // Create an identity via the actual bridge method.
             let original = scp.identity_create(py, "in_memory").unwrap();
             let old_did = original.did.clone();

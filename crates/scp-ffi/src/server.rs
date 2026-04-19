@@ -894,7 +894,6 @@ mod tests {
         use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
         // BridgeInstance must exist for transport manager storage.
-        crate::runtime::ensure_bridge_instance();
         let bi_setup = crate::runtime::default_bridge_instance()
             .expect("default bridge instance should initialize");
         crate::runtime::init_context_manager_for_test(&bi_setup);

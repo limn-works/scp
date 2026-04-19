@@ -1948,8 +1948,8 @@ mod tests {
 
     #[test]
     fn registry_stats_reflects_context_registration() {
-        ensure_bridge_instance();
-        let bi = bridge_instance().unwrap();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         init_context_manager_for_test(bi);
         let ctx_id = unique_ctx_id("stats-ctx");
         let creator = "did:dht:z6MkStatsTest";
@@ -1981,8 +1981,8 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn registry_stats_reflects_identity_registration() {
-        ensure_bridge_instance();
-        let bi = bridge_instance().unwrap();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         init_context_manager_for_test(bi);
         let did = "did:dht:z6MkStatsIdentityUnique9988";
 
@@ -2023,8 +2023,8 @@ mod tests {
     #[test]
     fn registry_stats_reflects_known_context_registration() {
         // Ensure bridge is initialized so known_contexts DashMap exists.
-        ensure_bridge_instance();
-        let bi = bridge_instance().unwrap();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         init_context_manager_for_test(bi);
 
         let ctx_id = unique_ctx_id("stats-known");
@@ -2035,7 +2035,7 @@ mod tests {
             last_seen: 0,
         };
 
-        register_known_context(&ctx_id, known);
+        register_known_context_on(bi, &ctx_id, known);
         let stats = registry_stats(bi);
 
         assert!(
@@ -2061,8 +2061,8 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn remove_identity_if_present_returns_true_when_found() {
-        ensure_bridge_instance();
-        let bi = bridge_instance().unwrap();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         init_context_manager_for_test(bi);
         let did = "did:dht:z6MkRemoveIfPresent";
         let entry = IdentityEntry {
@@ -2085,8 +2085,8 @@ mod tests {
 
     #[test]
     fn remove_identity_if_present_returns_false_when_not_found() {
-        ensure_bridge_instance();
-        let bi = bridge_instance().unwrap();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         init_context_manager_for_test(bi);
         assert!(!remove_identity_if_present(
             bi,
@@ -2096,8 +2096,8 @@ mod tests {
 
     #[test]
     fn registry_stats_returns_all_fields() {
-        ensure_bridge_instance();
-        let bi = bridge_instance().unwrap();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         init_context_manager_for_test(bi);
         // Verifies the struct shape and that registry_stats() doesn't panic.
         let stats = registry_stats(bi);
@@ -2118,8 +2118,8 @@ mod tests {
 
     #[test]
     fn context_manager_initializes_once() {
-        ensure_bridge_instance();
-        let bi = bridge_instance().unwrap();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         init_context_manager_for_test(bi);
         let mgr1 = context_manager(bi).unwrap();
         init_context_manager_for_test(bi);
@@ -2130,8 +2130,8 @@ mod tests {
 
     #[test]
     fn with_ffi_state_finds_registered_context() {
-        ensure_bridge_instance();
-        let bi = bridge_instance().unwrap();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         init_context_manager_for_test(bi);
         let ctx_id = unique_ctx_id("ffi-find");
         let creator = "did:dht:z6MkFfiFind";
@@ -2145,8 +2145,8 @@ mod tests {
 
     #[test]
     fn with_ffi_state_errors_on_missing_context() {
-        ensure_bridge_instance();
-        let bi = bridge_instance().unwrap();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         init_context_manager_for_test(bi);
         let result = with_ffi_state(bi, "nonexistent-ctx-id", |_| Ok(()));
         assert!(result.is_err());
@@ -2160,8 +2160,8 @@ mod tests {
     /// raw string.
     #[test]
     fn user_ceiling_strings_converted_to_ucan_format() {
-        ensure_bridge_instance();
-        let bi = bridge_instance().unwrap();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         init_context_manager_for_test(bi);
         let ctx_id = unique_ctx_id("ceiling-conv");
         let creator = "did:dht:z6MkCeilingConv";
@@ -2212,8 +2212,8 @@ mod tests {
     /// should be used with proper UCAN underscore format.
     #[test]
     fn empty_user_ceiling_uses_default_in_ucan_format() {
-        ensure_bridge_instance();
-        let bi = bridge_instance().unwrap();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         init_context_manager_for_test(bi);
         let ctx_id = unique_ctx_id("ceiling-default");
         let creator = "did:dht:z6MkCeilingDefault";
@@ -2241,12 +2241,10 @@ mod tests {
 
     #[test]
     fn bridge_instance_populated_by_init_context_manager() {
-        // init_context_manager_for_test populates BRIDGE_INSTANCE which owns
-        // the ContextManager. Since OnceLock is process-global, the first call
-        // in any test wins — subsequent calls are no-ops. We rely on this
-        // being called (possibly by other tests) before asserting.
-        ensure_bridge_instance();
-        let bi = bridge_instance().expect("bridge_instance should be initialized");
+        // init_context_manager_for_test populates the per-instance
+        // ContextManager. Phase D (#1695) removed the global default.
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         init_context_manager_for_test(bi);
 
         let cm = context_manager(bi).expect("context_manager should be initialized");
@@ -2254,14 +2252,14 @@ mod tests {
         // Both should point to the same ContextManager allocation.
         assert!(
             Arc::ptr_eq(cm, bi.core.try_context_manager().unwrap()),
-            "bridge_instance().context_manager() must be the same Arc as context_manager()"
+            "context_manager() must return the per-instance ContextManager Arc"
         );
     }
 
     #[test]
     fn bridge_instance_not_shutdown_initially() {
-        ensure_bridge_instance();
-        let bi = bridge_instance().expect("bridge_instance should be initialized");
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         init_context_manager_for_test(bi);
 
         assert!(
@@ -2316,7 +2314,8 @@ mod tests {
         // Verify that the typed identity_registry field is wired correctly:
         // inserting an entry through the field is observable via the same
         // Arc<DashMap> from both sides.
-        let bi = PyBridgeInstance::new_py();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         assert!(bi.identity_registry().is_empty());
         bi.identity_registry().insert(
             "did:dht:z6MkTest".to_owned(),
@@ -2365,16 +2364,8 @@ mod tests {
         assert!(a.core.check_handle(a.core.instance_id()).is_ok());
     }
 
-    #[test]
-    fn test_default_instance_is_same_arc() {
-        // Two calls to default_bridge_instance() must return the same Arc.
-        let a = default_bridge_instance().expect("default instance");
-        let b = default_bridge_instance().expect("default instance");
-        assert!(
-            Arc::ptr_eq(&a, &b),
-            "default_bridge_instance must return the same Arc on repeated calls"
-        );
-    }
+    // Phase D (#1695): `test_default_instance_is_same_arc` deleted — there
+    // is no process-global default instance to assert identity against.
 
     #[test]
     fn test_py_bridge_instance_with_storage_py_initializes_storage() {
@@ -2399,7 +2390,8 @@ mod tests {
     /// to `bi.core` (not the default bridge instance).
     #[test]
     fn init_context_manager_for_test_respects_explicit_bi() {
-        let bi = PyBridgeInstance::new_py();
+        let bi_arc = std::sync::Arc::new(PyBridgeInstance::new_py());
+        let bi = &*bi_arc;
         assert!(
             !bi.core.has_context_manager(),
             "fresh PyBridgeInstance must not have a ContextManager attached"
@@ -2433,23 +2425,20 @@ mod tests {
         );
     }
 
-    /// `register_context(bi_b, ...)` must register on `bi_b` regardless of any
-    /// state on the default bridge instance, and must attach `bi_b`'s own
-    /// `ContextManager` (not the default's).
+    /// `register_context(bi_b, ...)` must attach `bi_b`'s own `ContextManager`.
+    ///
+    /// Post-Phase D (#1695) there is no default bridge instance; this test
+    /// still verifies that two independent instances get independent managers.
     #[test]
     fn register_context_on_non_default_bi_attaches_cm_to_bi() {
-        // Prime the default bridge instance so it already has a CM — the bug
-        // would have caused `register_context(bi_b)` to be a no-op on bi_b.
-        ensure_bridge_instance();
-        let default_bi = bridge_instance().expect("default bridge instance");
-        init_context_manager_for_test(default_bi);
-        let default_cm = Arc::clone(default_bi.core.try_context_manager().unwrap());
+        let bi_a = PyBridgeInstance::new_py();
+        init_context_manager_for_test(&bi_a);
+        let bi_a_cm = Arc::clone(bi_a.core.try_context_manager().unwrap());
 
-        // Fresh non-default bi.
         let bi_b = PyBridgeInstance::new_py();
         assert!(
             !bi_b.core.has_context_manager(),
-            "fresh bi must not inherit a ContextManager from the default"
+            "fresh bi must not inherit a ContextManager from another instance"
         );
 
         let ctx_id = unique_ctx_id("per-instance-cm");
@@ -2462,8 +2451,8 @@ mod tests {
         );
         let bi_b_cm = bi_b.core.try_context_manager().unwrap();
         assert!(
-            !Arc::ptr_eq(&default_cm, bi_b_cm),
-            "bi_b must hold a distinct ContextManager — not the default's"
+            !Arc::ptr_eq(&bi_a_cm, bi_b_cm),
+            "bi_b must hold a distinct ContextManager — not bi_a's"
         );
     }
 

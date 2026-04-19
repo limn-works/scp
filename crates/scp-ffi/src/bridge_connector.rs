@@ -1446,7 +1446,7 @@ mod tests {
     use scp_core::bridge::provenance::BridgeTrustLevel;
 
     fn default_scp() -> crate::scp::PyScp {
-        crate::scp::PyScp::default_instance().expect("default SCP instance")
+        crate::scp::PyScp::new()
     }
 
     #[test]

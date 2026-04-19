@@ -585,7 +585,7 @@ mod tests {
     use super::*;
 
     fn default_scp() -> crate::scp::PyScp {
-        crate::scp::PyScp::default_instance().expect("default SCP instance")
+        crate::scp::PyScp::new()
     }
 
     #[test]

@@ -549,7 +549,7 @@ mod tests {
     use super::*;
 
     fn default_scp() -> crate::scp::PyScp {
-        crate::scp::PyScp::default_instance().expect("default SCP instance")
+        crate::scp::PyScp::new()
     }
 
     #[test]
@@ -561,13 +561,10 @@ mod tests {
 
     #[test]
     fn transport_disconnect_is_idempotent() {
-        // BridgeInstance must exist for transport operations.
-        crate::runtime::ensure_bridge_instance();
-        let bi = crate::runtime::default_bridge_instance()
-            .expect("default bridge instance should initialize");
-        crate::runtime::init_context_manager_for_test(&bi);
+        let scp = default_scp();
+        crate::runtime::init_context_manager_for_test(&scp.inner);
         // Disconnecting when not connected should not error.
-        let result = default_scp().transport_disconnect();
+        let result = scp.transport_disconnect();
         assert!(result.is_ok());
     }
 
