@@ -37,8 +37,13 @@ import Foundation
 /// See ADR-039 (Agent Key Binding) and spec section 9.
 public enum IdentityBridge {
     /// Create a new identity with the specified custody method.
+    ///
+    /// The optional `seed` parameter is a 32-byte deterministic seed for
+    /// the `in_memory` custody path only (ADR-046 parity harness). In
+    /// production use, pass `nil` to get OS RNG entropy.
     public typealias CreateFn = @Sendable (
-        _ custody: String
+        _ custody: String,
+        _ seed: Data?
     ) async throws -> Identity
 
     /// Load an existing identity by DID.
@@ -52,9 +57,9 @@ public enum IdentityBridge {
     ) async throws -> DidDocument
 
     /// Default create function — delegates to UniFFI
-    /// ``identityCreate(custody:)``.
-    public static let defaultCreate: CreateFn = { custody in
-        try await identityCreate(custody: custody)
+    /// ``identityCreate(custody:seed:)``.
+    public static let defaultCreate: CreateFn = { custody, seed in
+        try await identityCreate(custody: custody, seed: seed)
     }
 
     /// Default load function — delegates to UniFFI
@@ -359,8 +364,9 @@ public func identityVerifyDeviceAttestation(
 
 /// Creates a new SCP identity with the specified custody method.
 ///
-/// Delegates to the UniFFI ``identityCreate(custody:)`` bridge function.
-/// The custody method determines where private key material is stored:
+/// Delegates to the UniFFI ``identityCreate(custody:seed:)`` bridge
+/// function. The custody method determines where private key material
+/// is stored:
 ///
 /// - `"in_memory"` — Heap memory (dev/test only). Requires the
 ///   `allow_in_memory_custody` feature.
@@ -369,6 +375,11 @@ public func identityVerifyDeviceAttestation(
 ///
 /// - Parameters:
 ///   - custody: The custody method string (`"in_memory"` or `"platform"`).
+///   - seed: Optional 32-byte deterministic seed for `in_memory` custody.
+///       Pass `nil` in production — OS RNG entropy is used. Non-nil seeds
+///       are validated to be exactly 32 bytes; any other length is a
+///       validation error (SCP-VALID-7007). Only the `in_memory` custody
+///       path honors the seed (ADR-046 parity harness).
 ///   - createFn: Bridge function override for testing.
 /// - Returns: A new ``Identity`` instance.
 /// - Throws: ``ScpError/Identity(msg:code:)`` if creation fails.
@@ -376,12 +387,14 @@ public func identityVerifyDeviceAttestation(
 /// ## Provenance
 ///
 /// - ADR-006 (Platform Abstraction)
+/// - ADR-046 (Deterministic parity harness)
 /// - Spec section 9 (Identity)
 public func createIdentity(
     custody: String,
+    seed: Data? = nil,
     createFn: IdentityBridge.CreateFn = IdentityBridge.defaultCreate
 ) async throws -> Identity {
-    try await createFn(custody)
+    try await createFn(custody, seed)
 }
 
 /// Loads an existing SCP identity from storage by its DID.
