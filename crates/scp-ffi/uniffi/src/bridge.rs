@@ -14791,6 +14791,754 @@ impl Scp {
         listener.on_complete();
         Ok(())
     }
+
+    // ===== UniFFI sub-slice D — governance + close/restore/migration =====
+    //
+    // Migrates the 15 governance / ceiling / close / checkpoint / restore /
+    // migration free functions (`governance_execute`, `governance_propose`,
+    // `governance_approve`, `governance_reject`, `governance_withdraw`,
+    // `governance_get_proposal`, `governance_list_proposals`,
+    // `apply_pending_ceiling_modification`, `finalize_close`,
+    // `create_governance_checkpoint`, `add_checkpoint_cosignature`,
+    // `restore_context`, `restore_all_contexts`,
+    // `tombstone_migrated_context`, `migration_state`) to
+    // `impl crate::scp::Scp` methods routing through `&self.inner` (the
+    // `UniffiBridgeInstance` owned by the caller).
+    //
+    // Free functions above are retained (they still compile and are still
+    // exported via `#[uniffi::export]`) — the demolition slice at the end
+    // of PR 4 removes them in one shot after every caller is migrated.
+    // Bodies are preserved verbatim except for the
+    // `crate::runtime::context_manager()` → `bi.context_manager_or_error()?`
+    // swap and the handle-affinity inline check described in the PR 4
+    // sub-slice D plan.
+    //
+    // Part of #1549 Phase 4 PR 4.
+
+    /// Per-instance equivalent of the free-function [`governance_execute`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn governance_execute(
+        &self,
+        handle: Arc<ContextHandle>,
+        proposal_json: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        let context_id = handle.context_id.clone();
+
+        let (result, action_name) = runtime()
+            .spawn(async move {
+                let proposal: scp_core::context::governance::GovernanceProposal =
+                    serde_json::from_str(&proposal_json)?;
+                // Defense-in-depth: validate user-controlled string fields at the
+                // FFI boundary before the action reaches the ContextManager (#1601).
+                scp_ffi_common::validate::validate_governance_action_strings(&proposal.action)
+                    .map_err(|e| ScpError::Validation {
+                        msg: e.message,
+                        code: codes::VALID_7000.to_owned(),
+                    })?;
+                let action_name = proposal.action.variant_name();
+                let manager = bi.context_manager_or_error()?;
+                let result = manager
+                    .execute_governance_action(&context_id, &proposal)
+                    .await
+                    .map_err(ScpError::from)?;
+                // Serialize the result variant name for the caller.
+                use scp_core::context::manager::GovernanceActionResult;
+                let result_str = match result {
+                    GovernanceActionResult::MemberAdded => "MemberAdded",
+                    GovernanceActionResult::MemberRemoved => "MemberRemoved",
+                    GovernanceActionResult::RoleChanged => "RoleChanged",
+                    GovernanceActionResult::ToolRegistered => "ToolRegistered",
+                    GovernanceActionResult::ToolRemoved => "ToolRemoved",
+                    GovernanceActionResult::CeilingModified => "CeilingModified",
+                    GovernanceActionResult::ContextClosed => "ContextClosed",
+                    GovernanceActionResult::TtlExtended => "TtlExtended",
+                    GovernanceActionResult::PruningPolicyModified => "PruningPolicyModified",
+                    GovernanceActionResult::AdminTransferred => "AdminTransferred",
+                    GovernanceActionResult::SignerAdded => "SignerAdded",
+                    GovernanceActionResult::SignerRemoved => "SignerRemoved",
+                    GovernanceActionResult::ThresholdModified => "ThresholdModified",
+                    GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
+                    GovernanceActionResult::ToolInterfaceEstablished => "ToolInterfaceEstablished",
+                    GovernanceActionResult::MemberReset => "MemberReset",
+                    GovernanceActionResult::ConflictResolved => "ConflictResolved",
+                    GovernanceActionResult::ContextPromoted => "ContextPromoted",
+                    GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
+                    GovernanceActionResult::AccessRevoked(_) => "AccessRevoked",
+                    GovernanceActionResult::AccessRestored(_) => "AccessRestored",
+                    GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
+                    GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
+                    GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
+                    GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
+                    GovernanceActionResult::Executed => "Executed",
+                    GovernanceActionResult::MigrationProposed(_) => "MigrationProposed",
+                    GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
+                    GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
+                };
+                Ok::<_, ScpError>((result_str.to_owned(), action_name))
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during governance execution: {e}"),
+                code: codes::CTX_2032.to_owned(),
+            })??;
+
+        // Re-sync role state from ContextManager after governance execution (#796).
+        // Governance actions may modify roles/membership; without this sync the
+        // Swift/Kotlin SDKs see stale role state for UCAN/tool capability checks.
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+            tracing::warn!(
+                context_id = %handle.context_id,
+                action = action_name,
+                error = %e,
+                "failed to sync role state after governance execution"
+            );
+        }
+
+        // Sync FFI handle state for migration transitions (§5.11A).
+        match result.as_str() {
+            "MigrationProposed" => {
+                *handle.state.lock().await = ContextState::MigratingOut;
+            }
+            "MigrationCancelled" => {
+                *handle.state.lock().await = ContextState::Active;
+            }
+            "ContextTombstoned" => {
+                *handle.state.lock().await = ContextState::Tombstoned;
+            }
+            _ => {}
+        }
+
+        Ok(result)
+    }
+
+    /// Per-instance equivalent of the free-function [`governance_propose`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn governance_propose(
+        &self,
+        handle: Arc<ContextHandle>,
+        proposer_did: String,
+        action_json: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let signing_key = resolve_uniffi_signing_key(&handle).await?;
+        let bi = Arc::clone(&self.inner);
+        let context_id = handle.context_id.clone();
+
+        let (result, action_name) = runtime()
+            .spawn(async move {
+                let action: scp_core::context::governance::GovernanceAction =
+                    serde_json::from_str(&action_json)?;
+                // Defense-in-depth: validate user-controlled string fields at the
+                // FFI boundary before the action reaches the ContextManager (#1601).
+                scp_ffi_common::validate::validate_governance_action_strings(&action).map_err(
+                    |e| ScpError::Validation {
+                        msg: e.message,
+                        code: codes::CTX_2041.to_owned(),
+                    },
+                )?;
+                let action_name = action.variant_name();
+                let did = scp_identity::DID(proposer_did);
+                let manager = bi.context_manager_or_error()?;
+                let outcome = manager
+                    .propose_governance_action_checked(&context_id, &did, action, &signing_key)
+                    .await
+                    .map_err(ScpError::from)?;
+
+                let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));
+
+                let response = serde_json::json!({
+                    "proposal_id": hex::encode(outcome.proposal.proposal_id),
+                    "status": format!("{:?}", outcome.status),
+                    "execution_result": result_str,
+                });
+                Ok::<_, ScpError>((response.to_string(), action_name))
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during governance proposal: {e}"),
+                code: codes::CTX_2041.to_owned(),
+            })??;
+
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+            tracing::warn!(
+                context_id = %handle.context_id,
+                action = action_name,
+                error = %e,
+                "failed to sync role state after governance proposal"
+            );
+        }
+
+        Ok(result)
+    }
+
+    /// Per-instance equivalent of the free-function [`governance_approve`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn governance_approve(
+        &self,
+        handle: Arc<ContextHandle>,
+        voter_did: String,
+        proposal_id_hex: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let signing_key = resolve_uniffi_signing_key(&handle).await?;
+        let bi = Arc::clone(&self.inner);
+        let context_id = handle.context_id.clone();
+        let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
+
+        let result = runtime()
+            .spawn(async move {
+                let did = scp_identity::DID(voter_did);
+                let manager = bi.context_manager_or_error()?;
+                let status = manager
+                    .approve_governance_proposal(&context_id, &proposal_id, &did, &signing_key)
+                    .await
+                    .map_err(ScpError::from)?;
+
+                Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during governance approval: {e}"),
+                code: codes::CTX_2042.to_owned(),
+            })?;
+
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+            tracing::warn!(
+                context_id = %handle.context_id,
+                error = %e,
+                "failed to sync role state after governance approval"
+            );
+        }
+
+        result
+    }
+
+    /// Per-instance equivalent of the free-function [`governance_reject`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn governance_reject(
+        &self,
+        handle: Arc<ContextHandle>,
+        voter_did: String,
+        proposal_id_hex: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let signing_key = resolve_uniffi_signing_key(&handle).await?;
+        let bi = Arc::clone(&self.inner);
+        let context_id = handle.context_id.clone();
+        let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
+
+        let result = runtime()
+            .spawn(async move {
+                let did = scp_identity::DID(voter_did);
+                let manager = bi.context_manager_or_error()?;
+                let status = manager
+                    .reject_governance_proposal(&context_id, &proposal_id, &did, &signing_key)
+                    .await
+                    .map_err(ScpError::from)?;
+
+                Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during governance rejection: {e}"),
+                code: codes::CTX_2043.to_owned(),
+            })?;
+
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+            tracing::warn!(
+                context_id = %handle.context_id,
+                error = %e,
+                "failed to sync role state after governance rejection"
+            );
+        }
+
+        result
+    }
+
+    /// Per-instance equivalent of the free-function [`governance_withdraw`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn governance_withdraw(
+        &self,
+        handle: Arc<ContextHandle>,
+        voter_did: String,
+        proposal_id_hex: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        let context_id = handle.context_id.clone();
+        let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
+
+        let result = runtime()
+            .spawn(async move {
+                let did = scp_identity::DID(voter_did);
+                let manager = bi.context_manager_or_error()?;
+                let status = manager
+                    .withdraw_governance_vote(&context_id, &proposal_id, &did)
+                    .await
+                    .map_err(ScpError::from)?;
+
+                Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during governance withdrawal: {e}"),
+                code: codes::CTX_2044.to_owned(),
+            })?;
+
+        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+            tracing::warn!(
+                context_id = %handle.context_id,
+                error = %e,
+                "failed to sync role state after governance withdrawal"
+            );
+        }
+
+        result
+    }
+
+    /// Per-instance equivalent of the free-function [`governance_get_proposal`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn governance_get_proposal(
+        &self,
+        handle: Arc<ContextHandle>,
+        proposal_id_hex: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        let context_id = handle.context_id.clone();
+        let proposal_id = parse_uniffi_proposal_id(&proposal_id_hex)?;
+
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let proposal = manager
+                    .get_proposal(&context_id, &proposal_id)
+                    .await
+                    .map_err(ScpError::from)?;
+
+                serde_json::to_string(&proposal).map_err(|e| ScpError::Context {
+                    msg: format!("serialization failed: {e}"),
+                    code: codes::CTX_2045.to_owned(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during get proposal: {e}"),
+                code: codes::CTX_2045.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`governance_list_proposals`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn governance_list_proposals(
+        &self,
+        handle: Arc<ContextHandle>,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        let context_id = handle.context_id.clone();
+
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let proposals = manager
+                    .list_proposals(&context_id)
+                    .await
+                    .map_err(ScpError::from)?;
+
+                serde_json::to_string(&proposals).map_err(|e| ScpError::Context {
+                    msg: format!("serialization failed: {e}"),
+                    code: codes::CTX_2046.to_owned(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during list proposals: {e}"),
+                code: codes::CTX_2046.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`apply_pending_ceiling_modification`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn apply_pending_ceiling_modification(
+        &self,
+        handle: Arc<ContextHandle>,
+        current_timestamp: u64,
+    ) -> Result<bool, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        let context_id = handle.context_id.clone();
+
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                manager
+                    .apply_pending_ceiling_modification(&context_id, current_timestamp)
+                    .await
+                    .map_err(ScpError::from)
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!(
+                    "tokio task join error during apply_pending_ceiling_modification: {e}"
+                ),
+                code: codes::CTX_2060.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`finalize_close`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn finalize_close(&self, handle: Arc<ContextHandle>) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        let context_id = handle.context_id.clone();
+        let handle_ref = handle.clone();
+
+        // Use the handle's stored core_context_params (which carries correct
+        // memory_scope) instead of ContextParams::default(). memory_scope
+        // governs key destruction behavior in finalize_close — Ephemeral scope
+        // destroys keys, Full scope retains them.
+        let core_params = handle.core_context_params.clone();
+
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let core_handle = scp_core::context::ContextHandle::new(context_id, core_params);
+                let _ = core_handle
+                    .transition_to(&scp_core::context::ContextState::Active)
+                    .await;
+                let _ = core_handle
+                    .transition_to(&scp_core::context::ContextState::Closing)
+                    .await;
+
+                manager
+                    .finalize_close(&core_handle)
+                    .await
+                    .map_err(ScpError::from)?;
+
+                // Update FFI handle state to Closed.
+                *handle_ref.state.lock().await = ContextState::Closed;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during finalize_close: {e}"),
+                code: codes::CTX_2061.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`create_governance_checkpoint`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_governance_checkpoint(
+        &self,
+        handle: Arc<ContextHandle>,
+        checkpoint_seq: u64,
+        merkle_root_hex: String,
+        event_count: u64,
+        last_event_hash_hex: String,
+        state_snapshot_hash_hex: String,
+        creator_did: String,
+        creator_signature_hex: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        let context_id = handle.context_id.clone();
+
+        let merkle_root = parse_uniffi_hex_32(&merkle_root_hex, "merkle_root")?;
+        let last_event_hash = parse_uniffi_hex_32(&last_event_hash_hex, "last_event_hash")?;
+        let state_snapshot_hash =
+            parse_uniffi_hex_32(&state_snapshot_hash_hex, "state_snapshot_hash")?;
+        let creator_signature =
+            Zeroizing::new(hex::decode(&creator_signature_hex).map_err(|e| {
+                ScpError::Validation {
+                    msg: format!("invalid creator_signature hex: {e}"),
+                    code: codes::CTX_2066.to_owned(),
+                }
+            })?);
+        let did = scp_identity::DID(creator_did);
+
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let checkpoint = manager
+                    .create_governance_checkpoint(
+                        &context_id,
+                        checkpoint_seq,
+                        merkle_root,
+                        event_count,
+                        last_event_hash,
+                        state_snapshot_hash,
+                        &did,
+                        (*creator_signature).clone(),
+                    )
+                    .await
+                    .map_err(ScpError::from)?;
+
+                serde_json::to_string(&checkpoint).map_err(|e| ScpError::Context {
+                    msg: format!("serialization failed: {e}"),
+                    code: codes::CTX_2066.to_owned(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during create_governance_checkpoint: {e}"),
+                code: codes::CTX_2066.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`add_checkpoint_cosignature`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn add_checkpoint_cosignature(
+        &self,
+        handle: Arc<ContextHandle>,
+        checkpoint_json: String,
+        signer_did: String,
+        signature_hex: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        let context_id = handle.context_id.clone();
+
+        let mut checkpoint: scp_core::context::governance::ContextCheckpoint =
+            serde_json::from_str(&checkpoint_json).map_err(|e| ScpError::Validation {
+                msg: format!("invalid checkpoint JSON: {e}"),
+                code: codes::CTX_2063.to_owned(),
+            })?;
+
+        let signature =
+            Zeroizing::new(
+                hex::decode(&signature_hex).map_err(|e| ScpError::Validation {
+                    msg: format!("invalid signature hex: {e}"),
+                    code: codes::CTX_2063.to_owned(),
+                })?,
+            );
+
+        let cosignature = scp_core::context::governance::CosignedCheckpoint {
+            signer_did: scp_identity::DID(signer_did),
+            signature: (*signature).clone(),
+        };
+
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let status = manager
+                    .add_checkpoint_cosignature(&context_id, &mut checkpoint, cosignature)
+                    .await
+                    .map_err(ScpError::from)?;
+
+                let response = serde_json::json!({
+                    "attestation_status": format!("{status:?}"),
+                    "checkpoint": serde_json::to_value(&checkpoint).unwrap_or_default(),
+                });
+                Ok(response.to_string())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during add_checkpoint_cosignature: {e}"),
+                code: codes::CTX_2063.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`restore_context`].
+    ///
+    /// Routes through `&*self.inner`.
+    pub async fn restore_context(&self, context_id: String) -> Result<(), ScpError> {
+        let bi = Arc::clone(&self.inner);
+        let ctx_id = context_id.clone();
+
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                // Load the persisted snapshot to obtain the correct ContextParams
+                // (including memory_scope). Using ContextParams::default() would
+                // give Ephemeral scope, causing incorrect key destruction on
+                // subsequent finalize_close.
+                let (snapshot, _broadcast) = manager
+                    .load_persisted_context_state(&ctx_id)
+                    .map_err(ScpError::from)?;
+
+                let core_handle = scp_core::context::ContextHandle::new(
+                    ctx_id.clone(),
+                    snapshot.context_params.clone(),
+                );
+                let _ = core_handle
+                    .transition_to(&scp_core::context::ContextState::Active)
+                    .await;
+                manager
+                    .restore_context(&ctx_id, &core_handle)
+                    .await
+                    .map_err(ScpError::from)
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during restore_context: {e}"),
+                code: codes::CTX_2064.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`restore_all_contexts`].
+    ///
+    /// Routes through `&*self.inner`.
+    pub async fn restore_all_contexts(&self) -> Result<String, ScpError> {
+        let bi = Arc::clone(&self.inner);
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let restored = manager
+                    .restore_all_contexts()
+                    .await
+                    .map_err(ScpError::from)?;
+
+                serde_json::to_string(&restored).map_err(|e| ScpError::Context {
+                    msg: format!("serialization failed: {e}"),
+                    code: codes::CTX_2065.to_owned(),
+                })
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during restore_all_contexts: {e}"),
+                code: codes::CTX_2065.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function
+    /// [`tombstone_migrated_context`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn tombstone_migrated_context(
+        &self,
+        handle: Arc<ContextHandle>,
+    ) -> Result<(), ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        let context_id = handle.context_id.clone();
+        let handle_ref = handle.clone();
+
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                manager
+                    .tombstone_migrated_context(&context_id)
+                    .await
+                    .map_err(ScpError::from)?;
+
+                // Sync FFI handle state to Tombstoned (§5.11A.5).
+                *handle_ref.state.lock().await = ContextState::Tombstoned;
+
+                Ok(())
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during tombstone: {e}"),
+                code: codes::CTX_2050.to_owned(),
+            })?
+    }
+
+    /// Per-instance equivalent of the free-function [`migration_state`].
+    ///
+    /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+    /// `instance_id` does not match this `SCP`'s.
+    pub async fn migration_state(
+        &self,
+        handle: Arc<ContextHandle>,
+    ) -> Result<Option<String>, ScpError> {
+        self.inner
+            .core
+            .check_handle(handle.instance_id())
+            .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
+        let context_id = handle.context_id.clone();
+
+        runtime()
+            .spawn(async move {
+                let manager = bi.context_manager_or_error()?;
+                let state = manager.migration_state(&context_id).await;
+                match state {
+                    Some(ms) => {
+                        let json = serde_json::json!({
+                            "destination_context_id": ms.destination_context_id,
+                            "reason": ms.reason,
+                            "grace_period_end": ms.grace_period_end,
+                            "auto_invite": ms.auto_invite,
+                            "proposal_id": hex::encode(ms.proposal_id),
+                        });
+                        Ok(Some(json.to_string()))
+                    }
+                    None => Ok(None),
+                }
+            })
+            .await
+            .map_err(|e| ScpError::Context {
+                msg: format!("tokio task join error during migration_state: {e}"),
+                code: codes::CTX_2050.to_owned(),
+            })?
+    }
 }
 
 // ---------------------------------------------------------------------------
