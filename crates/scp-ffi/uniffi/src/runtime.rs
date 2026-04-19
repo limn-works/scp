@@ -90,6 +90,38 @@ pub enum StorageConfig {
     },
 }
 
+/// Bridge-internal error returned by [`UniffiBridgeInstance::with_storage_uniffi`]
+/// when a persistence backend cannot be initialized.
+///
+/// Converted to [`ScpError::Validation`] at the `Scp::with_storage`
+/// factory surface. Kept as a dedicated enum so the `runtime` layer
+/// does not depend on the bridge error vocabulary and so new backends
+/// (e.g. encrypted filesystem) can extend the enum without touching
+/// every caller.
+#[derive(Debug)]
+pub enum StorageInitError {
+    /// `SqliteStorage::new` failed — directory permission denied, key
+    /// mismatch on an existing DB, `SQLCipher` init error, and so on.
+    SqliteOpen {
+        /// The directory path the caller asked for (for the error message).
+        path: String,
+        /// The underlying `scp-platform` error rendered via `Display`.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for StorageInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SqliteOpen { path, message } => {
+                write!(f, "failed to open SQLCipher storage at {path}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StorageInitError {}
+
 /// Protocol repository variant: an `Arc<ProtocolRepository<_>>` whose inner
 /// `Storage` matches the bridge's configured persistence backend.
 ///
@@ -300,61 +332,68 @@ impl UniffiBridgeInstance {
     ///   `init_context_manager*` call picks the shared `Arc` up via
     ///   [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`]
     ///   so the `ContextManager` and the `CoreFields` mirror share a
-    ///   single `SqliteStorage` instance. If opening fails, the error is
-    ///   logged via `tracing::error!` and the instance is returned
-    ///   without persistence (matching the `PyO3` / NAPI bridges).
-    #[must_use]
-    pub fn with_storage_uniffi(config: StorageConfig) -> Self {
+    ///   single `SqliteStorage` instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageInitError::SqliteOpen`] when `SqliteStorage::new`
+    /// fails (permission denied, key mismatch, corrupt database). Unlike
+    /// the earlier silent-fallback behaviour, this now surfaces to the
+    /// caller so the bridge never masquerades an in-memory instance as
+    /// a SQLite-backed one.
+    pub fn with_storage_uniffi(config: StorageConfig) -> Result<Self, StorageInitError> {
         match config {
-            StorageConfig::InMemory => Self::new_uniffi(),
+            StorageConfig::InMemory => Ok(Self::new_uniffi()),
             StorageConfig::Sqlite { path, key } => {
+                // UniFFI's `Enum` derive cannot carry a `Zeroizing<Vec<u8>>`
+                // across the FFI boundary (no built-in `FfiConverter`), so
+                // the wire type is a plain `Vec<u8>`. The moment we own
+                // it, re-wrap it in `Zeroizing` so the drop-on-scope-exit
+                // semantics are enforced by the type system — matching
+                // `with_storage_napi` and `with_storage_py`. The earlier
+                // manual `zeroize::Zeroize::zeroize(&mut key_owned)` path
+                // was correct but relied on every exit path remembering
+                // to call it; `Zeroizing` removes that risk.
+                let key = zeroize::Zeroizing::new(key);
                 let path_buf = std::path::PathBuf::from(&path);
-                match scp_platform::sqlite::SqliteStorage::new(&path_buf, &key) {
-                    Ok(storage) => {
-                        let arc_storage = Arc::new(storage);
-                        // The same `Arc<SqliteStorage>` backs BOTH the
-                        // context-snapshot persistence bridge AND the
-                        // Merkle event log + trust aggregation repository.
-                        // This is the fix for the split-brain where
-                        // `with_storage(Sqlite)` used to persist snapshots
-                        // but silently fall back to in-memory storage for
-                        // event log entries.
-                        let persistence_repo =
-                            Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
-                        let persistence: Arc<
-                            dyn scp_core::context::manager::ContextPersistence + Send + Sync,
-                        > = Arc::new(
-                            scp_core::store::context::ProtocolRepositoryContextBridge::new(
-                                persistence_repo,
-                            ),
-                        );
-                        let event_log_repo =
-                            Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
-                        drop(arc_storage);
-                        // `key` is a `Vec<u8>` crossing the UniFFI
-                        // boundary — we cannot zero the caller's copy,
-                        // but we zero ours after SQLCipher has consumed
-                        // it internally.
-                        let mut key_owned = key;
-                        zeroize::Zeroize::zeroize(&mut key_owned);
-                        drop(key_owned);
-                        Self::with_persistence_uniffi_arc_and_repo(
-                            persistence,
-                            ProtocolRepoVariant::Sqlite(event_log_repo),
-                        )
-                    }
-                    Err(e) => {
+                let storage = scp_platform::sqlite::SqliteStorage::new(&path_buf, &key)
+                    .map_err(|e| {
                         tracing::error!(
                             error = %e,
                             path = %path,
-                            "with_storage_uniffi: SqliteStorage::new failed — instance created without persistence"
+                            "with_storage_uniffi: SqliteStorage::new failed — returning error to caller"
                         );
-                        let mut key_owned = key;
-                        zeroize::Zeroize::zeroize(&mut key_owned);
-                        drop(key_owned);
-                        Self::new_uniffi()
-                    }
-                }
+                        StorageInitError::SqliteOpen {
+                            path: path.clone(),
+                            message: e.to_string(),
+                        }
+                    })?;
+                let arc_storage = Arc::new(storage);
+                // The same `Arc<SqliteStorage>` backs BOTH the
+                // context-snapshot persistence bridge AND the
+                // Merkle event log + trust aggregation repository.
+                // This is the fix for the split-brain where
+                // `with_storage(Sqlite)` used to persist snapshots
+                // but silently fall back to in-memory storage for
+                // event log entries.
+                let persistence_repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                let persistence: Arc<
+                    dyn scp_core::context::manager::ContextPersistence + Send + Sync,
+                > = Arc::new(
+                    scp_core::store::context::ProtocolRepositoryContextBridge::new(
+                        persistence_repo,
+                    ),
+                );
+                let event_log_repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                drop(arc_storage);
+                // `key` is a `Zeroizing<Vec<u8>>`, zeroed on drop here.
+                // SQLCipher has already retained its derived key
+                // internally by this point.
+                drop(key);
+                Ok(Self::with_persistence_uniffi_arc_and_repo(
+                    persistence,
+                    ProtocolRepoVariant::Sqlite(event_log_repo),
+                ))
             }
         }
     }
@@ -1328,7 +1367,8 @@ mod tests {
         let bi = UniffiBridgeInstance::with_storage_uniffi(StorageConfig::Sqlite {
             path: tmp.path().to_string_lossy().into_owned(),
             key: vec![0x11u8; 32],
-        });
+        })
+        .expect("sqlite storage must initialize in test");
         assert!(
             matches!(bi.protocol_repository(), ProtocolRepoVariant::Sqlite(_)),
             "with_storage(Sqlite) must produce ProtocolRepoVariant::Sqlite so event log \

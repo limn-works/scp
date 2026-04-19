@@ -82,6 +82,38 @@ pub enum StorageConfig {
     },
 }
 
+/// Bridge-internal error returned by [`NapiBridgeInstance::with_storage_napi`]
+/// when a persistence backend cannot be initialized.
+///
+/// Converted to [`napi::Error`] (via [`ScpNapiError::Validation`]) at the
+/// `Scp::with_storage` factory surface. Kept as a dedicated enum so the
+/// `runtime` layer does not depend on the bridge error vocabulary and so
+/// new backends (e.g. encrypted filesystem) can extend the enum without
+/// touching every caller.
+#[derive(Debug)]
+pub enum StorageInitError {
+    /// `SqliteStorage::new` failed — directory permission denied, key
+    /// mismatch on an existing DB, `SQLCipher` init error, and so on.
+    SqliteOpen {
+        /// The directory path the caller asked for (for the error message).
+        path: String,
+        /// The underlying `scp-platform` error rendered via `Display`.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for StorageInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SqliteOpen { path, message } => {
+                write!(f, "failed to open SQLCipher storage at {path}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StorageInitError {}
+
 /// Protocol repository variant: an `Arc<ProtocolRepository<_>>` whose inner
 /// `Storage` matches the bridge's configured persistence backend.
 ///
@@ -274,47 +306,44 @@ impl NapiBridgeInstance {
     ///   opening fails, the error is logged via `tracing::error!` and the
     ///   instance is returned without persistence (matching the `PyO3`
     ///   bridge's behaviour).
-    #[must_use]
-    pub fn with_storage_napi(config: StorageConfig) -> Self {
+    pub fn with_storage_napi(config: StorageConfig) -> Result<Self, StorageInitError> {
         match config {
-            StorageConfig::InMemory => Self::new_napi(),
+            StorageConfig::InMemory => Ok(Self::new_napi()),
             StorageConfig::Sqlite { path, key } => {
-                match scp_platform::sqlite::SqliteStorage::new(&path, &key) {
-                    Ok(storage) => {
-                        let arc_storage = Arc::new(storage);
-                        // The same `Arc<SqliteStorage>` backs BOTH the
-                        // context-snapshot persistence bridge AND the
-                        // Merkle event log + trust aggregation repository.
-                        // This is the fix for the split-brain where
-                        // `with_storage(Sqlite)` used to persist snapshots
-                        // but silently fall back to in-memory storage for
-                        // event log entries.
-                        let persistence_repo =
-                            Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
-                        let persistence: Arc<dyn ContextPersistence + Send + Sync> = Arc::new(
-                            scp_core::store::context::ProtocolRepositoryContextBridge::new(
-                                persistence_repo,
-                            ),
-                        );
-                        let event_log_repo =
-                            Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
-                        drop(arc_storage);
-                        drop(key);
-                        Self::with_persistence_napi_arc_and_repo(
-                            persistence,
-                            ProtocolRepoVariant::Sqlite(event_log_repo),
-                        )
-                    }
-                    Err(e) => {
+                let storage = scp_platform::sqlite::SqliteStorage::new(&path, &key).map_err(
+                    |e| {
                         tracing::error!(
                             error = %e,
                             path = %path.display(),
-                            "with_storage_napi: SqliteStorage::new failed — instance created without persistence"
+                            "with_storage_napi: SqliteStorage::new failed — returning error to caller"
                         );
-                        drop(key);
-                        Self::new_napi()
-                    }
-                }
+                        StorageInitError::SqliteOpen {
+                            path: path.display().to_string(),
+                            message: e.to_string(),
+                        }
+                    },
+                )?;
+                let arc_storage = Arc::new(storage);
+                // The same `Arc<SqliteStorage>` backs BOTH the
+                // context-snapshot persistence bridge AND the
+                // Merkle event log + trust aggregation repository.
+                // This is the fix for the split-brain where
+                // `with_storage(Sqlite)` used to persist snapshots
+                // but silently fall back to in-memory storage for
+                // event log entries.
+                let persistence_repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                let persistence: Arc<dyn ContextPersistence + Send + Sync> = Arc::new(
+                    scp_core::store::context::ProtocolRepositoryContextBridge::new(
+                        persistence_repo,
+                    ),
+                );
+                let event_log_repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                drop(arc_storage);
+                drop(key);
+                Ok(Self::with_persistence_napi_arc_and_repo(
+                    persistence,
+                    ProtocolRepoVariant::Sqlite(event_log_repo),
+                ))
             }
         }
     }
@@ -1921,7 +1950,8 @@ mod tests {
         let bi = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
             path: tmp.path().to_path_buf(),
             key: zeroize::Zeroizing::new(vec![0x11u8; 32]),
-        });
+        })
+        .expect("sqlite storage must initialize in test");
         assert!(
             matches!(&bi.protocol_repository, ProtocolRepoVariant::Sqlite(_)),
             "with_storage(Sqlite) must produce ProtocolRepoVariant::Sqlite so event log \
