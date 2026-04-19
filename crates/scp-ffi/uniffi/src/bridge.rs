@@ -11725,12 +11725,18 @@ impl Scp {
     ///
     /// Starts an in-memory application node. If `identity` is supplied, it
     /// must have been minted by this `Scp` (cross-instance handles are
-    /// rejected via the `CoreFields::check_handle` inside the helper).
+    /// rejected via the `CoreFields::check_handle` call).
     #[cfg(feature = "server")]
     pub async fn node_start_in_memory(
         &self,
         identity: Option<Arc<Identity>>,
     ) -> Result<Arc<crate::server::NodeHandle>, ScpError> {
+        if let Some(ref id) = identity {
+            self.inner
+                .core
+                .check_handle(id.instance_id())
+                .map_err(ScpError::from)?;
+        }
         crate::server::node_start_in_memory_on(&self.inner, identity).await
     }
 
@@ -11745,6 +11751,12 @@ impl Scp {
         identity: Option<Arc<Identity>>,
         passphrase: Option<String>,
     ) -> Result<Arc<crate::server::NodeHandle>, ScpError> {
+        if let Some(ref id) = identity {
+            self.inner
+                .core
+                .check_handle(id.instance_id())
+                .map_err(ScpError::from)?;
+        }
         crate::server::node_start_local_on(&self.inner, data_dir, identity, passphrase).await
     }
 
