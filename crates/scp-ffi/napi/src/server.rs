@@ -526,22 +526,6 @@ fn build_node_identity(_bi: &NapiBridgeInstance, _did: &str) -> napi::Result<Nod
 // Free functions — relay startup
 // ---------------------------------------------------------------------------
 
-/// Starts a relay with in-memory blob storage on an OS-assigned port.
-///
-/// Returns a `NapiRelayHandle` whose `relayUrl` property contains the
-/// WebSocket URL for clients. Suitable for tests and demos.
-///
-/// ```js
-/// const relay = await relayStartInMemory();
-/// console.log(relay.relayUrl); // "ws://127.0.0.1:PORT/scp/v1"
-/// relay.shutdown();
-/// ```
-#[napi]
-pub async fn relay_start_in_memory() -> napi::Result<NapiRelayHandle> {
-    let bi = default_bridge_instance()?;
-    relay_start_in_memory_on(&bi).await
-}
-
 /// Per-bridge-instance implementation of [`relay_start_in_memory`].
 pub(crate) async fn relay_start_in_memory_on(
     bi: &NapiBridgeInstance,
@@ -552,22 +536,6 @@ pub(crate) async fn relay_start_in_memory_on(
         inner: relay,
         instance_id: bi.instance_id(),
     })
-}
-
-/// Starts a relay with redb-backed blob storage on an OS-assigned port.
-///
-/// Opens (or creates) a redb database at `<data_dir>/blobs.redb`. Suitable
-/// for local development with durable relay blob storage.
-///
-/// ```js
-/// const relay = await relayStartLocal("/tmp/my-relay");
-/// console.log(relay.relayUrl); // "ws://127.0.0.1:PORT/scp/v1"
-/// relay.shutdown();
-/// ```
-#[napi]
-pub async fn relay_start_local(data_dir: String) -> napi::Result<NapiRelayHandle> {
-    let bi = default_bridge_instance()?;
-    relay_start_local_on(&bi, data_dir).await
 }
 
 /// Per-bridge-instance implementation of [`relay_start_local`].
@@ -588,34 +556,6 @@ pub(crate) async fn relay_start_local_on(
 // ---------------------------------------------------------------------------
 // Free functions — node startup
 // ---------------------------------------------------------------------------
-
-/// Starts a full application node with in-memory storage.
-///
-/// Auto-wires in-memory key custody, in-memory storage, in-memory DHT client,
-/// self-signed TLS, and a relay on an OS-assigned port.
-///
-/// When `identityDid` is provided, the node uses the pre-existing identity
-/// from the identity registry (created via `identityCreate`) instead of
-/// generating a fresh one. This enables identity portability — the same
-/// DID persists across node restarts. The `ContextManager` is also
-/// auto-initialized with the node's relay as transport.
-///
-/// ```js
-/// const node = await nodeStartInMemory();
-/// console.log(node.relayUrl); // "ws://127.0.0.1:PORT/scp/v1"
-/// console.log(node.did);      // "did:dht:z6Mk..."
-/// node.shutdown();
-///
-/// // With identity portability:
-/// const id = await identityCreate("in_memory");
-/// const node2 = await nodeStartInMemory(id.did);
-/// console.log(node2.did === id.did); // true
-/// ```
-#[napi]
-pub async fn node_start_in_memory(identity_did: Option<String>) -> napi::Result<NapiNodeHandle> {
-    let bi = default_bridge_instance()?;
-    node_start_in_memory_on(&bi, identity_did).await
-}
 
 /// Per-bridge-instance implementation of [`node_start_in_memory`].
 pub(crate) async fn node_start_in_memory_on(
@@ -650,38 +590,6 @@ pub(crate) async fn node_start_in_memory_on(
         inner: RunningNode::InMemory(node),
         instance_id: bi.instance_id(),
     })
-}
-
-/// Starts a full application node with file-backed storage.
-///
-/// Opens (or creates) persistent storage at `<data_dir>/storage/` and a redb
-/// blob database at `<data_dir>/blobs.redb`.
-///
-/// When `identityDid` is provided, the node uses the pre-existing identity
-/// from the identity registry instead of generating a fresh one. When
-/// `identityDid` is `null`, the node creates or reloads a persistent
-/// identity via `FileKeyCustody`. The `passphrase` parameter is required
-/// in this mode.
-///
-/// ```js
-/// const node = await nodeStartLocal("/tmp/my-node", null, "my-secret");
-/// console.log(node.relayUrl); // "ws://127.0.0.1:PORT/scp/v1"
-/// console.log(node.did);      // "did:dht:z6Mk..."
-/// node.shutdown();
-///
-/// // With identity portability:
-/// const id = await identityCreate("in_memory");
-/// const node2 = await nodeStartLocal("/tmp/my-node", id.did);
-/// console.log(node2.did === id.did); // true
-/// ```
-#[napi]
-pub async fn node_start_local(
-    data_dir: String,
-    identity_did: Option<String>,
-    passphrase: Option<String>,
-) -> napi::Result<NapiNodeHandle> {
-    let bi = default_bridge_instance()?;
-    node_start_local_on(&bi, data_dir, identity_did, passphrase).await
 }
 
 /// Per-bridge-instance implementation of [`node_start_local`].
@@ -736,7 +644,7 @@ mod tests {
 
     #[test]
     fn relay_in_memory_starts_and_returns_url() {
-        let relay = rt().block_on(relay_start_in_memory()).unwrap();
+        let relay = rt().block_on(crate::scp::Scp::default_instance().unwrap().relay_start_in_memory()).unwrap();
         assert!(
             relay.relay_url().starts_with("ws://127.0.0.1:"),
             "expected ws:// URL, got: {}",
@@ -757,7 +665,7 @@ mod tests {
     fn relay_local_starts_and_returns_url() {
         let tmp = std::env::temp_dir().join(format!("scp-napi-relay-test-{}", std::process::id()));
         let relay = rt()
-            .block_on(relay_start_local(tmp.to_string_lossy().into_owned()))
+            .block_on(crate::scp::Scp::default_instance().unwrap().relay_start_local(tmp.to_string_lossy().into_owned()))
             .unwrap();
         assert!(
             relay.relay_url().starts_with("ws://127.0.0.1:"),
@@ -771,7 +679,7 @@ mod tests {
 
     #[test]
     fn node_in_memory_starts_and_returns_did() {
-        let node = rt().block_on(node_start_in_memory(None)).unwrap();
+        let node = rt().block_on(crate::scp::Scp::default_instance().unwrap().node_start_in_memory(None)).unwrap();
         let url = node.relay_url();
         assert!(
             url.starts_with("ws://") || url.starts_with("wss://"),
@@ -793,7 +701,7 @@ mod tests {
     fn node_local_starts_and_returns_did() {
         let tmp = std::env::temp_dir().join(format!("scp-napi-node-test-{}", std::process::id()));
         let node = rt()
-            .block_on(node_start_local(
+            .block_on(crate::scp::Scp::default_instance().unwrap().node_start_local(
                 tmp.to_string_lossy().into_owned(),
                 None,
                 Some("test-passphrase".to_owned()),
@@ -817,7 +725,7 @@ mod tests {
 
     #[test]
     fn relay_shutdown_is_idempotent() {
-        let relay = rt().block_on(relay_start_in_memory()).unwrap();
+        let relay = rt().block_on(crate::scp::Scp::default_instance().unwrap().relay_start_in_memory()).unwrap();
         relay.shutdown();
         // Second shutdown should not panic.
         relay.shutdown();
@@ -825,7 +733,7 @@ mod tests {
 
     #[test]
     fn node_shutdown_is_idempotent() {
-        let node = rt().block_on(node_start_in_memory(None)).unwrap();
+        let node = rt().block_on(crate::scp::Scp::default_instance().unwrap().node_start_in_memory(None)).unwrap();
         node.shutdown();
         // Second shutdown should not panic.
         node.shutdown();

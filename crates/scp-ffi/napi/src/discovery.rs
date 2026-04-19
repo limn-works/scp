@@ -22,22 +22,15 @@
 //! See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).
 
 use scp_ffi_common::error_codes as codes;
-use std::collections::HashMap;
 
 use napi_derive::napi;
 
 use scp_core::discovery::addressing::{HandleTarget, ParsedAddress};
-use scp_core::discovery::handles::{
-    HandleDeregisterParams, HandleLookupParams, HandleMetadata, HandleRegisterParams,
-    HandleRegistry, HandleTypeFilter,
-};
 use scp_core::discovery::{DiscoveryQuery, normalize_address, parse_address};
-use scp_identity::DID;
 
-use scp_ffi_common::petname_helpers::{self, LocalHandleQuerier, address_resolution_to_json};
+use scp_ffi_common::petname_helpers::{self};
 
 use crate::error::ScpNapiError;
-use crate::runtime::default_bridge_instance;
 
 // ---------------------------------------------------------------------------
 // Test-only reset helpers
@@ -45,14 +38,14 @@ use crate::runtime::default_bridge_instance;
 
 #[cfg(test)]
 fn reset_petname_map_for(owner_did: &str) {
-    if let Ok(bi) = default_bridge_instance() {
+    if let Ok(bi) = crate::runtime::default_bridge_instance() {
         petname_helpers::reset_petname_map_for(&bi.core, owner_did);
     }
 }
 
 #[cfg(test)]
 fn reset_handle_registry_for(context_id: &str) {
-    if let Ok(bi) = default_bridge_instance() {
+    if let Ok(bi) = crate::runtime::default_bridge_instance() {
         petname_helpers::reset_handle_registry_for(&bi.core, context_id);
     }
 }
@@ -248,584 +241,17 @@ pub async fn context_discover(query: String) -> napi::Result<String> {
 // Petname bridge functions (§22.4)
 // ---------------------------------------------------------------------------
 
-/// Sets a petname for a DID.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn petname_set(owner_did: String, target_did: String, name: String) -> napi::Result<()> {
-    if owner_did.is_empty() {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }));
-    }
-    if target_did.is_empty() {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: "target_did must not be empty".to_owned(),
-            code: codes::VALID_7111.to_owned(),
-        }));
-    }
-    let bi = default_bridge_instance()?;
-    let mut guard = bi.core.petname_maps().lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })
-    })?;
-    let map = guard.entry(owner_did).or_default();
-    map.set_petname(DID::from(target_did.as_str()), name);
-    Ok(())
-}
-
-/// Removes a petname from a DID.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn petname_remove(owner_did: String, target_did: String) -> napi::Result<()> {
-    if owner_did.is_empty() {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }));
-    }
-    let bi = default_bridge_instance()?;
-    let mut guard = bi.core.petname_maps().lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })
-    })?;
-    if let Some(map) = guard.get_mut(&owner_did) {
-        map.remove_petname(&DID::from(target_did.as_str()));
-    }
-    Ok(())
-}
-
-/// Sets a petname for a context.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn petname_set_context(
-    owner_did: String,
-    context_id: String,
-    name: String,
-) -> napi::Result<()> {
-    if owner_did.is_empty() {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }));
-    }
-    if context_id.is_empty() {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: "context_id must not be empty".to_owned(),
-            code: codes::VALID_7113.to_owned(),
-        }));
-    }
-    let bi = default_bridge_instance()?;
-    let mut guard = bi.core.petname_maps().lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })
-    })?;
-    let map = guard.entry(owner_did).or_default();
-    map.set_context_petname(context_id, name);
-    Ok(())
-}
-
-/// Removes a petname from a context.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn petname_remove_context(owner_did: String, context_id: String) -> napi::Result<()> {
-    if owner_did.is_empty() {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }));
-    }
-    let bi = default_bridge_instance()?;
-    let mut guard = bi.core.petname_maps().lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })
-    })?;
-    if let Some(map) = guard.get_mut(&owner_did) {
-        map.remove_context_petname(&context_id);
-    }
-    Ok(())
-}
-
-/// Resolves a petname to DIDs. Returns a JSON array of DID strings.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn petname_resolve_did(owner_did: String, name: String) -> napi::Result<String> {
-    if owner_did.is_empty() {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }));
-    }
-    let bi = default_bridge_instance()?;
-    let guard = bi.core.petname_maps().lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })
-    })?;
-    let dids: Vec<String> = guard
-        .get(&owner_did)
-        .map(|map| {
-            map.resolve_did(&name)
-                .into_iter()
-                .map(|d| d.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    serde_json::to_string(&dids).map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("failed to serialize petname resolve result: {e}"),
-            code: codes::VALID_7114.to_owned(),
-        })
-    })
-}
-
-/// Resolves a petname to context IDs. Returns a JSON array of strings.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn petname_resolve_context(owner_did: String, name: String) -> napi::Result<String> {
-    if owner_did.is_empty() {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }));
-    }
-    let bi = default_bridge_instance()?;
-    let guard = bi.core.petname_maps().lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })
-    })?;
-    let ids: Vec<String> = guard
-        .get(&owner_did)
-        .map(|map| map.resolve_context(&name))
-        .unwrap_or_default();
-    serde_json::to_string(&ids).map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("failed to serialize petname resolve result: {e}"),
-            code: codes::VALID_7114.to_owned(),
-        })
-    })
-}
-
-/// Gets the petname for a DID. Returns `null` if none.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn petname_get_for_did(owner_did: String, target_did: String) -> napi::Result<Option<String>> {
-    if owner_did.is_empty() {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }));
-    }
-    let bi = default_bridge_instance()?;
-    let guard = bi.core.petname_maps().lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })
-    })?;
-    Ok(guard.get(&owner_did).and_then(|map| {
-        map.petname_for_did(&DID::from(target_did.as_str()))
-            .map(str::to_owned)
-    }))
-}
-
-/// Gets the petname for a context. Returns `null` if none.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn petname_get_for_context(
-    owner_did: String,
-    context_id: String,
-) -> napi::Result<Option<String>> {
-    if owner_did.is_empty() {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }));
-    }
-    let bi = default_bridge_instance()?;
-    let guard = bi.core.petname_maps().lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })
-    })?;
-    Ok(guard
-        .get(&owner_did)
-        .and_then(|map| map.petname_for_context(&context_id).map(str::to_owned)))
-}
-
 // ---------------------------------------------------------------------------
 // Handle registry bridge functions (§22.3.1)
 // ---------------------------------------------------------------------------
-
-/// Registers a handle in a context with discovery tools. Returns JSON result.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn handle_register(
-    discovery_context_id: String,
-    handle: String,
-    target_json: String,
-    registrant_did: String,
-    description: Option<String>,
-    tags: Option<Vec<String>>,
-) -> napi::Result<String> {
-    let target = parse_handle_target(&target_json)?;
-    let params = HandleRegisterParams {
-        handle,
-        target,
-        metadata: Some(HandleMetadata { description, tags }),
-    };
-    let bi = default_bridge_instance()?;
-    let mut guard = bi.core.handle_registries().lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("handle registry lock poisoned: {e}"),
-            code: codes::VALID_7120.to_owned(),
-        })
-    })?;
-    let registry = guard
-        .entry(discovery_context_id.clone())
-        .or_insert_with(|| HandleRegistry::new(discovery_context_id));
-    let result = registry.register(
-        &params,
-        &DID::from(registrant_did.as_str()),
-        &scp_primitives::SystemClock,
-    );
-    serde_json::to_string(&result).map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("failed to serialize handle register result: {e}"),
-            code: codes::VALID_7122.to_owned(),
-        })
-    })
-}
-
-/// Looks up a handle in a context with discovery tools. Returns JSON result.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn handle_lookup(
-    discovery_context_id: String,
-    handle: String,
-    type_filter: Option<String>,
-) -> napi::Result<String> {
-    let filter = match type_filter.as_deref() {
-        Some("identity") => Some(HandleTypeFilter::Identity),
-        Some("context") => Some(HandleTypeFilter::Context),
-        Some(other) => {
-            return Err(napi::Error::from(ScpNapiError::Validation {
-                message: format!("invalid type_filter '{other}': expected 'identity' or 'context'"),
-                code: codes::VALID_7123.to_owned(),
-            }));
-        }
-        None => None,
-    };
-    let bi = default_bridge_instance()?;
-    let guard = bi.core.handle_registries().lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("handle registry lock poisoned: {e}"),
-            code: codes::VALID_7120.to_owned(),
-        })
-    })?;
-    let result = guard.get(&discovery_context_id).map_or_else(
-        || scp_core::discovery::HandleLookupResult {
-            results: Vec::new(),
-        },
-        |registry| {
-            registry.lookup(&HandleLookupParams {
-                handle,
-                type_filter: filter,
-            })
-        },
-    );
-    serde_json::to_string(&result).map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("failed to serialize handle lookup result: {e}"),
-            code: codes::VALID_7124.to_owned(),
-        })
-    })
-}
-
-/// Deregisters a handle from a context with discovery tools. Returns JSON result.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn handle_deregister(
-    discovery_context_id: String,
-    handle: String,
-    did: String,
-) -> napi::Result<String> {
-    let bi = default_bridge_instance()?;
-    let mut guard = bi.core.handle_registries().lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("handle registry lock poisoned: {e}"),
-            code: codes::VALID_7120.to_owned(),
-        })
-    })?;
-    let result = guard.get_mut(&discovery_context_id).map_or_else(
-        || scp_core::discovery::HandleDeregisterResult { removed: false },
-        |registry| {
-            registry.deregister(&HandleDeregisterParams {
-                handle,
-                did: DID::from(did.as_str()),
-            })
-        },
-    );
-    serde_json::to_string(&result).map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("failed to serialize handle deregister result: {e}"),
-            code: codes::VALID_7125.to_owned(),
-        })
-    })
-}
 
 // ---------------------------------------------------------------------------
 // Scope registry bridge functions (§22.3.5, ADR-043)
 // ---------------------------------------------------------------------------
 
-/// Registers a scope name in a scope registry. Returns JSON result.
-#[napi]
-#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
-pub fn scope_register(
-    scope_context_id: String,
-    name: String,
-    target_context_id: String,
-    relay_urls: Vec<String>,
-    registrant_did: String,
-    description: Option<String>,
-    tags: Option<Vec<String>>,
-) -> napi::Result<String> {
-    // Validate inputs at the FFI boundary (defense-in-depth)
-    scp_ffi_common::validate::validate_context_id(&scope_context_id)
-        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    scp_ffi_common::validate::validate_context_id(&target_context_id)
-        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    scp_ffi_common::validate::validate_did(&registrant_did)
-        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-
-    // Validate relay URLs at the FFI boundary
-    for url in &relay_urls {
-        scp_ffi_common::validate::validate_relay_url(url).map_err(|e| {
-            napi::Error::from(ScpNapiError::Validation {
-                message: e.to_string(),
-                code: codes::VALID_7135.to_owned(),
-            })
-        })?;
-    }
-
-    let params = scp_core::discovery::ScopeRegisterParams {
-        name,
-        target: scp_core::discovery::ScopeTarget {
-            context_id: target_context_id,
-            relay_urls,
-        },
-        metadata: if description.is_some() || tags.is_some() {
-            Some(scp_core::discovery::ScopeMetadata { description, tags })
-        } else {
-            None
-        },
-    };
-
-    let bi = default_bridge_instance()?;
-    let mut guard = bi.core.scope_registries().lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("scope registry lock poisoned: {e}"),
-            code: codes::VALID_7130.to_owned(),
-        })
-    })?;
-
-    let registry = guard
-        .entry(scope_context_id.clone())
-        .or_insert_with(|| scp_core::discovery::ScopeRegistry::new(scope_context_id));
-
-    let result = registry
-        .register(
-            &params,
-            &DID::from(registrant_did.as_str()),
-            &scp_primitives::SystemClock,
-        )
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Validation {
-                message: format!("scope registration failed: {e}"),
-                code: codes::VALID_7131.to_owned(),
-            })
-        })?;
-
-    serde_json::to_string(&result).map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("failed to serialize scope register result: {e}"),
-            code: codes::VALID_7132.to_owned(),
-        })
-    })
-}
-
-/// Looks up a scope name in a scope registry. Returns JSON result.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn scope_lookup(scope_context_id: String, name: String) -> napi::Result<String> {
-    scp_ffi_common::validate::validate_context_id(&scope_context_id)
-        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-
-    let bi = default_bridge_instance()?;
-    let guard = bi.core.scope_registries().lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("scope registry lock poisoned: {e}"),
-            code: codes::VALID_7130.to_owned(),
-        })
-    })?;
-
-    let result = match guard.get(&scope_context_id) {
-        Some(registry) => registry
-            .lookup(&scp_core::discovery::ScopeLookupParams { name })
-            .map_err(|e| {
-                napi::Error::from(ScpNapiError::Validation {
-                    message: format!("scope lookup failed: {e}"),
-                    code: codes::VALID_7133.to_owned(),
-                })
-            })?,
-        None => scp_core::discovery::ScopeLookupResult {
-            results: Vec::new(),
-        },
-    };
-
-    serde_json::to_string(&result).map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("failed to serialize scope lookup result: {e}"),
-            code: codes::VALID_7133.to_owned(),
-        })
-    })
-}
-
-/// Deregisters a scope name from a scope registry. Returns JSON result.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn scope_deregister(
-    scope_context_id: String,
-    name: String,
-    did: String,
-) -> napi::Result<String> {
-    scp_ffi_common::validate::validate_context_id(&scope_context_id)
-        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    scp_ffi_common::validate::validate_did(&did)
-        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-
-    let bi = default_bridge_instance()?;
-    let mut guard = bi.core.scope_registries().lock().map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("scope registry lock poisoned: {e}"),
-            code: codes::VALID_7130.to_owned(),
-        })
-    })?;
-
-    let result = match guard.get_mut(&scope_context_id) {
-        Some(registry) => registry
-            .deregister(&scp_core::discovery::ScopeDeregisterParams {
-                name,
-                did: DID::from(did.as_str()),
-            })
-            .map_err(|e| {
-                napi::Error::from(ScpNapiError::Validation {
-                    message: format!("scope deregister failed: {e}"),
-                    code: codes::VALID_7134.to_owned(),
-                })
-            })?,
-        None => scp_core::discovery::ScopeDeregisterResult { removed: false },
-    };
-
-    serde_json::to_string(&result).map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("failed to serialize scope deregister result: {e}"),
-            code: codes::VALID_7134.to_owned(),
-        })
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Address resolve (§22.8)
 // ---------------------------------------------------------------------------
-
-/// Resolves a human-readable address via multi-path resolution.
-/// Returns a JSON array of `AddressResolution` objects.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub async fn address_resolve(
-    owner_did: String,
-    address: String,
-    known_contexts_json: Option<String>,
-) -> napi::Result<String> {
-    if owner_did.is_empty() {
-        return Err(napi::Error::from(ScpNapiError::Validation {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }));
-    }
-    let bi = default_bridge_instance()?;
-    let mut known_contexts: HashMap<String, String> = if let Some(ref json) = known_contexts_json {
-        serde_json::from_str(json).map_err(|e| {
-            napi::Error::from(ScpNapiError::Validation {
-                message: format!("invalid known_contexts_json: {e}"),
-                code: codes::VALID_7090.to_owned(),
-            })
-        })?
-    } else {
-        let guard = bi.core.handle_registries().lock().map_err(|e| {
-            napi::Error::from(ScpNapiError::Validation {
-                message: format!("handle registry lock poisoned: {e}"),
-                code: codes::VALID_7120.to_owned(),
-            })
-        })?;
-        guard.keys().map(|k| (k.clone(), k.clone())).collect()
-    };
-
-    // Merge scope registry contexts for two-hop resolution (§22.3.5).
-    let scope_contexts = petname_helpers::known_contexts_from_scope_registries(&bi.core);
-    for (name, ctx_id) in scope_contexts {
-        known_contexts.entry(name).or_insert(ctx_id);
-    }
-    let known_domains: Vec<&str> = Vec::new();
-    let petname_map = {
-        let guard = bi.core.petname_maps().lock().map_err(|e| {
-            napi::Error::from(ScpNapiError::Validation {
-                message: format!("petname lock poisoned: {e}"),
-                code: codes::VALID_7112.to_owned(),
-            })
-        })?;
-        guard.get(&owner_did).cloned().unwrap_or_default()
-    };
-    let mut resolver = scp_core::discovery::AddressResolver::new();
-    let querier = LocalHandleQuerier::new(&bi.core);
-    let results = resolver
-        .resolve(
-            &address,
-            &petname_map,
-            &querier,
-            &known_contexts,
-            &known_domains,
-            &scp_primitives::SystemClock,
-        )
-        .await
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Validation {
-                message: format!("address resolution failed: {e}"),
-                code: codes::VALID_7091.to_owned(),
-            })
-        })?;
-    let json_results: Vec<serde_json::Value> =
-        results.iter().map(address_resolution_to_json).collect();
-    serde_json::to_string(&json_results).map_err(|e| {
-        napi::Error::from(ScpNapiError::Validation {
-            message: format!("failed to serialize address resolution results: {e}"),
-            code: codes::VALID_7092.to_owned(),
-        })
-    })
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -933,13 +359,13 @@ mod tests {
     fn petname_set_and_resolve() {
         let owner = "did:dht:zNapiTest1".to_owned();
         reset_petname_map_for(&owner);
-        petname_set(
+        crate::scp::Scp::default_instance().unwrap().petname_set(
             owner.clone(),
             "did:dht:zAlice".to_owned(),
             "alice".to_owned(),
         )
         .unwrap();
-        let json = petname_resolve_did(owner, "alice".to_owned()).unwrap();
+        let json = crate::scp::Scp::default_instance().unwrap().petname_resolve_did(owner, "alice".to_owned()).unwrap();
         let dids: Vec<String> = serde_json::from_str(&json).unwrap();
         assert_eq!(dids.len(), 1);
         assert_eq!(dids[0], "did:dht:zAlice");
@@ -949,8 +375,8 @@ mod tests {
     fn petname_context_set_and_resolve() {
         let owner = "did:dht:zNapiTest2".to_owned();
         reset_petname_map_for(&owner);
-        petname_set_context(owner.clone(), "ctx-napi-1".to_owned(), "work".to_owned()).unwrap();
-        let json = petname_resolve_context(owner, "work".to_owned()).unwrap();
+        crate::scp::Scp::default_instance().unwrap().petname_set_context(owner.clone(), "ctx-napi-1".to_owned(), "work".to_owned()).unwrap();
+        let json = crate::scp::Scp::default_instance().unwrap().petname_resolve_context(owner, "work".to_owned()).unwrap();
         let ids: Vec<String> = serde_json::from_str(&json).unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], "ctx-napi-1");
@@ -963,7 +389,7 @@ mod tests {
         let ctx = "ctx-napi-handle-1".to_owned();
         reset_handle_registry_for(&ctx);
         let target = r#"{"type": "identity", "did": "did:dht:zNapiAlice"}"#.to_owned();
-        let result = handle_register(
+        let result = crate::scp::Scp::default_instance().unwrap().handle_register(
             ctx.clone(),
             "alice".to_owned(),
             target,
@@ -975,7 +401,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["status"], "registered");
 
-        let lookup = handle_lookup(ctx, "alice".to_owned(), None).unwrap();
+        let lookup = crate::scp::Scp::default_instance().unwrap().handle_lookup(ctx, "alice".to_owned(), None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&lookup).unwrap();
         assert_eq!(parsed["results"].as_array().unwrap().len(), 1);
     }

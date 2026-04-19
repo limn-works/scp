@@ -185,37 +185,6 @@ fn validate_implementation_hash(bytes: Option<&[u8]>) -> napi::Result<[u8; 32]> 
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Registers a tool in an SCP context.
-///
-/// # Arguments
-///
-/// * `handle` — The context to register the tool in (must be `"active"`).
-/// * `definition` — Tool definition including name, description, schemas,
-///   operator DID, test vectors, and optional implementation hash.
-///
-/// # Returns
-///
-/// A `Promise<string>` resolving to the assigned tool ID.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-TOOL-6003` if the context is not `"active"`.
-/// - Rejects with `SCP-VALID-7035` if `input_schema_json` is not valid JSON.
-/// - Rejects with `SCP-VALID-7036` if `output_schema_json` is not valid JSON.
-/// - Rejects with `SCP-VALID-7037` if `test_vectors_json` is provided but not valid JSON.
-/// - Rejects with `SCP-VALID-7038` if `implementation_hash` is provided but not exactly 32 bytes.
-/// - Rejects with `SCP-TOOL-6001` if registration fails (permission denied,
-///   schema invalid, duplicate name, etc.) in the full runtime.
-#[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
-pub async fn tool_register(
-    handle: &NapiContextHandle,
-    definition: NapiToolDefinition,
-) -> napi::Result<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    tool_register_on(&bi, handle, definition).await
-}
-
 /// Per-bridge-instance implementation of [`tool_register`].
 #[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn tool_register_on(
@@ -295,80 +264,6 @@ pub(crate) async fn tool_register_on(
     .map_err(napi::Error::from)?;
 
     Ok(registered_id)
-}
-
-/// Invokes a tool within an SCP context, fully wired through the
-/// `ContextManager::invoke_tool_with_economy` pipeline.
-///
-/// This is the SINGLE entry point for tool invocation through the NAPI
-/// bridge. Per-invocation pricing, spending UCAN AND-composition
-/// (§19.5), per-DID velocity tracking, escalation (§19.7), budget
-/// enforcement, payment escrow, the Matrix-style hard rate limit, and
-/// `ToolEconomyTicket` rollback are all enforced inside the runtime
-/// wrapper. The NAPI bridge no longer reimplements any of those
-/// concerns.
-///
-/// Validates the UCAN token for tool invocation authorization before
-/// dispatching. The UCAN must contain a `tool_invoke:{tool_id}` or
-/// `tool_invoke:*` capability scoped to the context.
-///
-/// # Arguments
-///
-/// * `handle` — The context containing the tool (must be `"active"`).
-/// * `tool_id` — The ID of the tool to invoke.
-/// * `input_json` — Tool input parameters as a JSON string.
-/// * `identity_did` — The DID of the invoker (used for capability checking).
-/// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
-///   Validated using the full 11-step ADR-016 pipeline.
-/// * `proof_tokens` — Optional encoded parent UCAN tokens for the
-///   delegation chain (ADR-016 step 3).
-/// * `spending_ucan_jwt` — Optional JWT-encoded spending UCAN
-///   (`SpendingCapability`) for paid tool invocations. Required when an
-///   `EconomicPolicy` priced the tool above zero (§19.5). May be
-///   `null`/`undefined` for free tools.
-///
-/// # Returns
-///
-/// A `Promise<string>` resolving to the tool output as a JSON string.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-TOOL-6005` if the context is not `"active"`.
-/// - Rejects with `SCP-PERM-3001` if the UCAN token is invalid, expired,
-///   revoked, or lacks the required tool invocation capability.
-/// - Rejects with `SCP-ECON-12090` if the hard rate limit is exceeded.
-/// - Rejects with `SCP-ECON-12010` if the per-DID budget is insufficient.
-/// - Rejects with `SCP-ECON-12061` if `spending_ucan_jwt` is missing or
-///   malformed for a paid action.
-/// - Rejects with a tool-invocation error (6xxx range) if invocation fails (tool not found,
-///   schema mismatch, etc.).
-///
-/// See spec §6.2, §8, §19.5, §19.7, ADR-016, and issue #319.
-#[napi]
-#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-#[allow(clippy::too_many_arguments)] // mirrors the runtime's economy entry point
-pub async fn tool_invoke(
-    handle: &NapiContextHandle,
-    tool_id: String,
-    input_json: String,
-    identity_did: String,
-    ucan_token: String,
-    proof_tokens: Option<Vec<String>>,
-    spending_ucan_jwt: Option<String>,
-) -> napi::Result<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    tool_invoke_on(
-        &bi,
-        handle,
-        tool_id,
-        input_json,
-        identity_did,
-        ucan_token,
-        proof_tokens,
-        spending_ucan_jwt,
-    )
-    .await
 }
 
 /// Per-bridge-instance implementation of [`tool_invoke`].
@@ -519,32 +414,6 @@ pub(crate) async fn tool_invoke_on(
     })
 }
 
-/// Verifies a tool against its registered test vectors.
-///
-/// # Arguments
-///
-/// * `handle` — The context containing the tool (must be `"active"`).
-/// * `tool_id` — The ID of the tool to verify.
-///
-/// # Returns
-///
-/// A `Promise<NapiToolVerificationResult>` with pass/fail status.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-TOOL-6007` if the context is not `"active"`.
-/// - Rejects with `SCP-TOOL-6001` if the tool is not found in the context.
-#[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
-#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub async fn tool_verify(
-    handle: &NapiContextHandle,
-    tool_id: String,
-) -> napi::Result<NapiToolVerificationResult> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    tool_verify_on(&bi, handle, tool_id).await
-}
-
 /// Per-bridge-instance implementation of [`tool_verify`].
 #[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn tool_verify_on(
@@ -612,44 +481,6 @@ pub(crate) async fn tool_verify_on(
 // ---------------------------------------------------------------------------
 // Cross-context tool invocation
 // ---------------------------------------------------------------------------
-
-/// Invokes a tool across context boundaries.
-///
-/// Validates UCAN authorization against the target context, chain depth,
-/// source context capability, and target context tool existence per spec
-/// section 6.2.
-///
-/// # Returns
-///
-/// A `Promise<string>` resolving to the tool output as a JSON string.
-#[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
-#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-#[allow(clippy::too_many_arguments)] // FFI boundary: napi-rs requires explicit params
-pub async fn tool_invoke_cross_context(
-    source_handle: &NapiContextHandle,
-    target_handle: &NapiContextHandle,
-    tool_id: String,
-    input_json: String,
-    invoker_did: String,
-    ucan_token: String,
-    chain_depth: u8,
-    proof_tokens: Option<Vec<String>>,
-) -> napi::Result<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    tool_invoke_cross_context_on(
-        &bi,
-        source_handle,
-        target_handle,
-        tool_id,
-        input_json,
-        invoker_did,
-        ucan_token,
-        chain_depth,
-        proof_tokens,
-    )
-    .await
-}
 
 /// Per-bridge-instance implementation of [`tool_invoke_cross_context`].
 #[allow(clippy::too_many_arguments)]
@@ -807,24 +638,6 @@ pub(crate) async fn tool_invoke_cross_context_on(
 // Stateful tool sessions (spec section 6.2.1)
 // ---------------------------------------------------------------------------
 
-/// Creates a stateful tool session.
-///
-/// # Returns
-///
-/// A `Promise<string>` resolving to the session ID (UUID).
-#[napi]
-#[allow(clippy::unused_async)]
-#[allow(clippy::needless_pass_by_value)]
-pub async fn tool_session_create(
-    handle: &NapiContextHandle,
-    tool_id: String,
-    source_context_id: String,
-    ttl_seconds: Option<u32>,
-) -> napi::Result<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    tool_session_create_on(&bi, handle, tool_id, source_context_id, ttl_seconds).await
-}
-
 /// Per-bridge-instance implementation of [`tool_session_create`].
 pub(crate) async fn tool_session_create_on(
     bi: &crate::runtime::NapiBridgeInstance,
@@ -886,38 +699,6 @@ pub(crate) async fn tool_session_create_on(
         Ok(session_id)
     })
     .map_err(napi::Error::from)
-}
-
-/// Invokes a tool within an active session.
-///
-/// Each call is individually governed: the invoker must present a valid
-/// UCAN token. Session state is carried forward across invocations.
-///
-/// # Returns
-///
-/// A `Promise<string>` resolving to the tool output as a JSON string.
-#[napi]
-#[allow(clippy::unused_async)]
-#[allow(clippy::needless_pass_by_value)]
-pub async fn tool_session_invoke(
-    handle: &NapiContextHandle,
-    session_id: String,
-    input_json: String,
-    invoker_did: String,
-    ucan_token: String,
-    proof_tokens: Option<Vec<String>>,
-) -> napi::Result<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    tool_session_invoke_on(
-        &bi,
-        handle,
-        session_id,
-        input_json,
-        invoker_did,
-        ucan_token,
-        proof_tokens,
-    )
-    .await
 }
 
 /// Per-bridge-instance implementation of [`tool_session_invoke`].
@@ -1058,22 +839,6 @@ pub(crate) async fn tool_session_invoke_on(
     })
 }
 
-/// Closes a stateful tool session.
-///
-/// # Returns
-///
-/// A `Promise<void>` that resolves when the session is closed.
-#[napi]
-#[allow(clippy::unused_async)]
-#[allow(clippy::needless_pass_by_value)]
-pub async fn tool_session_close(
-    handle: &NapiContextHandle,
-    session_id: String,
-) -> napi::Result<()> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    tool_session_close_on(&bi, handle, session_id).await
-}
-
 /// Per-bridge-instance implementation of [`tool_session_close`].
 #[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn tool_session_close_on(
@@ -1100,28 +865,6 @@ pub(crate) async fn tool_session_close_on(
 // ---------------------------------------------------------------------------
 // Bidirectional consent protocol (spec §6.2.0.1)
 // ---------------------------------------------------------------------------
-
-/// Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
-///
-/// The caller (admin of the source context) proposes sharing a specific tool
-/// with a target context. Returns a JSON string of the `ToolInterface` with
-/// `approved_by_source = true` and `approved_by_target = false`.
-///
-/// # Returns
-///
-/// A `Promise<string>` resolving to the `ToolInterface` as JSON.
-#[napi]
-#[allow(clippy::unused_async)]
-#[allow(clippy::needless_pass_by_value)]
-pub async fn tool_interface_expose(
-    handle: &NapiContextHandle,
-    tool_id: String,
-    target_context_id: String,
-    rate_limit_json: Option<String>,
-) -> napi::Result<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    tool_interface_expose_on(&bi, handle, tool_id, target_context_id, rate_limit_json).await
-}
 
 /// Per-bridge-instance implementation of [`tool_interface_expose`].
 #[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
@@ -1195,24 +938,6 @@ pub(crate) async fn tool_interface_expose_on(
     .map_err(napi::Error::from)
 }
 
-/// Accepts a cross-context tool interface (§6.2.0.1 step 4).
-///
-/// Sets `approved_by_target = true` on the interface.
-///
-/// # Returns
-///
-/// A `Promise<string>` resolving to the updated `ToolInterface` as JSON.
-#[napi]
-#[allow(clippy::unused_async)]
-#[allow(clippy::needless_pass_by_value)]
-pub async fn tool_interface_accept(
-    handle: &NapiContextHandle,
-    interface_json: String,
-) -> napi::Result<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    tool_interface_accept_on(&bi, handle, interface_json).await
-}
-
 /// Per-bridge-instance implementation of [`tool_interface_accept`].
 #[allow(clippy::unused_async)] // preserves signature symmetry with the async free function
 pub(crate) async fn tool_interface_accept_on(
@@ -1267,24 +992,6 @@ pub(crate) async fn tool_interface_accept_on(
         })
     })
     .map_err(napi::Error::from)
-}
-
-/// Revokes a cross-context tool interface (§6.2.0.1 step 5).
-///
-/// Either context may revoke unilaterally.
-///
-/// # Returns
-///
-/// A `Promise<string>` resolving to the `InterfaceRevoked` event as JSON.
-#[napi]
-#[allow(clippy::unused_async)]
-#[allow(clippy::needless_pass_by_value)]
-pub async fn tool_interface_revoke(
-    handle: &NapiContextHandle,
-    interface_id_hex: String,
-) -> napi::Result<String> {
-    let bi = crate::runtime::default_bridge_instance()?;
-    tool_interface_revoke_on(&bi, handle, interface_id_hex).await
 }
 
 /// Per-bridge-instance implementation of [`tool_interface_revoke`].
@@ -1521,7 +1228,7 @@ mod tests {
             cost: None,
         };
 
-        let tool_id = tool_register(&handle, definition)
+        let tool_id = tool_register_on(&crate::runtime::default_bridge_instance().unwrap(), &handle, definition)
             .await
             .expect("tool_register should succeed");
 

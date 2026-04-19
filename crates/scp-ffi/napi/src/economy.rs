@@ -236,13 +236,6 @@ pub(crate) fn economy_evaluate_formula_on(
     Ok(scp_core::economy::evaluate_formula(&formula, &metrics).map_or(-1, |a| a.value() as i64))
 }
 
-/// Queries the remaining budget for a member in a context.
-#[napi]
-pub fn economy_budget_remaining(context_id: String, did: String) -> napi::Result<i64> {
-    let bi = default_bridge_instance()?;
-    economy_budget_remaining_on(&bi, context_id, did)
-}
-
 /// Per-bridge-instance implementation of [`economy_budget_remaining`].
 pub(crate) fn economy_budget_remaining_on(
     bi: &NapiBridgeInstance,
@@ -261,13 +254,6 @@ pub(crate) fn economy_budget_remaining_on(
         .with_economy_budget(&context_id, |tracker| tracker.remaining(&member_did));
     #[allow(clippy::cast_possible_wrap)]
     Ok(remaining.value() as i64)
-}
-
-/// Grants spending budget to a member in a context.
-#[napi]
-pub fn economy_budget_grant(context_id: String, did: String, amount: i64) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    economy_budget_grant_on(&bi, context_id, did, amount)
 }
 
 /// Per-bridge-instance implementation of [`economy_budget_grant`].
@@ -297,17 +283,6 @@ pub(crate) fn economy_budget_grant_on(
         );
     });
     Ok(())
-}
-
-/// Records a spend against a member's budget in a context.
-#[napi]
-pub fn economy_budget_record_spend(
-    context_id: String,
-    did: String,
-    amount: i64,
-) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    economy_budget_record_spend_on(&bi, context_id, did, amount)
 }
 
 /// Per-bridge-instance implementation of [`economy_budget_record_spend`].
@@ -340,17 +315,6 @@ pub(crate) fn economy_budget_record_spend_on(
     })
 }
 
-/// Records a message from a sender for antispam velocity tracking.
-#[napi]
-pub fn economy_antispam_record(
-    context_id: String,
-    sender_did: String,
-    timestamp: i64,
-) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    economy_antispam_record_on(&bi, context_id, sender_did, timestamp)
-}
-
 /// Per-bridge-instance implementation of [`economy_antispam_record`].
 pub(crate) fn economy_antispam_record_on(
     bi: &NapiBridgeInstance,
@@ -375,17 +339,6 @@ pub(crate) fn economy_antispam_record_on(
         tracker.record_message(&did, timestamp.cast_unsigned());
     });
     Ok(())
-}
-
-/// Queries the sender's message velocity within the sliding window.
-#[napi]
-pub fn economy_antispam_velocity(
-    context_id: String,
-    sender_did: String,
-    now: i64,
-) -> napi::Result<i64> {
-    let bi = default_bridge_instance()?;
-    economy_antispam_velocity_on(&bi, context_id, sender_did, now)
 }
 
 /// Per-bridge-instance implementation of [`economy_antispam_velocity`].
@@ -414,30 +367,6 @@ pub(crate) fn economy_antispam_velocity_on(
     });
     #[allow(clippy::cast_possible_wrap)]
     Ok(velocity as i64)
-}
-
-/// Computes the escalated cost for a sender based on antispam velocity.
-#[napi]
-pub fn economy_antispam_escalated_cost(
-    context_id: String,
-    sender_did: String,
-    now: i64,
-    base_cost: i64,
-    thresholds_json: String,
-    floor: Option<i64>,
-    cap: Option<i64>,
-) -> napi::Result<i64> {
-    let bi = default_bridge_instance()?;
-    economy_antispam_escalated_cost_on(
-        &bi,
-        context_id,
-        sender_did,
-        now,
-        base_cost,
-        thresholds_json,
-        floor,
-        cap,
-    )
 }
 
 /// Per-bridge-instance implementation of [`economy_antispam_escalated_cost`].
@@ -549,21 +478,21 @@ mod tests {
     #[test]
     fn budget_remaining_empty_context_returns_zero() {
         crate::runtime::init_context_manager_for_test();
-        let result = economy_budget_remaining("test-ctx".to_owned(), "did:key:test".to_owned());
+        let result = economy_budget_remaining_on(&crate::runtime::default_bridge_instance().unwrap(), "test-ctx".to_owned(), "did:key:test".to_owned());
         assert_eq!(result.unwrap(), 0);
     }
 
     #[test]
     fn budget_grant_and_spend() {
         crate::runtime::init_context_manager_for_test();
-        economy_budget_grant("napi-econ-ctx".to_owned(), "did:key:alice".to_owned(), 1000).unwrap();
-        let r = economy_budget_remaining("napi-econ-ctx".to_owned(), "did:key:alice".to_owned())
+        economy_budget_grant_on(&crate::runtime::default_bridge_instance().unwrap(), "napi-econ-ctx".to_owned(), "did:key:alice".to_owned(), 1000).unwrap();
+        let r = economy_budget_remaining_on(&crate::runtime::default_bridge_instance().unwrap(), "napi-econ-ctx".to_owned(), "did:key:alice".to_owned())
             .unwrap();
         assert_eq!(r, 1000);
 
-        economy_budget_record_spend("napi-econ-ctx".to_owned(), "did:key:alice".to_owned(), 400)
+        economy_budget_record_spend_on(&crate::runtime::default_bridge_instance().unwrap(), "napi-econ-ctx".to_owned(), "did:key:alice".to_owned(), 400)
             .unwrap();
-        let r = economy_budget_remaining("napi-econ-ctx".to_owned(), "did:key:alice".to_owned())
+        let r = economy_budget_remaining_on(&crate::runtime::default_bridge_instance().unwrap(), "napi-econ-ctx".to_owned(), "did:key:alice".to_owned())
             .unwrap();
         assert_eq!(r, 600);
     }
@@ -572,21 +501,21 @@ mod tests {
     fn antispam_velocity_starts_at_zero() {
         crate::runtime::init_context_manager_for_test();
         let v =
-            economy_antispam_velocity("napi-spam-ctx".to_owned(), "did:key:bob".to_owned(), 1000);
+            economy_antispam_velocity_on(&crate::runtime::default_bridge_instance().unwrap(), "napi-spam-ctx".to_owned(), "did:key:bob".to_owned(), 1000);
         assert_eq!(v.unwrap(), 0);
     }
 
     #[test]
     fn budget_validates_empty_inputs() {
-        assert!(economy_budget_remaining(String::new(), "did:key:x".to_owned()).is_err());
-        assert!(economy_budget_remaining("ctx".to_owned(), String::new()).is_err());
+        assert!(economy_budget_remaining_on(&crate::runtime::default_bridge_instance().unwrap(), String::new(), "did:key:x".to_owned()).is_err());
+        assert!(economy_budget_remaining_on(&crate::runtime::default_bridge_instance().unwrap(), "ctx".to_owned(), String::new()).is_err());
     }
 
     #[test]
     fn budget_grant_rejects_negative_amount() {
         crate::runtime::init_context_manager_for_test();
         let err =
-            economy_budget_grant("ctx".to_owned(), "did:key:alice".to_owned(), -1).unwrap_err();
+            economy_budget_grant_on(&crate::runtime::default_bridge_instance().unwrap(), "ctx".to_owned(), "did:key:alice".to_owned(), -1).unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"
@@ -596,7 +525,7 @@ mod tests {
     #[test]
     fn budget_record_spend_rejects_negative_amount() {
         crate::runtime::init_context_manager_for_test();
-        let err = economy_budget_record_spend("ctx".to_owned(), "did:key:alice".to_owned(), -100)
+        let err = economy_budget_record_spend_on(&crate::runtime::default_bridge_instance().unwrap(), "ctx".to_owned(), "did:key:alice".to_owned(), -100)
             .unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
@@ -608,7 +537,7 @@ mod tests {
     fn antispam_record_rejects_negative_timestamp() {
         crate::runtime::init_context_manager_for_test();
         let err =
-            economy_antispam_record("ctx".to_owned(), "did:key:bob".to_owned(), -1).unwrap_err();
+            economy_antispam_record_on(&crate::runtime::default_bridge_instance().unwrap(), "ctx".to_owned(), "did:key:bob".to_owned(), -1).unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"
@@ -619,7 +548,7 @@ mod tests {
     fn antispam_velocity_rejects_negative_now() {
         crate::runtime::init_context_manager_for_test();
         let err =
-            economy_antispam_velocity("ctx".to_owned(), "did:key:bob".to_owned(), -1).unwrap_err();
+            economy_antispam_velocity_on(&crate::runtime::default_bridge_instance().unwrap(), "ctx".to_owned(), "did:key:bob".to_owned(), -1).unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"

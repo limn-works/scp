@@ -28,7 +28,7 @@ use napi_derive::napi;
 use scp_ffi_common::validate::{validate_context_id, validate_relay_url};
 
 use crate::error::ScpNapiError;
-use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
+use crate::runtime::NapiBridgeInstance;
 use crate::{decrement_handle_count, increment_handle_count};
 
 // ---------------------------------------------------------------------------
@@ -343,41 +343,6 @@ impl Drop for NapiTransportManager {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Connects to an SCP relay.
-///
-/// Establishes a transport connection to the specified relay URL. The relay
-/// must use the `wss://` scheme (TLS-secured WebSocket) for remote hosts.
-/// Plaintext `ws://` is permitted for loopback addresses (`127.0.0.1`,
-/// `[::1]`, `localhost`) since loopback traffic cannot be intercepted.
-///
-/// **Note:** Calling this while already connected silently replaces the
-/// stored adapter. Any previously returned [`NapiTransportManager`] handles
-/// will report stale connection status via `is_connected()` because their
-/// local `status` mutex is not updated. Call [`transport_disconnect`] first
-/// to cleanly tear down the existing connection before reconnecting. This
-/// matches the `PyO3` bridge's `py_transport_connect` behavior.
-///
-/// # Arguments
-///
-/// * `relay_url` — The URL of the SCP relay (e.g., `"wss://relay.example.com"`
-///   or `"ws://127.0.0.1:9000/scp/v1"` for local development).
-///
-/// # Returns
-///
-/// A `Promise<NapiTransportManager>` resolving to the connection handle.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-VALID-7000` if `relay_url` uses `ws://` with a
-///   non-loopback host.
-/// - Rejects with `SCP-TRANS-5001` if the connection fails (unreachable relay,
-///   protocol mismatch, timeout, authentication failure) in the full runtime.
-#[napi]
-pub async fn transport_connect(relay_url: String) -> napi::Result<NapiTransportManager> {
-    let bi = default_bridge_instance()?;
-    transport_connect_on(&bi, relay_url).await
-}
-
 /// Per-bridge-instance implementation of [`transport_connect`].
 pub(crate) async fn transport_connect_on(
     bi: &NapiBridgeInstance,
@@ -447,27 +412,6 @@ pub(crate) async fn transport_connect_on(
     }
 }
 
-/// Returns the current transport connection status.
-///
-/// # Arguments
-///
-/// * `manager` — The transport manager handle.
-///
-/// # Returns
-///
-/// A `Promise<NapiTransportStatus>` with the current connection state.
-///
-/// # Errors
-///
-/// This function is infallible — the `Result` return type is required by
-/// the napi-rs bridge pattern.
-#[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
-pub async fn transport_status(manager: &NapiTransportManager) -> napi::Result<NapiTransportStatus> {
-    let bi = default_bridge_instance()?;
-    transport_status_on(&bi, manager).await
-}
-
 /// Per-bridge-instance implementation of [`transport_status`].
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub(crate) async fn transport_status_on(
@@ -484,26 +428,6 @@ pub(crate) async fn transport_status_on(
         status.connected = false;
     }
     Ok(status)
-}
-
-/// Disconnects from the relay.
-///
-/// Closes the active transport connection. Any pending sends are dropped.
-/// The `NapiTransportManager` handle transitions to a disconnected state and
-/// must not be used for new operations after this call.
-///
-/// # Arguments
-///
-/// * `manager` — The transport manager handle (must be connected).
-///
-/// # Errors
-///
-/// Rejects with `SCP-TRANS-5002` if the manager is not connected.
-#[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
-pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    transport_disconnect_on(&bi, manager).await
 }
 
 /// Per-bridge-instance implementation of [`transport_disconnect`].
@@ -545,30 +469,6 @@ pub(crate) async fn transport_disconnect_on(
     Ok(())
 }
 
-/// Pre-configures the [`ContextManager`] with [`LocalTransportProvider`].
-///
-/// **Must be called before any `identityCreate` → `contextCreate` sequence.**
-/// Once the `ContextManager` is initialized (by whichever call arrives first),
-/// the transport provider is locked in for the lifetime of the process.
-///
-/// With `LocalTransportProvider`, `contextSend` and `broadcastPublish`
-/// succeed locally without requiring a running relay. This is the correct
-/// setup for single-process E2E tests that exercise the full
-/// encrypt → sign → send pipeline.
-///
-/// The `local_did` parameter is used as the MLS credential identity for the
-/// `MlsCryptoProvider`. Pass any valid `did:dht:` string (typically the
-/// DID of the first identity you plan to create).
-///
-/// # Errors
-///
-/// Returns an error only if `local_did` fails DID format validation.
-#[napi(js_name = "configureLocalTransport")]
-pub fn configure_local_transport(local_did: String) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    configure_local_transport_on(&bi, local_did)
-}
-
 /// Per-bridge-instance implementation of [`configure_local_transport`].
 pub(crate) fn configure_local_transport_on(
     bi: &NapiBridgeInstance,
@@ -578,40 +478,6 @@ pub(crate) fn configure_local_transport_on(
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     crate::runtime::init_context_manager_with_local_transport(bi, &local_did);
     Ok(())
-}
-
-/// Pre-configures the [`ContextManager`] with [`RelayTransportProvider`].
-///
-/// **Must be called before any `identityCreate` → `contextCreate` sequence.**
-/// Once the `ContextManager` is initialized (by whichever call arrives first),
-/// the transport provider is locked in for the lifetime of the process.
-///
-/// Unlike `configureLocalTransport` (which silently succeeds without reaching
-/// the relay), this function creates a **real** relay connection and wraps it
-/// in `RelayTransportProvider`. This means `contextSend` will publish
-/// encrypted payloads through the relay, enabling full end-to-end
-/// send → relay → subscribe → receive tests.
-///
-/// The `relay_url` must point to a running relay. A separate
-/// `transportConnect` call is still needed for `contextSubscribe` (which
-/// uses the `BridgeInstance` transport manager for its subscription stream).
-///
-/// # Arguments
-///
-/// * `relay_url` — The URL of the relay to connect to.
-/// * `local_did` — The DID for MLS credential identity. Pass any valid
-///   `did:dht:` string (typically the DID of the first identity you plan
-///   to create).
-///
-/// # Errors
-///
-/// - Returns an error if `relay_url` fails URL validation.
-/// - Returns an error if `local_did` fails DID format validation.
-/// - Returns an error if the relay connection fails.
-#[napi(js_name = "configureRelayTransport")]
-pub async fn configure_relay_transport(relay_url: String, local_did: String) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    configure_relay_transport_on(&bi, relay_url, local_did).await
 }
 
 /// Per-bridge-instance implementation of [`configure_relay_transport`].
@@ -670,33 +536,6 @@ pub struct NapiReliabilityScore {
 // Multi-relay management functions
 // ---------------------------------------------------------------------------
 
-/// Registers an additional relay adapter with the transport manager.
-///
-/// Connects to the specified relay URL and adds the resulting adapter to
-/// the `BridgeInstance` transport manager. The [`transport_connect`] function
-/// must have been called first to initialize the manager.
-///
-/// # Arguments
-///
-/// * `relay_url` — The URL of the additional SCP relay to connect to.
-///
-/// # Returns
-///
-/// A `Promise<number>` resolving to the total number of adapters after
-/// adding (i.e. the new adapter count).
-///
-/// # Errors
-///
-/// - Rejects with `SCP-TRANS-5010` if no transport manager exists.
-/// - Rejects with `SCP-VALID-7000` if the URL is invalid.
-/// - Rejects with `SCP-TRANS-5001` if the connection fails.
-/// - Rejects with `SCP-TRANS-5003` if a subscription is active.
-#[napi]
-pub async fn transport_add_relay(relay_url: String) -> napi::Result<u32> {
-    let bi = default_bridge_instance()?;
-    transport_add_relay_on(&bi, relay_url).await
-}
-
 /// Per-bridge-instance implementation of [`transport_add_relay`].
 pub(crate) async fn transport_add_relay_on(
     bi: &NapiBridgeInstance,
@@ -739,31 +578,6 @@ pub(crate) async fn transport_add_relay_on(
     Ok(count)
 }
 
-/// Assigns a relay set for the given context.
-///
-/// Delegates to [`TransportManager::assign_relay_set`] which selects at
-/// least `min_relays` adapters per context using round-robin spread to
-/// minimize overlap.
-///
-/// # Arguments
-///
-/// * `context_id` — The context to assign relays for.
-///
-/// # Returns
-///
-/// A list of adapter indices assigned to this context.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-TRANS-5010` if no transport manager exists.
-/// - Rejects with `SCP-VALID-7000` if `context_id` is invalid.
-/// - Rejects with `SCP-TRANS-5002` if relay set assignment fails.
-#[napi]
-pub fn transport_assign_relay_set(context_id: String) -> napi::Result<Vec<u32>> {
-    let bi = default_bridge_instance()?;
-    transport_assign_relay_set_on(&bi, context_id)
-}
-
 /// Per-bridge-instance implementation of [`transport_assign_relay_set`].
 pub(crate) fn transport_assign_relay_set_on(
     bi: &NapiBridgeInstance,
@@ -793,43 +607,12 @@ pub(crate) fn transport_assign_relay_set_on(
     })
 }
 
-/// Returns the number of adapters registered in the transport manager.
-///
-/// # Errors
-///
-/// Rejects with `SCP-TRANS-5010` if no transport manager has been
-/// initialized.
-#[napi]
-pub fn transport_adapter_count() -> napi::Result<u32> {
-    let bi = default_bridge_instance()?;
-    transport_adapter_count_on(&bi)
-}
-
 /// Per-bridge-instance implementation of [`transport_adapter_count`].
 pub(crate) fn transport_adapter_count_on(bi: &NapiBridgeInstance) -> napi::Result<u32> {
     with_transport_manager_on(bi, |manager| {
         #[allow(clippy::cast_possible_truncation)]
         Ok(manager.adapter_count() as u32)
     })
-}
-
-/// Returns the reliability score for an adapter by index.
-///
-/// Returns the score as a [`NapiReliabilityScore`] object, or `null` if
-/// no score exists for the given adapter index.
-///
-/// # Arguments
-///
-/// * `adapter_index` — The adapter index (0-based) to query.
-///
-/// # Errors
-///
-/// Rejects with `SCP-TRANS-5010` if no transport manager has been
-/// initialized.
-#[napi]
-pub fn transport_reliability(adapter_index: u32) -> napi::Result<Option<NapiReliabilityScore>> {
-    let bi = default_bridge_instance()?;
-    transport_reliability_on(&bi, adapter_index)
 }
 
 /// Per-bridge-instance implementation of [`transport_reliability`].

@@ -51,7 +51,7 @@ use crate::decrement_handle_count;
 use crate::error::ScpNapiError;
 #[cfg(feature = "allow_in_memory_custody")]
 use crate::increment_handle_count;
-use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
+use crate::runtime::NapiBridgeInstance;
 
 // ---------------------------------------------------------------------------
 // NapiUcanTokenData — UCAN token metadata record
@@ -195,54 +195,6 @@ impl Drop for NapiUcanToken {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Validates a UCAN token for a required capability.
-///
-/// Delegates to `scp_core::crypto::ucan::validate::validate_ucan` for
-/// complete UCAN validation including Ed25519 signature verification, proof
-/// chain traversal, delegation depth enforcement, audience/issuer chain
-/// validation, scope attenuation, nonce uniqueness, revocation checking,
-/// and expiry verification.
-///
-/// # Arguments
-///
-/// * `handle` — The context the token is presented in.
-/// * `token` — The encoded UCAN token string (JWT format).
-/// * `capability` — The required capability URI
-///   (e.g., `"scp:ctx:abc123/messages:write"`).
-/// * `presenting_agent_did` — Optional. The DID of the agent presenting
-///   the token. If not provided, the token's `aud` field is used (the
-///   presenting agent is assumed to be the token's audience).
-/// * `proof_tokens` — Optional. List of encoded parent UCAN token strings
-///   for delegation chain verification. Required when validating delegated
-///   tokens with non-empty proof chains.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-PERM-3001` if validation fails (malformed token,
-///   invalid signature, expired, insufficient capabilities, revoked,
-///   broken delegation chain).
-#[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
-#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Option<Vec>
-pub async fn ucan_validate(
-    handle: &NapiContextHandle,
-    token: String,
-    capability: String,
-    presenting_agent_did: Option<String>,
-    proof_tokens: Option<Vec<String>>,
-) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    ucan_validate_on(
-        &bi,
-        handle,
-        token,
-        capability,
-        presenting_agent_did,
-        proof_tokens,
-    )
-    .await
-}
-
 /// Per-bridge-instance implementation of [`ucan_validate`].
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Option<Vec>
@@ -324,45 +276,6 @@ pub(crate) async fn ucan_validate_on(
     .map_err(napi::Error::from)?;
 
     Ok(())
-}
-
-/// Mints a new UCAN token for a context member with real Ed25519 signing.
-///
-/// Uses the context creator's `InMemoryKeyCustody` and active signing key
-/// (retained on the context handle during `context_create`) to produce a
-/// properly signed UCAN token via `scp_core::crypto::ucan::mint::mint_ucan`.
-///
-/// # Arguments
-///
-/// * `handle` — The context to mint the token for (must have key custody
-///   from `context_create` with an `in_memory` identity).
-/// * `member_did` — The DID of the member receiving the token.
-/// * `capabilities` — List of capability strings to grant (e.g.,
-///   `"messages:write"`). Scoped to the context automatically.
-///
-/// # Returns
-///
-/// A `Promise<NapiUcanToken>` with the minted token's metadata and a real
-/// Ed25519 signature.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-VALID-7000` if `member_did` fails [`validate_did`]
-///   (empty, malformed `did:{method}:{id}` format, or control characters).
-/// - Rejects with `SCP-PERM-3023` if the context does not have key custody
-///   (created from an `identity_load` handle without key material).
-/// - Rejects with `SCP-PERM-3023` if signing or token construction fails.
-#[napi]
-#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec/Option<Vec>
-#[allow(clippy::unused_async)] // napi requires async for Promise return type
-pub async fn ucan_mint(
-    handle: &NapiContextHandle,
-    member_did: String,
-    capabilities: Vec<String>,
-    proofs: Option<Vec<String>>,
-) -> napi::Result<NapiUcanToken> {
-    let bi = default_bridge_instance()?;
-    ucan_mint_on(&bi, handle, member_did, capabilities, proofs).await
 }
 
 /// Per-bridge-instance implementation of [`ucan_mint`].
@@ -475,61 +388,6 @@ pub(crate) async fn ucan_mint_on(
             instance_id: bi.instance_id(),
         })
     }
-}
-
-/// Delegates a UCAN token to another member.
-///
-/// Creates a delegated UCAN from an existing parent token, signed with the
-/// delegator's Ed25519 key via the retained `InMemoryKeyCustody`.
-/// Delegation enforces attenuation (capabilities can only narrow, never widen).
-///
-/// # Arguments
-///
-/// * `handle` — The context the token belongs to.
-/// * `delegator_did` — The DID of the entity delegating (must match parent
-///   token's audience).
-/// * `delegatee_did` — The DID of the entity receiving the delegation.
-/// * `parent_token` — The encoded parent UCAN token (JWT format).
-/// * `capabilities` — List of capability URI strings to delegate (must be
-///   subset of parent's capabilities).
-///
-/// # Returns
-///
-/// A `Promise<NapiUcanToken>` with the delegated token's metadata.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-VALID-7000` if `delegator_did` or `delegatee_did`
-///   fails [`validate_did`] (empty, malformed `did:{method}:{id}` format,
-///   or control characters).
-/// - Rejects with `SCP-VALID-7000` if `parent_token` fails
-///   [`validate_ucan_token`] (empty, too long, or control characters).
-/// - Rejects with `SCP-VALID-7000` if any capability URI fails
-///   [`validate_capability_uri`] (empty, too long, or control characters).
-/// - Rejects with `SCP-PERM-3023` if the context does not have key custody.
-/// - Rejects with `SCP-PERM-3023` if delegation fails.
-///
-/// See ADR-016 criterion 4.
-#[napi]
-#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
-pub async fn ucan_delegate(
-    handle: &NapiContextHandle,
-    delegator_did: String,
-    delegatee_did: String,
-    parent_token: String,
-    capabilities: Vec<String>,
-) -> napi::Result<NapiUcanToken> {
-    let bi = default_bridge_instance()?;
-    ucan_delegate_on(
-        &bi,
-        handle,
-        delegator_did,
-        delegatee_did,
-        parent_token,
-        capabilities,
-    )
-    .await
 }
 
 /// Per-bridge-instance implementation of [`ucan_delegate`].
@@ -682,44 +540,6 @@ pub(crate) async fn ucan_delegate_on(
             instance_id: bi.instance_id(),
         })
     }
-}
-
-/// Revokes a UCAN token using the full revocation pipeline.
-///
-/// Performs the complete UCAN revocation flow from ADR-016:
-///
-/// 1. **Authorization** -- Verifies the revoker is the token's issuer or the
-///    context creator.
-/// 2. **Local revocation** -- Adds the token CID to the context's
-///    `RevocationList` (fail-closed via `RevocationPending` state).
-/// 3. **Distribution** -- Logs the revocation for transport-layer broadcast.
-/// 4. **Event logging** -- Appends a `TokenRevoked` event to the context's
-///    Merkle event log.
-///
-/// # Arguments
-///
-/// * `handle` — The context the token belongs to.
-/// * `token` — The full encoded JWT string of the token to revoke.
-/// * `revoker_did` — The DID of the entity requesting the revocation. Must
-///   be either the token's issuer or the context creator.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-CTX-2023` if the context runtime is not initialized.
-/// - Rejects with `SCP-PERM-3001` if the token cannot be parsed.
-/// - Rejects with `SCP-PERM-3001` if the revoker is unauthorized.
-///
-/// Closes #499.
-#[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
-#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub async fn ucan_revoke(
-    handle: &NapiContextHandle,
-    token: String,
-    revoker_did: String,
-) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    ucan_revoke_on(&bi, handle, token, revoker_did).await
 }
 
 /// Per-bridge-instance implementation of [`ucan_revoke`].

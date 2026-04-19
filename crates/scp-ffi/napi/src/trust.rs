@@ -70,13 +70,6 @@ fn validation_error(msg: &str) -> napi::Error {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Queries participation-based trust data for a DID within a context.
-#[napi]
-pub fn trust_query_score(did: String, context_id: String) -> napi::Result<NapiTrustScoreResult> {
-    let bi = default_bridge_instance()?;
-    trust_query_score_on(&bi, did, context_id)
-}
-
 /// Per-bridge-instance implementation of [`trust_query_score`].
 pub(crate) fn trust_query_score_on(
     bi: &NapiBridgeInstance,
@@ -298,42 +291,6 @@ pub(crate) fn verify_participation_requirements_on(
 // aggregate_trust_input (§7.3)
 // ---------------------------------------------------------------------------
 
-/// Aggregates all trust engine layers into a single `TrustInput` for
-/// agent-level evaluation.
-///
-/// Uses the global `ProtocolRepository` for persistent trust data when
-/// initialized (trust data survives across calls); falls back to an
-/// ephemeral in-memory store otherwise. See issue #502.
-///
-/// See ADR-017 acceptance criterion 9, spec §7.3.
-#[napi]
-#[allow(clippy::too_many_arguments)]
-pub fn aggregate_trust_input(
-    context_id: String,
-    subject_did: String,
-    events_json: String,
-    merkle_root_json: String,
-    consequence_rules_json: String,
-    threshold_requirements_json: String,
-    attestor_sets_json: String,
-    cached_attestations_json: String,
-    challenge_results_json: String,
-) -> napi::Result<String> {
-    let bi = default_bridge_instance()?;
-    aggregate_trust_input_on(
-        &bi,
-        context_id,
-        subject_did,
-        events_json,
-        merkle_root_json,
-        consequence_rules_json,
-        threshold_requirements_json,
-        attestor_sets_json,
-        cached_attestations_json,
-        challenge_results_json,
-    )
-}
-
 /// Per-bridge-instance implementation of [`aggregate_trust_input`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn aggregate_trust_input_on(
@@ -451,19 +408,19 @@ mod tests {
 
     #[test]
     fn trust_query_score_validates_empty_did() {
-        let result = trust_query_score(String::new(), "ctx".to_owned());
+        let result = trust_query_score_on(&crate::runtime::default_bridge_instance().unwrap(), String::new(), "ctx".to_owned());
         assert!(result.is_err());
     }
 
     #[test]
     fn trust_query_score_validates_empty_context() {
-        let result = trust_query_score("did:key:test".to_owned(), String::new());
+        let result = trust_query_score_on(&crate::runtime::default_bridge_instance().unwrap(), "did:key:test".to_owned(), String::new());
         assert!(result.is_err());
     }
 
     #[test]
     fn trust_query_score_returns_zeros_for_unknown_context() {
-        let result = trust_query_score("did:key:test".to_owned(), "nonexistent-ctx".to_owned());
+        let result = trust_query_score_on(&crate::runtime::default_bridge_instance().unwrap(), "did:key:test".to_owned(), "nonexistent-ctx".to_owned());
         assert!(result.is_ok());
         let score = result.unwrap();
         assert_eq!(score.message_count, 0);
@@ -518,7 +475,7 @@ mod tests {
 
     #[test]
     fn aggregate_trust_input_rejects_empty_context() {
-        let result = aggregate_trust_input(
+        let result = aggregate_trust_input_on(&crate::runtime::default_bridge_instance().unwrap(), 
             String::new(),
             "did:key:test".to_owned(),
             "[]".to_owned(),
@@ -534,7 +491,7 @@ mod tests {
 
     #[test]
     fn aggregate_trust_input_rejects_invalid_events_json() {
-        let result = aggregate_trust_input(
+        let result = aggregate_trust_input_on(&crate::runtime::default_bridge_instance().unwrap(), 
             "ctx-1".to_owned(),
             "did:key:test".to_owned(),
             "not json".to_owned(),

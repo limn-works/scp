@@ -116,17 +116,6 @@ impl NapiFullStackNode {
 // Exported NAPI functions
 // ---------------------------------------------------------------------------
 
-/// Creates a full-stack test node with real MLS crypto.
-///
-/// All nodes created via this function share a single `FullStackNetwork`
-/// (and therefore a single [`KeyExchange`]), enabling Welcome message and
-/// sender key exchange between them.
-#[napi]
-pub fn fullstack_create_node(did: String) -> napi::Result<NapiFullStackNode> {
-    let bi = default_bridge_instance()?;
-    Ok(fullstack_create_node_on(&bi, did))
-}
-
 /// Per-bridge-instance implementation of [`fullstack_create_node`].
 pub(crate) fn fullstack_create_node_on(bi: &NapiBridgeInstance, did: String) -> NapiFullStackNode {
     let instance_id = bi.instance_id();
@@ -140,17 +129,6 @@ pub(crate) fn fullstack_create_node_on(bi: &NapiBridgeInstance, did: String) -> 
     })
 }
 
-/// Resets the default bridge instance's `FullStackNetwork`, dropping all
-/// nodes and state.
-///
-/// Call between test suites to prevent cross-test state leakage.
-#[napi]
-pub fn fullstack_reset_network() -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    fullstack_reset_network_on(&bi);
-    Ok(())
-}
-
 /// Per-bridge-instance implementation of [`fullstack_reset_network`].
 pub(crate) fn fullstack_reset_network_on(bi: &NapiBridgeInstance) {
     let mut guard = bi
@@ -158,21 +136,6 @@ pub(crate) fn fullstack_reset_network_on(bi: &NapiBridgeInstance) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *guard = None;
-}
-
-/// Creates an encrypted context owned by the given node.
-///
-/// Returns the context ID string on success. The `ceiling_json` parameter
-/// is a JSON-encoded object with optional `ceiling` (string array) and
-/// `governance` (string) fields.
-#[napi]
-pub fn fullstack_create_context(
-    node: &NapiFullStackNode,
-    context_id: String,
-    ceiling_json: String,
-) -> napi::Result<String> {
-    let bi = default_bridge_instance()?;
-    fullstack_create_context_on(&bi, node, context_id, ceiling_json)
 }
 
 /// Per-bridge-instance implementation of [`fullstack_create_context`].
@@ -243,22 +206,6 @@ pub(crate) fn fullstack_create_context_on(
     Ok(context_id)
 }
 
-/// Adds a member to the context (admin-side operation).
-///
-/// Internally calls `add_member` on the node's `FullStackNode`, which
-/// triggers `crypto.add_member` (capturing the Welcome) and
-/// `crypto.distribute_sender_key` (depositing the sender key in the shared
-/// `KeyExchange`).
-#[napi]
-pub fn fullstack_add_member(
-    node: &NapiFullStackNode,
-    context_id: String,
-    member_did: String,
-) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    fullstack_add_member_on(&bi, node, context_id, member_did)
-}
-
 /// Per-bridge-instance implementation of [`fullstack_add_member`].
 pub(crate) fn fullstack_add_member_on(
     _bi: &NapiBridgeInstance,
@@ -288,23 +235,6 @@ pub(crate) fn fullstack_add_member_on(
                 code: codes::CRYPTO_4050.to_owned(),
             })
         })
-}
-
-/// Joins a context by retrieving the Welcome from the shared `KeyExchange`.
-///
-/// This is the joiner-side operation. The adder must have called
-/// `fullstack_add_member` first to deposit the Welcome and sender keys.
-///
-/// After joining, the context is registered on the joiner's `ContextManager`
-/// with a `ContextHandle`, enabling subsequent `fullstack_send_message` and
-/// `fullstack_remove_member` calls on this node.
-#[napi]
-pub fn fullstack_join_from_welcome(
-    node: &NapiFullStackNode,
-    context_id: String,
-) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    fullstack_join_from_welcome_on(&bi, node, context_id)
 }
 
 /// Per-bridge-instance implementation of [`fullstack_join_from_welcome`].
@@ -385,24 +315,6 @@ pub(crate) fn fullstack_join_from_welcome_on(
     Ok(())
 }
 
-/// Synchronises sender keys between two nodes for a given context.
-///
-/// Each node distributes its own sender key to the other via the shared
-/// `KeyExchange`, then picks up the other's key. After this call, both
-/// nodes can encrypt and decrypt messages from each other.
-///
-/// Call this after `fullstack_join_from_welcome` to enable bidirectional
-/// messaging in tests.
-#[napi]
-pub fn fullstack_sync_sender_keys(
-    node_a: &NapiFullStackNode,
-    node_b: &NapiFullStackNode,
-    context_id: String,
-) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    fullstack_sync_sender_keys_on(&bi, node_a, node_b, context_id)
-}
-
 /// Per-bridge-instance implementation of [`fullstack_sync_sender_keys`].
 pub(crate) fn fullstack_sync_sender_keys_on(
     _bi: &NapiBridgeInstance,
@@ -451,21 +363,6 @@ pub(crate) fn fullstack_sync_sender_keys_on(
     })?;
 
     Ok(())
-}
-
-/// Encrypts a message and returns the ciphertext.
-///
-/// Uses the node's real `ContextManager` + `E2eCryptoProvider` for double
-/// encryption (sender key AES-256-GCM + MLS). The ciphertext is captured
-/// by the node's `CapturingTransport` and returned here.
-#[napi]
-pub fn fullstack_send_message(
-    node: &NapiFullStackNode,
-    context_id: String,
-    payload: Buffer,
-) -> napi::Result<Buffer> {
-    let bi = default_bridge_instance()?;
-    fullstack_send_message_on(&bi, node, context_id, payload)
 }
 
 /// Per-bridge-instance implementation of [`fullstack_send_message`].
@@ -519,22 +416,6 @@ pub(crate) fn fullstack_send_message_on(
     Ok(Buffer::from(sent[0].1.clone()))
 }
 
-/// Decrypts a message using the node's real MLS + sender key crypto.
-///
-/// Automatically processes any pending MLS commits first so the group
-/// epoch is current (handles multi-party scenarios where a third member
-/// was added after this node last synced).
-#[napi]
-pub fn fullstack_decrypt_message(
-    node: &NapiFullStackNode,
-    context_id: String,
-    ciphertext: Buffer,
-    sender_did: String,
-) -> napi::Result<Buffer> {
-    let bi = default_bridge_instance()?;
-    fullstack_decrypt_message_on(&bi, node, context_id, ciphertext, sender_did)
-}
-
 /// Per-bridge-instance implementation of [`fullstack_decrypt_message`].
 pub(crate) fn fullstack_decrypt_message_on(
     _bi: &NapiBridgeInstance,
@@ -555,20 +436,6 @@ pub(crate) fn fullstack_decrypt_message_on(
         })?;
 
     Ok(Buffer::from(plaintext))
-}
-
-/// Removes a member from the context.
-///
-/// After removal, the removed member should not be able to decrypt
-/// new messages (MLS forward secrecy).
-#[napi]
-pub fn fullstack_remove_member(
-    node: &NapiFullStackNode,
-    context_id: String,
-    member_did: String,
-) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    fullstack_remove_member_on(&bi, node, context_id, member_did)
 }
 
 /// Per-bridge-instance implementation of [`fullstack_remove_member`].

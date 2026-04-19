@@ -517,18 +517,6 @@ async fn run_mcp_stdio_server(
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Starts an MCP server exposing SCP context tools.
-///
-/// # Returns
-///
-/// A `Promise<NapiMcpServerHandle>` for stopping the server.
-#[napi]
-#[allow(clippy::unused_async)]
-pub async fn mcp_server_create(config: NapiMcpServerConfig) -> napi::Result<NapiMcpServerHandle> {
-    let bi = default_bridge_instance()?;
-    mcp_server_create_on(&bi, config).await
-}
-
 /// Per-bridge-instance implementation of [`mcp_server_create`].
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_server_create_on(
@@ -610,14 +598,6 @@ pub(crate) async fn mcp_server_create_on(
     })
 }
 
-/// Stops a running MCP server.
-#[napi]
-#[allow(clippy::unused_async)]
-pub async fn mcp_server_stop(handle: &NapiMcpServerHandle) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    mcp_server_stop_on(&bi, handle).await
-}
-
 /// Per-bridge-instance implementation of [`mcp_server_stop`].
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_server_stop_on(
@@ -655,17 +635,6 @@ pub(crate) async fn mcp_server_stop_on(
     bi.mcp_server_registry().remove(&handle.handle_id);
 
     Ok(())
-}
-
-/// Connects to an external MCP server via stdio transport.
-///
-/// Spawns the given command as a subprocess, communicates via line-delimited
-/// JSON over stdin/stdout, and performs the MCP initialize handshake.
-#[napi]
-#[allow(clippy::unused_async)]
-pub async fn mcp_client_connect_stdio(command: Vec<String>) -> napi::Result<NapiMcpClientHandle> {
-    let bi = default_bridge_instance()?;
-    mcp_client_connect_stdio_on(&bi, command).await
 }
 
 /// Per-bridge-instance implementation of [`mcp_client_connect_stdio`].
@@ -711,14 +680,6 @@ pub(crate) async fn mcp_client_connect_stdio_on(
     })
 }
 
-/// Connects to an external MCP server via SSE transport.
-#[napi]
-#[allow(clippy::unused_async)]
-pub async fn mcp_client_connect_sse(url: String) -> napi::Result<NapiMcpClientHandle> {
-    let bi = default_bridge_instance()?;
-    mcp_client_connect_sse_on(&bi, url).await
-}
-
 /// Per-bridge-instance implementation of [`mcp_client_connect_sse`].
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_client_connect_sse_on(
@@ -749,14 +710,6 @@ pub(crate) async fn mcp_client_connect_sse_on(
     })
 }
 
-/// Disconnects from an external MCP server.
-#[napi]
-#[allow(clippy::unused_async)]
-pub async fn mcp_client_disconnect(handle: &NapiMcpClientHandle) -> napi::Result<()> {
-    let bi = default_bridge_instance()?;
-    mcp_client_disconnect_on(&bi, handle).await
-}
-
 /// Per-bridge-instance implementation of [`mcp_client_disconnect`].
 #[allow(clippy::unused_async)]
 pub(crate) async fn mcp_client_disconnect_on(
@@ -773,16 +726,6 @@ pub(crate) async fn mcp_client_disconnect_on(
         .into());
     }
     Ok(())
-}
-
-/// Lists available tools from an external MCP server.
-#[napi]
-#[allow(clippy::unused_async)]
-pub async fn mcp_client_list_tools(
-    handle: &NapiMcpClientHandle,
-) -> napi::Result<Vec<NapiMcpToolInfo>> {
-    let bi = default_bridge_instance()?;
-    mcp_client_list_tools_on(&bi, handle).await
 }
 
 /// Per-bridge-instance implementation of [`mcp_client_list_tools`].
@@ -825,21 +768,6 @@ pub(crate) async fn mcp_client_list_tools_on(
                 .unwrap_or_else(|_| "{}".to_owned()),
         })
         .collect())
-}
-
-/// Invokes an external MCP tool with SCP provenance wrapping.
-#[napi]
-#[allow(clippy::unused_async)]
-#[allow(clippy::needless_pass_by_value)]
-pub async fn mcp_client_invoke(
-    handle: &NapiMcpClientHandle,
-    tool_name: String,
-    input_json: String,
-    context_id: String,
-    invoker_did: String,
-) -> napi::Result<NapiMcpInvokeResult> {
-    let bi = default_bridge_instance()?;
-    mcp_client_invoke_on(&bi, handle, tool_name, input_json, context_id, invoker_did).await
 }
 
 /// Per-bridge-instance implementation of [`mcp_client_invoke`].

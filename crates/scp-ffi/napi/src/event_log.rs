@@ -13,7 +13,7 @@ use scp_primitives::Clock;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
-use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
+use crate::runtime::NapiBridgeInstance;
 
 // ---------------------------------------------------------------------------
 // NapiEvent — protocol event record
@@ -57,38 +57,6 @@ pub struct NapiProof {
 // ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
-
-/// Queries the context event log with optional filter criteria.
-///
-/// Returns metadata about the event log: current event count and the Merkle
-/// root hash. Direct event replay requires the full transport layer; this
-/// function provides verifiable log state information.
-///
-/// # Arguments
-///
-/// * `handle` — The context whose event log to query (must be `"active"`).
-/// * `filter_json` — Optional JSON string with filter parameters:
-///   `event_type`, `actor_did`, `after_sequence`, `before_sequence`,
-///   `after_timestamp`, `before_timestamp`, `limit`. Pass `null` to return
-///   all events (up to the default limit).
-///
-/// # Returns
-///
-/// A `Promise<NapiEvent[]>` resolving to the matching events.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-CTX-2023` if the context is not found.
-/// - Rejects with `SCP-VALID-7000` if `filter_json` is not valid JSON.
-#[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
-pub async fn event_log_query(
-    handle: &NapiContextHandle,
-    filter_json: Option<String>,
-) -> napi::Result<Vec<NapiEvent>> {
-    let bi = default_bridge_instance()?;
-    event_log_query_on(&bi, handle, filter_json).await
-}
 
 /// Per-bridge-instance implementation of [`event_log_query`].
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
@@ -204,39 +172,6 @@ pub(crate) async fn event_log_query_on(
     } else {
         Ok(events)
     }
-}
-
-/// Verifies a claim against the context event log (Merkle proof).
-///
-/// Generates and verifies an inclusion or absence proof for the given claim.
-///
-/// # Arguments
-///
-/// * `handle` — The context whose event log to verify against.
-/// * `claim_json` — JSON string describing the claim:
-///   - `"type"`: `"inclusion"` or `"absence"`
-///   - `"leaf_index"` (for inclusion): event position in the log
-///   - `"event_hash"` (for absence): hex-encoded hash to prove absent
-///
-/// # Returns
-///
-/// A `Promise<NapiProof>` with the verification result and Merkle proof
-/// details.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-CTX-2025` if the context is not found or proof fails.
-/// - Rejects with `SCP-VALID-7000` if `claim_json` is not valid JSON or
-///   contains unrecognized proof type.
-#[napi]
-#[allow(clippy::unused_async)] // napi-rs requires async for Promise return
-#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub async fn event_log_verify(
-    handle: &NapiContextHandle,
-    claim_json: String,
-) -> napi::Result<NapiProof> {
-    let bi = default_bridge_instance()?;
-    event_log_verify_on(&bi, handle, claim_json).await
 }
 
 /// Per-bridge-instance implementation of [`event_log_verify`].
@@ -457,40 +392,6 @@ pub struct NapiCheckpoint {
     pub signature: String,
 }
 
-/// Generates a signed consistency checkpoint from the current event log state.
-///
-/// Creates a snapshot of the event log's Merkle root and event count, signs it
-/// with the caller's identity key, and returns the checkpoint. Checkpoints
-/// enable equivocation detection: members exchange signed Merkle roots and
-/// compare them to detect relay misbehavior.
-///
-/// # Arguments
-///
-/// * `handle` — The context whose event log to checkpoint.
-/// * `identity` — The identity generating the checkpoint (used for signing).
-/// * `epoch` — The current MLS epoch (pass 0 for Broadcast contexts).
-///
-/// # Returns
-///
-/// A `Promise<NapiCheckpoint>` containing the signed checkpoint data.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-PERM-3023` if key custody is not available.
-/// - Rejects with `SCP-CTX-2023` if the context is not found.
-///
-/// See ADR-011 acceptance criterion 8 and ADR-030.
-#[napi]
-#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned types
-pub fn event_log_checkpoint(
-    handle: &NapiContextHandle,
-    identity: &crate::identity::NapiIdentity,
-    epoch: f64,
-) -> napi::Result<NapiCheckpoint> {
-    let bi = default_bridge_instance()?;
-    event_log_checkpoint_on(&bi, handle, identity, epoch)
-}
-
 /// Per-bridge-instance implementation of [`event_log_checkpoint`].
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned types
 pub(crate) fn event_log_checkpoint_on(
@@ -573,41 +474,6 @@ pub(crate) fn event_log_checkpoint_on(
             signature: hex::encode(checkpoint.signature),
         })
     }
-}
-
-/// Generates a signed consistency checkpoint using a DID string to look up
-/// the identity from the global registry.
-///
-/// This variant accepts a DID string instead of a `NapiIdentity` reference,
-/// looking up the identity's key material from the global identity registry.
-/// This makes it callable from JavaScript without requiring the caller to
-/// pass the `NapiIdentity` JS object through the event log API.
-///
-/// # Arguments
-///
-/// * `handle` — The context whose event log to checkpoint.
-/// * `did` — The DID string of the identity generating the checkpoint.
-/// * `epoch` — The current MLS epoch (pass 0 for Broadcast contexts).
-///
-/// # Returns
-///
-/// A `NapiCheckpoint` containing the signed checkpoint data.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-PERM-3023` if the DID is not in the identity registry.
-/// - Rejects with `SCP-CTX-2023` if the context is not found.
-///
-/// See #1144 (C4).
-#[napi(js_name = "eventLogCheckpointByDid")]
-#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned types
-pub fn event_log_checkpoint_by_did(
-    handle: &NapiContextHandle,
-    did: String,
-    epoch: f64,
-) -> napi::Result<NapiCheckpoint> {
-    let bi = default_bridge_instance()?;
-    event_log_checkpoint_by_did_on(&bi, handle, did, epoch)
 }
 
 /// Per-bridge-instance implementation of [`event_log_checkpoint_by_did`].

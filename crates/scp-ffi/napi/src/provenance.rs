@@ -96,43 +96,6 @@ pub(crate) async fn evaluate_provenance_quality_on(
     Ok(quality as u32)
 }
 
-/// Attaches provenance metadata when data crosses a context boundary.
-///
-/// Records dual events in the event log: `ProvenanceAttached` in the source
-/// context and `ProvenanceReceived` in the target context (issue #586).
-///
-/// Returns a JSON string with the attached provenance record.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_arguments)] // napi-rs requires explicit params
-pub fn provenance_attach(
-    source_context_id: String,
-    source_type: String,
-    memory_scope: String,
-    members: Vec<String>,
-    target_context_id: String,
-    actor_did: String,
-    existing_chain_depth: Option<u32>,
-    discovery_method: Option<String>,
-    purpose: Option<String>,
-    counterparty_policy: Option<String>,
-) -> napi::Result<String> {
-    let bi = default_bridge_instance()?;
-    provenance_attach_on(
-        &bi,
-        source_context_id,
-        source_type,
-        memory_scope,
-        members,
-        target_context_id,
-        actor_did,
-        existing_chain_depth,
-        discovery_method,
-        purpose,
-        counterparty_policy,
-    )
-}
-
 /// Per-bridge-instance implementation of [`provenance_attach`].
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)] // napi-rs requires explicit params
