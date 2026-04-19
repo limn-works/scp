@@ -1,19 +1,26 @@
 //! `PyO3` bridge functions for SCP economic governance.
 //!
-//! Exposes economic operations to Python:
+//! Exposes economic operations to Python as methods on the `SCP` class:
 //!
-//! - [`py_economy_estimate_cost`] — Estimate cost for an action in a context.
-//! - [`py_economy_policy_requires_payment`] — Check if a policy requires payment.
-//! - [`py_economy_auto_accept_blocked`] — Check if auto-accept is blocked by economics.
-//! - [`py_economy_check_policy_lock`] — Check if economic policy mutation is allowed.
-//! - [`py_economy_validate_policy_change`] — Validate a proposed policy change.
-//! - [`py_economy_evaluate_formula`] — Evaluate a pricing formula against metrics.
-//! - [`py_economy_budget_remaining`] — Query remaining budget for a member.
-//! - [`py_economy_budget_grant`] — Grant spending budget to a member.
-//! - [`py_economy_budget_record_spend`] — Record a spend against a member's budget.
-//! - [`py_economy_antispam_record`] — Record a message for velocity tracking.
-//! - [`py_economy_antispam_velocity`] — Query sender velocity.
-//! - [`py_economy_antispam_escalated_cost`] — Compute escalated cost for a sender.
+//! - [`PyScp::economy_estimate_cost`] — Estimate cost for an action in a context.
+//! - [`PyScp::economy_policy_requires_payment`] — Check if a policy requires payment.
+//! - [`PyScp::economy_auto_accept_blocked`] — Check if auto-accept is blocked by economics.
+//! - [`PyScp::economy_check_policy_lock`] — Check if economic policy mutation is allowed.
+//! - [`PyScp::economy_validate_policy_change`] — Validate a proposed policy change.
+//! - [`PyScp::economy_evaluate_formula`] — Evaluate a pricing formula against metrics.
+//! - [`PyScp::economy_budget_remaining`] — Query remaining budget for a member.
+//! - [`PyScp::economy_budget_grant`] — Grant spending budget to a member.
+//! - [`PyScp::economy_budget_record_spend`] — Record a spend against a member's budget.
+//! - [`PyScp::economy_antispam_record`] — Record a message for velocity tracking.
+//! - [`PyScp::economy_antispam_velocity`] — Query sender velocity.
+//! - [`PyScp::economy_antispam_escalated_cost`] — Compute escalated cost for a sender.
+//!
+//! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
+//! methods in Phase 4 PR 4 sub-slice D (#1549). Pure helpers
+//! (`economy_estimate_cost`, `economy_policy_requires_payment`,
+//! `economy_auto_accept_blocked`, `economy_check_policy_lock`,
+//! `economy_validate_policy_change`, `economy_evaluate_formula`) remain as
+//! free `#[pyfunction]` exports — they have no bridge-state dependency.
 //!
 //! See spec section 19 (Economic Governance) and ADR-033.
 
@@ -246,168 +253,173 @@ pub fn py_economy_evaluate_formula(
 }
 
 // ---------------------------------------------------------------------------
-// Budget tracker (stateful, per-context via runtime registry)
+// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4, #1549).
 // ---------------------------------------------------------------------------
 
-/// Queries the remaining budget for a member in a context.
-///
-/// Returns the remaining budget as an integer, or 0 if no budget is allocated.
-#[pyfunction]
-#[pyo3(name = "economy_budget_remaining")]
-pub fn py_economy_budget_remaining(context_id: &str, did: &str) -> PyResult<u64> {
-    validate::validate_context_id(context_id)?;
-    validate::validate_did(did)?;
+#[pymethods]
+impl crate::scp::PyScp {
+    /// Queries the remaining budget for a member in a context.
+    ///
+    /// Returns the remaining budget as an integer, or 0 if no budget is allocated.
+    #[pyo3(name = "economy_budget_remaining")]
+    pub fn economy_budget_remaining(&self, context_id: &str, did: &str) -> PyResult<u64> {
+        let bi = &*self.inner;
+        validate::validate_context_id(context_id)?;
+        validate::validate_did(did)?;
 
-    let member_did = scp_identity::DID::from(did);
-    let remaining = crate::runtime::bridge_instance()?
-        .core
-        .with_economy_budget(context_id, |tracker| tracker.remaining(&member_did));
-    Ok(remaining.value())
-}
+        let member_did = scp_identity::DID::from(did);
+        let remaining = bi
+            .core
+            .with_economy_budget(context_id, |tracker| tracker.remaining(&member_did));
+        Ok(remaining.value())
+    }
 
-/// Grants spending budget to a member in a context.
-///
-/// Grants are additive: granting 100 twice gives a total limit of 200.
-#[pyfunction]
-#[pyo3(name = "economy_budget_grant")]
-pub fn py_economy_budget_grant(context_id: &str, did: &str, amount: u64) -> PyResult<()> {
-    validate::validate_context_id(context_id)?;
-    validate::validate_did(did)?;
+    /// Grants spending budget to a member in a context.
+    ///
+    /// Grants are additive: granting 100 twice gives a total limit of 200.
+    #[pyo3(name = "economy_budget_grant")]
+    pub fn economy_budget_grant(&self, context_id: &str, did: &str, amount: u64) -> PyResult<()> {
+        let bi = &*self.inner;
+        validate::validate_context_id(context_id)?;
+        validate::validate_did(did)?;
 
-    let member_did = scp_identity::DID::from(did);
-    crate::runtime::bridge_instance()?
-        .core
-        .with_economy_budget_mut(context_id, |tracker| {
+        let member_did = scp_identity::DID::from(did);
+        bi.core.with_economy_budget_mut(context_id, |tracker| {
             tracker.grant(&member_did, scp_core::economy::Amount::new(amount));
         });
-    Ok(())
-}
+        Ok(())
+    }
 
-/// Records a spend against a member's budget in a context.
-///
-/// # Errors
-///
-/// Raises `ValueError` if the member has no budget or the spend would exceed
-/// the remaining budget.
-#[pyfunction]
-#[pyo3(name = "economy_budget_record_spend")]
-pub fn py_economy_budget_record_spend(context_id: &str, did: &str, amount: u64) -> PyResult<()> {
-    validate::validate_context_id(context_id)?;
-    validate::validate_did(did)?;
+    /// Records a spend against a member's budget in a context.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValueError` if the member has no budget or the spend would exceed
+    /// the remaining budget.
+    #[pyo3(name = "economy_budget_record_spend")]
+    pub fn economy_budget_record_spend(
+        &self,
+        context_id: &str,
+        did: &str,
+        amount: u64,
+    ) -> PyResult<()> {
+        let bi = &*self.inner;
+        validate::validate_context_id(context_id)?;
+        validate::validate_did(did)?;
 
-    let member_did = scp_identity::DID::from(did);
-    crate::runtime::bridge_instance()?
-        .core
-        .with_economy_budget_mut(context_id, |tracker| {
+        let member_did = scp_identity::DID::from(did);
+        bi.core.with_economy_budget_mut(context_id, |tracker| {
             tracker
                 .record_spend(&member_did, scp_core::economy::Amount::new(amount))
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e}")))
         })
-}
+    }
 
-// ---------------------------------------------------------------------------
-// Antispam velocity tracker (stateful, per-context via runtime registry)
-// ---------------------------------------------------------------------------
+    /// Records a message from a sender for antispam velocity tracking.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` — The context ID.
+    /// * `sender_did` — The sender's DID.
+    /// * `timestamp` — Unix timestamp in seconds.
+    #[pyo3(name = "economy_antispam_record")]
+    pub fn economy_antispam_record(
+        &self,
+        context_id: &str,
+        sender_did: &str,
+        timestamp: u64,
+    ) -> PyResult<()> {
+        let bi = &*self.inner;
+        validate::validate_context_id(context_id)?;
+        validate::validate_did(sender_did)?;
 
-/// Records a message from a sender for antispam velocity tracking.
-///
-/// # Arguments
-///
-/// * `context_id` — The context ID.
-/// * `sender_did` — The sender's DID.
-/// * `timestamp` — Unix timestamp in seconds.
-#[pyfunction]
-#[pyo3(name = "economy_antispam_record")]
-pub fn py_economy_antispam_record(
-    context_id: &str,
-    sender_did: &str,
-    timestamp: u64,
-) -> PyResult<()> {
-    validate::validate_context_id(context_id)?;
-    validate::validate_did(sender_did)?;
-
-    let did = scp_identity::DID::from(sender_did);
-    crate::runtime::bridge_instance()?
-        .core
-        .with_economy_antispam(context_id, |tracker| {
+        let did = scp_identity::DID::from(sender_did);
+        bi.core.with_economy_antispam(context_id, |tracker| {
             tracker.record_message(&did, timestamp);
         });
-    Ok(())
-}
+        Ok(())
+    }
 
-/// Queries the sender's message velocity (messages within the sliding window).
-///
-/// # Arguments
-///
-/// * `context_id` — The context ID.
-/// * `sender_did` — The sender's DID.
-/// * `now` — Current Unix timestamp in seconds.
-///
-/// # Returns
-///
-/// Message count within the sliding window.
-#[pyfunction]
-#[pyo3(name = "economy_antispam_velocity")]
-pub fn py_economy_antispam_velocity(context_id: &str, sender_did: &str, now: u64) -> PyResult<u64> {
-    validate::validate_context_id(context_id)?;
-    validate::validate_did(sender_did)?;
+    /// Queries the sender's message velocity (messages within the sliding window).
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` — The context ID.
+    /// * `sender_did` — The sender's DID.
+    /// * `now` — Current Unix timestamp in seconds.
+    ///
+    /// # Returns
+    ///
+    /// Message count within the sliding window.
+    #[pyo3(name = "economy_antispam_velocity")]
+    pub fn economy_antispam_velocity(
+        &self,
+        context_id: &str,
+        sender_did: &str,
+        now: u64,
+    ) -> PyResult<u64> {
+        let bi = &*self.inner;
+        validate::validate_context_id(context_id)?;
+        validate::validate_did(sender_did)?;
 
-    let did = scp_identity::DID::from(sender_did);
-    let velocity = crate::runtime::bridge_instance()?
-        .core
-        .with_economy_antispam(context_id, |tracker| tracker.get_velocity(&did, now));
-    Ok(velocity)
-}
+        let did = scp_identity::DID::from(sender_did);
+        let velocity = bi
+            .core
+            .with_economy_antispam(context_id, |tracker| tracker.get_velocity(&did, now));
+        Ok(velocity)
+    }
 
-/// Computes the escalated cost for a sender based on antispam velocity.
-///
-/// # Arguments
-///
-/// * `context_id` — The context ID.
-/// * `sender_did` — The sender's DID.
-/// * `now` — Current Unix timestamp in seconds.
-/// * `base_cost` — Base cost (smallest currency unit).
-/// * `thresholds_json` — JSON array of `[velocity_threshold, additional_cost]`
-///   pairs.
-/// * `floor` — Optional minimum cost.
-/// * `cap` — Optional maximum cost.
-///
-/// # Returns
-///
-/// Escalated cost as integer (smallest currency unit).
-#[pyfunction]
-#[pyo3(name = "economy_antispam_escalated_cost", signature = (context_id, sender_did, now, base_cost, thresholds_json, floor=None, cap=None))]
-#[allow(clippy::too_many_arguments)]
-pub fn py_economy_antispam_escalated_cost(
-    context_id: &str,
-    sender_did: &str,
-    now: u64,
-    base_cost: u64,
-    thresholds_json: &str,
-    floor: Option<u64>,
-    cap: Option<u64>,
-) -> PyResult<u64> {
-    validate::validate_context_id(context_id)?;
-    validate::validate_did(sender_did)?;
+    /// Computes the escalated cost for a sender based on antispam velocity.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` — The context ID.
+    /// * `sender_did` — The sender's DID.
+    /// * `now` — Current Unix timestamp in seconds.
+    /// * `base_cost` — Base cost (smallest currency unit).
+    /// * `thresholds_json` — JSON array of `[velocity_threshold, additional_cost]`
+    ///   pairs.
+    /// * `floor` — Optional minimum cost.
+    /// * `cap` — Optional maximum cost.
+    ///
+    /// # Returns
+    ///
+    /// Escalated cost as integer (smallest currency unit).
+    #[pyo3(name = "economy_antispam_escalated_cost", signature = (context_id, sender_did, now, base_cost, thresholds_json, floor=None, cap=None))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn economy_antispam_escalated_cost(
+        &self,
+        context_id: &str,
+        sender_did: &str,
+        now: u64,
+        base_cost: u64,
+        thresholds_json: &str,
+        floor: Option<u64>,
+        cap: Option<u64>,
+    ) -> PyResult<u64> {
+        let bi = &*self.inner;
+        validate::validate_context_id(context_id)?;
+        validate::validate_did(sender_did)?;
 
-    let thresholds: Vec<(u64, u64)> = serde_json::from_str(thresholds_json).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("failed to parse thresholds JSON: {e}"))
-    })?;
+        let thresholds: Vec<(u64, u64)> =
+            serde_json::from_str(thresholds_json).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "failed to parse thresholds JSON: {e}"
+                ))
+            })?;
 
-    let config = scp_core::economy::EscalationConfig {
-        thresholds: thresholds
-            .into_iter()
-            .map(|(vel, cost)| scp_core::economy::EscalationThreshold {
-                velocity_threshold: vel,
-                additional_cost: scp_core::economy::Amount::new(cost),
-            })
-            .collect(),
-    };
+        let config = scp_core::economy::EscalationConfig {
+            thresholds: thresholds
+                .into_iter()
+                .map(|(vel, cost)| scp_core::economy::EscalationThreshold {
+                    velocity_threshold: vel,
+                    additional_cost: scp_core::economy::Amount::new(cost),
+                })
+                .collect(),
+        };
 
-    let did = scp_identity::DID::from(sender_did);
-    let cost = crate::runtime::bridge_instance()?
-        .core
-        .with_economy_antispam(context_id, |tracker| {
+        let did = scp_identity::DID::from(sender_did);
+        let cost = bi.core.with_economy_antispam(context_id, |tracker| {
             tracker.compute_escalated_cost(
                 &did,
                 now,
@@ -417,7 +429,8 @@ pub fn py_economy_antispam_escalated_cost(
                 cap.map(scp_core::economy::Amount::new),
             )
         });
-    Ok(cost.value())
+        Ok(cost.value())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +438,11 @@ pub fn py_economy_antispam_escalated_cost(
 // ---------------------------------------------------------------------------
 
 /// Registers all economy bridge functions with the Python module.
+///
+/// Post-migration (Phase 4 PR 4 sub-slice D), stateful economy operations are
+/// exposed as methods on `SCP` (see the `#[pymethods]` block above). Only pure
+/// helpers (cost estimation, policy inspection, formula evaluation) remain as
+/// free `#[pyfunction]` exports.
 pub fn register_economy(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_economy_estimate_cost, m)?)?;
     m.add_function(wrap_pyfunction!(py_economy_policy_requires_payment, m)?)?;
@@ -432,12 +450,6 @@ pub fn register_economy(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_economy_check_policy_lock, m)?)?;
     m.add_function(wrap_pyfunction!(py_economy_validate_policy_change, m)?)?;
     m.add_function(wrap_pyfunction!(py_economy_evaluate_formula, m)?)?;
-    m.add_function(wrap_pyfunction!(py_economy_budget_remaining, m)?)?;
-    m.add_function(wrap_pyfunction!(py_economy_budget_grant, m)?)?;
-    m.add_function(wrap_pyfunction!(py_economy_budget_record_spend, m)?)?;
-    m.add_function(wrap_pyfunction!(py_economy_antispam_record, m)?)?;
-    m.add_function(wrap_pyfunction!(py_economy_antispam_velocity, m)?)?;
-    m.add_function(wrap_pyfunction!(py_economy_antispam_escalated_cost, m)?)?;
     Ok(())
 }
 
