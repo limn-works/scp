@@ -19,7 +19,7 @@ use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams, c
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
 
 use crate::error::ScpNapiError;
-use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
+use crate::runtime::NapiBridgeInstance;
 
 // ---------------------------------------------------------------------------
 // Shared network
@@ -38,24 +38,11 @@ use crate::runtime::{NapiBridgeInstance, default_bridge_instance};
 // `fullstack_reset_network` entry point.
 // ---------------------------------------------------------------------------
 
-/// Returns the result of calling `f` with the default bridge instance's
-/// `FullStackNetwork`.
+/// Per-bridge-instance implementation of `with_network`.
 ///
-/// All nodes created via `fullstack_create_node` on the same instance share
-/// the same `KeyExchange` so Welcome messages and sender keys can be
+/// All nodes created via `fullstack_create_node_on` on the same instance
+/// share the same `KeyExchange` so Welcome messages and sender keys can be
 /// exchanged between them.
-//
-// Retained alongside `with_network_on` until the Phase 4 demolition slice.
-#[allow(dead_code)]
-fn with_network<F, R>(f: F) -> napi::Result<R>
-where
-    F: FnOnce(&FullStackNetwork) -> R,
-{
-    let bi = default_bridge_instance()?;
-    Ok(with_network_on(&bi, f))
-}
-
-/// Per-bridge-instance implementation of [`with_network`].
 fn with_network_on<F, R>(bi: &NapiBridgeInstance, f: F) -> R
 where
     F: FnOnce(&FullStackNetwork) -> R,
@@ -90,9 +77,7 @@ pub struct NapiFullStackNode {
     inner: FullStackNode,
     /// Stored context handles, keyed by context ID string.
     handles: Mutex<HashMap<String, ContextHandle>>,
-    /// `NapiBridgeInstance` id that minted this node. In the testing
-    /// harness this is always the default instance — cross-instance
-    /// isolation on test doubles is meaningless.
+    /// `NapiBridgeInstance` id that minted this node.
     pub(crate) instance_id: u64,
 }
 

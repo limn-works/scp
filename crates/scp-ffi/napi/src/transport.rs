@@ -59,43 +59,10 @@ fn map_transport_lock_error(e: TransportLockError) -> ScpNapiError {
     }
 }
 
-/// Stores a `TransportManager` (called by [`transport_connect`]).
-///
-/// Wraps in `Arc` and delegates to [`CoreFields::set_transport`].
-/// If the `BridgeInstance` doesn't exist yet, lazily creates it from
-/// the existing `ContextManager`.
-///
-/// # Errors
-///
-/// Returns `ScpNapiError::Transport` if the lock is poisoned or the bridge
-/// is not initialized.
-//
-// Retained alongside `set_transport_manager_on` until the Phase 4 demolition
-// slice deletes the free-function transport entry points. Tests still exercise
-// this path; suppress the unused-function lint rather than delete prematurely.
-#[allow(dead_code)]
-fn set_transport_manager(manager: scp_transport::TransportManager) -> napi::Result<()> {
-    // Try existing bridge instance first; fall back to lazy creation
-    // from the existing ContextManager.
-    let bi = if let Ok(bi) = crate::runtime::bridge_instance() {
-        bi
-    } else {
-        let default_bi = crate::runtime::default_bridge_instance()?;
-        if let Ok(cm) = crate::runtime::context_manager(&default_bi) {
-            crate::runtime::attach_context_manager_to_bridge(cm.clone());
-        } else {
-            crate::runtime::ensure_bridge_instance();
-        }
-        crate::runtime::bridge_instance()?
-    };
-    bi.set_transport(Arc::new(manager))
-        .map_err(|e| napi::Error::from(map_transport_lock_error(e)))
-}
-
-/// Per-bridge-instance implementation of [`set_transport_manager`].
+/// Per-bridge-instance transport manager setter.
 ///
 /// Stores the transport manager on the given [`NapiBridgeInstance`]'s core
-/// fields rather than the process-global default.
+/// fields.
 fn set_transport_manager_on(
     bi: &NapiBridgeInstance,
     manager: scp_transport::TransportManager,
@@ -105,46 +72,25 @@ fn set_transport_manager_on(
         .map_err(|e| napi::Error::from(map_transport_lock_error(e)))
 }
 
-/// Stores a pre-built `Arc<TransportManager>` (called by [`crate::server`]
-/// auto-wire where the caller needs to construct the manager externally).
+/// Stores a pre-built `Arc<TransportManager>` on the given bridge instance
+/// (called by [`crate::server`] auto-wire where the caller needs to
+/// construct the manager externally).
 ///
 /// Delegates to [`CoreFields::set_transport`].
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Transport` if the lock is poisoned or the bridge
-/// is not initialized.
-pub(crate) fn set_transport_manager_arc(
+/// Returns `ScpNapiError::Transport` if the lock is poisoned.
+pub(crate) fn set_transport_manager_arc_on(
+    bi: &NapiBridgeInstance,
     manager: Arc<scp_transport::TransportManager>,
 ) -> Result<(), ScpNapiError> {
-    let bi = crate::runtime::bridge_instance().map_err(|_| ScpNapiError::Transport {
-        message: "bridge not initialized — call identityCreate before transport operations"
-            .to_owned(),
-        code: codes::TRANS_5002.to_owned(),
-    })?;
-    bi.set_transport(manager).map_err(map_transport_lock_error)
+    bi.core
+        .set_transport(manager)
+        .map_err(map_transport_lock_error)
 }
 
-/// Executes a closure with a read reference to the `TransportManager`.
-///
-/// Delegates to [`CoreFields::with_transport`].
-///
-/// # Errors
-///
-/// Returns `ScpNapiError::Transport` if the lock is poisoned, no
-/// transport manager has been initialized, or the bridge is not initialized.
-//
-// Retained alongside `with_transport_manager_on` until demolition slice.
-#[allow(dead_code)]
-pub(crate) fn with_transport_manager<T>(
-    f: impl FnOnce(&scp_transport::TransportManager) -> napi::Result<T>,
-) -> napi::Result<T> {
-    let bi = crate::runtime::bridge_instance()?;
-    bi.with_transport(f)
-        .map_err(|e| napi::Error::from(map_transport_lock_error(e)))?
-}
-
-/// Per-bridge-instance implementation of [`with_transport_manager`].
+/// Per-bridge-instance implementation of `with_transport_manager`.
 pub(crate) fn with_transport_manager_on<T>(
     bi: &NapiBridgeInstance,
     f: impl FnOnce(&scp_transport::TransportManager) -> napi::Result<T>,
@@ -154,28 +100,7 @@ pub(crate) fn with_transport_manager_on<T>(
         .map_err(|e| napi::Error::from(map_transport_lock_error(e)))?
 }
 
-/// Executes a closure with a mutable reference to the `TransportManager`.
-///
-/// Delegates to [`CoreFields::with_transport_mut`]. Requires exclusive
-/// `Arc` ownership (refcount == 1). If subscription tasks hold cloned
-/// `Arc` references, this fails with `SCP-TRANS-5003`.
-///
-/// # Errors
-///
-/// Returns `ScpNapiError::Transport` if the lock is poisoned, no
-/// transport manager has been initialized, or the manager is in use.
-//
-// Retained alongside `with_transport_manager_mut_on` until demolition slice.
-#[allow(dead_code)]
-pub(crate) fn with_transport_manager_mut<T>(
-    f: impl FnOnce(&mut scp_transport::TransportManager) -> napi::Result<T>,
-) -> napi::Result<T> {
-    let bi = crate::runtime::bridge_instance()?;
-    bi.with_transport_mut(f)
-        .map_err(|e| napi::Error::from(map_transport_lock_error(e)))?
-}
-
-/// Per-bridge-instance implementation of [`with_transport_manager_mut`].
+/// Per-bridge-instance implementation of `with_transport_manager_mut`.
 pub(crate) fn with_transport_manager_mut_on<T>(
     bi: &NapiBridgeInstance,
     f: impl FnOnce(&mut scp_transport::TransportManager) -> napi::Result<T>,
@@ -185,15 +110,8 @@ pub(crate) fn with_transport_manager_mut_on<T>(
         .map_err(|e| napi::Error::from(map_transport_lock_error(e)))?
 }
 
-/// Returns `true` if a transport manager has been initialized.
-//
-// Retained alongside `has_transport_manager_on` until demolition slice.
-#[allow(dead_code)]
-fn has_transport_manager() -> bool {
-    crate::runtime::bridge_instance().is_ok_and(scp_ffi_common::CoreFields::has_transport)
-}
-
-/// Per-bridge-instance implementation of [`has_transport_manager`].
+/// Returns `true` if a transport manager has been initialized on the given
+/// bridge instance.
 fn has_transport_manager_on(bi: &NapiBridgeInstance) -> bool {
     scp_ffi_common::CoreFields::has_transport(&bi.core)
 }
@@ -209,37 +127,7 @@ pub(crate) fn get_transport_manager_on(
     bi.core.get_transport_arc().ok().flatten()
 }
 
-/// Default-bridge shim for [`get_transport_manager_on`].
-///
-/// Retained for call paths that have no `bi` in scope. Resolves the process-
-/// global default bridge instance via
-/// [`crate::runtime::default_bridge_instance`]. New callers should prefer
-/// [`get_transport_manager_on`] with an explicit bridge instance.
-#[allow(dead_code)]
-pub(crate) fn get_transport_manager() -> Option<Arc<scp_transport::TransportManager>> {
-    crate::runtime::default_bridge_instance()
-        .ok()
-        .and_then(|bi| get_transport_manager_on(&bi))
-}
-
-/// Clears the transport manager (called by [`transport_disconnect`]).
-///
-/// Delegates to [`CoreFields::clear_transport`].
-///
-/// # Errors
-///
-/// Returns `ScpNapiError::Transport` if the lock is poisoned or the bridge
-/// is not initialized.
-//
-// Retained alongside `clear_transport_manager_on` until demolition slice.
-#[allow(dead_code)]
-fn clear_transport_manager() -> napi::Result<()> {
-    let bi = crate::runtime::bridge_instance()?;
-    bi.clear_transport()
-        .map_err(|e| napi::Error::from(map_transport_lock_error(e)))
-}
-
-/// Per-bridge-instance implementation of [`clear_transport_manager`].
+/// Per-bridge-instance implementation of `clear_transport_manager`.
 fn clear_transport_manager_on(bi: &NapiBridgeInstance) -> napi::Result<()> {
     bi.core
         .clear_transport()
@@ -343,9 +231,12 @@ impl Drop for NapiTransportManager {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`transport_connect`].
+/// Per-bridge-instance implementation of `transport_connect`.
+///
+/// Takes an `Arc<NapiBridgeInstance>` so the spawned suppression-scoring
+/// task can hold a weak reference back to the bridge across await points.
 pub(crate) async fn transport_connect_on(
-    bi: &NapiBridgeInstance,
+    bi: &Arc<NapiBridgeInstance>,
     relay_url: String,
 ) -> napi::Result<NapiTransportManager> {
     validate_relay_url(&relay_url).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -388,9 +279,11 @@ pub(crate) async fn transport_connect_on(
             // suspend/resume cycles (#1678).
             bi.core.add_relay_url(relay_url.clone());
 
-            // Spawn suppression → scoring bridge task.
+            // Spawn suppression → scoring bridge task. Holds a `Weak` to the
+            // bridge instance so the task doesn't keep the bridge alive past
+            // shutdown.
             if let Some(rx) = suppression_rx {
-                spawn_suppression_scoring_task(rx, relay_url.clone());
+                spawn_suppression_scoring_task(Arc::downgrade(bi), rx, relay_url.clone());
             }
 
             let handle = NapiTransportManager {
@@ -536,9 +429,9 @@ pub struct NapiReliabilityScore {
 // Multi-relay management functions
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`transport_add_relay`].
+/// Per-bridge-instance implementation of `transport_add_relay`.
 pub(crate) async fn transport_add_relay_on(
-    bi: &NapiBridgeInstance,
+    bi: &Arc<NapiBridgeInstance>,
     relay_url: String,
 ) -> napi::Result<u32> {
     validate_relay_url(&relay_url).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -572,7 +465,7 @@ pub(crate) async fn transport_add_relay_on(
 
     // Spawn suppression → scoring bridge task.
     if let Some(rx) = suppression_rx {
-        spawn_suppression_scoring_task(rx, relay_url);
+        spawn_suppression_scoring_task(Arc::downgrade(bi), rx, relay_url);
     }
 
     Ok(count)
@@ -653,6 +546,7 @@ pub(crate) fn transport_reliability_on(
 /// The task exits gracefully when the sender half is dropped (adapter
 /// dropped or disconnected).
 fn spawn_suppression_scoring_task(
+    bi: std::sync::Weak<NapiBridgeInstance>,
     mut rx: tokio::sync::mpsc::Receiver<scp_transport::heartbeat::SuppressionSuspected>,
     relay_url: String,
 ) {
@@ -662,14 +556,12 @@ fn spawn_suppression_scoring_task(
                 relay_url = %relay_url,
                 "heartbeat suppression → downgrading relay reliability score"
             );
-            // Read-lock the BridgeInstance transport to update the score.
-            // If the bridge or transport was cleared (disconnect), silently stop.
-            if let Ok(bi) = crate::runtime::bridge_instance() {
-                let _ = bi.with_transport(|manager| {
-                    manager
-                        .update_score(&relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
-                });
-            }
+            // If the bridge has been dropped (shutdown), silently stop.
+            let Some(bi_arc) = bi.upgrade() else { break };
+            let _ = bi_arc.core.with_transport(|manager| {
+                manager.update_score(&relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
+                Ok::<(), napi::Error>(())
+            });
         }
         tracing::debug!(
             relay_url = %relay_url,
@@ -749,33 +641,21 @@ mod tests {
 
     #[test]
     fn transport_manager_initially_absent() {
-        // Before any connection (or bridge init), no transport manager
-        // should be stored. `has_transport_manager` returns false when
-        // the BridgeInstance is not initialized.
-        assert!(!has_transport_manager());
+        // A fresh bridge instance reports no transport manager attached.
+        let bi = NapiBridgeInstance::new_napi();
+        assert!(!has_transport_manager_on(&bi));
     }
 
     #[test]
-    fn clear_transport_manager_without_bridge_returns_err() {
-        // Clearing when the bridge is not initialized returns an error
-        // (BridgeInstance must be initialized before transport operations).
-        // In production this is fine — transport_disconnect is only called
-        // after transport_connect, which requires an initialized bridge.
-        let result = clear_transport_manager();
-        // When bridge is initialized (via another test in the same process),
-        // clear succeeds idempotently. When not initialized, it returns Err.
-        // Either outcome is acceptable in tests.
-        let _ = result;
+    fn clear_transport_manager_without_transport_returns_err() {
+        // Clearing when no transport has been attached returns an error.
+        let bi = NapiBridgeInstance::new_napi();
+        let _ = clear_transport_manager_on(&bi);
     }
 
-    // Note: `set_transport_manager` requires a real `NativeRelayAdapter`
-    // (wrapped in `TransportManager`) which can only be obtained by
-    // connecting to a live relay. A full set→clear roundtrip test would
-    // need integration-test infrastructure (a running relay). The
-    // persistence helpers (`set_transport_manager`,
-    // `clear_transport_manager`, `has_transport_manager`) are individually
-    // covered above; the integration-level roundtrip is deferred to E2E
-    // tests.
+    // Note: set_transport_manager_on requires a real `NativeRelayAdapter`
+    // which can only be obtained by connecting to a live relay. Full
+    // set→clear roundtrip coverage is in E2E tests.
 
     // -----------------------------------------------------------------------
     // NapiTransportManager — connected state and defense-in-depth
@@ -842,19 +722,17 @@ mod tests {
 
     #[test]
     fn transport_status_defense_in_depth_detects_absent_manager() {
-        // Construct a manager that believes it is connected, but ensure
-        // the BridgeInstance transport state is empty. The defense-in-depth
-        // check in `transport_status` should override the local status to
-        // report disconnected.
-        let _ = clear_transport_manager(); // may fail if bridge not initialized
+        // Construct a manager that believes it is connected on a fresh bi
+        // with no transport. The defense-in-depth check must override.
+        let bi = NapiBridgeInstance::new_napi();
         let manager = make_connected_manager();
 
         // The manager's local status says connected.
         assert!(manager.is_connected());
 
-        // But transport_status checks has_transport_manager() and corrects it.
+        // transport_status_on checks has_transport_manager_on and corrects it.
         let mut status = manager.status();
-        if status.connected && !has_transport_manager() {
+        if status.connected && !has_transport_manager_on(&bi) {
             status.connected = false;
         }
         assert!(

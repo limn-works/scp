@@ -101,8 +101,10 @@ async fn auto_wire_context_manager(
             {
                 Ok(relay_adapter) => {
                     let manager = scp_transport::TransportManager::new(Box::new(relay_adapter));
-                    let _ =
-                        crate::transport::set_transport_manager_arc(std::sync::Arc::new(manager));
+                    let _ = crate::transport::set_transport_manager_arc_on(
+                        bi,
+                        std::sync::Arc::new(manager),
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(
