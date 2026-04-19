@@ -262,7 +262,7 @@ Specific isolation boundaries in the runtime:
 
 ### 9.4.2 Authorization-State Persistence Invariant
 
-Any operation that transitions a member's authorization **downward** MUST be synchronously persisted before the operation's acknowledgment is visible to any observer (caller acknowledgment, outgoing network message, readable event log entry, event-log subscriber notification, sync-tier replication stream, or saga phase message to another actor). A process crash between the mutation and the acknowledgment MUST NOT restore the pre-mutation authorization.
+Any operation that transitions a member's authorization **downward** MUST be synchronously persisted before the operation is visible to any observer as defined in §5.15.3. A process crash between the mutation and the acknowledgment MUST NOT restore the pre-mutation authorization.
 
 Operations covered (downward transitions — those that reduce or remove authority):
 

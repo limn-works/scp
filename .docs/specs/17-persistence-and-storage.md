@@ -830,7 +830,7 @@ The 50 ms window is a normative upper bound on caller-observable rollback (§5.1
 
 ### 17.15.2 Synchronous Persist (Safety-Critical)
 
-Specific operations bypass coalescing and persist inline before the mutation is visible to any observer — caller acknowledgment, outgoing network message, readable event log entry, event-log subscriber notification, sync-tier replication stream, or saga phase message to another actor. The full list of sync-persisted operations is normative and appears in §5.15.3.
+Specific operations bypass coalescing and persist inline before the mutation is visible to any observer (observer set defined in §5.15.3). The full list of sync-persisted operations is normative and appears in §5.15.3.
 
 Implementation-level protocol: mutate in-memory state → persist synchronously → only after persist succeeds, surface any outbound effect. On persist failure, roll back the in-memory mutation and return an error. The caller's acknowledgment implies durable commit.
 
@@ -859,7 +859,7 @@ Journal entries are append-only per saga identifier. Earlier entries are not rew
 
 ### 17.16.2 Secret-Bearing Entries
 
-Saga classification is defined in §9.4.3. Journal implementations MUST enforce the at-rest encryption posture declared by their backing storage: a backend without at-rest encryption MUST refuse to host secret-bearing saga types. Runtime journal construction fails closed against a mismatched backend.
+Saga classification, commitment construction, bearer handling, and the at-rest-encryption refusal rule are defined in §9.4.3 and apply here without restatement.
 
 ### 17.16.3 Key Namespace
 

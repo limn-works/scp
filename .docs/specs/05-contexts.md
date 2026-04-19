@@ -1599,9 +1599,11 @@ A context's state is mode-specific. An encrypted context carries MLS group state
 
 ### 5.15.3 Caller-Visible Persistence Guarantee
 
+**Observers** (used throughout §5.15, §9.4.2, §17.15): for the purposes of persistence-ordering guarantees, any of the following counts as an observer of a mutation and MUST NOT see the effect before the persist tier's guarantee completes — the caller's acknowledgment, an outgoing network message derived from the mutation, a readable event log entry, an event-log subscriber notification, a sync-tier replication stream, or a saga phase message sent to another actor. Additional observer channels a specific implementation introduces (e.g., a custom RPC stream) MUST be treated equivalently.
+
 Operations fall into two persistence tiers.
 
-**Sync-persisted** — the caller's acknowledgment implies durable commit. A process crash immediately after the ack does not roll back the operation, and no outbound protocol effect derived from the mutation (including outgoing network message, event-log subscriber notification, sync-tier replication, or saga phase message to another actor) is visible before the persist completes. Sync-persisted operations — this is the complete enumeration; §9.4.2 lists the subset that is a security invariant:
+**Sync-persisted** — the caller's acknowledgment implies durable commit. A process crash immediately after the ack does not roll back the operation, and no observer (as defined above) sees the effect before the persist completes. Sync-persisted operations — this is the complete enumeration; §9.4.2 lists the subset that is a security invariant:
 
 - MLS epoch advance, sender-key rotation, MLS member removal
 - Every authorization-downward operation enumerated in §9.4.2
@@ -1636,7 +1638,7 @@ Concurrent sagas against the same context are serialized. A context accepts at m
 
 Commit retry budget: three retries (500 ms / 1 s / 2 s delays), then terminal `NeedsRepair` requiring operator action or process restart. No indefinite retry loop.
 
-Secret-bearing sagas (migration custody handovers) journal only a commitment, never the bearer bytes. Commitment construction is specified in §9.4.3. The bearer remains in actor-local state protected by zeroization (§9.4.3). The journal alone cannot replay a secret-bearing Commit; crash recovery requires both the journal and the surviving actor state.
+Secret-bearing sagas (migration custody handovers) are governed by §9.4.3 — commitment-only journaling, bearer in actor-local state with zeroization, journal-backend at-rest-encryption refusal. The journal alone cannot replay a secret-bearing Commit; crash recovery requires both the journal and the surviving actor state.
 
 ### 5.15.5 Governance is Single-Context
 
