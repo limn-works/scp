@@ -241,17 +241,24 @@ impl Drop for RelayHandle {
 
 /// Opaque handle to a running SCP application node.
 ///
-/// Created by [`node_start_in_memory`] or [`node_start_local`]. The node
-/// includes a running relay server, a generated DID identity, and (optionally)
-/// persistent storage. The HTTP server is **not** started automatically --
-/// only the relay is bound.
+/// Created by [`node_start_in_memory_on`] or [`node_start_local_on`]. The
+/// node includes a running relay server, a generated DID identity, and
+/// (optionally) persistent storage. The HTTP server is **not** started
+/// automatically -- only the relay is bound.
 #[derive(uniffi::Object)]
 pub struct NodeHandle {
     inner: RunningNode,
+    /// Owning `UniffiBridgeInstance` — the handle reaches back into its
+    /// instance's `ContextManager` for broadcast-key lookup during HTTP
+    /// projection. Phase D (#1695) replaced `crate::runtime::context_manager()`
+    /// free-function lookup with this Arc affinity.
+    pub(crate) bi: Arc<crate::runtime::UniffiBridgeInstance>,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
-    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
-    /// every `#[uniffi::export]` entry that accepts a `NodeHandle`.
+    /// Consumed at every `#[uniffi::export]` entry that accepts a
+    /// `NodeHandle` (e.g. `commit_deploy`, `rollback_deploy`,
+    /// `enable_site_projection`) via a direct
+    /// `self.bi.core.check_handle(...)` comparison.
     pub(crate) instance_id: u64,
 }
 
@@ -331,7 +338,7 @@ impl NodeHandle {
 
         // Resolve broadcast key: explicit, auto-lookup, or auto with explicit author.
         // Delegates to the shared resolver in scp-ffi-common (same logic as PyO3/NAPI).
-        let mgr = crate::runtime::context_manager()?;
+        let mgr = self.bi.context_manager_expect()?;
         let resolved = server::resolve_broadcast_key(
             broadcast_key_hex,
             author_did,
@@ -646,6 +653,7 @@ pub(crate) async fn node_start_in_memory_on(
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
         inner: RunningNode::InMemory(node),
+        bi: Arc::clone(bi),
         instance_id,
     }))
 }
@@ -686,6 +694,7 @@ pub(crate) async fn node_start_local_on(
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
         inner: RunningNode::Filesystem(node),
+        bi: Arc::clone(bi),
         instance_id,
     }))
 }

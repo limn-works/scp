@@ -2379,38 +2379,11 @@ fn spawn_suppression_scoring_task(
 /// requested but the `allow_in_memory_custody` feature is not enabled.
 /// Returns `ScpError::Validation` if the custody string is not recognized.
 ///
-/// Ensures the global production DID resolver is initialized.
-///
-/// Creates a `DualLayerResolver` backed by [`FfiDhtClient`] and
-/// `NoOpRelayQuerier`. The resolver is shared across all UCAN validation
-/// calls. Idempotent: subsequent calls are no-ops.
-///
-/// See #311 for the DID resolver unification design.
-///
-/// Retained for symmetry with [`ensure_did_resolver_initialized_on`]; the
-/// per-instance variant is used by `Scp::identity_create_with_agent_key`.
-/// All other call sites now route through the `_on` variant.
-#[allow(dead_code)]
-fn ensure_did_resolver_initialized(handle: tokio::runtime::Handle) -> Result<(), ScpError> {
-    if crate::runtime::did_resolver().is_some() {
-        return Ok(());
-    }
-
-    let dht_client = Arc::new(new_ffi_dht_client!().map_err(ScpError::from)?);
-    let relay_querier = Arc::new(NoOpRelayQuerier);
-    let cache = Arc::new(DidCache::new());
-    let bootstrap_relays = Vec::new();
-
-    let resolver = Arc::new(DualLayerResolver::new(
-        relay_querier,
-        dht_client,
-        cache,
-        bootstrap_relays,
-    ));
-
-    crate::runtime::init_did_resolver(resolver, handle);
-    Ok(())
-}
+// Phase D (#1695): `ensure_did_resolver_initialized` free-function helper
+// deleted along with the process-wide `DEFAULT_BRIDGE_INSTANCE`. Every
+// call site now routes through the per-instance
+// [`ensure_did_resolver_initialized_on`] helper, which stores the resolver
+// on the caller's own `UniffiBridgeInstance::did_resolver` slot.
 
 // ---------------------------------------------------------------------------
 // Free functions — device attestation (#419)
@@ -2752,6 +2725,7 @@ async fn identity_verify_link_attestation_impl(
 /// Runs the full 11-step ADR-016 pipeline, requiring `tool_invoke:{tool_id}`
 /// or `tool_invoke:*` capability. Extracted to keep `tool_invoke` focused.
 fn validate_tool_ucan_uniffi(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: &ContextHandle,
     tool_id: &str,
     ucan_token: &str,
@@ -2777,18 +2751,16 @@ fn validate_tool_ucan_uniffi(
     }
     let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
 
-    // Ensure UCAN state is registered for this context.
-    crate::runtime::ensure_ucan_registered(
+    // Ensure UCAN state is registered for this context on the caller's instance.
+    bi.ensure_ucan_registered(
         &handle.context_id,
         &handle.creator_did,
         &handle.ceiling_strings,
     );
 
-    crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
-        let production_resolver = crate::runtime::did_resolver();
-        let did_resolver = scp_ffi_common::DispatchDidResolver::new(
-            production_resolver.map(std::convert::AsRef::as_ref),
-        );
+    bi.with_ucan_state(&handle.context_id, |ucan_state| {
+        let production_resolver = bi.did_resolver();
+        let did_resolver = scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
             revocation_list: &ucan_state.revocation_list,
         };
@@ -4021,6 +3993,7 @@ async fn ucan_delegate_impl(
 
 #[cfg(feature = "allow_in_memory_custody")]
 async fn event_log_checkpoint_impl(
+    bi: Arc<crate::runtime::UniffiBridgeInstance>,
     handle: Arc<ContextHandle>,
     identity: Arc<Identity>,
     epoch: u64,
@@ -4047,8 +4020,9 @@ async fn event_log_checkpoint_impl(
                     code: codes::IDENT_1007.to_owned(),
                 })?;
 
-            // Ensure UCAN state (which contains the event log) is registered.
-            crate::runtime::ensure_ucan_registered(
+            // Ensure UCAN state (which contains the event log) is registered
+            // on this bridge instance.
+            bi.ensure_ucan_registered(
                 &handle.context_id,
                 &handle.creator_did,
                 &handle.ceiling_strings,
@@ -4057,35 +4031,36 @@ async fn event_log_checkpoint_impl(
             let sender_did = scp_identity::DID(identity.did.clone());
             let context_id = handle.context_id.clone();
 
-            let checkpoint = crate::runtime::with_ucan_state(&context_id, |ucan_state| {
-                let signer = scp_core::event_log::KeyCustodySigner {
-                    custody: &custody.0,
-                    key: &core_id.active_signing_key,
-                };
-                // generate_checkpoint is async — use block_in_place to allow
-                // blocking inside this spawned async task. block_in_place moves
-                // the worker thread to blocking mode (requires multi-thread runtime).
-                let handle = tokio::runtime::Handle::current();
-                tokio::task::block_in_place(|| {
-                    handle.block_on(async {
-                        scp_event_log::checkpoint::generate_checkpoint(
-                            &ucan_state.event_log,
-                            &sender_did,
-                            epoch,
-                            &signer,
-                        )
-                        .await
-                        .map_err(|e| ScpError::Context {
-                            msg: format!("checkpoint generation failed: {e}"),
-                            code: codes::CTX_2027.to_owned(),
+            let checkpoint = bi
+                .with_ucan_state(&context_id, |ucan_state| {
+                    let signer = scp_core::event_log::KeyCustodySigner {
+                        custody: &custody.0,
+                        key: &core_id.active_signing_key,
+                    };
+                    // generate_checkpoint is async — use block_in_place to allow
+                    // blocking inside this spawned async task. block_in_place moves
+                    // the worker thread to blocking mode (requires multi-thread runtime).
+                    let handle = tokio::runtime::Handle::current();
+                    tokio::task::block_in_place(|| {
+                        handle.block_on(async {
+                            scp_event_log::checkpoint::generate_checkpoint(
+                                &ucan_state.event_log,
+                                &sender_did,
+                                epoch,
+                                &signer,
+                            )
+                            .await
+                            .map_err(|e| ScpError::Context {
+                                msg: format!("checkpoint generation failed: {e}"),
+                                code: codes::CTX_2027.to_owned(),
+                            })
                         })
                     })
                 })
-            })
-            .ok_or_else(|| ScpError::Context {
-                msg: format!("context '{context_id}' not found in UCAN registry"),
-                code: codes::CTX_2027.to_owned(),
-            })??;
+                .ok_or_else(|| ScpError::Context {
+                    msg: format!("context '{context_id}' not found in UCAN registry"),
+                    code: codes::CTX_2027.to_owned(),
+                })??;
 
             Ok(Checkpoint {
                 context_id: checkpoint.context_id,
@@ -4107,6 +4082,7 @@ async fn event_log_checkpoint_impl(
 #[cfg(not(feature = "allow_in_memory_custody"))]
 #[allow(clippy::unused_async)]
 async fn event_log_checkpoint_impl(
+    _bi: Arc<crate::runtime::UniffiBridgeInstance>,
     _handle: Arc<ContextHandle>,
     _identity: Arc<Identity>,
     _epoch: u64,
@@ -6075,14 +6051,19 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u64) -> Result<String, Scp
 /// challenge JSON is malformed.
 /// Returns `ScpError::Identity` if the identity has no agent key when
 /// `#agent` is requested, or if signing fails.
-#[uniffi::export]
+/// Phase D (#1695): moved from a free function exported via
+/// `#[uniffi::export]` to an `Scp::scpid_sign` method so that the
+/// `Identity` handle-affinity check routes against the caller's `Scp`
+/// rather than the deleted process-wide `DEFAULT_BRIDGE_INSTANCE`.
+///
+/// The body is retained as a `pub(crate)` helper; `Scp::scpid_sign`
+/// performs the check and then delegates here.
 #[cfg(feature = "allow_in_memory_custody")]
-pub fn scpid_sign(
+pub(crate) fn scpid_sign_impl(
     identity: Arc<Identity>,
     signing_key_id: String,
     challenge_json: String,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(identity);
     use scp_core::identity::scpid_sign as core_sign;
 
     let key_id = parse_scpid_signing_key_id(&signing_key_id)?;
@@ -6167,8 +6148,16 @@ pub fn scpid_sign(
 /// Returns `ScpError::Validation` if either JSON string is malformed.
 /// Returns `ScpError::Identity` if DID resolution fails, the signature is
 /// invalid, the challenge has expired, or any other verification step fails.
-#[uniffi::export]
-pub fn scpid_verify(response_json: String, challenge_json: String) -> Result<String, ScpError> {
+///
+/// Phase D (#1695): formerly a `#[uniffi::export] pub fn`; migrated to an
+/// `Scp` method so the DID resolver lookup routes against the caller's
+/// per-instance `UniffiBridgeInstance`. The body lives in this `_on` helper
+/// and is invoked from `Scp::scpid_verify`.
+fn scpid_verify_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    response_json: String,
+    challenge_json: String,
+) -> Result<String, ScpError> {
     use scp_core::identity::scpid_verify as core_verify;
 
     let response: scp_core::identity::ScpIdResponse = serde_json::from_str(&response_json)
@@ -6183,7 +6172,7 @@ pub fn scpid_verify(response_json: String, challenge_json: String) -> Result<Str
             code: codes::IDENT_1038.to_owned(),
         })?;
 
-    let resolver = crate::runtime::did_resolver().ok_or_else(|| ScpError::Identity {
+    let resolver = bi.did_resolver().ok_or_else(|| ScpError::Identity {
         msg: "DID resolver not initialized — create an identity with \
               identityCreate before calling scpidVerify"
             .to_owned(),
@@ -7140,8 +7129,8 @@ impl Scp {
                     .await;
 
                 // Register per-context UCAN validation state (revocation list,
-                // nonce tracker, event log) for the UCAN pipeline.
-                crate::runtime::ensure_ucan_registered(&context_id, &identity.did, &params.ceiling);
+                // nonce tracker, event log) for the UCAN pipeline on this instance.
+                bi.ensure_ucan_registered(&context_id, &identity.did, &params.ceiling);
 
                 // §9.10.4: Send pseudonym announcement to inform other members of
                 // the creator's per-context routing ID. For freshly created
@@ -9512,6 +9501,7 @@ impl Scp {
                 // resolver, revocation list, and nonce tracker live in the
                 // bridge UCAN registry, not in the runtime.
                 validate_tool_ucan_uniffi(
+                    &bi,
                     &handle,
                     &tool_id,
                     &ucan_token,
@@ -9743,6 +9733,7 @@ impl Scp {
                 // ADR-016 pipeline against the TARGET context's ceiling.
                 // See spec §6.2, §8, ADR-016, and issue #319.
                 validate_tool_ucan_uniffi(
+                    &bi,
                     &target_handle,
                     &tool_id,
                     &ucan_token,
@@ -9911,6 +9902,7 @@ impl Scp {
             .core
             .check_handle(identity.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 let state = handle.state.lock().await;
@@ -9938,6 +9930,7 @@ impl Scp {
                 // Primary authorization: UCAN token validation via the full 11-step
                 // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
                 validate_tool_ucan_uniffi(
+                    &bi,
                     &handle,
                     &tool_id_for_ucan,
                     &ucan_token,
@@ -10437,10 +10430,11 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 // Ensure UCAN state (which contains the event log) is registered.
-                crate::runtime::ensure_ucan_registered(
+                bi.ensure_ucan_registered(
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
@@ -10488,105 +10482,108 @@ impl Scp {
                 let fallback_now = scp_primitives::SystemClock.now_secs();
 
                 // Query the event log from per-context UCAN state.
-                let events = crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
-                    let event_count = scp_event_log::tree::event_count(&ucan_state.event_log);
+                let events = bi
+                    .with_ucan_state(&handle.context_id, |ucan_state| {
+                        let event_count = scp_event_log::tree::event_count(&ucan_state.event_log);
 
-                    if event_count == 0 {
-                        return Vec::new();
-                    }
+                        if event_count == 0 {
+                            return Vec::new();
+                        }
 
-                    let merkle_root = scp_event_log::tree::root(&ucan_state.event_log);
-                    let merkle_root_hex = hex::encode(merkle_root);
+                        let merkle_root = scp_event_log::tree::root(&ucan_state.event_log);
+                        let merkle_root_hex = hex::encode(merkle_root);
 
-                    // Query events stored in the event log by iterating the
-                    // stored events slice and applying filters.
-                    let all_events = ucan_state.event_log.events();
+                        // Query events stored in the event log by iterating the
+                        // stored events slice and applying filters.
+                        let all_events = ucan_state.event_log.events();
 
-                    if !all_events.is_empty() {
-                        let mut results: Vec<Event> = Vec::new();
-                        for evt in all_events {
-                            // Apply sequence range filters.
-                            if let Some(after) = filter_after_seq
-                                && evt.sequence <= after
-                            {
-                                continue;
+                        if !all_events.is_empty() {
+                            let mut results: Vec<Event> = Vec::new();
+                            for evt in all_events {
+                                // Apply sequence range filters.
+                                if let Some(after) = filter_after_seq
+                                    && evt.sequence <= after
+                                {
+                                    continue;
+                                }
+                                if let Some(before) = filter_before_seq
+                                    && evt.sequence >= before
+                                {
+                                    continue;
+                                }
+                                // Apply event type filter.
+                                if let Some(ref et) = filter_event_type
+                                    && format!("{:?}", evt.event_type) != *et
+                                {
+                                    continue;
+                                }
+                                // Apply actor DID filter.
+                                if let Some(ref actor) = filter_actor_did
+                                    && evt.actor_did.0 != *actor
+                                {
+                                    continue;
+                                }
+
+                                // Try to interpret payload bytes as UTF-8 JSON; fall
+                                // back to hex encoding for binary payloads.
+                                let payload_json = std::str::from_utf8(&evt.payload.data)
+                                    .ok()
+                                    .filter(|s| {
+                                        serde_json::from_str::<serde_json::Value>(s).is_ok()
+                                    })
+                                    .map_or_else(
+                                        || {
+                                            serde_json::json!({
+                                                "hex": hex::encode(&evt.payload.data),
+                                            })
+                                            .to_string()
+                                        },
+                                        str::to_owned,
+                                    );
+
+                                results.push(Event {
+                                    event_type: format!("{:?}", evt.event_type),
+                                    actor_did: evt.actor_did.0.clone(),
+                                    timestamp: evt.timestamp,
+                                    payload_json,
+                                    sequence: evt.sequence,
+                                });
+
+                                if let Some(lim) = filter_limit
+                                    && results.len() >= lim
+                                {
+                                    break;
+                                }
                             }
-                            if let Some(before) = filter_before_seq
-                                && evt.sequence >= before
-                            {
-                                continue;
-                            }
-                            // Apply event type filter.
-                            if let Some(ref et) = filter_event_type
-                                && format!("{:?}", evt.event_type) != *et
-                            {
-                                continue;
-                            }
-                            // Apply actor DID filter.
-                            if let Some(ref actor) = filter_actor_did
-                                && evt.actor_did.0 != *actor
-                            {
-                                continue;
-                            }
-
-                            // Try to interpret payload bytes as UTF-8 JSON; fall
-                            // back to hex encoding for binary payloads.
-                            let payload_json = std::str::from_utf8(&evt.payload.data)
-                                .ok()
-                                .filter(|s| serde_json::from_str::<serde_json::Value>(s).is_ok())
-                                .map_or_else(
-                                    || {
-                                        serde_json::json!({
-                                            "hex": hex::encode(&evt.payload.data),
-                                        })
-                                        .to_string()
-                                    },
-                                    str::to_owned,
-                                );
-
-                            results.push(Event {
-                                event_type: format!("{:?}", evt.event_type),
-                                actor_did: evt.actor_did.0.clone(),
-                                timestamp: evt.timestamp,
-                                payload_json,
-                                sequence: evt.sequence,
-                            });
-
-                            if let Some(lim) = filter_limit
-                                && results.len() >= lim
-                            {
-                                break;
+                            if !results.is_empty() {
+                                return results;
                             }
                         }
-                        if !results.is_empty() {
-                            return results;
+
+                        // Fallback: return a summary event with Merkle root metadata.
+                        let summary = Event {
+                            event_type: "LogSummary".to_owned(),
+                            actor_did: String::new(),
+                            timestamp: fallback_now,
+                            payload_json: serde_json::json!({
+                                "event_count": event_count,
+                                "merkle_root": merkle_root_hex,
+                            })
+                            .to_string(),
+                            sequence: event_count.saturating_sub(1),
+                        };
+
+                        let summary_events = vec![summary];
+                        if let Some(lim) = filter_limit {
+                            summary_events.into_iter().take(lim).collect()
+                        } else {
+                            summary_events
                         }
-                    }
-
-                    // Fallback: return a summary event with Merkle root metadata.
-                    let summary = Event {
-                        event_type: "LogSummary".to_owned(),
-                        actor_did: String::new(),
-                        timestamp: fallback_now,
-                        payload_json: serde_json::json!({
-                            "event_count": event_count,
-                            "merkle_root": merkle_root_hex,
-                        })
-                        .to_string(),
-                        sequence: event_count.saturating_sub(1),
-                    };
-
-                    let summary_events = vec![summary];
-                    if let Some(lim) = filter_limit {
-                        summary_events.into_iter().take(lim).collect()
-                    } else {
-                        summary_events
-                    }
-                })
-                .ok_or_else(|| ScpError::Context {
-                    msg: format!("context '{}' not found in UCAN registry", handle.context_id),
-                    code: codes::CTX_2023.to_owned(),
-                })?;
+                    })
+                    .ok_or_else(|| ScpError::Context {
+                        msg: format!("context '{}' not found in UCAN registry", handle.context_id),
+                        code: codes::CTX_2023.to_owned(),
+                    })?;
 
                 Ok(events)
             })
@@ -10610,6 +10607,7 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 // Parse the claim JSON.
@@ -10627,8 +10625,9 @@ impl Scp {
                     }
                 })?;
 
-                // Ensure UCAN state (which contains the event log) is registered.
-                crate::runtime::ensure_ucan_registered(
+                // Ensure UCAN state (which contains the event log) is registered
+                // on this instance.
+                bi.ensure_ucan_registered(
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
@@ -10645,7 +10644,7 @@ impl Scp {
                                 code: codes::CTX_2025.to_owned(),
                             })?;
 
-                        crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                        bi.with_ucan_state(&handle.context_id, |ucan_state| {
                             let proof = scp_event_log::proof::prove_inclusion(
                                 &ucan_state.event_log,
                                 leaf_index,
@@ -10716,7 +10715,7 @@ impl Scp {
                                 }
                             })?;
 
-                        crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                        bi.with_ucan_state(&handle.context_id, |ucan_state| {
                             let proof = scp_event_log::proof::prove_absence(
                                 &ucan_state.event_log,
                                 &event_hash,
@@ -10802,7 +10801,7 @@ impl Scp {
             .core
             .check_handle(identity.instance_id())
             .map_err(ScpError::from)?;
-        event_log_checkpoint_impl(handle, identity, epoch).await
+        event_log_checkpoint_impl(Arc::clone(&self.inner), handle, identity, epoch).await
     }
 
     /// Per-instance equivalent of the free-function [`ucan_validate`].
@@ -10821,6 +10820,7 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 validate_ucan_token(&token)?;
@@ -10868,19 +10868,19 @@ impl Scp {
                 }
                 let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
 
-                // Ensure UCAN state is registered for this context.
-                crate::runtime::ensure_ucan_registered(
+                // Ensure UCAN state is registered for this context on this instance.
+                bi.ensure_ucan_registered(
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
                 );
 
                 // Execute the full 11-step validation pipeline via per-context state.
-                let validation_result =
-                    crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
-                        let production_resolver = crate::runtime::did_resolver();
+                let validation_result = bi
+                    .with_ucan_state(&handle.context_id, |ucan_state| {
+                        let production_resolver = bi.did_resolver();
                         let did_resolver = scp_ffi_common::DispatchDidResolver::new(
-                            production_resolver.map(std::convert::AsRef::as_ref),
+                            production_resolver.as_deref(),
                         );
                         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                             revocation_list: &ucan_state.revocation_list,
@@ -11667,6 +11667,38 @@ impl Scp {
             bridge_mode,
             context_id,
         )
+    }
+
+    /// Per-instance equivalent of the free-function `scpid_sign`.
+    ///
+    /// Signs an SCPID challenge with the identity's requested key. Rejects
+    /// any `Identity` whose `instance_id` does not match this `Scp`'s.
+    #[cfg(feature = "allow_in_memory_custody")]
+    pub fn scpid_sign(
+        &self,
+        identity: Arc<Identity>,
+        signing_key_id: String,
+        challenge_json: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        scpid_sign_impl(identity, signing_key_id, challenge_json)
+    }
+
+    /// Per-instance equivalent of the free-function `scpid_verify`.
+    ///
+    /// Uses this `Scp`'s DID resolver (populated when the caller invokes
+    /// `identity_create` / `identity_create_with_custody`). Phase D (#1695)
+    /// replaces the old free function that consulted the process-wide
+    /// `DEFAULT_BRIDGE_INSTANCE` DID resolver slot.
+    pub fn scpid_verify(
+        &self,
+        response_json: String,
+        challenge_json: String,
+    ) -> Result<String, ScpError> {
+        scpid_verify_on(&self.inner, response_json, challenge_json)
     }
 
     /// Per-instance equivalent of the free-function `relay_start_in_memory`.
@@ -14576,7 +14608,7 @@ mod tests {
     /// correct error code before attempting DID resolution.
     #[test]
     fn scpid_verify_rejects_malformed_response_json() {
-        let result = scpid_verify("not valid json".to_owned(), "{}".to_owned());
+        let result = scp_test().scpid_verify("not valid json".to_owned(), "{}".to_owned());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
@@ -14599,7 +14631,7 @@ mod tests {
             "issued_at": 1_000_000_000_u64,
             "expires_at": 2_000_000_000_u64,
         });
-        let result = scpid_verify(
+        let result = scp_test().scpid_verify(
             serde_json::to_string(&response_json).unwrap(),
             "not valid json".to_owned(),
         );

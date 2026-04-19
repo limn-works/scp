@@ -173,11 +173,10 @@ pub use bridge::{
     // Free functions — tools
     // Free functions — UCAN
 };
-// Feature-gated re-exports — only available with allow_in_memory_custody.
-#[cfg(feature = "allow_in_memory_custody")]
-pub use bridge::scpid_sign;
-// Re-export shutdown function defined in this module.
-// (scp_shutdown is defined here and exported via #[uniffi::export] above.)
+// Phase D (#1695): `scpid_sign` free-function re-export deleted — use
+// `Scp::scpid_sign` instead. The method performs the Identity
+// handle-affinity check against the caller's `Scp` (the deleted free
+// function read `DEFAULT_BRIDGE_INSTANCE` for that check).
 
 // Server startup re-exports — only available with the `server` feature.
 //
