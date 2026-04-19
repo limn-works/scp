@@ -440,7 +440,7 @@ mod tests {
     fn scpid_verify_rejects_malformed_response_json() {
         pyo3::prepare_freethreaded_python();
         let result = Python::with_gil(|py| {
-            let scp = default_scp()?;
+            let scp = default_scp();
             scp.scpid_verify(py, "not valid json".to_owned(), "{}".to_owned())
         });
         let err = result.unwrap_err();
@@ -468,7 +468,7 @@ mod tests {
             "expires_at": 2_000_000_000_u64,
         });
         let result = Python::with_gil(|py| {
-            let scp = default_scp()?;
+            let scp = default_scp();
             scp.scpid_verify(
                 py,
                 serde_json::to_string(&response_json).unwrap(),
