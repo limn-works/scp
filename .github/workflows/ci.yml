@@ -135,6 +135,41 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: bash scripts/check-protocol-deps.sh
 
+  # ── FFI singleton enforcement (ADR-048, #1549 Phase 4) ──────────────────
+  bridge-globals:
+    needs: check-draft
+    name: FFI / no-bridge-globals + OnceLock ratchet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: bash scripts/check-no-bridge-globals.sh
+
+  fallback-registry:
+    needs: check-draft
+    name: FFI / no-fallback-registry regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: bash scripts/check-no-fallback-registry.sh
+
+  # The `default-in-tests` gate (scripts/check-no-default-in-tests.sh) is
+  # staged but NOT yet required in CI. It is wired in the follow-up PR
+  # that completes the per-test SCP fixture codemod across all four SDKs.
+  # Running it today reports ~500 pre-existing call sites that must migrate
+  # first. See .docs/migration/phase-4.md § "Per-test SCP fixture" and
+  # ADR-048 §Decision 3.
+
+  handle-affinity:
+    needs: check-draft
+    name: FFI / handle-affinity check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: bash scripts/check-handle-affinity.sh
+
   wasm-protocol:
     needs: check-draft
     name: WASM / protocol
