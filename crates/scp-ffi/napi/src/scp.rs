@@ -1688,6 +1688,7 @@ impl Scp {
         identity: &NapiIdentity,
         params_json: String,
     ) -> napi::Result<NapiContextHandle> {
+        crate::napi_check_handle!(&self.inner.core, identity);
         crate::context::context_create_on(&self.inner, identity, params_json).await
     }
 
@@ -1699,6 +1700,7 @@ impl Scp {
         identity_did: String,
         spending_ucan_jwt: Option<String>,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_join_on(&self.inner, handle, identity_did, spending_ucan_jwt).await
     }
 
@@ -1709,6 +1711,7 @@ impl Scp {
         handle: &NapiContextHandle,
         identity_did: String,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_leave_on(&self.inner, handle, identity_did).await
     }
 
@@ -1719,6 +1722,7 @@ impl Scp {
         handle: &NapiContextHandle,
         identity_did: String,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_close_on(&self.inner, handle, identity_did).await
     }
 
@@ -1731,6 +1735,7 @@ impl Scp {
         payload: Vec<u8>,
         spending_ucan_jwt: Option<String>,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_send_on(
             &self.inner,
             handle,
@@ -1761,6 +1766,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `context_member_count`.
     #[napi(js_name = "contextMemberCount")]
     pub async fn context_member_count(&self, handle: &NapiContextHandle) -> napi::Result<u32> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_member_count_on(&self.inner, handle).await
     }
 
@@ -1771,6 +1777,7 @@ impl Scp {
         handle: &NapiContextHandle,
         did: String,
     ) -> napi::Result<bool> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_is_member_on(&self.inner, handle, did).await
     }
 
@@ -1780,6 +1787,7 @@ impl Scp {
         &self,
         handle: &NapiContextHandle,
     ) -> napi::Result<Vec<String>> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_member_dids_on(&self.inner, handle).await
     }
 
@@ -1790,6 +1798,7 @@ impl Scp {
         handle: &NapiContextHandle,
         did: String,
     ) -> napi::Result<Option<String>> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_member_role_on(&self.inner, handle, did).await
     }
 
@@ -1799,6 +1808,7 @@ impl Scp {
         &self,
         handle: &NapiContextHandle,
     ) -> napi::Result<Vec<String>> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_drain_events_on(&self.inner, handle).await
     }
 
@@ -1842,6 +1852,7 @@ impl Scp {
         &self,
         handle: &NapiContextHandle,
     ) -> napi::Result<Option<u32>> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_broadcast_subscriber_count_on(&self.inner, handle).await
     }
 
@@ -1852,6 +1863,7 @@ impl Scp {
         handle: &NapiContextHandle,
         did: String,
     ) -> napi::Result<bool> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_is_broadcast_subscriber_on(&self.inner, handle, did).await
     }
 
@@ -1861,6 +1873,7 @@ impl Scp {
         &self,
         handle: &NapiContextHandle,
     ) -> napi::Result<Option<String>> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_broadcast_admission_on(&self.inner, handle).await
     }
 
@@ -1871,6 +1884,7 @@ impl Scp {
         handle: &NapiContextHandle,
         subscriber_did: String,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::broadcast_subscribe_on(&self.inner, handle, subscriber_did).await
     }
 
@@ -1882,6 +1896,7 @@ impl Scp {
         subscriber_did: String,
         rotate_keys: Option<bool>,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::broadcast_unsubscribe_on(&self.inner, handle, subscriber_did, rotate_keys)
             .await
     }
@@ -1894,6 +1909,7 @@ impl Scp {
         author_did: String,
         payload: Vec<u8>,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::broadcast_publish_on(&self.inner, handle, author_did, payload).await
     }
 
@@ -1906,6 +1922,7 @@ impl Scp {
         asset: NapiAssetEntry,
         deploy_id: Option<String>,
     ) -> napi::Result<NapiPublishResult> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::broadcast_publish_asset_on(
             &self.inner,
             handle,
@@ -1925,6 +1942,7 @@ impl Scp {
         assets: Vec<NapiAssetEntry>,
         deploy_id: Option<String>,
     ) -> napi::Result<NapiBatchPublishResult> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::broadcast_publish_assets_on(
             &self.inner,
             handle,
@@ -1943,6 +1961,7 @@ impl Scp {
         subscriber_did: String,
         blocker_did: String,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::broadcast_block_subscriber_on(
             &self.inner,
             handle,
@@ -1960,6 +1979,7 @@ impl Scp {
         subscriber_did: String,
         unblocker_did: String,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::broadcast_unblock_subscriber_on(
             &self.inner,
             handle,
@@ -1977,6 +1997,7 @@ impl Scp {
         author_did: String,
         requester_did: String,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::broadcast_handle_key_request_on(
             &self.inner,
             handle,
@@ -1994,6 +2015,7 @@ impl Scp {
         action_json: String,
         proposer_did: String,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_execute_governance_action_on(
             &self.inner,
             handle,
@@ -2011,6 +2033,7 @@ impl Scp {
         action_json: String,
         proposer_did: String,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_governance_propose_on(
             &self.inner,
             handle,
@@ -2028,6 +2051,7 @@ impl Scp {
         proposal_id_hex: String,
         voter_did: String,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_governance_approve_on(
             &self.inner,
             handle,
@@ -2045,6 +2069,7 @@ impl Scp {
         proposal_id_hex: String,
         voter_did: String,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_governance_reject_on(
             &self.inner,
             handle,
@@ -2062,6 +2087,7 @@ impl Scp {
         proposal_id_hex: String,
         voter_did: String,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_governance_withdraw_on(
             &self.inner,
             handle,
@@ -2078,6 +2104,7 @@ impl Scp {
         handle: &NapiContextHandle,
         proposal_id_hex: String,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_governance_get_proposal_on(&self.inner, handle, proposal_id_hex)
             .await
     }
@@ -2088,6 +2115,7 @@ impl Scp {
         &self,
         handle: &NapiContextHandle,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_governance_list_proposals_on(&self.inner, handle).await
     }
 
@@ -2098,6 +2126,7 @@ impl Scp {
         handle: &NapiContextHandle,
         current_timestamp: f64,
     ) -> napi::Result<bool> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_apply_pending_ceiling_modification_on(
             &self.inner,
             handle,
@@ -2109,6 +2138,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `context_finalize_close`.
     #[napi(js_name = "contextFinalizeClose")]
     pub async fn context_finalize_close(&self, handle: &NapiContextHandle) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_finalize_close_on(&self.inner, handle).await
     }
 
@@ -2126,6 +2156,7 @@ impl Scp {
         creator_did: String,
         creator_signature_hex: String,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_create_governance_checkpoint_on(
             &self.inner,
             handle,
@@ -2149,6 +2180,7 @@ impl Scp {
         signer_did: String,
         signature_hex: String,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_add_checkpoint_cosignature_on(
             &self.inner,
             handle,
@@ -2174,6 +2206,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `context_tombstone_migrated`.
     #[napi(js_name = "contextTombstoneMigrated")]
     pub async fn context_tombstone_migrated(&self, handle: &NapiContextHandle) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_tombstone_migrated_on(&self.inner, handle).await
     }
 
@@ -2189,6 +2222,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `context_handle_ttl_expiry`.
     #[napi(js_name = "contextHandleTtlExpiry")]
     pub async fn context_handle_ttl_expiry(&self, handle: &NapiContextHandle) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_handle_ttl_expiry_on(&self.inner, handle).await
     }
 
@@ -2200,6 +2234,7 @@ impl Scp {
         proposer_did: String,
         extension_secs: u32,
     ) -> napi::Result<bool> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_propose_ttl_extension_on(
             &self.inner,
             handle,
@@ -2222,6 +2257,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `context_export`.
     #[napi(js_name = "contextExport")]
     pub async fn context_export(&self, handle: &NapiContextHandle) -> napi::Result<Vec<u8>> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_export_on(&self.inner, handle).await
     }
 
@@ -2239,6 +2275,7 @@ impl Scp {
         handle: &mut NapiContextHandle,
         _policy_json: String,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_set_economic_policy_on(&self.inner, handle, _policy_json)
     }
 
@@ -2248,6 +2285,7 @@ impl Scp {
         &self,
         handle: &NapiContextHandle,
     ) -> napi::Result<Option<String>> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_get_economic_policy_on(&self.inner, handle)
     }
 
@@ -2361,6 +2399,7 @@ impl Scp {
         handle: &NapiContextHandle,
         definition: NapiToolDefinition,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::tools::tool_register_on(&self.inner, handle, definition).await
     }
 
@@ -2377,6 +2416,7 @@ impl Scp {
         proof_tokens: Option<Vec<String>>,
         spending_ucan_jwt: Option<String>,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::tools::tool_invoke_on(
             &self.inner,
             handle,
@@ -2397,6 +2437,7 @@ impl Scp {
         handle: &NapiContextHandle,
         tool_id: String,
     ) -> napi::Result<NapiToolVerificationResult> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::tools::tool_verify_on(&self.inner, handle, tool_id).await
     }
 
@@ -2414,6 +2455,7 @@ impl Scp {
         chain_depth: u8,
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, source_handle, target_handle);
         crate::tools::tool_invoke_cross_context_on(
             &self.inner,
             source_handle,
@@ -2437,6 +2479,7 @@ impl Scp {
         source_context_id: String,
         ttl_seconds: Option<u32>,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::tools::tool_session_create_on(
             &self.inner,
             handle,
@@ -2458,6 +2501,7 @@ impl Scp {
         ucan_token: String,
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::tools::tool_session_invoke_on(
             &self.inner,
             handle,
@@ -2477,6 +2521,7 @@ impl Scp {
         handle: &NapiContextHandle,
         session_id: String,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::tools::tool_session_close_on(&self.inner, handle, session_id).await
     }
 
@@ -2489,6 +2534,7 @@ impl Scp {
         target_context_id: String,
         rate_limit_json: Option<String>,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::tools::tool_interface_expose_on(
             &self.inner,
             handle,
@@ -2506,6 +2552,7 @@ impl Scp {
         handle: &NapiContextHandle,
         interface_json: String,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::tools::tool_interface_accept_on(&self.inner, handle, interface_json).await
     }
 
@@ -2516,6 +2563,7 @@ impl Scp {
         handle: &NapiContextHandle,
         interface_id_hex: String,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::tools::tool_interface_revoke_on(&self.inner, handle, interface_id_hex).await
     }
 
@@ -2545,6 +2593,7 @@ impl Scp {
         presenting_agent_did: Option<String>,
         proof_tokens: Option<Vec<String>>,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::ucan::ucan_validate_on(
             &self.inner,
             handle,
@@ -2565,6 +2614,7 @@ impl Scp {
         capabilities: Vec<String>,
         proofs: Option<Vec<String>>,
     ) -> napi::Result<NapiUcanToken> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::ucan::ucan_mint_on(&self.inner, handle, member_did, capabilities, proofs).await
     }
 
@@ -2578,6 +2628,7 @@ impl Scp {
         parent_token: String,
         capabilities: Vec<String>,
     ) -> napi::Result<NapiUcanToken> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::ucan::ucan_delegate_on(
             &self.inner,
             handle,
@@ -2597,6 +2648,7 @@ impl Scp {
         token: String,
         revoker_did: String,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::ucan::ucan_revoke_on(&self.inner, handle, token, revoker_did).await
     }
 
@@ -2611,6 +2663,7 @@ impl Scp {
         handle: &NapiContextHandle,
         filter_json: Option<String>,
     ) -> napi::Result<Vec<NapiEvent>> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::event_log::event_log_query_on(&self.inner, handle, filter_json).await
     }
 
@@ -2621,6 +2674,7 @@ impl Scp {
         handle: &NapiContextHandle,
         claim_json: String,
     ) -> napi::Result<NapiProof> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::event_log::event_log_verify_on(&self.inner, handle, claim_json).await
     }
 
@@ -2632,6 +2686,7 @@ impl Scp {
         identity: &NapiIdentity,
         epoch: f64,
     ) -> napi::Result<NapiCheckpoint> {
+        crate::napi_check_handle!(&self.inner.core, handle, identity);
         crate::event_log::event_log_checkpoint_on(&self.inner, handle, identity, epoch)
     }
 
@@ -2643,6 +2698,7 @@ impl Scp {
         did: String,
         epoch: f64,
     ) -> napi::Result<NapiCheckpoint> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::event_log::event_log_checkpoint_by_did_on(&self.inner, handle, did, epoch)
     }
 
@@ -2668,6 +2724,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `transport_disconnect`.
     #[napi(js_name = "transportDisconnect")]
     pub async fn transport_disconnect(&self, manager: &NapiTransportManager) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, manager);
         crate::transport::transport_disconnect_on(&self.inner, manager).await
     }
 
@@ -3001,6 +3058,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `mcp_server_stop`.
     #[napi(js_name = "mcpServerStop")]
     pub async fn mcp_server_stop(&self, handle: &NapiMcpServerHandle) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::mcp::mcp_server_stop_on(&self.inner, handle).await
     }
 
@@ -3022,6 +3080,7 @@ impl Scp {
     /// Per-instance equivalent of the free-function `mcp_client_disconnect`.
     #[napi(js_name = "mcpClientDisconnect")]
     pub async fn mcp_client_disconnect(&self, handle: &NapiMcpClientHandle) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::mcp::mcp_client_disconnect_on(&self.inner, handle).await
     }
 
@@ -3031,6 +3090,7 @@ impl Scp {
         &self,
         handle: &NapiMcpClientHandle,
     ) -> napi::Result<Vec<NapiMcpToolInfo>> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::mcp::mcp_client_list_tools_on(&self.inner, handle).await
     }
 
@@ -3044,6 +3104,7 @@ impl Scp {
         context_id: String,
         invoker_did: String,
     ) -> napi::Result<NapiMcpInvokeResult> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::mcp::mcp_client_invoke_on(
             &self.inner,
             handle,
