@@ -44,7 +44,7 @@ fn setup() {
     });
 }
 
-/// Returns a fresh bridge instance with a test ContextManager attached.
+/// Returns a fresh bridge instance with a test `ContextManager` attached.
 /// Phase D (#1695): tests no longer share a process-global default.
 fn __bi() -> Arc<PyBridgeInstance> {
     let bi = Arc::new(PyBridgeInstance::new_py());

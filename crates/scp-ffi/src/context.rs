@@ -691,7 +691,7 @@ impl PyMessage {
     /// `instance_id`. Used by `drain_and_deliver` and `deliver_message` to
     /// feed messages into the receive channel.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         bi: &crate::runtime::PyBridgeInstance,
         sender_did: String,
         payload: Vec<u8>,
@@ -804,7 +804,7 @@ impl PyMessageReceiver {
     /// `FfiBridgeState::message_rx` so that `deliver_message` can access
     /// the receiver for oldest-drop overflow handling.
     #[must_use]
-    pub fn from_shared_rx(
+    pub const fn from_shared_rx(
         bi: &crate::runtime::PyBridgeInstance,
         rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PyMessage>>>,
     ) -> Self {
@@ -4306,7 +4306,7 @@ mod tests {
         #[allow(clippy::cast_precision_loss)]
         let ts = i as f64;
         PyMessage::new(
-            &*__bi(),
+            &__bi(),
             format!("did:test:sender-{i}"),
             format!("payload-{i}").into_bytes(),
             ts,
@@ -4318,7 +4318,7 @@ mod tests {
     async fn empty_then_message_delivery() {
         let (tx, rx) = mpsc::channel::<PyMessage>(RECEIVE_BUFFER_CAPACITY);
         let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
-        let msg_receiver = PyMessageReceiver::from_shared_rx(&*__bi(), Arc::clone(&rx_arc));
+        let msg_receiver = PyMessageReceiver::from_shared_rx(&__bi(), Arc::clone(&rx_arc));
 
         let rx_clone = Arc::clone(&msg_receiver.rx);
         let handle = tokio::spawn(async move {
@@ -4391,7 +4391,7 @@ mod tests {
             .unwrap();
 
         let overflow_warning = PyMessage::new(
-            &*__bi(),
+            &__bi(),
             "scp:system".to_owned(),
             b"BufferOverflow: oldest event dropped due to full receive buffer".to_vec(),
             0.0,
@@ -4707,7 +4707,7 @@ mod tests {
     #[test]
     fn handle_exposes_mode() {
         let handle = PyContextHandle::new(
-            &*__bi(),
+            &__bi(),
             "ctx-1".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
@@ -4721,7 +4721,7 @@ mod tests {
     #[test]
     fn handle_exposes_ceiling_policy() {
         let handle = PyContextHandle::new(
-            &*__bi(),
+            &__bi(),
             "ctx-2".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
@@ -4735,7 +4735,7 @@ mod tests {
     #[test]
     fn handle_exposes_promotion_policy() {
         let handle = PyContextHandle::new(
-            &*__bi(),
+            &__bi(),
             "ctx-3".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
@@ -4749,7 +4749,7 @@ mod tests {
     #[test]
     fn handle_exposes_template_id_none() {
         let handle = PyContextHandle::new(
-            &*__bi(),
+            &__bi(),
             "ctx-4".to_owned(),
             "did:test:creator".to_owned(),
             default_params(),
@@ -4760,7 +4760,7 @@ mod tests {
     #[test]
     fn handle_exposes_template_id_some() {
         let handle = PyContextHandle::new(
-            &*__bi(),
+            &__bi(),
             "ctx-5".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
@@ -4774,7 +4774,7 @@ mod tests {
     #[test]
     fn handle_exposes_economic_policy_none() {
         let handle = PyContextHandle::new(
-            &*__bi(),
+            &__bi(),
             "ctx-6".to_owned(),
             "did:test:creator".to_owned(),
             default_params(),
@@ -4786,7 +4786,7 @@ mod tests {
     fn handle_exposes_economic_policy_some() {
         let json = r#"{"locked":true}"#;
         let handle = PyContextHandle::new(
-            &*__bi(),
+            &__bi(),
             "ctx-7".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
@@ -4800,7 +4800,7 @@ mod tests {
     #[test]
     fn handle_repr_includes_mode() {
         let handle = PyContextHandle::new(
-            &*__bi(),
+            &__bi(),
             "ctx-repr".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
@@ -4815,7 +4815,7 @@ mod tests {
     #[test]
     fn handle_defaults_encrypted_immutable_no_promotion() {
         let handle = PyContextHandle::new(
-            &*__bi(),
+            &__bi(),
             "ctx-defaults".to_owned(),
             "did:test:creator".to_owned(),
             default_params(),
@@ -4837,7 +4837,7 @@ mod tests {
         // passes and the governance-rejection path is what errors (not
         // `SCP-PERM-3030`).
         let mut handle = PyContextHandle::new(
-            &*__bi(),
+            &__bi(),
             "ctx-econ-1".to_owned(),
             "did:test:creator".to_owned(),
             default_params(),

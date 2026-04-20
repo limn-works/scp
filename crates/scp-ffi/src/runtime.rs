@@ -2396,7 +2396,7 @@ mod tests {
             !bi.core.has_context_manager(),
             "fresh PyBridgeInstance must not have a ContextManager attached"
         );
-        init_context_manager_for_test(&bi);
+        init_context_manager_for_test(bi);
         assert!(
             bi.core.has_context_manager(),
             "init_context_manager_for_test(bi) must attach a ContextManager to bi.core"

@@ -118,6 +118,14 @@ pub struct PyIdentity {
     custody: String,
     /// Whether this identity has an agent signing key (`#agent` VM).
     has_agent_key: bool,
+    /// The agent verification method's public key in multibase form (if any).
+    ///
+    /// Snapshot of `DidDocument::agent_verification_method().public_key_multibase`
+    /// at construction time. We store it on the handle (instead of looking it
+    /// up through the bridge instance on each call) because `PyIdentity` is
+    /// a `frozen` `#[pyclass]` with no access to the owning `PyBridgeInstance`
+    /// from its getter methods. Returned by [`PyIdentity::get_agent_public_key`].
+    agent_public_key_multibase: Option<String>,
     /// Bridge instance affinity id (Phase 4 PR 1 — #1549). Consumed by
     /// [`crate::pyscp_check_handle!`] at every entry point that accepts this
     /// handle.
@@ -150,18 +158,19 @@ impl PyIdentity {
     /// Returns the agent key's public key as a multibase-encoded string, or
     /// `None` if no agent key exists.
     ///
-    /// Phase D (#1695): this getter returns `None` unconditionally since
-    /// `PyIdentity` no longer has access to the bridge registry. Callers who
-    /// need the agent key should use `SCP.identity_resolve(did)` which returns
-    /// a `PyDIDDocument` that exposes `agent_public_key`.
+    /// The value is snapshotted from the `DidDocument`'s `#agent`
+    /// verification method at the time this [`PyIdentity`] was constructed.
+    /// Rotating or removing the agent key returns a new `PyIdentity` with
+    /// the updated snapshot; callers must use the returned handle rather
+    /// than the stale one.
     ///
-    /// See ADR-039 acceptance criterion 19.
-    fn get_agent_public_key(&self) -> PyResult<Option<String>> {
-        // Without a bridge instance in scope, we cannot resolve the identity
-        // registry. Phase D deleted the default-instance fallback. Callers
-        // must use `SCP.identity_resolve(did)` instead to read the agent key
-        // from the returned `PyDIDDocument`.
-        Ok(None)
+    /// Mirrors the `UniFFI` bridge's `Identity::get_agent_public_key`
+    /// (see `crates/scp-ffi/uniffi/src/bridge.rs`) and the `NAPI` bridge.
+    ///
+    /// See ADR-039 acceptance criterion 19 and 4.
+    #[must_use]
+    fn get_agent_public_key(&self) -> Option<String> {
+        self.agent_public_key_multibase.clone()
     }
 
     fn __repr__(&self) -> String {
@@ -179,17 +188,51 @@ impl PyIdentity {
 impl PyIdentity {
     /// Creates a new `PyIdentity` tagged with the given bridge instance's
     /// `instance_id`.
+    ///
+    /// `agent_public_key_multibase` should be the `#agent` verification
+    /// method's `publicKeyMultibase` from the identity's DID document, or
+    /// `None` if the identity has no agent key. Use
+    /// [`PyIdentity::from_document`] when a `DidDocument` is in scope to
+    /// avoid computing `has_agent_key` and the agent key multibase twice.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         bi: &crate::runtime::PyBridgeInstance,
         did: String,
         custody: String,
         has_agent_key: bool,
+        agent_public_key_multibase: Option<String>,
     ) -> Self {
         Self {
             did,
             custody,
             has_agent_key,
+            agent_public_key_multibase,
+            instance_id: bi.core.instance_id(),
+        }
+    }
+
+    /// Creates a new `PyIdentity` by snapshotting agent key state from the
+    /// given [`DidDocument`].
+    ///
+    /// Prefer this over [`PyIdentity::new`] at callsites that already have a
+    /// `DidDocument` in scope — it guarantees `has_agent_key` and
+    /// `agent_public_key_multibase` agree (both derived from the same
+    /// document).
+    #[must_use]
+    pub fn from_document(
+        bi: &crate::runtime::PyBridgeInstance,
+        did: String,
+        custody: String,
+        document: &DidDocument,
+    ) -> Self {
+        let agent_vm = document.agent_verification_method();
+        let has_agent_key = agent_vm.is_some();
+        let agent_public_key_multibase = agent_vm.map(|vm| vm.public_key_multibase.clone());
+        Self {
+            did,
+            custody,
+            has_agent_key,
+            agent_public_key_multibase,
             instance_id: bi.core.instance_id(),
         }
     }
@@ -330,7 +373,7 @@ impl PyDIDDocument {
     /// Creates a new `PyDIDDocument` tagged with the given bridge instance's
     /// `instance_id`.
     #[must_use]
-    pub fn new(bi: &crate::runtime::PyBridgeInstance, document: DidDocument) -> Self {
+    pub const fn new(bi: &crate::runtime::PyBridgeInstance, document: DidDocument) -> Self {
         Self {
             inner: document,
             instance_id: bi.core.instance_id(),
@@ -543,6 +586,7 @@ impl crate::scp::PyScp {
                     .map_err(ScpPyError::from)?;
 
                 let did = identity.did.clone();
+                let document_for_handle = document.clone();
 
                 // Register the identity in this instance's registry so that
                 // subsequent bridge methods (UCAN minting, pseudonym
@@ -568,7 +612,12 @@ impl crate::scp::PyScp {
                     })?;
                 }
 
-                Ok(PyIdentity::new(&bi_arc, did, custody_str, false))
+                Ok(PyIdentity::from_document(
+                    &bi_arc,
+                    did,
+                    custody_str,
+                    &document_for_handle,
+                ))
             })
         })
     }
@@ -614,6 +663,7 @@ impl crate::scp::PyScp {
                     .map_err(ScpPyError::from)?;
 
                 let did = identity.did.clone();
+                let document_for_handle = document.clone();
 
                 crate::runtime::register_identity(
                     &bi_arc,
@@ -635,7 +685,12 @@ impl crate::scp::PyScp {
                     })?;
                 }
 
-                Ok(PyIdentity::new(&bi_arc, did, custody_str, true))
+                Ok(PyIdentity::from_document(
+                    &bi_arc,
+                    did,
+                    custody_str,
+                    &document_for_handle,
+                ))
             })
         })
     }
@@ -726,11 +781,19 @@ impl crate::scp::PyScp {
                 // minting, signing, pseudonym derivation, key rotation) would
                 // fail with "identity not found in registry".
                 if crate::runtime::identity_registry_contains(&bi_arc, &did_owned) {
-                    let has_agent = crate::runtime::with_identity(&bi_arc, &did_owned, |entry| {
-                        Ok(entry.document.has_agent_key())
-                    })
-                    .unwrap_or(false);
-                    return Ok(PyIdentity::new(&bi_arc, stored_did, custody_str, has_agent));
+                    let document_snapshot =
+                        crate::runtime::with_identity(&bi_arc, &did_owned, |entry| {
+                            Ok(entry.document.clone())
+                        })
+                        .ok();
+                    if let Some(document) = document_snapshot {
+                        return Ok(PyIdentity::from_document(
+                            &bi_arc,
+                            stored_did,
+                            custody_str,
+                            &document,
+                        ));
+                    }
                 }
 
                 Err(PyErr::from(ScpPyError::identity(format!(
@@ -831,15 +894,14 @@ impl crate::scp::PyScp {
                 });
 
                 let (new_identity, new_document) = rotation_result.map_err(ScpPyError::from)?;
-                let has_agent = new_document.has_agent_key();
                 entry.identity = new_identity;
                 entry.document = new_document;
 
-                Ok(PyIdentity::new(
+                Ok(PyIdentity::from_document(
                     &bi_arc,
                     did.clone(),
                     custody_str.clone(),
-                    has_agent,
+                    &entry.document,
                 ))
             })
         });
@@ -903,11 +965,11 @@ impl crate::scp::PyScp {
                 entry.identity = new_identity;
                 entry.document = new_document;
 
-                Ok(PyIdentity::new(
+                Ok(PyIdentity::from_document(
                     &bi_arc,
                     did.clone(),
                     custody_str.clone(),
-                    true,
+                    &entry.document,
                 ))
             })
         });
@@ -971,11 +1033,11 @@ impl crate::scp::PyScp {
                 entry.identity = new_identity;
                 entry.document = new_document;
 
-                Ok(PyIdentity::new(
+                Ok(PyIdentity::from_document(
                     &bi_arc,
                     did.clone(),
                     custody_str.clone(),
-                    true,
+                    &entry.document,
                 ))
             })
         });
@@ -1038,11 +1100,11 @@ impl crate::scp::PyScp {
                 entry.identity = new_identity;
                 entry.document = new_document;
 
-                Ok(PyIdentity::new(
+                Ok(PyIdentity::from_document(
                     &bi_arc,
                     did.clone(),
                     custody_str.clone(),
-                    false,
+                    &entry.document,
                 ))
             })
         });
@@ -1144,7 +1206,7 @@ impl crate::scp::PyScp {
                     .map_err(ScpPyError::from)?;
 
                 let new_did = new_identity.did.clone();
-                let has_agent = new_document.has_agent_key();
+                let document_for_handle = new_document.clone();
 
                 // Preserve existing attestations from the old DID across migration.
                 let existing_attestations = crate::runtime::with_identity(&bi_arc, &old_did, |e| {
@@ -1164,7 +1226,12 @@ impl crate::scp::PyScp {
                         identity_link_attestations: existing_attestations,
                     },
                 );
-                Ok(PyIdentity::new(&bi_arc, new_did, custody_str, has_agent))
+                Ok(PyIdentity::from_document(
+                    &bi_arc,
+                    new_did,
+                    custody_str,
+                    &document_for_handle,
+                ))
             })
         })
     }

@@ -113,7 +113,7 @@ impl PyUcanToken {
     /// Stamps the given bridge instance's `instance_id` on this token.
     /// Called by constructor sites so handle-affinity checks can reject
     /// cross-instance reuse.
-    pub(crate) fn stamp_instance_id(mut self, bi: &crate::runtime::PyBridgeInstance) -> Self {
+    pub(crate) const fn stamp_instance_id(mut self, bi: &crate::runtime::PyBridgeInstance) -> Self {
         self.instance_id = bi.core.instance_id();
         self
     }

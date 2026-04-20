@@ -454,7 +454,7 @@ fn parse_context_state(s: &str) -> PyResult<SourceContextState> {
 /// # Errors
 ///
 /// Returns `PyErr` if registration fails.
-pub fn register_provenance(_m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub const fn register_provenance(_m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 

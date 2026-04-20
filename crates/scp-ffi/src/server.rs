@@ -915,7 +915,7 @@ mod tests {
             .block_on(NativeRelayAdapter::connect_sourced(&sourced, None))
             .expect("should connect to the relay");
         let manager = scp_transport::TransportManager::new(Box::new(adapter));
-        let bi = bi_setup.clone();
+        let bi = bi_setup;
         crate::runtime::set_transport_manager(&bi, manager)
             .expect("should store transport manager in global");
 

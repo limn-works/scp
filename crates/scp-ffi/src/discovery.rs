@@ -60,10 +60,10 @@ use crate::error::ScpPyError;
 // them for historical reasons but should construct fresh `PyBridgeInstance`
 // instances to guarantee isolation.
 #[cfg(test)]
-fn reset_petname_map_for(_owner_did: &str) {}
+const fn reset_petname_map_for(_owner_did: &str) {}
 
 #[cfg(test)]
-fn reset_handle_registry_for(_context_id: &str) {}
+const fn reset_handle_registry_for(_context_id: &str) {}
 
 // ---------------------------------------------------------------------------
 // Bridge functions

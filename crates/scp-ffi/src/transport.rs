@@ -546,7 +546,6 @@ pub fn register_transport(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::*;
 
     fn default_scp() -> crate::scp::PyScp {
         crate::scp::PyScp::new()

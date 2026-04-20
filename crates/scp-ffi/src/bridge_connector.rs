@@ -18,7 +18,7 @@
 //!
 //! `SCP` methods (bridge-state accessors):
 //!
-//! - [`PyScp::bridge_create_shadow`] -- Create a shadow identity (uses bridge_state).
+//! - [`PyScp::bridge_create_shadow`] -- Create a shadow identity (uses `bridge_state`).
 //! - [`PyScp::bridge_credential_provision`] -- Provision (store) an encrypted credential.
 //! - [`PyScp::bridge_credential_retrieve`] -- Retrieve and decrypt a credential.
 //! - [`PyScp::bridge_credential_rotate`] -- Rotate (replace) a credential.
@@ -84,7 +84,7 @@ use crate::error::ScpPyError;
 /// `PyBridgeInstance` holds — `InMemoryCredentialStore` is thread-safe via
 /// internal `tokio::sync::RwLock`. Production deployments should replace
 /// this with a `Storage`-backed implementation when it lands (spec §12.11.2).
-fn credential_store_for(bi: &PyBridgeInstance) -> &Arc<InMemoryCredentialStore> {
+const fn credential_store_for(bi: &PyBridgeInstance) -> &Arc<InMemoryCredentialStore> {
     bi.credential_store()
 }
 

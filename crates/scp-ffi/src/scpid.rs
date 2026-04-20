@@ -252,7 +252,7 @@ const fn scpid_error_code(e: &scp_core::identity::ScpIdError) -> &'static str {
 /// # Errors
 ///
 /// Returns `PyErr` if registration fails.
-pub fn register_scpid(_m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub const fn register_scpid(_m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
