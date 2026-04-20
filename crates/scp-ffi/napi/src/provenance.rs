@@ -602,8 +602,7 @@ mod tests {
             provenance_pseudonymize_counterparties_on(&bi, prov_json.to_string(), key_hex.clone())
                 .unwrap();
         let result2 =
-            provenance_pseudonymize_counterparties_on(&bi, prov_json.to_string(), key_hex)
-                .unwrap();
+            provenance_pseudonymize_counterparties_on(&bi, prov_json.to_string(), key_hex).unwrap();
         assert_eq!(result1, result2);
 
         let parsed: serde_json::Value = serde_json::from_str(&result1).unwrap();

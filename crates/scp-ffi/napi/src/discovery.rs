@@ -361,12 +361,8 @@ mod tests {
     fn petname_context_set_and_resolve() {
         let owner = "did:dht:zNapiTest2".to_owned();
         let scp = crate::scp::Scp::new().unwrap();
-        scp.petname_set_context(
-            owner.clone(),
-            "ctx-napi-1".to_owned(),
-            "work".to_owned(),
-        )
-        .unwrap();
+        scp.petname_set_context(owner.clone(), "ctx-napi-1".to_owned(), "work".to_owned())
+            .unwrap();
         let json = scp
             .petname_resolve_context(owner, "work".to_owned())
             .unwrap();

@@ -445,11 +445,8 @@ mod tests {
     #[test]
     fn check_capability_missing_from_ceiling() {
         let bi = test_bi();
-        let result = media_check_capability_on(
-            &bi,
-            vec!["messages:read".to_owned()],
-            "voice".to_owned(),
-        );
+        let result =
+            media_check_capability_on(&bi, vec!["messages:read".to_owned()], "voice".to_owned());
         assert!(result.is_err());
     }
 

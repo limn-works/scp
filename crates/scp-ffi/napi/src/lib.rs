@@ -254,7 +254,6 @@ pub fn scp_version() -> String {
 // `BigInt` on the wire); pass `0n` to skip both graceful drain and
 // handle-release polling.
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

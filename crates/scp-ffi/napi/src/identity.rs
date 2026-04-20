@@ -40,14 +40,14 @@ use std::sync::Arc;
 
 use napi::Error as NapiError;
 use napi_derive::napi;
+#[cfg(all(test, feature = "allow_in_memory_custody"))]
+use scp_identity::DidMethod;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_identity::{DhtClient, IdentityError};
 use scp_identity::{
     DidCache, DidDht, DidDocument, DualLayerResolver, InMemoryDhtClient, NoOpRelayQuerier,
     ScpIdentity,
 };
-#[cfg(all(test, feature = "allow_in_memory_custody"))]
-use scp_identity::DidMethod;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
 #[cfg(feature = "allow_in_memory_custody")]
@@ -58,7 +58,6 @@ use std::fmt;
 
 use crate::error::ScpNapiError;
 use crate::{decrement_handle_count, increment_handle_count};
-
 
 /// Ensures the production DID resolver is initialized on the given bridge
 /// instance (idempotent). #311
@@ -437,7 +436,8 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
-                    bi: Arc::clone(&self.inner.bi), instance_id: self.inner.bi.instance_id(),
+                    bi: Arc::clone(&self.inner.bi),
+                    instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -510,7 +510,8 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
-                    bi: Arc::clone(&self.inner.bi), instance_id: self.inner.bi.instance_id(),
+                    bi: Arc::clone(&self.inner.bi),
+                    instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -583,7 +584,8 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
-                    bi: Arc::clone(&self.inner.bi), instance_id: self.inner.bi.instance_id(),
+                    bi: Arc::clone(&self.inner.bi),
+                    instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -656,7 +658,8 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
-                    bi: Arc::clone(&self.inner.bi), instance_id: self.inner.bi.instance_id(),
+                    bi: Arc::clone(&self.inner.bi),
+                    instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -769,7 +772,8 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
-                    bi: Arc::clone(&self.inner.bi), instance_id: self.inner.bi.instance_id(),
+                    bi: Arc::clone(&self.inner.bi),
+                    instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();

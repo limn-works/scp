@@ -835,7 +835,12 @@ impl crate::scp::PyScp {
                 entry.identity = new_identity;
                 entry.document = new_document;
 
-                Ok(PyIdentity::new(&bi_arc, did.clone(), custody_str.clone(), has_agent))
+                Ok(PyIdentity::new(
+                    &bi_arc,
+                    did.clone(),
+                    custody_str.clone(),
+                    has_agent,
+                ))
             })
         });
         result.map_err(PyErr::from)
@@ -898,7 +903,12 @@ impl crate::scp::PyScp {
                 entry.identity = new_identity;
                 entry.document = new_document;
 
-                Ok(PyIdentity::new(&bi_arc, did.clone(), custody_str.clone(), true))
+                Ok(PyIdentity::new(
+                    &bi_arc,
+                    did.clone(),
+                    custody_str.clone(),
+                    true,
+                ))
             })
         });
         result.map_err(PyErr::from)
@@ -961,7 +971,12 @@ impl crate::scp::PyScp {
                 entry.identity = new_identity;
                 entry.document = new_document;
 
-                Ok(PyIdentity::new(&bi_arc, did.clone(), custody_str.clone(), true))
+                Ok(PyIdentity::new(
+                    &bi_arc,
+                    did.clone(),
+                    custody_str.clone(),
+                    true,
+                ))
             })
         });
         result.map_err(PyErr::from)
@@ -1023,7 +1038,12 @@ impl crate::scp::PyScp {
                 entry.identity = new_identity;
                 entry.document = new_document;
 
-                Ok(PyIdentity::new(&bi_arc, did.clone(), custody_str.clone(), false))
+                Ok(PyIdentity::new(
+                    &bi_arc,
+                    did.clone(),
+                    custody_str.clone(),
+                    false,
+                ))
             })
         });
         result.map_err(PyErr::from)

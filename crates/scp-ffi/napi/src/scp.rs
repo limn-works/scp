@@ -498,7 +498,8 @@ impl Scp {
                         scp_identity: Some(identity),
                         in_memory_custody: Some(custody),
                         document: Some(document),
-                        bi: Arc::clone(&self.inner), instance_id: bi.instance_id(),
+                        bi: Arc::clone(&self.inner),
+                        instance_id: bi.instance_id(),
                     }),
                 };
                 crate::increment_handle_count();
@@ -520,7 +521,8 @@ impl Scp {
                 #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody: None,
                 document: Some(document),
-                bi: Arc::clone(&self.inner), instance_id: bi.instance_id(),
+                bi: Arc::clone(&self.inner),
+                instance_id: bi.instance_id(),
             }),
         };
         crate::increment_handle_count();

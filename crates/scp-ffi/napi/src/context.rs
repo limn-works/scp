@@ -3202,7 +3202,6 @@ pub(crate) fn metadata_record_to_json_on(
     })
 }
 
-
 /// Per-bridge-instance implementation of [`metadata_record_from_json`].
 pub(crate) fn metadata_record_from_json_on(
     _bi: &NapiBridgeInstance,
@@ -3364,8 +3363,8 @@ mod tests {
     /// creator); after a join it becomes 2.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn member_count_reflects_actual_membership() {
-        
-        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi()); crate::runtime::init_context_manager_for_test_on(&bi);
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_context_manager_for_test_on(&bi);
         let manager = context_manager(&bi).expect("manager initialized above");
         let ctx_id = format!("test-member-count-{}", uuid::Uuid::new_v4());
         let creator = DID("did:key:z6MkCreator".to_owned());
@@ -3454,8 +3453,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_change_role() {
-        
-        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi()); crate::runtime::init_context_manager_for_test_on(&bi);
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_context_manager_for_test_on(&bi);
         let manager = context_manager(&bi).expect("manager initialized above");
         let ctx_id = format!("napi-sync-role-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator1";
@@ -3516,8 +3515,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_add_member() {
-        
-        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi()); crate::runtime::init_context_manager_for_test_on(&bi);
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_context_manager_for_test_on(&bi);
         let manager = context_manager(&bi).expect("manager initialized above");
         let ctx_id = format!("napi-sync-add-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator2";
@@ -3569,8 +3568,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_remove_member() {
-        
-        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi()); crate::runtime::init_context_manager_for_test_on(&bi);
+        let bi = std::sync::Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        crate::runtime::init_context_manager_for_test_on(&bi);
         let manager = context_manager(&bi).expect("manager initialized above");
         let ctx_id = format!("napi-sync-rm-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator3";
@@ -3735,7 +3734,8 @@ mod tests {
             r#"{"has_spending_ucan":true,"configured_adapters":["x402"],"available_balance":10000}"#
                 .to_owned();
 
-        let result = super::evaluate_invitation_on(&bi,
+        let result = super::evaluate_invitation_on(
+            &bi,
             params_json,
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
@@ -3755,7 +3755,8 @@ mod tests {
         let params = scp_core::context::ContextParams::default();
         let params_json = serde_json::to_string(&params).unwrap();
 
-        let result = super::evaluate_invitation_on(&bi,
+        let result = super::evaluate_invitation_on(
+            &bi,
             params_json,
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
@@ -3773,7 +3774,8 @@ mod tests {
         let params = scp_core::context::ContextParams::default();
         let params_json = serde_json::to_string(&params).unwrap();
 
-        let result = super::evaluate_invitation_on(&bi,
+        let result = super::evaluate_invitation_on(
+            &bi,
             params_json,
             "did:dht:z6MkBobBobBobBobBobBobBobBobBobBobBobBobBo".to_owned(),
             "did:dht:z6MkLocalLocalLocalLocalLocalLocalLocal".to_owned(),
@@ -3910,7 +3912,8 @@ mod tests {
             .await
             .expect("context_create should succeed");
 
-        let result = super::context_join_on(&bi, 
+        let result = super::context_join_on(
+            &bi,
             &handle,
             identity.inner.did.clone(),
             Some("not.a.jwt".to_owned()),
@@ -4087,8 +4090,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn subscription_flag_resets_on_suspend() {
         use std::sync::atomic::Ordering;
-
-        
 
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 

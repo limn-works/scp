@@ -1453,12 +1453,10 @@ impl Identity {
     ///
     /// See SCP-214 acceptance criterion 9.
     pub async fn rotate_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
-        // #1646: every Category B (CoreFields-touching) UniFFI method must
-        // route through `default_bridge_instance()?` so `check_ready()`
-        // rejects operations against a suspended or shut-down bridge.
-        // `rotate_key` writes DID resolver state on `CoreFields` via the
-        // DHT signer path, so the gate is mandatory.
-        let _bi = crate::runtime::default_bridge_instance()?;
+        // Phase D (#1695): lifecycle gate deleted along with
+        // `DEFAULT_BRIDGE_INSTANCE`. The handle's own custody `Arc` keeps
+        // the signing key material alive; DID resolver state is now owned
+        // per-`Scp` (via `UniffiBridgeInstance`) and no longer process-wide.
         let core_id = self.core_id.as_ref().ok_or_else(|| ScpError::Identity {
             msg: "key rotation requires retained crypto state — this identity \
                       was loaded without key material (use identity_create or \
@@ -1581,9 +1579,8 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn add_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
-        // #1646: Category B gate — writes DID resolver / DHT state through
-        // `CoreFields`, must not run on a suspended or shut-down bridge.
-        let _bi = crate::runtime::default_bridge_instance()?;
+        // Phase D (#1695): lifecycle gate deleted — handle's own custody
+        // `Arc` keeps state alive; DID resolver is per-`Scp` now.
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -1672,9 +1669,8 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn remove_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
-        // #1646: Category B gate — writes DID resolver / DHT state through
-        // `CoreFields`, must not run on a suspended or shut-down bridge.
-        let _bi = crate::runtime::default_bridge_instance()?;
+        // Phase D (#1695): lifecycle gate deleted — handle's own custody
+        // `Arc` keeps state alive; DID resolver is per-`Scp` now.
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -1765,9 +1761,8 @@ impl Identity {
     // async required by UniFFI export interface even though non-custody path has no await
     #[allow(clippy::unused_async)]
     pub async fn rotate_agent_key(self: Arc<Self>) -> Result<Arc<Self>, ScpError> {
-        // #1646: Category B gate — writes DID resolver / DHT state through
-        // `CoreFields`, must not run on a suspended or shut-down bridge.
-        let _bi = crate::runtime::default_bridge_instance()?;
+        // Phase D (#1695): lifecycle gate deleted — handle's own custody
+        // `Arc` keeps state alive; DID resolver is per-`Scp` now.
         #[cfg(not(feature = "allow_in_memory_custody"))]
         {
             Err(ScpError::Identity {
@@ -2074,6 +2069,15 @@ impl Drop for UcanToken {
 pub struct TransportManager {
     /// Current connection state (relay URL, latency).
     pub(crate) status: std::sync::Mutex<TransportStatus>,
+    /// Owning `UniffiBridgeInstance` whose `CoreFields::transport` slot this
+    /// handle operates against.
+    ///
+    /// Phase D (#1695) replaces the old process-wide `DEFAULT_BRIDGE_INSTANCE`
+    /// lookup with a per-handle `Arc` — the `Scp` that minted the handle
+    /// keeps its transport state alive through this field, and
+    /// `suspend()`/`shutdown()` on that `Scp` transparently clears the
+    /// transport the handle reads from.
+    pub(crate) bi: Arc<crate::runtime::UniffiBridgeInstance>,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
     /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
@@ -2083,13 +2087,10 @@ pub struct TransportManager {
 
 impl fmt::Debug for TransportManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let adapter_count = crate::runtime::bridge_instance()
-            .ok()
-            .and_then(|bi| {
-                bi.core
-                    .with_transport(scp_transport::TransportManager::adapter_count)
-                    .ok()
-            })
+        let adapter_count = self
+            .bi
+            .core
+            .with_transport(scp_transport::TransportManager::adapter_count)
             .unwrap_or(0);
         f.debug_struct("TransportManager")
             .field("adapter_count", &adapter_count)
@@ -2134,9 +2135,10 @@ impl TransportManager {
     /// Reflects actual connection state: `connected` is `true` only if the
     /// inner transport manager has at least one adapter registered.
     pub fn status(&self) -> TransportStatus {
-        let has_adapters = crate::runtime::bridge_instance()
-            .ok()
-            .and_then(|bi| bi.core.with_transport(|mgr| mgr.adapter_count() > 0).ok())
+        let has_adapters = self
+            .bi
+            .core
+            .with_transport(|mgr| mgr.adapter_count() > 0)
             .unwrap_or(false);
         let status = self.status.lock().map_or(
             TransportStatus {
@@ -2155,22 +2157,18 @@ impl TransportManager {
 
     /// Returns `true` if the transport is currently connected (has adapters).
     pub fn is_connected(&self) -> bool {
-        crate::runtime::bridge_instance()
-            .ok()
-            .and_then(|bi| bi.core.with_transport(|mgr| mgr.adapter_count() > 0).ok())
+        self.bi
+            .core
+            .with_transport(|mgr| mgr.adapter_count() > 0)
             .unwrap_or(false)
     }
 
     /// Returns the number of adapters registered in the transport manager.
     #[allow(clippy::cast_possible_truncation)] // Adapter count is bounded by connection budget (<<u32::MAX).
     pub fn adapter_count(&self) -> u32 {
-        crate::runtime::bridge_instance()
-            .ok()
-            .and_then(|bi| {
-                bi.core
-                    .with_transport(|mgr| mgr.adapter_count() as u32)
-                    .ok()
-            })
+        self.bi
+            .core
+            .with_transport(|mgr| mgr.adapter_count() as u32)
             .unwrap_or(0)
     }
 
@@ -2193,11 +2191,8 @@ impl TransportManager {
 
         validate_relay_url(&relay_url)?;
 
-        // #1646: Category B gate — mutates `CoreFields::transport` state,
-        // must not run on a suspended or shut-down bridge.
-        // `default_bridge_instance()` errors on shutdown; `bridge_instance()`
-        // only warns, which is too permissive for a mutation.
-        let bi = crate::runtime::default_bridge_instance()?;
+        // Phase D (#1695): the handle's `bi` field is the owning
+        // `UniffiBridgeInstance` — mutate its transport slot directly.
         let rt = runtime();
         let sourced = SourcedRelayUrl {
             url: relay_url.clone(),
@@ -2216,7 +2211,8 @@ impl TransportManager {
         // events and downgrades the relay's reliability score (#1533 AC5).
         let suppression_rx = adapter.take_suppression_receiver();
 
-        let count = bi
+        let count = self
+            .bi
             .core
             .with_transport_mut(|mgr| {
                 let _eviction = mgr.add_adapter(Box::new(adapter));
@@ -2229,10 +2225,10 @@ impl TransportManager {
                 code: codes::TRANS_5003.to_owned(),
             })?;
 
-        // Spawn suppression → scoring bridge task.
-        // Uses BridgeInstance transport for score updates.
+        // Spawn suppression → scoring bridge task against this handle's
+        // owning `UniffiBridgeInstance`.
         if let Some(rx) = suppression_rx {
-            spawn_suppression_scoring_task(rx, relay_url);
+            spawn_suppression_scoring_task(Arc::clone(&self.bi), rx, relay_url);
         }
 
         Ok(count)
@@ -2256,10 +2252,9 @@ impl TransportManager {
     /// Returns `ScpError::Transport` if no adapters are registered.
     pub fn assign_relay_set(&self, context_id: String) -> Result<Vec<u32>, ScpError> {
         validate_context_id(&context_id)?;
-        // #1646: Category B gate — mutates `CoreFields::transport` state,
-        // must not run on a suspended or shut-down bridge.
-        let bi = crate::runtime::default_bridge_instance()?;
-        let indices = bi
+        // Phase D (#1695): mutate this handle's owning instance's transport.
+        let indices = self
+            .bi
             .core
             .with_transport(|mgr| {
                 mgr.assign_relay_set(&context_id)
@@ -2284,8 +2279,8 @@ impl TransportManager {
     ///
     /// * `adapter_index` -- The adapter index (0-based) to query.
     pub fn reliability_score(&self, adapter_index: u32) -> Option<ReliabilityScoreRecord> {
-        let bi = crate::runtime::bridge_instance().ok()?;
-        let score = bi
+        let score = self
+            .bi
             .core
             .with_transport(|mgr| mgr.get_reliability_score(adapter_index as usize))
             .ok()??;
@@ -2324,18 +2319,20 @@ impl Drop for TransportManager {
 /// #1533 AC5). Each suppression event downgrades the relay's reliability
 /// score via `DeliveryOutcome::Failure`.
 ///
-/// Accesses the transport via `BridgeInstance` — the task exits gracefully
-/// when the bridge is shut down or the transport is cleared.
+/// Accesses the transport via a cloned `Arc<UniffiBridgeInstance>` — the
+/// task exits gracefully when the bridge is shut down or the transport is
+/// cleared.
 fn spawn_suppression_scoring_task(
+    bi: Arc<crate::runtime::UniffiBridgeInstance>,
     mut rx: tokio::sync::mpsc::Receiver<scp_transport::heartbeat::SuppressionSuspected>,
     relay_url: String,
 ) {
     tokio::spawn(async move {
         while let Some(_suppression) = rx.recv().await {
-            let Ok(bi) = crate::runtime::bridge_instance() else {
+            if bi.core.is_shutdown() {
                 // Bridge shut down — exit gracefully.
                 break;
-            };
+            }
             tracing::debug!(
                 relay_url = %relay_url,
                 "heartbeat suppression → downgrading relay reliability score"
@@ -2357,63 +2354,13 @@ fn spawn_suppression_scoring_task(
 // See ADR-021 acceptance criterion 2.
 // ---------------------------------------------------------------------------
 
-/// Creates a new DID identity with the specified custody method.
-///
-/// # Arguments
-///
-/// * `custody` — The custody type string. Accepted values depend on the build
-///   configuration:
-///   - `"platform"` — always accepted; requires a wired `KeyCustodyProvider`.
-///   - `"software"` — always accepted; requires a wired `KeyCustodyProvider`.
-///   - `"in_memory"` — **only** accepted when the `allow_in_memory_custody`
-///     feature is enabled at compile time. Returns `ScpError::Identity` with
-///     code `SCP-IDENT-1008` otherwise. Stores key material in unprotected heap
-///     memory; suitable for testing and development but NOT for production use
-///     on mobile devices.
-///
-/// # Returns
-///
-/// An `Identity` handle with the new DID and custody type.
-///
-/// # Errors
-///
-/// Returns `ScpError::Identity` if key generation or DID creation fails.
-/// Returns `ScpError::Identity` with code `SCP-IDENT-1008` if `"in_memory"` is
-/// requested but the `allow_in_memory_custody` feature is not enabled.
-/// Returns `ScpError::Validation` if the custody string is not recognized.
-///
-/// Ensures the global production DID resolver is initialized.
-///
-/// Creates a `DualLayerResolver` backed by [`FfiDhtClient`] and
-/// `NoOpRelayQuerier`. The resolver is shared across all UCAN validation
-/// calls. Idempotent: subsequent calls are no-ops.
-///
-/// See #311 for the DID resolver unification design.
-///
-/// Retained for symmetry with [`ensure_did_resolver_initialized_on`]; the
-/// per-instance variant is used by `Scp::identity_create_with_agent_key`.
-/// All other call sites now route through the `_on` variant.
-#[allow(dead_code)]
-fn ensure_did_resolver_initialized(handle: tokio::runtime::Handle) -> Result<(), ScpError> {
-    if crate::runtime::did_resolver().is_some() {
-        return Ok(());
-    }
-
-    let dht_client = Arc::new(new_ffi_dht_client!().map_err(ScpError::from)?);
-    let relay_querier = Arc::new(NoOpRelayQuerier);
-    let cache = Arc::new(DidCache::new());
-    let bootstrap_relays = Vec::new();
-
-    let resolver = Arc::new(DualLayerResolver::new(
-        relay_querier,
-        dht_client,
-        cache,
-        bootstrap_relays,
-    ));
-
-    crate::runtime::init_did_resolver(resolver, handle);
-    Ok(())
-}
+// Phase D (#1695): `ensure_did_resolver_initialized` free-function helper
+// deleted along with the process-wide `DEFAULT_BRIDGE_INSTANCE`. Every
+// call site now routes through the per-instance
+// [`ensure_did_resolver_initialized_on`] helper, which stores the resolver
+// on the caller's own `UniffiBridgeInstance::did_resolver` slot. The
+// companion `identity_create` free function moved earlier in the same
+// demolition to `Scp::identity_create` (PR 4 sub-slice B).
 
 // ---------------------------------------------------------------------------
 // Free functions — device attestation (#419)
@@ -2535,35 +2482,19 @@ const UNIFFI_LINK_ATTESTATION_REGISTRY_CAP: usize = 10_000;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 
-/// Fallback empty identity link attestation registry for when the default
-/// `UniffiBridgeInstance` has not been initialized yet.
-static EMPTY_IDENTITY_LINK_ATTESTATION_REGISTRY: std::sync::OnceLock<
-    dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>,
-> = std::sync::OnceLock::new();
-
-/// Returns a reference to the default bridge instance's identity link
+/// Returns a reference to this `UniffiBridgeInstance`'s identity link
 /// attestation registry.
 ///
 /// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
 /// typed `identity_link_attestation_registry` field on
 /// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 6.
-/// Falls back to an empty registry when the default instance has not been
-/// initialized yet.
-fn identity_link_attestation_registry()
--> &'static dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>>
-{
-    crate::runtime::default_bridge_instance_raw().map_or_else(
-        || EMPTY_IDENTITY_LINK_ATTESTATION_REGISTRY.get_or_init(dashmap::DashMap::new),
-        |bi| bi.identity_link_attestation_registry().as_ref(),
-    )
+/// Phase D (#1695) deletes the empty-fallback branch — every caller now
+/// threads through its owning `Scp`.
+fn identity_link_attestation_registry(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+) -> &dashmap::DashMap<String, Vec<scp_core::identity::attestation::IdentityLinkAttestation>> {
+    bi.identity_link_attestation_registry().as_ref()
 }
-
-/// Fallback empty identity custody registry for when the default
-/// `UniffiBridgeInstance` has not been initialized yet.
-#[cfg(feature = "allow_in_memory_custody")]
-static EMPTY_IDENTITY_CUSTODY_REGISTRY: std::sync::OnceLock<
-    dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)>,
-> = std::sync::OnceLock::new();
 
 /// Retained identity custody for attestation verification (keyed by DID).
 ///
@@ -2572,27 +2503,21 @@ static EMPTY_IDENTITY_CUSTODY_REGISTRY: std::sync::OnceLock<
 /// up the issuer's public key without requiring the caller to pass the
 /// Identity object.
 ///
-/// PR 1 moved the registry onto the typed `identity_custody_registry` field
-/// on the default `UniffiBridgeInstance`. Commit 6 of #1549 Phase 4 PR 2
-/// lifts the internal `EMPTY` fallback `OnceLock` out of this function onto
-/// module scope so all three `UniFFI` registries follow the uniform
-/// `EMPTY_* -> bi.field.as_ref()` resolution pattern.
+/// Phase D (#1695): operates directly on the caller's `Scp`'s
+/// `UniffiBridgeInstance` — there is no process-wide fallback.
 #[cfg(feature = "allow_in_memory_custody")]
-pub(crate) fn identity_custody_registry()
--> &'static dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
-    crate::runtime::ensure_bridge_instance();
-    crate::runtime::default_bridge_instance_raw().map_or_else(
-        || EMPTY_IDENTITY_CUSTODY_REGISTRY.get_or_init(dashmap::DashMap::new),
-        |bi| bi.identity_custody_registry.as_ref(),
-    )
+pub(crate) fn identity_custody_registry(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+) -> &dashmap::DashMap<String, (Arc<OpaqueInMemoryKeyCustody>, scp_platform::KeyHandle)> {
+    bi.identity_custody_registry.as_ref()
 }
 
 /// Creates an identity link attestation for an external platform identity.
 ///
 /// See spec §3.5.1, §3.5.2.
 #[cfg(feature = "allow_in_memory_custody")]
-#[cfg(feature = "allow_in_memory_custody")]
 async fn identity_create_link_attestation_impl(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     identity: Arc<Identity>,
     platform: String,
     handle: String,
@@ -2669,7 +2594,7 @@ async fn identity_create_link_attestation_impl(
     // Store custody for later verification lookups.
     // Use entry() API to avoid TOCTOU between contains_key and insert.
     {
-        let registry = identity_custody_registry();
+        let registry = identity_custody_registry(bi);
         let len = registry.len();
         match registry.entry(identity.did.clone()) {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
@@ -2697,7 +2622,7 @@ async fn identity_create_link_attestation_impl(
 
     // Use entry() API to avoid TOCTOU between contains_key and insert.
     {
-        let registry = identity_link_attestation_registry();
+        let registry = identity_link_attestation_registry(bi);
         let len = registry.len();
         match registry.entry(identity.did.clone()) {
             dashmap::mapref::entry::Entry::Occupied(mut occ) => {
@@ -2740,7 +2665,6 @@ async fn identity_create_link_attestation_impl(
 ///
 /// See spec §3.5.1.
 #[cfg(feature = "allow_in_memory_custody")]
-#[must_use]
 #[allow(clippy::unused_async)]
 async fn identity_verify_link_attestation_impl(
     attestation_json: String,
@@ -2778,6 +2702,7 @@ async fn identity_verify_link_attestation_impl(
 /// Runs the full 11-step ADR-016 pipeline, requiring `tool_invoke:{tool_id}`
 /// or `tool_invoke:*` capability. Extracted to keep `tool_invoke` focused.
 fn validate_tool_ucan_uniffi(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: &ContextHandle,
     tool_id: &str,
     ucan_token: &str,
@@ -2803,18 +2728,16 @@ fn validate_tool_ucan_uniffi(
     }
     let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
 
-    // Ensure UCAN state is registered for this context.
-    crate::runtime::ensure_ucan_registered(
+    // Ensure UCAN state is registered for this context on the caller's instance.
+    bi.ensure_ucan_registered(
         &handle.context_id,
         &handle.creator_did,
         &handle.ceiling_strings,
     );
 
-    crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
-        let production_resolver = crate::runtime::did_resolver();
-        let did_resolver = scp_ffi_common::DispatchDidResolver::new(
-            production_resolver.map(std::convert::AsRef::as_ref),
-        );
+    bi.with_ucan_state(&handle.context_id, |ucan_state| {
+        let production_resolver = bi.did_resolver();
+        let did_resolver = scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
             revocation_list: &ucan_state.revocation_list,
         };
@@ -2942,47 +2865,43 @@ pub struct McpAllowlistState {
 // context_create and deregistered during context_close/leave.
 // ---------------------------------------------------------------------------
 
-/// Fallback empty context handle registry for when the default
-/// `UniffiBridgeInstance` has not been initialized yet.
-static EMPTY_CONTEXT_HANDLE_REGISTRY: std::sync::OnceLock<
-    dashmap::DashMap<String, Arc<ContextHandle>>,
-> = std::sync::OnceLock::new();
-
-/// Returns a reference to the default bridge instance's context handle
+/// Returns a reference to this `UniffiBridgeInstance`'s context handle
 /// registry.
 ///
 /// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
 /// typed `context_handle_registry` field on
 /// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 6.
-/// Falls back to an empty registry when the default instance has not been
-/// initialized yet.
+/// Phase D (#1695) deletes the empty-fallback branch — every caller threads
+/// through the owning `Scp`.
 ///
 /// Used by `McpUniFfiBridgeProvider` to look up per-context tool registries,
 /// handlers, and event log state. The `Arc<ContextHandle>` keeps the handle
 /// alive as long as it is in the registry (the caller also holds an Arc).
-fn context_handle_registry() -> &'static dashmap::DashMap<String, Arc<ContextHandle>> {
-    crate::runtime::default_bridge_instance_raw().map_or_else(
-        || EMPTY_CONTEXT_HANDLE_REGISTRY.get_or_init(dashmap::DashMap::new),
-        |bi| bi.context_handle_registry().as_ref(),
-    )
+fn context_handle_registry(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+) -> &dashmap::DashMap<String, Arc<ContextHandle>> {
+    bi.context_handle_registry().as_ref()
 }
 
-/// Registers a context handle in the global registry.
+/// Registers a context handle in the owning instance's registry.
 ///
 /// Called from `context_create` after the handle is constructed. If a handle
 /// with the same context ID is already registered, the old one is replaced
 /// (last-writer-wins — should not happen in practice since context IDs are
 /// UUIDs).
-fn register_context_handle(handle: &Arc<ContextHandle>) {
-    context_handle_registry().insert(handle.context_id.clone(), Arc::clone(handle));
+fn register_context_handle(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    handle: &Arc<ContextHandle>,
+) {
+    context_handle_registry(bi).insert(handle.context_id.clone(), Arc::clone(handle));
 }
 
-/// Removes a context handle from the global registry.
+/// Removes a context handle from the owning instance's registry.
 ///
 /// Called from `context_close` and `context_leave`. No-op if the context ID
 /// is not registered.
-fn deregister_context_handle(context_id: &str) {
-    context_handle_registry().remove(context_id);
+fn deregister_context_handle(bi: &Arc<crate::runtime::UniffiBridgeInstance>, context_id: &str) {
+    context_handle_registry(bi).remove(context_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -3005,36 +2924,24 @@ pub(crate) struct McpClientEntry {
     pub(crate) client: std::sync::Mutex<scp_mcp::client::McpClient<McpUniFFITransportWrapper>>,
 }
 
-/// Fallback empty MCP server registry for when the default
-/// `UniffiBridgeInstance` has not been initialized yet. Mirrors the
-/// NAPI `EMPTY_SERVER_REGISTRY` fallback pattern.
-static EMPTY_MCP_SERVER_REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpServerEntry>> =
-    std::sync::OnceLock::new();
-
-/// Fallback empty MCP client registry.
-static EMPTY_MCP_CLIENT_REGISTRY: std::sync::OnceLock<dashmap::DashMap<String, McpClientEntry>> =
-    std::sync::OnceLock::new();
-
-/// Returns a reference to the default bridge instance's MCP server registry.
+/// Returns a reference to this `UniffiBridgeInstance`'s MCP server registry.
 ///
 /// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
 /// typed `mcp_server_registry` field on
 /// [`crate::runtime::UniffiBridgeInstance`] in #1549 Phase 4 PR 2 commit 4.
-/// Falls back to an empty registry when the default instance has not been
-/// initialized yet.
-fn mcp_server_registry() -> &'static dashmap::DashMap<String, McpServerEntry> {
-    crate::runtime::default_bridge_instance_raw().map_or_else(
-        || EMPTY_MCP_SERVER_REGISTRY.get_or_init(dashmap::DashMap::new),
-        |bi| bi.mcp_server_registry().as_ref(),
-    )
+/// Phase D (#1695) deletes the empty-fallback branch — every caller threads
+/// through the owning `Scp`.
+fn mcp_server_registry(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+) -> &dashmap::DashMap<String, McpServerEntry> {
+    bi.mcp_server_registry().as_ref()
 }
 
-/// Returns a reference to the default bridge instance's MCP client registry.
-fn mcp_client_registry() -> &'static dashmap::DashMap<String, McpClientEntry> {
-    crate::runtime::default_bridge_instance_raw().map_or_else(
-        || EMPTY_MCP_CLIENT_REGISTRY.get_or_init(dashmap::DashMap::new),
-        |bi| bi.mcp_client_registry().as_ref(),
-    )
+/// Returns a reference to this `UniffiBridgeInstance`'s MCP client registry.
+fn mcp_client_registry(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+) -> &dashmap::DashMap<String, McpClientEntry> {
+    bi.mcp_client_registry().as_ref()
 }
 
 fn mcp_handle_id(prefix: &str) -> String {
@@ -3257,6 +3164,12 @@ const UNIFFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::tools::DEFAULT_TIMEOUT_MS
 /// - `context_members()` reads from `ContextManager::member_dids()` + `member_role()`
 /// - `context_events()` reads from the per-context event log (UCAN state)
 struct McpUniFfiBridgeProvider {
+    /// Owning `UniffiBridgeInstance` — source for the context handle
+    /// registry, `ContextManager`, and UCAN state lookups.
+    ///
+    /// Phase D (#1695): replaces process-wide `DEFAULT_BRIDGE_INSTANCE`
+    /// lookups with per-provider `Arc` affinity.
+    bi: Arc<crate::runtime::UniffiBridgeInstance>,
     agent_did: String,
     context_ids: Vec<String>,
     /// Maximum time (in milliseconds) to wait for a tool handler to complete.
@@ -3273,8 +3186,8 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
-        // Read the agent's role assignment from the ContextManager's role state.
-        let manager = crate::runtime::context_manager().ok()?;
+        // Read the agent's role assignment from this instance's ContextManager.
+        let manager = self.bi.context_manager_expect().ok()?;
         let role_state = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(manager.get_role_state(context_id))
         })?;
@@ -3289,9 +3202,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     fn context_tools(&self, context_id: &str) -> Vec<scp_mcp::server::ContextToolInfo> {
-        // Look up the ContextHandle from the global registry and read its
-        // tool_registry.
-        let registry = context_handle_registry();
+        // Look up the ContextHandle from this provider's instance registry
+        // and read its tool_registry.
+        let registry = context_handle_registry(&self.bi);
         let Some(handle) = registry.get(context_id) else {
             return Vec::new();
         };
@@ -3329,10 +3242,12 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             // Scope the DashMap Ref so the shard lock is released before
             // entering with_ucan_state (which uses a different DashMap).
             {
-                let handle = context_handle_registry().get(context_id).ok_or_else(|| {
-                    format!("context '{context_id}' not found in handle registry")
-                })?;
-                crate::runtime::ensure_ucan_registered(
+                let handle = context_handle_registry(&self.bi)
+                    .get(context_id)
+                    .ok_or_else(|| {
+                        format!("context '{context_id}' not found in handle registry")
+                    })?;
+                self.bi.ensure_ucan_registered(
                     context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
@@ -3340,46 +3255,46 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             }
 
             let agent_did = self.agent_did.clone();
-            crate::runtime::with_ucan_state(context_id, |ucan_state| {
-                let production_resolver = crate::runtime::did_resolver();
-                let did_resolver = scp_ffi_common::DispatchDidResolver::new(
-                    production_resolver.map(std::convert::AsRef::as_ref),
-                );
-                let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
-                    revocation_list: &ucan_state.revocation_list,
-                };
-                let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                    inner: &mut ucan_state.nonce_tracker,
-                };
+            self.bi
+                .with_ucan_state(context_id, |ucan_state| {
+                    let production_resolver = self.bi.did_resolver();
+                    let did_resolver =
+                        scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
+                    let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+                        revocation_list: &ucan_state.revocation_list,
+                    };
+                    let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+                        inner: &mut ucan_state.nonce_tracker,
+                    };
 
-                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-                    did_resolver: &did_resolver,
-                    nonce_tracker: &mut nonce_adapter,
-                    revocation_checker: &revocation_checker,
-                    proof_resolver: &proof_resolver,
-                    ceiling: &ucan_state.ceiling_strings,
-                    context_creator_did: &ucan_state.creator_did,
-                    presenting_agent_did: &agent_did,
-                    clock_skew_tolerance_secs:
-                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                    clock: &scp_primitives::SystemClock,
-                };
+                    let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                        did_resolver: &did_resolver,
+                        nonce_tracker: &mut nonce_adapter,
+                        revocation_checker: &revocation_checker,
+                        proof_resolver: &proof_resolver,
+                        ceiling: &ucan_state.ceiling_strings,
+                        context_creator_did: &ucan_state.creator_did,
+                        presenting_agent_did: &agent_did,
+                        clock_skew_tolerance_secs:
+                            scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                        clock: &scp_primitives::SystemClock,
+                    };
 
-                scp_core::context::tools::validate_tool_invocation_ucan(
-                    token, context_id, tool_name, &mut ctx,
-                )
-                .map_err(|e| {
-                    tracing::warn!(
-                        agent = %agent_did,
-                        tool = %tool_name,
-                        context = %context_id,
-                        error = %e,
-                        "UCAN validation failed for tool invocation"
-                    );
-                    format!("UCAN authorization failed for tool '{tool_name}': {e}")
+                    scp_core::context::tools::validate_tool_invocation_ucan(
+                        token, context_id, tool_name, &mut ctx,
+                    )
+                    .map_err(|e| {
+                        tracing::warn!(
+                            agent = %agent_did,
+                            tool = %tool_name,
+                            context = %context_id,
+                            error = %e,
+                            "UCAN validation failed for tool invocation"
+                        );
+                        format!("UCAN authorization failed for tool '{tool_name}': {e}")
+                    })
                 })
-            })
-            .ok_or_else(|| format!("UCAN state not found for context '{context_id}'"))??;
+                .ok_or_else(|| format!("UCAN state not found for context '{context_id}'"))??;
         } else {
             tracing::warn!(
                 agent = %self.agent_did,
@@ -3392,7 +3307,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        let manager = crate::runtime::context_manager()
+        let manager = self
+            .bi
+            .context_manager_expect()
             .map_err(|e| format!("ContextManager not initialized: {e}"))?;
         let role_state = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(manager.get_role_state(context_id))
@@ -3434,7 +3351,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         // handler execution to avoid blocking concurrent context operations.
         // The DashMap Ref (shard lock) is scoped to this block.
         let (dispatch, input_hash) = {
-            let handle = context_handle_registry()
+            let handle = context_handle_registry(&self.bi)
                 .get(context_id)
                 .ok_or_else(|| format!("context '{context_id}' not found in handle registry"))?;
 
@@ -3536,15 +3453,15 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             .map_or(0, |d| d.as_secs());
 
         // Ensure UCAN state is registered before appending the event.
-        if let Some(handle) = context_handle_registry().get(context_id) {
-            crate::runtime::ensure_ucan_registered(
+        if let Some(handle) = context_handle_registry(&self.bi).get(context_id) {
+            self.bi.ensure_ucan_registered(
                 context_id,
                 &handle.creator_did,
                 &handle.ceiling_strings,
             );
         }
 
-        let append_result = crate::runtime::with_ucan_state(context_id, |ucan_state| {
+        let append_result = self.bi.with_ucan_state(context_id, |ucan_state| {
             let sequence = scp_event_log::tree::event_count(&ucan_state.event_log);
             let prev_hash = if ucan_state.event_log.leaves().is_empty() {
                 scp_event_log::tree::GENESIS_PREV_HASH
@@ -3590,8 +3507,8 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     fn context_members(&self, context_id: &str) -> Vec<scp_mcp::server::MemberInfo> {
-        // Read member list and role assignments from the ContextManager.
-        let Ok(manager) = crate::runtime::context_manager() else {
+        // Read member list and role assignments from this instance's ContextManager.
+        let Ok(manager) = self.bi.context_manager_expect() else {
             return Vec::new();
         };
 
@@ -3617,23 +3534,24 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     fn context_events(&self, context_id: &str) -> serde_json::Value {
         // The EventLog stores Merkle tree hashes, not event payloads.
         // Return the event count and Merkle root as metadata (matching PyO3).
-        if let Some(handle) = context_handle_registry().get(context_id) {
-            crate::runtime::ensure_ucan_registered(
+        if let Some(handle) = context_handle_registry(&self.bi).get(context_id) {
+            self.bi.ensure_ucan_registered(
                 context_id,
                 &handle.creator_did,
                 &handle.ceiling_strings,
             );
         }
 
-        crate::runtime::with_ucan_state(context_id, |ucan_state| {
-            let leaf_count = ucan_state.event_log.leaves().len();
-            let root = scp_event_log::tree::root(&ucan_state.event_log);
-            serde_json::json!({
-                "event_count": leaf_count,
-                "merkle_root": hex::encode(root),
+        self.bi
+            .with_ucan_state(context_id, |ucan_state| {
+                let leaf_count = ucan_state.event_log.leaves().len();
+                let root = scp_event_log::tree::root(&ucan_state.event_log);
+                serde_json::json!({
+                    "event_count": leaf_count,
+                    "merkle_root": hex::encode(root),
+                })
             })
-        })
-        .unwrap_or_else(|| serde_json::json!({ "event_count": 0 }))
+            .unwrap_or_else(|| serde_json::json!({ "event_count": 0 }))
     }
 
     fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
@@ -4052,6 +3970,7 @@ async fn ucan_delegate_impl(
 
 #[cfg(feature = "allow_in_memory_custody")]
 async fn event_log_checkpoint_impl(
+    bi: Arc<crate::runtime::UniffiBridgeInstance>,
     handle: Arc<ContextHandle>,
     identity: Arc<Identity>,
     epoch: u64,
@@ -4078,8 +3997,9 @@ async fn event_log_checkpoint_impl(
                     code: codes::IDENT_1007.to_owned(),
                 })?;
 
-            // Ensure UCAN state (which contains the event log) is registered.
-            crate::runtime::ensure_ucan_registered(
+            // Ensure UCAN state (which contains the event log) is registered
+            // on this bridge instance.
+            bi.ensure_ucan_registered(
                 &handle.context_id,
                 &handle.creator_did,
                 &handle.ceiling_strings,
@@ -4088,35 +4008,36 @@ async fn event_log_checkpoint_impl(
             let sender_did = scp_identity::DID(identity.did.clone());
             let context_id = handle.context_id.clone();
 
-            let checkpoint = crate::runtime::with_ucan_state(&context_id, |ucan_state| {
-                let signer = scp_core::event_log::KeyCustodySigner {
-                    custody: &custody.0,
-                    key: &core_id.active_signing_key,
-                };
-                // generate_checkpoint is async — use block_in_place to allow
-                // blocking inside this spawned async task. block_in_place moves
-                // the worker thread to blocking mode (requires multi-thread runtime).
-                let handle = tokio::runtime::Handle::current();
-                tokio::task::block_in_place(|| {
-                    handle.block_on(async {
-                        scp_event_log::checkpoint::generate_checkpoint(
-                            &ucan_state.event_log,
-                            &sender_did,
-                            epoch,
-                            &signer,
-                        )
-                        .await
-                        .map_err(|e| ScpError::Context {
-                            msg: format!("checkpoint generation failed: {e}"),
-                            code: codes::CTX_2027.to_owned(),
+            let checkpoint = bi
+                .with_ucan_state(&context_id, |ucan_state| {
+                    let signer = scp_core::event_log::KeyCustodySigner {
+                        custody: &custody.0,
+                        key: &core_id.active_signing_key,
+                    };
+                    // generate_checkpoint is async — use block_in_place to allow
+                    // blocking inside this spawned async task. block_in_place moves
+                    // the worker thread to blocking mode (requires multi-thread runtime).
+                    let handle = tokio::runtime::Handle::current();
+                    tokio::task::block_in_place(|| {
+                        handle.block_on(async {
+                            scp_event_log::checkpoint::generate_checkpoint(
+                                &ucan_state.event_log,
+                                &sender_did,
+                                epoch,
+                                &signer,
+                            )
+                            .await
+                            .map_err(|e| ScpError::Context {
+                                msg: format!("checkpoint generation failed: {e}"),
+                                code: codes::CTX_2027.to_owned(),
+                            })
                         })
                     })
                 })
-            })
-            .ok_or_else(|| ScpError::Context {
-                msg: format!("context '{context_id}' not found in UCAN registry"),
-                code: codes::CTX_2027.to_owned(),
-            })??;
+                .ok_or_else(|| ScpError::Context {
+                    msg: format!("context '{context_id}' not found in UCAN registry"),
+                    code: codes::CTX_2027.to_owned(),
+                })??;
 
             Ok(Checkpoint {
                 context_id: checkpoint.context_id,
@@ -4138,6 +4059,7 @@ async fn event_log_checkpoint_impl(
 #[cfg(not(feature = "allow_in_memory_custody"))]
 #[allow(clippy::unused_async)]
 async fn event_log_checkpoint_impl(
+    _bi: Arc<crate::runtime::UniffiBridgeInstance>,
     _handle: Arc<ContextHandle>,
     _identity: Arc<Identity>,
     _epoch: u64,
@@ -4791,7 +4713,6 @@ pub fn verify_participation_requirements(
 // ---------------------------------------------------------------------------
 // aggregate_trust_input (§7.3)
 // ---------------------------------------------------------------------------
-
 
 /// Per-instance equivalent of [`uniffi_append_provenance_event`].
 ///
@@ -5524,7 +5445,6 @@ fn uniffi_parse_handle_target(
     })
 }
 
-
 // ---------------------------------------------------------------------------
 // Sync — get policy (#428)
 // ---------------------------------------------------------------------------
@@ -5786,8 +5706,12 @@ pub fn bridge_register(
 /// `ScpError::Context` if shadow creation fails.
 ///
 /// See spec section 12 (Bridge System) and ADR-023.
-#[uniffi::export]
-pub fn bridge_create_shadow(
+///
+/// Phase D (#1695): moved from a module-level free function to a method on
+/// `Scp`. The bridge state it mutates (`CoreFields::bridge_state`) is now
+/// per-instance and can only be reached via a caller-owned `Scp` handle.
+fn bridge_create_shadow_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     bridge_id: String,
     platform_handle: String,
     bridge_mode: String,
@@ -5819,7 +5743,6 @@ pub fn bridge_create_shadow(
         timestamp: 0,
     };
 
-    let bi = crate::runtime::bridge_instance()?;
     let mut entry = bi
         .core
         .bridge_state()
@@ -6050,8 +5973,6 @@ impl scp_core::context::invitation::TrustOracle for UniffiBridgeTrustOracle {
     }
 }
 
-
-
 // ---------------------------------------------------------------------------
 // SCPID authentication (§3.11)
 // ---------------------------------------------------------------------------
@@ -6107,14 +6028,19 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u64) -> Result<String, Scp
 /// challenge JSON is malformed.
 /// Returns `ScpError::Identity` if the identity has no agent key when
 /// `#agent` is requested, or if signing fails.
-#[uniffi::export]
+/// Phase D (#1695): moved from a free function exported via
+/// `#[uniffi::export]` to an `Scp::scpid_sign` method so that the
+/// `Identity` handle-affinity check routes against the caller's `Scp`
+/// rather than the deleted process-wide `DEFAULT_BRIDGE_INSTANCE`.
+///
+/// The body is retained as a `pub(crate)` helper; `Scp::scpid_sign`
+/// performs the check and then delegates here.
 #[cfg(feature = "allow_in_memory_custody")]
-pub fn scpid_sign(
+pub(crate) fn scpid_sign_impl(
     identity: Arc<Identity>,
     signing_key_id: String,
     challenge_json: String,
 ) -> Result<String, ScpError> {
-    crate::uniffi_check_handle!(identity);
     use scp_core::identity::scpid_sign as core_sign;
 
     let key_id = parse_scpid_signing_key_id(&signing_key_id)?;
@@ -6199,8 +6125,16 @@ pub fn scpid_sign(
 /// Returns `ScpError::Validation` if either JSON string is malformed.
 /// Returns `ScpError::Identity` if DID resolution fails, the signature is
 /// invalid, the challenge has expired, or any other verification step fails.
-#[uniffi::export]
-pub fn scpid_verify(response_json: String, challenge_json: String) -> Result<String, ScpError> {
+///
+/// Phase D (#1695): formerly a `#[uniffi::export] pub fn`; migrated to an
+/// `Scp` method so the DID resolver lookup routes against the caller's
+/// per-instance `UniffiBridgeInstance`. The body lives in this `_on` helper
+/// and is invoked from `Scp::scpid_verify`.
+fn scpid_verify_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    response_json: String,
+    challenge_json: String,
+) -> Result<String, ScpError> {
     use scp_core::identity::scpid_verify as core_verify;
 
     let response: scp_core::identity::ScpIdResponse = serde_json::from_str(&response_json)
@@ -6215,7 +6149,7 @@ pub fn scpid_verify(response_json: String, challenge_json: String) -> Result<Str
             code: codes::IDENT_1038.to_owned(),
         })?;
 
-    let resolver = crate::runtime::did_resolver().ok_or_else(|| ScpError::Identity {
+    let resolver = bi.did_resolver().ok_or_else(|| ScpError::Identity {
         msg: "DID resolver not initialized — create an identity with \
               identityCreate before calling scpidVerify"
             .to_owned(),
@@ -6384,7 +6318,6 @@ pub fn economy_evaluate_formula(
     Ok(scp_core::economy::evaluate_formula(&formula, &metrics)
         .map(scp_core::economy::Amount::value))
 }
-
 
 // ---------------------------------------------------------------------------
 // Economy helpers
@@ -6987,6 +6920,7 @@ impl Scp {
             .check_handle(identity.instance_id())
             .map_err(ScpError::from)?;
         identity_create_link_attestation_impl(
+            &self.inner,
             identity,
             platform,
             handle,
@@ -7004,10 +6938,9 @@ impl Scp {
     ///
     /// See spec §3.5.1.
     pub fn identity_link_attestations(&self, did: String) -> Result<String, ScpError> {
-        // Registry lookup currently routes through the module-level helper
-        // which reads from `DEFAULT_BRIDGE_INSTANCE`. Later sub-slices
-        // migrate the helper to operate on `&self.inner` directly.
-        let attestations = identity_link_attestation_registry()
+        // Phase D (#1695): registry lookup routes through this `Scp`'s
+        // `UniffiBridgeInstance` directly — the process-wide default is gone.
+        let attestations = identity_link_attestation_registry(&self.inner)
             .get(&did)
             .map(|v| v.value().clone())
             .unwrap_or_default();
@@ -7026,15 +6959,13 @@ impl Scp {
     #[cfg(feature = "allow_in_memory_custody")]
     #[must_use]
     pub fn identity_remove_link_attestation(&self, did: String, attestation_id: String) -> bool {
-        // Registry lookups currently route through the module-level
-        // helpers which read from `DEFAULT_BRIDGE_INSTANCE`. Later
-        // sub-slices migrate the helpers to operate on `&self.inner`.
+        // Phase D (#1695): per-`Scp` registry lookups — no default fallback.
         // Verify the caller owns the DID by checking the identity custody registry.
-        if !identity_custody_registry().contains_key(&did) {
+        if !identity_custody_registry(&self.inner).contains_key(&did) {
             return false;
         }
 
-        let Some(mut entry) = identity_link_attestation_registry().get_mut(&did) else {
+        let Some(mut entry) = identity_link_attestation_registry(&self.inner).get_mut(&did) else {
             return false;
         };
         let before = entry.len();
@@ -7175,8 +7106,8 @@ impl Scp {
                     .await;
 
                 // Register per-context UCAN validation state (revocation list,
-                // nonce tracker, event log) for the UCAN pipeline.
-                crate::runtime::ensure_ucan_registered(&context_id, &identity.did, &params.ceiling);
+                // nonce tracker, event log) for the UCAN pipeline on this instance.
+                bi.ensure_ucan_registered(&context_id, &identity.did, &params.ceiling);
 
                 // §9.10.4: Send pseudonym announcement to inform other members of
                 // the creator's per-context routing ID. For freshly created
@@ -7252,9 +7183,10 @@ impl Scp {
                     core_context_params: retained_core_params,
                     instance_id: bi.core.instance_id(),
                 });
-                // Register in the global context handle registry so the MCP
-                // bridge provider can look up per-context state by context ID.
-                register_context_handle(&handle);
+                // Register in this instance's context handle registry so the
+                // MCP bridge provider can look up per-context state by
+                // context ID.
+                register_context_handle(&bi, &handle);
                 increment_handle_count();
                 Ok(handle)
             })
@@ -7489,7 +7421,7 @@ impl Scp {
                     .map_err(ScpError::from)?;
 
                 // Deregister the context handle from the MCP lookup registry.
-                deregister_context_handle(&handle.context_id);
+                deregister_context_handle(&bi, &handle.context_id);
 
                 Ok(())
             })
@@ -7621,15 +7553,15 @@ impl Scp {
                     }
                 }
 
-                // Clean up per-context UCAN state.
-                crate::runtime::remove_ucan_state(&handle.context_id);
+                // Clean up per-context UCAN state on this instance.
+                bi.remove_ucan_state(&handle.context_id);
 
                 // Clean up per-context bridge connector state and economy state.
                 bi.core.remove_bridge_state(&handle.context_id);
                 bi.core.remove_economy_state(&handle.context_id);
 
                 // Deregister the context handle from the MCP lookup registry.
-                deregister_context_handle(&handle.context_id);
+                deregister_context_handle(&bi, &handle.context_id);
 
                 *state = ContextState::Closed;
                 drop(state);
@@ -7918,7 +7850,11 @@ impl Scp {
         // Re-sync role state from ContextManager after governance execution (#796).
         // Governance actions may modify roles/membership; without this sync the
         // Swift/Kotlin SDKs see stale role state for UCAN/tool capability checks.
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        if let Err(e) = self
+            .inner
+            .sync_role_state_from_manager(&handle.context_id)
+            .await
+        {
             tracing::warn!(
                 context_id = %handle.context_id,
                 action = action_name,
@@ -7997,7 +7933,11 @@ impl Scp {
                 code: codes::CTX_2041.to_owned(),
             })??;
 
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        if let Err(e) = self
+            .inner
+            .sync_role_state_from_manager(&handle.context_id)
+            .await
+        {
             tracing::warn!(
                 context_id = %handle.context_id,
                 action = action_name,
@@ -8045,7 +7985,11 @@ impl Scp {
                 code: codes::CTX_2042.to_owned(),
             })?;
 
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        if let Err(e) = self
+            .inner
+            .sync_role_state_from_manager(&handle.context_id)
+            .await
+        {
             tracing::warn!(
                 context_id = %handle.context_id,
                 error = %e,
@@ -8092,7 +8036,11 @@ impl Scp {
                 code: codes::CTX_2043.to_owned(),
             })?;
 
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        if let Err(e) = self
+            .inner
+            .sync_role_state_from_manager(&handle.context_id)
+            .await
+        {
             tracing::warn!(
                 context_id = %handle.context_id,
                 error = %e,
@@ -8138,7 +8086,11 @@ impl Scp {
                 code: codes::CTX_2044.to_owned(),
             })?;
 
-        if let Err(e) = crate::runtime::sync_role_state_from_manager(&handle.context_id).await {
+        if let Err(e) = self
+            .inner
+            .sync_role_state_from_manager(&handle.context_id)
+            .await
+        {
             tracing::warn!(
                 context_id = %handle.context_id,
                 error = %e,
@@ -9546,6 +9498,7 @@ impl Scp {
                 // resolver, revocation list, and nonce tracker live in the
                 // bridge UCAN registry, not in the runtime.
                 validate_tool_ucan_uniffi(
+                    &bi,
                     &handle,
                     &tool_id,
                     &ucan_token,
@@ -9777,6 +9730,7 @@ impl Scp {
                 // ADR-016 pipeline against the TARGET context's ceiling.
                 // See spec §6.2, §8, ADR-016, and issue #319.
                 validate_tool_ucan_uniffi(
+                    &bi,
                     &target_handle,
                     &tool_id,
                     &ucan_token,
@@ -9945,6 +9899,7 @@ impl Scp {
             .core
             .check_handle(identity.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 let state = handle.state.lock().await;
@@ -9972,6 +9927,7 @@ impl Scp {
                 // Primary authorization: UCAN token validation via the full 11-step
                 // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
                 validate_tool_ucan_uniffi(
+                    &bi,
                     &handle,
                     &tool_id_for_ucan,
                     &ucan_token,
@@ -10471,10 +10427,11 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 // Ensure UCAN state (which contains the event log) is registered.
-                crate::runtime::ensure_ucan_registered(
+                bi.ensure_ucan_registered(
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
@@ -10522,105 +10479,108 @@ impl Scp {
                 let fallback_now = scp_primitives::SystemClock.now_secs();
 
                 // Query the event log from per-context UCAN state.
-                let events = crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
-                    let event_count = scp_event_log::tree::event_count(&ucan_state.event_log);
+                let events = bi
+                    .with_ucan_state(&handle.context_id, |ucan_state| {
+                        let event_count = scp_event_log::tree::event_count(&ucan_state.event_log);
 
-                    if event_count == 0 {
-                        return Vec::new();
-                    }
+                        if event_count == 0 {
+                            return Vec::new();
+                        }
 
-                    let merkle_root = scp_event_log::tree::root(&ucan_state.event_log);
-                    let merkle_root_hex = hex::encode(merkle_root);
+                        let merkle_root = scp_event_log::tree::root(&ucan_state.event_log);
+                        let merkle_root_hex = hex::encode(merkle_root);
 
-                    // Query events stored in the event log by iterating the
-                    // stored events slice and applying filters.
-                    let all_events = ucan_state.event_log.events();
+                        // Query events stored in the event log by iterating the
+                        // stored events slice and applying filters.
+                        let all_events = ucan_state.event_log.events();
 
-                    if !all_events.is_empty() {
-                        let mut results: Vec<Event> = Vec::new();
-                        for evt in all_events {
-                            // Apply sequence range filters.
-                            if let Some(after) = filter_after_seq
-                                && evt.sequence <= after
-                            {
-                                continue;
+                        if !all_events.is_empty() {
+                            let mut results: Vec<Event> = Vec::new();
+                            for evt in all_events {
+                                // Apply sequence range filters.
+                                if let Some(after) = filter_after_seq
+                                    && evt.sequence <= after
+                                {
+                                    continue;
+                                }
+                                if let Some(before) = filter_before_seq
+                                    && evt.sequence >= before
+                                {
+                                    continue;
+                                }
+                                // Apply event type filter.
+                                if let Some(ref et) = filter_event_type
+                                    && format!("{:?}", evt.event_type) != *et
+                                {
+                                    continue;
+                                }
+                                // Apply actor DID filter.
+                                if let Some(ref actor) = filter_actor_did
+                                    && evt.actor_did.0 != *actor
+                                {
+                                    continue;
+                                }
+
+                                // Try to interpret payload bytes as UTF-8 JSON; fall
+                                // back to hex encoding for binary payloads.
+                                let payload_json = std::str::from_utf8(&evt.payload.data)
+                                    .ok()
+                                    .filter(|s| {
+                                        serde_json::from_str::<serde_json::Value>(s).is_ok()
+                                    })
+                                    .map_or_else(
+                                        || {
+                                            serde_json::json!({
+                                                "hex": hex::encode(&evt.payload.data),
+                                            })
+                                            .to_string()
+                                        },
+                                        str::to_owned,
+                                    );
+
+                                results.push(Event {
+                                    event_type: format!("{:?}", evt.event_type),
+                                    actor_did: evt.actor_did.0.clone(),
+                                    timestamp: evt.timestamp,
+                                    payload_json,
+                                    sequence: evt.sequence,
+                                });
+
+                                if let Some(lim) = filter_limit
+                                    && results.len() >= lim
+                                {
+                                    break;
+                                }
                             }
-                            if let Some(before) = filter_before_seq
-                                && evt.sequence >= before
-                            {
-                                continue;
-                            }
-                            // Apply event type filter.
-                            if let Some(ref et) = filter_event_type
-                                && format!("{:?}", evt.event_type) != *et
-                            {
-                                continue;
-                            }
-                            // Apply actor DID filter.
-                            if let Some(ref actor) = filter_actor_did
-                                && evt.actor_did.0 != *actor
-                            {
-                                continue;
-                            }
-
-                            // Try to interpret payload bytes as UTF-8 JSON; fall
-                            // back to hex encoding for binary payloads.
-                            let payload_json = std::str::from_utf8(&evt.payload.data)
-                                .ok()
-                                .filter(|s| serde_json::from_str::<serde_json::Value>(s).is_ok())
-                                .map_or_else(
-                                    || {
-                                        serde_json::json!({
-                                            "hex": hex::encode(&evt.payload.data),
-                                        })
-                                        .to_string()
-                                    },
-                                    str::to_owned,
-                                );
-
-                            results.push(Event {
-                                event_type: format!("{:?}", evt.event_type),
-                                actor_did: evt.actor_did.0.clone(),
-                                timestamp: evt.timestamp,
-                                payload_json,
-                                sequence: evt.sequence,
-                            });
-
-                            if let Some(lim) = filter_limit
-                                && results.len() >= lim
-                            {
-                                break;
+                            if !results.is_empty() {
+                                return results;
                             }
                         }
-                        if !results.is_empty() {
-                            return results;
+
+                        // Fallback: return a summary event with Merkle root metadata.
+                        let summary = Event {
+                            event_type: "LogSummary".to_owned(),
+                            actor_did: String::new(),
+                            timestamp: fallback_now,
+                            payload_json: serde_json::json!({
+                                "event_count": event_count,
+                                "merkle_root": merkle_root_hex,
+                            })
+                            .to_string(),
+                            sequence: event_count.saturating_sub(1),
+                        };
+
+                        let summary_events = vec![summary];
+                        if let Some(lim) = filter_limit {
+                            summary_events.into_iter().take(lim).collect()
+                        } else {
+                            summary_events
                         }
-                    }
-
-                    // Fallback: return a summary event with Merkle root metadata.
-                    let summary = Event {
-                        event_type: "LogSummary".to_owned(),
-                        actor_did: String::new(),
-                        timestamp: fallback_now,
-                        payload_json: serde_json::json!({
-                            "event_count": event_count,
-                            "merkle_root": merkle_root_hex,
-                        })
-                        .to_string(),
-                        sequence: event_count.saturating_sub(1),
-                    };
-
-                    let summary_events = vec![summary];
-                    if let Some(lim) = filter_limit {
-                        summary_events.into_iter().take(lim).collect()
-                    } else {
-                        summary_events
-                    }
-                })
-                .ok_or_else(|| ScpError::Context {
-                    msg: format!("context '{}' not found in UCAN registry", handle.context_id),
-                    code: codes::CTX_2023.to_owned(),
-                })?;
+                    })
+                    .ok_or_else(|| ScpError::Context {
+                        msg: format!("context '{}' not found in UCAN registry", handle.context_id),
+                        code: codes::CTX_2023.to_owned(),
+                    })?;
 
                 Ok(events)
             })
@@ -10644,6 +10604,7 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 // Parse the claim JSON.
@@ -10661,8 +10622,9 @@ impl Scp {
                     }
                 })?;
 
-                // Ensure UCAN state (which contains the event log) is registered.
-                crate::runtime::ensure_ucan_registered(
+                // Ensure UCAN state (which contains the event log) is registered
+                // on this instance.
+                bi.ensure_ucan_registered(
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
@@ -10679,7 +10641,7 @@ impl Scp {
                                 code: codes::CTX_2025.to_owned(),
                             })?;
 
-                        crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                        bi.with_ucan_state(&handle.context_id, |ucan_state| {
                             let proof = scp_event_log::proof::prove_inclusion(
                                 &ucan_state.event_log,
                                 leaf_index,
@@ -10750,7 +10712,7 @@ impl Scp {
                                 }
                             })?;
 
-                        crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                        bi.with_ucan_state(&handle.context_id, |ucan_state| {
                             let proof = scp_event_log::proof::prove_absence(
                                 &ucan_state.event_log,
                                 &event_hash,
@@ -10836,7 +10798,7 @@ impl Scp {
             .core
             .check_handle(identity.instance_id())
             .map_err(ScpError::from)?;
-        event_log_checkpoint_impl(handle, identity, epoch).await
+        event_log_checkpoint_impl(Arc::clone(&self.inner), handle, identity, epoch).await
     }
 
     /// Per-instance equivalent of the free-function [`ucan_validate`].
@@ -10855,6 +10817,7 @@ impl Scp {
             .core
             .check_handle(handle.instance_id())
             .map_err(ScpError::from)?;
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 validate_ucan_token(&token)?;
@@ -10902,19 +10865,19 @@ impl Scp {
                 }
                 let proof_resolver = scp_ffi_common::BridgeProofResolver { proofs };
 
-                // Ensure UCAN state is registered for this context.
-                crate::runtime::ensure_ucan_registered(
+                // Ensure UCAN state is registered for this context on this instance.
+                bi.ensure_ucan_registered(
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
                 );
 
                 // Execute the full 11-step validation pipeline via per-context state.
-                let validation_result =
-                    crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
-                        let production_resolver = crate::runtime::did_resolver();
+                let validation_result = bi
+                    .with_ucan_state(&handle.context_id, |ucan_state| {
+                        let production_resolver = bi.did_resolver();
                         let did_resolver = scp_ffi_common::DispatchDidResolver::new(
-                            production_resolver.map(std::convert::AsRef::as_ref),
+                            production_resolver.as_deref(),
                         );
                         let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
                             revocation_list: &ucan_state.revocation_list,
@@ -11007,6 +10970,7 @@ impl Scp {
             code: codes::VALID_7011.to_owned(),
         })?;
 
+        let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
                 use scp_core::crypto::ucan::validate::parse_ucan;
@@ -11019,15 +10983,15 @@ impl Scp {
                 // Parse the token to extract the issuer DID for authorization.
                 let parsed = parse_ucan(&token).map_err(ScpError::from)?;
 
-                // Ensure UCAN state is registered for this context.
-                crate::runtime::ensure_ucan_registered(
+                // Ensure UCAN state is registered for this context on this instance.
+                bi.ensure_ucan_registered(
                     &handle.context_id,
                     &handle.creator_did,
                     &handle.ceiling_strings,
                 );
 
                 // Execute the full revocation pipeline within the UCAN state closure.
-                crate::runtime::with_ucan_state(&handle.context_id, |ucan_state| {
+                bi.with_ucan_state(&handle.context_id, |ucan_state| {
                     let authorizer = BridgeRevocationAuthorizer {
                         issuer_did: parsed.payload.iss.clone(),
                         creator_did: ucan_state.creator_did.clone(),
@@ -11196,13 +11160,15 @@ impl Scp {
                         relay_url: Some(relay_url.clone()),
                         latency_ms: None,
                     }),
+                    bi: Arc::clone(&bi),
                     instance_id: bi.core.instance_id(),
                 });
                 increment_handle_count();
 
-                // Spawn suppression → scoring bridge task.
+                // Spawn suppression → scoring bridge task bound to this
+                // instance (not the process-wide default).
                 if let Some(rx) = suppression_rx {
-                    spawn_suppression_scoring_task(rx, relay_url);
+                    spawn_suppression_scoring_task(Arc::clone(&bi), rx, relay_url);
                 }
 
                 Ok(handle)
@@ -11335,6 +11301,7 @@ impl Scp {
         }
 
         let provider = McpUniFfiBridgeProvider {
+            bi: Arc::clone(&self.inner),
             agent_did: config.identity_did.clone(),
             context_ids: config.context_ids.clone(),
             tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
@@ -11352,6 +11319,7 @@ impl Scp {
         let sse_context_ids = config.context_ids;
         let sse_ucan_token = config.ucan_token;
         let sse_proof_tokens = config.proof_tokens;
+        let sse_bi = Arc::clone(&self.inner);
 
         let task_handle = runtime().spawn(async move {
             match transport_mode.as_str() {
@@ -11360,6 +11328,7 @@ impl Scp {
                 }
                 "sse" => {
                     let provider = McpUniFfiBridgeProvider {
+                        bi: sse_bi,
                         agent_did: sse_identity_did,
                         context_ids: sse_context_ids,
                         tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
@@ -11387,7 +11356,7 @@ impl Scp {
         });
 
         let handle_id = mcp_handle_id("mcp-server");
-        mcp_server_registry().insert(
+        mcp_server_registry(&self.inner).insert(
             handle_id.clone(),
             McpServerEntry {
                 shutdown_tx: Some(shutdown_tx),
@@ -11408,13 +11377,12 @@ impl Scp {
     pub async fn mcp_server_stop(&self, handle: String) -> Result<(), ScpError> {
         validate_mcp_handle(&handle)?;
 
-        let mut entry =
-            mcp_server_registry()
-                .get_mut(&handle)
-                .ok_or_else(|| ScpError::Transport {
-                    msg: format!("MCP server handle '{handle}' not found"),
-                    code: codes::TRANS_5012.to_owned(),
-                })?;
+        let mut entry = mcp_server_registry(&self.inner)
+            .get_mut(&handle)
+            .ok_or_else(|| ScpError::Transport {
+                msg: format!("MCP server handle '{handle}' not found"),
+                code: codes::TRANS_5012.to_owned(),
+            })?;
 
         if entry.stopped {
             return Err(ScpError::Transport {
@@ -11456,7 +11424,7 @@ impl Scp {
         })?;
 
         let handle_id = mcp_handle_id("mcp-client");
-        mcp_client_registry().insert(
+        mcp_client_registry(&self.inner).insert(
             handle_id.clone(),
             McpClientEntry {
                 client: std::sync::Mutex::new(client),
@@ -11483,7 +11451,7 @@ impl Scp {
         })?;
 
         let handle_id = mcp_handle_id("mcp-client");
-        mcp_client_registry().insert(
+        mcp_client_registry(&self.inner).insert(
             handle_id.clone(),
             McpClientEntry {
                 client: std::sync::Mutex::new(client),
@@ -11501,7 +11469,7 @@ impl Scp {
     pub async fn mcp_client_disconnect(&self, handle: String) -> Result<(), ScpError> {
         validate_mcp_handle(&handle)?;
 
-        let removed = mcp_client_registry().remove(&handle);
+        let removed = mcp_client_registry(&self.inner).remove(&handle);
         if removed.is_none() {
             return Err(ScpError::Transport {
                 msg: format!("MCP client handle '{handle}' not found"),
@@ -11522,7 +11490,7 @@ impl Scp {
     ) -> Result<Vec<McpToolInfo>, ScpError> {
         validate_mcp_handle(&handle)?;
 
-        let entry = mcp_client_registry()
+        let entry = mcp_client_registry(&self.inner)
             .get(&handle)
             .ok_or_else(|| ScpError::Transport {
                 msg: format!("MCP client handle '{handle}' not found"),
@@ -11567,7 +11535,7 @@ impl Scp {
         validate_context_id(&context_id)?;
         validate_did(&invoker_did)?;
 
-        let entry = mcp_client_registry()
+        let entry = mcp_client_registry(&self.inner)
             .get(&handle)
             .ok_or_else(|| ScpError::Transport {
                 msg: format!("MCP client handle '{handle}' not found"),
@@ -11676,6 +11644,120 @@ impl Scp {
         };
         let did_ref: scp_identity::DID = did.into();
         manager.is_local_did(&did_ref).await
+    }
+
+    /// Per-instance equivalent of the free-function [`bridge_create_shadow`].
+    ///
+    /// Mutates this instance's per-context bridge state. Rejects any
+    /// cross-instance caller (the method takes `&self` — the `bi` threaded
+    /// into `bridge_create_shadow_on` is always this instance's).
+    pub fn bridge_create_shadow(
+        &self,
+        bridge_id: String,
+        platform_handle: String,
+        bridge_mode: String,
+        context_id: String,
+    ) -> Result<ShadowIdentityResult, ScpError> {
+        bridge_create_shadow_on(
+            &self.inner,
+            bridge_id,
+            platform_handle,
+            bridge_mode,
+            context_id,
+        )
+    }
+
+    /// Per-instance equivalent of the free-function `scpid_sign`.
+    ///
+    /// Signs an SCPID challenge with the identity's requested key. Rejects
+    /// any `Identity` whose `instance_id` does not match this `Scp`'s.
+    #[cfg(feature = "allow_in_memory_custody")]
+    pub fn scpid_sign(
+        &self,
+        identity: Arc<Identity>,
+        signing_key_id: String,
+        challenge_json: String,
+    ) -> Result<String, ScpError> {
+        self.inner
+            .core
+            .check_handle(identity.instance_id())
+            .map_err(ScpError::from)?;
+        scpid_sign_impl(identity, signing_key_id, challenge_json)
+    }
+
+    /// Per-instance equivalent of the free-function `scpid_verify`.
+    ///
+    /// Uses this `Scp`'s DID resolver (populated when the caller invokes
+    /// `identity_create` / `identity_create_with_custody`). Phase D (#1695)
+    /// replaces the old free function that consulted the process-wide
+    /// `DEFAULT_BRIDGE_INSTANCE` DID resolver slot.
+    pub fn scpid_verify(
+        &self,
+        response_json: String,
+        challenge_json: String,
+    ) -> Result<String, ScpError> {
+        scpid_verify_on(&self.inner, response_json, challenge_json)
+    }
+
+    /// Per-instance equivalent of the free-function `relay_start_in_memory`.
+    ///
+    /// Starts a new in-memory relay server and returns a `RelayHandle`
+    /// whose `instance_id` is stamped against this `Scp`. Phase D (#1695)
+    /// replaces the old free function that looked up `DEFAULT_BRIDGE_INSTANCE`
+    /// for the handle's `instance_id`.
+    #[cfg(feature = "server")]
+    pub async fn relay_start_in_memory(&self) -> Result<Arc<crate::server::RelayHandle>, ScpError> {
+        crate::server::relay_start_in_memory_on(&self.inner).await
+    }
+
+    /// Per-instance equivalent of the free-function `relay_start_local`.
+    ///
+    /// Starts a new redb-backed relay at `data_dir/blobs.redb`.
+    #[cfg(feature = "server")]
+    pub async fn relay_start_local(
+        &self,
+        data_dir: String,
+    ) -> Result<Arc<crate::server::RelayHandle>, ScpError> {
+        crate::server::relay_start_local_on(&self.inner, data_dir).await
+    }
+
+    /// Per-instance equivalent of the free-function `node_start_in_memory`.
+    ///
+    /// Starts an in-memory application node. If `identity` is supplied, it
+    /// must have been minted by this `Scp` (cross-instance handles are
+    /// rejected via the `CoreFields::check_handle` call).
+    #[cfg(feature = "server")]
+    pub async fn node_start_in_memory(
+        &self,
+        identity: Option<Arc<Identity>>,
+    ) -> Result<Arc<crate::server::NodeHandle>, ScpError> {
+        if let Some(ref id) = identity {
+            self.inner
+                .core
+                .check_handle(id.instance_id())
+                .map_err(ScpError::from)?;
+        }
+        crate::server::node_start_in_memory_on(&self.inner, identity).await
+    }
+
+    /// Per-instance equivalent of the free-function `node_start_local`.
+    ///
+    /// Starts a file-backed application node at `data_dir`. If `identity`
+    /// is supplied, it must have been minted by this `Scp`.
+    #[cfg(feature = "server")]
+    pub async fn node_start_local(
+        &self,
+        data_dir: String,
+        identity: Option<Arc<Identity>>,
+        passphrase: Option<String>,
+    ) -> Result<Arc<crate::server::NodeHandle>, ScpError> {
+        if let Some(ref id) = identity {
+            self.inner
+                .core
+                .check_handle(id.instance_id())
+                .map_err(ScpError::from)?;
+        }
+        crate::server::node_start_local_on(&self.inner, data_dir, identity, passphrase).await
     }
 
     /// Per-instance equivalent of the free-function [`trust_query_score`].
@@ -12198,6 +12280,7 @@ impl Scp {
         #[cfg(feature = "allow_in_memory_custody")]
         let custody_arc = in_memory.map(Arc::clone);
         let callback_custody = identity.callback_custody.as_ref().map(Arc::clone);
+        let bi = Arc::clone(&self.inner);
 
         runtime()
             .spawn(async move {
@@ -12251,14 +12334,14 @@ impl Scp {
                     #[cfg(not(feature = "allow_in_memory_custody"))]
                     let attestation_did = new_did;
                     {
-                        let registry = identity_link_attestation_registry();
+                        let registry = identity_link_attestation_registry(&bi);
                         if let Some((_, attestations)) = registry.remove(&old_did) {
                             registry.insert(attestation_did, attestations);
                         }
                     }
                     #[cfg(feature = "allow_in_memory_custody")]
                     {
-                        let registry = identity_custody_registry();
+                        let registry = identity_custody_registry(&bi);
                         if let Some((_, entry)) = registry.remove(&old_did) {
                             registry.insert(new_did, entry);
                         }
@@ -12313,14 +12396,14 @@ impl Scp {
                     #[cfg(not(feature = "allow_in_memory_custody"))]
                     let attestation_did = new_did;
                     {
-                        let registry = identity_link_attestation_registry();
+                        let registry = identity_link_attestation_registry(&bi);
                         if let Some((_, attestations)) = registry.remove(&old_did) {
                             registry.insert(attestation_did, attestations);
                         }
                     }
                     #[cfg(feature = "allow_in_memory_custody")]
                     {
-                        let registry = identity_custody_registry();
+                        let registry = identity_custody_registry(&bi);
                         if let Some((_, entry)) = registry.remove(&old_did) {
                             registry.insert(new_did, entry);
                         }
@@ -12882,11 +12965,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `petname_resolve_did`.
-    pub fn petname_resolve_did(
-        &self,
-        owner_did: String,
-        name: String,
-    ) -> Result<String, ScpError> {
+    pub fn petname_resolve_did(&self, owner_did: String, name: String) -> Result<String, ScpError> {
         if owner_did.is_empty() {
             return Err(ScpError::Validation {
                 msg: "owner_did must not be empty".to_owned(),
@@ -13020,15 +13099,15 @@ impl Scp {
             target,
             metadata: Some(scp_core::discovery::HandleMetadata { description, tags }),
         };
-        let mut guard = self
-            .inner
-            .core
-            .handle_registries()
-            .lock()
-            .map_err(|e| ScpError::Validation {
-                msg: format!("handle registry lock poisoned: {e}"),
-                code: codes::VALID_7120.to_owned(),
-            })?;
+        let mut guard =
+            self.inner
+                .core
+                .handle_registries()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("handle registry lock poisoned: {e}"),
+                    code: codes::VALID_7120.to_owned(),
+                })?;
         let registry = guard
             .entry(discovery_context_id.clone())
             .or_insert_with(|| scp_core::discovery::HandleRegistry::new(discovery_context_id));
@@ -13055,23 +13134,21 @@ impl Scp {
             Some("context") => Some(scp_core::discovery::HandleTypeFilter::Context),
             Some(other) => {
                 return Err(ScpError::Validation {
-                    msg: format!(
-                        "invalid type_filter '{other}': expected 'identity' or 'context'"
-                    ),
+                    msg: format!("invalid type_filter '{other}': expected 'identity' or 'context'"),
                     code: codes::VALID_7123.to_owned(),
                 });
             }
             None => None,
         };
-        let guard = self
-            .inner
-            .core
-            .handle_registries()
-            .lock()
-            .map_err(|e| ScpError::Validation {
-                msg: format!("handle registry lock poisoned: {e}"),
-                code: codes::VALID_7120.to_owned(),
-            })?;
+        let guard =
+            self.inner
+                .core
+                .handle_registries()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("handle registry lock poisoned: {e}"),
+                    code: codes::VALID_7120.to_owned(),
+                })?;
         let result = guard.get(&discovery_context_id).map_or_else(
             || scp_core::discovery::HandleLookupResult {
                 results: Vec::new(),
@@ -13096,15 +13173,15 @@ impl Scp {
         handle: String,
         did: String,
     ) -> Result<String, ScpError> {
-        let mut guard = self
-            .inner
-            .core
-            .handle_registries()
-            .lock()
-            .map_err(|e| ScpError::Validation {
-                msg: format!("handle registry lock poisoned: {e}"),
-                code: codes::VALID_7120.to_owned(),
-            })?;
+        let mut guard =
+            self.inner
+                .core
+                .handle_registries()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("handle registry lock poisoned: {e}"),
+                    code: codes::VALID_7120.to_owned(),
+                })?;
         let result = guard.get_mut(&discovery_context_id).map_or_else(
             || scp_core::discovery::HandleDeregisterResult { removed: false },
             |registry| {
@@ -13141,9 +13218,11 @@ impl Scp {
 
         // Validate relay URLs at the FFI boundary
         for url in &relay_urls {
-            scp_ffi_common::validate::validate_relay_url(url).map_err(|e| ScpError::Validation {
-                msg: e.to_string(),
-                code: codes::VALID_7135.to_owned(),
+            scp_ffi_common::validate::validate_relay_url(url).map_err(|e| {
+                ScpError::Validation {
+                    msg: e.to_string(),
+                    code: codes::VALID_7135.to_owned(),
+                }
             })?;
         }
 
@@ -13192,22 +13271,18 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `scope_lookup`.
-    pub fn scope_lookup(
-        &self,
-        scope_context_id: String,
-        name: String,
-    ) -> Result<String, ScpError> {
+    pub fn scope_lookup(&self, scope_context_id: String, name: String) -> Result<String, ScpError> {
         validate_context_id(&scope_context_id)?;
 
-        let guard = self
-            .inner
-            .core
-            .scope_registries()
-            .lock()
-            .map_err(|e| ScpError::Validation {
-                msg: format!("scope registry lock poisoned: {e}"),
-                code: codes::VALID_7130.to_owned(),
-            })?;
+        let guard =
+            self.inner
+                .core
+                .scope_registries()
+                .lock()
+                .map_err(|e| ScpError::Validation {
+                    msg: format!("scope registry lock poisoned: {e}"),
+                    code: codes::VALID_7130.to_owned(),
+                })?;
 
         let result = match guard.get(&scope_context_id) {
             Some(registry) => registry
@@ -13291,14 +13366,14 @@ impl Scp {
                     code: codes::VALID_7090.to_owned(),
                 })?
             } else {
-                let guard = bi
-                    .core
-                    .handle_registries()
-                    .lock()
-                    .map_err(|e| ScpError::Validation {
-                        msg: format!("handle registry lock poisoned: {e}"),
-                        code: codes::VALID_7120.to_owned(),
-                    })?;
+                let guard =
+                    bi.core
+                        .handle_registries()
+                        .lock()
+                        .map_err(|e| ScpError::Validation {
+                            msg: format!("handle registry lock poisoned: {e}"),
+                            code: codes::VALID_7120.to_owned(),
+                        })?;
                 guard.keys().map(|k| (k.clone(), k.clone())).collect()
             };
 
@@ -13537,10 +13612,7 @@ impl Scp {
     // ----- Context export/import methods -----
 
     /// Per-instance equivalent of the free-function `context_export`.
-    pub async fn context_export(
-        &self,
-        handle: Arc<ContextHandle>,
-    ) -> Result<Vec<u8>, ScpError> {
+    pub async fn context_export(&self, handle: Arc<ContextHandle>) -> Result<Vec<u8>, ScpError> {
         self.inner
             .core
             .check_handle(handle.instance_id())
@@ -13574,10 +13646,12 @@ impl Scp {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
-                let export = scp_core::context::export_import::deserialize_export(&data)
-                    .map_err(|e| ScpError::Context {
-                        msg: format!("invalid export data: {e}"),
-                        code: codes::CTX_2032.to_owned(),
+                let export =
+                    scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
+                        ScpError::Context {
+                            msg: format!("invalid export data: {e}"),
+                            code: codes::CTX_2032.to_owned(),
+                        }
                     })?;
                 let context_id = export.snapshot.context_id.clone();
 
@@ -13630,22 +13704,26 @@ impl Scp {
             })?;
 
         let policy: Option<AutoAcceptPolicy> = match policy_json {
-            Some(ref json) => Some(serde_json::from_str(json).map_err(|e| {
-                ScpError::Validation {
-                    msg: format!("failed to parse auto-accept policy JSON: {e}"),
-                    code: codes::VALID_7010.to_owned(),
-                }
-            })?),
+            Some(ref json) => {
+                Some(
+                    serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                        msg: format!("failed to parse auto-accept policy JSON: {e}"),
+                        code: codes::VALID_7010.to_owned(),
+                    })?,
+                )
+            }
             None => None,
         };
 
         let spending: Option<SpendingContext> = match spending_json {
-            Some(ref json) => Some(serde_json::from_str(json).map_err(|e| {
-                ScpError::Validation {
-                    msg: format!("failed to parse spending context JSON: {e}"),
-                    code: codes::VALID_7010.to_owned(),
-                }
-            })?),
+            Some(ref json) => {
+                Some(
+                    serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                        msg: format!("failed to parse spending context JSON: {e}"),
+                        code: codes::VALID_7010.to_owned(),
+                    })?,
+                )
+            }
             None => None,
         };
 
@@ -13658,17 +13736,19 @@ impl Scp {
         };
         let inviter = scp_identity::DID::from(inviter_did.as_str());
 
-        let decision = self.inner.with_rate_limit_tracker(&identity_did, |tracker| {
-            core_evaluate(
-                &params,
-                &inviter,
-                policy.as_ref(),
-                spending.as_ref(),
-                &oracle,
-                tracker,
-                &scp_core::time::SystemClock,
-            )
-        });
+        let decision = self
+            .inner
+            .with_rate_limit_tracker(&identity_did, |tracker| {
+                core_evaluate(
+                    &params,
+                    &inviter,
+                    policy.as_ref(),
+                    spending.as_ref(),
+                    &oracle,
+                    tracker,
+                    &scp_core::time::SystemClock,
+                )
+            });
 
         match decision {
             Ok(EvaluationDecision::AutoAccept) => Ok("auto_accept".to_owned()),
@@ -13700,9 +13780,12 @@ mod tests {
         crate::scp::Scp::new()
     }
 
-    fn test_handle() -> Arc<ContextHandle> {
-        // Phase D (#1695): no default instance id; tests use UNSET_INSTANCE_ID.
-        let instance_id = scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID;
+    /// Builds a synthetic `ContextHandle` stamped with `scp`'s own
+    /// `instance_id` so the per-instance handle-affinity check accepts
+    /// it. Phase D (#1695): replaces the old `UNSET_INSTANCE_ID` stamp
+    /// which only worked against the deleted process-wide default.
+    fn test_handle_for(scp: &Arc<crate::scp::Scp>) -> Arc<ContextHandle> {
+        let instance_id = scp.instance_id();
         Arc::new(ContextHandle {
             context_id: "ctx-test".to_owned(),
             state: tokio::sync::Mutex::new(ContextState::Active),
@@ -13721,9 +13804,10 @@ mod tests {
         })
     }
 
-    fn test_identity() -> Arc<Identity> {
-        // Phase D (#1695): no default instance id; tests use UNSET_INSTANCE_ID.
-        let instance_id = scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID;
+    /// Builds a synthetic `Identity` stamped with `scp`'s own
+    /// `instance_id`. Phase D (#1695): see `test_handle_for`.
+    fn test_identity_for(scp: &Arc<crate::scp::Scp>) -> Arc<Identity> {
+        let instance_id = scp.instance_id();
         Arc::new(Identity {
             did: "did:dht:z6MkTestUser".to_owned(),
             custody_type: CustodyMethod::InMemory,
@@ -13741,16 +13825,18 @@ mod tests {
     /// is a required non-optional parameter. See issue #423.
     #[tokio::test]
     async fn tool_invoke_rejects_none_ucan_token() {
-        let result = scp_test().tool_invoke(
-            test_handle(),
-            "test-tool".to_owned(),
-            "{}".to_owned(),
-            test_identity(),
-            None, // No UCAN token
-            None,
-            None, // spending_ucan_jwt
-        )
-        .await;
+        let scp = scp_test();
+        let result = scp
+            .tool_invoke(
+                test_handle_for(&scp),
+                "test-tool".to_owned(),
+                "{}".to_owned(),
+                test_identity_for(&scp),
+                None, // No UCAN token
+                None,
+                None, // spending_ucan_jwt
+            )
+            .await;
 
         let err = result.expect_err("None ucan_token must be rejected");
         match err {
@@ -13764,9 +13850,10 @@ mod tests {
     /// Direct `set_economic_policy` always rejects — must use governance (#728).
     #[test]
     fn set_economic_policy_always_rejects_requires_governance() {
-        // Use the default SCP instance so the handle's instance_id matches.
+        // Phase D (#1695): use a fresh SCP instance and stamp the handle
+        // with its instance_id so the per-instance affinity check accepts it.
         let scp = crate::scp::Scp::new();
-        let handle = test_handle();
+        let handle = test_handle_for(&scp);
 
         // Initially None.
         let result = scp.get_economic_policy(Arc::clone(&handle)).unwrap();
@@ -14047,7 +14134,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_invalid_input_schema_json() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
@@ -14059,7 +14147,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp
+            .tool_register(handle, def)
             .await
             .expect_err("invalid input_schema_json must be rejected");
         match err {
@@ -14076,7 +14165,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_invalid_output_schema_json() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
@@ -14088,7 +14178,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp
+            .tool_register(handle, def)
             .await
             .expect_err("invalid output_schema_json must be rejected");
         match err {
@@ -14107,7 +14198,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_non_object_input_schema() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
@@ -14119,7 +14211,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp
+            .tool_register(handle, def)
             .await
             .expect_err("non-object input_schema must be rejected");
         match err {
@@ -14140,7 +14233,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_non_object_output_schema() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
@@ -14152,7 +14246,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp
+            .tool_register(handle, def)
             .await
             .expect_err("non-object output_schema must be rejected");
         match err {
@@ -14175,7 +14270,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_invalid_test_vectors_json() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
@@ -14187,7 +14283,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp
+            .tool_register(handle, def)
             .await
             .expect_err("non-array test_vectors_json must be rejected");
         match err {
@@ -14204,7 +14301,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_test_vectors_missing_fields() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         // Array of objects missing required fields for TestVector deserialization.
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
@@ -14217,7 +14315,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp
+            .tool_register(handle, def)
             .await
             .expect_err("test vectors with missing fields must be rejected");
         match err {
@@ -14232,7 +14331,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_implementation_hash_wrong_length() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
@@ -14244,7 +14344,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp
+            .tool_register(handle, def)
             .await
             .expect_err("implementation_hash with wrong length must be rejected");
         match err {
@@ -14265,7 +14366,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_register_rejects_implementation_hash_too_long() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
@@ -14277,7 +14379,8 @@ mod tests {
             cost: None,
         };
 
-        let err = scp_test().tool_register(handle, def)
+        let err = scp
+            .tool_register(handle, def)
             .await
             .expect_err("implementation_hash with wrong length must be rejected");
         match err {
@@ -14399,7 +14502,8 @@ mod tests {
     /// stored `ToolRegistration`. Catches the original bug from issue #871.
     #[tokio::test]
     async fn registered_at_is_seconds_epoch() {
-        let handle = test_handle();
+        let scp = scp_test();
+        let handle = test_handle_for(&scp);
         let def = ToolDefinition {
             name: "timestamp-probe".to_owned(),
             description: "probes registered_at value".to_owned(),
@@ -14413,7 +14517,8 @@ mod tests {
             cost: None,
         };
 
-        let tool_id = scp_test().tool_register(handle.clone(), def)
+        let tool_id = scp
+            .tool_register(handle.clone(), def)
             .await
             .expect("tool_register should succeed");
 
@@ -14528,7 +14633,7 @@ mod tests {
     /// correct error code before attempting DID resolution.
     #[test]
     fn scpid_verify_rejects_malformed_response_json() {
-        let result = scpid_verify("not valid json".to_owned(), "{}".to_owned());
+        let result = scp_test().scpid_verify("not valid json".to_owned(), "{}".to_owned());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
@@ -14551,7 +14656,7 @@ mod tests {
             "issued_at": 1_000_000_000_u64,
             "expires_at": 2_000_000_000_u64,
         });
-        let result = scpid_verify(
+        let result = scp_test().scpid_verify(
             serde_json::to_string(&response_json).unwrap(),
             "not valid json".to_owned(),
         );
@@ -14680,7 +14785,9 @@ mod tests {
     /// `mcp_client_disconnect` must reject unknown handle.
     #[tokio::test]
     async fn mcp_client_disconnect_rejects_unknown_handle() {
-        let result = scp_test().mcp_client_disconnect("mcp-client-nonexistent".to_owned()).await;
+        let result = scp_test()
+            .mcp_client_disconnect("mcp-client-nonexistent".to_owned())
+            .await;
         let err = result.expect_err("unknown handle must be rejected");
         match err {
             ScpError::Transport { ref code, .. } => {
@@ -14693,7 +14800,9 @@ mod tests {
     /// `mcp_client_list_tools` must reject unknown handle.
     #[tokio::test]
     async fn mcp_client_list_tools_rejects_unknown_handle() {
-        let result = scp_test().mcp_client_list_tools("mcp-client-nonexistent".to_owned()).await;
+        let result = scp_test()
+            .mcp_client_list_tools("mcp-client-nonexistent".to_owned())
+            .await;
         let err = result.expect_err("unknown handle must be rejected");
         match err {
             ScpError::Transport { ref code, .. } => {
@@ -14706,14 +14815,15 @@ mod tests {
     /// `mcp_client_invoke` must reject invalid input JSON.
     #[tokio::test]
     async fn mcp_client_invoke_rejects_unknown_handle() {
-        let result = scp_test().mcp_client_invoke(
-            "mcp-client-nonexistent".to_owned(),
-            "test-tool".to_owned(),
-            "{}".to_owned(),
-            "ctx-test".to_owned(),
-            "did:dht:z6MkTestUser".to_owned(),
-        )
-        .await;
+        let result = scp_test()
+            .mcp_client_invoke(
+                "mcp-client-nonexistent".to_owned(),
+                "test-tool".to_owned(),
+                "{}".to_owned(),
+                "ctx-test".to_owned(),
+                "did:dht:z6MkTestUser".to_owned(),
+            )
+            .await;
         let err = result.expect_err("unknown handle must be rejected");
         match err {
             ScpError::Transport { ref code, .. } => {
@@ -14726,7 +14836,9 @@ mod tests {
     /// `mcp_server_stop` must reject unknown handle.
     #[tokio::test]
     async fn mcp_server_stop_rejects_unknown_handle() {
-        let result = scp_test().mcp_server_stop("mcp-server-nonexistent".to_owned()).await;
+        let result = scp_test()
+            .mcp_server_stop("mcp-server-nonexistent".to_owned())
+            .await;
         let err = result.expect_err("unknown handle must be rejected");
         match err {
             ScpError::Transport { ref code, .. } => {

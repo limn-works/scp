@@ -552,8 +552,7 @@ fn event_log_verify_inclusion_proof_after_append() {
 fn event_log_query_invalid_context_fails() {
     setup();
     Python::with_gil(|py| {
-        let result = _scp_core::scp::PyScp::new()
-            .event_log_query(py, "nonexistent", None);
+        let result = _scp_core::scp::PyScp::new().event_log_query(py, "nonexistent", None);
         assert!(result.is_err());
     });
 }
@@ -661,8 +660,12 @@ fn provenance_evaluate_quality_returns_tier() {
 #[test]
 fn provenance_evaluate_quality_invalid_source_type() {
     setup();
-    let r = _scp_core::scp::PyScp::new()
-        .evaluate_provenance_quality(None, "invalid_type", "active", None);
+    let r = _scp_core::scp::PyScp::new().evaluate_provenance_quality(
+        None,
+        "invalid_type",
+        "active",
+        None,
+    );
     assert!(r.is_err());
 }
 
@@ -728,50 +731,34 @@ fn provenance_attach_increments_chain_depth() {
 #[test]
 fn provenance_check_chain_depth_within_limit() {
     setup();
-    assert!(
-        _scp_core::scp::PyScp::new()
-            .provenance_check_chain_depth(0, None)
-    );
-    assert!(
-        _scp_core::scp::PyScp::new()
-            .provenance_check_chain_depth(3, None)
-    );
+    assert!(_scp_core::scp::PyScp::new().provenance_check_chain_depth(0, None));
+    assert!(_scp_core::scp::PyScp::new().provenance_check_chain_depth(3, None));
 }
 
 #[test]
 fn provenance_check_chain_depth_exceeds_limit() {
     setup();
     // Default is now 8 (ADR-043), so depth 4 is within default.
-    assert!(
-        _scp_core::scp::PyScp::new()
-            .provenance_check_chain_depth(4, None)
-    );
+    assert!(_scp_core::scp::PyScp::new().provenance_check_chain_depth(4, None));
     // Depth 9 exceeds default of 8.
-    assert!(
-        !_scp_core::scp::PyScp::new()
-            .provenance_check_chain_depth(9, None)
-    );
-    assert!(
-        !_scp_core::scp::PyScp::new()
-            .provenance_check_chain_depth(2, Some(1))
-    );
+    assert!(!_scp_core::scp::PyScp::new().provenance_check_chain_depth(9, None));
+    assert!(!_scp_core::scp::PyScp::new().provenance_check_chain_depth(2, Some(1)));
 }
 
 #[test]
 fn provenance_attach_rejects_invalid_memory_scope() {
     setup();
     Python::with_gil(|py| {
-        let r = _scp_core::scp::PyScp::new()
-            .provenance_attach(
-                py,
-                "ctx".to_owned(),
-                "persistent",
-                "invalid_scope",
-                vec![],
-                "ctx-t".to_owned(),
-                "did:key:actor".to_owned(),
-                None,
-            );
+        let r = _scp_core::scp::PyScp::new().provenance_attach(
+            py,
+            "ctx".to_owned(),
+            "persistent",
+            "invalid_scope",
+            vec![],
+            "ctx-t".to_owned(),
+            "did:key:actor".to_owned(),
+            None,
+        );
         assert!(r.is_err());
     });
 }

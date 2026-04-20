@@ -203,8 +203,7 @@ mod tests {
     #[test]
     fn challenge_returns_valid_json() {
         let bi = test_bi();
-        let json =
-            scpid_challenge_on(&bi, "https://example.com".to_owned(), 60).unwrap();
+        let json = scpid_challenge_on(&bi, "https://example.com".to_owned(), 60).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["protocol"], "scpid/1.0");
         assert_eq!(v["audience"], "https://example.com");

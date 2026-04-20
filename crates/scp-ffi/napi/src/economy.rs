@@ -408,12 +408,8 @@ mod tests {
     #[test]
     fn estimate_cost_invalid_action() {
         let bi = test_bi();
-        let result = economy_estimate_cost_on(
-            &bi,
-            "null".to_owned(),
-            "bad".to_owned(),
-            "{}".to_owned(),
-        );
+        let result =
+            economy_estimate_cost_on(&bi, "null".to_owned(), "bad".to_owned(), "{}".to_owned());
         assert!(result.is_err());
     }
 
@@ -432,11 +428,8 @@ mod tests {
     #[test]
     fn budget_remaining_empty_context_returns_zero() {
         let bi = test_bi();
-        let result = economy_budget_remaining_on(
-            &bi,
-            "test-ctx".to_owned(),
-            "did:key:test".to_owned(),
-        );
+        let result =
+            economy_budget_remaining_on(&bi, "test-ctx".to_owned(), "did:key:test".to_owned());
         assert_eq!(result.unwrap(), 0);
     }
 
@@ -489,24 +482,15 @@ mod tests {
     #[test]
     fn budget_validates_empty_inputs() {
         let bi = test_bi();
-        assert!(
-            economy_budget_remaining_on(&bi, String::new(), "did:key:x".to_owned()).is_err()
-        );
-        assert!(
-            economy_budget_remaining_on(&bi, "ctx".to_owned(), String::new()).is_err()
-        );
+        assert!(economy_budget_remaining_on(&bi, String::new(), "did:key:x".to_owned()).is_err());
+        assert!(economy_budget_remaining_on(&bi, "ctx".to_owned(), String::new()).is_err());
     }
 
     #[test]
     fn budget_grant_rejects_negative_amount() {
         let bi = test_bi();
-        let err = economy_budget_grant_on(
-            &bi,
-            "ctx".to_owned(),
-            "did:key:alice".to_owned(),
-            -1,
-        )
-        .unwrap_err();
+        let err = economy_budget_grant_on(&bi, "ctx".to_owned(), "did:key:alice".to_owned(), -1)
+            .unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"
@@ -516,13 +500,9 @@ mod tests {
     #[test]
     fn budget_record_spend_rejects_negative_amount() {
         let bi = test_bi();
-        let err = economy_budget_record_spend_on(
-            &bi,
-            "ctx".to_owned(),
-            "did:key:alice".to_owned(),
-            -100,
-        )
-        .unwrap_err();
+        let err =
+            economy_budget_record_spend_on(&bi, "ctx".to_owned(), "did:key:alice".to_owned(), -100)
+                .unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"
@@ -532,13 +512,8 @@ mod tests {
     #[test]
     fn antispam_record_rejects_negative_timestamp() {
         let bi = test_bi();
-        let err = economy_antispam_record_on(
-            &bi,
-            "ctx".to_owned(),
-            "did:key:bob".to_owned(),
-            -1,
-        )
-        .unwrap_err();
+        let err = economy_antispam_record_on(&bi, "ctx".to_owned(), "did:key:bob".to_owned(), -1)
+            .unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"
@@ -548,13 +523,8 @@ mod tests {
     #[test]
     fn antispam_velocity_rejects_negative_now() {
         let bi = test_bi();
-        let err = economy_antispam_velocity_on(
-            &bi,
-            "ctx".to_owned(),
-            "did:key:bob".to_owned(),
-            -1,
-        )
-        .unwrap_err();
+        let err = economy_antispam_velocity_on(&bi, "ctx".to_owned(), "did:key:bob".to_owned(), -1)
+            .unwrap_err();
         assert!(
             err.reason.contains("non-negative"),
             "error should mention 'non-negative': {err:?}"
