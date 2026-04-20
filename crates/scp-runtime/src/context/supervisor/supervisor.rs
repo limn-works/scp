@@ -40,7 +40,8 @@ use scp_identity::DID;
 use scp_protocol::context::ContextError;
 
 use crate::context::actor::commands::{
-    ContextCommand, LifecycleCommand, MessagingCommand, QueriesCommand, TtlCloseCommand,
+    ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand, MessagingCommand,
+    QueriesCommand, TrustRecoveryCommand, TtlCloseCommand,
 };
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::handlers;
@@ -694,6 +695,129 @@ impl Supervisor {
             manager: cm,
         };
         Ok(handlers::ttl_close::dispatch_from_shim(&mut view, cmd).await)
+    }
+
+    /// Dispatch a [`GovernanceCommand`] through the migration shim
+    /// (ADR-049 commit 10 / plan row 10).
+    ///
+    /// Contract (byte-identical to the legacy
+    /// [`ContextManager`](crate::context::manager::ContextManager)
+    /// governance methods it replaces):
+    ///
+    /// Step 1 builds a [`MutationStateView`] over a scratch
+    /// [`SendSequenceTracker`](crate::context::actor::SendSequenceTracker)
+    /// plus a reference to the attached manager. Governance handlers
+    /// never read or mutate `send_tracker` (only the messaging path
+    /// touches it), so no per-context take-and-swap is required —
+    /// same shape as the lifecycle shim.
+    ///
+    /// Step 2 invokes
+    /// [`handlers::governance::dispatch_from_shim`](crate::context::actor::handlers::governance::dispatch_from_shim).
+    /// Each variant wraps the delegated
+    /// [`ContextManager`](crate::context::manager::ContextManager) method
+    /// in `tokio::time::timeout` with a 30s budget, maps a timeout to
+    /// [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout),
+    /// and relays the typed reply on the variant's oneshot.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet.
+    /// - Any typed error from the delegated manager method is surfaced
+    ///   through the variant's oneshot reply; the method-level result
+    ///   here is `Ok(Outcome { .. })`.
+    /// - [`ContextError::TransportTimeout`] is surfaced through the
+    ///   oneshot reply, not the method result.
+    pub async fn dispatch_governance_command(
+        &self,
+        cmd: GovernanceCommand,
+    ) -> Result<Outcome<()>, ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::dispatch_governance_command — no ContextManager attached".to_owned(),
+            )
+        })?;
+
+        let mut scratch_tracker = SendSequenceTracker::new();
+        let mut view = MutationStateView {
+            send_tracker: &mut scratch_tracker,
+            manager: cm,
+        };
+        // `Box::pin` — see the matching comment on
+        // `handlers::governance::dispatch` for the 16-KB stack-future
+        // rationale.
+        Ok(Box::pin(handlers::governance::dispatch_from_shim(&mut view, cmd)).await)
+    }
+
+    /// Dispatch an [`EconomyCommand`] through the migration shim
+    /// (ADR-049 commit 10 / plan row 10).
+    ///
+    /// Same shape as [`Self::dispatch_governance_command`]. The
+    /// economy handler only exposes the single public-surface method
+    /// on [`ContextManager`](crate::context::manager::ContextManager),
+    /// [`verify_payment_receipts`](crate::context::manager::ContextManager::verify_payment_receipts);
+    /// internal helpers (`authorize_paid_action`, `complete_paid_action`,
+    /// `void_paid_action`) remain on the manager's private surface
+    /// and are exercised through the messaging path.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet.
+    pub async fn dispatch_economy_command(
+        &self,
+        cmd: EconomyCommand,
+    ) -> Result<Outcome<()>, ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::dispatch_economy_command — no ContextManager attached".to_owned(),
+            )
+        })?;
+
+        let mut scratch_tracker = SendSequenceTracker::new();
+        let mut view = MutationStateView {
+            send_tracker: &mut scratch_tracker,
+            manager: cm,
+        };
+        Ok(handlers::economy::dispatch_from_shim(&mut view, cmd).await)
+    }
+
+    /// Dispatch a [`TrustRecoveryCommand`] through the migration shim
+    /// (ADR-049 commit 10 / plan row 10).
+    ///
+    /// Same shape as [`Self::dispatch_governance_command`]. Covers the
+    /// checkpoint + cosignature paths, MLS epoch advancement for
+    /// compromise recovery (spec §9.12 step 2), and recovery-
+    /// notification send paths (spec §9.12 step 5).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet.
+    pub async fn dispatch_trust_recovery_command(
+        &self,
+        cmd: TrustRecoveryCommand,
+    ) -> Result<Outcome<()>, ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::dispatch_trust_recovery_command — no ContextManager attached"
+                    .to_owned(),
+            )
+        })?;
+
+        let mut scratch_tracker = SendSequenceTracker::new();
+        let mut view = MutationStateView {
+            send_tracker: &mut scratch_tracker,
+            manager: cm,
+        };
+        // `Box::pin` — CreateGovernanceCheckpoint's payload carries
+        // multiple 32-byte hashes + a variable-length Ed25519 signature
+        // vector; the per-variant locals cross clippy's 16-KB stack-
+        // future budget.
+        Ok(Box::pin(handlers::trust_recovery::dispatch_from_shim(&mut view, cmd)).await)
     }
 
     /// Helper: acquire the per-context lock, build the view, run the

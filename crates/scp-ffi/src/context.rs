@@ -2021,6 +2021,47 @@ impl scp_core::crypto::ucan::validate::ProofResolver for NoOpProofResolver {
 ///
 /// Returns `RuntimeError` if the context manager is not initialized, the
 /// proposal JSON is invalid, or governance execution fails.
+/// Maps a [`GovernanceActionResult`](scp_core::context::manager::GovernanceActionResult)
+/// to its canonical `PascalCase` name for the SDK-facing return
+/// string. Factored out of `py_governance_execute` to keep that
+/// function below the `too_many_lines` clippy threshold.
+const fn governance_action_result_name(
+    result: &scp_core::context::manager::GovernanceActionResult,
+) -> &'static str {
+    use scp_core::context::manager::GovernanceActionResult;
+    match result {
+        GovernanceActionResult::MemberAdded => "MemberAdded",
+        GovernanceActionResult::MemberRemoved => "MemberRemoved",
+        GovernanceActionResult::RoleChanged => "RoleChanged",
+        GovernanceActionResult::ToolRegistered => "ToolRegistered",
+        GovernanceActionResult::ToolRemoved => "ToolRemoved",
+        GovernanceActionResult::CeilingModified => "CeilingModified",
+        GovernanceActionResult::ContextClosed => "ContextClosed",
+        GovernanceActionResult::TtlExtended => "TtlExtended",
+        GovernanceActionResult::PruningPolicyModified => "PruningPolicyModified",
+        GovernanceActionResult::AdminTransferred => "AdminTransferred",
+        GovernanceActionResult::SignerAdded => "SignerAdded",
+        GovernanceActionResult::SignerRemoved => "SignerRemoved",
+        GovernanceActionResult::ThresholdModified => "ThresholdModified",
+        GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
+        GovernanceActionResult::ToolInterfaceEstablished => "ToolInterfaceEstablished",
+        GovernanceActionResult::MemberReset => "MemberReset",
+        GovernanceActionResult::ConflictResolved => "ConflictResolved",
+        GovernanceActionResult::ContextPromoted => "ContextPromoted",
+        GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
+        GovernanceActionResult::AccessRevoked(_) => "AccessRevoked",
+        GovernanceActionResult::AccessRestored(_) => "AccessRestored",
+        GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
+        GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
+        GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
+        GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
+        GovernanceActionResult::Executed => "Executed",
+        GovernanceActionResult::MigrationProposed(_) => "MigrationProposed",
+        GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
+        GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
+    }
+}
+
 #[pyfunction]
 #[pyo3(signature = (handle, proposal_json))]
 fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyResult<String> {
@@ -2033,7 +2074,20 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
     let handle_state = handle.state.clone();
     let proposal_json_owned = proposal_json.to_owned();
 
+    // Route through the ADR-049 commit-10 governance shim
+    // ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command))
+    // rather than calling `ContextManager::execute_governance_action`
+    // directly. The shim wraps the delegated call in a 30s transport-
+    // timeout budget and is the entry point commit 12 will keep after
+    // `ContextManager` is deleted.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
+
     rt.block_on(async move {
+        use scp_core::context::actor::commands::{
+            ExecuteGovernanceActionPayload, GovernanceCommand,
+        };
+
         let proposal: scp_core::context::governance::GovernanceProposal =
             serde_json::from_str(&proposal_json_owned).map_err(|e| {
                 PyValueError::new_err(format!("invalid governance proposal JSON: {e}"))
@@ -2041,9 +2095,25 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
         scp_ffi_common::validate::validate_governance_action_strings(&proposal.action)
             .map_err(|e| PyValueError::new_err(e.message))?;
         let action_name = proposal.action.variant_name();
-        let result = mgr
-            .execute_governance_action(&context_id, &proposal)
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::ExecuteGovernanceAction {
+            payload: Box::new(ExecuteGovernanceActionPayload {
+                context_id: context_id.clone(),
+                proposal,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "supervisor dispatch_governance_command failed: {e}"
+            ))
+        })?;
+        let result = rx
             .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("governance execute shim reply dropped: {e}"))
+            })?
             .map_err(|e| PyRuntimeError::new_err(format!("governance execution failed: {e}")))?;
 
         // Re-sync local role state cache from ContextManager after any
@@ -2078,38 +2148,7 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             }
         }
 
-        use scp_core::context::manager::GovernanceActionResult;
-        let result_str = match result {
-            GovernanceActionResult::MemberAdded => "MemberAdded",
-            GovernanceActionResult::MemberRemoved => "MemberRemoved",
-            GovernanceActionResult::RoleChanged => "RoleChanged",
-            GovernanceActionResult::ToolRegistered => "ToolRegistered",
-            GovernanceActionResult::ToolRemoved => "ToolRemoved",
-            GovernanceActionResult::CeilingModified => "CeilingModified",
-            GovernanceActionResult::ContextClosed => "ContextClosed",
-            GovernanceActionResult::TtlExtended => "TtlExtended",
-            GovernanceActionResult::PruningPolicyModified => "PruningPolicyModified",
-            GovernanceActionResult::AdminTransferred => "AdminTransferred",
-            GovernanceActionResult::SignerAdded => "SignerAdded",
-            GovernanceActionResult::SignerRemoved => "SignerRemoved",
-            GovernanceActionResult::ThresholdModified => "ThresholdModified",
-            GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
-            GovernanceActionResult::ToolInterfaceEstablished => "ToolInterfaceEstablished",
-            GovernanceActionResult::MemberReset => "MemberReset",
-            GovernanceActionResult::ConflictResolved => "ConflictResolved",
-            GovernanceActionResult::ContextPromoted => "ContextPromoted",
-            GovernanceActionResult::MemberSuspended(_) => "MemberSuspended",
-            GovernanceActionResult::AccessRevoked(_) => "AccessRevoked",
-            GovernanceActionResult::AccessRestored(_) => "AccessRestored",
-            GovernanceActionResult::ContentKeysRotated(_) => "ContentKeysRotated",
-            GovernanceActionResult::GovernanceReconfigured(_) => "GovernanceReconfigured",
-            GovernanceActionResult::SubscriberBanned(_) => "SubscriberBanned",
-            GovernanceActionResult::SubscriberUnbanned { .. } => "SubscriberUnbanned",
-            GovernanceActionResult::Executed => "Executed",
-            GovernanceActionResult::MigrationProposed(_) => "MigrationProposed",
-            GovernanceActionResult::MigrationCancelled => "MigrationCancelled",
-            GovernanceActionResult::ContextTombstoned => "ContextTombstoned",
-        };
+        let result_str = governance_action_result_name(&result);
 
         // Sync FFI handle state for migration transitions (§5.11A).
         // The core ContextManager has already transitioned; keep the
@@ -2283,15 +2322,21 @@ fn py_governance_propose(
 ) -> PyResult<String> {
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // sync_role_state_from_manager below uses its own global accessor.
     let context_id = handle.context_id.clone();
     let action_json_owned = action_json.to_owned();
     let signing_key = resolve_signing_key(identity_did)?;
     let proposer_did = scp_identity::DID(identity_did.to_owned());
 
+    // Route through the ADR-049 commit-10 governance shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
+
     rt.block_on(async move {
+        use scp_core::context::actor::commands::{
+            GovernanceCommand, ProposeGovernanceActionPayload, SigningKeyBytes,
+        };
+
         let action: scp_core::context::governance::GovernanceAction =
             serde_json::from_str(&action_json_owned).map_err(|e| {
                 PyValueError::new_err(format!("SCP-CTX-2040: invalid governance action JSON: {e}"))
@@ -2302,9 +2347,28 @@ fn py_governance_propose(
 
         let action_name = action.variant_name();
 
-        let outcome = mgr
-            .propose_governance_action_checked(&context_id, &proposer_did, action, &signing_key)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::ProposeGovernanceActionChecked {
+            payload: Box::new(ProposeGovernanceActionPayload {
+                context_id: context_id.clone(),
+                proposer_did: proposer_did.clone(),
+                action,
+                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+            }),
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "SCP-CTX-2041: supervisor dispatch_governance_command failed: {e}"
+            ))
+        })?;
+        let outcome = rx
             .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2041: governance propose shim reply dropped: {e}"
+                ))
+            })?
             .map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2041: governance proposal failed: {e}"))
             })?;
@@ -2371,18 +2435,46 @@ fn py_governance_approve(
 ) -> PyResult<String> {
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // sync_role_state_from_manager below still relies on the attached
+    // ContextManager via its own global accessor; no need to keep an
+    // Arc alive in this scope now that the vote routes through the
+    // supervisor shim.
     let context_id = handle.context_id.clone();
     let signing_key = resolve_signing_key(identity_did)?;
     let voter_did = scp_identity::DID(identity_did.to_owned());
     let proposal_id = parse_proposal_id(proposal_id_hex)?;
 
+    // Route through the ADR-049 commit-10 governance shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
+
     rt.block_on(async move {
-        let status = mgr
-            .approve_governance_proposal(&context_id, &proposal_id, &voter_did, &signing_key)
+        use scp_core::context::actor::commands::{
+            GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
+        };
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::ApproveGovernanceProposal {
+            payload: Box::new(VoteOnProposalPayload {
+                context_id: context_id.clone(),
+                proposal_id,
+                voter_did: voter_did.clone(),
+                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+            }),
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "SCP-CTX-2042: supervisor dispatch_governance_command failed: {e}"
+            ))
+        })?;
+        let status = rx
             .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2042: governance approve shim reply dropped: {e}"
+                ))
+            })?
             .map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2042: governance approval failed: {e}"))
             })?;

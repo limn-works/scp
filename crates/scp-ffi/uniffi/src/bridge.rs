@@ -7781,6 +7781,10 @@ pub async fn governance_execute(
 
     let (result, action_name) = runtime()
         .spawn(async move {
+            use scp_core::context::actor::commands::{
+                ExecuteGovernanceActionPayload, GovernanceCommand,
+            };
+
             let proposal: scp_core::context::governance::GovernanceProposal =
                 serde_json::from_str(&proposal_json)?;
             // Defense-in-depth: validate user-controlled string fields at the
@@ -7791,10 +7795,31 @@ pub async fn governance_execute(
                     code: codes::VALID_7000.to_owned(),
                 })?;
             let action_name = proposal.action.variant_name();
-            let manager = crate::runtime::context_manager()?;
-            let result = manager
-                .execute_governance_action(&context_id, &proposal)
+
+            // Route through the ADR-049 commit-10 governance shim
+            // ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command))
+            // rather than calling `ContextManager::execute_governance_action`
+            // directly. `supervisor_lenient()` mirrors the shutdown-
+            // tolerance contract used by the commit-9 lifecycle shim
+            // paths for UniFFI.
+            let sup = crate::runtime::supervisor_lenient()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = GovernanceCommand::ExecuteGovernanceAction {
+                payload: Box::new(ExecuteGovernanceActionPayload {
+                    context_id: context_id.clone(),
+                    proposal,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_governance_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            let result = rx
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("governance execute shim reply dropped: {e}"),
+                    code: codes::CTX_2032.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
             // Serialize the result variant name for the caller.
             use scp_core::context::manager::GovernanceActionResult;
@@ -7959,6 +7984,10 @@ pub async fn governance_propose(
 
     let (result, action_name) = runtime()
         .spawn(async move {
+            use scp_core::context::actor::commands::{
+                GovernanceCommand, ProposeGovernanceActionPayload, SigningKeyBytes,
+            };
+
             let action: scp_core::context::governance::GovernanceAction =
                 serde_json::from_str(&action_json)?;
             // Defense-in-depth: validate user-controlled string fields at the
@@ -7971,10 +8000,28 @@ pub async fn governance_propose(
             })?;
             let action_name = action.variant_name();
             let did = scp_identity::DID(proposer_did);
-            let manager = crate::runtime::context_manager()?;
-            let outcome = manager
-                .propose_governance_action_checked(&context_id, &did, action, &signing_key)
+
+            // Route through the ADR-049 commit-10 governance shim.
+            let sup = crate::runtime::supervisor_lenient()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = GovernanceCommand::ProposeGovernanceActionChecked {
+                payload: Box::new(ProposeGovernanceActionPayload {
+                    context_id: context_id.clone(),
+                    proposer_did: did,
+                    action,
+                    signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+                }),
+                reply: tx,
+            };
+            sup.dispatch_governance_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            let outcome = rx
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("governance propose shim reply dropped: {e}"),
+                    code: codes::CTX_2041.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
 
             let result_str = outcome.execution_result.as_ref().map(|r| format!("{r:?}"));

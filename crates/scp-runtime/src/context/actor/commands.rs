@@ -457,12 +457,294 @@ pub enum LifecycleCommand {
     },
 }
 
-/// See [`ContextCommand::Governance`]. Real variants arrive in commit 10.
+/// Reply-channel type alias for
+/// [`GovernanceCommand::ProposeGovernanceAction`]. The reply carries the
+/// created proposal, the emitted engine events, and the optional
+/// auto-execution result (present for `SingleAdmin` governance).
+/// Factored out to satisfy `clippy::type_complexity`.
+pub type ProposeGovernanceActionReply = oneshot::Sender<
+    Result<
+        (
+            scp_protocol::context::governance::GovernanceProposal,
+            Vec<scp_protocol::context::governance::GovernanceEvent>,
+            Option<crate::context::manager::GovernanceActionResult>,
+        ),
+        ContextError,
+    >,
+>;
+
+/// Reply-channel type alias for
+/// [`GovernanceCommand::ProposeGovernanceActionChecked`]. The reply
+/// carries a full [`ProposalOutcome`] — proposal, status, optional
+/// execution result. Factored out for the same reason as
+/// [`ProposeGovernanceActionReply`].
+pub type ProposeGovernanceActionCheckedReply =
+    oneshot::Sender<Result<crate::context::manager::ProposalOutcome, ContextError>>;
+
+/// Reply-channel type alias for [`GovernanceCommand::VoteOnProposal`].
+/// Mirrors the legacy method: `(ProposalStatus, Vec<GovernanceEvent>)`.
+pub type VoteOnProposalReply = oneshot::Sender<
+    Result<
+        (
+            scp_protocol::context::governance::ProposalStatus,
+            Vec<scp_protocol::context::governance::GovernanceEvent>,
+        ),
+        ContextError,
+    >,
+>;
+
+/// Payload for [`GovernanceCommand::ProposeGovernanceAction`] and
+/// [`GovernanceCommand::ProposeGovernanceActionChecked`]. Boxed inside
+/// each variant so the enum's variant sizes stay uniform under
+/// `clippy::large_enum_variant` (GovernanceAction may embed large
+/// sub-structs like tool interfaces or ceiling modifications).
+pub struct ProposeGovernanceActionPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Proposer DID.
+    pub proposer_did: scp_identity::DID,
+    /// Typed governance action — one of the 28 variants from ADR-031.
+    pub action: scp_protocol::context::governance::GovernanceAction,
+    /// Proposer's Ed25519 signing key. Wrapped in [`SigningKeyBytes`]
+    /// so the private key zeroes on drop (mirrors the messaging path's
+    /// command-level zeroize contract).
+    pub signing_key: SigningKeyBytes,
+}
+
+/// Payload for [`GovernanceCommand::VoteOnProposal`],
+/// [`GovernanceCommand::ApproveGovernanceProposal`], and
+/// [`GovernanceCommand::RejectGovernanceProposal`]. Boxed so the outer
+/// enum's variant sizes stay uniform — the signing key embeds a
+/// [`Zeroizing<[u8; 32]>`](zeroize::Zeroizing) and the proposal-ID +
+/// DID + context-id fields combine to ~150 bytes; boxing keeps the
+/// variant payload size constant.
+pub struct VoteOnProposalPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Target proposal ID (32 bytes).
+    pub proposal_id: scp_protocol::context::governance::ProposalId,
+    /// Voter DID.
+    pub voter_did: scp_identity::DID,
+    /// Voter's Ed25519 signing key (zeroized on drop via
+    /// [`SigningKeyBytes`]).
+    pub signing_key: SigningKeyBytes,
+}
+
+/// Payload for [`GovernanceCommand::ExecuteGovernanceAction`]. Boxed
+/// because [`scp_protocol::context::governance::GovernanceProposal`]
+/// carries a complete
+/// [`GovernanceAction`](scp_protocol::context::governance::GovernanceAction)
+/// plus signatures; together the struct is well over the
+/// `large_enum_variant` threshold.
+pub struct ExecuteGovernanceActionPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Fully-validated governance proposal (status ==
+    /// [`ProposalStatus::Approved`](scp_protocol::context::governance::ProposalStatus)).
+    pub proposal: scp_protocol::context::governance::GovernanceProposal,
+}
+
+/// See [`ContextCommand::Governance`]. Real variants land in commit 10
+/// of the ADR-049 commit ladder (see `handlers/governance.rs`).
+/// Variants mirror the public surface of
+/// [`crate::context::manager::governance`] one-to-one: propose, vote,
+/// approve/reject/withdraw, execute, read proposals, apply pending
+/// ceiling / economic-policy changes, tombstone migrations, acknowledge
+/// commit faults. ADR-031 defines 28 governance actions; those are the
+/// payload discriminants of the single
+/// [`GovernanceAction`](scp_protocol::context::governance::GovernanceAction)
+/// enum carried by the propose variants — the command surface here
+/// mirrors the manager methods that accept them, not the actions
+/// themselves.
 pub enum GovernanceCommand {
-    /// Placeholder.
+    /// Placeholder — retained so out-of-tree callers constructed during
+    /// commit 6 still compile. Handler replies `NotImplemented`. Removed
+    /// in commit 12 when the shim is deleted.
     Placeholder {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Submits a governance proposal — unchecked variant. Mirrors
+    /// [`ContextManager::propose_governance_action`](crate::context::manager::ContextManager::propose_governance_action).
+    /// Accepts the proposer DID + action + signing key without a
+    /// capability pre-check (the governance engine enforces eligibility
+    /// internally). For `SingleAdmin` contexts the proposal is auto-
+    /// approved and executed; for multi-admin models it enters
+    /// `Pending`.
+    ProposeGovernanceAction {
+        /// Boxed owned payload.
+        payload: Box<ProposeGovernanceActionPayload>,
+        /// Oneshot reply channel. See
+        /// [`ProposeGovernanceActionReply`].
+        reply: ProposeGovernanceActionReply,
+    },
+
+    /// Submits a governance proposal — checked variant. Mirrors
+    /// [`ContextManager::propose_governance_action_checked`](crate::context::manager::ContextManager::propose_governance_action_checked).
+    /// Validates the proposer's `GovernancePropose` capability inside
+    /// the same lock as the proposal submission (no TOCTOU).
+    ProposeGovernanceActionChecked {
+        /// Boxed owned payload (same shape as the unchecked variant).
+        payload: Box<ProposeGovernanceActionPayload>,
+        /// Oneshot reply channel. See
+        /// [`ProposeGovernanceActionCheckedReply`].
+        reply: ProposeGovernanceActionCheckedReply,
+    },
+
+    /// Casts a vote on a pending proposal. Mirrors
+    /// [`ContextManager::vote_on_proposal`](crate::context::manager::ContextManager::vote_on_proposal).
+    /// `approve == true` is an approval vote; `false` is rejection.
+    VoteOnProposal {
+        /// Boxed owned payload.
+        payload: Box<VoteOnProposalPayload>,
+        /// `true` for an approval vote, `false` for rejection. Kept
+        /// outside the boxed payload for legibility at the dispatch
+        /// site.
+        approve: bool,
+        /// Oneshot reply channel. See [`VoteOnProposalReply`].
+        reply: VoteOnProposalReply,
+    },
+
+    /// Casts an approval vote with explicit capability pre-check.
+    /// Mirrors [`ContextManager::approve_governance_proposal`](crate::context::manager::ContextManager::approve_governance_proposal).
+    /// The reply carries only the resulting status (the legacy method
+    /// discards the event list by convention — see its implementation).
+    ApproveGovernanceProposal {
+        /// Boxed owned payload.
+        payload: Box<VoteOnProposalPayload>,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<
+            Result<scp_protocol::context::governance::ProposalStatus, ContextError>,
+        >,
+    },
+
+    /// Casts a rejection vote with explicit capability pre-check.
+    /// Mirrors [`ContextManager::reject_governance_proposal`](crate::context::manager::ContextManager::reject_governance_proposal).
+    RejectGovernanceProposal {
+        /// Boxed owned payload.
+        payload: Box<VoteOnProposalPayload>,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<
+            Result<scp_protocol::context::governance::ProposalStatus, ContextError>,
+        >,
+    },
+
+    /// Withdraws a previously cast vote. Mirrors
+    /// [`ContextManager::withdraw_governance_vote`](crate::context::manager::ContextManager::withdraw_governance_vote).
+    /// No signing key — withdrawal is the voter's privileged operation
+    /// on their own vote per the governance engine's trait contract.
+    WithdrawGovernanceVote {
+        /// Context identifier string.
+        context_id: String,
+        /// Target proposal ID (32 bytes).
+        proposal_id: scp_protocol::context::governance::ProposalId,
+        /// Voter DID.
+        voter_did: scp_identity::DID,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<
+            Result<scp_protocol::context::governance::ProposalStatus, ContextError>,
+        >,
+    },
+
+    /// Executes an already-approved governance proposal. Mirrors
+    /// [`ContextManager::execute_governance_action`](crate::context::manager::ContextManager::execute_governance_action).
+    /// Caller MUST pass a proposal whose status is
+    /// [`ProposalStatus::Approved`](scp_protocol::context::governance::ProposalStatus);
+    /// the legacy method enforces the gate.
+    ExecuteGovernanceAction {
+        /// Boxed owned payload (GovernanceProposal is ~several hundred
+        /// bytes depending on the inner action).
+        payload: Box<ExecuteGovernanceActionPayload>,
+        /// Oneshot reply channel.
+        reply:
+            oneshot::Sender<Result<crate::context::manager::GovernanceActionResult, ContextError>>,
+    },
+
+    /// Reads a single proposal by ID. Mirrors
+    /// [`ContextManager::get_proposal`](crate::context::manager::ContextManager::get_proposal).
+    GetProposal {
+        /// Context identifier string.
+        context_id: String,
+        /// Target proposal ID.
+        proposal_id: scp_protocol::context::governance::ProposalId,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<
+            Result<scp_protocol::context::governance::GovernanceProposal, ContextError>,
+        >,
+    },
+
+    /// Lists all proposals for a context. Mirrors
+    /// [`ContextManager::list_proposals`](crate::context::manager::ContextManager::list_proposals).
+    ListProposals {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<
+            Result<Vec<scp_protocol::context::governance::GovernanceProposal>, ContextError>,
+        >,
+    },
+
+    /// Applies a pending ceiling modification whose notification period
+    /// has expired. Mirrors
+    /// [`ContextManager::apply_pending_ceiling_modification`](crate::context::manager::ContextManager::apply_pending_ceiling_modification).
+    /// Returns `true` iff a pending modification was applied.
+    ApplyPendingCeilingModification {
+        /// Context identifier string.
+        context_id: String,
+        /// Current timestamp (seconds). Caller supplies to keep the
+        /// handler pure / deterministic across clock sources.
+        current_timestamp: u64,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<bool, ContextError>>,
+    },
+
+    /// Applies a pending economic-policy change whose notification
+    /// period has expired. Mirrors
+    /// [`ContextManager::apply_pending_economic_policy_change`](crate::context::manager::ContextManager::apply_pending_economic_policy_change).
+    /// Returns `true` iff a pending change was applied.
+    ApplyPendingEconomicPolicyChange {
+        /// Context identifier string.
+        context_id: String,
+        /// Current timestamp (seconds).
+        current_timestamp: u64,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<bool, ContextError>>,
+    },
+
+    /// Tombstones a migrated context after the grace period expires.
+    /// Mirrors
+    /// [`ContextManager::tombstone_migrated_context`](crate::context::manager::ContextManager::tombstone_migrated_context).
+    TombstoneMigratedContext {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Returns the migration state for a context if one exists. Mirrors
+    /// [`ContextManager::migration_state`](crate::context::manager::ContextManager::migration_state).
+    ///
+    /// This is read-only; the handler returns
+    /// [`Outcome::ok`](crate::context::actor::Outcome::ok) and reports
+    /// `mutated: false`.
+    MigrationState {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel. `Ok(None)` iff the context is unknown
+        /// or not migrating (matches the legacy contract).
+        reply:
+            oneshot::Sender<Result<Option<crate::context::manager::MigrationState>, ContextError>>,
+    },
+
+    /// Acknowledges and clears a commit-fault marker for a context
+    /// (PR #1606 C6). Mirrors
+    /// [`ContextManager::acknowledge_commit_fault`](crate::context::manager::ContextManager::acknowledge_commit_fault).
+    AcknowledgeCommitFault {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel. Carries the cleared fault marker.
+        reply: oneshot::Sender<Result<crate::context::manager::CommitFaultMarker, ContextError>>,
     },
 }
 
@@ -475,19 +757,197 @@ pub enum BroadcastCommand {
     },
 }
 
-/// See [`ContextCommand::Economy`]. Real variants arrive in commit 10.
+/// Reply-channel type alias for
+/// [`EconomyCommand::VerifyPaymentReceipts`]. Factored out to satisfy
+/// `clippy::type_complexity` given the deep crate-path return type.
+pub type VerifyPaymentReceiptsReply = oneshot::Sender<
+    Vec<
+        Result<
+            crate::economy::receipt::ReceiptVerification,
+            crate::economy::receipt::ReceiptVerificationError,
+        >,
+    >,
+>;
+
+/// See [`ContextCommand::Economy`]. Real variants land in commit 10 of
+/// the ADR-049 commit ladder (see `handlers/economy.rs`). The public
+/// surface of [`crate::context::manager::economy`] currently consists
+/// of a single method, [`verify_payment_receipts`](crate::context::manager::ContextManager::verify_payment_receipts);
+/// all other economy methods (`authorize_paid_action`,
+/// `complete_paid_action`, `void_paid_action`, `rollback_economy_ticket`)
+/// are `pub(super)` helpers invoked by the messaging path. Commit 12
+/// rewires the sender-side pipeline to construct economy commands
+/// internally rather than calling the helpers directly; commit 10
+/// lands only the public surface.
 pub enum EconomyCommand {
-    /// Placeholder.
+    /// Placeholder — retained so out-of-tree callers constructed during
+    /// commit 6 still compile. Handler replies `NotImplemented`. Removed
+    /// in commit 12 when the shim is deleted.
     Placeholder {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
+
+    /// Verifies a batch of payment receipts against the configured
+    /// payment adapter. Mirrors
+    /// [`ContextManager::verify_payment_receipts`](crate::context::manager::ContextManager::verify_payment_receipts).
+    ///
+    /// Read-only — the handler returns
+    /// [`Outcome::ok`](crate::context::actor::Outcome::ok) and reports
+    /// `mutated: false`. Verification results come back vector-indexed
+    /// with the input receipts; each entry is either a
+    /// [`ReceiptVerification`](crate::economy::receipt::ReceiptVerification)
+    /// or a
+    /// [`ReceiptVerificationError`](crate::economy::receipt::ReceiptVerificationError).
+    VerifyPaymentReceipts {
+        /// Receipts to verify. Boxed vector so the variant payload stays
+        /// pointer-sized.
+        receipts: Box<Vec<crate::economy::adapter::PaymentReceipt>>,
+        /// Oneshot reply channel. See [`VerifyPaymentReceiptsReply`].
+        reply: VerifyPaymentReceiptsReply,
+    },
 }
 
-/// See [`ContextCommand::TrustRecovery`]. Real variants arrive in commit 10.
+/// Payload for [`TrustRecoveryCommand::CreateGovernanceCheckpoint`].
+/// Boxed so the variant payload stays pointer-sized — the two 32-byte
+/// Merkle/state hashes plus the creator signature push the total over
+/// the `large_enum_variant` threshold.
+pub struct CreateGovernanceCheckpointPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Checkpoint sequence number (monotonic per context).
+    pub checkpoint_seq: u64,
+    /// Merkle root of the context event log at checkpoint time.
+    pub merkle_root: [u8; 32],
+    /// Total event count at checkpoint time.
+    pub event_count: u64,
+    /// Hash of the last event included in the checkpoint.
+    pub last_event_hash: [u8; 32],
+    /// Hash of the state snapshot accompanying the checkpoint.
+    pub state_snapshot_hash: [u8; 32],
+    /// Creator DID.
+    pub creator_did: scp_identity::DID,
+    /// Creator's Ed25519 signature over the canonical checkpoint
+    /// bytes (computed outside the handler — passed through verbatim).
+    pub creator_signature: Vec<u8>,
+}
+
+/// Payload for [`TrustRecoveryCommand::RecoverySendNotification`].
+/// Boxed so the outer variant payload stays pointer-sized. Owns the
+/// payload bytes and the signing key so the command can cross the
+/// actor mailbox without lifetime juggling.
+pub struct RecoverySendNotificationPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Sender DID.
+    pub sender_did: String,
+    /// Opaque recovery-notification payload bytes.
+    pub payload: Vec<u8>,
+    /// Recovery-step sequence number (0 = MLS epoch advance, 1 = UCAN
+    /// revocation, 2 = key-package rotation, 3 = PSK rotation, 4 =
+    /// contact notification — see spec §9.12).
+    pub sequence: u64,
+    /// Sender's Ed25519 signing key. Wrapped in [`SigningKeyBytes`] so
+    /// the private key zeroes on drop.
+    pub signing_key: SigningKeyBytes,
+}
+
+/// Payload for [`TrustRecoveryCommand::RecoveryNotifyContact`]. Boxed
+/// for the same reason as [`RecoverySendNotificationPayload`].
+pub struct RecoveryNotifyContactPayload {
+    /// Recovering DID (the party running the recovery protocol).
+    pub recovering_did: String,
+    /// Contact DID (the party to notify through a shared context).
+    pub contact_did: String,
+    /// Opaque recovery-notification payload bytes.
+    pub payload: Vec<u8>,
+    /// Recovering DID's signing key (zeroized on drop).
+    pub signing_key: SigningKeyBytes,
+}
+
+/// See [`ContextCommand::TrustRecovery`]. Real variants land in commit
+/// 10 of the ADR-049 commit ladder (see `handlers/trust_recovery.rs`).
+/// Variants mirror the public surface of
+/// [`crate::context::manager::trust_recovery`] one-to-one: attestation
+/// verification, challenge issuance + verification, governance
+/// checkpoints + cosignatures, compromise-recovery epoch advance, and
+/// recovery notifications (spec §9.12).
 pub enum TrustRecoveryCommand {
-    /// Placeholder.
+    /// Placeholder — retained so out-of-tree callers constructed during
+    /// commit 6 still compile. Handler replies `NotImplemented`. Removed
+    /// in commit 12 when the shim is deleted.
     Placeholder {
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Creates a governance-aware checkpoint for a context. Mirrors
+    /// [`ContextManager::create_governance_checkpoint`](crate::context::manager::ContextManager::create_governance_checkpoint).
+    CreateGovernanceCheckpoint {
+        /// Boxed owned payload.
+        payload: Box<CreateGovernanceCheckpointPayload>,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<
+            Result<scp_protocol::context::governance::ContextCheckpoint, ContextError>,
+        >,
+    },
+
+    /// Adds a cosignature to an existing checkpoint and re-evaluates
+    /// attestation status. Mirrors
+    /// [`ContextManager::add_checkpoint_cosignature`](crate::context::manager::ContextManager::add_checkpoint_cosignature).
+    ///
+    /// The caller supplies a mutable checkpoint (by owned value) and
+    /// the cosignature; the handler applies the cosignature on success
+    /// and returns both the attestation status and the updated
+    /// checkpoint via the reply.
+    AddCheckpointCosignature {
+        /// Context identifier string.
+        context_id: String,
+        /// Target checkpoint (boxed — carries the full cosignature
+        /// vector plus the Merkle/state hashes).
+        checkpoint: Box<scp_protocol::context::governance::ContextCheckpoint>,
+        /// Cosignature to add (boxed — wraps an Ed25519 signature +
+        /// signer DID).
+        cosignature: Box<scp_protocol::context::governance::CosignedCheckpoint>,
+        /// Oneshot reply channel. Carries the updated checkpoint and
+        /// its new attestation status.
+        reply: oneshot::Sender<
+            Result<
+                (
+                    scp_protocol::context::governance::ContextCheckpoint,
+                    scp_protocol::context::governance::CheckpointAttestationStatus,
+                ),
+                ContextError,
+            >,
+        >,
+    },
+
+    /// Advances the MLS epoch for a context as part of compromise
+    /// recovery (spec §9.12 step 2). Mirrors
+    /// [`ContextManager::recovery_advance_epoch`](crate::context::manager::ContextManager::recovery_advance_epoch).
+    RecoveryAdvanceEpoch {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel. Carries the new epoch number.
+        reply: oneshot::Sender<Result<u64, ContextError>>,
+    },
+
+    /// Sends a recovery notification directly through a named context
+    /// (spec §9.12 step 5 — context already known). Mirrors
+    /// [`ContextManager::recovery_send_notification`](crate::context::manager::ContextManager::recovery_send_notification).
+    RecoverySendNotification {
+        /// Boxed owned payload (carries the signing key bytes).
+        payload: Box<RecoverySendNotificationPayload>,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Sends a recovery notification to a contact DID by finding a
+    /// shared context. Mirrors
+    /// [`ContextManager::recovery_notify_contact`](crate::context::manager::ContextManager::recovery_notify_contact).
+    RecoveryNotifyContact {
+        /// Boxed owned payload (carries the signing key bytes).
+        payload: Box<RecoveryNotifyContactPayload>,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },

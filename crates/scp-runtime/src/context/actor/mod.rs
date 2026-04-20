@@ -215,18 +215,12 @@ impl ContextActor {
                 );
             }
             ContextCommand::Lifecycle(sub) => Self::skeleton_dispatch_lifecycle(sub),
-            ContextCommand::Governance(GovernanceCommand::Placeholder { reply }) => {
-                ack_not_impl(reply, "governance");
-            }
+            ContextCommand::Governance(sub) => Self::skeleton_dispatch_governance(sub),
             ContextCommand::Broadcast(BroadcastCommand::Placeholder { reply }) => {
                 ack_not_impl(reply, "broadcast");
             }
-            ContextCommand::Economy(EconomyCommand::Placeholder { reply }) => {
-                ack_not_impl(reply, "economy");
-            }
-            ContextCommand::TrustRecovery(TrustRecoveryCommand::Placeholder { reply }) => {
-                ack_not_impl(reply, "trust_recovery");
-            }
+            ContextCommand::Economy(sub) => Self::skeleton_dispatch_economy(sub),
+            ContextCommand::TrustRecovery(sub) => Self::skeleton_dispatch_trust_recovery(sub),
             ContextCommand::Standing(StandingCommand::Placeholder { reply }) => {
                 ack_not_impl(reply, "standing");
             }
@@ -393,6 +387,158 @@ impl ContextActor {
             LifecycleCommand::ImportContext { reply, .. } => ack_not_impl(
                 reply,
                 "lifecycle::import_context (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
+            ),
+        }
+    }
+
+    /// Skeleton-dispatch helper for [`ContextCommand::Governance`].
+    /// Extracted from [`Self::skeleton_dispatch`] so the outer function
+    /// stays below the `too_many_lines` clippy threshold.
+    ///
+    /// Shim-routed governance dispatch does not go through this
+    /// function — the real production path is
+    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_governance_command`]
+    /// (ADR-049 commit 10).
+    fn skeleton_dispatch_governance(sub: GovernanceCommand) {
+        fn ack_not_impl<T>(
+            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+            which: &'static str,
+        ) {
+            let _ = reply.send(Err(ContextError::NotImplemented(format!(
+                "{which} — migrates in the matching handler commit of ADR-049"
+            ))));
+        }
+        match sub {
+            GovernanceCommand::Placeholder { reply } => ack_not_impl(reply, "governance"),
+            GovernanceCommand::ProposeGovernanceAction { reply, .. } => ack_not_impl(
+                reply,
+                "governance::propose_governance_action (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+            GovernanceCommand::ProposeGovernanceActionChecked { reply, .. } => ack_not_impl(
+                reply,
+                "governance::propose_governance_action_checked (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+            GovernanceCommand::VoteOnProposal { reply, .. } => ack_not_impl(
+                reply,
+                "governance::vote_on_proposal (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+            GovernanceCommand::ApproveGovernanceProposal { reply, .. } => ack_not_impl(
+                reply,
+                "governance::approve_governance_proposal (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+            GovernanceCommand::RejectGovernanceProposal { reply, .. } => ack_not_impl(
+                reply,
+                "governance::reject_governance_proposal (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+            GovernanceCommand::WithdrawGovernanceVote { reply, .. } => ack_not_impl(
+                reply,
+                "governance::withdraw_governance_vote (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+            GovernanceCommand::ExecuteGovernanceAction { reply, .. } => ack_not_impl(
+                reply,
+                "governance::execute_governance_action (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+            GovernanceCommand::GetProposal { reply, .. } => ack_not_impl(
+                reply,
+                "governance::get_proposal (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+            GovernanceCommand::ListProposals { reply, .. } => ack_not_impl(
+                reply,
+                "governance::list_proposals (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+            GovernanceCommand::ApplyPendingCeilingModification { reply, .. } => ack_not_impl(
+                reply,
+                "governance::apply_pending_ceiling_modification (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+            GovernanceCommand::ApplyPendingEconomicPolicyChange { reply, .. } => ack_not_impl(
+                reply,
+                "governance::apply_pending_economic_policy_change (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+            GovernanceCommand::TombstoneMigratedContext { reply, .. } => ack_not_impl(
+                reply,
+                "governance::tombstone_migrated_context (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+            GovernanceCommand::MigrationState { reply, .. } => ack_not_impl(
+                reply,
+                "governance::migration_state (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+            GovernanceCommand::AcknowledgeCommitFault { reply, .. } => ack_not_impl(
+                reply,
+                "governance::acknowledge_commit_fault (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+        }
+    }
+
+    /// Skeleton-dispatch helper for [`ContextCommand::Economy`].
+    /// Extracted from [`Self::skeleton_dispatch`] so the outer function
+    /// stays below the `too_many_lines` clippy threshold.
+    ///
+    /// Shim-routed economy dispatch does not go through this
+    /// function — the real production path is
+    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_economy_command`]
+    /// (ADR-049 commit 10).
+    fn skeleton_dispatch_economy(sub: EconomyCommand) {
+        fn ack_not_impl<T>(
+            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+            which: &'static str,
+        ) {
+            let _ = reply.send(Err(ContextError::NotImplemented(format!(
+                "{which} — migrates in the matching handler commit of ADR-049"
+            ))));
+        }
+        match sub {
+            EconomyCommand::Placeholder { reply } => ack_not_impl(reply, "economy"),
+            // `VerifyPaymentReceipts` carries a `Vec<Result<..>>` reply
+            // (not `Result<.., ContextError>`); synthesize an empty
+            // reply so the mailbox contract is preserved even for the
+            // skeleton. Callers that mistakenly route through the
+            // skeleton observe an empty verification vector (the
+            // timeout/error semantics are defined in the real
+            // handler).
+            EconomyCommand::VerifyPaymentReceipts { reply, .. } => {
+                let _ = reply.send(Vec::new());
+            }
+        }
+    }
+
+    /// Skeleton-dispatch helper for [`ContextCommand::TrustRecovery`].
+    /// Extracted from [`Self::skeleton_dispatch`] so the outer function
+    /// stays below the `too_many_lines` clippy threshold.
+    ///
+    /// Shim-routed trust-recovery dispatch does not go through this
+    /// function — the real production path is
+    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_trust_recovery_command`]
+    /// (ADR-049 commit 10).
+    fn skeleton_dispatch_trust_recovery(sub: TrustRecoveryCommand) {
+        fn ack_not_impl<T>(
+            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+            which: &'static str,
+        ) {
+            let _ = reply.send(Err(ContextError::NotImplemented(format!(
+                "{which} — migrates in the matching handler commit of ADR-049"
+            ))));
+        }
+        match sub {
+            TrustRecoveryCommand::Placeholder { reply } => ack_not_impl(reply, "trust_recovery"),
+            TrustRecoveryCommand::CreateGovernanceCheckpoint { reply, .. } => ack_not_impl(
+                reply,
+                "trust_recovery::create_governance_checkpoint (use Supervisor::dispatch_trust_recovery_command during commits 10-11)",
+            ),
+            TrustRecoveryCommand::AddCheckpointCosignature { reply, .. } => ack_not_impl(
+                reply,
+                "trust_recovery::add_checkpoint_cosignature (use Supervisor::dispatch_trust_recovery_command during commits 10-11)",
+            ),
+            TrustRecoveryCommand::RecoveryAdvanceEpoch { reply, .. } => ack_not_impl(
+                reply,
+                "trust_recovery::recovery_advance_epoch (use Supervisor::dispatch_trust_recovery_command during commits 10-11)",
+            ),
+            TrustRecoveryCommand::RecoverySendNotification { reply, .. } => ack_not_impl(
+                reply,
+                "trust_recovery::recovery_send_notification (use Supervisor::dispatch_trust_recovery_command during commits 10-11)",
+            ),
+            TrustRecoveryCommand::RecoveryNotifyContact { reply, .. } => ack_not_impl(
+                reply,
+                "trust_recovery::recovery_notify_contact (use Supervisor::dispatch_trust_recovery_command during commits 10-11)",
             ),
         }
     }

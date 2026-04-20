@@ -421,6 +421,82 @@ pub fn py_economy_antispam_escalated_cost(
 }
 
 // ---------------------------------------------------------------------------
+// Payment receipt verification (ADR-049 commit-10 shim — routes through
+// Supervisor::dispatch_economy_command)
+// ---------------------------------------------------------------------------
+
+/// Verifies a batch of payment receipts against the configured payment
+/// adapter.
+///
+/// Routes through the ADR-049 commit-10 economy shim
+/// ([`Supervisor::dispatch_economy_command`](scp_core::context::supervisor::Supervisor::dispatch_economy_command))
+/// rather than calling `ContextManager::verify_payment_receipts`
+/// directly. The shim wraps the delegated call in a 30s transport-
+/// timeout budget and is the entry point commit 12 will keep after
+/// `ContextManager` is deleted.
+///
+/// # Arguments
+///
+/// * `receipts_json` — JSON-encoded array of `PaymentReceipt` objects.
+///
+/// # Returns
+///
+/// JSON string: array of per-receipt results. Each entry is either
+/// `{"receipt_id": hex, "result": ...}` on success or
+/// `{"error": "...", "code": "..."}` on failure.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the receipts JSON is invalid or the
+/// supervisor is not initialized.
+#[pyo3::pyfunction]
+pub fn py_economy_verify_payment_receipts(receipts_json: &str) -> PyResult<String> {
+    use pyo3::exceptions::{PyRuntimeError, PyValueError};
+    use std::sync::Arc;
+
+    let rt = crate::runtime()?;
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
+
+    let receipts: Vec<scp_core::economy::PaymentReceipt> = serde_json::from_str(receipts_json)
+        .map_err(|e| PyValueError::new_err(format!("invalid receipts JSON: {e}")))?;
+
+    rt.block_on(async move {
+        use scp_core::context::actor::commands::EconomyCommand;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = EconomyCommand::VerifyPaymentReceipts {
+            receipts: Box::new(receipts),
+            reply: tx,
+        };
+        sup.dispatch_economy_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_economy_command failed: {e}"))
+        })?;
+        let results = rx.await.map_err(|e| {
+            PyRuntimeError::new_err(format!("verify_payment_receipts shim reply dropped: {e}"))
+        })?;
+
+        // Serialize results. Each entry is a
+        // `Result<ReceiptVerification, ReceiptVerificationError>`.
+        let entries: Vec<serde_json::Value> = results
+            .into_iter()
+            .map(|r| match r {
+                Ok(v) => serde_json::json!({
+                    "ok": true,
+                    "receipt_id": hex::encode(v.receipt_id),
+                    "result": format!("{:?}", v.result),
+                }),
+                Err(e) => serde_json::json!({
+                    "ok": false,
+                    "error": format!("{e}"),
+                }),
+            })
+            .collect();
+        Ok(serde_json::json!({ "results": entries }).to_string())
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -438,6 +514,7 @@ pub fn register_economy(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_economy_antispam_record, m)?)?;
     m.add_function(wrap_pyfunction!(py_economy_antispam_velocity, m)?)?;
     m.add_function(wrap_pyfunction!(py_economy_antispam_escalated_cost, m)?)?;
+    m.add_function(wrap_pyfunction!(py_economy_verify_payment_receipts, m)?)?;
     Ok(())
 }
 

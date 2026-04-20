@@ -2624,15 +2624,44 @@ pub async fn context_governance_propose(
 
     #[cfg(feature = "allow_in_memory_custody")]
     {
+        use scp_core::context::actor::commands::{
+            GovernanceCommand, ProposeGovernanceActionPayload, SigningKeyBytes,
+        };
+
         let signing_key = resolve_napi_signing_key(handle).await?;
 
         let did = DID(proposer_did);
-        let manager = context_manager()?;
         let context_id = handle.context_id.clone();
 
-        let outcome = manager
-            .propose_governance_action_checked(&context_id, &did, action, &signing_key)
+        // Route through the ADR-049 commit-10 governance shim
+        // ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command))
+        // rather than calling `ContextManager::propose_governance_action_checked`
+        // directly.
+        let sup = crate::runtime::supervisor()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::ProposeGovernanceActionChecked {
+            payload: Box::new(ProposeGovernanceActionPayload {
+                context_id: context_id.clone(),
+                proposer_did: did,
+                action,
+                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+            }),
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("supervisor dispatch_governance_command failed: {e}"),
+                code: codes::CTX_2041.to_owned(),
+            })
+        })?;
+        let outcome = rx
             .await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("governance proposal shim reply dropped: {e}"),
+                    code: codes::CTX_2041.to_owned(),
+                })
+            })?
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("governance proposal failed: {e}"),
@@ -2695,15 +2724,41 @@ pub async fn context_governance_approve(
 
     #[cfg(feature = "allow_in_memory_custody")]
     {
+        use scp_core::context::actor::commands::{
+            GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
+        };
+
         let signing_key = resolve_napi_signing_key(handle).await?;
 
         let did = DID(voter_did);
-        let manager = context_manager()?;
         let context_id = handle.context_id.clone();
 
-        let status = manager
-            .approve_governance_proposal(&context_id, &proposal_id, &did, &signing_key)
+        // Route through the ADR-049 commit-10 governance shim.
+        let sup = crate::runtime::supervisor()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::ApproveGovernanceProposal {
+            payload: Box::new(VoteOnProposalPayload {
+                context_id: context_id.clone(),
+                proposal_id,
+                voter_did: did,
+                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+            }),
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("supervisor dispatch_governance_command failed: {e}"),
+                code: codes::CTX_2042.to_owned(),
+            })
+        })?;
+        let status = rx
             .await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("governance approval shim reply dropped: {e}"),
+                    code: codes::CTX_2042.to_owned(),
+                })
+            })?
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Context {
                     message: format!("governance approval failed: {e}"),
@@ -3016,7 +3071,6 @@ pub async fn context_create_governance_checkpoint(
 ) -> napi::Result<String> {
     crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
-    let manager = context_manager()?;
 
     let merkle_root = parse_napi_hex_32(&merkle_root_hex, "merkle_root")?;
     let last_event_hash = parse_napi_hex_32(&last_event_hash_hex, "last_event_hash")?;
@@ -3034,18 +3088,46 @@ pub async fn context_create_governance_checkpoint(
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let count = event_count as u64;
 
-    let checkpoint = manager
-        .create_governance_checkpoint(
-            &context_id,
-            seq,
+    // Route through the ADR-049 commit-10 trust-recovery shim
+    // ([`Supervisor::dispatch_trust_recovery_command`](scp_core::context::supervisor::Supervisor::dispatch_trust_recovery_command))
+    // rather than calling `ContextManager::create_governance_checkpoint`
+    // directly. The shim wraps the delegated call in a 30s transport-
+    // timeout budget and is the entry point commit 12 will keep after
+    // `ContextManager` is deleted.
+    use scp_core::context::actor::commands::{
+        CreateGovernanceCheckpointPayload, TrustRecoveryCommand,
+    };
+    let sup = crate::runtime::supervisor()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = TrustRecoveryCommand::CreateGovernanceCheckpoint {
+        payload: Box::new(CreateGovernanceCheckpointPayload {
+            context_id,
+            checkpoint_seq: seq,
             merkle_root,
-            count,
+            event_count: count,
             last_event_hash,
             state_snapshot_hash,
-            &did,
+            creator_did: did,
             creator_signature,
-        )
+        }),
+        reply: tx,
+    };
+    sup.dispatch_trust_recovery_command(cmd)
         .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("supervisor dispatch_trust_recovery_command failed: {e}"),
+                code: codes::CTX_2062.to_owned(),
+            })
+        })?;
+    let checkpoint = rx
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("create_governance_checkpoint shim reply dropped: {e}"),
+                code: codes::CTX_2062.to_owned(),
+            })
+        })?
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("create_governance_checkpoint failed: {e}"),
@@ -3211,11 +3293,28 @@ fn parse_napi_hex_32(hex_str: &str, field_name: &str) -> napi::Result<[u8; 32]> 
 pub async fn context_tombstone_migrated(handle: &NapiContextHandle) -> napi::Result<()> {
     crate::napi_check_handle!(handle);
     let context_id = handle.context_id.clone();
-    let manager = context_manager()?;
 
-    manager
-        .tombstone_migrated_context(&context_id)
-        .await
+    // Route through the ADR-049 commit-10 governance shim.
+    use scp_core::context::actor::commands::GovernanceCommand;
+    let sup = crate::runtime::supervisor()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = GovernanceCommand::TombstoneMigratedContext {
+        context_id,
+        reply: tx,
+    };
+    sup.dispatch_governance_command(cmd).await.map_err(|e| {
+        NapiError::from(ScpNapiError::Context {
+            message: format!("supervisor dispatch_governance_command failed: {e}"),
+            code: codes::CTX_2050.to_owned(),
+        })
+    })?;
+    rx.await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("tombstone_migrated_context shim reply dropped: {e}"),
+                code: codes::CTX_2050.to_owned(),
+            })
+        })?
         .map_err(|e| {
             NapiError::from(ScpNapiError::Context {
                 message: format!("tombstone_migrated_context failed: {e}"),
