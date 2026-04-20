@@ -907,6 +907,65 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, crate::error::Sc
 // Bridge functions
 // ---------------------------------------------------------------------------
 
+/// Dispatch `create_context` through the ADR-049 commit-9 lifecycle
+/// shim ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
+/// rather than calling `ContextManager::create_context` directly. The
+/// shim wraps the delegated call in a 30s transport-timeout budget
+/// and is the entry point commit 12 will keep after `ContextManager`
+/// is deleted.
+///
+/// Extracted from `py_context_create` to keep that function below the
+/// `too_many_lines` clippy threshold.
+fn bridge_dispatch_create_context(
+    parsed: &PyContextParams,
+    context_id: &str,
+    identity_did: &str,
+    local_pseudonym: Option<[u8; 32]>,
+) -> PyResult<()> {
+    use scp_core::context::actor::commands::{CreateContextPayload, LifecycleCommand};
+    let core_params = build_core_context_params(parsed)?;
+    let creator_did_owned = scp_identity::DID(identity_did.to_owned());
+    let rt = crate::runtime()?;
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
+    let mgr =
+        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let mgr = mgr.clone();
+    let ctx_id = context_id.to_owned();
+    let creator_did_for_register = scp_identity::DID(identity_did.to_owned());
+    let outcome = rt.block_on(async move {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::CreateContext {
+            payload: Box::new(CreateContextPayload {
+                context_id: ctx_id,
+                params: core_params,
+                creator_did: creator_did_owned,
+                local_pseudonym,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+            scp_core::context::ContextError::CreationFailed(format!(
+                "supervisor dispatch_lifecycle_command failed: {e}"
+            ))
+        })?;
+        rx.await
+            .map_err(|e| {
+                scp_core::context::ContextError::CreationFailed(format!("shim reply dropped: {e}"))
+            })?
+            .map_err(|e| scp_core::context::ContextError::CreationFailed(e.to_string()))?;
+        // Register the creator's DID as a local DID for defense-in-depth,
+        // matching NAPI's behavior.
+        mgr.register_local_did(creator_did_for_register).await;
+        Ok::<(), scp_core::context::ContextError>(())
+    });
+    outcome.map_err(|e| {
+        // Clean up FFI state on ContextManager failure.
+        crate::runtime::remove_context(context_id);
+        PyRuntimeError::new_err(format!("ContextManager create_context failed: {e}"))
+    })
+}
+
 /// Creates a new SCP context.
 ///
 /// # Arguments
@@ -971,31 +1030,11 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
     })
     .ok();
 
-    // Build scp-core ContextParams from the parsed PyContextParams.
-    {
-        let core_params = build_core_context_params(&parsed)?;
-        let creator_did_owned = scp_identity::DID(identity_did.to_owned());
-        let rt = crate::runtime()?;
-        let mgr = crate::runtime::context_manager()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let mgr = mgr.clone();
-        let ctx_id = context_id.clone();
-        let creator_did_for_register = scp_identity::DID(identity_did.to_owned());
-        rt.block_on(async move {
-            mgr.create_context(ctx_id, core_params, creator_did_owned, local_pseudonym)
-                .await
-                .map_err(|e| scp_core::context::ContextError::CreationFailed(e.to_string()))?;
-            // Register the creator's DID as a local DID for defense-in-depth,
-            // matching NAPI's behavior.
-            mgr.register_local_did(creator_did_for_register).await;
-            Ok::<(), scp_core::context::ContextError>(())
-        })
-        .map_err(|e| {
-            // Clean up FFI state on ContextManager failure.
-            crate::runtime::remove_context(&context_id);
-            PyRuntimeError::new_err(format!("ContextManager create_context failed: {e}"))
-        })?;
-    }
+    // Build scp-core ContextParams from the parsed PyContextParams and
+    // dispatch create-context through the ADR-049 commit-9 lifecycle
+    // shim. Extracted to keep `py_context_create` under the
+    // `too_many_lines` threshold.
+    bridge_dispatch_create_context(&parsed, &context_id, identity_did, local_pseudonym)?;
 
     // §9.10.4: Send pseudonym announcement to inform other members of the
     // creator's per-context routing ID. For freshly created single-member
@@ -1327,34 +1366,64 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
     // auth check — the ContextManager is authoritative.
     let context_id = handle.context_id.clone();
 
-    // Delegate close to the shared ContextManager FIRST. If it fails with a
-    // real error (not "context not found" which is idempotent), propagate
-    // before cleaning up FFI state. This prevents the scenario where FFI
-    // state is destroyed but the ContextManager still holds the context.
+    // Delegate close through the ADR-049 commit-9 lifecycle shim
+    // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command)).
+    // The shim routes the call through the migrated
+    // `handlers::lifecycle` handler, which wraps
+    // `ContextManager::close_context` in a 30s transport-timeout budget
+    // and preserves byte-identical close semantics (capability check,
+    // TTL cancel, broadcast teardown, persistence).
+    //
+    // If it fails with a real error (not "context not found" which is
+    // idempotent), propagate before cleaning up FFI state. This
+    // prevents the scenario where FFI state is destroyed but the
+    // ContextManager still holds the context.
     {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
         let initiator_did = scp_identity::DID(identity_did.to_owned());
         let rt = crate::runtime()?;
-        let mgr = crate::runtime::context_manager()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let mgr = mgr.clone();
+        let sup =
+            crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let sup = Arc::clone(sup);
 
         let core_params = build_core_context_params(&handle.params)?;
-        let temp_handle = scp_core::context::ContextHandle::new(context_id, core_params);
-        let close_result = rt.block_on(async {
-            let _ = temp_handle
-                .transition_to(&scp_core::context::ContextState::Active)
-                .await;
-            mgr.close_context(&temp_handle, &initiator_did).await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::CloseContext {
+            payload: Box::new(CloseContextPayload {
+                context_id,
+                params: core_params,
+                initiator_did,
+            }),
+            reply: tx,
+        };
+        // Returns `Result<Result<CloseResult, ContextError>, PyErr>` so
+        // the idempotency check below can still match on
+        // `ContextError::ContextNotRegistered` directly.
+        let dispatch_outcome: Result<
+            Result<scp_core::context::ttl::CloseResult, scp_core::context::ContextError>,
+            pyo3::PyErr,
+        > = rt.block_on(async move {
+            sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "supervisor dispatch_lifecycle_command failed: {e}"
+                ))
+            })?;
+            rx.await
+                .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))
         });
-        // Propagate errors unless the context was already removed from
-        // ContextManager (idempotent — e.g. all members left). The
-        // ContextNotRegistered error is safe to ignore.
-        if let Err(ref e) = close_result
-            && !matches!(e, scp_core::context::ContextError::ContextNotRegistered(_))
-        {
-            return Err(PyRuntimeError::new_err(format!(
-                "ContextManager close_context failed: {e}"
-            )));
+        match dispatch_outcome {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                // Propagate errors unless the context was already
+                // removed from ContextManager (idempotent — e.g. all
+                // members left).
+                if !matches!(e, scp_core::context::ContextError::ContextNotRegistered(_)) {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "ContextManager close_context failed: {e}"
+                    )));
+                }
+            }
+            Err(py_err) => return Err(py_err),
         }
     }
 

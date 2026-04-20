@@ -249,12 +249,211 @@ impl SigningKeyBytes {
     }
 }
 
-/// See [`ContextCommand::Lifecycle`]. Real variants arrive in commit 9.
+/// Reply-channel type alias for [`LifecycleCommand::CreateContext`]. The
+/// reply carries the [`ContextHandle`](crate::context::ContextHandle) of
+/// the freshly-created context. Factored out to satisfy
+/// `clippy::type_complexity` given the crate-path-heavy return type.
+pub type CreateContextReply = oneshot::Sender<
+    Result<crate::context::ContextHandle, scp_protocol::context::builder::ContextCreationError>,
+>;
+
+/// Reply-channel type alias for [`LifecycleCommand::CloseContext`]. The
+/// reply carries a [`CloseResult`](crate::context::ttl::CloseResult) so
+/// the caller can observe summary-generation / key-destruction flags.
+pub type CloseContextReply =
+    oneshot::Sender<Result<crate::context::ttl::CloseResult, ContextError>>;
+
+/// Reply-channel type alias for [`LifecycleCommand::ExportContext`]. The
+/// reply carries a fully-populated
+/// [`ContextExport`](crate::context::export_import::ContextExport) —
+/// snapshot, Merkle event log, (currently empty) MLS state, and signed
+/// header.
+pub type ExportContextReply =
+    oneshot::Sender<Result<crate::context::export_import::ContextExport, ContextError>>;
+
+/// Reply-channel type alias for [`LifecycleCommand::ImportContext`]. The
+/// reply carries the restored context's
+/// [`ContextHandle`](crate::context::ContextHandle).
+pub type ImportContextReply = oneshot::Sender<Result<crate::context::ContextHandle, ContextError>>;
+
+/// Payload for [`LifecycleCommand::CreateContext`]. Boxed inside the
+/// variant so the enum's variant sizes stay uniform despite
+/// [`ContextParams`](scp_protocol::context::params::ContextParams)
+/// being ~1KB.
+pub struct CreateContextPayload {
+    /// Context identifier (plain string; the legacy
+    /// `ContextManager::create_context` derives the 32-byte hash
+    /// internally).
+    pub context_id: String,
+    /// Creation-time parameters — governance model, ceiling, TTL,
+    /// economic policy, etc.
+    pub params: scp_protocol::context::params::ContextParams,
+    /// Creator's DID. Becomes the sole `admin` assignment in the
+    /// initial `ContextRoleState`.
+    pub creator_did: scp_identity::DID,
+    /// Optional §9.10.4 pseudonym routing ID for the creator's
+    /// local member. `None` on broadcast contexts (ignored).
+    pub local_pseudonym: Option<[u8; 32]>,
+}
+
+/// Payload for [`LifecycleCommand::JoinContext`]. Boxed inside the
+/// variant for the same reason as [`CreateContextPayload`].
+pub struct JoinContextPayload {
+    /// Context identifier string (matches the legacy API).
+    pub context_id: String,
+    /// Context params — used to rebuild an ephemeral
+    /// [`ContextHandle`](crate::context::ContextHandle) on the
+    /// handler side, matching the legacy method's borrow shape.
+    pub params: scp_protocol::context::params::ContextParams,
+    /// MLS key package identifying the joining member. Carries the
+    /// member DID + TLS-serialized key-package bytes.
+    pub key_package: scp_protocol::context::membership::KeyPackage,
+    /// Optional spending UCAN for the join (§19.5).
+    pub spending_ucan: Option<scp_protocol::crypto::ucan::UcanToken>,
+    /// Optional §9.10.4 pseudonym routing ID for the joining
+    /// member.
+    pub local_pseudonym: Option<[u8; 32]>,
+}
+
+/// Payload for [`LifecycleCommand::LeaveContext`]. Boxed inside the
+/// variant for the same reason as [`CreateContextPayload`].
+pub struct LeaveContextPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Context params — used to rebuild an ephemeral handle.
+    pub params: scp_protocol::context::params::ContextParams,
+    /// Caller DID (the initiator of the leave operation).
+    pub caller_did: scp_identity::DID,
+    /// Target DID (the member to remove; may equal `caller_did`).
+    pub member_did: scp_identity::DID,
+}
+
+/// Payload for [`LifecycleCommand::CloseContext`]. Boxed inside the
+/// variant for the same reason as [`CreateContextPayload`].
+pub struct CloseContextPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Context params — used to rebuild an ephemeral handle.
+    pub params: scp_protocol::context::params::ContextParams,
+    /// Initiator DID. Requires the `ContextClose` capability under
+    /// `SingleAdmin` governance.
+    pub initiator_did: scp_identity::DID,
+}
+
+/// See [`ContextCommand::Lifecycle`]. Real variants land in commit 9 of
+/// the ADR-049 commit ladder (see `handlers/lifecycle.rs`). Variants
+/// mirror the legacy
+/// [`ContextManager`](crate::context::manager::ContextManager) lifecycle
+/// surface one-to-one: the handler shim delegates to the legacy method
+/// under the hood while the command shape fixes the post-refactor
+/// dispatch envelope. Commit 12 deletes the shim; the handler bodies
+/// keep their current shape (input types + reply channels) but route
+/// state mutations to the actor's owned
+/// [`PerContextState`](crate::context::actor::state::PerContextState).
+///
+/// **Create-as-prepare.** `CreateContext` / `JoinContext` are legitimate
+/// saga entry points in later commits (standing-pair creation,
+/// migration). Commit 9 routes them through
+/// [`ContextManager::create_context`](crate::context::manager::ContextManager::create_context)
+/// / [`ContextManager::join_context`](crate::context::manager::ContextManager::join_context)
+/// directly; saga wiring moves into this enum in commit 11.
 pub enum LifecycleCommand {
-    /// Placeholder.
+    /// Placeholder — retained so out-of-tree callers constructed during
+    /// commit 6 still compile. Handler replies `NotImplemented` and
+    /// returns `Outcome::err`. Removed in commit 12 when the shim is
+    /// deleted.
     Placeholder {
+        /// Oneshot reply channel. Handler stub sends
+        /// `Err(ContextError::NotImplemented(..))` back.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Creates a new MLS-backed (or broadcast-mode) context. Mirrors
+    /// [`ContextManager::create_context`](crate::context::manager::ContextManager::create_context).
+    ///
+    /// Saga-compatible: the same variant carries the
+    /// `create_context`-for-standing-pair-prepare flow in commit 11; for
+    /// commit 9 the handler goes straight through the legacy method.
+    ///
+    /// Boxed payload — [`ContextParams`](scp_protocol::context::params::ContextParams)
+    /// is ~1KB, which would blow up every sibling variant under
+    /// `clippy::large_enum_variant`. The handler unboxes on receipt.
+    CreateContext {
+        /// Boxed owned payload.
+        payload: Box<CreateContextPayload>,
+        /// Oneshot reply channel. See [`CreateContextReply`].
+        reply: CreateContextReply,
+    },
+
+    /// Joins an existing context. Mirrors
+    /// [`ContextManager::join_context`](crate::context::manager::ContextManager::join_context).
+    ///
+    /// The caller is the MLS `KeyPackage` owner (`key_package.owner_did`).
+    /// `spending_ucan` is the optional UCAN for the economy layer's
+    /// AND-composition check (spec §19.5); parsed by the FFI bridges
+    /// before dispatch.
+    ///
+    /// Boxed for the same reason as [`Self::CreateContext`].
+    JoinContext {
+        /// Boxed owned payload.
+        payload: Box<JoinContextPayload>,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Removes a member from an active context. Mirrors
+    /// [`ContextManager::leave_context`](crate::context::manager::ContextManager::leave_context).
+    ///
+    /// Self-removal (`caller_did == member_did`) is always permitted;
+    /// removing another member requires the `MemberRemove` capability
+    /// on the caller.
+    LeaveContext {
+        /// Boxed owned payload.
+        payload: Box<LeaveContextPayload>,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Initiates cooperative context closure. Mirrors
+    /// [`ContextManager::close_context`](crate::context::manager::ContextManager::close_context)
+    /// (not `close_context_with_key` — the latter is an internal
+    /// optimization for checkpoint generation; commit 9 exposes the
+    /// public surface through the command enum).
+    ///
+    /// Only valid on `SingleAdmin` governance contexts; multi-admin
+    /// contexts must route through the governance path
+    /// (`GovernanceAction::CloseContext`).
+    CloseContext {
+        /// Boxed owned payload.
+        payload: Box<CloseContextPayload>,
+        /// Oneshot reply channel. See [`CloseContextReply`].
+        reply: CloseContextReply,
+    },
+
+    /// Exports a snapshot of the context for cross-instance transfer.
+    /// Mirrors
+    /// [`ContextManager::export_context`](crate::context::manager::ContextManager::export_context).
+    ExportContext {
+        /// Context identifier string.
+        context_id: String,
+        /// Exporter DID — signs the export header.
+        exporter_did: scp_identity::DID,
+        /// Oneshot reply channel. See [`ExportContextReply`].
+        reply: ExportContextReply,
+    },
+
+    /// Imports a previously exported context. Mirrors
+    /// [`ContextManager::import_context`](crate::context::manager::ContextManager::import_context).
+    ///
+    /// The per-instance authorization-state wipe policy (C3) is enforced
+    /// by the legacy method; the command carries the raw export and
+    /// expects the handler to pass it through verbatim.
+    ImportContext {
+        /// Fully-parsed context export — envelope has already been
+        /// deserialized by the FFI bridge.
+        export: Box<crate::context::export_import::ContextExport>,
+        /// Oneshot reply channel. See [`ImportContextReply`].
+        reply: ImportContextReply,
     },
 }
 
@@ -303,10 +502,130 @@ pub enum StandingCommand {
     },
 }
 
-/// See [`ContextCommand::TtlClose`]. Real variants arrive in commit 9.
+/// Payload for TTL-close variants that carry a
+/// [`ContextParams`](scp_protocol::context::params::ContextParams) —
+/// specifically [`TtlCloseCommand::StartTtlTimer`],
+/// [`TtlCloseCommand::ResetTtlTimer`],
+/// [`TtlCloseCommand::ExecuteTtlClose`], and
+/// [`TtlCloseCommand::FinalizeClose`]. Boxed inside each variant so
+/// the enum's variant sizes stay uniform under
+/// `clippy::large_enum_variant`.
+pub struct TtlContextPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Context params — used to rebuild the ephemeral handle the
+    /// legacy TTL methods accept.
+    pub params: scp_protocol::context::params::ContextParams,
+}
+
+/// Payload for [`TtlCloseCommand::StartTtlTimer`] and
+/// [`TtlCloseCommand::ResetTtlTimer`] — adds a duration to the base
+/// [`TtlContextPayload`] shape. Boxed inside the variant for the same
+/// reason.
+pub struct TtlTimerPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Context params — used to rebuild the ephemeral handle that
+    /// the timer task will pass to `run_ttl_expiry_with_retries`.
+    pub params: scp_protocol::context::params::ContextParams,
+    /// TTL duration. Fires relative to the dispatcher's clock for
+    /// `StartTtlTimer`; the replacement duration for
+    /// `ResetTtlTimer`.
+    pub duration: std::time::Duration,
+}
+
+/// See [`ContextCommand::TtlClose`]. Real variants land in commit 9 of
+/// the ADR-049 commit ladder (see `handlers/ttl_close.rs`). Variants
+/// mirror the legacy
+/// [`ContextManager`](crate::context::manager::ContextManager) TTL
+/// surface one-to-one. The handler shim delegates to the legacy method
+/// under the hood.
+///
+/// **TTL timer specifics (commit 9 scope).** The post-refactor
+/// architecture turns the TTL timer into a `select!` arm in
+/// [`ContextActor::run`](crate::context::actor::ContextActor). Commit 9
+/// keeps the timer spawned from the legacy
+/// [`ContextManager`](crate::context::manager::ContextManager) internals
+/// (`spawn_ttl_timer`); the handler variants here respond to
+/// caller-initiated TTL commands (extend, finalize, explicit expiry)
+/// synchronously. Full timer-owning actor logic migrates with plan row
+/// 11.
 pub enum TtlCloseCommand {
-    /// Placeholder.
+    /// Placeholder — retained so out-of-tree callers constructed during
+    /// commit 6 still compile. Handler replies `NotImplemented` and
+    /// returns `Outcome::err`. Removed in commit 12 when the shim is
+    /// deleted.
     Placeholder {
+        /// Oneshot reply channel. Handler stub sends
+        /// `Err(ContextError::NotImplemented(..))` back.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Spawns (or respawns) the TTL timer for the given context with a
+    /// caller-supplied duration. Mirrors the legacy
+    /// [`ContextManager::spawn_ttl_timer`](crate::context::manager::ContextManager)
+    /// call path used at `create_context` / `restore_context` time.
+    ///
+    /// `Ok(())` once the timer has been successfully installed.
+    StartTtlTimer {
+        /// Boxed owned payload — see [`TtlTimerPayload`].
+        payload: Box<TtlTimerPayload>,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Proposes a TTL extension on behalf of a specific member. Mirrors
+    /// [`ContextManager::propose_ttl_extension`](crate::context::manager::ContextManager::propose_ttl_extension).
+    ///
+    /// Reply is `Ok(true)` iff the extension reaches unanimous consent
+    /// on this call; the caller then invokes
+    /// [`Self::ResetTtlTimer`] with the new duration to install it.
+    ///
+    /// This variant does NOT carry `ContextParams`, so it is
+    /// unboxed — the state mutation happens directly on the registered
+    /// context, not through an ephemeral handle.
+    ExtendTtl {
+        /// Context identifier string.
+        context_id: String,
+        /// Consenting member DID.
+        member_did: scp_identity::DID,
+        /// Proposed TTL duration.
+        proposed_duration: std::time::Duration,
+        /// Oneshot reply channel. `Ok(true)` iff unanimous consent was
+        /// reached on this call.
+        reply: oneshot::Sender<Result<bool, ContextError>>,
+    },
+
+    /// Resets the TTL timer to a new duration after a successful
+    /// unanimous extension. Mirrors
+    /// [`ContextManager::reset_ttl_timer`](crate::context::manager::ContextManager::reset_ttl_timer).
+    ResetTtlTimer {
+        /// Boxed owned payload — see [`TtlTimerPayload`].
+        payload: Box<TtlTimerPayload>,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Executes a caller-initiated TTL expiry. Mirrors
+    /// [`ContextManager::handle_ttl_expiry`](crate::context::manager::ContextManager::handle_ttl_expiry).
+    ///
+    /// In commit 9 this is the explicit-expiry entry point; the timer
+    /// task spawned by `StartTtlTimer` still runs the automatic path
+    /// internally. Commit 11 converges both paths onto the actor's
+    /// `select!` arm.
+    ExecuteTtlClose {
+        /// Boxed owned payload — see [`TtlContextPayload`].
+        payload: Box<TtlContextPayload>,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Completes context closure after all members have processed the
+    /// `ContextClosing` notification. Mirrors
+    /// [`ContextManager::finalize_close`](crate::context::manager::ContextManager::finalize_close).
+    FinalizeClose {
+        /// Boxed owned payload — see [`TtlContextPayload`].
+        payload: Box<TtlContextPayload>,
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },

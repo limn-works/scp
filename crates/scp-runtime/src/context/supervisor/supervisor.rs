@@ -39,7 +39,9 @@ use dashmap::DashMap;
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
 
-use crate::context::actor::commands::{ContextCommand, MessagingCommand, QueriesCommand};
+use crate::context::actor::commands::{
+    ContextCommand, LifecycleCommand, MessagingCommand, QueriesCommand, TtlCloseCommand,
+};
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::handlers;
 use crate::context::actor::mutation_state_view::MutationStateView;
@@ -581,6 +583,117 @@ impl Supervisor {
         }
 
         Ok(outcome)
+    }
+
+    /// Dispatch a mutating [`LifecycleCommand`] through the migration
+    /// shim (ADR-049 commit 9 / plan row 9).
+    ///
+    /// Contract (byte-identical to the legacy
+    /// [`ContextManager`](crate::context::manager::ContextManager)
+    /// lifecycle methods it replaces):
+    ///
+    /// Step 1 builds a [`MutationStateView`] over a scratch
+    /// [`SendSequenceTracker`](crate::context::actor::SendSequenceTracker)
+    /// plus a reference to the attached manager. Lifecycle handlers never
+    /// read or mutate `send_tracker` (only the messaging path touches it),
+    /// so we do not need the messaging shim's per-context take-and-swap.
+    /// The scratch tracker preserves the post-refactor handler signature.
+    ///
+    /// Step 2 invokes
+    /// [`handlers::lifecycle::dispatch_from_shim`](crate::context::actor::handlers::lifecycle::dispatch_from_shim).
+    /// Each variant wraps the delegated
+    /// [`ContextManager`](crate::context::manager::ContextManager) method
+    /// in `tokio::time::timeout` with a 30s budget, maps a timeout to
+    /// [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout),
+    /// and relays the typed reply on the variant's oneshot.
+    ///
+    /// # Why no per-context Arc lookup
+    ///
+    /// `CreateContext` / `ImportContext` operate on a context that does
+    /// not yet exist; `CloseContext` / `LeaveContext` /
+    /// `ExportContext` / `JoinContext` delegate to the legacy method
+    /// which resolves the per-context Arc internally. Routing through
+    /// `get_context_arc_pub` here would duplicate that resolution, and
+    /// for the create/import variants would fail pre-emptively with
+    /// `ContextNotRegistered`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet — the caller must call
+    ///   [`Self::attach_context_manager`] first.
+    /// - Any typed error returned by the delegated
+    ///   `ContextManager::{create,join,leave,close,export,import}_context`
+    ///   call is surfaced through the variant's oneshot reply; the
+    ///   method-level result here is `Ok(Outcome { .. })`.
+    /// - [`ContextError::TransportTimeout`] is surfaced through the
+    ///   oneshot reply, not the method result.
+    pub async fn dispatch_lifecycle_command(
+        &self,
+        cmd: LifecycleCommand,
+    ) -> Result<Outcome<()>, ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::dispatch_lifecycle_command — no ContextManager attached".to_owned(),
+            )
+        })?;
+
+        // Scratch tracker — see method docs. The view needs a
+        // `&mut SendSequenceTracker` to construct; lifecycle handlers
+        // never touch it, so we allocate a fresh one on each call.
+        let mut scratch_tracker = SendSequenceTracker::new();
+        let mut view = MutationStateView {
+            send_tracker: &mut scratch_tracker,
+            manager: cm,
+        };
+        // `Box::pin` — the combined size of the rebuilt handle,
+        // context params, and the per-variant 30s-timeout future
+        // crosses clippy's 16-KB stack budget for async futures. See
+        // the matching comment on `handlers::lifecycle::dispatch`.
+        Ok(Box::pin(handlers::lifecycle::dispatch_from_shim(&mut view, cmd)).await)
+    }
+
+    /// Dispatch a mutating [`TtlCloseCommand`] through the migration
+    /// shim (ADR-049 commit 9 / plan row 9).
+    ///
+    /// Same shape as [`Self::dispatch_lifecycle_command`] — a scratch
+    /// [`SendSequenceTracker`](crate::context::actor::SendSequenceTracker)
+    /// backs the [`MutationStateView`], handlers wrap delegated
+    /// [`ContextManager`](crate::context::manager::ContextManager) calls
+    /// in [`tokio::time::timeout`] with a 30s budget, and the typed
+    /// result is relayed through the variant's oneshot.
+    ///
+    /// # TTL-timer ownership
+    ///
+    /// The post-refactor architecture turns the TTL timer into a
+    /// `select!` arm in the actor's `run()` loop. Commit 9 keeps the
+    /// timer spawned inside the legacy `ContextManager`; this dispatch
+    /// method routes caller-initiated extend/reset/finalize/explicit-
+    /// expiry commands synchronously. Full timer-owning actor logic
+    /// arrives with plan row 11.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet.
+    pub async fn dispatch_ttl_close_command(
+        &self,
+        cmd: TtlCloseCommand,
+    ) -> Result<Outcome<()>, ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::dispatch_ttl_close_command — no ContextManager attached".to_owned(),
+            )
+        })?;
+
+        let mut scratch_tracker = SendSequenceTracker::new();
+        let mut view = MutationStateView {
+            send_tracker: &mut scratch_tracker,
+            manager: cm,
+        };
+        Ok(handlers::ttl_close::dispatch_from_shim(&mut view, cmd).await)
     }
 
     /// Helper: acquire the per-context lock, build the view, run the

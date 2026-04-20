@@ -544,17 +544,43 @@ pub async fn context_create(
     // Derived BEFORE create_context so it can be passed to the ContextManager.
     let local_pseudonym = derive_context_pseudonym(identity, &context_id).await;
 
-    // Delegate to ContextManager with pseudonym for per-member routing.
+    // Route through the ADR-049 commit-9 lifecycle shim
+    // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
+    // rather than calling `ContextManager::create_context` directly.
+    // The shim wraps the delegated call in the 30s transport-timeout
+    // budget and is the entry point commit 12 will keep after
+    // `ContextManager` is deleted.
     let manager = context_manager()?;
-    let core_handle = manager
-        .create_context(
-            context_id.clone(),
-            context_params,
-            DID(creator_did.clone()),
-            local_pseudonym,
-        )
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    let core_handle = {
+        use scp_core::context::actor::commands::{CreateContextPayload, LifecycleCommand};
+        let sup = crate::runtime::supervisor()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::CreateContext {
+            payload: Box::new(CreateContextPayload {
+                context_id: context_id.clone(),
+                params: context_params,
+                creator_did: DID(creator_did.clone()),
+                local_pseudonym,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_lifecycle_command(cmd)
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        rx.await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("shim reply dropped: {e}"),
+                    code: codes::CTX_2000.to_owned(),
+                })
+            })?
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("create_context failed: {e}"),
+                    code: codes::CTX_2000.to_owned(),
+                })
+            })?
+    };
 
     // Register the creator's DID as a local DID for defense-in-depth.
     manager.register_local_did(DID(creator_did.clone())).await;
@@ -819,11 +845,35 @@ pub async fn context_close(handle: &NapiContextHandle, identity_did: String) -> 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
     let did = DID(identity_did.clone());
 
-    let manager = context_manager()?;
-    manager
-        .close_context(core_handle, &did)
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    // Route through the ADR-049 commit-9 lifecycle shim
+    // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
+    // rather than calling `ContextManager::close_context` directly. The
+    // shim wraps the delegated call in the 30s transport-timeout budget
+    // and preserves byte-identical close semantics.
+    {
+        use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+        let sup = crate::runtime::supervisor()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::CloseContext {
+            payload: Box::new(CloseContextPayload {
+                context_id: core_handle.context_id().to_owned(),
+                params: core_handle.params().clone(),
+                initiator_did: did,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_lifecycle_command(cmd)
+            .await
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+        rx.await
+            .map_err(|e| {
+                NapiError::from(ScpNapiError::Context {
+                    message: format!("shim reply dropped: {e}"),
+                    code: codes::CTX_2000.to_owned(),
+                })
+            })?
+            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    }
 
     handle.set_closed().map_err(NapiError::from)?;
 

@@ -1023,6 +1023,48 @@ pub fn supervisor_expect()
     Ok(bi.core.supervisor())
 }
 
+/// Lenient sibling of [`supervisor_expect`].
+///
+/// Returns the supervisor even when [`CoreFields::is_shutdown`] is
+/// `true`, matching the shutdown-tolerance contract of
+/// [`context_manager()`] (`context_manager` only logs a warning on
+/// shutdown; it does not error). Used by the ADR-049 commit-9
+/// lifecycle shim paths (`context_create`, `context_close`) so the
+/// shim's behaviour reaches parity with the pre-shim
+/// `ContextManager::...` call sites those paths delegate to. Still
+/// errors on `is_suspended` (the resume-required contract) and on
+/// missing-bridge.
+///
+/// Deleted in commit 12 with the shim.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` (code `SCP-CTX-2000`) when the bridge
+/// instance has not been initialized, or when the bridge is
+/// explicitly suspended.
+pub fn supervisor_lenient()
+-> Result<&'static Arc<scp_core::context::supervisor::Supervisor>, crate::ScpError> {
+    let bi = DEFAULT_BRIDGE_INSTANCE
+        .get()
+        .ok_or_else(|| crate::ScpError::Context {
+            msg: "bridge not ready: no local DID registered".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })?;
+    if bi.core.is_suspended() {
+        return Err(crate::ScpError::Context {
+            msg: "bridge not ready: suspended".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        });
+    }
+    if bi.core.is_shutdown() {
+        tracing::warn!(
+            "supervisor_lenient() called after shutdown — \
+             operations may fail (ADR-049 commit 9 shim path)"
+        );
+    }
+    Ok(bi.core.supervisor())
+}
+
 /// Initializes the global [`ContextManager`] with [`MlsCryptoProvider`] and
 /// [`scp_core::context::NotConfiguredTransportProvider`].
 ///

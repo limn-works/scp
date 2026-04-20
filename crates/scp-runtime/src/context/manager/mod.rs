@@ -2741,6 +2741,27 @@ impl ContextManager {
         Arc::clone(&self.event_log)
     }
 
+    // -------------------------------------------------------------------
+    // Commit 9 / ADR-049 — transitional lifecycle / TTL shim accessors.
+    // Deleted in commit 12 with the shim itself.
+    // -------------------------------------------------------------------
+
+    /// Public shim accessor for the crate-private
+    /// [`Self::spawn_ttl_timer`]. The actor-shape
+    /// [`TtlCloseCommand::StartTtlTimer`](crate::context::actor::commands::TtlCloseCommand::StartTtlTimer)
+    /// handler needs to install a TTL timer from outside the `manager/`
+    /// submodule; exposing this thin `pub(crate)` wrapper keeps the
+    /// underlying `pub(super)` internal while the shim exists. Commit 12
+    /// deletes both this wrapper and the legacy method.
+    pub(crate) async fn start_ttl_timer(
+        &self,
+        context_id: &str,
+        duration: std::time::Duration,
+        handle: crate::context::ContextHandle,
+    ) {
+        self.spawn_ttl_timer(context_id, duration, handle).await;
+    }
+
     /// Last-issued actor-shape send-sequence number for a context.
     /// Acquires the per-context lock briefly. Used by the messaging
     /// shim integration test (ADR-049 commit 8) to verify

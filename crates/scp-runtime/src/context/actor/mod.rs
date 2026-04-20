@@ -214,9 +214,7 @@ impl ContextActor {
                     "messaging::deliver_incoming (use Supervisor::dispatch_command during commits 8-11)",
                 );
             }
-            ContextCommand::Lifecycle(LifecycleCommand::Placeholder { reply }) => {
-                ack_not_impl(reply, "lifecycle");
-            }
+            ContextCommand::Lifecycle(sub) => Self::skeleton_dispatch_lifecycle(sub),
             ContextCommand::Governance(GovernanceCommand::Placeholder { reply }) => {
                 ack_not_impl(reply, "governance");
             }
@@ -232,9 +230,7 @@ impl ContextActor {
             ContextCommand::Standing(StandingCommand::Placeholder { reply }) => {
                 ack_not_impl(reply, "standing");
             }
-            ContextCommand::TtlClose(TtlCloseCommand::Placeholder { reply }) => {
-                ack_not_impl(reply, "ttl_close");
-            }
+            ContextCommand::TtlClose(sub) => Self::skeleton_dispatch_ttl_close(sub),
             ContextCommand::Tools(ToolsCommand::Placeholder { reply }) => {
                 ack_not_impl(reply, "tools");
             }
@@ -341,6 +337,105 @@ impl ContextActor {
             QueriesCommand::VelocityForTest { reply, .. } => {
                 ack_not_impl(reply, "queries::velocity_for_test");
             }
+        }
+    }
+
+    /// Skeleton-dispatch helper for [`ContextCommand::Lifecycle`].
+    /// Extracted from [`Self::skeleton_dispatch`] so the outer function
+    /// stays below the `too_many_lines` clippy threshold.
+    ///
+    /// Shim-routed lifecycle dispatch does not go through this
+    /// function — the real production path is
+    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_lifecycle_command`]
+    /// (ADR-049 commit 9). Any caller that mistakenly routes a
+    /// lifecycle operation through the actor mailbox during the
+    /// migration window gets a typed error rather than a hang.
+    fn skeleton_dispatch_lifecycle(sub: LifecycleCommand) {
+        fn ack_not_impl<T>(
+            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+            which: &'static str,
+        ) {
+            let _ = reply.send(Err(ContextError::NotImplemented(format!(
+                "{which} — migrates in the matching handler commit of ADR-049"
+            ))));
+        }
+        match sub {
+            LifecycleCommand::Placeholder { reply } => ack_not_impl(reply, "lifecycle"),
+            // `CreateContext` carries a `ContextCreationError` reply
+            // (not `ContextError`); surface an equivalent
+            // `CreationFailed` stub so the typed result's error
+            // category is preserved.
+            LifecycleCommand::CreateContext { reply, .. } => {
+                let _ = reply.send(Err(
+                    scp_protocol::context::builder::ContextCreationError::CreationFailed(
+                        "lifecycle::create_context (use Supervisor::dispatch_lifecycle_command during commits 9-11) \
+                         — migrates in the matching handler commit of ADR-049"
+                            .to_owned(),
+                    ),
+                ));
+            }
+            LifecycleCommand::JoinContext { reply, .. } => ack_not_impl(
+                reply,
+                "lifecycle::join_context (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
+            ),
+            LifecycleCommand::LeaveContext { reply, .. } => ack_not_impl(
+                reply,
+                "lifecycle::leave_context (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
+            ),
+            LifecycleCommand::CloseContext { reply, .. } => ack_not_impl(
+                reply,
+                "lifecycle::close_context (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
+            ),
+            LifecycleCommand::ExportContext { reply, .. } => ack_not_impl(
+                reply,
+                "lifecycle::export_context (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
+            ),
+            LifecycleCommand::ImportContext { reply, .. } => ack_not_impl(
+                reply,
+                "lifecycle::import_context (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
+            ),
+        }
+    }
+
+    /// Skeleton-dispatch helper for [`ContextCommand::TtlClose`].
+    /// Extracted from [`Self::skeleton_dispatch`] so the outer function
+    /// stays below the `too_many_lines` clippy threshold.
+    ///
+    /// Shim-routed TTL-close dispatch does not go through this
+    /// function — the real production path is
+    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_ttl_close_command`]
+    /// (ADR-049 commit 9).
+    fn skeleton_dispatch_ttl_close(sub: TtlCloseCommand) {
+        fn ack_not_impl<T>(
+            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+            which: &'static str,
+        ) {
+            let _ = reply.send(Err(ContextError::NotImplemented(format!(
+                "{which} — migrates in the matching handler commit of ADR-049"
+            ))));
+        }
+        match sub {
+            TtlCloseCommand::Placeholder { reply } => ack_not_impl(reply, "ttl_close"),
+            TtlCloseCommand::StartTtlTimer { reply, .. } => ack_not_impl(
+                reply,
+                "ttl_close::start_ttl_timer (use Supervisor::dispatch_ttl_close_command during commits 9-11)",
+            ),
+            TtlCloseCommand::ExtendTtl { reply, .. } => ack_not_impl(
+                reply,
+                "ttl_close::extend_ttl (use Supervisor::dispatch_ttl_close_command during commits 9-11)",
+            ),
+            TtlCloseCommand::ResetTtlTimer { reply, .. } => ack_not_impl(
+                reply,
+                "ttl_close::reset_ttl_timer (use Supervisor::dispatch_ttl_close_command during commits 9-11)",
+            ),
+            TtlCloseCommand::ExecuteTtlClose { reply, .. } => ack_not_impl(
+                reply,
+                "ttl_close::execute_ttl_close (use Supervisor::dispatch_ttl_close_command during commits 9-11)",
+            ),
+            TtlCloseCommand::FinalizeClose { reply, .. } => ack_not_impl(
+                reply,
+                "ttl_close::finalize_close (use Supervisor::dispatch_ttl_close_command during commits 9-11)",
+            ),
         }
     }
 }

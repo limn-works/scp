@@ -3216,17 +3216,41 @@ pub async fn context_create(
                     None
                 };
 
-            // Delegate to the shared ContextManager with pseudonym.
+            // Route through the ADR-049 commit-9 lifecycle shim
+            // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
+            // rather than calling `ContextManager::create_context`
+            // directly. The shim wraps the delegated call in the 30s
+            // transport-timeout budget and is the entry point commit 12
+            // will keep after `ContextManager` is deleted.
             let manager = crate::runtime::context_manager()?;
-            let _core_handle = manager
-                .create_context(
-                    context_id.clone(),
-                    core_params,
-                    identity.did.clone().into(),
-                    local_pseudonym,
-                )
-                .await
-                .map_err(ScpError::from)?;
+            {
+                use scp_core::context::actor::commands::{CreateContextPayload, LifecycleCommand};
+                // `supervisor_lenient` rather than `supervisor_expect` so
+                // the shim matches the pre-shim `context_manager()`
+                // shutdown-tolerance contract (only `suspended` is a
+                // hard error; `shutdown` warns-and-proceeds).
+                let sup = crate::runtime::supervisor_lenient()?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = LifecycleCommand::CreateContext {
+                    payload: Box::new(CreateContextPayload {
+                        context_id: context_id.clone(),
+                        params: core_params,
+                        creator_did: identity.did.clone().into(),
+                        local_pseudonym,
+                    }),
+                    reply: tx,
+                };
+                sup.dispatch_lifecycle_command(cmd)
+                    .await
+                    .map_err(ScpError::from)?;
+                let _core_handle = rx
+                    .await
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("shim reply dropped: {e}"),
+                        code: "SCP-CTX-2000".to_owned(),
+                    })?
+                    .map_err(ScpError::from)?;
+            }
 
             // Register the creator's DID as a local DID for defense-in-depth,
             // matching NAPI's behavior.
@@ -3596,8 +3620,14 @@ pub async fn context_close(
                 });
             }
 
-            // Delegate to the shared ContextManager.
-            let manager = crate::runtime::context_manager()?;
+            // Route through the ADR-049 commit-9 lifecycle shim
+            // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command))
+            // rather than calling `ContextManager::close_context`
+            // directly. The shim wraps the delegated call in the 30s
+            // transport-timeout budget and preserves byte-identical
+            // close semantics. The supervisor resolves the manager
+            // internally; the bridge no longer needs a direct
+            // `context_manager()` reference here.
             let core_handle = scp_core::context::ContextHandle::new(
                 handle.context_id.clone(),
                 scp_core::context::ContextParams::default(),
@@ -3607,10 +3637,30 @@ pub async fn context_close(
                 .await;
 
             let initiator_did: scp_identity::DID = identity_did.clone().into();
-            manager
-                .close_context(&core_handle, &initiator_did)
-                .await
-                .map_err(ScpError::from)?;
+            {
+                use scp_core::context::actor::commands::{CloseContextPayload, LifecycleCommand};
+                // `supervisor_lenient` — see the comment on the
+                // sibling `context_create` call site.
+                let sup = crate::runtime::supervisor_lenient()?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = LifecycleCommand::CloseContext {
+                    payload: Box::new(CloseContextPayload {
+                        context_id: core_handle.context_id().to_owned(),
+                        params: core_handle.params().clone(),
+                        initiator_did,
+                    }),
+                    reply: tx,
+                };
+                sup.dispatch_lifecycle_command(cmd)
+                    .await
+                    .map_err(ScpError::from)?;
+                rx.await
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("shim reply dropped: {e}"),
+                        code: codes::CTX_2000.to_owned(),
+                    })?
+                    .map_err(ScpError::from)?;
+            }
 
             // Wire CloseOrchestrator for contexts with summary verification.
             // After the ContextManager has processed the close, check the
