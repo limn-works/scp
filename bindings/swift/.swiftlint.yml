@@ -36,3 +36,46 @@ function_parameter_count:
 # Force cast and force try are already enabled by default
 # force_cast: error
 # force_try: error
+
+# ---------------------------------------------------------------------------
+# Custom rules — forward-prevention of mutable shared process-globals
+# ---------------------------------------------------------------------------
+# Phase 4 (#1549) removed the process-wide default bridge instance and the
+# `SCP.default()` fallback. The Swift SDK is a thin delegation layer over
+# UniFFI and holds no implicit per-process state. These rules stop the
+# DEFAULT_BRIDGE_INSTANCE pattern from creeping back in as a `static var`
+# on any Swift type.
+#
+# See .docs/adrs/ADR-048-scp-multi-instance.md for rationale.
+custom_rules:
+  no_static_var:
+    name: "No static var globals"
+    regex: '^\s*static\s+var\s+\w'
+    message: >
+      Mutable static storage is forbidden in Sources/SCP/. Use a fresh SCP()
+      instance per caller — no process-global mutable state. If this is a
+      genuinely one-shot FFI addon cache, add a SwiftLint disable comment
+      with a `// why:` rationale and reference ADR-048.
+    severity: error
+    included:
+      - "Sources/SCP/.*\\.swift$"
+    excluded:
+      # UniFFI-generated bindings. Auto-generated; never reviewed for
+      # multi-instance hygiene — the ratchet lives on the Rust side.
+      - "Sources/SCP/Internal/.*\\.swift$"
+      # Tests may use static fixtures to share setup across cases.
+      - "Tests/.*\\.swift$"
+
+  no_static_lazy_var:
+    name: "No static lazy var globals"
+    regex: '^\s*static\s+lazy\s+var\s+\w'
+    message: >
+      Mutable lazy static storage is forbidden in Sources/SCP/. `lazy var`
+      defers initialization but still holds mutable per-process state —
+      same hazard as `static var`. See no_static_var.
+    severity: error
+    included:
+      - "Sources/SCP/.*\\.swift$"
+    excluded:
+      - "Sources/SCP/Internal/.*\\.swift$"
+      - "Tests/.*\\.swift$"
