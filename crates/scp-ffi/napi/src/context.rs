@@ -927,17 +927,46 @@ pub async fn context_send(
             })
         })?;
 
-    let manager = context_manager()?;
-    manager
-        .send_message(
-            core_handle,
-            &did,
-            &payload,
-            resolved_signing_key.as_ref(),
-            None,
-            spending_ucan.as_ref(),
-        )
+    // Route through the ADR-049 commit-8 messaging shim
+    // ([`Supervisor::dispatch_command`](scp_core::context::supervisor::Supervisor::dispatch_command))
+    // rather than calling `ContextManager::send_message` directly.
+    // The shim exercises the RAII [`SequenceReservation`] + 30s
+    // transport timeout inside the handler, preserves byte-identical
+    // envelope construction by delegating to the legacy method, and
+    // is the entry point commit 12 will keep after `ContextManager`
+    // is deleted.
+    use scp_core::context::actor::commands::{
+        MessagingCommand, SendMessagePayload, SigningKeyBytes,
+    };
+    let sup = crate::runtime::supervisor()?;
+    let context_id = core_handle.context_id().to_owned();
+    let params = core_handle.params().clone();
+    let signing_key_bytes = resolved_signing_key
+        .as_ref()
+        .map(SigningKeyBytes::from_signing_key);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = MessagingCommand::SendMessage {
+        payload: Box::new(SendMessagePayload {
+            context_id: context_id.clone(),
+            params,
+            sender_did: did,
+            payload: payload.clone(),
+            signing_key: signing_key_bytes,
+            source_provenance: None,
+            spending_ucan,
+        }),
+        reply: tx,
+    };
+    sup.dispatch_command(&context_id, cmd)
         .await
+        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+    rx.await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("shim reply dropped: {e}"),
+                code: codes::CTX_2001.to_owned(),
+            })
+        })?
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
     Ok(())
@@ -1200,10 +1229,16 @@ pub async fn context_subscribe(
             }
         }
 
-        let manager = match context_manager() {
-            Ok(m) => m.clone(),
+        // Route decrypt through the ADR-049 commit-8 messaging shim
+        // ([`Supervisor::dispatch_command`](scp_core::context::supervisor::Supervisor::dispatch_command))
+        // rather than calling `ContextManager::deliver_incoming`
+        // directly. The shim wraps the call in a 30s transport timeout
+        // and delegates to the legacy method for byte-identical
+        // crypto / anti-replay / buffered delivery.
+        let supervisor = match crate::runtime::supervisor() {
+            Ok(s) => std::sync::Arc::clone(s),
             Err(e) => {
-                tracing::error!(error = %e, "ContextManager not initialized");
+                tracing::error!(error = %e, "Supervisor not initialized");
                 on_message.call(
                     Ok(None),
                     napi::threadsafe_function::ThreadsafeFunctionCallMode::NonBlocking,
@@ -1245,11 +1280,28 @@ pub async fn context_subscribe(
 
             match event {
                 scp_transport::TransportEvent::Envelope(envelope) => {
-                    // Decrypt via ContextManager.
-                    match manager
-                        .deliver_incoming(&context_id, &envelope.encrypted_blob)
-                        .await
-                    {
+                    // Decrypt via the ADR-049 commit-8 messaging shim.
+                    use scp_core::context::actor::commands::MessagingCommand;
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let cmd = MessagingCommand::DeliverIncoming {
+                        context_id: context_id.clone(),
+                        envelope_bytes: envelope.encrypted_blob.clone(),
+                        reply: tx,
+                    };
+                    let dispatch_result = supervisor.dispatch_command(&context_id, cmd).await;
+                    let reply_result = if dispatch_result.is_ok() {
+                        rx.await.ok()
+                    } else {
+                        None
+                    };
+                    let deliver_result = match (dispatch_result, reply_result) {
+                        (Ok(_), Some(r)) => r,
+                        (Err(e), _) => Err(e),
+                        (Ok(_), None) => Err(scp_core::context::ContextError::CryptoFailed(
+                            "deliver shim reply dropped".to_owned(),
+                        )),
+                    };
+                    match deliver_result {
                         Ok(Some((plaintext, sender_did))) => {
                             sequence_counter += 1.0;
                             #[allow(clippy::cast_precision_loss)]

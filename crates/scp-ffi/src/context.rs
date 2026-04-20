@@ -1437,31 +1437,48 @@ fn py_context_send(
     // the encrypted send path to fail with "signing key required".
     let signing_key = resolve_signing_key(&identity_did_owned)?;
 
-    // Delegate to ContextManager for message delivery through the transport.
+    // Route through the ADR-049 commit-8 messaging shim
+    // ([`Supervisor::dispatch_command`](scp_core::context::supervisor::Supervisor::dispatch_command))
+    // rather than calling `ContextManager::send_message` directly. The
+    // shim exercises the RAII [`SequenceReservation`] + 30s transport
+    // timeout inside the handler, preserves byte-identical envelope
+    // construction by delegating to the legacy method, and is the
+    // entry point commit 12 will keep after `ContextManager` is
+    // deleted.
     let context_id_for_drain = context_id.clone();
     {
+        use scp_core::context::actor::commands::{
+            MessagingCommand, SendMessagePayload, SigningKeyBytes,
+        };
         let sender_did = scp_identity::DID(identity_did_owned);
-        let mgr = crate::runtime::context_manager()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let mgr = mgr.clone();
+        let sup =
+            crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let sup = Arc::clone(sup);
 
         let core_params = build_core_context_params(&handle.params)?;
-        let temp_handle = scp_core::context::ContextHandle::new(context_id, core_params);
-        rt.block_on(async {
-            let _ = temp_handle
-                .transition_to(&scp_core::context::ContextState::Active)
-                .await;
-            mgr.send_message(
-                &temp_handle,
-                &sender_did,
-                &payload_bytes,
-                Some(&signing_key),
-                None,
-                spending_ucan.as_ref(),
-            )
-            .await
-        })
-        .map_err(|e| PyRuntimeError::new_err(format!("ContextManager send_message failed: {e}")))?;
+        let signing_key_bytes = SigningKeyBytes::from_signing_key(&signing_key);
+        let ctx_id_for_cmd = context_id.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::SendMessage {
+            payload: Box::new(SendMessagePayload {
+                context_id: ctx_id_for_cmd,
+                params: core_params,
+                sender_did,
+                payload: payload_bytes,
+                signing_key: Some(signing_key_bytes),
+                source_provenance: None,
+                spending_ucan,
+            }),
+            reply: tx,
+        };
+        rt.block_on(async move {
+            sup.dispatch_command(&context_id, cmd).await.map_err(|e| {
+                PyRuntimeError::new_err(format!("supervisor dispatch_command failed: {e}"))
+            })?;
+            rx.await
+                .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
+                .map_err(|e| PyRuntimeError::new_err(format!("send_message failed: {e}")))
+        })?;
     }
 
     // Bridge: drain events from ContextManager's receive buffer and deliver

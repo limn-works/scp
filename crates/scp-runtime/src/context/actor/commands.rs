@@ -51,6 +51,13 @@ use scp_protocol::context::ContextError;
 /// `clippy::type_complexity`.
 type BroadcastKeyReply = oneshot::Sender<Result<(zeroize::Zeroizing<[u8; 32]>, u64), ContextError>>;
 
+/// Reply-channel type alias for
+/// [`MessagingCommand::DeliverIncoming`]. The reply carries either
+/// `Some((plaintext, sender_did))` for application messages, or `None`
+/// for MLS control / management messages that were processed
+/// internally. Factored out to satisfy `clippy::type_complexity`.
+pub type DeliverIncomingReply = oneshot::Sender<Result<Option<(Vec<u8>, String)>, ContextError>>;
+
 // ---------------------------------------------------------------------------
 // Outer enum
 // ---------------------------------------------------------------------------
@@ -100,17 +107,146 @@ pub enum ContextCommand {
 // Placeholder sub-enums
 // ---------------------------------------------------------------------------
 
-/// See [`ContextCommand::Messaging`]. Real variants arrive in commit 8.
+/// Payload for [`MessagingCommand::SendMessage`]. Boxed inside the
+/// variant so the enum's variant sizes stay uniform despite
+/// [`ContextParams`](scp_protocol::context::params::ContextParams)
+/// being ~1KB.
+///
+/// Every field is owned (`Vec<u8>`, `String`, `DID`, `ContextParams`)
+/// rather than borrowed so the command can cross the actor mailbox
+/// without lifetime juggling. The handler reconstructs an ephemeral
+/// [`ContextHandle`](crate::context::ContextHandle) on the receive
+/// side to match the legacy method's signature.
+pub struct SendMessagePayload {
+    /// Context identifier (plain string, matches the legacy API).
+    pub context_id: String,
+    /// Creation-time parameters used to rebuild an ephemeral
+    /// [`ContextHandle`](crate::context::ContextHandle) on the handler
+    /// side. Cloned from the caller's handle at dispatch time.
+    pub params: scp_protocol::context::params::ContextParams,
+    /// Sender DID.
+    pub sender_did: scp_identity::DID,
+    /// Plaintext payload to encrypt and send.
+    pub payload: Vec<u8>,
+    /// Sender's Ed25519 signing key. `None` is rejected by the
+    /// encrypted path — the inner envelope cannot be signed without
+    /// it. Wrapped in [`SigningKeyBytes`] so the private key bytes
+    /// zeroize on drop.
+    pub signing_key: Option<SigningKeyBytes>,
+    /// Optional cross-context provenance metadata — attaches a
+    /// signed `DataProvenance` envelope to the inner message.
+    pub source_provenance: Option<scp_protocol::provenance::attach::SourceContextInfo>,
+    /// Optional `Spend` UCAN for the economy layer's AND-composition
+    /// check (spec §19.5). Parsed form; the FFI bridges parse the
+    /// JWT once before dispatch.
+    pub spending_ucan: Option<scp_protocol::crypto::ucan::UcanToken>,
+}
+
+/// See [`ContextCommand::Messaging`]. Real variants land in commit 8 of
+/// the ADR-049 commit ladder (see `handlers/messaging.rs`). Variants
+/// cover the hot-path send + deliver operations; sender-key rotation,
+/// distribute/remove, sender-key request handling, and sender-key
+/// management messages all stay on the legacy [`ContextManager`] surface
+/// until commits 10-11 per the plan row-6 scope.
 pub enum MessagingCommand {
-    /// Placeholder — fully defined when `handlers/messaging.rs` migrates
-    /// in commit 8 (plan "commit ladder"). Drop the oneshot receiver to
-    /// cancel; the actor still processes the command but discards the
-    /// outcome.
+    /// Placeholder — retained so out-of-tree callers constructed during
+    /// commit 6 still compile. Handler replies `NotImplemented` and
+    /// returns `Outcome::err`. Removed in commit 12 when the shim is
+    /// deleted.
     Placeholder {
         /// Oneshot reply channel. Handler stub sends
         /// `Err(ContextError::NotImplemented(..))` back.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
+
+    /// Encrypts and transmits a message within an active context.
+    ///
+    /// Mirrors the legacy
+    /// [`ContextManager::send_message`](crate::context::manager::ContextManager::send_message)
+    /// signature exactly: the handler delegates to that method for
+    /// byte-identical envelope construction, inner-signature signing,
+    /// sender-key sealing, MLS encryption, and transport fan-out.
+    ///
+    /// # Owned payload fields
+    ///
+    /// Every field is owned (`Vec<u8>`, `String`, `DID`,
+    /// `ContextParams`) rather than borrowed so the command can cross
+    /// the actor mailbox without lifetime juggling. The handler
+    /// reconstructs an ephemeral [`ContextHandle`] on the receive side
+    /// to match the legacy method's signature.
+    ///
+    /// # Reply
+    ///
+    /// The reply channel carries the legacy method's `Result<(),
+    /// ContextError>` outcome. Drop the receiver to cancel — the actor
+    /// processes the send to completion (message flies on the wire)
+    /// but the outcome is discarded.
+    SendMessage {
+        /// Boxed send-message payload — factored into a separate heap
+        /// allocation so [`MessagingCommand`] / [`ContextCommand`]
+        /// variant sizes stay uniform (ContextParams is ~1KB).
+        /// Satisfies `clippy::large_enum_variant`.
+        payload: Box<SendMessagePayload>,
+        /// Oneshot reply channel. Kept outside the boxed payload so the
+        /// actor's dispatch loop can consume `reply` by pattern-match
+        /// without an additional heap dereference for the hot reply
+        /// path.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Decrypts an incoming envelope from the relay and delivers the
+    /// plaintext + sender DID (or records a control-message side effect
+    /// and returns `None`).
+    ///
+    /// Mirrors the legacy
+    /// [`ContextManager::deliver_incoming`](crate::context::manager::ContextManager::deliver_incoming)
+    /// signature. Used by every FFI bridge's relay subscription loop;
+    /// the return type matches the bridge's per-event dispatch pattern.
+    ///
+    /// # Reply
+    ///
+    /// `Ok(Some((plaintext, sender_did)))` — application message; caller
+    /// should forward to the language binding's receive channel.
+    /// `Ok(None)` — MLS Commit / Proposal / management message; processed
+    /// internally, no plaintext to surface.
+    /// `Err(..)` — decryption, signature verification, anti-replay, or
+    /// access-key unwrap failure.
+    DeliverIncoming {
+        /// Context identifier.
+        context_id: String,
+        /// Encrypted envelope bytes (outer blob as received from the
+        /// relay).
+        envelope_bytes: Vec<u8>,
+        /// Oneshot reply channel. See [`DeliverIncomingReply`].
+        reply: DeliverIncomingReply,
+    },
+}
+
+/// Owned Ed25519 signing key bytes used inside
+/// [`MessagingCommand::SendMessage`]. Wraps the 32-byte seed in
+/// [`Zeroizing`](zeroize::Zeroizing) so the private key zeroes on drop
+/// even if the command is dropped mid-mailbox without being dispatched
+/// (cancellation path). The handler reconstructs
+/// [`ed25519_dalek::SigningKey`] from the bytes on the receive side.
+pub struct SigningKeyBytes(pub zeroize::Zeroizing<[u8; 32]>);
+
+impl SigningKeyBytes {
+    /// Construct from an [`ed25519_dalek::SigningKey`] borrowed from
+    /// the caller. Copies the 32-byte seed so the caller's key can be
+    /// dropped while the command is in flight.
+    #[must_use]
+    pub fn from_signing_key(sk: &ed25519_dalek::SigningKey) -> Self {
+        Self(zeroize::Zeroizing::new(sk.to_bytes()))
+    }
+
+    /// Rebuild the [`ed25519_dalek::SigningKey`] on the handler side.
+    /// The returned value is NOT wrapped in `Zeroizing`; callers take
+    /// responsibility for zeroizing it after use (the command's own
+    /// bytes zero on drop regardless).
+    #[must_use]
+    pub fn to_signing_key(&self) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&self.0)
+    }
 }
 
 /// See [`ContextCommand::Lifecycle`]. Real variants arrive in commit 9.

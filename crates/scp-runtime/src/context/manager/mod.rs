@@ -1234,6 +1234,28 @@ pub(crate) struct PerContextState {
     /// Not persisted in `ContextSnapshot` — the tree is rebuilt from the
     /// `MerkleEventLogProvider`'s entries on `restore_context` / `import_context`.
     merkle_tree: scp_event_log::EventLog,
+
+    /// Actor-shape send-sequence tracker (ADR-049 commit 8 / plan
+    /// §"`SequenceReservation`"). Seeds the RAII
+    /// [`SequenceReservation`](crate::context::actor::SequenceReservation)
+    /// used by the messaging handler in
+    /// [`crate::context::actor::handlers::messaging::dispatch`]. During
+    /// the commits-8-to-11 migration window the legacy
+    /// [`MembershipState`]-scoped per-sender tracker remains the
+    /// authoritative production sequence source (`next_sequence_number` /
+    /// `rollback_sequence_number` on `send_message`); this field is the
+    /// actor-shape counterpart that the handler exercises to prove the
+    /// RAII rollback path.
+    ///
+    /// Commit 12 deletes `MembershipState::next_sequence_number` and this
+    /// field becomes authoritative. Until then both trackers advance
+    /// together — the handler reserves a number here on every send, then
+    /// commits it iff the underlying `ContextManager::send_message` call
+    /// succeeded. Any failure (transport timeout, crypto error, early `?`
+    /// return) drops the reservation and rolls this counter back. The
+    /// legacy `MembershipState` tracker is still authoritative for wire
+    /// sequence numbers during the shim period.
+    send_tracker: crate::context::actor::SendSequenceTracker,
 }
 
 impl PerContextState {
@@ -1321,6 +1343,44 @@ impl PerContextState {
         &self,
     ) -> &scp_protocol::economy::antispam::SenderVelocityTracker {
         &self.governance.velocity_tracker
+    }
+
+    // -------------------------------------------------------------------
+    // Commit 8 / ADR-049 mutable accessors for the transitional
+    // [`crate::context::actor::mutation_state_view::MutationStateView`]
+    // shim. Mutable siblings of the read-only accessors above. Every
+    // entry here is deleted in commit 12 along with the manager struct.
+    // The only reason these are not simple `pub(super)` field accesses
+    // is that the shim lives in `context::actor`, a sibling module, and
+    // the fields are private to `manager`.
+    // -------------------------------------------------------------------
+
+    /// Mutable send-sequence tracker (ADR-049 commit 8). Caller passes
+    /// this to [`crate::context::actor::SequenceReservation::reserve`]
+    /// to reserve the next send-sequence number with RAII rollback.
+    ///
+    /// Production wire sequence numbers still come from
+    /// [`MembershipState::next_sequence_number`] during the shim period
+    /// (commits 8-11); the handler uses this tracker to exercise the
+    /// RAII rollback path so the failure modes (timeout, crypto error,
+    /// `?`-early-return) are covered structurally before commit 12
+    /// makes this tracker authoritative.
+    #[must_use]
+    pub(crate) const fn send_tracker_mut(
+        &mut self,
+    ) -> &mut crate::context::actor::SendSequenceTracker {
+        &mut self.send_tracker
+    }
+
+    /// Last-issued send sequence (read-only). Convenience for the shim
+    /// integration test to assert the reservation advanced / rolled
+    /// back as expected without constructing a full tracker borrow.
+    /// Gated on the `testing` feature so the accessor is never part of
+    /// production call graphs.
+    #[must_use]
+    #[cfg(feature = "testing")]
+    pub(crate) const fn send_tracker_last_issued(&self) -> u64 {
+        self.send_tracker.last_issued()
     }
 
     /// Pushes an event to the receive buffer and, if a broadcast channel is
@@ -2679,6 +2739,33 @@ impl ContextManager {
     #[must_use]
     pub(crate) fn event_log_provider_arc(&self) -> Arc<dyn ContextEventLogProvider> {
         Arc::clone(&self.event_log)
+    }
+
+    /// Last-issued actor-shape send-sequence number for a context.
+    /// Acquires the per-context lock briefly. Used by the messaging
+    /// shim integration test (ADR-049 commit 8) to verify
+    /// [`SequenceReservation`](crate::context::actor::SequenceReservation)
+    /// rollback / commit semantics through the public path.
+    ///
+    /// Returns `None` if the context is unknown. Deleted in commit 12
+    /// with the shim.
+    ///
+    /// Gated on the `testing` cargo feature so the accessor is never
+    /// callable from production code — the CI clippy configuration
+    /// builds with the feature enabled, so the method is always
+    /// compiled and linted.
+    ///
+    /// # Errors
+    ///
+    /// None — returns `None` on unknown context rather than a typed
+    /// error so the accessor composes with test-path parity helpers
+    /// that use `Option`-based soft defaults.
+    #[must_use]
+    #[cfg(feature = "testing")]
+    pub async fn send_tracker_last_issued(&self, context_id: &str) -> Option<u64> {
+        let arc = self.get_context_arc(context_id).ok()?;
+        let guard = arc.lock().await;
+        Some(guard.send_tracker_last_issued())
     }
 
     /// Insert a new context into the map. Returns an error if

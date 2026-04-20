@@ -3798,16 +3798,18 @@ pub async fn context_send(
             // required".
             let resolved_signing_key = resolve_uniffi_signing_key(&handle).await.ok();
 
-            // Delegate to the shared ContextManager for message delivery
-            // through the transport provider.
-            let manager = crate::runtime::context_manager()?;
-            let core_handle = scp_core::context::ContextHandle::new(
-                handle.context_id.clone(),
-                scp_core::context::ContextParams::default(),
-            );
-            let _ = core_handle
-                .transition_to(&scp_core::context::ContextState::Active)
-                .await;
+            // Route through the ADR-049 commit-8 messaging shim
+            // ([`Supervisor::dispatch_command`](scp_core::context::supervisor::Supervisor::dispatch_command))
+            // rather than calling `ContextManager::send_message`
+            // directly. The shim exercises RAII
+            // [`SequenceReservation`] + 30s transport timeout, and
+            // delegates to the legacy method for byte-identical
+            // envelope construction.
+            use scp_core::context::actor::commands::{
+                MessagingCommand, SendMessagePayload, SigningKeyBytes,
+            };
+            let sup = crate::runtime::supervisor_expect()?;
+            let context_id_owned = handle.context_id.clone();
 
             // Parse optional spending UCAN JWT into a UcanToken for AND-composition.
             let spending_ucan = spending_ucan_jwt
@@ -3820,16 +3822,30 @@ pub async fn context_send(
                 })?;
 
             let sender_did: scp_identity::DID = identity.did.clone().into();
-            manager
-                .send_message(
-                    &core_handle,
-                    &sender_did,
-                    &payload,
-                    resolved_signing_key.as_ref(),
-                    None,
-                    spending_ucan.as_ref(),
-                )
+            let signing_key_bytes = resolved_signing_key
+                .as_ref()
+                .map(SigningKeyBytes::from_signing_key);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = MessagingCommand::SendMessage {
+                payload: Box::new(SendMessagePayload {
+                    context_id: context_id_owned.clone(),
+                    params: scp_core::context::ContextParams::default(),
+                    sender_did,
+                    payload: payload.clone(),
+                    signing_key: signing_key_bytes,
+                    source_provenance: None,
+                    spending_ucan,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_command(&context_id_owned, cmd)
                 .await
+                .map_err(ScpError::from)?;
+            rx.await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("shim reply dropped: {e}"),
+                    code: codes::CTX_2001.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
 
             Ok(())

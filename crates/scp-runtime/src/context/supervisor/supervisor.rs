@@ -39,11 +39,13 @@ use dashmap::DashMap;
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
 
-use crate::context::actor::commands::{ContextCommand, QueriesCommand};
+use crate::context::actor::commands::{ContextCommand, MessagingCommand, QueriesCommand};
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::handlers;
+use crate::context::actor::mutation_state_view::MutationStateView;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::query_state_view::QueryStateView;
+use crate::context::actor::sequence::SendSequenceTracker;
 use crate::context::actor::state::WrappingKeyPair;
 use crate::context::manager::{ContextManager, ContextPersistence};
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
@@ -428,6 +430,157 @@ impl Supervisor {
                 Self::dispatch_with_view(cm, &ctx_id, cmd, /*soft_fallback=*/ true).await
             }
         }
+    }
+
+    /// Dispatch a mutating [`MessagingCommand`] through the migration
+    /// shim (ADR-049 commit 8 / plan row 8).
+    ///
+    /// Contract (byte-identical to the legacy
+    /// [`ContextManager::send_message`](crate::context::manager::ContextManager::send_message)
+    /// / [`ContextManager::deliver_incoming`](crate::context::manager::ContextManager::deliver_incoming)
+    /// it replaces):
+    ///
+    /// 1. Takes the tracker out of the per-context state under a brief
+    ///    lock (`std::mem::take` replaces it with a fresh
+    ///    [`SendSequenceTracker`](crate::context::actor::SendSequenceTracker)
+    ///    whose high-water mark matches the previous one).
+    /// 2. Drops the lock so the delegated
+    ///    [`ContextManager`](crate::context::manager::ContextManager)
+    ///    call can re-acquire it internally without deadlock.
+    /// 3. Builds a [`MutationStateView`] over the taken tracker + a
+    ///    reference to the attached manager, and invokes
+    ///    [`handlers::messaging::dispatch`](crate::context::actor::handlers::messaging::dispatch).
+    ///    The handler exercises
+    ///    [`SequenceReservation`](crate::context::actor::SequenceReservation)
+    ///    on the view's `send_tracker` (the taken tracker), wraps the
+    ///    delegated
+    ///    [`ContextManager::send_message`](crate::context::manager::ContextManager::send_message)
+    ///    / [`ContextManager::deliver_incoming`](crate::context::manager::ContextManager::deliver_incoming)
+    ///    call in `tokio::time::timeout` with a 30s budget, and maps
+    ///    a timeout to
+    ///    [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout).
+    /// 4. After the handler returns, the dispatcher re-acquires the
+    ///    lock briefly to swap the (now reservation-committed or
+    ///    rollback-reverted) tracker back into the per-context state.
+    ///    Subsequent sends see the post-handler high-water mark.
+    ///
+    /// # Why the take-and-swap pattern
+    ///
+    /// `MutationStateView` holds `&mut SendSequenceTracker`. If the
+    /// view held a `tokio::sync::OwnedMutexGuard<PerContextState>` the
+    /// borrow would live across the delegated `cm.send_message(...).await`
+    /// and deadlock the re-entrant per-context mutex acquisition inside
+    /// `ContextManager::send_message`. The take-and-swap workaround
+    /// makes the tracker reservation lock-free: the dispatcher owns
+    /// the tracker for the handler's await points, and the per-context
+    /// lock is held for zero duration during the delegated call. This
+    /// mirrors the plan's "handler takes `&mut` sibling of the query
+    /// view" contract while preserving deadlock safety during the shim
+    /// period. Commit 12 replaces this with a direct `&mut PerContextState`
+    /// on the actor's owned state (no lock involved, the actor
+    /// serializes by construction).
+    ///
+    /// # Missing ActorDeps during the shim
+    ///
+    /// `ActorDeps` requires a `SupervisorHandle`, `KeyPackageStoreActor`
+    /// handle, `MlsBackend`, `HpkeBackend`, and `OpenMlsStorageAdapter`
+    /// — all of which wire up in commits 9-11. For the shim's messaging
+    /// path those fields are unused: the handler delegates every
+    /// transport/MLS call to the attached
+    /// [`ContextManager`](crate::context::manager::ContextManager)'s
+    /// pre-existing providers. Rather than construct placeholder deps
+    /// on every call, the shim forwards `None` for the deps argument
+    /// via the overload
+    /// [`handlers::messaging::dispatch_from_shim`](crate::context::actor::handlers::messaging::dispatch_from_shim),
+    /// which shares the same match arms as the post-refactor
+    /// [`handlers::messaging::dispatch`](crate::context::actor::handlers::messaging::dispatch)
+    /// but takes no [`ActorDeps`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet — the caller must call
+    ///   [`Self::attach_context_manager`] first.
+    /// - [`ContextError::ContextNotRegistered`] if the command targets a
+    ///   context that has not been created / joined / imported on the
+    ///   attached manager.
+    /// - Any typed error returned by the delegated
+    ///   `ContextManager::send_message` /
+    ///   `ContextManager::deliver_incoming` call (`CryptoFailed`,
+    ///   `PermissionDenied`, `MemberNotFound`, `RateLimited`, etc.).
+    /// - [`ContextError::TransportTimeout`] if the delegated call
+    ///   exceeds the 30-second handler budget.
+    //
+    // `significant_drop_tightening` allow (function-level): Phase C's
+    // lock-scope block holds a `tokio::sync::MutexGuard` across a
+    // read-modify-write on the live send-tracker. Splitting the guard
+    // into two acquisitions (read then write) opens a TOCTOU window
+    // where a concurrent actor-path caller could advance `live`
+    // between our read and our write, regressing the high-water mark
+    // we compute. The lock scope is already minimal — three
+    // sequential expressions with no awaits. The block-level
+    // attribute form clippy suggests is not applicable to a `{ }`
+    // expression without a wrapping fn.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn dispatch_command(
+        &self,
+        ctx_id: &str,
+        cmd: MessagingCommand,
+    ) -> Result<Outcome<()>, ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::dispatch_command — no ContextManager attached".to_owned(),
+            )
+        })?;
+
+        // Resolve the per-context Arc. `ContextNotRegistered` surfaces
+        // directly to the caller — messaging commands have no
+        // soft-default: a missing context can't encrypt or decrypt a
+        // message.
+        let arc = cm.get_context_arc_pub(ctx_id)?;
+
+        // Phase A: take the tracker out under a brief lock. See the
+        // doc comment for the deadlock-avoidance rationale.
+        let mut taken_tracker = {
+            let mut guard = arc.lock().await;
+            std::mem::take(guard.send_tracker_mut())
+        };
+
+        // Phase B: invoke the handler with a view over the taken
+        // tracker + a borrow of the attached manager. No per-context
+        // lock is held during this await so the delegated
+        // `cm.send_message(...)` call inside the handler acquires the
+        // same mutex without contention.
+        let outcome = {
+            let mut view = MutationStateView {
+                send_tracker: &mut taken_tracker,
+                manager: cm,
+            };
+            handlers::messaging::dispatch_from_shim(&mut view, cmd).await
+        };
+
+        // Phase C: swap the (committed or rolled-back) tracker back
+        // in. If another task concurrently reserved a number on the
+        // manager's in-place tracker (via the legacy path) while ours
+        // was taken, we merge by taking the max high-water mark so
+        // neither side regresses. In practice the legacy path does not
+        // use `send_tracker` — it uses `MembershipState::next_sequence_number`
+        // — so the merge is a no-op during the shim period. Future-
+        // proofed so a stray legacy advance cannot regress on resume.
+        let taken_hw = taken_tracker.last_issued();
+        {
+            // See the function-level
+            // `#[allow(clippy::significant_drop_tightening)]` for the
+            // TOCTOU rationale on this guard's span.
+            let mut guard = arc.lock().await;
+            let live = guard.send_tracker_mut();
+            let live_hw = live.last_issued();
+            let merged = taken_hw.max(live_hw);
+            *live = SendSequenceTracker::from_persisted(merged);
+        }
+
+        Ok(outcome)
     }
 
     /// Helper: acquire the per-context lock, build the view, run the

@@ -595,6 +595,13 @@ impl ContextManager {
                 .into_iter()
                 .map(|(did_str, p)| (DID(did_str), p))
                 .collect(),
+            // ADR-049 commit 8: fresh actor-shape tracker. Restored
+            // snapshots predate this field (shim period), so seed at zero
+            // and let the legacy `MembershipState` per-sender tracker
+            // continue to supply wire sequence numbers. Commit 12 rewires
+            // snapshot persistence to seed this field from the persisted
+            // high-water mark.
+            send_tracker: crate::context::actor::SendSequenceTracker::new(),
         };
 
         // Atomic check-and-insert — eliminates TOCTOU race between
@@ -1316,6 +1323,8 @@ impl ContextManager {
             // The importing member must re-derive and re-announce.
             local_pseudonym: None,
             pseudonym_registry: HashMap::new(),
+            // ADR-049 commit 8: fresh actor-shape tracker on import.
+            send_tracker: crate::context::actor::SendSequenceTracker::new(),
         };
 
         // 7. Register the context.
@@ -1519,6 +1528,8 @@ impl ContextManager {
             // contexts; broadcast contexts ignore this field.
             local_pseudonym,
             pseudonym_registry: HashMap::new(),
+            // ADR-049 commit 8: fresh actor-shape tracker at creation.
+            send_tracker: crate::context::actor::SendSequenceTracker::new(),
         };
 
         // Atomic check-and-insert — eliminates TOCTOU race between
@@ -1855,6 +1866,8 @@ impl ContextManager {
             // later via the standard create_context path.
             local_pseudonym: None,
             pseudonym_registry: HashMap::new(),
+            // ADR-049 commit 8: fresh actor-shape tracker.
+            send_tracker: crate::context::actor::SendSequenceTracker::new(),
         })
     }
 

@@ -39,6 +39,7 @@ pub mod commands;
 pub mod deps;
 pub mod handle;
 pub mod handlers;
+pub(crate) mod mutation_state_view;
 pub mod outcome;
 pub(crate) mod query_state_view;
 pub mod sequence;
@@ -194,6 +195,24 @@ impl ContextActor {
         match cmd {
             ContextCommand::Messaging(MessagingCommand::Placeholder { reply }) => {
                 ack_not_impl(reply, "messaging");
+            }
+            ContextCommand::Messaging(MessagingCommand::SendMessage { reply, .. }) => {
+                // Skeleton dispatch does NOT own a ContextManager to
+                // delegate to — the shim routes messaging through
+                // [`Supervisor::dispatch_command`] (commit 8). Any
+                // caller that mistakenly routes a SendMessage through
+                // the actor mailbox during the migration window gets a
+                // typed error rather than a hang.
+                ack_not_impl(
+                    reply,
+                    "messaging::send_message (use Supervisor::dispatch_command during commits 8-11)",
+                );
+            }
+            ContextCommand::Messaging(MessagingCommand::DeliverIncoming { reply, .. }) => {
+                ack_not_impl(
+                    reply,
+                    "messaging::deliver_incoming (use Supervisor::dispatch_command during commits 8-11)",
+                );
             }
             ContextCommand::Lifecycle(LifecycleCommand::Placeholder { reply }) => {
                 ack_not_impl(reply, "lifecycle");

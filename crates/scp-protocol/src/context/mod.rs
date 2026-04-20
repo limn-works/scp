@@ -470,6 +470,26 @@ pub enum ContextError {
     /// translators.
     #[error("SCP-CTX-2132: not initialized: {0}")]
     NotInitialized(String),
+
+    /// A transport operation exceeded its per-call timeout budget while
+    /// invoked inside a context actor handler (ADR-049 §7 / plan §"Transport
+    /// timeouts inside actor handlers"). Distinct from
+    /// [`Self::TransportFailed`]: the transport layer did not return a
+    /// typed error — it hung past the deadline and the handler gave up
+    /// waiting so other mailbox commands can be drained.
+    ///
+    /// On timeout, handlers that had not yet committed their in-memory
+    /// mutations roll back via RAII (see
+    /// [`crate::context::SequenceReservation`](../../context/index.html)
+    /// if applicable). Handlers that already mutated state report
+    /// [`crate::context::builder::ContextCreationError`]-style partial
+    /// success via `Outcome::err_mutated` so the per-context snapshot is
+    /// persisted before the timeout error propagates.
+    ///
+    /// Mapped to canonical code `SCP-CTX-2133` through the bridge error
+    /// translators.
+    #[error("SCP-CTX-2133: transport timeout: {0}")]
+    TransportTimeout(String),
 }
 
 // ---------------------------------------------------------------------------
