@@ -1713,11 +1713,12 @@ mod tests {
         crate::init_runtime().ok();
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
+            let scp = default_scp();
             let bridge_id = "bridge-cred-test-001";
             let key = py_bridge_generate_credential_key();
 
             // Provision.
-            let result = default_scp().bridge_credential_provision(
+            let result = scp.bridge_credential_provision(
                 py,
                 bridge_id,
                 "ApiKey",
@@ -1727,7 +1728,7 @@ mod tests {
             assert!(result.is_ok(), "provision should succeed");
 
             // Retrieve.
-            let plaintext = default_scp()
+            let plaintext = scp
                 .bridge_credential_retrieve(bridge_id, "ApiKey", key)
                 .unwrap();
             assert_eq!(plaintext, b"my-secret-api-key");
@@ -1739,22 +1740,22 @@ mod tests {
         crate::init_runtime().ok();
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
+            let scp = default_scp();
             let bridge_id = "bridge-cred-test-002";
             let key = py_bridge_generate_credential_key();
 
             // Provision.
-            default_scp()
-                .bridge_credential_provision(
-                    py,
-                    bridge_id,
-                    "OAuthAccessToken",
-                    b"old-token".to_vec(),
-                    key.clone(),
-                )
-                .unwrap();
+            scp.bridge_credential_provision(
+                py,
+                bridge_id,
+                "OAuthAccessToken",
+                b"old-token".to_vec(),
+                key.clone(),
+            )
+            .unwrap();
 
             // Rotate.
-            let result = default_scp().bridge_credential_rotate(
+            let result = scp.bridge_credential_rotate(
                 py,
                 bridge_id,
                 "OAuthAccessToken",
@@ -1764,7 +1765,7 @@ mod tests {
             assert!(result.is_ok());
 
             // Retrieve should return new value.
-            let plaintext = default_scp()
+            let plaintext = scp
                 .bridge_credential_retrieve(bridge_id, "OAuthAccessToken", key)
                 .unwrap();
             assert_eq!(plaintext, b"new-token");
@@ -1776,30 +1777,29 @@ mod tests {
         crate::init_runtime().ok();
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
+            let scp = default_scp();
             let bridge_id = "bridge-cred-test-003";
             let key = py_bridge_generate_credential_key();
 
-            default_scp()
-                .bridge_credential_provision(
-                    py,
-                    bridge_id,
-                    "ApiKey",
-                    b"key-val".to_vec(),
-                    key.clone(),
-                )
-                .unwrap();
+            scp.bridge_credential_provision(
+                py,
+                bridge_id,
+                "ApiKey",
+                b"key-val".to_vec(),
+                key.clone(),
+            )
+            .unwrap();
 
-            default_scp()
-                .bridge_credential_provision(
-                    py,
-                    bridge_id,
-                    "WebhookSecret",
-                    b"secret-val".to_vec(),
-                    key,
-                )
-                .unwrap();
+            scp.bridge_credential_provision(
+                py,
+                bridge_id,
+                "WebhookSecret",
+                b"secret-val".to_vec(),
+                key,
+            )
+            .unwrap();
 
-            let list = default_scp().bridge_credential_list(py, bridge_id).unwrap();
+            let list = scp.bridge_credential_list(py, bridge_id).unwrap();
             let list_ref = list.bind(py);
             assert_eq!(list_ref.len(), 2);
         });
@@ -1810,23 +1810,23 @@ mod tests {
         crate::init_runtime().ok();
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
+            let scp = default_scp();
             let bridge_id = "bridge-cred-test-004";
             let key = py_bridge_generate_credential_key();
 
-            default_scp()
-                .bridge_credential_provision(
-                    py,
-                    bridge_id,
-                    "ApiKey",
-                    b"to-be-destroyed".to_vec(),
-                    key.clone(),
-                )
-                .unwrap();
+            scp.bridge_credential_provision(
+                py,
+                bridge_id,
+                "ApiKey",
+                b"to-be-destroyed".to_vec(),
+                key.clone(),
+            )
+            .unwrap();
 
-            default_scp().bridge_credential_revoke(bridge_id).unwrap();
+            scp.bridge_credential_revoke(bridge_id).unwrap();
 
             // Retrieve should fail.
-            let result = default_scp().bridge_credential_retrieve(bridge_id, "ApiKey", key);
+            let result = scp.bridge_credential_retrieve(bridge_id, "ApiKey", key);
             assert!(result.is_err());
         });
     }
@@ -1834,31 +1834,28 @@ mod tests {
     #[test]
     fn credential_store_and_get_key_roundtrip() {
         crate::init_runtime().ok();
+        let scp = default_scp();
         let bridge_id = "bridge-cred-test-005";
         let key = py_bridge_generate_credential_key();
 
-        default_scp()
-            .bridge_credential_store_key(bridge_id, key.clone())
+        scp.bridge_credential_store_key(bridge_id, key.clone())
             .unwrap();
 
-        let retrieved = default_scp().bridge_credential_get_key(bridge_id).unwrap();
+        let retrieved = scp.bridge_credential_get_key(bridge_id).unwrap();
         assert_eq!(retrieved, key);
     }
 
     #[test]
     fn credential_delete_key_removes_it() {
         crate::init_runtime().ok();
+        let scp = default_scp();
         let bridge_id = "bridge-cred-test-006";
         let key = py_bridge_generate_credential_key();
 
-        default_scp()
-            .bridge_credential_store_key(bridge_id, key)
-            .unwrap();
-        default_scp()
-            .bridge_credential_delete_key(bridge_id)
-            .unwrap();
+        scp.bridge_credential_store_key(bridge_id, key).unwrap();
+        scp.bridge_credential_delete_key(bridge_id).unwrap();
 
-        let result = default_scp().bridge_credential_get_key(bridge_id);
+        let result = scp.bridge_credential_get_key(bridge_id);
         assert!(result.is_err());
     }
 

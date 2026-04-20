@@ -252,3 +252,30 @@ impl Default for PyScp {
         Self::new()
     }
 }
+
+// Non-pyo3 impl block — exposes internals for Rust consumers (integration
+// tests and downstream bridge glue). Items here do NOT become Python
+// attributes because they're not annotated with `#[pymethods]`.
+impl PyScp {
+    /// Returns a shared reference to this instance's `PyBridgeInstance`.
+    ///
+    /// Useful for Rust-side code (integration tests, crate-internal glue)
+    /// that needs to pass the same `PyBridgeInstance` to `runtime::*`
+    /// helpers that this `PyScp` services. Python code should never see
+    /// this — it is not `#[pymethods]`.
+    #[must_use]
+    pub const fn bridge_instance(&self) -> &Arc<PyBridgeInstance> {
+        &self.inner
+    }
+
+    /// Constructs a `PyScp` that wraps an existing `PyBridgeInstance`.
+    ///
+    /// Used by integration tests that need the same `PyBridgeInstance`
+    /// for both `runtime::*` helpers (which take `&PyBridgeInstance`) and
+    /// `PyScp::*` methods (which route through `self.inner`). Production
+    /// code should use [`PyScp::new`] or [`PyScp::with_storage`] instead.
+    #[must_use]
+    pub const fn from_bridge_instance(inner: Arc<PyBridgeInstance>) -> Self {
+        Self { inner }
+    }
+}

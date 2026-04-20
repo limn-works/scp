@@ -4454,13 +4454,14 @@ mod tests {
     #[tokio::test]
     async fn deliver_message_via_runtime() {
         let context_id = "ctx-deliver-test";
+        let bi = __bi();
 
-        crate::runtime::register_context(&*__bi(), context_id, "did:test:creator", &[]).unwrap();
+        crate::runtime::register_context(&bi, context_id, "did:test:creator", &[]).unwrap();
 
         let (tx, rx) = mpsc::channel::<PyMessage>(RECEIVE_BUFFER_CAPACITY);
         let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
 
-        crate::runtime::with_context(&*__bi(), context_id, |rt| {
+        crate::runtime::with_context(&bi, context_id, |rt| {
             rt.message_tx = Some(tx);
             rt.message_rx = Some(Arc::clone(&rx_arc));
             Ok(())
@@ -4468,36 +4469,34 @@ mod tests {
         .unwrap();
 
         let msg = make_test_message(42, context_id);
-        crate::runtime::deliver_message(&*__bi(), context_id, msg).unwrap();
+        crate::runtime::deliver_message(&bi, context_id, msg).unwrap();
 
         let mut guard = rx_arc.lock().await;
         let received = guard.try_recv().unwrap();
         assert_eq!(received.sender_did, "did:test:sender-42");
         drop(guard);
 
-        crate::runtime::close_receive_channel(&*__bi(), context_id).unwrap();
+        crate::runtime::close_receive_channel(&bi, context_id).unwrap();
 
-        let result = crate::runtime::deliver_message(
-            &*__bi(),
-            context_id,
-            make_test_message(43, context_id),
-        );
+        let result =
+            crate::runtime::deliver_message(&bi, context_id, make_test_message(43, context_id));
         assert!(result.is_err(), "should fail after channel is closed");
 
-        crate::runtime::remove_context(&*__bi(), context_id);
+        crate::runtime::remove_context(&bi, context_id);
     }
 
     #[tokio::test]
     async fn deliver_message_overflow_injects_warning() {
         let context_id = "ctx-overflow-deliver";
         let capacity = RECEIVE_BUFFER_CAPACITY;
+        let bi = __bi();
 
-        crate::runtime::register_context(&*__bi(), context_id, "did:test:creator", &[]).unwrap();
+        crate::runtime::register_context(&bi, context_id, "did:test:creator", &[]).unwrap();
 
         let (tx, rx) = mpsc::channel::<PyMessage>(capacity);
         let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
 
-        crate::runtime::with_context(&*__bi(), context_id, |rt| {
+        crate::runtime::with_context(&bi, context_id, |rt| {
             rt.message_tx = Some(tx);
             rt.message_rx = Some(Arc::clone(&rx_arc));
             Ok(())
@@ -4508,14 +4507,15 @@ mod tests {
         // "cannot call blocking_lock from within a runtime" panic.
         // deliver_message uses blocking_lock internally for oldest-drop.
         let ctx_id = context_id.to_owned();
+        let bi_task = Arc::clone(&bi);
         tokio::task::spawn_blocking(move || {
             for i in 0..capacity {
-                crate::runtime::deliver_message(&*__bi(), &ctx_id, make_test_message(i, &ctx_id))
+                crate::runtime::deliver_message(&bi_task, &ctx_id, make_test_message(i, &ctx_id))
                     .unwrap();
             }
 
             crate::runtime::deliver_message(
-                &*__bi(),
+                &bi_task,
                 &ctx_id,
                 make_test_message(capacity, &ctx_id),
             )
@@ -4544,36 +4544,37 @@ mod tests {
         assert!(found_new_msg, "should find the overflow-triggering message");
 
         drop(guard);
-        crate::runtime::remove_context(&*__bi(), context_id);
+        crate::runtime::remove_context(&bi, context_id);
     }
 
     #[test]
     fn close_receive_channel_on_leave() {
         crate::init_runtime().ok();
         let context_id = "ctx-leave-close";
+        let bi = __bi();
 
-        crate::runtime::register_context(&*__bi(), context_id, "did:test:creator", &[]).unwrap();
+        crate::runtime::register_context(&bi, context_id, "did:test:creator", &[]).unwrap();
 
         let (tx, rx) = mpsc::channel::<PyMessage>(RECEIVE_BUFFER_CAPACITY);
         let rx_arc = Arc::new(tokio::sync::Mutex::new(rx));
 
-        crate::runtime::with_context(&*__bi(), context_id, |rt| {
+        crate::runtime::with_context(&bi, context_id, |rt| {
             rt.message_tx = Some(tx);
             rt.message_rx = Some(rx_arc);
             Ok(())
         })
         .unwrap();
 
-        crate::runtime::close_receive_channel(&*__bi(), context_id).unwrap();
+        crate::runtime::close_receive_channel(&bi, context_id).unwrap();
 
         let result =
-            crate::runtime::deliver_message(&*__bi(), context_id, make_test_message(0, context_id));
+            crate::runtime::deliver_message(&bi, context_id, make_test_message(0, context_id));
         assert!(
             result.is_err(),
             "deliver should fail after close_receive_channel"
         );
 
-        crate::runtime::remove_context(&*__bi(), context_id);
+        crate::runtime::remove_context(&bi, context_id);
     }
 
     // -----------------------------------------------------------------------
@@ -4854,17 +4855,16 @@ mod tests {
 
     #[test]
     fn get_economic_policy_none() {
-        // Ensure the default bridge instance exists so `PyContextHandle::new`
-        // stamps the handle with a real instance id (not `UNSET_INSTANCE_ID`).
-        // Without this, `pyscp_check_handle!` inside `get_economic_policy`
-        // would reject the handle with `SCP-PERM-3030`.
+        // The handle must be stamped with the same bridge instance that
+        // services the `get_economic_policy` call; otherwise
+        // `pyscp_check_handle!` rejects it with `SCP-PERM-3030`.
+        let scp = crate::scp::PyScp::new();
         let handle = PyContextHandle::new(
-            &*__bi(),
+            &scp.inner,
             "ctx-econ-3".to_owned(),
             "did:test:creator".to_owned(),
             default_params(),
         );
-        let scp = crate::scp::PyScp::new();
         let result = scp
             .get_economic_policy(&handle)
             .expect("handle is default-instance");
@@ -4874,8 +4874,9 @@ mod tests {
     #[test]
     fn get_economic_policy_some() {
         let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
+        let scp = crate::scp::PyScp::new();
         let handle = PyContextHandle::new(
-            &*__bi(),
+            &scp.inner,
             "ctx-econ-4".to_owned(),
             "did:test:creator".to_owned(),
             PyContextParams {
@@ -4883,7 +4884,6 @@ mod tests {
                 ..default_params()
             },
         );
-        let scp = crate::scp::PyScp::new();
         let result = scp
             .get_economic_policy(&handle)
             .expect("handle is default-instance");
@@ -4901,9 +4901,9 @@ mod tests {
         crate::init_runtime().ok();
         let ctx_id = format!("sync-role-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkCreatorSync1";
-        crate::runtime::register_context(&*__bi(), &ctx_id, creator, &[]).unwrap();
-        let __bi_arc = __bi();
-        let mgr = crate::runtime::context_manager(&*__bi_arc).unwrap();
+        let bi = __bi();
+        crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
+        let mgr = crate::runtime::context_manager(&bi).unwrap();
         let rt = crate::runtime().unwrap();
         let params = scp_core::context::ContextParams {
             ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
@@ -4928,7 +4928,7 @@ mod tests {
         );
         rt.block_on(mgr.execute_governance_action(&ctx_id, &add))
             .unwrap();
-        crate::runtime::sync_role_state_from_manager(&*__bi(), &ctx_id).unwrap();
+        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
         let change = approved_proposal(
             [2u8; 32],
             &ctx_id,
@@ -4940,8 +4940,8 @@ mod tests {
         );
         rt.block_on(mgr.execute_governance_action(&ctx_id, &change))
             .unwrap();
-        crate::runtime::sync_role_state_from_manager(&*__bi(), &ctx_id).unwrap();
-        crate::runtime::with_context(&*__bi(), &ctx_id, |st| {
+        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
+        crate::runtime::with_context(&bi, &ctx_id, |st| {
             let assignment = st
                 .role_state
                 .assignments
@@ -4954,7 +4954,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        crate::runtime::remove_context(&*__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
@@ -4962,9 +4962,9 @@ mod tests {
         crate::init_runtime().ok();
         let ctx_id = format!("sync-add-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkCreatorSync2";
-        crate::runtime::register_context(&*__bi(), &ctx_id, creator, &[]).unwrap();
-        let __bi_arc = __bi();
-        let mgr = crate::runtime::context_manager(&*__bi_arc).unwrap();
+        let bi = __bi();
+        crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
+        let mgr = crate::runtime::context_manager(&bi).unwrap();
         let rt = crate::runtime().unwrap();
         let params = scp_core::context::ContextParams {
             ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
@@ -4978,7 +4978,7 @@ mod tests {
         ))
         .unwrap();
         let new_did = "did:key:z6MkAdded1";
-        crate::runtime::with_context(&*__bi(), &ctx_id, |st| {
+        crate::runtime::with_context(&bi, &ctx_id, |st| {
             assert!(!st.role_state.members.contains(new_did));
             Ok(())
         })
@@ -4994,8 +4994,8 @@ mod tests {
         );
         rt.block_on(mgr.execute_governance_action(&ctx_id, &add))
             .unwrap();
-        crate::runtime::sync_role_state_from_manager(&*__bi(), &ctx_id).unwrap();
-        crate::runtime::with_context(&*__bi(), &ctx_id, |st| {
+        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
+        crate::runtime::with_context(&bi, &ctx_id, |st| {
             assert!(st.role_state.members.contains(new_did));
             assert_eq!(
                 st.role_state
@@ -5007,7 +5007,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        crate::runtime::remove_context(&*__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
@@ -5016,9 +5016,9 @@ mod tests {
         let ctx_id = format!("sync-rm-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkCreatorSync3";
         let target = "did:key:z6MkRemoveTarget";
-        crate::runtime::register_context(&*__bi(), &ctx_id, creator, &[]).unwrap();
-        let __bi_arc = __bi();
-        let mgr = crate::runtime::context_manager(&*__bi_arc).unwrap();
+        let bi = __bi();
+        crate::runtime::register_context(&bi, &ctx_id, creator, &[]).unwrap();
+        let mgr = crate::runtime::context_manager(&bi).unwrap();
         let rt = crate::runtime().unwrap();
         let params = scp_core::context::ContextParams {
             ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
@@ -5042,8 +5042,8 @@ mod tests {
         );
         rt.block_on(mgr.execute_governance_action(&ctx_id, &add))
             .unwrap();
-        crate::runtime::sync_role_state_from_manager(&*__bi(), &ctx_id).unwrap();
-        crate::runtime::with_context(&*__bi(), &ctx_id, |st| {
+        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
+        crate::runtime::with_context(&bi, &ctx_id, |st| {
             assert!(st.role_state.members.contains(target));
             Ok(())
         })
@@ -5059,14 +5059,14 @@ mod tests {
         );
         rt.block_on(mgr.execute_governance_action(&ctx_id, &rm))
             .unwrap();
-        crate::runtime::sync_role_state_from_manager(&*__bi(), &ctx_id).unwrap();
-        crate::runtime::with_context(&*__bi(), &ctx_id, |st| {
+        crate::runtime::sync_role_state_from_manager(&bi, &ctx_id).unwrap();
+        crate::runtime::with_context(&bi, &ctx_id, |st| {
             assert!(!st.role_state.members.contains(target));
             assert!(!st.role_state.assignments.contains_key(target));
             Ok(())
         })
         .unwrap();
-        crate::runtime::remove_context(&*__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------

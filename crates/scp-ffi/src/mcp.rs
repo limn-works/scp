@@ -2424,14 +2424,20 @@ mod tests {
 
     /// Registers a context in the runtime registry and optionally adds a tool.
     /// Returns a unique context ID to avoid collisions with parallel tests.
-    fn setup_test_context(creator_did: &str, with_tool: bool) -> String {
+    ///
+    /// Callers must pass the same `bi` they use for subsequent registry lookups;
+    /// each `PyBridgeInstance` has its own `instance_id` and context registry.
+    fn setup_test_context(
+        bi: &crate::runtime::PyBridgeInstance,
+        creator_did: &str,
+        with_tool: bool,
+    ) -> String {
         // Use a unique context ID to avoid collisions across parallel tests.
         let ctx_id = crate::types::generate_random_id("test-mcp");
-        let bi = __bi();
-        crate::runtime::register_context(&bi, &ctx_id, creator_did, &[]).unwrap();
+        crate::runtime::register_context(bi, &ctx_id, creator_did, &[]).unwrap();
 
         if with_tool {
-            crate::runtime::with_context(&bi, &ctx_id, |rt| {
+            crate::runtime::with_context(bi, &ctx_id, |rt| {
                 let registration = scp_core::context::tools::ToolRegistration {
                     tool_id: "calculator".to_owned(),
                     name: "Calculator".to_owned(),
@@ -2481,10 +2487,11 @@ mod tests {
     #[test]
     fn ffi_bridge_provider_validate_capability_rejects_missing_ucan() {
         let creator = "did:dht:z6MkCreatorValCap";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2504,7 +2511,7 @@ mod tests {
             "error should mention UCAN requirement: {err}"
         );
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2515,11 +2522,12 @@ mod tests {
     #[test]
     fn ffi_bridge_provider_validate_capability_rejects_unauthorized() {
         let creator = "did:dht:z6MkCreatorValCapReject";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Add a member with no ToolInvoke capability.
         let member = "did:dht:z6MkMemberNoInvoke";
-        crate::runtime::with_context(&__bi(), &ctx_id, |rt| {
+        crate::runtime::with_context(&bi, &ctx_id, |rt| {
             rt.role_state.members.insert(member.to_owned());
             let mut caps = std::collections::HashSet::new();
             caps.insert(scp_core::context::roles::Capability::MessagesRead);
@@ -2531,7 +2539,7 @@ mod tests {
         .unwrap();
 
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: member.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2550,7 +2558,7 @@ mod tests {
             "error should mention UCAN requirement: {err}"
         );
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2560,10 +2568,11 @@ mod tests {
     #[test]
     fn ffi_bridge_provider_invoke_tool_echo_fallback_without_handler() {
         let creator = "did:dht:z6MkCreatorInvokeTool";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2586,7 +2595,7 @@ mod tests {
         assert_eq!(output["input_valid"], true);
         assert_eq!(output["validated_input"], input);
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2597,17 +2606,18 @@ mod tests {
     #[test]
     fn invoke_tool_echo_mode_appends_tool_invoked_event() {
         let creator = "did:dht:z6MkCreatorEventLog";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Verify the event log is initially empty.
-        let initial_count = crate::runtime::with_context(&__bi(), &ctx_id, |rt| {
+        let initial_count = crate::runtime::with_context(&bi, &ctx_id, |rt| {
             Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
         assert_eq!(initial_count, 0, "event log should start empty");
 
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2622,7 +2632,7 @@ mod tests {
         assert!(result.is_ok(), "invoke_tool should succeed: {result:?}");
 
         // Verify the event log now has one event.
-        let after_count = crate::runtime::with_context(&__bi(), &ctx_id, |rt| {
+        let after_count = crate::runtime::with_context(&bi, &ctx_id, |rt| {
             Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
@@ -2636,7 +2646,7 @@ mod tests {
             provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 5, "b": 6}));
         assert!(result2.is_ok());
 
-        let final_count = crate::runtime::with_context(&__bi(), &ctx_id, |rt| {
+        let final_count = crate::runtime::with_context(&bi, &ctx_id, |rt| {
             Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
@@ -2645,13 +2655,14 @@ mod tests {
             "event log should have 2 events after two invocations"
         );
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn invoke_tool_with_handler_appends_tool_invoked_event() {
         let creator = "did:dht:z6MkCreatorHandlerEventLog";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a handler.
         let handler: crate::runtime::ToolHandler =
@@ -2660,10 +2671,10 @@ mod tests {
                 let b = input["b"].as_f64().unwrap_or(0.0);
                 Ok(serde_json::json!({"result": a + b}))
             });
-        crate::runtime::register_tool_handler(&__bi(), &ctx_id, "calculator", handler).unwrap();
+        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", handler).unwrap();
 
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2678,14 +2689,14 @@ mod tests {
         assert_eq!(result.unwrap(), serde_json::json!({"result": 30.0}));
 
         // Verify event was logged.
-        let count = crate::runtime::with_context(&__bi(), &ctx_id, |rt| {
+        let count = crate::runtime::with_context(&bi, &ctx_id, |rt| {
             Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
         assert_eq!(count, 1, "handler path should also append to event log");
 
         // Verify the merkle root is non-zero (tree was actually built).
-        let root = crate::runtime::with_context(&__bi(), &ctx_id, |rt| {
+        let root = crate::runtime::with_context(&bi, &ctx_id, |rt| {
             Ok(scp_event_log::tree::root(&rt.event_log))
         })
         .unwrap();
@@ -2694,16 +2705,17 @@ mod tests {
             "merkle root should be non-zero after appending an event"
         );
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn invoke_tool_error_does_not_append_event() {
         let creator = "did:dht:z6MkCreatorNoEventOnErr";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2718,7 +2730,7 @@ mod tests {
         assert!(result.is_err(), "invalid input should be rejected");
 
         // Event log should still be empty (no event appended on error).
-        let count = crate::runtime::with_context(&__bi(), &ctx_id, |rt| {
+        let count = crate::runtime::with_context(&bi, &ctx_id, |rt| {
             Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
@@ -2727,7 +2739,7 @@ mod tests {
             "event log should remain empty when invocation fails"
         );
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2737,10 +2749,11 @@ mod tests {
     #[test]
     fn ffi_bridge_provider_invoke_tool_validates_schema() {
         let creator = "did:dht:z6MkCreatorSchemaVal";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2772,7 +2785,7 @@ mod tests {
             provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
         assert!(result.is_ok(), "valid input should succeed: {result:?}");
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2782,10 +2795,11 @@ mod tests {
     #[test]
     fn ffi_bridge_provider_invoke_tool_rejects_unknown_tool() {
         let creator = "did:dht:z6MkCreatorUnknownTool";
-        let ctx_id = setup_test_context(creator, false);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, false);
 
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2802,7 +2816,7 @@ mod tests {
             "error should mention tool not found: {err}"
         );
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2812,24 +2826,25 @@ mod tests {
     #[test]
     fn load_contexts_returns_local_contexts() {
         let creator = "did:dht:z6MkCreatorLoadCtx";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Since py_mcp_load_contexts requires Python, we test the underlying
         // runtime function directly.
-        let ids = crate::runtime::context_ids_for_member(&__bi(), creator);
+        let ids = crate::runtime::context_ids_for_member(&bi, creator);
         assert!(
             ids.contains(&ctx_id),
             "creator should be a member of the context"
         );
 
         // Non-member should not see the context.
-        let other_ids = crate::runtime::context_ids_for_member(&__bi(), "did:dht:z6MkNobody");
+        let other_ids = crate::runtime::context_ids_for_member(&bi, "did:dht:z6MkNobody");
         assert!(
             !other_ids.contains(&ctx_id),
             "non-member should not see the context"
         );
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2927,7 +2942,8 @@ mod tests {
     #[test]
     fn register_tool_handler_and_invoke_dispatches_through_handler() {
         let creator = "did:dht:z6MkCreatorHandler";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a Rust handler that adds two numbers (simulates a Python handler).
         let handler: crate::runtime::ToolHandler =
@@ -2943,10 +2959,10 @@ mod tests {
                 Ok(serde_json::json!({"result": a + b}))
             });
 
-        crate::runtime::register_tool_handler(&__bi(), &ctx_id, "calculator", handler).unwrap();
+        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", handler).unwrap();
 
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2972,19 +2988,19 @@ mod tests {
             "handler output should not contain echo-mode 'status' field"
         );
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn register_tool_handler_rejects_unregistered_tool() {
         let creator = "did:dht:z6MkCreatorHandlerReject";
-        let ctx_id = setup_test_context(creator, false); // No tool registered.
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, false); // No tool registered.
 
         let handler: crate::runtime::ToolHandler =
             std::sync::Arc::new(|_input| Ok(serde_json::json!({})));
 
-        let result =
-            crate::runtime::register_tool_handler(&__bi(), &ctx_id, "nonexistent", handler);
+        let result = crate::runtime::register_tool_handler(&bi, &ctx_id, "nonexistent", handler);
         assert!(
             result.is_err(),
             "should reject handler for unregistered tool"
@@ -2995,23 +3011,24 @@ mod tests {
             "error should mention tool not found: {err}"
         );
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn invoke_tool_with_handler_validates_output_schema() {
         let creator = "did:dht:z6MkCreatorOutVal";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a handler that returns a string instead of an object
         // (violates the output schema which requires an object).
         let bad_handler: crate::runtime::ToolHandler =
             std::sync::Arc::new(|_input| Ok(serde_json::json!("not an object")));
 
-        crate::runtime::register_tool_handler(&__bi(), &ctx_id, "calculator", bad_handler).unwrap();
+        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", bad_handler).unwrap();
 
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -3032,23 +3049,23 @@ mod tests {
             "error should mention output validation: {err}"
         );
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn invoke_tool_handler_error_is_propagated() {
         let creator = "did:dht:z6MkCreatorHandlerErr";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a handler that always fails.
         let failing_handler: crate::runtime::ToolHandler =
             std::sync::Arc::new(|_input| Err("computation exploded".to_owned()));
 
-        crate::runtime::register_tool_handler(&__bi(), &ctx_id, "calculator", failing_handler)
-            .unwrap();
+        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", failing_handler).unwrap();
 
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -3066,7 +3083,7 @@ mod tests {
             "error should contain handler error message: {err}"
         );
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -3076,7 +3093,8 @@ mod tests {
     #[test]
     fn invoke_tool_handler_timeout_produces_clear_error() {
         let creator = "did:dht:z6MkCreatorTimeout";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a handler that blocks for 5 seconds (will be timed out).
         let blocking_handler: crate::runtime::ToolHandler = std::sync::Arc::new(|_input| {
@@ -3084,11 +3102,11 @@ mod tests {
             Ok(serde_json::json!({"result": 42}))
         });
 
-        crate::runtime::register_tool_handler(&__bi(), &ctx_id, "calculator", blocking_handler)
+        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", blocking_handler)
             .unwrap();
 
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: 50, // 50ms — will expire before the 5s sleep.
@@ -3110,13 +3128,14 @@ mod tests {
             "error should include the timeout duration: {err}"
         );
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn invoke_tool_handler_completes_within_timeout_succeeds() {
         let creator = "did:dht:z6MkCreatorTimeoutOk";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a fast handler.
         let fast_handler: crate::runtime::ToolHandler =
@@ -3132,11 +3151,10 @@ mod tests {
                 Ok(serde_json::json!({"result": a + b}))
             });
 
-        crate::runtime::register_tool_handler(&__bi(), &ctx_id, "calculator", fast_handler)
-            .unwrap();
+        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", fast_handler).unwrap();
 
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: 5_000, // 5 seconds — plenty for an instant handler.
@@ -3158,7 +3176,7 @@ mod tests {
             "handler output should be correct"
         );
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
@@ -3219,11 +3237,12 @@ mod tests {
     #[test]
     fn cleanup_stopped_servers_removes_stopped_entries() {
         let creator = "did:dht:z6MkCreatorCleanup";
-        let ctx_id = setup_test_context(creator, false);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, false);
 
         // Create a minimal server entry directly in the registry.
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -3235,7 +3254,6 @@ mod tests {
         let server = Arc::new(Mutex::new(server));
         let handle = generate_handle_id("mcp-server");
 
-        let bi = __bi();
         server_registry_of(&bi).insert(
             handle.clone(),
             McpServerState {
@@ -3255,7 +3273,7 @@ mod tests {
             "stopped server handle should be present before cleanup"
         );
 
-        cleanup_stopped_servers_for(&__bi());
+        cleanup_stopped_servers_for(&bi);
 
         // The specific handle should be gone. We check by key rather than
         // by count because parallel tests may insert/remove other entries.
@@ -3264,16 +3282,17 @@ mod tests {
             "stopped server handle should be removed after cleanup"
         );
 
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn cleanup_stopped_servers_leaves_running_entries() {
         let creator = "did:dht:z6MkCreatorCleanupRunning";
-        let ctx_id = setup_test_context(creator, false);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, false);
 
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::clone(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -3285,7 +3304,6 @@ mod tests {
         let server = Arc::new(Mutex::new(server));
         let handle = generate_handle_id("mcp-server");
 
-        let bi = __bi();
         server_registry_of(&bi).insert(
             handle.clone(),
             McpServerState {
@@ -3299,7 +3317,7 @@ mod tests {
             },
         );
 
-        cleanup_stopped_servers_for(&__bi());
+        cleanup_stopped_servers_for(&bi);
 
         // Running server should still be present.
         assert!(
@@ -3309,7 +3327,7 @@ mod tests {
 
         // Cleanup: remove manually.
         server_registry_of(&bi).remove(&handle);
-        crate::runtime::remove_context(&__bi(), &ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]

@@ -69,7 +69,11 @@ fn random_context_id() -> String {
 }
 
 /// Creates an in-memory identity and registers it in the runtime registry.
-fn create_test_identity() -> String {
+///
+/// Takes the bridge instance so the caller can reuse the same `bi` for
+/// subsequent registry lookups — each `PyBridgeInstance` has its own
+/// identity/context registry and `instance_id`.
+fn create_test_identity(bi: &PyBridgeInstance) -> String {
     setup();
     let rt = test_runtime();
 
@@ -87,7 +91,7 @@ fn create_test_identity() -> String {
     let did = identity.did.clone();
 
     runtime::register_identity(
-        &__bi(),
+        bi,
         &did,
         IdentityEntry {
             identity,
@@ -102,13 +106,17 @@ fn create_test_identity() -> String {
 
 /// Creates a context via `ContextManager` and registers FFI state.
 /// Returns the `context_id`.
-fn create_test_context(creator_did: &str) -> String {
+///
+/// Takes the bridge instance so the caller can reuse the same `bi` for
+/// subsequent registry lookups — each `PyBridgeInstance` has its own
+/// identity/context registry and `instance_id`.
+fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
     setup();
     let context_id = random_context_id();
-    runtime::register_context(&__bi(), &context_id, creator_did, &[]).unwrap();
+    runtime::register_context(bi, &context_id, creator_did, &[]).unwrap();
 
     let rt = test_runtime();
-    let mgr = runtime::context_manager(&__bi()).unwrap().clone();
+    let mgr = runtime::context_manager(bi).unwrap().clone();
     let creator = scp_identity::DID(creator_did.to_owned());
     let ctx_id = context_id.clone();
 
@@ -172,30 +180,33 @@ fn build_tool_reg<'py>(py: Python<'py>, name: &str, operator_did: &str) -> Bound
 
 #[test]
 fn identity_create_returns_valid_did() {
-    let did = create_test_identity();
+    let bi = __bi();
+    let did = create_test_identity(&bi);
     assert!(did.starts_with("did:dht:"));
-    assert!(runtime::identity_registry_contains(&__bi(), &did));
+    assert!(runtime::identity_registry_contains(&bi, &did));
 }
 
 #[test]
 fn identity_multiple_unique() {
-    let did1 = create_test_identity();
-    let did2 = create_test_identity();
+    let bi = __bi();
+    let did1 = create_test_identity(&bi);
+    let did2 = create_test_identity(&bi);
     assert_ne!(did1, did2);
 }
 
 #[test]
 fn identity_registry_lookup() {
-    let did = create_test_identity();
-    let result = runtime::with_identity(&__bi(), &did, |entry| Ok(entry.identity.did.clone()));
+    let bi = __bi();
+    let did = create_test_identity(&bi);
+    let result = runtime::with_identity(&bi, &did, |entry| Ok(entry.identity.did.clone()));
     assert_eq!(result.unwrap(), did);
 }
 
 #[test]
 fn identity_unknown_did_fails() {
     setup();
-    let result: Result<(), _> =
-        runtime::with_identity(&__bi(), "did:dht:nonexistent", |_entry| Ok(()));
+    let bi = __bi();
+    let result: Result<(), _> = runtime::with_identity(&bi, "did:dht:nonexistent", |_entry| Ok(()));
     assert!(result.is_err());
 }
 
@@ -205,20 +216,22 @@ fn identity_unknown_did_fails() {
 
 #[test]
 fn context_create_registers_in_runtime() {
-    let did = create_test_identity();
-    let ctx_id = create_test_context(&did);
+    let bi = __bi();
+    let did = create_test_identity(&bi);
+    let ctx_id = create_test_context(&bi, &did);
 
-    let creator = runtime::with_context(&__bi(), &ctx_id, |rt| Ok(rt.creator_did.clone())).unwrap();
+    let creator = runtime::with_context(&bi, &ctx_id, |rt| Ok(rt.creator_did.clone())).unwrap();
     assert_eq!(creator, did);
 }
 
 #[test]
 fn context_membership_creator_is_member() {
-    let did = create_test_identity();
-    let ctx_id = create_test_context(&did);
+    let bi = __bi();
+    let did = create_test_identity(&bi);
+    let ctx_id = create_test_context(&bi, &did);
 
     let rt = test_runtime();
-    let mgr = runtime::context_manager(&__bi()).unwrap().clone();
+    let mgr = runtime::context_manager(&bi).unwrap().clone();
 
     assert!(rt.block_on(mgr.is_member(&ctx_id, &did)));
     assert_eq!(rt.block_on(mgr.member_count(&ctx_id)), Some(1));
@@ -229,11 +242,12 @@ fn context_membership_creator_is_member() {
 
 #[test]
 fn context_member_role_creator_is_admin() {
-    let did = create_test_identity();
-    let ctx_id = create_test_context(&did);
+    let bi = __bi();
+    let did = create_test_identity(&bi);
+    let ctx_id = create_test_context(&bi, &did);
 
     let rt = test_runtime();
-    let mgr = runtime::context_manager(&__bi()).unwrap().clone();
+    let mgr = runtime::context_manager(&bi).unwrap().clone();
 
     let role = rt.block_on(mgr.member_role(&ctx_id, &did));
     assert!(role.is_some());
@@ -247,11 +261,12 @@ fn context_member_role_creator_is_admin() {
 
 #[test]
 fn context_drain_events_is_idempotent() {
-    let did = create_test_identity();
-    let ctx_id = create_test_context(&did);
+    let bi = __bi();
+    let did = create_test_identity(&bi);
+    let ctx_id = create_test_context(&bi, &did);
 
     let rt = test_runtime();
-    let mgr = runtime::context_manager(&__bi()).unwrap().clone();
+    let mgr = runtime::context_manager(&bi).unwrap().clone();
 
     // First drain: may or may not have events depending on ContextManager internals.
     let events = rt.block_on(mgr.drain_events(&ctx_id));
@@ -267,9 +282,10 @@ fn context_drain_events_is_idempotent() {
 
 #[test]
 fn multiple_contexts_independent() {
-    let did = create_test_identity();
-    let ctx1 = create_test_context(&did);
-    let ctx2 = create_test_context(&did);
+    let bi = __bi();
+    let did = create_test_identity(&bi);
+    let ctx1 = create_test_context(&bi, &did);
+    let ctx2 = create_test_context(&bi, &did);
     assert_ne!(ctx1, ctx2);
 }
 
@@ -288,11 +304,12 @@ fn multiple_contexts_independent() {
 /// identity creation → context creation → `ContextManager` state is populated.
 #[test]
 fn context_create_establishes_mls_group() {
-    let did = create_test_identity();
-    let ctx_id = create_test_context(&did);
+    let bi = __bi();
+    let did = create_test_identity(&bi);
+    let ctx_id = create_test_context(&bi, &did);
 
     let rt = test_runtime();
-    let mgr = runtime::context_manager(&__bi()).unwrap().clone();
+    let mgr = runtime::context_manager(&bi).unwrap().clone();
 
     // The ContextManager should have the context with the creator as a member.
     // This confirms that the full creation flow ran (including the crypto
@@ -335,8 +352,10 @@ fn context_create_establishes_mls_group() {
 #[test]
 fn tool_register_and_verify() {
     Python::with_gil(|py| {
-        let did = create_test_identity();
-        let ctx_id = create_test_context(&did);
+        let scp = _scp_core::scp::PyScp::new();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
         let reg = PyDict::new(py);
         reg.set_item("name", "test_tool").unwrap();
@@ -377,7 +396,6 @@ fn tool_register_and_verify() {
         let tv_list = PyList::new(py, &[tv]).unwrap();
         reg.set_item("test_vectors", tv_list).unwrap();
 
-        let scp = _scp_core::scp::PyScp::new();
         let tool_id = scp.tool_register(&ctx_id, &reg.as_borrowed()).unwrap();
         assert!(tool_id.contains("test_tool"));
 
@@ -409,8 +427,10 @@ fn tool_register_rejects_invalid_context() {
 #[test]
 fn tool_register_rejects_empty_name() {
     Python::with_gil(|py| {
-        let did = create_test_identity();
-        let ctx_id = create_test_context(&did);
+        let scp = _scp_core::scp::PyScp::new();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
         let reg = PyDict::new(py);
         reg.set_item("name", "").unwrap();
@@ -421,7 +441,6 @@ fn tool_register_rejects_empty_name() {
         schema.set_item("output_schema", PyDict::new(py)).unwrap();
         reg.set_item("schema", schema).unwrap();
 
-        let scp = _scp_core::scp::PyScp::new();
         let result = scp.tool_register(&ctx_id, &reg.as_borrowed());
         assert!(result.is_err());
     });
@@ -455,15 +474,15 @@ fn ucan_mint_rejects_empty_context() {
 #[test]
 fn event_log_query_empty_returns_empty() {
     Python::with_gil(|py| {
-        let did = create_test_identity();
-        let ctx_id = create_test_context(&did);
+        let scp = _scp_core::scp::PyScp::new();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
         // Event log starts empty when context is created via ContextManager
         // (not via py_context_create which appends events). Query should
         // succeed and return an empty list.
-        let events = _scp_core::scp::PyScp::new()
-            .event_log_query(py, &ctx_id, None)
-            .unwrap();
+        let events = scp.event_log_query(py, &ctx_id, None).unwrap();
         assert!(events.is_empty());
     });
 }
@@ -471,11 +490,13 @@ fn event_log_query_empty_returns_empty() {
 #[test]
 fn event_log_query_with_appended_event() {
     Python::with_gil(|py| {
-        let did = create_test_identity();
-        let ctx_id = create_test_context(&did);
+        let scp = _scp_core::scp::PyScp::new();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
         // Manually append an unsigned event to the log.
-        runtime::with_context(&__bi(), &ctx_id, |rt| {
+        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
             let event = scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
                 actor_did: scp_identity::DID("did:key:test".to_owned()),
@@ -491,9 +512,7 @@ fn event_log_query_with_appended_event() {
         .unwrap();
 
         // Now query should return a LogSummary.
-        let events = _scp_core::scp::PyScp::new()
-            .event_log_query(py, &ctx_id, None)
-            .unwrap();
+        let events = scp.event_log_query(py, &ctx_id, None).unwrap();
         assert!(!events.is_empty());
     });
 }
@@ -501,13 +520,15 @@ fn event_log_query_with_appended_event() {
 #[test]
 fn event_log_query_with_filter() {
     Python::with_gil(|py| {
-        let did = create_test_identity();
-        let ctx_id = create_test_context(&did);
+        let scp = _scp_core::scp::PyScp::new();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
         let filter = PyDict::new(py);
         filter.set_item("limit", 1).unwrap();
 
-        let events = _scp_core::scp::PyScp::new()
+        let events = scp
             .event_log_query(py, &ctx_id, Some(&filter.as_borrowed()))
             .unwrap();
         assert!(events.len() <= 1);
@@ -517,11 +538,13 @@ fn event_log_query_with_filter() {
 #[test]
 fn event_log_verify_inclusion_proof_after_append() {
     Python::with_gil(|py| {
-        let did = create_test_identity();
-        let ctx_id = create_test_context(&did);
+        let scp = _scp_core::scp::PyScp::new();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
         // Append an unsigned event so the log is non-empty.
-        runtime::with_context(&__bi(), &ctx_id, |rt| {
+        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
             let event = scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
                 actor_did: scp_identity::DID("did:key:test".to_owned()),
@@ -540,7 +563,7 @@ fn event_log_verify_inclusion_proof_after_append() {
         claim.set_item("type", "inclusion").unwrap();
         claim.set_item("leaf_index", 0).unwrap();
 
-        let proof = _scp_core::scp::PyScp::new()
+        let proof = scp
             .event_log_verify(py, &ctx_id, &claim.as_borrowed())
             .unwrap();
         assert!(proof.verified);
@@ -1021,10 +1044,12 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
     // Does NOT call functions requiring the crate-internal global runtime
     // (py_ucan_mint, py_event_log_checkpoint). Those are tested in unit tests.
     Python::with_gil(|py| {
-        let did_a = create_test_identity();
-        let ctx_id = create_test_context(&did_a);
+        let scp = _scp_core::scp::PyScp::new();
+        runtime::init_context_manager_for_test(scp.bridge_instance());
+        let did_a = create_test_identity(scp.bridge_instance());
+        let ctx_id = create_test_context(scp.bridge_instance(), &did_a);
 
-        runtime::with_context(&__bi(), &ctx_id, |rt| {
+        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
             rt.ceiling_strings.insert("tool_invoke:*".to_owned());
             rt.ceiling_strings.insert("messages:write".to_owned());
             Ok(())
@@ -1033,7 +1058,6 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
 
         // Register a tool using the helper.
         let reg = build_tool_reg(py, "cross_domain_tool", &did_a);
-        let scp = _scp_core::scp::PyScp::new();
         let tool_id = scp.tool_register(&ctx_id, &reg.as_borrowed()).unwrap();
         assert!(!tool_id.is_empty());
 
@@ -1042,7 +1066,7 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
         assert!(vr.passed);
 
         // Append an event and query.
-        runtime::with_context(&__bi(), &ctx_id, |rt| {
+        runtime::with_context(scp.bridge_instance(), &ctx_id, |rt| {
             let event = scp_event_log::Event {
                 event_type: scp_event_log::EventType::ContextCreated,
                 actor_did: scp_identity::DID(did_a.clone()),
@@ -1057,9 +1081,7 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
         })
         .unwrap();
 
-        let events = _scp_core::scp::PyScp::new()
-            .event_log_query(py, &ctx_id, None)
-            .unwrap();
+        let events = scp.event_log_query(py, &ctx_id, None).unwrap();
         assert!(!events.is_empty());
 
         // Revoke a token (revoker is the context creator).
@@ -1069,7 +1091,7 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
         scp.ucan_revoke(&ctx_id, dummy, &did_a).unwrap();
 
         // Evaluate provenance.
-        let q = _scp_core::scp::PyScp::new()
+        let q = scp
             .evaluate_provenance_quality(Some(ctx_id), "persistent", "active", None)
             .unwrap();
         assert!(q <= 3);
