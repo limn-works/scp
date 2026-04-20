@@ -389,16 +389,19 @@ async function opIdentityCreate(
   const seedHex =
     typeof req.args.seed_hex === "string" ? req.args.seed_hex : undefined;
   if (req.bridgeMode === "napi") {
-    const bridge = await loadNapi();
+    // Go through the raw napi addon (not the TS SDK wrapper) because the
+    // wrapper's `identityCreate(custody)` signature intentionally drops
+    // the optional `seed` parameter — seeded identity creation is a
+    // parity-harness affordance, not a public SDK surface. The raw
+    // addon's `identityCreate(custody, seed?: Buffer)` is what the
+    // bridge tests exercise directly.
+    const addon = await loadNapiAddon();
     const seed = seedFromHex(seedHex, false);
-    // Pass `seed` through even when undefined — the bridge's
-    // `identityCreate(custody, seed)` signature accepts `Option<Buffer>`
-    // which surfaces as `Buffer | null | undefined` on the JS side.
-    const handle = await bridge.identityCreate(custody, seed);
+    const handle = await addon.identityCreate(custody, seed);
     return {
       did: handle.did,
       custody,
-      verifying_key: handle.verifyingKey ?? null,
+      verifying_key: handle.verifyingKey ?? handle.verifying_key ?? null,
     };
   }
   const { raw } = await loadWasm();
@@ -518,12 +521,25 @@ async function opEventLogAppend(
 // Shared tool registration body — pinned across bridges in
 // `seed_operations.py::OP_TOOL_REGISTER`. Keep the shape aligned with
 // the scp-core ToolRegistration: name, description, schema {input,
-// output}, operator_did. Schemas are trivial objects (the parity
-// assertion is on `tool_id`, not schema content).
+// output}, operator_did. Schemas carry 2 fields each to satisfy
+// `MIN_SCHEMA_FIELDS = 2` in `validate_specificity_floor` — one side
+// must declare at least two distinct properties.
 const PARITY_TOOL_NAME = "parity_probe";
 const PARITY_TOOL_SCHEMA = {
-  input: { type: "object", properties: { x: { type: "integer" } } },
-  output: { type: "object", properties: { y: { type: "integer" } } },
+  input: {
+    type: "object",
+    properties: {
+      x: { type: "integer" },
+      label: { type: "string" },
+    },
+  },
+  output: {
+    type: "object",
+    properties: {
+      y: { type: "integer" },
+      status: { type: "string" },
+    },
+  },
 };
 const PARITY_TOOL_CEILING = [
   "messages:read",
@@ -752,15 +768,20 @@ async function opSignMessage(req: BridgeRequest): Promise<Record<string, unknown
       ? Number(req.args.signed_at_override)
       : undefined;
   if (req.bridgeMode === "napi") {
-    const bridge = await loadNapi();
+    // Use the raw addon: the TS SDK wrapper's `identityCreate(custody)` and
+    // `scpidSign(did, keyId, challengeJson)` intentionally drop `seed` and
+    // `signed_at_override` respectively — those are parity-harness
+    // affordances gated at the bridge layer, not public SDK surface. The
+    // raw addon exposes the full signatures the bridge registers.
+    const addon = await loadNapiAddon();
     const seed = seedFromHex(seedHex, false);
-    const identity = await bridge.identityCreate("in_memory", seed);
-    const challenge = bridge.scpidChallenge(audience, ttl);
+    const identity = await addon.identityCreate("in_memory", seed);
+    const challenge = addon.scpidChallenge(audience, ttl);
     // Rewrite challenge fields so issued_at/expires_at cover the override.
     const patched = patchChallengeForOverride(challenge, signedAtOverride);
     const overrideArg =
       signedAtOverride === undefined ? null : BigInt(signedAtOverride);
-    const responseJson = bridge.scpidSign(
+    const responseJson = addon.scpidSign(
       identity.did,
       "#active",
       patched,

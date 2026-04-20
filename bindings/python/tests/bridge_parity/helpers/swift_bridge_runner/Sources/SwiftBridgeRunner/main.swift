@@ -339,10 +339,30 @@ func opIdentityCreate(_ req: BridgeRequest) async throws -> [String: JSONValue] 
     // — the bridge falls back to OS entropy.
     let seed = req.args["seed_hex"]?.stringValue.flatMap { seedFromHex($0) }
     let identity = try await identityCreate(custody: custody, seed: seed)
-    return [
+    var out: [String: JSONValue] = [
         "did": .string(identity.did()),
         "custody": .string(custody)
     ]
+    // Normalise `#0` verifying-key to base64 to match the PyO3/NAPI/WASM
+    // output shape. The UniFFI `verifyingKey()` getter returns hex;
+    // other bridges emit base64 from `base64::encode(&pub_bytes)`.
+    if let hex = identity.verifyingKey() {
+        let bytes = hexToBytes(hex)
+        out["verifying_key"] = .string(bytes.base64EncodedString())
+    }
+    return out
+}
+
+private func hexToBytes(_ hex: String) -> Data {
+    precondition(hex.count % 2 == 0, "hex string length must be even")
+    var out = Data(capacity: hex.count / 2)
+    var idx = hex.startIndex
+    while idx < hex.endIndex {
+        let next = hex.index(idx, offsetBy: 2)
+        out.append(UInt8(hex[idx..<next], radix: 16)!)
+        idx = next
+    }
+    return out
 }
 
 func opContextCreate(_ req: BridgeRequest) async throws -> [String: JSONValue] {
@@ -431,8 +451,11 @@ func opToolRegister(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     let handle = try await contextCreate(
         identity: identity, params: buildContextParams(ceiling: ceiling)
     )
-    let inputSchema = "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}}}"
-    let outputSchema = "{\"type\":\"object\",\"properties\":{\"y\":{\"type\":\"integer\"}}}"
+    // Two-field schemas to satisfy `validate_specificity_floor`
+    // (MIN_SCHEMA_FIELDS = 2). Kept aligned with the PyO3/Node/Kotlin
+    // fixtures so tool_id parity holds across every bridge.
+    let inputSchema = "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"},\"label\":{\"type\":\"string\"}}}"
+    let outputSchema = "{\"type\":\"object\",\"properties\":{\"y\":{\"type\":\"integer\"},\"status\":{\"type\":\"string\"}}}"
     let toolId = try await toolRegister(
         handle: handle,
         definition: ToolDefinition(

@@ -662,7 +662,7 @@ jobs:
         run: |
           source .venv/bin/activate
           cd bindings/python
-          maturin develop --release --features scp-core/testing,allow_in_memory_custody
+          maturin develop --release --features scp-core/testing,allow_in_memory_custody,testing
       - name: Build NAPI native addon
         run: |
           cargo build -p scp-ffi-napi --release \
@@ -762,7 +762,7 @@ jobs:
         run: |
           source .venv/bin/activate
           cd bindings/python
-          maturin develop --release --features scp-core/testing,allow_in_memory_custody
+          maturin develop --release --features scp-core/testing,allow_in_memory_custody,testing
       - name: Build UniFFI cdylib
         run: |
           cargo build -p scp-ffi-uniffi --features allow_in_memory_custody,testing
@@ -823,7 +823,7 @@ jobs:
         run: |
           source .venv/bin/activate
           cd bindings/python
-          maturin develop --release --features scp-core/testing,allow_in_memory_custody
+          maturin develop --release --features scp-core/testing,allow_in_memory_custody,testing
       - name: Build XCFramework (dev mode — macOS arm64 only)
         run: bindings/swift/build-xcframework.sh --dev
       - name: Build Swift parity runner

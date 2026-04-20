@@ -269,7 +269,27 @@ private suspend fun opIdentityCreate(args: JsonObject): JsonObject {
     return buildJsonObject {
         put("did", JsonPrimitive(identity.did()))
         put("custody", JsonPrimitive(custody))
+        // `verifyingKey()` is the hex-encoded Ed25519 `#0` identity-key.
+        // The PyO3/NAPI/WASM runners return this base64-encoded under
+        // the key name `verifying_key` — normalise here to the same
+        // base64 shape (the harness consumes raw strings — matching
+        // case-sensitively against PyO3's base64 output).
+        val verifyingKeyHex = identity.verifyingKey()
+        if (verifyingKeyHex != null) {
+            val keyBytes = hexToBytes(verifyingKeyHex)
+            val base64 = java.util.Base64.getEncoder().encodeToString(keyBytes)
+            put("verifying_key", JsonPrimitive(base64))
+        }
     }
+}
+
+private fun hexToBytes(hex: String): ByteArray {
+    require(hex.length % 2 == 0) { "hex string length must be even" }
+    val out = ByteArray(hex.length / 2)
+    for (i in out.indices) {
+        out[i] = ((hex[i * 2].digitToInt(16) shl 4) or hex[i * 2 + 1].digitToInt(16)).toByte()
+    }
+    return out
 }
 
 private suspend fun opContextCreate(args: JsonObject): JsonObject {
@@ -358,8 +378,13 @@ private suspend fun opToolRegister(args: JsonObject): JsonObject {
     val ceiling = ceilingFromArgs(args, PARITY_TOOL_CEILING)
     val identity = uniffi.scp.identityCreate("in_memory", null)
     val handle = uniffi.scp.contextCreate(identity, buildContextParams(ceiling))
-    val inputSchema = """{"type":"object","properties":{"x":{"type":"integer"}}}"""
-    val outputSchema = """{"type":"object","properties":{"y":{"type":"integer"}}}"""
+    // Two-field schemas on both sides to satisfy
+    // `validate_specificity_floor` (MIN_SCHEMA_FIELDS = 2). Matches the
+    // PyO3 and Node fixtures so tool_id parity holds across every bridge.
+    val inputSchema =
+        """{"type":"object","properties":{"x":{"type":"integer"},"label":{"type":"string"}}}"""
+    val outputSchema =
+        """{"type":"object","properties":{"y":{"type":"integer"},"status":{"type":"string"}}}"""
     val toolId = uniffi.scp.toolRegister(
         handle,
         uniffi.scp.ToolDefinition(

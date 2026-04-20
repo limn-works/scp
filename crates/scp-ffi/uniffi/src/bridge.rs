@@ -7332,13 +7332,6 @@ pub async fn event_log_query(
     crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
-            // Ensure UCAN state (which contains the event log) is registered.
-            crate::runtime::ensure_ucan_registered(
-                &handle.context_id,
-                &handle.creator_did,
-                &handle.ceiling_strings,
-            );
-
             // Parse optional filter JSON.
             let filter: Option<serde_json::Value> = match filter_json {
                 Some(ref json_str) => {
@@ -7352,23 +7345,27 @@ pub async fn event_log_query(
                 None => None,
             };
 
+            // Accept both snake_case (existing UniFFI contract) and camelCase
+            // (cross-bridge parity harness sends from TypeScript) spellings for
+            // every filter field so the same filter surface works through every
+            // code path below. Mirrors NAPI (`event_log.rs`).
             let filter_event_type = filter
                 .as_ref()
-                .and_then(|f| f.get("event_type"))
-                .and_then(|v| v.as_str())
+                .and_then(|f| f.get("event_type").or_else(|| f.get("eventType")))
+                .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
             let filter_actor_did = filter
                 .as_ref()
-                .and_then(|f| f.get("actor_did"))
-                .and_then(|v| v.as_str())
+                .and_then(|f| f.get("actor_did").or_else(|| f.get("actorDid")))
+                .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
             let filter_after_seq = filter
                 .as_ref()
-                .and_then(|f| f.get("after_sequence"))
+                .and_then(|f| f.get("after_sequence").or_else(|| f.get("afterSequence")))
                 .and_then(serde_json::Value::as_u64);
             let filter_before_seq = filter
                 .as_ref()
-                .and_then(|f| f.get("before_sequence"))
+                .and_then(|f| f.get("before_sequence").or_else(|| f.get("beforeSequence")))
                 .and_then(serde_json::Value::as_u64);
             #[allow(clippy::cast_possible_truncation)]
             let filter_limit = filter
@@ -7376,6 +7373,80 @@ pub async fn event_log_query(
                 .and_then(|f| f.get("limit"))
                 .and_then(serde_json::Value::as_u64)
                 .map(|v| v as usize);
+
+            // Try the ContextManager's authoritative Merkle event log first —
+            // the lifecycle events (`ContextCreated`, `MemberJoined`, …) are
+            // appended there by `MerkleEventLogProvider`, NOT into the
+            // per-context UCAN state log. NAPI (`napi/src/event_log.rs`)
+            // solved the same fresh-context parity issue this way. Falls back
+            // to the UCAN state log below if the manager has no entries.
+            let context_id_str = handle.context_id.clone();
+            let ctx_id_bytes = scp_core::context::context_id_bytes(&context_id_str);
+            let manager_entries = crate::runtime::context_manager()
+                .ok()
+                .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten());
+
+            if let Some(entries) = manager_entries
+                && !entries.is_empty()
+            {
+                let mut results: Vec<Event> = Vec::new();
+                for (idx, entry) in entries.iter().enumerate() {
+                    let sequence = idx as u64;
+                    if let Some(after) = filter_after_seq
+                        && sequence <= after
+                    {
+                        continue;
+                    }
+                    if let Some(before) = filter_before_seq
+                        && sequence >= before
+                    {
+                        continue;
+                    }
+                    if let Some(ref et) = filter_event_type
+                        && entry.event != *et
+                    {
+                        continue;
+                    }
+                    // `EventLogEntry` does not carry an actor DID in the bridge
+                    // mapping (NAPI sets this to an empty string too); an
+                    // `actor_did` filter can only match the empty string.
+                    if let Some(ref actor) = filter_actor_did
+                        && !actor.is_empty()
+                    {
+                        continue;
+                    }
+
+                    let payload_json = serde_json::json!({
+                        "hash": hex::encode(entry.hash),
+                    })
+                    .to_string();
+
+                    results.push(Event {
+                        event_type: entry.event.clone(),
+                        actor_did: String::new(),
+                        timestamp: entry.timestamp,
+                        payload_json,
+                        sequence,
+                    });
+
+                    if let Some(lim) = filter_limit
+                        && results.len() >= lim
+                    {
+                        break;
+                    }
+                }
+
+                return Ok(results);
+            }
+
+            // Ensure UCAN state (which contains the event log) is registered
+            // for the fallback path that reads from the per-context UCAN
+            // state event log.
+            crate::runtime::ensure_ucan_registered(
+                &handle.context_id,
+                &handle.creator_did,
+                &handle.ceiling_strings,
+            );
 
             // Pre-compute timestamp for the fallback summary event outside the
             // closure so we can propagate clock errors properly.
