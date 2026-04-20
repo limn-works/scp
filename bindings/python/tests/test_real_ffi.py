@@ -56,20 +56,17 @@ def session_scp() -> SCP:
     test still receives its own handles and identities. The instance is
     torn down after the session via the finalizer in ``SCP.__exit__``.
 
-    Note: the SDK wrapper is layered over ``_scp_core.SCP.default_instance()``
-    because the bridge's ``PyContextHandle::new`` stamps the default
-    instance's id (Phase 4 PR 1 handle-affinity wiring is incomplete for
-    fresh instances). Wiring handle-affinity through caller-owned
-    instances is a Phase 4 PR 5+ concern; until then, real-FFI tests
-    dispatch through the default bridge to keep ``context_join`` /
-    ``context_send`` / etc. from tripping ``SCP-PERM-3030``.
+    Phase 4 PR 4 (#1549) removed the process-global default bridge
+    instance; every caller now threads an explicit ``SCP()`` through.
+    Handle-affinity is wired through caller-owned instances, so this
+    fixture simply constructs a fresh bridge for the session.
     """
     wrapper = SCP.__new__(SCP)
-    wrapper._native = _scp_core.SCP.default_instance()
+    wrapper._native = _scp_core.SCP()
     yield wrapper
-    # No shutdown: the default instance is shared with any other session-
-    # scoped consumers in this process. The bridge tears it down in its own
-    # module finalizer.
+    # No shutdown here: session-scoped bridge is reaped when the process
+    # exits. Explicit shutdown would race with any lingering asyncio
+    # receivers that outlive the last test (rare but observed).
 
 
 @pytest.fixture(scope="session", autouse=True)

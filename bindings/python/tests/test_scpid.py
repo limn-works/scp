@@ -46,20 +46,20 @@ from scp_sdk.sync import run_sync
 from scp_sdk.types import CustodyType
 
 # ---------------------------------------------------------------------------
-# SCP fixture — overrides conftest to share the default bridge instance
+# SCP fixture — overrides conftest to expose the raw bridge handle directly
 # ---------------------------------------------------------------------------
 #
 # scpid_sign dispatches on the identity's DID via the bridge's identity
 # registry; identities created via ``Identity.create*`` register into
-# that same shared registry. Until caller-owned instances fully carry
-# handle-affinity (Phase 4 PR 5+), tests wire through
-# ``_scp_core.SCP.default_instance()``.
+# the same bridge instance, so a fresh ``SCP()`` per test gives each
+# test an isolated registry. Phase 4 PR 4 (#1549) removed the
+# process-global default instance; every caller owns its own bridge.
 
 
 @pytest.fixture
 def scp() -> SCP:
     wrapper = SCP.__new__(SCP)
-    wrapper._native = _scp_core.SCP.default_instance()
+    wrapper._native = _scp_core.SCP()
     return wrapper
 
 

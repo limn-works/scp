@@ -61,15 +61,13 @@ from scp_sdk import SCP
 def session_scp() -> SCP:
     """Session-wide :class:`scp_sdk.SCP` that owns the relay wiring.
 
-    Layered over ``_scp_core.SCP.default_instance()`` because the bridge
-    handles are stamped with the default instance's id by
-    ``PyContextHandle::new``; Phase 4 PR 1 handle-affinity wiring for
-    caller-owned instances is a separate follow-up. Until that lands,
-    real-FFI tests must dispatch through the default bridge to avoid
-    ``SCP-PERM-3030`` rejections on ``context_join`` / ``context_send``.
+    Phase 4 PR 4 (#1549) removed the process-global default bridge
+    instance; every caller now owns its own ``SCP()``. Handle-affinity
+    is wired end-to-end for caller-owned instances, so a fresh bridge
+    for the session is the canonical shape.
     """
     wrapper = SCP.__new__(SCP)
-    wrapper._native = _scp_core.SCP.default_instance()
+    wrapper._native = _scp_core.SCP()
     yield wrapper
 
 

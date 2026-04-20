@@ -258,15 +258,12 @@ class NodeHandle:
 class SCP:
     """Caller-owned SCP bridge instance (ADR-048 multi-instance).
 
-    Use :meth:`default_instance` for the process-global default instance
-    (deprecated — scheduled for removal two release cycles after Phase 4
-    merge) or the constructor/:meth:`with_storage` / :meth:`with_persistence`
-    for a fresh instance.
+    Construct via ``SCP()`` / :meth:`with_storage` / :meth:`with_persistence`.
+    Phase 4 PR 4 (#1549) removed the process-global ``default_instance``
+    factory; every caller now owns an explicit bridge instance.
     """
 
     def __new__(cls) -> SCP: ...
-    @staticmethod
-    def default_instance() -> SCP: ...
     @staticmethod
     def with_persistence() -> SCP: ...
     @staticmethod
