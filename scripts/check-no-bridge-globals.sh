@@ -12,7 +12,7 @@
 #   crates/scp-ffi/common/src/ (shared bridge-runtime helpers)
 # must either
 #   (a) be on the explicit allowlist of process-global statics that the plan
-#       deliberately retained (DEFAULT_BRIDGE_INSTANCE, RUNTIME, HANDLE_COUNT,
+#       deliberately retained (RUNTIME, HANDLE_COUNT,
 #       SHARED_DHT_CLIENT, INSTANCE_ID_COUNTER, or a `std::sync::Once` init
 #       guard used for one-time setup like `tracing_subscriber::init`), OR
 #   (b) be grandfathered against the ratchet baseline in
@@ -97,8 +97,12 @@ fi
 # Allowlist of module-level static NAMES that the plan deliberately retains
 # as process-global. Any other module-level static is counted against the
 # ratchet.
+#
+# `DEFAULT_BRIDGE_INSTANCE` was removed from this allowlist in Phase 4 PR 4
+# (2026-04-19) — the OnceLock itself was deleted alongside the free-function
+# façade in that PR, so any new occurrence is a regression, not a permitted
+# global.
 ALLOWLIST=(
-    DEFAULT_BRIDGE_INSTANCE
     RUNTIME
     HANDLE_COUNT
     SHARED_DHT_CLIENT

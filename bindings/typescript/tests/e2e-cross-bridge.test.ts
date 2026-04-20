@@ -228,7 +228,6 @@ if (napiBridge === null || serverAddon === null || wasmModule === null) {
 
   describe("Cross-bridge identity creation", () => {
     test("NAPI and WASM both create valid did:dht identities", async () => {
-      // SCP-DEFAULT-INSTANCE-OK: raw NAPI/WASM bridge test; bypasses SDK facade by design
       const napiIdentity = await napi.identityCreate("in_memory");
       const wasmIdentity = await wasm.identity_create("in_memory");
 
@@ -242,7 +241,6 @@ if (napiBridge === null || serverAddon === null || wasmModule === null) {
 
     test("Node DID, NAPI-created DID, and WASM-created DID are all distinct", async () => {
       const nodeDid = nodeHandle?.did ?? "";
-      // SCP-DEFAULT-INSTANCE-OK: raw NAPI/WASM bridge test; bypasses SDK facade by design
       const napiDid = (await napi.identityCreate("in_memory")).did;
       const wasmDid = (await wasm.identity_create("in_memory")).did;
 

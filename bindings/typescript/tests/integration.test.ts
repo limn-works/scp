@@ -44,33 +44,26 @@ afterEach(async () => {
 
 describe("Identity runtime (mock bridge)", () => {
   it("creates an identity with a valid did:dht DID", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.identityCreate("in_memory");
     expect(handle.did).toMatch(/^did:dht:[a-z2-7]{52}$/);
     expect(handle.custodyType).toBe("in_memory");
   });
 
   it("creates identities with unique DIDs", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const h1 = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const h2 = await mockBridge.identityCreate("in_memory");
     expect(h1.did).not.toBe(h2.did);
   });
 
   it("loads an existing identity by DID", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const created = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const loaded = await mockBridge.identityLoad(created.did);
     expect(loaded.did).toBe(created.did);
     expect(loaded.custodyType).toBe("in_memory");
   });
 
   it("resolves a DID to a DID document", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const doc = await mockBridge.identityResolve(handle.did);
     expect(doc.id).toBe(handle.did);
     expect(doc.verificationMethods.length).toBeGreaterThanOrEqual(1);
@@ -79,15 +72,12 @@ describe("Identity runtime (mock bridge)", () => {
   });
 
   it("rotates a key and returns the same DID", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const rotated = await mockBridge.identityRotateKey(handle);
     expect(rotated.did).toBe(handle.did);
   });
 
   it("rejects invalid DID format on load", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await expect(mockBridge.identityLoad("not-a-did")).rejects.toThrow(/SCP-IDENT-1001/);
   });
 });
@@ -98,9 +88,7 @@ describe("Identity runtime (mock bridge)", () => {
 
 describe("Context runtime (mock bridge)", () => {
   it("creates a context and returns active state", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -114,9 +102,7 @@ describe("Context runtime (mock bridge)", () => {
   });
 
   it("records ContextCreated event on creation", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -130,18 +116,14 @@ describe("Context runtime (mock bridge)", () => {
   });
 
   it("allows join and records MemberJoined event", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const creator = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const joiner = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       creator,
       JSON.stringify({
         ceiling: ["messages:read"],
       }),
     );
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextJoin(ctx, joiner.did);
     const events = await mockBridge.eventLogQuery(ctx, {
       eventType: "MemberJoined",
@@ -151,9 +133,7 @@ describe("Context runtime (mock bridge)", () => {
   });
 
   it("sends a message and delivers to subscribers", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -162,14 +142,12 @@ describe("Context runtime (mock bridge)", () => {
     );
 
     const received: Array<{ senderDid: string; content: string | Uint8Array }> = [];
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSubscribe(ctx, identity.did, {
       onMessage: (msg) => received.push(msg),
       onComplete: () => {},
     });
 
     const payload = new TextEncoder().encode("hello world");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSend(ctx, identity.did, payload);
 
     expect(received.length).toBe(1);
@@ -178,9 +156,7 @@ describe("Context runtime (mock bridge)", () => {
   });
 
   it("leave records MemberLeft and notifies subscribers", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -189,7 +165,6 @@ describe("Context runtime (mock bridge)", () => {
     );
 
     let completed = false;
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSubscribe(ctx, identity.did, {
       onMessage: () => {},
       onComplete: () => {
@@ -197,7 +172,6 @@ describe("Context runtime (mock bridge)", () => {
       },
     });
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextLeave(ctx, identity.did);
     expect(completed).toBe(true);
 
@@ -208,20 +182,16 @@ describe("Context runtime (mock bridge)", () => {
   });
 
   it("close transitions context to closed state", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
         ceiling: ["messages:read"],
       }),
     );
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextClose(ctx, identity.did);
 
     // Operations on closed context should fail
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await expect(mockBridge.contextSend(ctx, identity.did, new Uint8Array([1]))).rejects.toThrow(
       /SCP-CTX-2030/,
     );
@@ -234,9 +204,7 @@ describe("Context runtime (mock bridge)", () => {
 
 describe("Tool runtime (mock bridge)", () => {
   it("registers a tool and returns a tool ID", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -258,9 +226,7 @@ describe("Tool runtime (mock bridge)", () => {
   });
 
   it("invokes a tool with a handler and returns output", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -297,9 +263,7 @@ describe("Tool runtime (mock bridge)", () => {
   });
 
   it("rejects tool invocation without a UCAN token", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -323,9 +287,7 @@ describe("Tool runtime (mock bridge)", () => {
   });
 
   it("rejects tool invocation with an empty UCAN token", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -349,9 +311,7 @@ describe("Tool runtime (mock bridge)", () => {
   });
 
   it("rejects tool invocation with a revoked UCAN token", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -381,9 +341,7 @@ describe("Tool runtime (mock bridge)", () => {
   });
 
   it("verifies a tool with test vectors — pass", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -415,9 +373,7 @@ describe("Tool runtime (mock bridge)", () => {
   });
 
   it("verifies a tool with test vectors — fail", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -445,9 +401,7 @@ describe("Tool runtime (mock bridge)", () => {
   });
 
   it("rejects invocation for nonexistent tool", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -468,9 +422,7 @@ describe("Tool runtime (mock bridge)", () => {
   // toolInvoke argument; verify it round-trips through the bridge
   // and is recorded in the mock bridge's ToolInvoked event payload.
   it("forwards spendingUcan through bridge.toolInvoke", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -594,9 +546,7 @@ describe("Tool runtime (mock bridge)", () => {
 
 describe("UCAN runtime (mock bridge)", () => {
   it("mints a UCAN token with capabilities", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -604,7 +554,6 @@ describe("UCAN runtime (mock bridge)", () => {
       }),
     );
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const memberDid = (await mockBridge.identityCreate("in_memory")).did;
     const token = await mockBridge.ucanMint(ctx, memberDid, ["messages:read"]);
 
@@ -617,9 +566,7 @@ describe("UCAN runtime (mock bridge)", () => {
   });
 
   it("validates a minted token for a granted capability", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -627,19 +574,15 @@ describe("UCAN runtime (mock bridge)", () => {
       }),
     );
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const memberDid = (await mockBridge.identityCreate("in_memory")).did;
     const token = await mockBridge.ucanMint(ctx, memberDid, ["messages:read"]);
 
     // Should not throw
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.ucanValidate(ctx, token.encoded, "messages:read");
   });
 
   it("rejects validation for an ungranted capability", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -647,20 +590,16 @@ describe("UCAN runtime (mock bridge)", () => {
       }),
     );
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const memberDid = (await mockBridge.identityCreate("in_memory")).did;
     const token = await mockBridge.ucanMint(ctx, memberDid, ["messages:read"]);
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await expect(mockBridge.ucanValidate(ctx, token.encoded, "messages:write")).rejects.toThrow(
       /SCP-PERM-3002/,
     );
   });
 
   it("revokes a token and rejects subsequent validation", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -668,13 +607,11 @@ describe("UCAN runtime (mock bridge)", () => {
       }),
     );
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const memberDid = (await mockBridge.identityCreate("in_memory")).did;
     const token = await mockBridge.ucanMint(ctx, memberDid, ["messages:read"]);
 
     await mockBridge.ucanRevoke(ctx, token.encoded, identity.did);
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await expect(mockBridge.ucanValidate(ctx, token.encoded, "messages:read")).rejects.toThrow(
       /SCP-PERM-3001/,
     );
@@ -687,9 +624,7 @@ describe("UCAN runtime (mock bridge)", () => {
 
 describe("Event log runtime (mock bridge)", () => {
   it("queries all events in a context", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -697,9 +632,7 @@ describe("Event log runtime (mock bridge)", () => {
       }),
     );
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSend(ctx, identity.did, new TextEncoder().encode("msg1"));
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSend(ctx, identity.did, new TextEncoder().encode("msg2"));
 
     const events = await mockBridge.eventLogQuery(ctx, undefined);
@@ -711,9 +644,7 @@ describe("Event log runtime (mock bridge)", () => {
   });
 
   it("filters events by type", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -721,7 +652,6 @@ describe("Event log runtime (mock bridge)", () => {
       }),
     );
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSend(ctx, identity.did, new TextEncoder().encode("msg"));
 
     const events = await mockBridge.eventLogQuery(ctx, {
@@ -732,11 +662,8 @@ describe("Event log runtime (mock bridge)", () => {
   });
 
   it("filters events by actor DID", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const creator = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const other = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       creator,
       JSON.stringify({
@@ -744,11 +671,8 @@ describe("Event log runtime (mock bridge)", () => {
       }),
     );
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextJoin(ctx, other.did);
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSend(ctx, creator.did, new TextEncoder().encode("from creator"));
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSend(ctx, other.did, new TextEncoder().encode("from other"));
 
     const events = await mockBridge.eventLogQuery(ctx, {
@@ -762,9 +686,7 @@ describe("Event log runtime (mock bridge)", () => {
   });
 
   it("verifies an inclusion proof for a known event", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -781,9 +703,7 @@ describe("Event log runtime (mock bridge)", () => {
   });
 
   it("returns non-verified for an out-of-range leaf index", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -799,9 +719,7 @@ describe("Event log runtime (mock bridge)", () => {
   });
 
   it("creates a checkpoint with root hash and event count", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -809,7 +727,6 @@ describe("Event log runtime (mock bridge)", () => {
       }),
     );
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSend(ctx, identity.did, new TextEncoder().encode("msg"));
 
     const checkpoint = await mockBridge.eventLogCheckpoint(ctx, identity.did, 0);
@@ -896,9 +813,7 @@ describe("SDK class wiring (type-safe delegation)", () => {
 
 describe("Trust evaluation runtime (mock bridge)", () => {
   it("computes behavioral record from event log", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({
@@ -1047,13 +962,10 @@ describe("Participation verification (mock bridge)", () => {
 describe("End-to-end context lifecycle", () => {
   it("create -> join -> send -> receive -> leave -> close", async () => {
     // Create identities
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const alice = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const bob = await mockBridge.identityCreate("in_memory");
 
     // Create context
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       alice,
       JSON.stringify({
@@ -1064,26 +976,22 @@ describe("End-to-end context lifecycle", () => {
     );
 
     // Bob joins
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextJoin(ctx, bob.did);
 
     // Subscribe to messages
     const messages: Array<{ senderDid: string; contextId: string }> = [];
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSubscribe(ctx, bob.did, {
       onMessage: (msg) => messages.push({ senderDid: msg.senderDid, contextId: msg.contextId }),
       onComplete: () => {},
     });
 
     // Alice sends a message
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSend(ctx, alice.did, new TextEncoder().encode("hello bob"));
     expect(messages.length).toBe(1);
     expect(messages[0]?.senderDid).toBe(alice.did);
     expect(messages[0]?.contextId).toBe(ctx.contextId);
 
     // Bob sends a message
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSend(ctx, bob.did, new TextEncoder().encode("hello alice"));
     expect(messages.length).toBe(2);
     expect(messages[1]?.senderDid).toBe(bob.did);
@@ -1093,11 +1001,9 @@ describe("End-to-end context lifecycle", () => {
     expect(allEvents.length).toBe(4); // Created + Joined + 2 Sent
 
     // Bob leaves
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextLeave(ctx, bob.did);
 
     // Alice closes
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextClose(ctx, alice.did);
 
     // Verify final event log
@@ -1112,11 +1018,8 @@ describe("End-to-end context lifecycle", () => {
 
 describe("UCAN full lifecycle", () => {
   it("mint -> validate -> revoke -> validation fails", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const admin = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const member = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       admin,
       JSON.stringify({
@@ -1129,16 +1032,13 @@ describe("UCAN full lifecycle", () => {
     expect(token.capabilities).toEqual(["messages:read", "messages:write"]);
 
     // Validate succeeds
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.ucanValidate(ctx, token.encoded, "messages:read");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.ucanValidate(ctx, token.encoded, "messages:write");
 
     // Revoke (revoker is the admin/context creator)
     await mockBridge.ucanRevoke(ctx, token.encoded, admin.did);
 
     // Validate fails after revocation
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await expect(mockBridge.ucanValidate(ctx, token.encoded, "messages:read")).rejects.toThrow(
       /SCP-PERM-3001/,
     );
@@ -1151,9 +1051,7 @@ describe("UCAN full lifecycle", () => {
 
 describe("Economic policy roundtrip (mock bridge)", () => {
   it("set then get returns the same policy JSON", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"] }),
@@ -1173,9 +1071,7 @@ describe("Economic policy roundtrip (mock bridge)", () => {
   });
 
   it("get returns null when no policy is set", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"] }),
@@ -1238,9 +1134,7 @@ describe("EconomicPolicy schema validation", () => {
 
 describe("TTL operations (mock bridge)", () => {
   it("handleTtlExpiry transitions context to expired", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
@@ -1252,9 +1146,7 @@ describe("TTL operations (mock bridge)", () => {
   });
 
   it("proposeTtlExtension returns true for single-member context", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
@@ -1266,16 +1158,12 @@ describe("TTL operations (mock bridge)", () => {
   });
 
   it("proposeTtlExtension returns false for multi-member context", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const alice = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const bob = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       alice,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
     );
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextJoin(ctx, bob.did);
 
     const approved = await mockBridge.contextProposeTtlExtension(ctx, alice.did, 120);
@@ -1284,9 +1172,7 @@ describe("TTL operations (mock bridge)", () => {
   });
 
   it("resetTtlTimer replaces TTL with new duration", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
@@ -1303,9 +1189,7 @@ describe("TTL operations (mock bridge)", () => {
 
 describe("Context export/import (mock bridge)", () => {
   it("exports and re-imports a context", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
@@ -1315,7 +1199,6 @@ describe("Context export/import (mock bridge)", () => {
     expect(exported).toBeInstanceOf(Uint8Array);
     expect(exported.length).toBeGreaterThan(0);
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const importedId = await mockBridge.contextImport(exported);
     expect(importedId).toBe(ctx.contextId);
 
@@ -1325,7 +1208,6 @@ describe("Context export/import (mock bridge)", () => {
   });
 
   it("import rejects malformed data", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await expect(mockBridge.contextImport(new TextEncoder().encode("not json{"))).rejects.toThrow(
       /SCP-CTX-2032/,
     );
@@ -1333,23 +1215,17 @@ describe("Context export/import (mock bridge)", () => {
 
   it("import rejects missing snapshot", async () => {
     await expect(
-      // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
       mockBridge.contextImport(new TextEncoder().encode(JSON.stringify({}))),
     ).rejects.toThrow(/SCP-CTX-2032/);
   });
 
   it("round-trips broadcast context with subscribers and blocked list", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(identity, JSON.stringify({ mode: "Broadcast" }));
 
     // Add subscribers and block one
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const sub1 = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const sub2 = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const blocked = await mockBridge.identityCreate("in_memory");
 
     await mockBridge.broadcastSubscribe(ctx, sub1.did);
@@ -1369,7 +1245,6 @@ describe("Context export/import (mock bridge)", () => {
     // Remove the original so import creates a fresh entry
     mockBridge._contexts.delete(ctx.contextId);
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const importedId = await mockBridge.contextImport(exported);
     expect(importedId).toBe(ctx.contextId);
 
@@ -1383,9 +1258,7 @@ describe("Context export/import (mock bridge)", () => {
   });
 
   it("round-trips encrypted context preserving mode", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"] }),
@@ -1394,7 +1267,6 @@ describe("Context export/import (mock bridge)", () => {
     const exported = await mockBridge.contextExport(ctx);
     mockBridge._contexts.delete(ctx.contextId);
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const importedId = await mockBridge.contextImport(exported);
     const imported = mockBridge._contexts.get(importedId);
     expect(imported?.mode).toBe("Encrypted");
@@ -1410,17 +1282,13 @@ describe("Context export/import (mock bridge)", () => {
 
 describe("Drain events (mock bridge)", () => {
   it("drains events from context", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
     );
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSend(ctx, identity.did, new TextEncoder().encode("msg1"));
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSend(ctx, identity.did, new TextEncoder().encode("msg2"));
 
     const events = await mockBridge.contextDrainEvents(ctx);
@@ -1433,15 +1301,12 @@ describe("Drain events (mock bridge)", () => {
   });
 
   it("drain clears receive buffer but preserves event log", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const ctx = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
     );
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSend(ctx, identity.did, new TextEncoder().encode("msg1"));
 
     const drained = await mockBridge.contextDrainEvents(ctx);
@@ -1465,9 +1330,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
   });
 
   it("handleTtlExpiry delegates to bridge", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
@@ -1479,9 +1342,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
   });
 
   it("proposeTtlExtension delegates to bridge", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
@@ -1493,9 +1354,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
   });
 
   it("proposeTtlExtension rejects zero or negative seconds", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
@@ -1507,9 +1366,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
   });
 
   it("resetTtlTimer delegates to bridge", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
@@ -1521,9 +1378,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
   });
 
   it("resetTtlTimer rejects zero or negative seconds", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
@@ -1535,9 +1390,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
   });
 
   it("extendTtl rejects zero or negative seconds", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
@@ -1549,9 +1402,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
   });
 
   it("extendTtl rejects Infinity and -Infinity", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
@@ -1563,9 +1414,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
   });
 
   it("proposeTtlExtension rejects Infinity and -Infinity", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
@@ -1577,9 +1426,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
   });
 
   it("resetTtlTimer rejects Infinity and -Infinity", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
@@ -1591,9 +1438,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
   });
 
   it("export returns Uint8Array", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"] }),
@@ -1607,9 +1452,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
 
   it("static import returns context ID", async () => {
     _setBridge(scp, mockBridge);
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"] }),
@@ -1622,16 +1465,13 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
   });
 
   it("drainEvents returns event strings", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
     );
     const ctx = Context._fromHandle(handle, identity.did, scp);
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     await mockBridge.contextSend(handle, identity.did, new TextEncoder().encode("hello"));
 
     const events = await ctx.drainEvents();
@@ -1642,9 +1482,7 @@ describe("Context SDK wrapper — TTL, export/import, drain", () => {
   });
 
   it("methods throw on disposed context", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(
       identity,
       JSON.stringify({ ceiling: ["messages:read"], ttlSeconds: 300 }),
@@ -1671,20 +1509,16 @@ describe("UCAN delegation (SDK wrapper)", () => {
   });
 
   it("delegateUcan delegates to bridge and returns delegated token", async () => {
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const admin = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(
       admin,
       JSON.stringify({ ceiling: ["messages:read", "messages:write"] }),
     );
     const ctx = Context._fromHandle(handle, admin.did, scp);
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const memberDid = (await mockBridge.identityCreate("in_memory")).did;
     const parentToken = await mintUcan(ctx, memberDid, ["messages:read", "messages:write"]);
 
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const delegateeDid = (await mockBridge.identityCreate("in_memory")).did;
     const delegated = await delegateUcan(ctx, parentToken, memberDid, delegateeDid, [
       "messages:read",
@@ -1704,9 +1538,7 @@ describe("UCAN delegation (SDK wrapper)", () => {
 describe("Broadcast mutation operations (mock bridge)", () => {
   async function createBroadcastContext() {
     _setBridge(scp, mockBridge);
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, JSON.stringify({ mode: "Broadcast" }));
     const ctx = Context._fromHandle(handle, identity.did, scp);
     return { identity, handle, ctx };
@@ -1714,7 +1546,6 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
   it("broadcastSubscribe adds a subscriber", async () => {
     const { ctx } = await createBroadcastContext();
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const subscriber = await mockBridge.identityCreate("in_memory");
 
     await ctx.broadcastSubscribe(subscriber.did);
@@ -1725,12 +1556,9 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
   it("broadcastSubscribe rejects non-broadcast context", async () => {
     _setBridge(scp, mockBridge);
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, JSON.stringify({ mode: "Encrypted" }));
     const ctx = Context._fromHandle(handle, identity.did, scp);
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const subscriber = await mockBridge.identityCreate("in_memory");
 
     await expect(ctx.broadcastSubscribe(subscriber.did)).rejects.toThrow("not a broadcast context");
@@ -1738,7 +1566,6 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
   it("broadcastUnsubscribe removes a subscriber", async () => {
     const { ctx } = await createBroadcastContext();
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const subscriber = await mockBridge.identityCreate("in_memory");
 
     await ctx.broadcastSubscribe(subscriber.did);
@@ -1751,7 +1578,6 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
   it("broadcastUnsubscribe with rotateKeys=false does not trigger key rotation", async () => {
     const { ctx, handle } = await createBroadcastContext();
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const subscriber = await mockBridge.identityCreate("in_memory");
 
     await ctx.broadcastSubscribe(subscriber.did);
@@ -1768,7 +1594,6 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
   it("broadcastUnsubscribe with rotateKeys=true triggers key rotation", async () => {
     const { ctx, handle } = await createBroadcastContext();
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const subscriber = await mockBridge.identityCreate("in_memory");
 
     await ctx.broadcastSubscribe(subscriber.did);
@@ -1795,7 +1620,6 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
   it("broadcastPublish rejects non-member author", async () => {
     const { ctx } = await createBroadcastContext();
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const nonMember = await mockBridge.identityCreate("in_memory");
     const payload = new Uint8Array([1, 2, 3]);
 
@@ -1804,7 +1628,6 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
   it("broadcastBlockSubscriber removes and blocks a subscriber", async () => {
     const { ctx, identity } = await createBroadcastContext();
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const subscriber = await mockBridge.identityCreate("in_memory");
 
     await ctx.broadcastSubscribe(subscriber.did);
@@ -1817,7 +1640,6 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
   it("broadcastBlockSubscriber prevents re-subscribe", async () => {
     const { ctx, identity } = await createBroadcastContext();
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const subscriber = await mockBridge.identityCreate("in_memory");
 
     await ctx.broadcastSubscribe(subscriber.did);
@@ -1829,7 +1651,6 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
   it("broadcastUnblockSubscriber allows re-subscribe after unblock", async () => {
     const { ctx, identity } = await createBroadcastContext();
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const subscriber = await mockBridge.identityCreate("in_memory");
 
     await ctx.broadcastSubscribe(subscriber.did);
@@ -1845,7 +1666,6 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
   it("broadcastHandleKeyRequest grants key to subscribed DID", async () => {
     const { ctx, identity } = await createBroadcastContext();
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const subscriber = await mockBridge.identityCreate("in_memory");
 
     await ctx.broadcastSubscribe(subscriber.did);
@@ -1856,7 +1676,6 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
   it("broadcastHandleKeyRequest denies key to non-subscribed DID", async () => {
     const { ctx, identity } = await createBroadcastContext();
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const nonSubscriber = await mockBridge.identityCreate("in_memory");
 
     const decision = await ctx.broadcastHandleKeyRequest(identity.did, nonSubscriber.did);
@@ -1865,7 +1684,6 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
   it("broadcastHandleKeyRequest denies key to blocked DID", async () => {
     const { ctx, identity } = await createBroadcastContext();
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const subscriber = await mockBridge.identityCreate("in_memory");
 
     await ctx.broadcastSubscribe(subscriber.did);
@@ -1878,9 +1696,7 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
   it("broadcastSubscriberCount returns null for non-broadcast context", async () => {
     _setBridge(scp, mockBridge);
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, JSON.stringify({ mode: "Encrypted" }));
     const ctx = Context._fromHandle(handle, identity.did, scp);
 
@@ -1894,9 +1710,7 @@ describe("Broadcast mutation operations (mock bridge)", () => {
 
   it("broadcastAdmission returns null for non-broadcast context", async () => {
     _setBridge(scp, mockBridge);
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const identity = await mockBridge.identityCreate("in_memory");
-    // SCP-DEFAULT-INSTANCE-OK: mockBridge from createMockBridge(); bypasses default bridge
     const handle = await mockBridge.contextCreate(identity, JSON.stringify({ mode: "Encrypted" }));
     const ctx = Context._fromHandle(handle, identity.did, scp);
 

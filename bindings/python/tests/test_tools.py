@@ -132,7 +132,6 @@ class TestChainDepthValidation:
         mock_bridge = MagicMock()
         mock_bridge.tool_invoke_cross_context.return_value = {"ok": True}
         with patch("scp_sdk.tools._scp_core", mock_bridge):
-            # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.tools._scp_core
             result = await invoke_cross_context(
                 scp=MagicMock(),
                 source_context_id=_DUMMY_CTX_SRC,
@@ -149,7 +148,6 @@ class TestChainDepthValidation:
         mock_bridge = MagicMock()
         mock_bridge.tool_invoke_cross_context.return_value = {"ok": True}
         with patch("scp_sdk.tools._scp_core", mock_bridge):
-            # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.tools._scp_core
             result = await invoke_cross_context(
                 scp=MagicMock(),
                 source_context_id=_DUMMY_CTX_SRC,
@@ -166,7 +164,6 @@ class TestChainDepthValidation:
         mock_bridge = MagicMock()
         with patch("scp_sdk.tools._scp_core", mock_bridge):
             with pytest.raises(ValidationError, match="chain_depth") as exc_info:
-                # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.tools._scp_core
                 await invoke_cross_context(
                     scp=MagicMock(),
                     source_context_id=_DUMMY_CTX_SRC,
@@ -183,7 +180,6 @@ class TestChainDepthValidation:
         mock_bridge = MagicMock()
         with patch("scp_sdk.tools._scp_core", mock_bridge):
             with pytest.raises(ValidationError, match="chain_depth") as exc_info:
-                # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.tools._scp_core
                 await invoke_cross_context(
                     scp=MagicMock(),
                     source_context_id=_DUMMY_CTX_SRC,
@@ -200,7 +196,6 @@ class TestChainDepthValidation:
         mock_bridge = MagicMock()
         with patch("scp_sdk.tools._scp_core", mock_bridge):
             with pytest.raises(ValidationError, match="chain_depth") as exc_info:
-                # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.tools._scp_core
                 await invoke_cross_context(
                     scp=MagicMock(),
                     source_context_id=_DUMMY_CTX_SRC,
@@ -217,7 +212,6 @@ class TestChainDepthValidation:
         mock_bridge = MagicMock()
         with patch("scp_sdk.tools._scp_core", mock_bridge):
             with pytest.raises(ValidationError, match="chain_depth") as exc_info:
-                # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.tools._scp_core
                 await invoke_cross_context(
                     scp=MagicMock(),
                     source_context_id=_DUMMY_CTX_SRC,
@@ -234,7 +228,6 @@ class TestChainDepthValidation:
         mock_bridge = MagicMock()
         with patch("scp_sdk.tools._scp_core", mock_bridge):
             with pytest.raises(ValidationError, match="chain_depth") as exc_info:
-                # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.tools._scp_core
                 await invoke_cross_context(
                     scp=MagicMock(),
                     source_context_id=_DUMMY_CTX_SRC,

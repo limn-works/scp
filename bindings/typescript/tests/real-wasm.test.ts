@@ -335,16 +335,13 @@ if (bridge === null || wasmModule === null) {
 
   describe("Identity (real WASM)", () => {
     test("creates an in-memory identity with a valid did:dht DID", async () => {
-      // SCP-DEFAULT-INSTANCE-OK: raw WASM bridge test; bypasses SDK facade by design
       const handle = await wasm.identityCreate("in_memory");
       expect(handle.did).toMatch(/^did:dht:/);
       expect(handle.custodyType).toBe("in_memory");
     });
 
     test("creates two identities with distinct DIDs", async () => {
-      // SCP-DEFAULT-INSTANCE-OK: raw WASM bridge test; bypasses SDK facade by design
       const a = await wasm.identityCreate("in_memory");
-      // SCP-DEFAULT-INSTANCE-OK: raw WASM bridge test; bypasses SDK facade by design
       const b = await wasm.identityCreate("in_memory");
       expect(a.did).not.toBe(b.did);
     });

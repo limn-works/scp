@@ -156,7 +156,6 @@ class TestUcanMintProofsFalsy:
 
         bridge = _make_mock_ucan_bridge()
         with patch("scp_sdk.ucan._scp_core", bridge):
-            # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.ucan._scp_core
             await mint(
                 scp=MagicMock(),
                 audience="did:dht:zBob",
@@ -174,7 +173,6 @@ class TestUcanMintProofsFalsy:
 
         bridge = _make_mock_ucan_bridge()
         with patch("scp_sdk.ucan._scp_core", bridge):
-            # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.ucan._scp_core
             await mint(
                 scp=MagicMock(),
                 audience="did:dht:zBob",
@@ -191,7 +189,6 @@ class TestUcanMintProofsFalsy:
 
         bridge = _make_mock_ucan_bridge()
         with patch("scp_sdk.ucan._scp_core", bridge):
-            # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.ucan._scp_core
             await mint(
                 scp=MagicMock(),
                 audience="did:dht:zBob",

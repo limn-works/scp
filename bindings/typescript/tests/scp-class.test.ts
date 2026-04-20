@@ -120,7 +120,6 @@ describe.skipIf(!addon)(`SCP class (Phase 4 PR 1) [${skipReason}]`, () => {
       return;
     }
     const defaultInstance = addon.SCP.default();
-    // SCP-DEFAULT-INSTANCE-OK: verifies default-instance handle stamping invariant
     const identity = await addon.identityCreate("in_memory");
     expect(typeof identity.instanceId).toBe("string");
     expect(identity.instanceId).not.toBe("0");

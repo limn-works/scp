@@ -538,18 +538,15 @@ class TestStdioAllowlistApi:
     def test_configure_with_no_binaries_is_noop(self) -> None:
         """Calling with no binaries should not error."""
         # This returns early before calling the bridge, so no bridge needed.
-        # SCP-DEFAULT-INSTANCE-OK: pure-Python validation path; returns before bridge call
         configure_stdio_allowlist()
 
     def test_disable_requires_confirmation(self) -> None:
         """disable_stdio_allowlist must receive i_trust_all_commands=True."""
         with pytest.raises(ValidationError, match="i_trust_all_commands"):
-            # SCP-DEFAULT-INSTANCE-OK: pure-Python validation path; returns before bridge call
             disable_stdio_allowlist()
 
     def test_disable_rejects_false_confirmation(self) -> None:
         with pytest.raises(ValidationError, match="i_trust_all_commands"):
-            # SCP-DEFAULT-INSTANCE-OK: pure-Python validation path; returns before bridge call
             disable_stdio_allowlist(i_trust_all_commands=False)
 
 

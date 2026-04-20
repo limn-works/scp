@@ -1,7 +1,7 @@
 # ADR-048: SCP as First-Class Multi-Instance SDK Object
 
-**Status:** Proposed
-**Date:** 2026-04-18
+**Status:** Accepted
+**Date:** 2026-04-18 (re-scoped 2026-04-19 — façade deleted in PR 4, no deprecation window)
 **Phase:** Phase 4 remainder (issue #1549)
 **Related:** ADR-021 (UniFFI Bridge), ADR-022 (Language Bindings), ADR-028 (Kotlin SDK), ADR-034 (WASM Constraints), ADR-043 (Scope Registration as Handle Convention, phase-3), ADR-046 (Bridge Parity Harness, sibling), ADR-047 (Bridge Symmetry Enforcement, sibling)
 
@@ -49,18 +49,21 @@ The class is named after the protocol, not after internal plumbing. This matches
 
 Every shared helper in `scp-ffi-common` operates on `&dyn BridgeInstanceCore`. Per-bridge callers pass their concrete instance. The four `Box<dyn Any>` slots introduced in Phase 4a are removed. Type safety is compile-time; there are no runtime downcasts. This satisfies the CLAUDE.md rule "enforce mechanically — type system over documentation."
 
-### 3. Default-instance façade remains as a sunset scaffold
+### 3. Default-instance façade is DELETED in PR 4 (no deprecation window)
 
-`DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<{Py,Napi,Uniffi}BridgeInstance>>` (renamed from `BRIDGE_INSTANCE`; the concrete type varies per bridge — `PyBridgeInstance` in PyO3, `NapiBridgeInstance` in NAPI, `UniffiBridgeInstance` in UniFFI) stays in each bridge for one deprecation window. Existing free-function exports (`py_context_create`, `napi context_create`, UniFFI `context_create`) continue to work by forwarding to `SCP::default()`. Each forward emits a one-time deprecation warning per function name:
+**Re-scoped 2026-04-19 per builder tenet "no deferral" and pre-release posture (no external consumers).** The earlier draft of this ADR called for `DEFAULT_BRIDGE_INSTANCE` and every free-function façade to remain in place for a two-release-cycle sunset window. That plan is abandoned.
 
-- Python: `warnings.warn(..., DeprecationWarning)`
-- TypeScript: `console.warn(...)`
-- Swift: `@available(*, deprecated, message: "Use SCP().contextCreate(…) instead")`
-- Kotlin: `@Deprecated("Use SCP().contextCreate(…) instead")`
+The façade is **removed in PR 4 alongside the `SCP` migration**:
 
-Removal target: **two release cycles after Phase 4 merge.** At removal, `DEFAULT_BRIDGE_INSTANCE` and every free-function forward are deleted. Backward-compat during the deprecation window is functional equivalence, not byte-identical behavior — `DeprecationWarning` is intentional.
+- `DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<{Py,Napi,Uniffi}BridgeInstance>>` — deleted in all three bridges.
+- Every free-function export that forwarded to the default instance — deleted (`py_context_create`, `napi context_create`, UniFFI `context_create`, and every sibling on all three bridges).
+- `SCP.default()` factories on all four SDKs — deleted.
+- Deprecation scaffolding (`_deprecation.py`, `internal/deprecation.ts`, `@available(*, deprecated)`, `@Deprecated` annotations) — deleted. No `DeprecationWarning` is emitted because there is no façade left to deprecate.
+- `scripts/check-no-default-in-tests.sh` and every `SCP-DEFAULT-INSTANCE-OK: <reason>` opt-in tag — deleted. The gate exists to police use of a façade that no longer exists; the tags are attached to tests that no longer call deleted functions. Both are removed together.
 
-A CI gate (`scripts/check-no-default-in-tests.sh`) rejects test files that call the free-function façade unless they carry the tag `SCP-DEFAULT-INSTANCE-OK: <reason>`. Production callers get the deprecation warning at runtime; test suites get the mechanical gate immediately.
+**Rationale for the re-scope.** SCP is pre-release. There are no external callers of the free-function façade — every consumer lives in this repository. A deprecation window buys nothing a redundant migration cannot buy better: it adds a second round of churn (first to deprecated, then to deleted), keeps the test-serialization scaffolding live for the duration, and defers enforcement gates that the codebase was designed around. The builder tenet "no deferral" applies — the work is done now, in one PR, not split across two release cycles.
+
+Every call site that previously used the façade routes through a fresh `SCP()` instance per test, or through an application-owned `SCP` instance in long-lived code. Phases A-D of PR 4 migrated all four SDKs and all ~200 test files mechanically. Phase E (this phase) deletes the enforcement gate and opt-in tags that the migration made obsolete.
 
 ### 4. Handle affinity enforced via `instance_id: u64`
 
@@ -94,7 +97,7 @@ This is a breaking change versus the Phase 4a `shutdown()` that took no argument
 - **Multi-identity and multi-relay coexistence work.** A single process may hold multiple `SCP` instances, each with its own identity and its own relay connection. No shared mutable state leaks across them.
 - **Handle misuse is caught at the boundary.** Cross-instance handle reuse returns `SCP-PERM-3030` immediately, rather than corrupting silently.
 - **Shutdown is bounded and recoverable.** `shutdown(timeout)` drains outstanding work deterministically. Callers no longer deadlock on stuck tasks.
-- **Deprecation warnings during sunset window.** Every call to a free-function façade emits a one-time warning. External consumers may need to configure their test runners (`pytest -W default::DeprecationWarning`, Jest custom reporter) to avoid spurious failures — covered in the migration guide.
+- **No deprecation window.** The free-function façade is deleted in PR 4. There is no one-release-cycle tolerance period; every call site migrates in the same change that removes the façade. SCP is pre-release with no external consumers, so the cost of dropping the sunset window is zero and the benefit is eliminating a migration that would have to happen anyway two releases later.
 - **Breaking change to `shutdown` signature.** Documented in the migration guide with a minimal upgrade example.
 
 ## Rejected alternatives
@@ -155,7 +158,7 @@ Phase 4 remainder is four sequential PRs:
 1. **PR 1 — Foundation.** This ADR, the `SCP` class scaffold in all three bridges, `BridgeInstanceCore` trait + per-bridge concrete struct refactor, rename `BRIDGE_INSTANCE` → `DEFAULT_BRIDGE_INSTANCE`, deprecation scaffold on the free-function façade, `instance_id`-backed handle affinity, `shutdown(timeout)` signature change and plumbing. No singletons migrated yet — free functions still forward to the default instance.
 2. **PR 2 — Migrations + deletions + #1646.** Move every remaining per-identity singleton into typed fields on its per-bridge struct. Delete `EMPTY_IDENTITY_REGISTRY`, `EMPTY_UCAN_REGISTRY`, `BRIDGE_LIFECYCLE_SERIAL`. Fix `flush_all_contexts_sync` (AC3 bugs). Exhaustive security-reviewer audit of every path reaching ContextManager state.
 3. **PR 3 — Persistence + multi-relay + real UniFFI crypto.** [LANDED 2026-04-18.] Expose `SqliteStorage` via `SCP::with_storage`. Thread persistence provider through UniFFI `ContextManager::new()` (#1260). Make `resume()` async; restore contexts + reconnect transport using stored `pending_relay_url` (#1678). Wire real `MlsCryptoProvider` through UniFFI (#1342). Integration tests for multi-relay + suspend-kill-resume-restore. See **PR 3 actualized** section below for the final shape.
-4. **PR 4 — Tests + docs + enforcement.** Per-test `SCP` fixture codemod across all four SDKs. Spec clarifications for §3.7, §22.3.1, §22.3.5 (clarifications, not semantic changes — the spec just becomes explicit about "per-identity/per-context within an `SCP` instance"). CI gates (`check-no-bridge-globals.sh`, `check-once-lock-ratchet.sh`, `check-no-default-in-tests.sh`, `check-handle-affinity.sh`). SDK capability matrix updates. Migration guide for external SDK consumers.
+4. **PR 4 — Façade deletion + method migration + test codemod + enforcement.** (Re-scoped 2026-04-19.) (a) Every operation previously exposed as a free-function façade becomes an instance method on `PyScp` / `NapiScp` / `UniffiScp`. (b) Those methods are exposed in all four SDK wrappers. (c) Every free-function façade export is deleted, every `_deprecation.*` helper module removed, every `@available(*, deprecated)` / `@Deprecated` annotation stripped, `DEFAULT_BRIDGE_INSTANCE` `OnceLock` deleted in all three bridges, `SCP.default()` factory deleted in all four SDKs. (d) Every SDK test is rewritten to instantiate a fresh `SCP()` per test via the per-test fixture; the ~200-file mechanical codemod happens in this PR. (e) `scripts/check-no-default-in-tests.sh` gate and every `SCP-DEFAULT-INSTANCE-OK:` opt-in tag are deleted — the gate policed a façade that no longer exists. (f) This ADR is updated to reflect the outcome (façade DELETED in PR 4, no sunset window), and §3.7 / §22.3.1 / §22.3.5 carry the "per-identity/per-context within a single `SCP` instance" clarification. (g) Remaining CI gates stay in place and are verified to pass: `check-no-bridge-globals.sh` (with `DEFAULT_BRIDGE_INSTANCE` removed from the allowlist), `check-once-lock-ratchet.sh`, `check-no-fallback-registry.sh`, `check-handle-affinity.sh`. SDK capability matrix updated. CLAUDE.md enforcement-file list updated.
 
 PR 2 and PR 3 touch independent axes and may run concurrently after PR 1. PR 4 depends on all prior.
 
