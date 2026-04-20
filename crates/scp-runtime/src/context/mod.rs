@@ -27,6 +27,7 @@
 //! handles are serialized internally via `tokio::sync::RwLock`. See
 //! `.docs/standards/sdk-common.md` Concurrency Model.
 
+pub mod actor;
 pub mod app_sandbox;
 pub mod builder;
 pub mod export_import;
