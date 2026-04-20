@@ -34,6 +34,7 @@ pub mod governance;
 pub mod manager;
 pub mod policy;
 pub mod providers;
+pub mod supervisor;
 pub mod ttl;
 
 pub mod tools;
