@@ -103,6 +103,10 @@ ALLOWLIST=(
     _mcpAddon
     # server.ts — cached napi addon handle for Server bridge functions.
     _addon
+    # internal/bridge.ts — WASM runtime is intrinsically process-wide
+    # (wasm-bindgen writes global state in the WebAssembly instance);
+    # cannot be per-SCP like the native bridge. See ADR-048.
+    _wasmBridge
 )
 
 SCAN_DIR="bindings/typescript/src"
