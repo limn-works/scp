@@ -30,7 +30,7 @@
 //! on `BridgeInstance` (deleted as part of #1549 Phase 4 PR 1).
 
 use async_trait::async_trait;
-use scp_ffi_common::bridge_instance::{BridgeInstanceCore, ShutdownError, ShutdownOutcome};
+use scp_ffi_common::bridge_instance::BridgeInstanceCore;
 // Re-export `CoreFields` at `crate::runtime::CoreFields` so the
 // `uniffi_check_handle!` macro can refer to it as
 // `$crate::runtime::CoreFields`.
@@ -39,7 +39,6 @@ use scp_ffi_common::bridge_runtime::BridgeInMemoryStorage;
 use scp_ffi_common::error_codes as codes;
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use dashmap::DashMap;
 use scp_core::context::builder::{ContextCryptoProvider, ContextEventLogProvider};
@@ -479,30 +478,17 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         &self.core
     }
 
-    /// `UniFFI`-specific resume: flag flip, then transport reconnect, then
-    /// persisted-context restore.
-    ///
-    /// Mirrors the `PyO3` / NAPI overrides so Swift and Kotlin callers get
-    /// the same resume semantics as Python and TypeScript.
-    async fn resume(&self) -> Result<(), scp_ffi_common::bridge_instance::LifecycleError> {
-        self.core.resume().await?;
-        // Reconnect transport BEFORE rehydrating persisted contexts so
-        // restored subscriptions can attach to a live relay connection.
-        self.core.reconnect_transport_if_pending().await?;
-        self.core.restore_all_persisted_contexts().await;
-        Ok(())
-    }
+    // `resume` inherits the `BridgeInstanceCore` default (ADR-049 §11,
+    // landed in commit 6): flag flip + transport reconnect +
+    // persisted-context restore. Overriding here would diverge from
+    // the shared contract and be caught by the cross-bridge consistency
+    // gate `scripts/check-bridge-instance-lifecycle.py`.
 
-    async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
-        // `bridge_specific_shutdown` MUST run even when
-        // `shutdown_core_async` returns `AlreadyShutDown` — that variant
-        // signals the sync shutdown path raced ahead; without the cleanup
-        // call, typed UniFFI registries (UCAN, identity custody) leak
-        // key material past shutdown.
-        let result = self.core.shutdown_core_async(timeout).await;
-        self.bridge_specific_shutdown();
-        result
-    }
+    // `shutdown` inherits the `BridgeInstanceCore` default (ADR-049 §11,
+    // landed in commit 6): `core.shutdown_core_async(timeout).await +
+    // bridge_specific_shutdown()`. Overriding here would diverge from
+    // the shared contract and be caught by the cross-bridge consistency
+    // gate `scripts/check-bridge-instance-lifecycle.py`.
 
     fn bridge_specific_shutdown(&self) {
         // Clear typed registries. Dropping `Arc<OpaqueInMemoryKeyCustody>`

@@ -30,10 +30,19 @@
 
 #![deny(unsafe_code)]
 
+pub mod handle;
 mod identity_capability;
+pub mod key_package_actor;
 pub mod saga_journal;
 pub mod saga_prepared_state;
+#[allow(clippy::module_inception)]
+pub mod supervisor;
 
+pub use handle::SupervisorHandle;
+pub use key_package_actor::{
+    KP_MAILBOX_CAPACITY, KP_SEND_TIMEOUT, KeyPackageCommand, KeyPackagePrivateStub,
+    KeyPackageStoreActor, KeyPackageStoreHandle, KpRef, RelayUrl, ReservationId,
+};
 pub use saga_journal::{
     JournalEntry, JournalError, ProtocolRepositorySagaJournal, SAGA_JOURNAL_KEY_PREFIX, SagaId,
     SagaJournal, SagaState, SagaTerminalState,
@@ -41,4 +50,8 @@ pub use saga_journal::{
 pub use saga_prepared_state::{
     BroadcastHostingHandshakePrepared, ContextMigrationPrepared,
     CrossContextToolInvocationPrepared, SagaPreparedState, StandingPairCreatePrepared,
+};
+pub use supervisor::{
+    ACTOR_MAILBOX_CAPACITY, CrashWindow, PendingSagaProjection, SagaInput, SagaOutput, Supervisor,
+    SupervisorConfig,
 };

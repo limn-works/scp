@@ -1881,29 +1881,67 @@ pub trait BridgeInstanceCore: Send + Sync {
 
     /// Resumes the instance — see [`CoreFields::resume`].
     ///
-    /// Default implementation delegates to `CoreFields::resume` (flag flip
-    /// only). Per-bridge implementations override this to chain async work
-    /// such as transport reconnect and persisted-context restoration.
+    /// Default implementation (extended in commit 6 of the actor-per-context
+    /// refactor, ADR-049 §11):
+    ///
+    /// 1. Flip the suspended flag via [`CoreFields::resume`].
+    /// 2. Reconnect transport if a relay URL was retained via
+    ///    [`CoreFields::reconnect_transport_if_pending`] — the reconnect
+    ///    MUST precede persisted-context rehydration so restored
+    ///    subscriptions attach to a live relay connection.
+    /// 3. Rehydrate persisted contexts via
+    ///    [`CoreFields::restore_all_persisted_contexts`].
+    ///
+    /// Per-bridge concrete structs (`PyBridgeInstance`,
+    /// `NapiBridgeInstance`, `UniffiBridgeInstance`) MUST NOT override
+    /// this default. The CI gate
+    /// `scripts/check-bridge-instance-lifecycle.py` enforces the ban.
+    /// Bridges that need additional resume-time work add a
+    /// `post_resume_hook` (future extension; not yet defined because
+    /// no bridge currently requires one).
     ///
     /// # Errors
     ///
     /// Returns [`LifecycleError::AlreadyShutDown`] if the instance has
-    /// been permanently shut down.
+    /// been permanently shut down, or [`LifecycleError::ReconnectFailed`]
+    /// if transport reconnect raced to failure.
     async fn resume(&self) -> Result<(), LifecycleError> {
-        self.core().resume().await
+        self.core().resume().await?;
+        self.core().reconnect_transport_if_pending().await?;
+        self.core().restore_all_persisted_contexts().await;
+        Ok(())
     }
 
     /// Async shutdown with a graceful deadline.
     ///
-    /// Implementors typically delegate to
-    /// [`CoreFields::shutdown_core_async`] and then call
-    /// [`BridgeInstanceCore::bridge_specific_shutdown`] to clean up any
-    /// bridge-specific typed fields.
+    /// Default implementation (landed in commit 6 of the actor-per-context
+    /// refactor, ADR-049 §11) drains the core's async tasks under the
+    /// supplied timeout, then delegates to
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`] so per-bridge
+    /// concrete structs can drop their typed registries (MCP registries,
+    /// identity custody, etc.).
+    ///
+    /// `bridge_specific_shutdown` runs UNCONDITIONALLY — even when
+    /// [`CoreFields::shutdown_core_async`] returns
+    /// [`ShutdownError::AlreadyShutDown`]. That variant signals a race
+    /// between this call and a prior sync `shutdown()` / prior async call;
+    /// without invoking the bridge-specific cleanup, typed registries
+    /// would leak key material past shutdown.
+    ///
+    /// Per-bridge concrete structs (`PyBridgeInstance`,
+    /// `NapiBridgeInstance`, `UniffiBridgeInstance`) MUST NOT override
+    /// this default. Override `bridge_specific_shutdown` (and the
+    /// `pre_*_hook` / `post_*_hook` extension points) instead. The CI
+    /// gate `scripts/check-bridge-instance-lifecycle.py` enforces this.
     ///
     /// # Errors
     ///
     /// Returns [`ShutdownError::AlreadyShutDown`] on a second call.
-    async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError>;
+    async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
+        let result = self.core().shutdown_core_async(timeout).await;
+        self.bridge_specific_shutdown();
+        result
+    }
 
     /// Override hook for per-bridge concrete structs to drop their
     /// bridge-specific typed fields (MCP registries, custody store, etc.).
@@ -3711,11 +3749,11 @@ mod tests {
         fn core(&self) -> &CoreFields {
             &self.core
         }
-        async fn shutdown(&self, timeout: Duration) -> Result<ShutdownOutcome, ShutdownError> {
-            let outcome = self.core.shutdown_core_async(timeout).await?;
-            self.bridge_specific_shutdown();
-            Ok(outcome)
-        }
+        // `shutdown` inherits the trait default (landed in commit 6 of
+        // ADR-049): `self.core().shutdown_core_async(timeout).await +
+        // self.bridge_specific_shutdown()`. Overriding it here would
+        // diverge from production behavior and be caught by the
+        // cross-bridge consistency gate.
     }
 
     #[test]

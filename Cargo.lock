@@ -5429,11 +5429,13 @@ version = "0.1.0-beta.1"
 dependencies = [
  "aes",
  "aes-gcm",
+ "arc-swap",
  "async-trait",
  "base64",
  "bs58",
  "dashmap",
  "ed25519-dalek 2.2.0",
+ "futures",
  "hex",
  "hkdf",
  "jsonschema",

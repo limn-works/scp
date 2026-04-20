@@ -430,6 +430,36 @@ pub enum ContextError {
         /// Total number of send attempts.
         attempts: u32,
     },
+
+    /// A caller-side mailbox send exceeded the 30-second per-command
+    /// backpressure deadline (ADR-049 §"Mailbox parameters"). The target
+    /// [`ContextActor`](https://example.invalid) is draining slowly or
+    /// backed up; the caller's command was never delivered to the actor
+    /// and may be retried. Distinct from
+    /// [`Self::RateLimited`], which rejects pre-mailbox on capability
+    /// grounds.
+    ///
+    /// Mapped to canonical code `SCP-CTX-2130` through the bridge error
+    /// translators.
+    #[error("SCP-CTX-2130: actor is busy: {0}")]
+    ActorBusy(String),
+
+    /// A handler reached a code path that has not yet been migrated off
+    /// the legacy `ContextManager` surface (ADR-049 commit ladder — actor
+    /// handlers land incrementally in commits 7-11). The actor skeleton
+    /// wires every command variant to a concrete return value rather than
+    /// `unimplemented!()` / `todo!()` so the dispatch loop compiles and
+    /// test fixtures observe a typed error.
+    ///
+    /// Production callers MUST NOT observe this variant once commit 12 of
+    /// ADR-049 lands — by then every handler has migrated to the actor
+    /// path. The CI gates fail the build if this variant is reachable
+    /// from non-test code after that commit.
+    ///
+    /// Mapped to canonical code `SCP-CTX-2131` through the bridge error
+    /// translators.
+    #[error("SCP-CTX-2131: not implemented: {0}")]
+    NotImplemented(String),
 }
 
 // ---------------------------------------------------------------------------

@@ -62,6 +62,8 @@ subtle = { workspace = true }
 unicode-normalization = { workspace = true }
 metrics = { workspace = true }
 dashmap = { workspace = true }
+arc-swap = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

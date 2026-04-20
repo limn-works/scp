@@ -1,9 +1,18 @@
 //! Per-context actor module — owns `&mut PerContextState` by move.
 //!
-//! Introduced by commit 5 of the actor-per-context refactor (ADR-049 §1).
+//! # Clippy allows
 //!
-//! Commit 5 lands only the foundational types referenced by the actor's
-//! command-dispatch contract:
+//! `doc_markdown` / `too_long_first_doc_paragraph` — doc prose cites
+//! plan sections in quoted form (§"ContextActor", etc.).
+#![allow(clippy::doc_markdown, clippy::too_long_first_doc_paragraph)]
+//!
+//! Introduced by commit 5 of the actor-per-context refactor (ADR-049 §1).
+//! Commit 6 extends this module with the full actor skeleton
+//! ([`ContextActor`], [`ContextActorHandle`], [`ActorDeps`], the
+//! `handlers/` dispatch tree, and the command + state shapes the
+//! dispatch loop consumes).
+//!
+//! # Commit-5 foundations
 //!
 //! - [`outcome::Outcome`] — handler return type. Carries `mutated: bool`
 //!   so the actor knows when to mark its state dirty for coalesced
@@ -12,20 +21,309 @@
 //!   send-sequence number. Drop rolls back; explicit `commit()` makes
 //!   the reservation durable.
 //! - [`sequence::SendSequenceTracker`] — minimal monotonic counter the
-//!   reservation guards. The full per-actor send-sequence wiring is
-//!   delivered in a later commit; this commit lands the type so the RAII
-//!   semantics can be unit-tested in isolation.
+//!   reservation guards.
 //!
-//! Later commits (6+) flesh this module out with `ContextActor`,
-//! `ContextActorHandle`, `ActorDeps`, and the `handlers/` submodule.
+//! # Commit-6 additions
+//!
+//! - [`ContextActor`] — the actor struct and its `run()` dispatch loop.
+//! - [`commands::ContextCommand`] — outer enum + 12 sub-enums carrying
+//!   the domain-grouped handler routes.
+//! - [`handle::ContextActorHandle`] — the caller-side send-with-timeout
+//!   mailbox wrapper.
+//! - [`deps::ActorDeps`] — capability-reduced dependency bundle.
+//! - [`state::PerContextState`] — the owned state payload.
+//! - [`handlers`] — per-domain dispatch stubs (commits 7-11 migrate the
+//!   real handlers off `ContextManager`).
 
+pub mod commands;
+pub mod deps;
+pub mod handle;
+pub mod handlers;
 pub mod outcome;
 pub mod sequence;
+pub mod state;
 
+pub use commands::{
+    BroadcastCommand, ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand,
+    LifecycleControlCommand, MessagingCommand, QueriesCommand, SagaPhaseMessage, StandingCommand,
+    ToolsCommand, TrustRecoveryCommand, TtlCloseCommand,
+};
+pub use deps::ActorDeps;
+pub use handle::{ContextActorHandle, SEND_TIMEOUT};
 pub use outcome::Outcome;
 pub use sequence::{SendSequenceTracker, SequenceReservation};
+pub use state::{
+    AuthorKeyEntry, BroadcastRecvTracker, BroadcastState, ContextCryptoState, ContextEventLog,
+    ContextLifecycleState, ContextModeState, PerContextState, RecvSequenceTracker,
+    WelcomeProcessing, WrappingKeyPair,
+};
 
 /// Re-export of [`scp_protocol::context::ContextError`] for handler-side
-/// use. `Outcome<T>` carries `Result<T, ContextError>`; handlers in later
-/// commits will use this re-export rather than a deep path.
+/// use. `Outcome<T>` carries `Result<T, ContextError>`; handlers use this
+/// re-export rather than a deep path.
 pub use scp_protocol::context::ContextError;
+
+// ---------------------------------------------------------------------------
+// ContextActor — the per-context dispatch loop
+// ---------------------------------------------------------------------------
+
+use tokio::sync::mpsc;
+
+/// Per-context actor. Owns one [`PerContextState`] by move and processes
+/// commands from its inbox one at a time.
+///
+/// See plan §"ContextActor" for the full shape. Commit 6 lands the
+/// skeleton — the `run()` loop compiles and dispatches to the handler
+/// stubs; the real timer arms, persistence coalescing, and governance
+/// timeout fire-and-forget work lands alongside the handler migrations
+/// in commits 7-11.
+pub struct ContextActor {
+    /// Stable context identifier. Kept as a `String` alongside
+    /// [`PerContextState::context_id`] for tracing / logging — the
+    /// `state.context_id` is the canonical `[u8; 32]` hash.
+    #[allow(dead_code)] // read into log events when the watchdog lands
+    context_id: String,
+    /// Command inbox. Paired with the `Sender` held by
+    /// [`ContextActorHandle`].
+    inbox: mpsc::Receiver<ContextCommand>,
+    // NOTE — deliberately omitted until the migration commits wire real
+    // construction sites (plan §"Commit ladder" commits 7-11):
+    //
+    //   state: PerContextState,
+    //   deps: ActorDeps,
+    //   ttl_timer: Option<tokio::time::Interval>,
+    //   governance_timeout: Option<tokio::time::Sleep>,
+    //   last_persisted_at: std::time::Instant,
+    //   dirty: bool,
+    //
+    // The skeleton's `run()` loop only drives the inbox arm; landing
+    // these fields now with `Default::default()` would violate the
+    // "no hardcoded None in place of wired state" failure mode
+    // explicitly called out in plan §"Known failure modes". They land
+    // with the handlers that exercise them.
+}
+
+impl ContextActor {
+    /// Construct a fresh actor. `inbox` is paired with a
+    /// `Sender<ContextCommand>` held by one or more
+    /// [`ContextActorHandle`]s. The actor's `run()` loop exits when
+    /// either (a) every sender drops, making `inbox.recv()` return
+    /// `None`, or (b) a `LifecycleControlCommand::Shutdown` is received.
+    ///
+    /// Visibility is `pub(in crate::context)` — only
+    /// `crate::context::supervisor::supervisor` constructs actors
+    /// (commit 6's `Supervisor::spawn_actor`).
+    ///
+    /// `dead_code` allow: the only production caller is
+    /// `Supervisor::spawn_actor`, which is itself only exercised in
+    /// `#[cfg(test)]` until the lifecycle handler migrates in commit 9.
+    /// The non-test build sees `new` as uncalled because no production
+    /// path yet invokes `spawn_actor` — the allow is removed when that
+    /// path wires up.
+    #[allow(dead_code)]
+    pub(in crate::context) const fn new(
+        context_id: String,
+        inbox: mpsc::Receiver<ContextCommand>,
+    ) -> Self {
+        Self { context_id, inbox }
+    }
+
+    /// Dispatch loop. See plan §"ContextActor" for the full
+    /// four-arm `select!` shape that commits 7-11 build out. Commit 6's
+    /// loop is a single-arm variant: drain the inbox until it closes or
+    /// a terminal command arrives.
+    ///
+    /// The commit-6 loop is NOT yet wired to state-owning handlers
+    /// (`ContextActor` does not hold `state` / `deps` yet — see the
+    /// struct's field list). Received commands are matched to detect
+    /// the terminal `Shutdown` variant; all other variants receive an
+    /// immediate
+    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
+    /// reply via the command's embedded `oneshot::Sender`. This keeps
+    /// callers unblocked while the migration commits land.
+    pub async fn run(mut self) {
+        while let Some(cmd) = self.inbox.recv().await {
+            let is_shutdown = cmd.is_shutdown();
+            Self::skeleton_dispatch(cmd);
+            if is_shutdown {
+                break;
+            }
+        }
+    }
+
+    /// Skeleton dispatch — matches every variant and ACKs via the
+    /// embedded `oneshot::Sender`. Commits 7-11 replace this with the
+    /// real four-arm `tokio::select!` dispatch described in plan
+    /// §"ContextActor".
+    ///
+    /// The function body is a flat `match` on the outer
+    /// [`ContextCommand`] variants. Each arm routes to the matching
+    /// handler stub's dispatch path, which replies `NotImplemented` and
+    /// returns `Outcome::err`. Taking `Outcome` and ignoring it is fine
+    /// for the skeleton — the real actor (commits 7-11) uses the
+    /// `Outcome::mutated` flag to flip `self.dirty`.
+    ///
+    /// Lifecycle-control commands use a dedicated fast path that acks
+    /// with `Ok(())` so the bridge's `BridgeInstanceCore::suspend()`
+    /// default body can complete its pause/persist/shutdown sequence
+    /// without each actor returning `NotImplemented` on the control
+    /// channel (see `handlers/lifecycle_control.rs`).
+    #[allow(clippy::needless_pass_by_value)] // consumed by the dispatch
+    fn skeleton_dispatch(cmd: ContextCommand) {
+        // Route every variant to its matching handler's oneshot-ack so
+        // callers learn the outcome even while the real state is owned
+        // by the legacy `ContextManager`. We MUST route the oneshot
+        // sender out of the variant — synchronously, in this function
+        // — because the real handler modules take a
+        // `&mut PerContextState` which the skeleton actor does not
+        // carry yet. Reproducing the ack shape inline keeps the
+        // skeleton's mailbox contract (`send -> ack`) intact.
+        fn ack_not_impl<T>(
+            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+            which: &'static str,
+        ) {
+            let _ = reply.send(Err(ContextError::NotImplemented(format!(
+                "{which} — migrates in the matching handler commit of ADR-049"
+            ))));
+        }
+        fn ack_ok(reply: tokio::sync::oneshot::Sender<Result<(), ContextError>>) {
+            let _ = reply.send(Ok(()));
+        }
+
+        match cmd {
+            ContextCommand::Messaging(MessagingCommand::Placeholder { reply }) => {
+                ack_not_impl(reply, "messaging");
+            }
+            ContextCommand::Lifecycle(LifecycleCommand::Placeholder { reply }) => {
+                ack_not_impl(reply, "lifecycle");
+            }
+            ContextCommand::Governance(GovernanceCommand::Placeholder { reply }) => {
+                ack_not_impl(reply, "governance");
+            }
+            ContextCommand::Broadcast(BroadcastCommand::Placeholder { reply }) => {
+                ack_not_impl(reply, "broadcast");
+            }
+            ContextCommand::Economy(EconomyCommand::Placeholder { reply }) => {
+                ack_not_impl(reply, "economy");
+            }
+            ContextCommand::TrustRecovery(TrustRecoveryCommand::Placeholder { reply }) => {
+                ack_not_impl(reply, "trust_recovery");
+            }
+            ContextCommand::Standing(StandingCommand::Placeholder { reply }) => {
+                ack_not_impl(reply, "standing");
+            }
+            ContextCommand::TtlClose(TtlCloseCommand::Placeholder { reply }) => {
+                ack_not_impl(reply, "ttl_close");
+            }
+            ContextCommand::Tools(ToolsCommand::Placeholder { reply }) => {
+                ack_not_impl(reply, "tools");
+            }
+            ContextCommand::Queries(QueriesCommand::Placeholder { reply }) => {
+                ack_not_impl(reply, "queries");
+            }
+            ContextCommand::SagaPhase(SagaPhaseMessage::Placeholder { reply }) => {
+                ack_not_impl(reply, "saga_phase");
+            }
+            ContextCommand::LifecycleControl(LifecycleControlCommand::Pause { reply }) => {
+                // Ack Ok — the bridge's `suspend()` default body sends
+                // `Pause` and expects an Ok reply to proceed to
+                // `PersistSync`. Commit 11's real handler keeps the
+                // same Ok-on-pause contract.
+                ack_ok(reply);
+            }
+            ContextCommand::LifecycleControl(LifecycleControlCommand::PersistSync { reply }) => {
+                // Ack Ok — nothing to persist through the actor path
+                // yet (the legacy `ContextManager` still owns mutating
+                // paths until commit 12). Semantically equivalent to
+                // "flush buffer is empty, nothing to write".
+                ack_ok(reply);
+            }
+            ContextCommand::LifecycleControl(LifecycleControlCommand::Shutdown { reply }) => {
+                // Ack Ok and let the outer `run()` loop exit after this
+                // dispatch returns (the caller detected `is_shutdown`
+                // before invoking us).
+                ack_ok(reply);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn actor_acks_placeholder_command_with_not_implemented() {
+        let (tx, rx) = mpsc::channel::<ContextCommand>(1);
+        let actor = ContextActor::new("ctx-42".to_owned(), rx);
+        let actor_handle = tokio::spawn(actor.run());
+
+        let handle = ContextActorHandle::from_sender(tx);
+        let err = handle
+            .send(|reply| ContextCommand::Messaging(MessagingCommand::Placeholder { reply }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ContextError::NotImplemented(_)));
+
+        // Send a shutdown and let the actor exit cleanly.
+        handle.send_shutdown().await.unwrap();
+        actor_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_exits_on_inbox_close() {
+        let (tx, rx) = mpsc::channel::<ContextCommand>(1);
+        let actor = ContextActor::new("ctx-1".to_owned(), rx);
+        let actor_handle = tokio::spawn(actor.run());
+
+        // Drop every sender; actor should observe `None` on recv and
+        // exit without a Shutdown command.
+        drop(tx);
+
+        // Bound the wait so a regression that fails to exit is caught.
+        tokio::time::timeout(std::time::Duration::from_secs(2), actor_handle)
+            .await
+            .expect("actor must exit when every sender drops")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_pause_acks_ok_and_keeps_running() {
+        let (tx, rx) = mpsc::channel::<ContextCommand>(1);
+        let actor = ContextActor::new("ctx-1".to_owned(), rx);
+        let actor_handle = tokio::spawn(actor.run());
+
+        let handle = ContextActorHandle::from_sender(tx);
+        handle.send_pause().await.unwrap();
+        // Actor is still running; a subsequent command is processed.
+        let err = handle
+            .send(|reply| ContextCommand::Messaging(MessagingCommand::Placeholder { reply }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ContextError::NotImplemented(_)));
+
+        handle.send_shutdown().await.unwrap();
+        actor_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_shutdown_command_exits_loop_promptly() {
+        let (tx, rx) = mpsc::channel::<ContextCommand>(1);
+        let actor = ContextActor::new("ctx-1".to_owned(), rx);
+        let actor_handle = tokio::spawn(actor.run());
+
+        let handle = ContextActorHandle::from_sender(tx);
+        handle.send_shutdown().await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), actor_handle)
+            .await
+            .expect("actor must exit promptly after Shutdown")
+            .unwrap();
+    }
+}
