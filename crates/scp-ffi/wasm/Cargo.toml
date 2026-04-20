@@ -11,16 +11,14 @@ publish = false
 crate-type = ["cdylib"]
 
 [features]
-# Enables the did:key:{hex} DID format in resolve_public_key. This is a
-# non-standard test convenience — production builds must resolve via did:dht:z.
-# Also enables the `seed: Option<Vec<u8>>` parameter on `identity_create`
-# AND the `signed_at_override: Option<u64>` parameter on `scpid_sign` for
-# the cross-bridge parity harness (ADR-046). Under the seed path, a
-# distinct `#active` key is derived from `seed[32..64]` — matching scp-
-# core's two-key `DidDht::create` sequence — so `#active`-signed SCPID
-# responses are byte-exact across every bridge. Pulls in `rand` for the
-# `StdRng::from_seed` KDF — not needed in production WASM builds.
-testing = ["dep:rand"]
+# Enables the `signed_at_override: Option<u64>` parameter on `scpid_sign`
+# for the cross-bridge parity harness (ADR-046). Production WASM bundles
+# reject any non-`undefined` value. The two-key identity model (#0 and
+# #active, spec §3.2.1) and the seeded `identity_create` path are now
+# always compiled in — they match the other bridges' `DidDht::create`
+# behaviour and are required for production WASM compliance, so they
+# are no longer behind this feature.
+testing = []
 
 [dependencies]
 wasm-bindgen = "0.2"
@@ -46,10 +44,10 @@ getrandom = { version = "0.2", features = ["js"] }
 getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 ed25519-dalek = { workspace = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
-# Deterministic RNG (`StdRng::from_seed`) for the `testing`-gated seed
-# parameter on `identity_create`. Gated so production WASM bundles don't
-# include the extra code.
-rand = { workspace = true, optional = true }
+# Deterministic RNG (`StdRng::from_seed`) for the seeded path of
+# `identity_create`. The two-key model (§3.2.1) is always enabled, so
+# `rand` is a mandatory dependency for both production and testing builds.
+rand = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 base64 = { workspace = true }

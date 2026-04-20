@@ -514,8 +514,14 @@ _TOOL_CEILING = ["messages:read", "messages:write", "tool:register", "tool_invok
 _TOOL_NAME = "parity_probe"
 _EXPECTED_TOOL_ID = f"tool-{_TOOL_NAME}"
 _TOOL_SCHEMA: dict[str, Any] = {
-    "input_schema": {"type": "object", "properties": {"x": {"type": "integer"}}},
-    "output_schema": {"type": "object", "properties": {"y": {"type": "integer"}}},
+    "input_schema": {
+        "type": "object",
+        "properties": {"x": {"type": "integer"}, "label": {"type": "string"}},
+    },
+    "output_schema": {
+        "type": "object",
+        "properties": {"y": {"type": "integer"}, "status": {"type": "string"}},
+    },
 }
 
 
@@ -626,6 +632,20 @@ OP_UCAN_MINT = OpSpec(
     expected_values=(
         ("audience", _UCAN_MEMBER_DID),
         ("capability_count", len(_UCAN_REQUESTED_CAPS)),
+    ),
+    # WASM has no in-bridge key custody by design (ADR-034): UCAN
+    # signing MUST happen JS-side via `SubtleCrypto` through the TS
+    # SDK wrapper's `mintUcan()` method, which delegates to the WASM
+    # bridge for metadata assembly and then signs the envelope in JS.
+    # The parity harness here exercises the raw bridge, so WASM can't
+    # complete the mint. Lifting this xfail requires exercising the
+    # SDK wrapper in the WASM runner, which is cross-cutting enough
+    # to warrant a dedicated op rather than conflating SDK vs. bridge
+    # coverage inside `ucan_mint`.
+    xfail_bridges=("wasm",),
+    xfail_reason=(
+        "WASM UCAN mint requires JS-side custody (SubtleCrypto) via the TS SDK"
+        " wrapper; raw-bridge parity has no custody to drive it (ADR-034)."
     ),
 )
 

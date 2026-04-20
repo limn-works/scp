@@ -223,42 +223,59 @@ pub fn event_log_query(context: &WasmContextHandle, filter_json: Option<String>)
 
         let parsed = extract_filter(filter.as_ref());
 
-        let (count, root) =
-            with_manager(|mgr| mgr.event_log_query(&context_id)).map_err(ScpWasmError::into_js)?;
+        let event_type_filter = filter
+            .as_ref()
+            .and_then(|f| f.get("eventType").or_else(|| f.get("event_type")))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let actor_did_filter = filter
+            .as_ref()
+            .and_then(|f| f.get("actorDid").or_else(|| f.get("actor_did")))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let after_sequence = filter
+            .as_ref()
+            .and_then(|f| f.get("afterSequence").or_else(|| f.get("after_sequence")))
+            .and_then(serde_json::Value::as_u64);
+        let before_sequence = filter
+            .as_ref()
+            .and_then(|f| f.get("beforeSequence").or_else(|| f.get("before_sequence")))
+            .and_then(serde_json::Value::as_u64);
+
+        let events = with_manager(|mgr| mgr.event_log_query_events(&context_id))
+            .map_err(ScpWasmError::into_js)?;
 
         // Empty log → empty array.
-        if count == 0 {
+        if events.is_empty() {
             return Ok(JsValue::from_str("[]"));
         }
 
-        let payload = serde_json::json!({
-            "event_count": count,
-            "merkle_root": root,
-        });
-
-        #[allow(clippy::cast_precision_loss)]
-        let timestamp_f64 = crate::time::now_secs() as f64;
-        #[allow(clippy::cast_precision_loss)]
-        let sequence_f64 = count.saturating_sub(1) as f64;
-
-        let summary = serde_json::json!({
-            "eventType": "LogSummary",
-            "actorDid": "",
-            "timestamp": timestamp_f64,
-            "payloadJson": serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned()),
-            // Synthetic summary event sequence number for TypeScript adapter
-            // compatibility. This is NOT a real event sequence — it represents
-            // the last valid index in the log (count - 1). The NAPI bridge
-            // uses the same `count.saturating_sub(1) as f64` pattern. If this
-            // semantic needs to change, update both bridges together.
-            "sequence": sequence_f64,
-        });
-
-        // Apply `limit` — the only filter field parsed. Both bridges produce
-        // a single synthetic LogSummary event.
-        let events = [summary];
-        let result: Vec<&serde_json::Value> = events
-            .iter()
+        let result: Vec<serde_json::Value> = events
+            .into_iter()
+            .filter(|ev| {
+                event_type_filter
+                    .as_deref()
+                    .is_none_or(|want| ev.get("eventType").and_then(|v| v.as_str()) == Some(want))
+            })
+            .filter(|ev| {
+                actor_did_filter
+                    .as_deref()
+                    .is_none_or(|want| ev.get("actorDid").and_then(|v| v.as_str()) == Some(want))
+            })
+            .filter(|ev| {
+                let seq = ev
+                    .get("sequence")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation
+                )]
+                let seq_u64 = if seq < 0.0 { 0 } else { seq as u64 };
+                after_sequence.is_none_or(|lo| seq_u64 > lo)
+                    && before_sequence.is_none_or(|hi| seq_u64 < hi)
+            })
             .take(parsed.limit.unwrap_or(usize::MAX))
             .collect();
 
@@ -523,45 +540,43 @@ mod tests {
     // JSON output structure — validates the serialized event format
     // -----------------------------------------------------------------------
 
-    /// Helper: builds a `LogSummary` event JSON value matching the bridge output.
-    fn build_log_summary(count: u64, root: &str, timestamp: f64) -> serde_json::Value {
-        let payload = serde_json::json!({
-            "event_count": count,
-            "merkle_root": root,
-        });
-        #[allow(clippy::cast_precision_loss)]
-        let sequence_f64 = count.saturating_sub(1) as f64;
+    /// Helper: builds an event JSON value matching the bridge output shape
+    /// (`WasmContextManager::event_log_query_events`). Fields mirror the
+    /// TypeScript `Event` interface: `eventType`, `actorDid`, `timestamp`,
+    /// `payloadJson`, `sequence`.
+    fn build_event(
+        event_type: &str,
+        actor_did: &str,
+        timestamp: f64,
+        sequence: f64,
+    ) -> serde_json::Value {
         serde_json::json!({
-            "eventType": "LogSummary",
-            "actorDid": "",
+            "eventType": event_type,
+            "actorDid": actor_did,
             "timestamp": timestamp,
-            "payloadJson": serde_json::to_string(&payload).unwrap(),
-            "sequence": sequence_f64,
+            "payloadJson": "",
+            "sequence": sequence,
         })
     }
 
     #[test]
     fn json_output_has_required_event_fields() {
-        let event = build_log_summary(5, "abcd1234", 1_700_000_000.0);
-        assert_eq!(event["eventType"], "LogSummary");
-        assert_eq!(event["actorDid"], "");
+        let event = build_event("ContextCreated", "did:dht:zabc", 1_700_000_000.0, 0.0);
+        assert_eq!(event["eventType"], "ContextCreated");
+        assert_eq!(event["actorDid"], "did:dht:zabc");
         assert_eq!(event["timestamp"], 1_700_000_000.0);
-        assert_eq!(event["sequence"], 4.0);
-        // payloadJson is a nested JSON string.
-        let payload_str = event["payloadJson"].as_str().unwrap();
-        let payload: serde_json::Value = serde_json::from_str(payload_str).unwrap();
-        assert_eq!(payload["event_count"], 5);
-        assert_eq!(payload["merkle_root"], "abcd1234");
+        assert_eq!(event["sequence"], 0.0);
+        assert_eq!(event["payloadJson"], "");
     }
 
     #[test]
     fn json_output_wraps_in_array() {
-        let event = build_log_summary(1, "ffff", 100.0);
+        let event = build_event("ContextCreated", "", 100.0, 0.0);
         let events = vec![&event];
         let serialized = serde_json::to_string(&events).unwrap();
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&serialized).unwrap();
         assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0]["eventType"], "LogSummary");
+        assert_eq!(parsed[0]["eventType"], "ContextCreated");
     }
 
     #[test]

@@ -666,7 +666,7 @@ jobs:
       - name: Build NAPI native addon
         run: |
           cargo build -p scp-ffi-napi --release \
-            --features scp-ffi-napi/allow_in_memory_custody,scp-core/testing
+            --features scp-ffi-napi/allow_in_memory_custody,scp-ffi-napi/testing,scp-core/testing
       - name: Wire NAPI addon into node_modules
         run: |
           ARCH=$(uname -m)
@@ -693,7 +693,8 @@ jobs:
           # behind a bundler. `--target nodejs` emits a self-loading
           # CJS-compatible module that Bun can consume directly.
           cd crates/scp-ffi/wasm
-          wasm-pack build --target nodejs --release --out-dir pkg-node
+          wasm-pack build --target nodejs --release --out-dir pkg-node -- \
+            --features testing
       - name: Wire WASM package into node_modules
         run: |
           WASM_PKG_DIR="bindings/typescript/node_modules/@limn-works/scp-ts-wasm"
@@ -764,7 +765,7 @@ jobs:
           maturin develop --release --features scp-core/testing,allow_in_memory_custody
       - name: Build UniFFI cdylib
         run: |
-          cargo build -p scp-ffi-uniffi --features allow_in_memory_custody
+          cargo build -p scp-ffi-uniffi --features allow_in_memory_custody,testing
       - name: Generate UniFFI Kotlin bindings
         run: ./scripts/generate-uniffi-kotlin.sh --skip-build --features=allow_in_memory_custody
       - name: Build Kotlin parity runner (installDist)
