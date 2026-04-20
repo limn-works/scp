@@ -4353,6 +4353,130 @@ fn py_access_key_restore(context_id: &str, member_did: &str, caller_did: &str) -
         })
 }
 
+// ---------------------------------------------------------------------------
+// ADR-049 commit-11 shim entry points — 1 per domain routed through the
+// new supervisor dispatch methods. These exercise the command round-
+// trip at the FFI layer; they coexist with the direct-manager bridge
+// functions above, which will be migrated en masse in commit 12 when
+// `ContextManager` is deleted.
+// ---------------------------------------------------------------------------
+
+/// Query whether a standing (bilateral-persistent) context exists for
+/// the given peer DID.
+///
+/// Routes through the ADR-049 commit-11 standing shim
+/// ([`Supervisor::dispatch_standing_command`](scp_core::context::supervisor::Supervisor::dispatch_standing_command))
+/// rather than calling `ContextManager::has_standing_context` directly.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the supervisor is not initialized.
+#[pyfunction]
+#[pyo3(name = "standing_has_context_via_shim")]
+pub fn py_standing_has_context_via_shim(peer_did: &str) -> PyResult<bool> {
+    validate::validate_did(peer_did)?;
+    let rt = crate::runtime()?;
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = std::sync::Arc::clone(sup);
+
+    let did = scp_identity::DID::from(peer_did);
+    rt.block_on(async move {
+        use scp_core::context::actor::commands::StandingCommand;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sup.dispatch_standing_command(StandingCommand::HasStandingContext {
+            peer_did: did,
+            reply: tx,
+        })
+        .await
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_standing_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("standing shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(format!("has_standing_context: {e}")))
+    })
+}
+
+/// Try to consume one hard-rate-limit token. Routes through the
+/// ADR-049 commit-11 tools shim
+/// ([`Supervisor::dispatch_tools_command`](scp_core::context::supervisor::Supervisor::dispatch_tools_command)).
+///
+/// Returns `true` if a token was consumed OR the context is unknown
+/// (matches the legacy pass-through contract).
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the supervisor is not initialized.
+#[pyfunction]
+#[pyo3(name = "tools_try_consume_hard_rate_limit_via_shim")]
+pub fn py_tools_try_consume_hard_rate_limit_via_shim(
+    context_id: &str,
+    did: &str,
+    now_secs: u64,
+) -> PyResult<bool> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_did(did)?;
+    let rt = crate::runtime()?;
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = std::sync::Arc::clone(sup);
+
+    let ctx_id = context_id.to_owned();
+    let did_owned = scp_identity::DID::from(did);
+    rt.block_on(async move {
+        use scp_core::context::actor::commands::ToolsCommand;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sup.dispatch_tools_command(ToolsCommand::TryConsumeHardRateLimit {
+            context_id: ctx_id,
+            did: did_owned,
+            now_secs,
+            reply: tx,
+        })
+        .await
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_tools_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("tools shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(format!("try_consume_hard_rate_limit: {e}")))
+    })
+}
+
+/// Query the subscriber count for a broadcast context.
+///
+/// Routes through the ADR-049 commit-11 broadcast shim
+/// ([`Supervisor::dispatch_broadcast_command`](scp_core::context::supervisor::Supervisor::dispatch_broadcast_command)).
+/// Returns `None` if the context is unknown or not a broadcast context
+/// (legacy contract preserved).
+///
+/// # Errors
+///
+/// Returns `RuntimeError` if the supervisor is not initialized.
+#[pyfunction]
+#[pyo3(name = "broadcast_subscriber_count_via_shim")]
+pub fn py_broadcast_subscriber_count_via_shim(context_id: &str) -> PyResult<Option<usize>> {
+    validate::validate_context_id(context_id)?;
+    let rt = crate::runtime()?;
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = std::sync::Arc::clone(sup);
+
+    let ctx_id = context_id.to_owned();
+    rt.block_on(async move {
+        use scp_core::context::actor::commands::BroadcastCommand;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sup.dispatch_broadcast_command(BroadcastCommand::BroadcastSubscriberCount {
+            context_id: ctx_id,
+            reply: tx,
+        })
+        .await
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_broadcast_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("broadcast shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(format!("broadcast_subscriber_count: {e}")))
+    })
+}
+
 /// Registers all context bridge types and functions with the Python module.
 ///
 /// Called from `lib.rs` during module initialization.
@@ -4432,6 +4556,14 @@ pub fn register_context(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_access_key_generate, m)?)?;
     m.add_function(wrap_pyfunction!(py_access_key_revoke, m)?)?;
     m.add_function(wrap_pyfunction!(py_access_key_restore, m)?)?;
+    // ADR-049 commit-11 shim entry points — 1 per domain routed
+    // through the new supervisor dispatch methods.
+    m.add_function(wrap_pyfunction!(py_standing_has_context_via_shim, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        py_tools_try_consume_hard_rate_limit_via_shim,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(py_broadcast_subscriber_count_via_shim, m)?)?;
     Ok(())
 }
 

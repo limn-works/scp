@@ -748,12 +748,287 @@ pub enum GovernanceCommand {
     },
 }
 
-/// See [`ContextCommand::Broadcast`]. Real variants arrive in commit 11.
+/// Reply-channel type alias for [`BroadcastCommand::SubscribeBroadcast`].
+/// Factored out to satisfy `clippy::type_complexity`.
+pub type SubscribeBroadcastReply =
+    oneshot::Sender<Result<scp_protocol::context::broadcast::SubscriptionResult, ContextError>>;
+
+/// Reply-channel type alias for
+/// [`BroadcastCommand::UnsubscribeBroadcast`]. Factored out to satisfy
+/// `clippy::type_complexity`.
+pub type UnsubscribeBroadcastReply =
+    oneshot::Sender<Result<scp_protocol::context::broadcast::UnsubscribeResult, ContextError>>;
+
+/// Reply-channel type alias for [`BroadcastCommand::PublishBroadcast`] and
+/// [`BroadcastCommand::PublishBroadcastContent`]. Factored out to satisfy
+/// `clippy::type_complexity`.
+pub type PublishBroadcastReply =
+    oneshot::Sender<Result<scp_protocol::crypto::sender_keys::BroadcastEnvelope, ContextError>>;
+
+/// Reply-channel type alias for
+/// [`BroadcastCommand::BlockBroadcastSubscriber`]. Factored out to satisfy
+/// `clippy::type_complexity`.
+pub type BlockBroadcastSubscriberReply =
+    oneshot::Sender<Result<scp_protocol::context::broadcast::BlockResult, ContextError>>;
+
+/// Reply-channel type alias for
+/// [`BroadcastCommand::HandleBroadcastKeyRequest`]. Factored out to
+/// satisfy `clippy::type_complexity`.
+pub type HandleBroadcastKeyRequestReply =
+    oneshot::Sender<Result<scp_protocol::context::broadcast::KeyRequestDecision, ContextError>>;
+
+/// Reply-channel type alias for
+/// [`BroadcastCommand::BroadcastAdmission`]. Factored out to satisfy
+/// `clippy::type_complexity`.
+pub type BroadcastAdmissionReply = oneshot::Sender<
+    Result<Option<scp_protocol::context::broadcast::BroadcastAdmission>, ContextError>,
+>;
+
+/// Payload for [`BroadcastCommand::SubscribeBroadcast`]. Boxed inside the
+/// variant so the enum's variant sizes stay uniform despite carrying an
+/// optional [`UcanToken`](scp_protocol::crypto::ucan::UcanToken) plus
+/// context / DID strings.
+pub struct SubscribeBroadcastPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Subscriber DID.
+    pub subscriber_did: scp_identity::DID,
+    /// Optional UCAN token — required for gated broadcast contexts.
+    pub ucan: Option<scp_protocol::crypto::ucan::UcanToken>,
+    /// Timestamp (seconds) at the point of subscription. The caller
+    /// supplies this to keep the handler deterministic w.r.t. clock
+    /// source (economy / nonce tracking reuse the timestamp).
+    pub timestamp: u64,
+}
+
+/// Payload for [`BroadcastCommand::UnsubscribeBroadcast`]. Boxed for
+/// variant-size uniformity.
+pub struct UnsubscribeBroadcastPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Subscriber DID.
+    pub subscriber_did: scp_identity::DID,
+    /// Rotate per-author keys on unsubscribe so the departed subscriber
+    /// cannot decrypt future broadcasts (forward secrecy). `false` is
+    /// valid when the subscriber left voluntarily and re-subscribes
+    /// immediately (key churn avoidance).
+    pub rotate_keys: bool,
+}
+
+/// Payload for [`BroadcastCommand::PublishBroadcast`]. Boxed for
+/// variant-size uniformity — payload `Vec<u8>` may be large.
+///
+/// # KeyCustody plumbing
+///
+/// The legacy
+/// [`ContextManager::publish_broadcast`](crate::context::manager::ContextManager::publish_broadcast)
+/// takes a `custody: &impl KeyCustody + &KeyHandle` pair; the
+/// [`KeyCustody`](scp_platform::KeyCustody) trait uses RPITIT and is
+/// NOT `dyn`-safe, so it cannot cross the actor mailbox. Instead:
+///
+/// - The command carries only the
+///   [`KeyHandle`](scp_platform::KeyHandle) (an opaque reference that
+///   IS `Send + Sync + Clone`).
+/// - The shim-dispatch entry point
+///   [`Supervisor::dispatch_broadcast_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command)
+///   is generic over the concrete custody type, and the shim extracts
+///   the `KeyHandle` from the command and passes both to
+///   [`ContextManager::publish_broadcast`](crate::context::manager::ContextManager::publish_broadcast).
+/// - For the post-refactor actor loop (commit 12+), the custody is
+///   available via the actor's bridge-instance reference; the actor
+///   body resolves the custody from the instance and signs inline.
+pub struct PublishBroadcastPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Author DID (registered in the broadcast context).
+    pub author_did: scp_identity::DID,
+    /// Plaintext payload bytes.
+    pub payload: Vec<u8>,
+    /// Handle to the author's signing key inside the caller's custody
+    /// backend. The key bytes themselves never cross the mailbox — see
+    /// the struct-level docs for the custody plumbing contract.
+    pub signing_key_handle: scp_platform::KeyHandle,
+}
+
+/// Payload for [`BroadcastCommand::PublishBroadcastContent`]. See
+/// [`PublishBroadcastPayload`] for the custody plumbing rationale.
+pub struct PublishBroadcastContentPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Author DID.
+    pub author_did: scp_identity::DID,
+    /// Structured broadcast content.
+    pub content: scp_protocol::context::BroadcastContent,
+    /// Handle to the author's signing key inside the caller's custody
+    /// backend.
+    pub signing_key_handle: scp_platform::KeyHandle,
+}
+
+/// Payload for
+/// [`BroadcastCommand::BlockBroadcastSubscriber`] and
+/// [`BroadcastCommand::UnblockBroadcastSubscriber`]. Boxed for
+/// variant-size uniformity.
+pub struct BroadcastBlockPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Author DID executing the block/unblock.
+    pub author_did: scp_identity::DID,
+    /// Subscriber DID being blocked/unblocked.
+    pub subscriber_did: scp_identity::DID,
+}
+
+/// See [`ContextCommand::Broadcast`]. Real variants cover every public
+/// method on [`crate::context::manager::broadcast`] that is NOT the
+/// saga-wired broadcast-hosting handshake. The handshake is spec-gapped
+/// — see `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+///
+/// # Key-custody handoff
+///
+/// `PublishBroadcast` / `PublishBroadcastContent` each require the
+/// caller's [`KeyCustody`](scp_platform::KeyCustody) backend to sign the
+/// broadcast envelope — the custody trait uses RPITIT and cannot cross
+/// an actor mailbox. For commit 11 the non-saga variants store only the
+/// [`KeyHandle`](scp_platform::KeyHandle); the handler reaches back to
+/// the attached [`ContextManager`](crate::context::manager::ContextManager)
+/// for the custody reference, matching the bridge-level wiring the
+/// legacy method uses today.
 pub enum BroadcastCommand {
-    /// Placeholder.
+    /// Placeholder — retained so out-of-tree callers constructed during
+    /// commit 6 still compile. Handler replies `NotImplemented`. Removed
+    /// in commit 12 with the shim.
     Placeholder {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Subscribe a DID to a broadcast context. Mirrors
+    /// [`ContextManager::subscribe_broadcast`](crate::context::manager::ContextManager::subscribe_broadcast).
+    ///
+    /// The validation-context-generic variant on `ContextManager` carries
+    /// a `ValidationContext<'_, D, N, R, P, S>` parameter; the actor
+    /// command surface passes `None` for that slot to match the default
+    /// unvalidated path. Gated contexts with a UCAN still route through
+    /// the UCAN token's inline validation.
+    SubscribeBroadcast {
+        /// Boxed owned payload.
+        payload: Box<SubscribeBroadcastPayload>,
+        /// Oneshot reply channel. See [`SubscribeBroadcastReply`].
+        reply: SubscribeBroadcastReply,
+    },
+
+    /// Unsubscribe a DID from a broadcast context. Mirrors
+    /// [`ContextManager::unsubscribe_broadcast`](crate::context::manager::ContextManager::unsubscribe_broadcast).
+    UnsubscribeBroadcast {
+        /// Boxed owned payload.
+        payload: Box<UnsubscribeBroadcastPayload>,
+        /// Oneshot reply channel. See [`UnsubscribeBroadcastReply`].
+        reply: UnsubscribeBroadcastReply,
+    },
+
+    /// Publish raw bytes to a broadcast context. Mirrors
+    /// [`ContextManager::publish_broadcast`](crate::context::manager::ContextManager::publish_broadcast).
+    PublishBroadcast {
+        /// Boxed owned payload.
+        payload: Box<PublishBroadcastPayload>,
+        /// Oneshot reply channel. See [`PublishBroadcastReply`].
+        reply: PublishBroadcastReply,
+    },
+
+    /// Publish structured [`BroadcastContent`](scp_protocol::context::broadcast::BroadcastContent)
+    /// to a broadcast context. Mirrors
+    /// [`ContextManager::publish_broadcast_content`](crate::context::manager::ContextManager::publish_broadcast_content).
+    PublishBroadcastContent {
+        /// Boxed owned payload.
+        payload: Box<PublishBroadcastContentPayload>,
+        /// Oneshot reply channel. See [`PublishBroadcastReply`].
+        reply: PublishBroadcastReply,
+    },
+
+    /// Block a subscriber from receiving future broadcasts from a
+    /// specific author. Mirrors
+    /// [`ContextManager::block_broadcast_subscriber`](crate::context::manager::ContextManager::block_broadcast_subscriber).
+    BlockBroadcastSubscriber {
+        /// Boxed owned payload.
+        payload: Box<BroadcastBlockPayload>,
+        /// Oneshot reply channel. See [`BlockBroadcastSubscriberReply`].
+        reply: BlockBroadcastSubscriberReply,
+    },
+
+    /// Unblock a previously blocked subscriber. Mirrors
+    /// [`ContextManager::unblock_broadcast_subscriber`](crate::context::manager::ContextManager::unblock_broadcast_subscriber).
+    UnblockBroadcastSubscriber {
+        /// Boxed owned payload.
+        payload: Box<BroadcastBlockPayload>,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Evaluate a subscriber's broadcast-key request. Mirrors
+    /// [`ContextManager::handle_broadcast_key_request`](crate::context::manager::ContextManager::handle_broadcast_key_request).
+    ///
+    /// Read-mostly (no per-context mutation) — handler reports
+    /// `mutated: false`.
+    HandleBroadcastKeyRequest {
+        /// Context identifier string.
+        context_id: String,
+        /// Author DID (locally controlled) whose key is being requested.
+        author_did: scp_identity::DID,
+        /// Requester DID.
+        requester_did: scp_identity::DID,
+        /// Oneshot reply channel. See
+        /// [`HandleBroadcastKeyRequestReply`].
+        reply: HandleBroadcastKeyRequestReply,
+    },
+
+    /// Return the subscriber count for a broadcast context. Mirrors
+    /// [`ContextManager::broadcast_subscriber_count`](crate::context::manager::ContextManager::broadcast_subscriber_count).
+    /// Read-only. `Ok(None)` iff the context is unknown or not broadcast.
+    BroadcastSubscriberCount {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<Option<usize>, ContextError>>,
+    },
+
+    /// Membership predicate — `true` iff `did` is a subscriber. Mirrors
+    /// [`ContextManager::is_broadcast_subscriber`](crate::context::manager::ContextManager::is_broadcast_subscriber).
+    /// Read-only.
+    IsBroadcastSubscriber {
+        /// Context identifier string.
+        context_id: String,
+        /// Candidate subscriber DID.
+        did: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<bool, ContextError>>,
+    },
+
+    /// Return the broadcast context's admission policy. Mirrors
+    /// [`ContextManager::broadcast_admission`](crate::context::manager::ContextManager::broadcast_admission).
+    /// Read-only. `Ok(None)` iff the context is unknown or not broadcast.
+    BroadcastAdmission {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel. See [`BroadcastAdmissionReply`].
+        reply: BroadcastAdmissionReply,
+    },
+
+    /// Saga-initiator path for the broadcast-hosting handshake. Returns
+    /// [`ContextError::NotImplemented`] in commit 11 — the handshake
+    /// protocol (subscriber-to-host key exchange, host config negotiation,
+    /// §5.14.2 step 4 transport) is spec-gapped. See
+    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+    InitiateBroadcastHostingHandshake {
+        /// Host context ID (32-byte hash).
+        host_context_id: [u8; 32],
+        /// Broadcast context ID (32-byte hash).
+        broadcast_context_id: [u8; 32],
+        /// Subscriber DID requesting hosting.
+        subscriber_did: scp_identity::DID,
+        /// Oneshot reply channel. Carries the saga's durable ID on
+        /// success; `ContextError::NotImplemented` during the deferred
+        /// window.
+        reply:
+            oneshot::Sender<Result<crate::context::supervisor::saga_journal::SagaId, ContextError>>,
     },
 }
 
@@ -953,12 +1228,101 @@ pub enum TrustRecoveryCommand {
     },
 }
 
-/// See [`ContextCommand::Standing`]. Real variants arrive in commit 11.
+/// See [`ContextCommand::Standing`]. Real variants cover every public
+/// method on [`crate::context::manager::standing`] that is NOT the
+/// saga-wired standing-pair-create initiator path. The saga path is
+/// spec-gapped — see
+/// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
 pub enum StandingCommand {
-    /// Placeholder.
+    /// Placeholder — retained so out-of-tree callers constructed during
+    /// commit 6 still compile. Handler replies `NotImplemented`. Removed
+    /// in commit 12 with the shim.
     Placeholder {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Get-or-create a standing bilateral context between two identities
+    /// (spec §5.12.4 — contact graph). Mirrors
+    /// [`ContextManager::standing_context`](crate::context::manager::ContextManager::standing_context).
+    ///
+    /// Idempotent at the legacy-method level — a concurrent call
+    /// returning `Active` or `Creating` surfaces the same context ID
+    /// without error.
+    ///
+    /// # Saga scope
+    ///
+    /// The legacy method internally calls
+    /// [`ContextManager::create_context`](crate::context::manager::ContextManager::create_context).
+    /// Commit 11 routes through that legacy path directly — the
+    /// standing-pair-create saga FSM (Prepare+Commit 2-phase) is
+    /// deferred per
+    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+    StandingContext {
+        /// Local identity DID.
+        local_did: scp_identity::DID,
+        /// Remote peer DID.
+        peer_did: scp_identity::DID,
+        /// Oneshot reply channel. `Ok(String)` carries the
+        /// deterministic standing context ID; the legacy method returns
+        /// the same ID whether the context already existed or was
+        /// freshly created.
+        reply: oneshot::Sender<Result<String, ContextError>>,
+    },
+
+    /// Returns the number of tracked standing contexts. Mirrors
+    /// [`ContextManager::standing_context_count`](crate::context::manager::ContextManager::standing_context_count).
+    /// Read-only.
+    StandingContextCount {
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<usize, ContextError>>,
+    },
+
+    /// Returns `true` iff a standing context exists for the given peer.
+    /// Mirrors
+    /// [`ContextManager::has_standing_context`](crate::context::manager::ContextManager::has_standing_context).
+    /// Read-only.
+    HasStandingContext {
+        /// Candidate peer DID.
+        peer_did: scp_identity::DID,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<bool, ContextError>>,
+    },
+
+    /// Registers an existing context as a standing context. Mirrors
+    /// [`ContextManager::register_standing_context`](crate::context::manager::ContextManager::register_standing_context).
+    /// Called during SDK init to restore the contact-graph index from a
+    /// persisted snapshot.
+    RegisterStandingContext {
+        /// Peer DID whose context to register.
+        peer_did: scp_identity::DID,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Reconnects transport for every standing context. Mirrors
+    /// [`ContextManager::reconnect_all_standing`](crate::context::manager::ContextManager::reconnect_all_standing).
+    /// Returns the number of contexts that were successfully
+    /// reconnected.
+    ReconnectAllStanding {
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<usize, ContextError>>,
+    },
+
+    /// Saga-initiator path for standing-pair creation. Returns
+    /// [`ContextError::NotImplemented`] in commit 11 — the 2-phase
+    /// Prepare+Commit decomposition is spec-gapped. See
+    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+    InitiateStandingPairCreate {
+        /// Local identity DID initiating the pair.
+        local_did: scp_identity::DID,
+        /// Remote peer DID.
+        peer_did: scp_identity::DID,
+        /// Oneshot reply channel. Carries the saga's durable ID on
+        /// success; `ContextError::NotImplemented` during the deferred
+        /// window.
+        reply:
+            oneshot::Sender<Result<crate::context::supervisor::saga_journal::SagaId, ContextError>>,
     },
 }
 
@@ -1091,12 +1455,77 @@ pub enum TtlCloseCommand {
     },
 }
 
-/// See [`ContextCommand::Tools`]. Real variants arrive in commit 11.
+/// See [`ContextCommand::Tools`]. Real variants cover every public
+/// method on [`crate::context::manager::tools`] EXCEPT
+/// [`ContextManager::invoke_tool_with_economy`](crate::context::manager::ContextManager::invoke_tool_with_economy)
+/// — that method is the cross-context tool-invocation entry and carries
+/// a generic executor closure `F: FnOnce(Value) -> Fut` which cannot
+/// cross the actor mailbox. The cross-context saga path is spec-gapped
+/// regardless; see
+/// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+///
+/// The migrated variants are the hard-rate-limit consume / refund
+/// helpers (async + sync + runtime-agnostic) that FFI bridges call from
+/// their own tool-dispatch paths. All 6 methods on
+/// [`crate::context::manager::tools`] migrate here because they are the
+/// supervisor-observable tool surface.
 pub enum ToolsCommand {
-    /// Placeholder.
+    /// Placeholder — retained so out-of-tree callers constructed during
+    /// commit 6 still compile. Handler replies `NotImplemented`. Removed
+    /// in commit 12 with the shim.
     Placeholder {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Try to consume one hard-rate-limit token for the given
+    /// `(context_id, did)` pair (async variant). Mirrors
+    /// [`ContextManager::try_consume_hard_rate_limit`](crate::context::manager::ContextManager::try_consume_hard_rate_limit).
+    ///
+    /// Reply carries `Ok(true)` iff a token was consumed or the context
+    /// is unknown (pass-through contract on unknown contexts — matches
+    /// the legacy method).
+    TryConsumeHardRateLimit {
+        /// Context identifier string.
+        context_id: String,
+        /// Sender DID.
+        did: scp_identity::DID,
+        /// Current Unix time in seconds — caller supplies to keep the
+        /// handler pure / deterministic.
+        now_secs: u64,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<bool, ContextError>>,
+    },
+
+    /// Refund one hard-rate-limit token (async variant). Mirrors
+    /// [`ContextManager::refund_hard_rate_limit`](crate::context::manager::ContextManager::refund_hard_rate_limit).
+    /// No-op on unknown context.
+    RefundHardRateLimit {
+        /// Context identifier string.
+        context_id: String,
+        /// Sender DID.
+        did: scp_identity::DID,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Saga-initiator path for cross-context tool invocation. Returns
+    /// [`ContextError::NotImplemented`] in commit 11 — the cross-context
+    /// invoke transport protocol (caller→target context forwarding,
+    /// UCAN proof plumbing, receipt relay) is spec-gapped. See
+    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+    InitiateCrossContextToolInvocation {
+        /// Calling context ID (32-byte hash).
+        caller_context_id: [u8; 32],
+        /// Calling DID.
+        caller_did: scp_identity::DID,
+        /// Target tool registration ID.
+        tool_registration_id: String,
+        /// Oneshot reply channel. Carries the saga's durable ID on
+        /// success; `ContextError::NotImplemented` during the deferred
+        /// window.
+        reply:
+            oneshot::Sender<Result<crate::context::supervisor::saga_journal::SagaId, ContextError>>,
     },
 }
 

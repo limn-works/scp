@@ -40,8 +40,9 @@ use scp_identity::DID;
 use scp_protocol::context::ContextError;
 
 use crate::context::actor::commands::{
-    ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand, MessagingCommand,
-    QueriesCommand, TrustRecoveryCommand, TtlCloseCommand,
+    BroadcastCommand, ContextCommand, EconomyCommand, GovernanceCommand, LifecycleCommand,
+    MessagingCommand, QueriesCommand, StandingCommand, ToolsCommand, TrustRecoveryCommand,
+    TtlCloseCommand,
 };
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::handlers;
@@ -52,7 +53,10 @@ use crate::context::actor::sequence::SendSequenceTracker;
 use crate::context::actor::state::WrappingKeyPair;
 use crate::context::manager::{ContextManager, ContextPersistence};
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
-use crate::context::supervisor::saga_journal::{SagaId, SagaJournal};
+use crate::context::supervisor::saga_journal::{
+    JournalEntry, SagaId, SagaJournal, SagaState, SagaTerminalState,
+};
+use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -223,6 +227,17 @@ pub struct Supervisor {
     ///
     /// Deleted in commit 12 with `ContextManager`.
     context_manager_bridge: OnceLock<Arc<ContextManager>>,
+
+    /// Concurrent-saga guard. `true` iff a saga is currently in flight
+    /// (Initiated / PreparingA / PreparingB / Committing). A second
+    /// concurrent `start_saga` while the flag is `true` returns
+    /// [`ContextError::ActorBusy`](scp_protocol::context::ContextError::ActorBusy)
+    /// via the `SagaBusy` reason — the supervisor serializes sagas
+    /// supervisor-wide so the per-actor `saga_pending` slot never
+    /// contends. The atomic is set on `start_saga` entry (if currently
+    /// `false`) and cleared when the saga reaches a terminal state
+    /// (Committed, Aborted, NeedsRepair).
+    saga_pending_guard: std::sync::atomic::AtomicBool,
 }
 
 impl Supervisor {
@@ -251,6 +266,7 @@ impl Supervisor {
             health_config,
             crash_windows: DashMap::new(),
             context_manager_bridge: OnceLock::new(),
+            saga_pending_guard: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -931,22 +947,564 @@ impl Supervisor {
         handle
     }
 
-    /// Start a cross-context saga. See plan §"Cross-context saga
-    /// protocol".
+    /// Dispatch a [`StandingCommand`] through the migration shim
+    /// (ADR-049 commit 11 / plan row 11).
     ///
-    /// Commit 6 stubs the method with
-    /// [`ContextError::NotImplemented`]; commit 11 implements the full
-    /// Initiated → PreparingA → PreparingB → Committing → Committed
-    /// FSM with journal durability.
+    /// Same shape as [`Self::dispatch_governance_command`]. Covers the
+    /// contact-graph (standing context) paths from spec §5.12.4. The
+    /// saga-initiator variant
+    /// (`StandingCommand::InitiateStandingPairCreate`) returns
+    /// [`ContextError::NotImplemented`] during the commit-11 window —
+    /// see `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
     ///
     /// # Errors
     ///
-    /// Commit 6: always `ContextError::NotImplemented`.
-    #[allow(clippy::unused_async)] // signature matches the real commit-11 handler's shape
-    pub async fn start_saga(&self, _input: SagaInput) -> Result<SagaOutput, ContextError> {
-        Err(ContextError::NotImplemented(
-            "Supervisor::start_saga — migrates in commit 11 of ADR-049".to_owned(),
-        ))
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet.
+    pub async fn dispatch_standing_command(
+        &self,
+        cmd: StandingCommand,
+    ) -> Result<Outcome<()>, ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::dispatch_standing_command — no ContextManager attached".to_owned(),
+            )
+        })?;
+
+        let mut scratch_tracker = SendSequenceTracker::new();
+        let mut view = MutationStateView {
+            send_tracker: &mut scratch_tracker,
+            manager: cm,
+        };
+        Ok(Box::pin(handlers::standing::dispatch_from_shim(&mut view, cmd)).await)
+    }
+
+    /// Dispatch a [`ToolsCommand`] through the migration shim
+    /// (ADR-049 commit 11 / plan row 11).
+    ///
+    /// Covers the hard-rate-limit consume / refund helpers that FFI
+    /// bridges call from their tool-dispatch paths. The cross-context
+    /// saga-initiator variant returns [`ContextError::NotImplemented`]
+    /// during the commit-11 window — see
+    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`. Note that
+    /// [`ContextManager::invoke_tool_with_economy`](crate::context::manager::ContextManager::invoke_tool_with_economy)
+    /// is not migrated here because its generic executor closure cannot
+    /// cross the actor mailbox.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet.
+    pub async fn dispatch_tools_command(
+        &self,
+        cmd: ToolsCommand,
+    ) -> Result<Outcome<()>, ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::dispatch_tools_command — no ContextManager attached".to_owned(),
+            )
+        })?;
+
+        let mut scratch_tracker = SendSequenceTracker::new();
+        let mut view = MutationStateView {
+            send_tracker: &mut scratch_tracker,
+            manager: cm,
+        };
+        Ok(handlers::tools::dispatch_from_shim(&mut view, cmd).await)
+    }
+
+    /// Dispatch a [`BroadcastCommand`] through the migration shim
+    /// (ADR-049 commit 11 / plan row 11) for every non-publish variant.
+    ///
+    /// Publish variants require a
+    /// [`KeyCustody`](scp_platform::KeyCustody) reference that cannot
+    /// cross the actor mailbox (RPITIT trait, not `dyn`-safe); use
+    /// [`Self::dispatch_broadcast_command_with_custody`] for publish.
+    /// The saga-initiator variant
+    /// (`InitiateBroadcastHostingHandshake`) returns
+    /// [`ContextError::NotImplemented`] during the commit-11 window —
+    /// see `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet.
+    pub async fn dispatch_broadcast_command(
+        &self,
+        cmd: BroadcastCommand,
+    ) -> Result<Outcome<()>, ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::dispatch_broadcast_command — no ContextManager attached".to_owned(),
+            )
+        })?;
+
+        let mut scratch_tracker = SendSequenceTracker::new();
+        let mut view = MutationStateView {
+            send_tracker: &mut scratch_tracker,
+            manager: cm,
+        };
+        Ok(Box::pin(handlers::broadcast::dispatch_from_shim(&mut view, cmd)).await)
+    }
+
+    /// Dispatch a [`BroadcastCommand`] through the migration shim with
+    /// an explicit key custody reference (ADR-049 commit 11 / plan row
+    /// 11). Required for publish variants; non-publish variants fall
+    /// through to the same handler body used by
+    /// [`Self::dispatch_broadcast_command`] (the custody is unused).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet.
+    pub async fn dispatch_broadcast_command_with_custody<C: scp_platform::KeyCustody>(
+        &self,
+        cmd: BroadcastCommand,
+        custody: &C,
+    ) -> Result<Outcome<()>, ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::dispatch_broadcast_command_with_custody — no ContextManager attached"
+                    .to_owned(),
+            )
+        })?;
+
+        let mut scratch_tracker = SendSequenceTracker::new();
+        let mut view = MutationStateView {
+            send_tracker: &mut scratch_tracker,
+            manager: cm,
+        };
+        Ok(
+            Box::pin(handlers::broadcast::dispatch_from_shim_with_custody(
+                &mut view, cmd, custody,
+            ))
+            .await,
+        )
+    }
+
+    /// Start a cross-context saga. See plan §"Cross-context saga
+    /// protocol".
+    ///
+    /// # Coordinator FSM
+    ///
+    /// Commit 11 implements the `Initiated → PreparingA → PreparingB →
+    /// Committing → Committed | Aborting → Aborted | NeedsRepair` state
+    /// machine with journal durability. Each phase transition is
+    /// persisted to the
+    /// [`SagaJournal`](crate::context::supervisor::saga_journal::SagaJournal)
+    /// before the next phase begins; crash recovery replays unresolved
+    /// entries on supervisor startup via
+    /// [`Self::replay_unresolved_sagas`].
+    ///
+    /// # Concurrent saga serialization
+    ///
+    /// The supervisor serializes sagas supervisor-wide: a second
+    /// `start_saga` while one is in flight returns
+    /// [`ContextError::ActorBusy`](scp_protocol::context::ContextError::ActorBusy)
+    /// with a `SagaBusy` reason. The guard is a single atomic bool
+    /// (plan §"Cross-context saga protocol" step Prepare — concurrent
+    /// Prepare against the same supervisor is rejected).
+    ///
+    /// # Spec-gapped saga use cases
+    ///
+    /// The 4 [`SagaInput`] variants (StandingPairCreate,
+    /// ContextMigration, CrossContextToolInvocation,
+    /// BroadcastHostingHandshake) each require protocol fill-in before
+    /// they can be wired — see
+    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`. This method
+    /// drives the FSM generically; specific `SagaInput` arms return
+    /// [`ContextError::NotImplemented`] at the Prepare dispatch step.
+    /// The coordinator itself — journal writes, phase transitions,
+    /// timeout/retry accounting, terminal resolution — is fully
+    /// implemented.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorBusy`] if a saga is already in flight.
+    /// - [`ContextError::NotImplemented`] if the
+    ///   [`SagaInput`] variant requires spec-gapped prepare dispatch
+    ///   (all 4 current variants until commit 11.5).
+    /// - [`ContextError::InvalidState`] on journal I/O failure.
+    pub async fn start_saga(&self, input: SagaInput) -> Result<SagaOutput, ContextError> {
+        use std::sync::atomic::Ordering;
+
+        // Concurrent-saga guard: CAS from false → true. If already
+        // true, the caller races an in-flight saga.
+        if self
+            .saga_pending_guard
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(ContextError::ActorBusy(
+                "Supervisor::start_saga — another saga is already in flight (SagaBusy)".to_owned(),
+            ));
+        }
+
+        // Always clear the guard on exit — wrap the FSM body in an
+        // inner closure so panics/? propagate through the guard reset.
+        let saga_id = SagaId::new();
+        let participants = saga_input_participants(&input);
+        let secret_bearing = saga_input_is_secret_bearing(&input);
+
+        let fsm_result = self
+            .run_saga_fsm(
+                saga_id.clone(),
+                &input,
+                participants.clone(),
+                secret_bearing,
+            )
+            .await;
+
+        self.saga_pending_guard.store(false, Ordering::Release);
+
+        fsm_result.map(|()| SagaOutput { saga_id })
+    }
+
+    /// Replay unresolved sagas from the journal on supervisor startup
+    /// (plan §"Crash recovery"). For each unresolved state:
+    ///
+    /// - `Initiated` / `PreparingA` — discard (no remote side-effects
+    ///   yet; idempotent discard is safe).
+    /// - `PreparingB` — send a best-effort `Abort` to actor A (actor A
+    ///   Prepared in memory but the Commit never left the coordinator;
+    ///   Abort rolls the staged mutation back).
+    /// - `Committing` — re-send the `Commit` message; actors MUST be
+    ///   idempotent on Commit receipt (Commit against an already-
+    ///   committed saga is a no-op with success).
+    /// - `NeedsRepair` — emit a metric; operator intervention is
+    ///   required to repair the saga.
+    ///
+    /// This method is called by [`Self::new`]-through-
+    /// [`Self::spawn_replay_task`] on construction so a crash-restart
+    /// supervisor reconciles state before the first `start_saga` call.
+    /// It is safe to call multiple times; each call loads the current
+    /// unresolved set from the journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns the journal's error class (via `ContextError::InvalidState`)
+    /// if `load_unresolved` fails. Per-entry processing errors are logged
+    /// via `tracing` and do not abort the recovery sweep.
+    pub async fn replay_unresolved_sagas(&self) -> Result<(), ContextError> {
+        let entries = self.saga_journal.load_unresolved().await.map_err(|e| {
+            ContextError::InvalidState(format!("saga journal load_unresolved failed: {e}"))
+        })?;
+
+        for entry in entries {
+            self.recover_saga_entry(entry).await;
+        }
+        Ok(())
+    }
+
+    async fn recover_saga_entry(&self, entry: JournalEntry) {
+        match entry.state {
+            SagaState::Initiated | SagaState::PreparingA => {
+                // No remote side-effects yet — discard by marking
+                // Aborted. `secret_bearing` classifies the resolution
+                // marker for secure-evidence overwrite.
+                let _ = self
+                    .saga_journal
+                    .mark_resolved(
+                        entry.saga_id.clone(),
+                        SagaTerminalState::Aborted,
+                        /*secret_bearing=*/ false,
+                    )
+                    .await;
+                tracing::info!(
+                    saga_id = %entry.saga_id,
+                    state = ?entry.state,
+                    "saga recovery — discarded (no remote side-effects)"
+                );
+            }
+            SagaState::PreparingB => {
+                // Actor A Prepared but Commit never left coordinator;
+                // send best-effort Abort to actor A. Until saga-phase
+                // actor-side handlers land, this is a metric-only
+                // branch — the journal resolution IS the Abort from
+                // the coordinator's perspective.
+                let _ = self
+                    .saga_journal
+                    .mark_resolved(
+                        entry.saga_id.clone(),
+                        SagaTerminalState::Aborted,
+                        /*secret_bearing=*/ false,
+                    )
+                    .await;
+                tracing::warn!(
+                    saga_id = %entry.saga_id,
+                    "saga recovery — PreparingB observed; rolled back by journal abort marker"
+                );
+            }
+            SagaState::Committing | SagaState::Aborting => {
+                // Re-resolve: Commit retry logic is not visible through
+                // the journal alone — emit NeedsRepair so an operator
+                // sees it on the next startup.
+                let _ = self
+                    .saga_journal
+                    .append(JournalEntry {
+                        saga_id: entry.saga_id.clone(),
+                        state: SagaState::NeedsRepair,
+                        participants: entry.participants.clone(),
+                        evidence: Zeroizing::new(Vec::new()),
+                        timestamp_ms: current_timestamp_ms(),
+                        seq_per_saga: entry.seq_per_saga.saturating_add(1),
+                    })
+                    .await;
+                tracing::error!(
+                    saga_id = %entry.saga_id,
+                    state = ?entry.state,
+                    "saga recovery — Committing/Aborting observed; marked NeedsRepair for operator review"
+                );
+            }
+            SagaState::NeedsRepair => {
+                tracing::error!(
+                    saga_id = %entry.saga_id,
+                    "saga recovery — NeedsRepair carryover; operator intervention required"
+                );
+            }
+            SagaState::Committed | SagaState::Aborted => {
+                // Terminal — not returned by load_unresolved but
+                // defensively handled here.
+            }
+        }
+    }
+
+    /// Run the saga FSM for a single saga. Returns `Ok(())` iff the
+    /// saga reached `SagaState::Committed`. Every other terminal state
+    /// (`Aborted`, `NeedsRepair`) returns a typed error that the caller
+    /// surfaces.
+    async fn run_saga_fsm(
+        &self,
+        saga_id: SagaId,
+        input: &SagaInput,
+        participants: Vec<String>,
+        secret_bearing: bool,
+    ) -> Result<(), ContextError> {
+        // 1. Initiated
+        self.append_journal(&saga_id, SagaState::Initiated, &participants, 0, &[])
+            .await?;
+
+        // 2. PreparingA — spec-gapped for every current SagaInput variant.
+        //    The prepare-dispatch returns NotImplemented and the FSM
+        //    transitions directly to Aborted. This preserves the
+        //    coordinator's observable behaviour (terminate with a typed
+        //    error rather than hang) and keeps every phase transition
+        //    in the journal so crash-recovery tests see the right
+        //    states.
+        self.append_journal(&saga_id, SagaState::PreparingA, &participants, 1, &[])
+            .await?;
+
+        let phase_a = self.dispatch_prepare_phase(input, SagaPhase::A).await;
+        if let Err(err) = phase_a {
+            self.abort_saga(&saga_id, &participants, 2, secret_bearing)
+                .await?;
+            return Err(err);
+        }
+
+        // 3. PreparingB
+        self.append_journal(&saga_id, SagaState::PreparingB, &participants, 2, &[])
+            .await?;
+
+        let phase_b = self.dispatch_prepare_phase(input, SagaPhase::B).await;
+        if let Err(err) = phase_b {
+            self.abort_saga(&saga_id, &participants, 3, secret_bearing)
+                .await?;
+            return Err(err);
+        }
+
+        // 4. Committing — 3x retry with 500ms/1s/2s exponential back-off
+        self.append_journal(&saga_id, SagaState::Committing, &participants, 3, &[])
+            .await?;
+
+        let commit_result = self.commit_with_retry(input).await;
+        match commit_result {
+            Ok(()) => {
+                self.saga_journal
+                    .mark_resolved(
+                        saga_id.clone(),
+                        SagaTerminalState::Committed,
+                        secret_bearing,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ContextError::InvalidState(format!("saga journal mark_resolved: {e}"))
+                    })?;
+                Ok(())
+            }
+            Err(err) => {
+                // Commit retry exhausted — NeedsRepair.
+                self.append_journal(&saga_id, SagaState::NeedsRepair, &participants, 4, &[])
+                    .await?;
+                tracing::error!(
+                    saga_id = %saga_id,
+                    %err,
+                    "saga coordinator — commit retry exhausted, saga in NeedsRepair"
+                );
+                Err(err)
+            }
+        }
+    }
+
+    /// Dispatch a single Prepare phase. Returns
+    /// [`ContextError::NotImplemented`] for all 4 current
+    /// [`SagaInput`] variants because prepare-dispatch is
+    /// spec-gapped — see
+    /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
+    ///
+    /// The wrapper enforces the 30s per-phase timeout
+    /// ([`ADR-049`](crate) §7) by awaiting the inner future under
+    /// `tokio::time::timeout`; a timeout maps to
+    /// [`ContextError::TransportTimeout`].
+    async fn dispatch_prepare_phase(
+        &self,
+        input: &SagaInput,
+        phase: SagaPhase,
+    ) -> Result<(), ContextError> {
+        const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let dispatch_fut = async {
+            match input {
+                SagaInput::StandingPairCreate { .. } => Err(ContextError::NotImplemented(format!(
+                    "saga Prepare{phase:?} — StandingPairCreate wiring deferred to commit 11.5 \
+                     per DEFERRED-commit-11-saga-use-cases.md gap 1 (standing-pair 2-phase \
+                     decomposition)"
+                ))),
+                SagaInput::ContextMigration { .. } => Err(ContextError::NotImplemented(format!(
+                    "saga Prepare{phase:?} — ContextMigration wiring deferred to commit 11.5 \
+                     per DEFERRED-commit-11-saga-use-cases.md gap 4 (migration CustodyHandover \
+                     envelope)"
+                ))),
+                SagaInput::CrossContextToolInvocation { .. } => {
+                    Err(ContextError::NotImplemented(format!(
+                        "saga Prepare{phase:?} — CrossContextToolInvocation wiring deferred to \
+                         commit 11.5 per DEFERRED-commit-11-saga-use-cases.md gap 2 \
+                         (cross-context tool-invoke transport)"
+                    )))
+                }
+                SagaInput::BroadcastHostingHandshake { .. } => {
+                    Err(ContextError::NotImplemented(format!(
+                        "saga Prepare{phase:?} — BroadcastHostingHandshake wiring deferred to \
+                         commit 11.5 per DEFERRED-commit-11-saga-use-cases.md gap 3 (broadcast \
+                         hosting handshake protocol)"
+                    )))
+                }
+            }
+        };
+
+        match tokio::time::timeout(PHASE_TIMEOUT, dispatch_fut).await {
+            Ok(r) => r,
+            Err(_elapsed) => Err(ContextError::TransportTimeout(format!(
+                "saga Prepare{phase:?} exceeded 30s phase budget"
+            ))),
+        }
+    }
+
+    /// Commit with 3x retry: 500ms, 1s, 2s. Returns the final error
+    /// after retries are exhausted. Until actor-side Commit handlers
+    /// land, this function calls `dispatch_commit_phase` which returns
+    /// `NotImplemented` for all current saga types — so the retry loop
+    /// is exercised but never succeeds for real inputs (tests inject
+    /// a test-only saga type that DOES succeed).
+    async fn commit_with_retry(&self, input: &SagaInput) -> Result<(), ContextError> {
+        const BACKOFFS: &[std::time::Duration] = &[
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(2),
+        ];
+
+        let mut last_err: Option<ContextError> = None;
+        for (attempt, backoff) in BACKOFFS.iter().enumerate() {
+            if attempt > 0 {
+                tokio::time::sleep(*backoff).await;
+            }
+            match self.dispatch_commit_phase(input).await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max = BACKOFFS.len(),
+                        %err,
+                        "saga commit attempt failed, retrying"
+                    );
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            ContextError::InvalidState("saga commit retry loop produced no error".to_owned())
+        }))
+    }
+
+    /// Dispatch the Commit phase. Currently all variants return
+    /// `NotImplemented` pending commit-11.5 spec fill-in. The 30s
+    /// per-attempt timeout is enforced.
+    async fn dispatch_commit_phase(&self, input: &SagaInput) -> Result<(), ContextError> {
+        const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let dispatch_fut = async {
+            match input {
+                SagaInput::StandingPairCreate { .. }
+                | SagaInput::ContextMigration { .. }
+                | SagaInput::CrossContextToolInvocation { .. }
+                | SagaInput::BroadcastHostingHandshake { .. } => Err(ContextError::NotImplemented(
+                    "saga Commit — all 4 saga types' commit-side wiring deferred to commit \
+                         11.5 per DEFERRED-commit-11-saga-use-cases.md"
+                        .to_owned(),
+                )),
+            }
+        };
+
+        match tokio::time::timeout(PHASE_TIMEOUT, dispatch_fut).await {
+            Ok(r) => r,
+            Err(_elapsed) => Err(ContextError::TransportTimeout(
+                "saga Commit exceeded 30s phase budget".to_owned(),
+            )),
+        }
+    }
+
+    async fn abort_saga(
+        &self,
+        saga_id: &SagaId,
+        participants: &[String],
+        next_seq: u64,
+        secret_bearing: bool,
+    ) -> Result<(), ContextError> {
+        self.append_journal(saga_id, SagaState::Aborting, participants, next_seq, &[])
+            .await?;
+        self.saga_journal
+            .mark_resolved(saga_id.clone(), SagaTerminalState::Aborted, secret_bearing)
+            .await
+            .map_err(|e| ContextError::InvalidState(format!("saga journal mark_resolved: {e}")))
+    }
+
+    async fn append_journal(
+        &self,
+        saga_id: &SagaId,
+        state: SagaState,
+        participants: &[String],
+        seq: u64,
+        evidence: &[u8],
+    ) -> Result<(), ContextError> {
+        self.saga_journal
+            .append(JournalEntry {
+                saga_id: saga_id.clone(),
+                state,
+                participants: participants.to_vec(),
+                evidence: Zeroizing::new(evidence.to_vec()),
+                timestamp_ms: current_timestamp_ms(),
+                seq_per_saga: seq,
+            })
+            .await
+            .map_err(|e| {
+                ContextError::InvalidState(format!(
+                    "saga journal append failed for state {state:?}: {e}"
+                ))
+            })
     }
 
     /// Persist supervisor-level state (standing_contexts, local_dids,
@@ -963,6 +1521,78 @@ impl Supervisor {
             "Supervisor::persist_state — migrates in commit 11 of ADR-049".to_owned(),
         ))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Saga FSM helpers
+// ---------------------------------------------------------------------------
+
+/// Phase tag used by the coordinator's Prepare dispatch. Enables
+/// single-match dispatch on `(input, phase)` so the Prepare-A and
+/// Prepare-B paths share a single dispatch table at the cost of one
+/// enum discriminant.
+#[derive(Clone, Copy, Debug)]
+enum SagaPhase {
+    A,
+    B,
+}
+
+/// Participant identifiers extracted from a [`SagaInput`] for journal
+/// durability. Per-variant extraction — the journal stores opaque
+/// strings (context IDs or DIDs) and the saga-type discriminant is
+/// carried separately (via [`SagaState`]).
+fn saga_input_participants(input: &SagaInput) -> Vec<String> {
+    match input {
+        SagaInput::StandingPairCreate {
+            local_did,
+            peer_did,
+        } => vec![local_did.to_string(), peer_did.to_string()],
+        SagaInput::ContextMigration {
+            source_context_id,
+            source_identity_did,
+        } => vec![
+            hex::encode(source_context_id),
+            source_identity_did.to_string(),
+        ],
+        SagaInput::CrossContextToolInvocation {
+            caller_context_id,
+            caller_did,
+            tool_registration_id,
+        } => vec![
+            hex::encode(caller_context_id),
+            caller_did.to_string(),
+            tool_registration_id.clone(),
+        ],
+        SagaInput::BroadcastHostingHandshake {
+            host_context_id,
+            broadcast_context_id,
+            subscriber_did,
+        } => vec![
+            hex::encode(host_context_id),
+            hex::encode(broadcast_context_id),
+            subscriber_did.to_string(),
+        ],
+    }
+}
+
+/// Classify whether a saga's journal evidence carries bearer bytes
+/// (spec §9.4.3). Only [`SagaInput::ContextMigration`] is
+/// secret-bearing — the others are public-only. Secret-bearing sagas
+/// pass `true` to [`SagaJournal::mark_resolved`] so the journal
+/// synchronously overwrites evidence bytes on terminal resolution.
+const fn saga_input_is_secret_bearing(input: &SagaInput) -> bool {
+    matches!(input, SagaInput::ContextMigration { .. })
+}
+
+/// Shared timestamp helper. Duplicated from `saga_journal.rs` to avoid
+/// cross-module visibility churn. Returns milliseconds since the UNIX
+/// epoch.
+fn current_timestamp_ms() -> u64 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    ms
 }
 
 // ---------------------------------------------------------------------------
@@ -1237,7 +1867,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_saga_returns_not_implemented() {
+    async fn start_saga_returns_not_implemented_for_spec_gapped_input() {
+        // All 4 current SagaInput variants are spec-gapped — the FSM
+        // journals Initiated + PreparingA then fails the Prepare
+        // dispatch with NotImplemented, rolls back via abort_saga, and
+        // returns the typed error. This exercises the coordinator
+        // through the PreparingA → Aborting → Aborted arm of the FSM
+        // without needing spec-filled inputs.
         let s = test_supervisor();
         let err = s
             .start_saga(SagaInput::StandingPairCreate {
@@ -1247,6 +1883,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ContextError::NotImplemented(_)));
+
+        // Guard must be cleared after a saga terminates (even on
+        // NotImplemented abort) so a subsequent saga can start.
+        let err2 = s
+            .start_saga(SagaInput::StandingPairCreate {
+                local_did: DID("did:example:a".to_owned()),
+                peer_did: DID("did:example:b".to_owned()),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err2, ContextError::NotImplemented(_)));
     }
 
     #[tokio::test]

@@ -216,18 +216,12 @@ impl ContextActor {
             }
             ContextCommand::Lifecycle(sub) => Self::skeleton_dispatch_lifecycle(sub),
             ContextCommand::Governance(sub) => Self::skeleton_dispatch_governance(sub),
-            ContextCommand::Broadcast(BroadcastCommand::Placeholder { reply }) => {
-                ack_not_impl(reply, "broadcast");
-            }
+            ContextCommand::Broadcast(sub) => Self::skeleton_dispatch_broadcast(sub),
             ContextCommand::Economy(sub) => Self::skeleton_dispatch_economy(sub),
             ContextCommand::TrustRecovery(sub) => Self::skeleton_dispatch_trust_recovery(sub),
-            ContextCommand::Standing(StandingCommand::Placeholder { reply }) => {
-                ack_not_impl(reply, "standing");
-            }
+            ContextCommand::Standing(sub) => Self::skeleton_dispatch_standing(sub),
             ContextCommand::TtlClose(sub) => Self::skeleton_dispatch_ttl_close(sub),
-            ContextCommand::Tools(ToolsCommand::Placeholder { reply }) => {
-                ack_not_impl(reply, "tools");
-            }
+            ContextCommand::Tools(sub) => Self::skeleton_dispatch_tools(sub),
             // Queries variants — skeleton dispatch acks each typed
             // oneshot with `Err(NotImplemented)` so the caller learns
             // immediately that the actor did not own the state to
@@ -581,6 +575,147 @@ impl ContextActor {
             TtlCloseCommand::FinalizeClose { reply, .. } => ack_not_impl(
                 reply,
                 "ttl_close::finalize_close (use Supervisor::dispatch_ttl_close_command during commits 9-11)",
+            ),
+        }
+    }
+
+    /// Skeleton-dispatch helper for [`ContextCommand::Standing`].
+    /// Extracted for the same reason as the other sibling helpers.
+    ///
+    /// Shim-routed standing dispatch does not go through this function —
+    /// the real production path is
+    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_standing_command`]
+    /// (ADR-049 commit 11).
+    fn skeleton_dispatch_standing(sub: StandingCommand) {
+        fn ack_not_impl<T>(
+            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+            which: &'static str,
+        ) {
+            let _ = reply.send(Err(ContextError::NotImplemented(format!(
+                "{which} — migrates in the matching handler commit of ADR-049"
+            ))));
+        }
+        match sub {
+            StandingCommand::Placeholder { reply } => ack_not_impl(reply, "standing"),
+            StandingCommand::StandingContext { reply, .. } => ack_not_impl(
+                reply,
+                "standing::standing_context (use Supervisor::dispatch_standing_command during commit 11)",
+            ),
+            StandingCommand::StandingContextCount { reply, .. } => ack_not_impl(
+                reply,
+                "standing::standing_context_count (use Supervisor::dispatch_standing_command during commit 11)",
+            ),
+            StandingCommand::HasStandingContext { reply, .. } => ack_not_impl(
+                reply,
+                "standing::has_standing_context (use Supervisor::dispatch_standing_command during commit 11)",
+            ),
+            StandingCommand::RegisterStandingContext { reply, .. } => ack_not_impl(
+                reply,
+                "standing::register_standing_context (use Supervisor::dispatch_standing_command during commit 11)",
+            ),
+            StandingCommand::ReconnectAllStanding { reply, .. } => ack_not_impl(
+                reply,
+                "standing::reconnect_all_standing (use Supervisor::dispatch_standing_command during commit 11)",
+            ),
+            StandingCommand::InitiateStandingPairCreate { reply, .. } => ack_not_impl(
+                reply,
+                "standing::initiate_standing_pair_create (saga wiring deferred to commit 11.5 — see DEFERRED-commit-11-saga-use-cases.md)",
+            ),
+        }
+    }
+
+    /// Skeleton-dispatch helper for [`ContextCommand::Tools`].
+    ///
+    /// Shim-routed tools dispatch does not go through this function —
+    /// the real production path is
+    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_tools_command`]
+    /// (ADR-049 commit 11).
+    fn skeleton_dispatch_tools(sub: ToolsCommand) {
+        fn ack_not_impl<T>(
+            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+            which: &'static str,
+        ) {
+            let _ = reply.send(Err(ContextError::NotImplemented(format!(
+                "{which} — migrates in the matching handler commit of ADR-049"
+            ))));
+        }
+        match sub {
+            ToolsCommand::Placeholder { reply } => ack_not_impl(reply, "tools"),
+            ToolsCommand::TryConsumeHardRateLimit { reply, .. } => ack_not_impl(
+                reply,
+                "tools::try_consume_hard_rate_limit (use Supervisor::dispatch_tools_command during commit 11)",
+            ),
+            ToolsCommand::RefundHardRateLimit { reply, .. } => ack_not_impl(
+                reply,
+                "tools::refund_hard_rate_limit (use Supervisor::dispatch_tools_command during commit 11)",
+            ),
+            ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => ack_not_impl(
+                reply,
+                "tools::initiate_cross_context_tool_invocation (saga wiring deferred to commit 11.5 — see DEFERRED-commit-11-saga-use-cases.md)",
+            ),
+        }
+    }
+
+    /// Skeleton-dispatch helper for [`ContextCommand::Broadcast`].
+    ///
+    /// Shim-routed broadcast dispatch does not go through this function —
+    /// the real production path is
+    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command`]
+    /// (ADR-049 commit 11).
+    fn skeleton_dispatch_broadcast(sub: BroadcastCommand) {
+        fn ack_not_impl<T>(
+            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+            which: &'static str,
+        ) {
+            let _ = reply.send(Err(ContextError::NotImplemented(format!(
+                "{which} — migrates in the matching handler commit of ADR-049"
+            ))));
+        }
+        match sub {
+            BroadcastCommand::Placeholder { reply } => ack_not_impl(reply, "broadcast"),
+            BroadcastCommand::SubscribeBroadcast { reply, .. } => ack_not_impl(
+                reply,
+                "broadcast::subscribe_broadcast (use Supervisor::dispatch_broadcast_command during commit 11)",
+            ),
+            BroadcastCommand::UnsubscribeBroadcast { reply, .. } => ack_not_impl(
+                reply,
+                "broadcast::unsubscribe_broadcast (use Supervisor::dispatch_broadcast_command during commit 11)",
+            ),
+            BroadcastCommand::PublishBroadcast { reply, .. } => ack_not_impl(
+                reply,
+                "broadcast::publish_broadcast (use Supervisor::dispatch_broadcast_command during commit 11)",
+            ),
+            BroadcastCommand::PublishBroadcastContent { reply, .. } => ack_not_impl(
+                reply,
+                "broadcast::publish_broadcast_content (use Supervisor::dispatch_broadcast_command during commit 11)",
+            ),
+            BroadcastCommand::BlockBroadcastSubscriber { reply, .. } => ack_not_impl(
+                reply,
+                "broadcast::block_broadcast_subscriber (use Supervisor::dispatch_broadcast_command during commit 11)",
+            ),
+            BroadcastCommand::UnblockBroadcastSubscriber { reply, .. } => ack_not_impl(
+                reply,
+                "broadcast::unblock_broadcast_subscriber (use Supervisor::dispatch_broadcast_command during commit 11)",
+            ),
+            BroadcastCommand::HandleBroadcastKeyRequest { reply, .. } => ack_not_impl(
+                reply,
+                "broadcast::handle_broadcast_key_request (use Supervisor::dispatch_broadcast_command during commit 11)",
+            ),
+            BroadcastCommand::BroadcastSubscriberCount { reply, .. } => ack_not_impl(
+                reply,
+                "broadcast::broadcast_subscriber_count (use Supervisor::dispatch_broadcast_command during commit 11)",
+            ),
+            BroadcastCommand::IsBroadcastSubscriber { reply, .. } => ack_not_impl(
+                reply,
+                "broadcast::is_broadcast_subscriber (use Supervisor::dispatch_broadcast_command during commit 11)",
+            ),
+            BroadcastCommand::BroadcastAdmission { reply, .. } => ack_not_impl(
+                reply,
+                "broadcast::broadcast_admission (use Supervisor::dispatch_broadcast_command during commit 11)",
+            ),
+            BroadcastCommand::InitiateBroadcastHostingHandshake { reply, .. } => ack_not_impl(
+                reply,
+                "broadcast::initiate_broadcast_hosting_handshake (saga wiring deferred to commit 11.5 — see DEFERRED-commit-11-saga-use-cases.md)",
             ),
         }
     }
