@@ -40,6 +40,7 @@ pub mod deps;
 pub mod handle;
 pub mod handlers;
 pub mod outcome;
+pub(crate) mod query_state_view;
 pub mod sequence;
 pub mod state;
 
@@ -218,9 +219,16 @@ impl ContextActor {
             ContextCommand::Tools(ToolsCommand::Placeholder { reply }) => {
                 ack_not_impl(reply, "tools");
             }
-            ContextCommand::Queries(QueriesCommand::Placeholder { reply }) => {
-                ack_not_impl(reply, "queries");
-            }
+            // Queries variants — skeleton dispatch acks each typed
+            // oneshot with `Err(NotImplemented)` so the caller learns
+            // immediately that the actor did not own the state to
+            // answer. The real answer path lives on
+            // `Supervisor::dispatch_query`, which bypasses this skeleton
+            // by talking to the legacy `ContextManager` under the query
+            // shim. The skeleton only sees query commands if a caller
+            // mistakenly routes through the actor's mailbox — the real
+            // FFI dispatch goes through `Supervisor::dispatch_query`.
+            ContextCommand::Queries(q) => Self::skeleton_dispatch_queries(q),
             ContextCommand::SagaPhase(SagaPhaseMessage::Placeholder { reply }) => {
                 ack_not_impl(reply, "saga_phase");
             }
@@ -243,6 +251,76 @@ impl ContextActor {
                 // dispatch returns (the caller detected `is_shutdown`
                 // before invoking us).
                 ack_ok(reply);
+            }
+        }
+    }
+
+    /// Skeleton-dispatch helper for [`ContextCommand::Queries`]. Extracted
+    /// from [`Self::skeleton_dispatch`] so the outer function stays below
+    /// the `too_many_lines` clippy threshold. The body is a flat match on
+    /// every [`QueriesCommand`] variant; each arm acks with
+    /// `Err(NotImplemented)` via the variant's embedded oneshot sender.
+    ///
+    /// Shim-routed query dispatch does not go through this function — see
+    /// the comment on the sole call site in [`Self::skeleton_dispatch`].
+    fn skeleton_dispatch_queries(q: QueriesCommand) {
+        fn ack_not_impl<T>(
+            reply: tokio::sync::oneshot::Sender<Result<T, ContextError>>,
+            which: &'static str,
+        ) {
+            let _ = reply.send(Err(ContextError::NotImplemented(format!(
+                "{which} — migrates in the matching handler commit of ADR-049"
+            ))));
+        }
+        match q {
+            QueriesCommand::LocalPseudonym { reply, .. } => {
+                ack_not_impl(reply, "queries::local_pseudonym");
+            }
+            QueriesCommand::GetBroadcastKeyForLocalAuthor { reply, .. } => {
+                ack_not_impl(reply, "queries::get_broadcast_key_for_local_author");
+            }
+            QueriesCommand::MemberCount { reply, .. } => {
+                ack_not_impl(reply, "queries::member_count");
+            }
+            QueriesCommand::IsMember { reply, .. } => {
+                ack_not_impl(reply, "queries::is_member");
+            }
+            QueriesCommand::MemberDids { reply, .. } => {
+                ack_not_impl(reply, "queries::member_dids");
+            }
+            QueriesCommand::MemberRole { reply, .. } => {
+                ack_not_impl(reply, "queries::member_role");
+            }
+            QueriesCommand::ContextParams { reply, .. } => {
+                ack_not_impl(reply, "queries::context_params");
+            }
+            QueriesCommand::GetRoleState { reply, .. } => {
+                ack_not_impl(reply, "queries::get_role_state");
+            }
+            QueriesCommand::PendingCommits { reply, .. } => {
+                ack_not_impl(reply, "queries::pending_commits");
+            }
+            QueriesCommand::CommitFault { reply, .. } => {
+                ack_not_impl(reply, "queries::commit_fault");
+            }
+            QueriesCommand::EventLogEntries { reply, .. } => {
+                ack_not_impl(reply, "queries::event_log_entries");
+            }
+            #[cfg(feature = "testing")]
+            QueriesCommand::GetAccessKey { reply, .. } => {
+                ack_not_impl(reply, "queries::get_access_key");
+            }
+            #[cfg(feature = "testing")]
+            QueriesCommand::GetAllAccessKeys { reply, .. } => {
+                ack_not_impl(reply, "queries::get_all_access_keys");
+            }
+            #[cfg(feature = "testing")]
+            QueriesCommand::RemainingBudgetForTest { reply, .. } => {
+                ack_not_impl(reply, "queries::remaining_budget_for_test");
+            }
+            #[cfg(feature = "testing")]
+            QueriesCommand::VelocityForTest { reply, .. } => {
+                ack_not_impl(reply, "queries::velocity_for_test");
             }
         }
     }

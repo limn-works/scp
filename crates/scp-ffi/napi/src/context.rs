@@ -1358,61 +1358,126 @@ pub fn context_cancel_subscription(handle: &NapiContextHandle) -> napi::Result<(
 /// Returns an error if the `ContextManager` is not initialised.
 #[napi(js_name = "contextMemberCount")]
 pub async fn context_member_count(handle: &NapiContextHandle) -> napi::Result<u32> {
+    use scp_core::context::actor::commands::QueriesCommand;
     crate::napi_check_handle!(handle);
-    let manager = context_manager()?;
-    let count = manager.member_count(&handle.context_id).await.unwrap_or(0);
+    let supervisor = crate::runtime::supervisor()?;
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::MemberCount {
+        context_id,
+        reply: tx,
+    };
+    supervisor
+        .dispatch_query(cmd)
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("supervisor dispatch_query failed: {e}")))?;
+    let count = rx
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?
+        .unwrap_or(0);
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
 /// Returns whether a DID is a member of the context.
 ///
-/// Delegates to `ContextManager::is_member`.
+/// Routed through the ADR-049 query shim
+/// ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
+/// The shim acquires the same per-context mutex as the legacy
+/// `ContextManager::is_member` path; see
+/// `crates/scp-runtime/tests/actor_query_shim.rs` for the parity test.
 ///
 /// # Errors
 ///
-/// Returns an error if the `ContextManager` is not initialised.
+/// Returns an error if the `Supervisor` or `ContextManager` is not
+/// initialised, or if the shim reply channel is dropped before the
+/// handler completes.
 #[napi(js_name = "contextIsMember")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_is_member(handle: &NapiContextHandle, did: String) -> napi::Result<bool> {
+    use scp_core::context::actor::commands::QueriesCommand;
     crate::napi_check_handle!(handle);
-    let manager = context_manager()?;
-    Ok(manager.is_member(&handle.context_id, &did).await)
+    let supervisor = crate::runtime::supervisor()?;
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::IsMember {
+        context_id,
+        did,
+        reply: tx,
+    };
+    supervisor
+        .dispatch_query(cmd)
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("supervisor dispatch_query failed: {e}")))?;
+    rx.await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
+        .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
 /// Returns all member DIDs for a context.
 ///
-/// Delegates to `ContextManager::member_dids`.
+/// Routed through the ADR-049 query shim. See [`context_is_member`] for
+/// the shim rationale.
 ///
 /// # Errors
 ///
-/// Returns an error if the `ContextManager` is not initialised.
+/// Returns an error if the `Supervisor` or `ContextManager` is not
+/// initialised.
 #[napi(js_name = "contextMemberDids")]
 pub async fn context_member_dids(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
+    use scp_core::context::actor::commands::QueriesCommand;
     crate::napi_check_handle!(handle);
-    let manager = context_manager()?;
-    Ok(manager.member_dids(&handle.context_id).await)
+    let supervisor = crate::runtime::supervisor()?;
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::MemberDids {
+        context_id,
+        reply: tx,
+    };
+    supervisor
+        .dispatch_query(cmd)
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("supervisor dispatch_query failed: {e}")))?;
+    rx.await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
+        .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
 /// Returns the role assignment for a specific member in a context.
 ///
-/// Delegates to `ContextManager::member_role`. Returns the role name
-/// as a string, or `null` if the member is not found.
+/// Routed through the ADR-049 query shim. See [`context_is_member`] for
+/// the shim rationale. Returns the role name as a string, or `null`
+/// if the member is not found.
 ///
 /// # Errors
 ///
-/// Returns an error if the `ContextManager` is not initialised.
+/// Returns an error if the `Supervisor` or `ContextManager` is not
+/// initialised.
 #[napi(js_name = "contextMemberRole")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn context_member_role(
     handle: &NapiContextHandle,
     did: String,
 ) -> napi::Result<Option<String>> {
+    use scp_core::context::actor::commands::QueriesCommand;
     crate::napi_check_handle!(handle);
-    let manager = context_manager()?;
-    Ok(manager
-        .member_role(&handle.context_id, &did)
+    let supervisor = crate::runtime::supervisor()?;
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::MemberRole {
+        context_id,
+        did,
+        reply: tx,
+    };
+    supervisor
+        .dispatch_query(cmd)
         .await
-        .map(|a| a.role_name))
+        .map_err(|e| napi::Error::from_reason(format!("supervisor dispatch_query failed: {e}")))?;
+    let assignment = rx
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("shim reply dropped: {e}")))?
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    Ok(assignment.map(|a| a.role_name))
 }
 
 // ---------------------------------------------------------------------------

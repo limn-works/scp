@@ -193,6 +193,43 @@ pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
     })
 }
 
+/// Returns a reference to the shared
+/// [`Supervisor`](scp_core::context::supervisor::Supervisor) from the
+/// default bridge instance.
+///
+/// Used by the commits-7-to-11 FFI query shim — query bridge functions
+/// route through
+/// [`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)
+/// instead of calling `ContextManager::member_count` etc. directly.
+/// Deleted in commit 12 with the shim.
+///
+/// # Errors
+///
+/// Returns `ScpPyError::ContextError` if the bridge instance has not
+/// been initialized yet or if the bridge is currently suspended. Does
+/// NOT require the `ContextManager` itself to be attached — a future
+/// caller that constructs the supervisor before the manager is ready
+/// would observe `ContextError::NotInitialized` on dispatch, which maps
+/// to a descriptive Python error at the bridge boundary.
+pub fn supervisor() -> Result<&'static Arc<scp_core::context::supervisor::Supervisor>, ScpPyError> {
+    let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
+        ScpPyError::context(
+            "Supervisor not initialized — call py_context_create or \
+             init_context_manager first"
+                .to_owned(),
+        )
+    })?;
+    if bi.core.is_suspended() {
+        return Err(ScpPyError::context(
+            "bridge is suspended — call resume() before performing operations".to_owned(),
+        ));
+    }
+    if bi.core.is_shutdown() {
+        tracing::warn!("supervisor() called after shutdown — operations may fail");
+    }
+    Ok(bi.core.supervisor())
+}
+
 // ---------------------------------------------------------------------------
 // PyBridgeInstance (per-bridge concrete struct wrapping CoreFields — #1549 Phase 4)
 // ---------------------------------------------------------------------------

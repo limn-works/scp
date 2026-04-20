@@ -68,12 +68,23 @@ pub mod context {
         MANAGEMENT_MSG_MAGIC, MAX_MANAGEMENT_PAYLOAD_SIZE, RemoveMemberOutput,
     };
     pub use scp_runtime::context::ContextHandle;
+    /// Actor module — re-exported from `scp-runtime` so the FFI bridges
+    /// can name the [`QueriesCommand`](actor::commands::QueriesCommand)
+    /// variants they dispatch through
+    /// [`supervisor::Supervisor::dispatch_query`]. Part of the same
+    /// commits-7-to-11 shim surface; deleted in commit 12.
+    pub use scp_runtime::context::actor;
     pub use scp_runtime::context::builder::{
         ContextEventLogProvider, ContextTransportProvider, LocalTransportProvider,
         NotConfiguredTransportProvider,
     };
     pub use scp_runtime::context::manager::ContextManager;
     pub use scp_runtime::context::manager::ContextPersistence;
+    /// Supervisor module — re-exported from `scp-runtime` so the FFI
+    /// bridges (which depend on `scp-core`, not `scp-runtime` directly)
+    /// can construct the commits-7-to-11 query shim. Shrinks back to an
+    /// internal module in commit 12 when the shim is deleted.
+    pub use scp_runtime::context::supervisor;
     // Broadcast content types (previously at context level).
     pub use scp_protocol::context::broadcast_content::{
         BROADCAST_CONTENT_MAGIC, BROADCAST_CONTENT_VERSION, BroadcastContent,

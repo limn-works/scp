@@ -1158,7 +1158,15 @@ pub(super) struct PseudonymAnnouncement {
 pub(super) const PSEUDONYM_ANNOUNCEMENT_TAG: &str = "\0scp:pseudonym-announce:v1";
 
 /// Internal state tracked by the manager for each context.
-pub(super) struct PerContextState {
+///
+/// **Visibility:** elevated to `pub(crate)` by commit 7 of ADR-049 so the
+/// transitional [`crate::context::actor::query_state_view::QueryStateView`]
+/// adapter can borrow into this struct while the query-handler migration is
+/// under way. The struct (and this elevation) is deleted in commit 12
+/// alongside `ContextManager`. Do not add new public users outside the
+/// shim — everything that reads this type today either lives inside
+/// `manager/` or passes through the shim's typed accessor methods.
+pub(crate) struct PerContextState {
     /// Monotonic generation counter. Assigned on insertion into the contexts
     /// map. Used by Phase 3 re-checks to detect the confused-deputy scenario
     /// where a context was removed and recreated between lock release and
@@ -1229,6 +1237,92 @@ pub(super) struct PerContextState {
 }
 
 impl PerContextState {
+    // -------------------------------------------------------------------
+    // Commit 7 / ADR-049 read-only accessors
+    //
+    // These accessors expose borrowed views into the legacy
+    // `PerContextState` for the transitional
+    // [`crate::context::actor::query_state_view::QueryStateView`] shim.
+    // They return shared references only; every mutating path continues
+    // to touch fields directly inside the manager module. The set is
+    // deleted in commit 12 together with `manager::PerContextState`.
+    // -------------------------------------------------------------------
+
+    /// Membership state — the live `MembershipState` the manager uses to
+    /// track members, pseudonyms, and bind each member DID to its routing
+    /// identity.
+    #[must_use]
+    pub(crate) const fn membership(&self) -> &MembershipState {
+        &self.membership
+    }
+
+    /// Role / ceiling / assignment state.
+    #[must_use]
+    pub(crate) const fn role_state(&self) -> &ContextRoleState {
+        &self.role_state
+    }
+
+    /// Optional pseudonym routing ID (§9.10.4). `None` for legacy callers
+    /// and broadcast contexts.
+    #[must_use]
+    pub(crate) const fn local_pseudonym(&self) -> Option<&[u8; 32]> {
+        self.local_pseudonym.as_ref()
+    }
+
+    /// Broadcast-mode per-author key map. `None` for encrypted contexts.
+    #[must_use]
+    pub(crate) const fn broadcast_context(&self) -> Option<&BroadcastContext> {
+        self.broadcast_context.as_ref()
+    }
+
+    /// Context handle — used by callers that need the configured
+    /// `ContextParams` (session cap, nesting depth, chain depth, etc.).
+    #[must_use]
+    pub(crate) const fn handle(&self) -> &ContextHandle {
+        &self.handle
+    }
+
+    /// Pending MLS Commit retry queue (PR #1606 C6 surface). Read-only
+    /// view; mutation happens in the governance-timeout task.
+    #[must_use]
+    pub(crate) const fn pending_commits(&self) -> &VecDeque<PendingCommit> {
+        &self.pending_commits
+    }
+
+    /// Active commit fault marker. `Some` iff the most recent Commit
+    /// broadcast exhausted its retry budget.
+    #[must_use]
+    pub(crate) const fn commit_fault(&self) -> Option<&CommitFaultMarker> {
+        self.commit_fault.as_ref()
+    }
+
+    /// Per-member access-key store.
+    #[must_use]
+    pub(crate) const fn access_key_store(
+        &self,
+    ) -> &scp_protocol::crypto::access_keys::AccessKeyStore {
+        &self.access.access_key_store
+    }
+
+    /// Per-member budget tracker. Exposed for `#[cfg(feature = "testing")]`
+    /// assertions that verify the governance-economy bridge consumed
+    /// budget for a tool invocation.
+    #[must_use]
+    pub(crate) const fn budget_tracker(
+        &self,
+    ) -> &scp_protocol::economy::budget::MemberBudgetTracker {
+        &self.governance.budget_tracker
+    }
+
+    /// Per-member velocity tracker. Same scope and rationale as
+    /// [`Self::budget_tracker`].
+    #[must_use]
+    pub(crate) const fn velocity_tracker(
+        &self,
+    ) -> &scp_protocol::economy::antispam::SenderVelocityTracker {
+        &self.governance.velocity_tracker
+    }
+
     /// Pushes an event to the receive buffer and, if a broadcast channel is
     /// provided, sends a sanitized copy there too. Consolidates the two-step
     /// `receive_buffer.push` + `tx.send` pattern into a single call site to
@@ -2554,6 +2648,37 @@ impl ContextManager {
             .get(context_id)
             .map(|entry| Arc::clone(entry.value()))
             .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))
+    }
+
+    // -------------------------------------------------------------------
+    // Commit 7 / ADR-049 — transitional read accessors for the
+    // actor-per-context query shim. Deleted in commit 12.
+    // -------------------------------------------------------------------
+
+    /// `pub(crate)` variant of [`Self::get_context_arc`]. Used by the
+    /// commit-7 query shim on
+    /// [`Supervisor::dispatch_query`](crate::context::supervisor::supervisor::Supervisor::dispatch_query)
+    /// to resolve the per-context Arc outside the `manager/` submodule
+    /// without exposing the inner Mutex contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is
+    /// unknown.
+    pub(crate) fn get_context_arc_pub(
+        &self,
+        context_id: &str,
+    ) -> Result<Arc<Mutex<PerContextState>>, ContextError> {
+        self.get_context_arc(context_id)
+    }
+
+    /// Cheap reference to the manager's shared
+    /// [`ContextEventLogProvider`]. Used by the query shim to expose
+    /// Merkle event-log reads (e.g. `event_log_entries`) without cloning
+    /// the provider per call.
+    #[must_use]
+    pub(crate) fn event_log_provider_arc(&self) -> Arc<dyn ContextEventLogProvider> {
+        Arc::clone(&self.event_log)
     }
 
     /// Insert a new context into the map. Returns an error if

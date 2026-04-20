@@ -990,6 +990,39 @@ pub fn context_manager_expect() -> Result<&'static Arc<ContextManager>, crate::S
         })
 }
 
+/// Returns the per-instance
+/// [`Supervisor`](scp_core::context::supervisor::Supervisor) used by the
+/// commits-7-to-11 FFI query shim. Deleted in commit 12.
+///
+/// # Errors
+///
+/// Returns `ScpError::Context` (code `SCP-CTX-2000`) when the bridge
+/// instance has not been initialized, or when the bridge is suspended
+/// or shut down. Does not require the `ContextManager` itself to be
+/// attached.
+pub fn supervisor_expect()
+-> Result<&'static Arc<scp_core::context::supervisor::Supervisor>, crate::ScpError> {
+    let bi = DEFAULT_BRIDGE_INSTANCE
+        .get()
+        .ok_or_else(|| crate::ScpError::Context {
+            msg: "bridge not ready: no local DID registered".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })?;
+    if bi.core.is_suspended() {
+        return Err(crate::ScpError::Context {
+            msg: "bridge not ready: suspended".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        });
+    }
+    if bi.core.is_shutdown() {
+        return Err(crate::ScpError::Context {
+            msg: "bridge not ready: shut down".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        });
+    }
+    Ok(bi.core.supervisor())
+}
+
 /// Initializes the global [`ContextManager`] with [`MlsCryptoProvider`] and
 /// [`scp_core::context::NotConfiguredTransportProvider`].
 ///

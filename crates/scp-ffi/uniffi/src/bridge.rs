@@ -9205,8 +9205,15 @@ pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
 /// Returns the current member count for a context.
 ///
 /// Returns `None` if the context is not registered.
+///
+/// Routed through the ADR-049 query shim
+/// ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query))
+/// rather than calling `ContextManager::member_count` directly. The shim
+/// acquires the same per-context mutex as the legacy path and returns
+/// byte-identical results; see `crates/scp-runtime/tests/actor_query_shim.rs`.
 #[uniffi::export]
 pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
+    use scp_core::context::actor::commands::QueriesCommand;
     let check: Result<(), ScpError> = (|| {
         crate::uniffi_check_handle!(handle);
         Ok(())
@@ -9214,18 +9221,28 @@ pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
     if check.is_err() {
         return None;
     }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
+    let Ok(supervisor) = crate::runtime::supervisor_expect() else {
         return None;
     };
-    manager
-        .member_count(&handle.context_id)
-        .await
-        .map(|n| n as u64)
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::MemberCount {
+        context_id,
+        reply: tx,
+    };
+    if supervisor.dispatch_query(cmd).await.is_err() {
+        return None;
+    }
+    rx.await.ok()?.ok()?.map(|n| n as u64)
 }
 
 /// Returns `true` if the given DID is a member of the context.
+///
+/// Routed through the ADR-049 query shim. See
+/// [`context_member_count`] for the shim rationale.
 #[uniffi::export]
 pub async fn context_is_member(handle: Arc<ContextHandle>, did: String) -> bool {
+    use scp_core::context::actor::commands::QueriesCommand;
     let check: Result<(), ScpError> = (|| {
         crate::uniffi_check_handle!(handle);
         Ok(())
@@ -9233,15 +9250,29 @@ pub async fn context_is_member(handle: Arc<ContextHandle>, did: String) -> bool 
     if check.is_err() {
         return false;
     }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
+    let Ok(supervisor) = crate::runtime::supervisor_expect() else {
         return false;
     };
-    manager.is_member(&handle.context_id, &did).await
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::IsMember {
+        context_id,
+        did,
+        reply: tx,
+    };
+    if supervisor.dispatch_query(cmd).await.is_err() {
+        return false;
+    }
+    rx.await.ok().and_then(Result::ok).unwrap_or(false)
 }
 
 /// Returns all member DIDs for a context.
+///
+/// Routed through the ADR-049 query shim. See
+/// [`context_member_count`] for the shim rationale.
 #[uniffi::export]
 pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
+    use scp_core::context::actor::commands::QueriesCommand;
     let check: Result<(), ScpError> = (|| {
         crate::uniffi_check_handle!(handle);
         Ok(())
@@ -9249,17 +9280,30 @@ pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
     if check.is_err() {
         return Vec::new();
     }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
+    let Ok(supervisor) = crate::runtime::supervisor_expect() else {
         return Vec::new();
     };
-    manager.member_dids(&handle.context_id).await
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::MemberDids {
+        context_id,
+        reply: tx,
+    };
+    if supervisor.dispatch_query(cmd).await.is_err() {
+        return Vec::new();
+    }
+    rx.await.ok().and_then(Result::ok).unwrap_or_default()
 }
 
 /// Returns the role assignment for a specific member as a JSON string.
 ///
 /// Returns `None` if the member is not found or the context is not registered.
+///
+/// Routed through the ADR-049 query shim. See
+/// [`context_member_count`] for the shim rationale.
 #[uniffi::export]
 pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Option<String> {
+    use scp_core::context::actor::commands::QueriesCommand;
     let check: Result<(), ScpError> = (|| {
         crate::uniffi_check_handle!(handle);
         Ok(())
@@ -9267,12 +9311,23 @@ pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Opt
     if check.is_err() {
         return None;
     }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
+    let Ok(supervisor) = crate::runtime::supervisor_expect() else {
         return None;
     };
-    manager
-        .member_role(&handle.context_id, &did)
-        .await
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::MemberRole {
+        context_id,
+        did,
+        reply: tx,
+    };
+    if supervisor.dispatch_query(cmd).await.is_err() {
+        return None;
+    }
+    rx.await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
         .map(|r| format!("{r:?}"))
 }
 

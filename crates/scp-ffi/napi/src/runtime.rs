@@ -560,6 +560,36 @@ pub fn context_manager() -> napi::Result<&'static Arc<ContextManager>> {
     })
 }
 
+/// Returns the per-instance
+/// [`Supervisor`](scp_core::context::supervisor::Supervisor) used by the
+/// commits-7-to-11 FFI query shim. Deleted in commit 12.
+///
+/// # Errors
+///
+/// Returns `napi::Error` if the default bridge instance has not been
+/// initialized, or if the bridge is currently suspended. Does not
+/// require `ContextManager` to be attached.
+pub fn supervisor() -> napi::Result<&'static Arc<scp_core::context::supervisor::Supervisor>> {
+    let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
+        napi::Error::from(ScpNapiError::Context {
+            message: "Supervisor not initialized — call context_create or \
+                      init_context_manager first"
+                .to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })
+    })?;
+    if bi.core.is_suspended() {
+        return Err(napi::Error::from(ScpNapiError::Context {
+            message: "bridge is suspended — call resume() before performing operations".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        }));
+    }
+    if bi.core.is_shutdown() {
+        tracing::warn!("supervisor() called after shutdown — operations may fail");
+    }
+    Ok(bi.core.supervisor())
+}
+
 // ---------------------------------------------------------------------------
 // Default bridge instance (#1549 Phase 4 PR 1)
 //

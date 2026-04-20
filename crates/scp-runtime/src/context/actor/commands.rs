@@ -43,6 +43,14 @@ use tokio::sync::oneshot;
 
 use scp_protocol::context::ContextError;
 
+/// Reply-channel type alias for
+/// [`QueriesCommand::GetBroadcastKeyForLocalAuthor`]. The reply carries
+/// the locally-controlled author's broadcast key (32 bytes, wrapped in
+/// [`Zeroizing`](zeroize::Zeroizing) so the secret is zeroed on drop)
+/// plus the author's current broadcast epoch. Factored out to satisfy
+/// `clippy::type_complexity`.
+type BroadcastKeyReply = oneshot::Sender<Result<(zeroize::Zeroizing<[u8; 32]>, u64), ContextError>>;
+
 // ---------------------------------------------------------------------------
 // Outer enum
 // ---------------------------------------------------------------------------
@@ -177,14 +185,179 @@ pub enum ToolsCommand {
     },
 }
 
-/// See [`ContextCommand::Queries`]. Real variants arrive in commit 7 (the
-/// first handler migration — queries are the lowest-blast-radius path).
+/// See [`ContextCommand::Queries`]. Pure-read variants — handlers MUST
+/// NOT mutate `PerContextState` or any observable state reachable through
+/// the view / deps. Each variant carries a typed oneshot reply channel;
+/// the dispatch function sends the reply and returns
+/// `Outcome { mutated: false }`.
+///
+/// Commit 7 lands the real read variants that route through the
+/// transitional
+/// [`QueryStateView`](crate::context::actor::query_state_view::QueryStateView)
+/// borrow adapter. Variants that mutate state (even if they live in
+/// `manager/queries.rs` today — `drain_events`, access-key management,
+/// `compare_remote_checkpoint`, `prove_event_*`, etc.) are NOT migrated
+/// here and continue to route through the legacy `ContextManager` until
+/// their respective handler commits (8-11).
 pub enum QueriesCommand {
-    /// Placeholder. Queries are pure-read; commit 7 adds real variants
-    /// that return `Outcome { mutated: false }`.
-    Placeholder {
+    /// Pseudonym routing ID for the local member (§9.10.4).
+    /// `Ok(None)` iff no pseudonym is set. Read-only.
+    LocalPseudonym {
+        /// Context identifier string (matches the legacy API).
+        context_id: String,
         /// Oneshot reply channel.
-        reply: oneshot::Sender<Result<(), ContextError>>,
+        reply: oneshot::Sender<Result<Option<[u8; 32]>, ContextError>>,
+    },
+    /// Broadcast key + epoch for a locally-controlled author in a
+    /// broadcast context. Read-only.
+    GetBroadcastKeyForLocalAuthor {
+        /// Context identifier string.
+        context_id: String,
+        /// Author DID to look up.
+        author_did: String,
+        /// Oneshot reply channel — `Zeroizing<[u8; 32]>` key + epoch.
+        /// See [`BroadcastKeyReply`] for the typed alias.
+        reply: BroadcastKeyReply,
+    },
+    /// Current member count for the context.
+    MemberCount {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel. `Ok(None)` iff the context is unknown
+        /// (matches the legacy `ContextManager::member_count` contract).
+        reply: oneshot::Sender<Result<Option<usize>, ContextError>>,
+    },
+    /// Membership predicate — `true` iff `did` is currently a member.
+    IsMember {
+        /// Context identifier string.
+        context_id: String,
+        /// Candidate member DID.
+        did: String,
+        /// Oneshot reply channel. `Ok(false)` iff the context is
+        /// unknown (matches the legacy contract).
+        reply: oneshot::Sender<Result<bool, ContextError>>,
+    },
+    /// All member DIDs for the context.
+    MemberDids {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel. Empty vec iff the context is unknown
+        /// (matches the legacy contract).
+        reply: oneshot::Sender<Result<Vec<String>, ContextError>>,
+    },
+    /// Role assignment for a specific member.
+    MemberRole {
+        /// Context identifier string.
+        context_id: String,
+        /// Member DID.
+        did: String,
+        /// Oneshot reply channel. `Ok(None)` if the context is unknown
+        /// or the member has no assignment.
+        reply: oneshot::Sender<
+            Result<Option<scp_protocol::context::roles::RoleAssignment>, ContextError>,
+        >,
+    },
+    /// Configured `ContextParams`.
+    ContextParams {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel. `Ok(None)` iff the context is unknown.
+        reply: oneshot::Sender<
+            Result<Option<scp_protocol::context::params::ContextParams>, ContextError>,
+        >,
+    },
+    /// Role state snapshot (cloned).
+    GetRoleState {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel. `Ok(None)` iff the context is unknown.
+        reply: oneshot::Sender<
+            Result<Option<scp_protocol::context::roles::ContextRoleState>, ContextError>,
+        >,
+    },
+    /// Pending MLS Commit retry queue (PR #1606 C6). Cloned vec.
+    PendingCommits {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel. Empty vec iff the context is unknown.
+        reply: oneshot::Sender<Result<Vec<crate::context::manager::PendingCommit>, ContextError>>,
+    },
+    /// Active commit-fault marker. `Some` iff the context is in
+    /// fail-close state (PR #1606 C6).
+    CommitFault {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel. `Ok(None)` iff no fault or unknown.
+        reply: oneshot::Sender<
+            Result<Option<crate::context::manager::CommitFaultMarker>, ContextError>,
+        >,
+    },
+    /// Merkle event-log entries for a context (ADR-011). Delegates to
+    /// the shared `ContextEventLogProvider` — read-only.
+    EventLogEntries {
+        /// Canonical 32-byte context ID hash.
+        context_id_bytes: [u8; 32],
+        /// Oneshot reply channel. `Ok(None)` iff no log exists for the
+        /// context.
+        reply: oneshot::Sender<
+            Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>,
+        >,
+    },
+
+    // -------------------------------------------------------------------
+    // `#[cfg(feature = "testing")]` accessors. Pure reads.
+    // -------------------------------------------------------------------
+    /// Per-member access key (testing). `Ok(None)` iff the context is
+    /// unknown or no key has been issued for the member.
+    #[cfg(feature = "testing")]
+    GetAccessKey {
+        /// Context identifier string.
+        context_id: String,
+        /// Member DID.
+        member_did: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<
+            Result<Option<scp_protocol::crypto::access_keys::AccessKey>, ContextError>,
+        >,
+    },
+    /// All access keys for a context (testing). Empty map iff the
+    /// context is unknown.
+    #[cfg(feature = "testing")]
+    GetAllAccessKeys {
+        /// Context identifier string.
+        context_id: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<
+            Result<
+                std::collections::HashMap<String, scp_protocol::crypto::access_keys::AccessKey>,
+                ContextError,
+            >,
+        >,
+    },
+    /// Remaining budget for a member (testing). Returns zero iff the
+    /// context is unknown.
+    #[cfg(feature = "testing")]
+    RemainingBudgetForTest {
+        /// Context identifier string.
+        context_id: String,
+        /// Member DID.
+        member_did: scp_identity::DID,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<scp_protocol::economy::types::Amount, ContextError>>,
+    },
+    /// Velocity count for a member in the antispam window (testing).
+    /// Returns zero iff the context is unknown.
+    #[cfg(feature = "testing")]
+    VelocityForTest {
+        /// Context identifier string.
+        context_id: String,
+        /// Member DID.
+        member_did: scp_identity::DID,
+        /// Current Unix time (seconds) — caller supplies to keep the
+        /// handler pure / deterministic.
+        now_secs: u64,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<u64, ContextError>>,
     },
 }
 

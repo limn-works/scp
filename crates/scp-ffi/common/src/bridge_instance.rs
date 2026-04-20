@@ -65,6 +65,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use scp_core::context::ContextManager;
 use scp_core::context::ContextPersistence;
+use scp_core::context::supervisor::Supervisor;
 use scp_core::discovery::handles::HandleRegistry;
 use scp_core::discovery::petnames::PetnameMap;
 use scp_core::discovery::scope::ScopeRegistry;
@@ -208,6 +209,23 @@ pub struct CoreFields {
     /// steady-state operation, callers go through bridge functions that ensure
     /// `init_context_manager(real_did)` has been called first.
     context_manager: OnceLock<Arc<ContextManager>>,
+
+    /// Per-instance [`Supervisor`] — commits-7-to-11 FFI query shim.
+    ///
+    /// Every bridge instance owns one supervisor. Queries dispatched
+    /// through the supervisor's
+    /// [`dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)
+    /// path are answered by migrated handler code reading through the
+    /// transitional `QueryStateView` borrow adapter; writes continue to
+    /// run on the legacy `ContextManager`. See ADR-049 row 7 of the
+    /// commit ladder. Deleted in commit 12 with the shim itself.
+    ///
+    /// Constructed eagerly by every `CoreFields` constructor via
+    /// [`Supervisor::for_query_shim`]; the `ContextManager` is attached
+    /// automatically inside [`Self::set_context_manager`] so the shim's
+    /// `NotInitialized` error path never surfaces for well-sequenced
+    /// FFI callers.
+    supervisor: Arc<Supervisor>,
 
     /// Whether this instance has been shut down permanently.
     ///
@@ -429,6 +447,7 @@ impl CoreFields {
     pub fn new() -> Self {
         Self {
             context_manager: OnceLock::new(),
+            supervisor: Arc::new(Supervisor::for_query_shim()),
             shutdown: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
@@ -507,6 +526,7 @@ impl CoreFields {
     pub fn with_persistence_arc(persistence: Arc<dyn ContextPersistence + Send + Sync>) -> Self {
         Self {
             context_manager: OnceLock::new(),
+            supervisor: Arc::new(Supervisor::for_query_shim()),
             shutdown: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
@@ -598,9 +618,37 @@ impl CoreFields {
     /// does not carry a DID). Subsequent calls are ignored with a warning
     /// (`OnceLock` guarantees single initialization).
     pub fn set_context_manager(&self, context_manager: Arc<ContextManager>) {
+        // Attach to the query-shim supervisor first so that after this
+        // method returns, both the `CoreFields::context_manager` slot
+        // and `Supervisor::attached_context_manager` resolve the same
+        // `Arc`. Any ordering where the supervisor observes a manager
+        // before `try_context_manager` would returns it is fine (both
+        // point at the same `Arc`); the reverse ordering is also safe
+        // because `attach_context_manager` is idempotent on identity.
+        if let Err(err) = self.supervisor.attach_context_manager(&context_manager) {
+            // The only way this can fail is if a *different* ContextManager
+            // was previously attached — matches the OnceLock semantics on
+            // `context_manager` below. Log-and-continue preserves backward
+            // compatibility with the existing "already set" warning path.
+            tracing::warn!(
+                error = %err,
+                "set_context_manager — supervisor::attach_context_manager rejected the new manager (different pointer)"
+            );
+        }
         if self.context_manager.set(context_manager).is_err() {
             tracing::warn!("set_context_manager called but ContextManager already set — ignoring");
         }
+    }
+
+    /// Returns the shared per-instance [`Supervisor`]. Every `CoreFields`
+    /// constructor allocates one via [`Supervisor::for_query_shim`]; the
+    /// `ContextManager` is attached automatically in
+    /// [`Self::set_context_manager`]. FFI query call sites route through
+    /// [`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)
+    /// on the returned reference — see the ADR-049 commit-ladder row 7.
+    #[must_use]
+    pub const fn supervisor(&self) -> &Arc<Supervisor> {
+        &self.supervisor
     }
 
     /// Returns a reference to the persistence provider, if configured.

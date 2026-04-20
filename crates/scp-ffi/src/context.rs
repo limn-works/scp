@@ -3374,57 +3374,124 @@ fn py_broadcast_admission(handle: &PyContextHandle) -> PyResult<Option<String>> 
 /// Returns the current member count for a context.
 ///
 /// Returns `None` if the context is not registered.
+///
+/// Routed through the ADR-049 query shim
+/// ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query))
+/// rather than calling `ContextManager::member_count` directly. The shim
+/// acquires the same per-context mutex as the legacy path and returns
+/// byte-identical results; see `crates/scp-runtime/tests/actor_query_shim.rs`.
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_context_member_count(handle: &PyContextHandle) -> PyResult<Option<u64>> {
+    use scp_core::context::actor::commands::QueriesCommand;
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let context_id = handle.context_id.clone();
-    Ok(rt.block_on(mgr.member_count(&context_id)).map(|n| n as u64))
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::MemberCount {
+        context_id,
+        reply: tx,
+    };
+    rt.block_on(async move {
+        sup.dispatch_query(cmd)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })
+    .map(|opt| opt.map(|n| n as u64))
 }
 
 /// Returns `True` if the given DID is a member of the context.
+///
+/// Routed through the ADR-049 query shim. See
+/// [`py_context_member_count`] for the shim rationale.
 #[pyfunction]
 #[pyo3(signature = (handle, did))]
 fn py_context_is_member(handle: &PyContextHandle, did: &str) -> PyResult<bool> {
+    use scp_core::context::actor::commands::QueriesCommand;
     crate::pyscp_check_handle!(handle);
     validate::validate_did(did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let context_id = handle.context_id.clone();
-    Ok(rt.block_on(mgr.is_member(&context_id, did)))
+    let did = did.to_owned();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::IsMember {
+        context_id,
+        did,
+        reply: tx,
+    };
+    rt.block_on(async move {
+        sup.dispatch_query(cmd)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })
 }
 
 /// Returns all member DIDs for a context.
+///
+/// Routed through the ADR-049 query shim. See
+/// [`py_context_member_count`] for the shim rationale.
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_context_member_dids(handle: &PyContextHandle) -> PyResult<Vec<String>> {
+    use scp_core::context::actor::commands::QueriesCommand;
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let context_id = handle.context_id.clone();
-    Ok(rt.block_on(mgr.member_dids(&context_id)))
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::MemberDids {
+        context_id,
+        reply: tx,
+    };
+    rt.block_on(async move {
+        sup.dispatch_query(cmd)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })
 }
 
 /// Returns the role assignment for a specific member as a debug string.
 ///
 /// Returns `None` if the member is not found or the context is not registered.
+///
+/// Routed through the ADR-049 query shim. See
+/// [`py_context_member_count`] for the shim rationale.
 #[pyfunction]
 #[pyo3(signature = (handle, did))]
 fn py_context_member_role(handle: &PyContextHandle, did: &str) -> PyResult<Option<String>> {
+    use scp_core::context::actor::commands::QueriesCommand;
     crate::pyscp_check_handle!(handle);
     validate::validate_did(did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let context_id = handle.context_id.clone();
-    Ok(rt
-        .block_on(mgr.member_role(&context_id, did))
-        .map(|r| format!("{r:?}")))
+    let did = did.to_owned();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::MemberRole {
+        context_id,
+        did,
+        reply: tx,
+    };
+    rt.block_on(async move {
+        sup.dispatch_query(cmd)
+            .await
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })
+    .map(|opt| opt.map(|r| format!("{r:?}")))
 }
 
 // ---------------------------------------------------------------------------

@@ -460,6 +460,16 @@ pub enum ContextError {
     /// translators.
     #[error("SCP-CTX-2131: not implemented: {0}")]
     NotImplemented(String),
+
+    /// A subsystem required for this operation has not been wired up yet.
+    /// Distinct from `NotImplemented`: the operation itself exists and is
+    /// migrated, but a dependency (e.g. the legacy `ContextManager` bridge
+    /// during the commits-7-11 migration window) is absent.
+    ///
+    /// Mapped to canonical code `SCP-CTX-2132` through the bridge error
+    /// translators.
+    #[error("SCP-CTX-2132: not initialized: {0}")]
+    NotInitialized(String),
 }
 
 // ---------------------------------------------------------------------------
