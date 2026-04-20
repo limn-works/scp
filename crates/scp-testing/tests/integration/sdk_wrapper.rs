@@ -60,8 +60,8 @@ const SWIFT_DISCOVERY: &str =
 const SWIFT_PROVENANCE: &str =
     include_str!("../../../../bindings/swift/Sources/SCP/Provenance.swift");
 const SWIFT_TRUST: &str = include_str!("../../../../bindings/swift/Sources/SCP/Trust.swift");
-const SWIFT_SYNC: &str = include_str!("../../../../bindings/swift/Sources/SCP/Sync.swift");
-const SWIFT_BRIDGE: &str = include_str!("../../../../bindings/swift/Sources/SCP/Bridge.swift");
+// Sync.swift and Bridge.swift deleted in PR 4 Phase C (#1549 façade deletion) —
+// their functionality is exposed as methods on the SCP class directly.
 const SWIFT_GOVERNANCE: &str =
     include_str!("../../../../bindings/swift/Sources/SCP/Governance.swift");
 
@@ -146,8 +146,6 @@ fn swift_all() -> String {
         SWIFT_DISCOVERY,
         SWIFT_PROVENANCE,
         SWIFT_TRUST,
-        SWIFT_SYNC,
-        SWIFT_BRIDGE,
         SWIFT_GOVERNANCE,
     ]
     .join("\n")
@@ -1214,8 +1212,6 @@ fn all_sdk_source_files_are_non_empty() {
         ("Swift Discovery.swift", SWIFT_DISCOVERY),
         ("Swift Provenance.swift", SWIFT_PROVENANCE),
         ("Swift Trust.swift", SWIFT_TRUST),
-        ("Swift Sync.swift", SWIFT_SYNC),
-        ("Swift Bridge.swift", SWIFT_BRIDGE),
         ("Swift Governance.swift", SWIFT_GOVERNANCE),
         ("Kotlin Identity.kt", KT_IDENTITY),
         ("Kotlin BridgeConnector.kt", KT_BRIDGE_CONNECTOR),
