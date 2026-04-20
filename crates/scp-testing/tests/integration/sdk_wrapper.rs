@@ -64,6 +64,19 @@ const SWIFT_TRUST: &str = include_str!("../../../../bindings/swift/Sources/SCP/T
 // their functionality is exposed as methods on the SCP class directly.
 const SWIFT_GOVERNANCE: &str =
     include_str!("../../../../bindings/swift/Sources/SCP/Governance.swift");
+// Phase 4 PR 4 migrated many per-module Swift wrappers into methods on the
+// `SCP` class in `Scp.swift` (e.g. `ucanValidate`, `transportStatus`,
+// `syncClassifyOffline`, `identityMigrate`, `bridgeEvaluateTrust`). This
+// file is now the canonical wrapper surface alongside the per-module
+// files above, so include it for the SDK wrapper coverage matrix.
+const SWIFT_SCP: &str = include_str!("../../../../bindings/swift/Sources/SCP/Scp.swift");
+// UniFFI-generated bindings. Exposes the raw bridge functions
+// (`bridgeRegister`, `bridgeCreateShadow`, `evaluateProvenanceQuality`,
+// etc.) that the hand-written wrappers delegate to. Some operations are
+// currently invoked only via the generated free functions — include this
+// file so the coverage matrix sees them.
+const SWIFT_BINDINGS: &str =
+    include_str!("../../../../bindings/swift/Sources/SCP/Internal/ScpBindings.swift");
 
 // Kotlin SDK files
 const KT_IDENTITY: &str =
@@ -147,6 +160,8 @@ fn swift_all() -> String {
         SWIFT_PROVENANCE,
         SWIFT_TRUST,
         SWIFT_GOVERNANCE,
+        SWIFT_SCP,
+        SWIFT_BINDINGS,
     ]
     .join("\n")
 }
@@ -326,12 +341,20 @@ fn expected_operations() -> Vec<ExpectedOp> {
             kt_patterns: &["fun toolVerify("],
         },
         // --- UCAN ---
+        // Phase 4 PR 4 moved the UCAN wrappers from free-function form
+        // (`validateUcanToken` / `mintUcanToken` / `revokeUcanToken`) into
+        // methods on the `SCP` class (`ucanValidate` / `ucanMint` /
+        // `ucanRevoke`). Both spellings are accepted.
         ExpectedOp {
             category: "UCAN",
             name: "validate",
             py_patterns: &["async def validate(", "ucan_validate"],
             ts_patterns: &["validateUcan(", "ucanValidate"],
-            swift_patterns: &["func validateUcanToken(", "func validate("],
+            swift_patterns: &[
+                "func validateUcanToken(",
+                "func validate(",
+                "func ucanValidate(",
+            ],
             kt_patterns: &["fun ucanValidate("],
         },
         ExpectedOp {
@@ -339,7 +362,7 @@ fn expected_operations() -> Vec<ExpectedOp> {
             name: "mint",
             py_patterns: &["async def mint(", "ucan_mint"],
             ts_patterns: &["mintUcan(", "ucanMint"],
-            swift_patterns: &["func mintUcanToken(", "func mint("],
+            swift_patterns: &["func mintUcanToken(", "func mint(", "func ucanMint("],
             kt_patterns: &["fun ucanMint("],
         },
         ExpectedOp {
@@ -347,7 +370,7 @@ fn expected_operations() -> Vec<ExpectedOp> {
             name: "revoke",
             py_patterns: &["async def revoke(", "ucan_revoke"],
             ts_patterns: &["revokeUcan(", "ucanRevoke"],
-            swift_patterns: &["func revokeUcanToken(", "func revoke("],
+            swift_patterns: &["func revokeUcanToken(", "func revoke(", "func ucanRevoke("],
             kt_patterns: &["fun ucanRevoke("],
         },
         // --- Event Log ---
@@ -523,7 +546,9 @@ fn expected_operations() -> Vec<ExpectedOp> {
             name: "evaluate_trust",
             py_patterns: &["evaluate_trust", "bridge_evaluate_trust"],
             ts_patterns: &["evaluateBridgeTrust(", "bridgeEvaluateTrust"],
-            swift_patterns: &["func evaluateBridgeTrust("],
+            // Phase 4 PR 4 renamed `evaluateBridgeTrust` → `bridgeEvaluateTrust`
+            // on the `SCP` class in Scp.swift. Accept both.
+            swift_patterns: &["func evaluateBridgeTrust(", "func bridgeEvaluateTrust("],
             kt_patterns: &["fun bridgeEvaluateTrust("],
         },
         ExpectedOp {
@@ -923,16 +948,26 @@ fn swift_sdk_context_wrappers() {
 #[test]
 fn swift_sdk_ucan_wrappers() {
     let src = swift_all();
+    // Phase 4 PR 4 moved UCAN wrappers onto the `SCP` class
+    // (`ucanValidate` / `ucanMint` / `ucanRevoke`). Accept the new method
+    // names alongside the legacy `validateUcanToken` / `mintUcanToken` /
+    // `revokeUcanToken` free-function spellings.
     assert!(
-        src.contains("func validateUcanToken(") || src.contains("func validate("),
+        src.contains("func validateUcanToken(")
+            || src.contains("func validate(")
+            || src.contains("func ucanValidate("),
         "Swift SDK missing UCAN validate wrapper"
     );
     assert!(
-        src.contains("func mintUcanToken(") || src.contains("func mint("),
+        src.contains("func mintUcanToken(")
+            || src.contains("func mint(")
+            || src.contains("func ucanMint("),
         "Swift SDK missing UCAN mint wrapper"
     );
     assert!(
-        src.contains("func revokeUcanToken(") || src.contains("func revoke("),
+        src.contains("func revokeUcanToken(")
+            || src.contains("func revoke(")
+            || src.contains("func ucanRevoke("),
         "Swift SDK missing UCAN revoke wrapper"
     );
 }
@@ -962,12 +997,16 @@ fn swift_sdk_transport_wrappers() {
 #[test]
 fn swift_sdk_bridge_wrappers() {
     let src = swift_all();
+    // Phase 4 PR 4 renamed `evaluateBridgeTrust` → `bridgeEvaluateTrust`
+    // on the `SCP` class in Scp.swift. `bridgeRegister` and
+    // `bridgeCreateShadow` come from the UniFFI-generated bindings in
+    // `Internal/ScpBindings.swift`, which is now included in `swift_all()`.
     assert!(
         src.contains("func bridgeRegister("),
         "Swift SDK missing bridge register wrapper"
     );
     assert!(
-        src.contains("func evaluateBridgeTrust("),
+        src.contains("func evaluateBridgeTrust(") || src.contains("func bridgeEvaluateTrust("),
         "Swift SDK missing bridge evaluate_trust wrapper"
     );
     assert!(

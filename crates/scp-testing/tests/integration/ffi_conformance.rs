@@ -39,6 +39,11 @@ const PYO3_TRUST: &str = include_str!("../../../../crates/scp-ffi/src/trust.rs")
 const PYO3_MCP: &str = include_str!("../../../../crates/scp-ffi/src/mcp.rs");
 const PYO3_ECONOMY: &str = include_str!("../../../../crates/scp-ffi/src/economy.rs");
 const PYO3_MEDIA: &str = include_str!("../../../../crates/scp-ffi/src/media.rs");
+// Phase 4 PR 4 migrated `fn py_foo(...)` free functions to
+// `#[pymethods] impl PyScp { pub fn foo(&self, ...) }` methods. The per-category
+// files above still contain these methods on PyScp; `scp.rs` holds the
+// lifecycle surface (new / with_storage / suspend / resume / shutdown).
+const PYO3_SCP: &str = include_str!("../../../../crates/scp-ffi/src/scp.rs");
 
 // UniFFI bridge (single file)
 const UNIFFI_BRIDGE: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
@@ -59,6 +64,10 @@ const NAPI_TRUST: &str = include_str!("../../../../crates/scp-ffi/napi/src/trust
 const NAPI_MCP: &str = include_str!("../../../../crates/scp-ffi/napi/src/mcp.rs");
 const NAPI_ECONOMY: &str = include_str!("../../../../crates/scp-ffi/napi/src/economy.rs");
 const NAPI_MEDIA: &str = include_str!("../../../../crates/scp-ffi/napi/src/media.rs");
+// Phase 4 PR 4 migrated `fn napi_foo(...)` free functions to `impl Scp { pub async fn foo(&self, ...) }`
+// methods in `scp.rs`. The per-category source files retain helpers and types,
+// but the canonical bridge surface now lives on the `Scp` struct.
+const NAPI_SCP: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp.rs");
 
 // WASM bridge sources
 const WASM_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/wasm/src/identity.rs");
@@ -230,35 +239,49 @@ fn any_source_has_fn(sources: &[&str], name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Returns the function names to search for in PyO3 sources.
-/// PyO3 prefixes all functions with `py_`, plus some operations use
-/// different names (e.g. `context_receive` instead of `context_subscribe`).
+///
+/// Historically PyO3 prefixed every free function with `py_`. Phase 4 PR 4
+/// (#1549 façade deletion) migrated those free functions to
+/// `#[pymethods] impl PyScp { pub fn foo(&self, ...) }` methods. The method
+/// form uses the canonical name directly, so both the legacy `py_{canonical}`
+/// and the method form `{canonical}` are accepted. Pre-existing renamings
+/// (`context_subscribe` → `context_receive`, `broadcast_block` →
+/// `broadcast_block_subscriber`, governance checkpoints losing the
+/// `context_` prefix) are also checked under both the legacy `py_*` form
+/// and the new method form.
 fn pyo3_names(canonical: &str) -> Vec<String> {
-    let mut names = vec![format!("py_{canonical}")];
+    // Accept the canonical method name and the legacy `py_` prefix.
+    let mut names = vec![canonical.to_string(), format!("py_{canonical}")];
     match canonical {
         // PyO3 uses "context_receive" for the subscribe/receive pattern
         "context_subscribe" => {
+            names.push("context_receive".to_string());
             names.push("py_context_receive".to_string());
         }
         // PyO3 uses "broadcast_block_subscriber" not "broadcast_block"
         "broadcast_block" => {
+            names.push("broadcast_block_subscriber".to_string());
             names.push("py_broadcast_block_subscriber".to_string());
         }
-        // PyO3 governance is named py_governance_execute
-        "governance_execute" => {
-            names.push("py_governance_execute".to_string());
-        }
+        // `governance_execute` + legacy `py_governance_execute` already
+        // match via the default `{canonical}` and `py_{canonical}` entries,
+        // so no additional alias is needed. Drop-through handled by `_`.
         // MCP: check for specific sub-functions
         "mcp_server" => {
+            names.push("mcp_serve".to_string());
             names.push("py_mcp_serve".to_string());
         }
         "mcp_client" => {
+            names.push("mcp_client_connect_stdio".to_string());
             names.push("py_mcp_client_connect_stdio".to_string());
         }
-        // Governance checkpoints: PyO3 uses py_create_governance_checkpoint
+        // Governance checkpoints: PyO3 drops the `context_` prefix.
         "context_create_governance_checkpoint" => {
+            names.push("create_governance_checkpoint".to_string());
             names.push("py_create_governance_checkpoint".to_string());
         }
         "context_add_checkpoint_cosignature" => {
+            names.push("add_checkpoint_cosignature".to_string());
             names.push("py_add_checkpoint_cosignature".to_string());
         }
         _ => {}
@@ -369,6 +392,7 @@ fn pyo3_sources() -> Vec<&'static str> {
         PYO3_MCP,
         PYO3_ECONOMY,
         PYO3_MEDIA,
+        PYO3_SCP,
     ]
 }
 
@@ -388,6 +412,7 @@ fn napi_sources() -> Vec<&'static str> {
         NAPI_MCP,
         NAPI_ECONOMY,
         NAPI_MEDIA,
+        NAPI_SCP,
     ]
 }
 
@@ -746,16 +771,22 @@ fn uniffi_source_contains_export_markers() {
     );
 }
 
-/// Verifies NAPI source files actually contain `#[napi]` markers.
+/// Verifies NAPI source files actually contain napi-rs export markers.
+///
+/// Phase 4 PR 4 migrated free-function napi exports into `impl Scp { ... }`
+/// methods; most of those methods carry `#[napi(js_name = "...")]` instead
+/// of the bare `#[napi]` attribute. Accept both forms by counting the
+/// shared `#[napi` prefix (which covers `#[napi]`, `#[napi(...)]`,
+/// `#[napi(object)]`, etc.).
 #[test]
 fn napi_sources_contain_napi_markers() {
     let sources = napi_sources();
-    let marker_count: usize = sources.iter().map(|s| s.matches("#[napi]").count()).sum();
+    let marker_count: usize = sources.iter().map(|s| s.matches("#[napi").count()).sum();
 
-    eprintln!("NAPI #[napi] count: {marker_count}");
+    eprintln!("NAPI #[napi...] count: {marker_count}");
     assert!(
         marker_count >= 30,
-        "Expected at least 30 #[napi] markers, found {marker_count}"
+        "Expected at least 30 #[napi...] markers, found {marker_count}"
     );
 }
 
