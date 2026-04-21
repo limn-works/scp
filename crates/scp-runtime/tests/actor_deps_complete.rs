@@ -392,6 +392,13 @@ async fn build_actor_deps_populates_every_field() {
         deps.payment_adapter.is_none(),
         "payment_adapter must populate as `None` when the manager has no adapter configured"
     );
+
+    // `local_dids` — wired from the supervisor's own `ArcSwap`. Fresh
+    // supervisor has an empty set; witness by loading the snapshot.
+    assert!(
+        deps.local_dids.load().is_empty(),
+        "local_dids must populate — fresh supervisor starts with empty set"
+    );
 }
 
 /// `build_actor_deps_from_attached` fails clean if no ContextManager is

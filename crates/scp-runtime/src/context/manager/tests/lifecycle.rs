@@ -4285,3 +4285,94 @@ impl super::ContextPersistence for SharedMockPersistence {
         self.0.list_persisted_contexts()
     }
 }
+
+// -----------------------------------------------------------------------
+// ADR-049 commit 12b.2a — `take_context_state` tests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn take_context_state_removes_entry() {
+    // Create a context via the full create_context path (which inserts
+    // into `manager.contexts`), then drain via `take_context_state`.
+    // Subsequent `get_context_arc_pub` calls must return
+    // `ContextNotRegistered` — the contract 12b.2b relies on when
+    // spawning an actor with owned state.
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let creator = DID("did:example:creator".into());
+    let _handle = manager
+        .create_context("take-ctx-1".into(), ContextParams::default(), creator, None)
+        .await
+        .expect("create_context");
+
+    // Pre-take: get_context_arc_pub succeeds.
+    assert!(manager.get_context_arc_pub("take-ctx-1").is_ok());
+
+    let _taken = manager
+        .take_context_state("take-ctx-1")
+        .expect("take_context_state succeeds for registered context");
+
+    // Post-take: get_context_arc_pub returns ContextNotRegistered.
+    match manager.get_context_arc_pub("take-ctx-1") {
+        Err(scp_protocol::context::ContextError::ContextNotRegistered(id)) => {
+            assert_eq!(id, "take-ctx-1");
+        }
+        Ok(_) => panic!("expected ContextNotRegistered, got Ok"),
+        Err(other) => panic!("expected ContextNotRegistered, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn take_context_state_missing_context_returns_not_registered() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    // `Arc<Mutex<PerContextState>>` does not implement `Debug` (the
+    // inner state carries non-`Debug` fields like `ScpMlsGroup`), so
+    // match the Result shape explicitly rather than call `expect_err`.
+    match manager.take_context_state("never-created") {
+        Ok(_) => panic!("take on unknown context must error"),
+        Err(scp_protocol::context::ContextError::ContextNotRegistered(id)) => {
+            assert_eq!(id, "never-created");
+        }
+        Err(other) => panic!("expected ContextNotRegistered, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn take_context_state_returns_arc_holding_state() {
+    // The returned Arc holds the moved state. Lock it and verify the
+    // handle matches what was registered.
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    let creator = DID("did:example:creator".into());
+    let _handle = manager
+        .create_context(
+            "take-ctx-returns".into(),
+            ContextParams::default(),
+            creator,
+            None,
+        )
+        .await
+        .expect("create_context");
+
+    let arc = manager
+        .take_context_state("take-ctx-returns")
+        .expect("take succeeds");
+    let guard = arc.lock().await;
+    assert_eq!(guard.handle().context_id(), "take-ctx-returns");
+}

@@ -2861,6 +2861,78 @@ impl ContextManager {
         self.get_context_arc(context_id)
     }
 
+    /// Destructively move per-context state out of the manager's
+    /// `contexts` map so a [`crate::context::actor::ContextActor`] can
+    /// own it directly (ADR-049 commit 12b.2a).
+    ///
+    /// After `Ok` return:
+    /// - `self.contexts[context_id]` is absent.
+    /// - Every subsequent [`Self::get_context_arc`] /
+    ///   [`Self::lock_context`] / [`Self::relock_context`] /
+    ///   [`Self::get_context_arc_pub`] call for `context_id` returns
+    ///   [`ContextError::ContextNotRegistered`] — the same error those
+    ///   methods already produce when a context is unknown. This matches
+    ///   the plan's "actor took ownership" contract: legacy surfaces
+    ///   observe the state as gone; the actor holds the authoritative
+    ///   copy.
+    ///
+    /// # Return shape
+    ///
+    /// Returns the `Arc<Mutex<PerContextState>>` wholesale rather than
+    /// draining the inner struct. The actor's construction helper
+    /// (landing in commit 12b.2b) locks the Mutex once, moves the state
+    /// via [`tokio::sync::Mutex::into_inner`] (which requires sole Arc
+    /// ownership after any outstanding `get_context_arc` clones drop),
+    /// and discards the Mutex. Handing the Arc through avoids an async
+    /// lock acquisition on the manager side and keeps the drain purely
+    /// on the actor side where it's cheap.
+    ///
+    /// # Concurrency
+    ///
+    /// The `DashMap::remove` is atomic. Any caller that cloned the Arc
+    /// via [`Self::get_context_arc`] BEFORE the remove still holds a
+    /// live reference and can lock the Mutex — but `PerContextState` is
+    /// `!Sync` under the Mutex and the actor's construction helper
+    /// drains the state under its own lock acquisition, so the race
+    /// resolves by timing: either (a) the in-flight call completes
+    /// before the actor locks (state is drained to the actor after),
+    /// or (b) the actor locks first and the in-flight call sees the
+    /// post-drain default / empty state. Production call sites
+    /// serialize spawn-vs-mutation through the supervisor's
+    /// `write_lock` or the bridge's suspend flow; this method does not
+    /// itself need an async lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if `context_id` is
+    /// not in the `contexts` map (already taken or never created —
+    /// indistinguishable from the manager's POV since the manager does
+    /// not track the "taken" predicate; the supervisor's
+    /// `actors` registry is the authoritative "actor owns this context"
+    /// signal).
+    ///
+    /// # Scope — infrastructure only
+    ///
+    /// Commit 12b.2a wires the move path but no production site calls
+    /// it. Commit 12b.2b is the first call site; see
+    /// `.docs/adrs/ADR-049-actor-per-context.md` §Commit ladder
+    /// row 12b.2b.
+    ///
+    /// `dead_code` allow: no production caller yet. The crate-local
+    /// unit tests here exercise the method; 12b.2b removes the allow
+    /// when the lifecycle handler's create/restore path invokes it.
+    #[allow(dead_code)]
+    pub(crate) fn take_context_state(
+        &self,
+        context_id: &str,
+    ) -> Result<Arc<Mutex<PerContextState>>, ContextError> {
+        let (_, arc) = self
+            .contexts
+            .remove(context_id)
+            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        Ok(arc)
+    }
+
     /// Cheap reference to the manager's shared
     /// [`ContextEventLogProvider`]. Used by the query shim to expose
     /// Merkle event-log reads (e.g. `event_log_entries`) without cloning

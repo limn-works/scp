@@ -442,6 +442,20 @@ impl Supervisor {
             event_tx: cm.event_tx_opt(),
             key_resolver: cm.key_resolver_clone(),
             payment_adapter: cm.payment_adapter_opt(),
+            // Supervisor owns the authoritative `local_dids` snapshot.
+            // The bundle's field is `Arc<ArcSwap<HashSet<DID>>>` — the
+            // supervisor's own field is `ArcSwap<HashSet<DID>>`
+            // (non-Arc'd). Wrap a fresh `ArcSwap` around the
+            // supervisor's current snapshot so the returned bundle is
+            // clone-cheap. Note: the returned bundle sees the snapshot
+            // AT BUILD-TIME — later supervisor mutations to
+            // `self.local_dids` don't propagate. This matches the
+            // legacy `ContextManager::local_dids` observability:
+            // captured state at read-time, not live view. Post-12b.2b
+            // the authoritative field will live on the supervisor and
+            // this bundle field will hold an `Arc` clone of the
+            // supervisor's own `ArcSwap`, sharing writes live.
+            local_dids: Arc::new(arc_swap::ArcSwap::new(self.local_dids.load_full())),
         })
     }
 
@@ -1022,12 +1036,99 @@ impl Supervisor {
             self.actors.insert(ctx_id.clone(), handle.clone());
         }
 
-        // Spawn the actor's dispatch loop. Commit 6's `ContextActor::run`
-        // is a skeleton that returns `NotImplemented` for every
-        // non-lifecycle command.
+        // Spawn the actor's dispatch loop. During the 12b.2a → 12b.2b
+        // window the existing no-state `spawn_actor` signature routes
+        // through [`ContextActor::new_skeleton`] — the state still
+        // lives on `ContextManager`, and the shim dispatch (see
+        // [`Self::dispatch_command`] family) continues to delegate
+        // there. [`Self::spawn_actor_with_state`] is the post-12b.2a
+        // path that takes owned state + deps and constructs a
+        // state-carrying actor via [`ContextActor::new`].
         let inbox = rx;
         tokio::spawn(async move {
-            crate::context::actor::ContextActor::new(ctx_id, inbox)
+            crate::context::actor::ContextActor::new_skeleton(ctx_id, inbox)
+                .run()
+                .await;
+        });
+
+        handle
+    }
+
+    /// Spawn a new `ContextActor` task that owns drained
+    /// [`PerContextState`](crate::context::actor::PerContextState) +
+    /// [`ActorDeps`](crate::context::actor::ActorDeps) directly
+    /// (ADR-049 commit 12b.2a).
+    ///
+    /// This is the post-refactor spawn path: the supervisor's caller
+    /// drains state from the legacy `ContextManager` and
+    /// `MlsCryptoProvider` via
+    /// [`crate::context::manager::ContextManager::take_context_state`]
+    /// +
+    /// [`crate::crypto::mls::provider::MlsCryptoProvider::take_crypto_state`],
+    /// assembles the actor-side `PerContextState` using the drained
+    /// fields, and hands the state + deps bundle into this method.
+    /// The spawned actor becomes the sole owner; subsequent
+    /// manager/provider calls for the same context return the typed
+    /// "taken by actor" errors.
+    ///
+    /// The returned [`ContextActorHandle`] is registered in the
+    /// supervisor's `actors` map under the same `write_lock` that
+    /// [`Self::spawn_actor`] uses. The handle's mailbox capacity
+    /// matches [`ACTOR_MAILBOX_CAPACITY`] (256, plan §"Mailbox
+    /// parameters").
+    ///
+    /// # Visibility
+    ///
+    /// `pub(in crate::context)` — the only production caller is the
+    /// lifecycle handler's create / restore / import path (landing
+    /// in commit 12b.2b). External callers (FFI bridges,
+    /// downstream crates) reach the actor through
+    /// [`Self::dispatch_command`] or the
+    /// [`crate::context::supervisor::handle::SupervisorHandle`] /
+    /// [`crate::context::actor::deps::ActorDeps::supervisor`]
+    /// capabilities — never directly.
+    ///
+    /// # Scope — infrastructure only
+    ///
+    /// Commit 12b.2a wires the signature and registry insertion.
+    /// The spawned actor's `run()` loop currently delegates every
+    /// command variant to the skeleton dispatch (same fallback as
+    /// [`ContextActor::new_skeleton`]) — migrating real handler
+    /// bodies onto `&mut self.state` + `&self.deps` is 12b.2b's
+    /// atomic transition across all nine handler submodules.
+    ///
+    /// `dead_code` allow: no production call site yet. 12b.2b is the
+    /// first.
+    #[allow(dead_code)]
+    pub(in crate::context) async fn spawn_actor_with_state(
+        &self,
+        state: crate::context::actor::state::PerContextState,
+        deps: crate::context::actor::deps::ActorDeps,
+        mailbox_capacity: Option<usize>,
+    ) -> ContextActorHandle {
+        let capacity = mailbox_capacity.unwrap_or(ACTOR_MAILBOX_CAPACITY);
+        let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(capacity);
+
+        // Derive the supervisor-registry string key from the state's
+        // canonical 32-byte context ID. `hex::encode` matches the
+        // string form used throughout the legacy shim (see
+        // `ContextManager::contexts`, keyed by `String`).
+        let ctx_id_str = hex::encode(state.context_id);
+
+        let handle = ContextActorHandle::from_sender(tx);
+        {
+            // Write-path mutation: register the handle under the
+            // write lock — same contract as [`Self::spawn_actor`].
+            let _guard = self.write_lock.lock().await;
+            self.actors.insert(ctx_id_str.clone(), handle.clone());
+        }
+
+        // Hand the owned state + deps into the actor task. The
+        // spawned future captures both by move; neither escapes the
+        // actor's scope.
+        let inbox = rx;
+        tokio::spawn(async move {
+            crate::context::actor::ContextActor::new(state, deps, inbox)
                 .run()
                 .await;
         });
@@ -2001,5 +2102,182 @@ mod tests {
         // lands with the panic-recovery path in commit 11).
         let _handle2 = s.spawn_actor("ctx-42".to_owned(), None).await;
         assert!(s.lookup("ctx-42").is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-049 commit 12b.2a — `spawn_actor_with_state` tests
+    // -----------------------------------------------------------------
+
+    /// Construct a minimal [`crate::context::actor::deps::ActorDeps`] for
+    /// the `spawn_actor_with_state` tests. Builds through the attached
+    /// manager's `build_actor_deps_from_attached` path so we exercise
+    /// real construction rather than invent synthetic mocks.
+    fn test_actor_deps(supervisor: &Arc<Supervisor>) -> crate::context::actor::deps::ActorDeps {
+        use scp_platform::testing::InMemoryStorage;
+
+        let persistence: Arc<dyn ContextPersistence> = Arc::new(TestPersistence);
+        let mls: Arc<dyn crate::crypto::mls::backend::MlsBackend> =
+            Arc::new(crate::crypto::mls::production_backend::ProductionMlsBackend::new());
+        let hpke: Arc<dyn crate::crypto::hpke_backend::HpkeBackend> =
+            Arc::new(crate::crypto::hpke_backend::ProductionHpkeBackend::new());
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let kp_store = crate::context::supervisor::key_package_actor::KeyPackageStoreActor::spawn(
+            DID("did:example:spawn-state-test".to_owned()),
+        );
+
+        supervisor
+            .build_actor_deps_from_attached(persistence, mls, hpke, mls_storage, kp_store)
+            .expect("build_actor_deps_from_attached needs manager attached")
+    }
+
+    /// A tiny `ContextEventLogProvider` that accepts every call and
+    /// returns empty data for every read. Exists only so
+    /// [`supervisor_with_manager`] can construct a manager via the
+    /// builder without dragging in the full mock stack from the
+    /// `tests/actor_*_shim.rs` integration harnesses.
+    struct TestEventLog;
+    impl crate::context::builder::ContextEventLogProvider for TestEventLog {
+        fn init_event_log(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        fn append_event(
+            &self,
+            _context_id: &[u8; 32],
+            _event: &str,
+            _actor_did: &str,
+            _payload: Option<&serde_json::Value>,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        fn destroy_event_log(
+            &self,
+            _context_id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Build a supervisor WITH an attached `ContextManager` so
+    /// [`test_actor_deps`] can construct `ActorDeps` via the real
+    /// `build_actor_deps_from_attached` path. The `test_supervisor`
+    /// helper above does NOT attach a manager because its saga /
+    /// lookup tests do not need one.
+    fn supervisor_with_manager() -> Arc<Supervisor> {
+        // Minimal providers — the spawn-registry tests only care about
+        // the supervisor's actor map, not the manager's behaviour.
+        // `MlsCryptoProvider::new` takes a String DID; the stub DID is
+        // never used by the spawn tests because no
+        // `create_context` call runs.
+        let crypto: Box<dyn scp_protocol::context::builder::ContextCryptoProvider> =
+            Box::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+                "did:dht:z6MktestDoNotRely".to_owned(),
+            ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(TestEventLog);
+        let manager = Arc::new(crate::context::manager::ContextManager::new(
+            crypto,
+            transport,
+            event_log,
+            Arc::new(|_| None),
+        ));
+
+        let persistence: Arc<dyn ContextPersistence> = Arc::new(TestPersistence);
+        let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
+            scp_platform::testing::InMemoryStorage::new(),
+        )));
+        let supervisor = Arc::new(Supervisor::new(
+            persistence,
+            journal,
+            SupervisorConfig::default(),
+        ));
+        supervisor.attach_context_manager(&manager).unwrap();
+        supervisor
+    }
+
+    #[tokio::test]
+    async fn spawn_actor_with_state_registers_handle_and_accepts_commands() {
+        let supervisor_arc = supervisor_with_manager();
+        let deps = test_actor_deps(&supervisor_arc);
+
+        // Construct a fresh encrypted-mode PerContextState. The
+        // context_id is arbitrary for this test — the registry key
+        // is derived from it via `hex::encode`.
+        let ctx_id_bytes = [0xABu8; 32];
+        let expected_ctx_key = hex::encode(ctx_id_bytes);
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+
+        let handle = supervisor_arc
+            .spawn_actor_with_state(state, deps, None)
+            .await;
+        // Handle is registered under the hex-encoded context id key.
+        assert!(
+            supervisor_arc.lookup(&expected_ctx_key).is_some(),
+            "actor must be registered under hex-encoded context id"
+        );
+
+        // Handle is alive — send a placeholder messaging command and
+        // observe the skeleton dispatch's `NotImplemented` ack. This
+        // exercises both the mpsc plumbing and the
+        // `ContextActor::new` + `run()` happy path.
+        let err = handle
+            .send(|reply| ContextCommand::Messaging(MessagingCommand::Placeholder { reply }))
+            .await
+            .expect_err("skeleton dispatch still ACKs NotImplemented in 12b.2a");
+        assert!(matches!(err, ContextError::NotImplemented(_)));
+
+        // Cleanly shut down.
+        handle.send_shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_actor_with_state_overwrites_existing_handle() {
+        // Same contract as the skeleton `spawn_actor`: a second spawn
+        // with the same context_id overwrites. The watchdog / panic-
+        // recovery path (commit 11) polices duplicate spawns; this
+        // method stays minimal.
+        let supervisor_arc = supervisor_with_manager();
+
+        let ctx_id_bytes = [0xCDu8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+
+        let state1 = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+        let deps1 = test_actor_deps(&supervisor_arc);
+        let h1 = supervisor_arc
+            .spawn_actor_with_state(state1, deps1, None)
+            .await;
+        assert!(supervisor_arc.lookup(&ctx_key).is_some());
+
+        let state2 = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_001,
+            DID("did:example:admin".to_owned()),
+        );
+        let deps2 = test_actor_deps(&supervisor_arc);
+        let h2 = supervisor_arc
+            .spawn_actor_with_state(state2, deps2, None)
+            .await;
+        assert!(supervisor_arc.lookup(&ctx_key).is_some());
+
+        // Shut down both to avoid leaked tasks.
+        let _ = h1.send_shutdown().await;
+        let _ = h2.send_shutdown().await;
     }
 }

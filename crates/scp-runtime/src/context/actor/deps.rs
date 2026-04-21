@@ -35,10 +35,42 @@
 //!   `ContextManager::payment_adapter`. `Option` because "free context"
 //!   is a valid configuration.
 //!
+//! # Commit 12b.2a expansion
+//!
+//! Commit 12b.2a of ADR-049 (actor-owned-state infrastructure) adds one
+//! additional cross-cutting collaborator that handler bodies need once
+//! they stop delegating to `ContextManager`:
+//!
+//! - `local_dids` — `Arc<ArcSwap<HashSet<DID>>>`. Legacy:
+//!   `ContextManager::local_dids` (`RwLock<HashSet<DID>>`). Rewritten to
+//!   `ArcSwap` here because the read path is on the hot path of every
+//!   `deliver_incoming` (resolve local member for sender-key layer) —
+//!   `ArcSwap::load` is lock-free. Supervisor-scoped on the post-
+//!   refactor side; wired at actor-spawn time by the supervisor cloning
+//!   its own `Arc`.
+//!
+//! # `storage` is NOT on the bundle
+//!
+//! The [`scp_platform::Storage`] trait uses `impl Future` in its
+//! associated methods, so it is not dyn-compatible — `Arc<dyn Storage>`
+//! fails to compile. Every production carrier of `Storage` is generic
+//! over `S: Storage` (see `ProtocolRepositorySagaJournal<S>`,
+//! `ProtocolRepository<S>`). Embedding a generic in `ActorDeps` would
+//! require parameterizing every handler signature over `S`, which is a
+//! non-additive restructure out of scope for commit 12b.2a.
+//!
+//! Handler bodies that need raw byte-blob storage (saga evidence, KP
+//! store blobs) reach it through the specific bridge that already
+//! owns a concrete `Arc<S>` — e.g. [`Self::persistence`] (typed
+//! `ContextSnapshot` persistence), or the
+//! [`KeyPackageStoreHandle`](crate::context::supervisor::key_package_actor::KeyPackageStoreHandle)
+//! inside the bundle. No handler currently needs `dyn Storage`
+//! directly; if one ever does, the path is a focused generic
+//! parameterization, not a dyn-trait field here.
+//!
 //! Fields explicitly **not** added here:
 //!
-//! - `local_dids`, `standing_contexts` — supervisor-scoped state already
-//!   reachable through `SupervisorHandle::local_dids()` /
+//! - `standing_contexts` — supervisor-scoped state reachable through
 //!   `SupervisorHandle::standing_peer()` per ADR §2.
 //! - `contexts` / `contexts_arc` — cross-actor reads are banned by the
 //!   capability contract (ADR §2: "Never ContextActor → ContextActor
@@ -55,8 +87,11 @@
 //! new fields — 12b+ performs the mechanical migration from
 //! `view.manager().foo` → `deps.foo`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
+use scp_identity::DID;
 use scp_primitives::Clock;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
@@ -137,6 +172,19 @@ pub struct ActorDeps {
     /// `None` for "free context" configurations — handlers skip the
     /// escrow path and fall through to budget-only enforcement.
     pub payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
+    /// DIDs controlled by the local node/SDK. `ArcSwap` for lock-free
+    /// reads on every `deliver_incoming` (resolve local member). Legacy:
+    /// [`crate::context::manager::ContextManager::local_dids`]
+    /// (`RwLock<HashSet<DID>>`). The actor model hoists this to the
+    /// supervisor so every actor shares the same snapshot without each
+    /// one carrying its own `RwLock` — the `Arc<ArcSwap<_>>` is
+    /// clone-cheap and every actor gets a snapshot reference at spawn
+    /// time.
+    ///
+    /// Added in commit 12b.2a of ADR-049. Read by the messaging
+    /// handler's `deliver_incoming` body (landing 12b.2b) to resolve
+    /// which local DID the incoming envelope addresses.
+    pub local_dids: Arc<ArcSwap<HashSet<DID>>>,
 }
 
 // Compile-time witness that `ActorDeps` is `Send + Sync` — the bundle

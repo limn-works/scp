@@ -71,6 +71,20 @@ pub use scp_protocol::context::ContextError;
 
 use tokio::sync::mpsc;
 
+/// Encode a 32-byte context ID as lowercase hex. Matches the string
+/// form used throughout the legacy `ContextManager` shim so the
+/// actor's `context_id` field is interchangeable with the shim's
+/// `ctx_id: &str` parameter.
+fn hex_encode_context_id(id: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for byte in id {
+        use std::fmt::Write;
+        // Infallible for `u8` inputs written into `String`.
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
+}
+
 /// Per-context actor. Owns one [`PerContextState`] by move and processes
 /// commands from its inbox one at a time.
 ///
@@ -88,46 +102,159 @@ pub struct ContextActor {
     /// Command inbox. Paired with the `Sender` held by
     /// [`ContextActorHandle`].
     inbox: mpsc::Receiver<ContextCommand>,
-    // NOTE — deliberately omitted until the migration commits wire real
-    // construction sites (plan §"Commit ladder" commits 7-11):
-    //
-    //   state: PerContextState,
-    //   deps: ActorDeps,
-    //   ttl_timer: Option<tokio::time::Interval>,
-    //   governance_timeout: Option<tokio::time::Sleep>,
-    //   last_persisted_at: std::time::Instant,
-    //   dirty: bool,
-    //
-    // The skeleton's `run()` loop only drives the inbox arm; landing
-    // these fields now with `Default::default()` would violate the
-    // "no hardcoded None in place of wired state" failure mode
-    // explicitly called out in plan §"Known failure modes". They land
-    // with the handlers that exercise them.
+    /// Owned per-context state. `Some` for actors constructed via
+    /// [`Self::new`] with a full state payload (12b.2a infrastructure
+    /// path, exercised by 12b.2b handlers). `None` for skeleton actors
+    /// constructed via [`Self::new_skeleton`] — these are the pre-
+    /// 12b.2a test fixtures and the shim-era `spawn_actor` path whose
+    /// dispatch continues to route through
+    /// [`crate::context::supervisor::supervisor::Supervisor::dispatch_command`]
+    /// against the legacy `ContextManager`.
+    ///
+    /// Two-mode is bounded: once 12b.2b flips all handler dispatch to
+    /// the actor path, every spawn carries `Some(state)` and this
+    /// field becomes non-`Option`.
+    ///
+    /// Read into handler bodies as `&mut self.state` in 12b.2b+. The
+    /// 12b.2a dispatch loop does not yet consume the state — it still
+    /// ACKs with `Err(NotImplemented)` via the skeleton dispatch —
+    /// because migrating one handler without the others silently
+    /// breaks the nine remaining shim handlers (see
+    /// `.docs/adrs/ADR-049-actor-per-context.md` §Commit ladder
+    /// row 12b.2a rationale).
+    #[allow(dead_code)] // read by 12b.2b handler bodies
+    state: Option<state::PerContextState>,
+    /// Owned dependency bundle. `Some` / `None` mirrors [`Self::state`]
+    /// — the two are always both `Some` or both `None`. Two-mode is
+    /// bounded identically.
+    #[allow(dead_code)] // read by 12b.2b handler bodies
+    deps: Option<deps::ActorDeps>,
+    /// TTL expiry interval timer. Armed at actor construction when the
+    /// context's TTL configuration demands it; `None` for contexts
+    /// without TTL and for skeleton-mode actors. Drives the
+    /// `handlers/ttl_close.rs` expiry path once the run-loop grows a
+    /// `select!` TTL arm in 12b.2b+.
+    #[allow(dead_code)] // read by 12b.2b+ run-loop
+    ttl_timer: Option<tokio::time::Interval>,
+    /// Governance proposal timeout deadline. Armed on governance
+    /// proposal creation; fires once and is rearmed if a subsequent
+    /// proposal lands. Driven by the handler migration in 12b.2b+.
+    ///
+    /// Note — `tokio::time::Sleep` is `!Unpin` so the field holds a
+    /// pinned box. Constructing the future upfront (even unused)
+    /// keeps the run-loop's `select!` arm shape stable as the
+    /// migration lands.
+    #[allow(dead_code)] // read by 12b.2b+ run-loop
+    governance_timeout: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    /// Unix-ms instant of the last successful coalesced persist. The
+    /// run-loop's persistence arm compares `now() - last_persisted_at`
+    /// against the coalescing window (250 ms per plan
+    /// §"Persistence coalescing") before issuing a snapshot write.
+    /// Initialized to "now" at actor construction.
+    #[allow(dead_code)] // read by 12b.2b+ run-loop
+    last_persisted_at: std::time::Instant,
+    /// Dirty flag set when any handler's [`outcome::Outcome`] carries
+    /// `mutated: true`. Cleared after a successful coalesced persist.
+    /// Initialized `false` at actor construction.
+    #[allow(dead_code)] // read by 12b.2b+ run-loop
+    dirty: bool,
 }
 
 impl ContextActor {
-    /// Construct a fresh actor. `inbox` is paired with a
-    /// `Sender<ContextCommand>` held by one or more
-    /// [`ContextActorHandle`]s. The actor's `run()` loop exits when
-    /// either (a) every sender drops, making `inbox.recv()` return
-    /// `None`, or (b) a `LifecycleControlCommand::Shutdown` is received.
+    /// Construct a fresh actor that owns [`PerContextState`] and
+    /// [`ActorDeps`] directly (ADR-049 commit 12b.2a infrastructure
+    /// path).
+    ///
+    /// This is the production constructor — every
+    /// [`crate::context::supervisor::supervisor::Supervisor::spawn_actor`]
+    /// call that migrates state out of the legacy `ContextManager` /
+    /// `MlsCryptoProvider` uses this constructor to hand the drained
+    /// state into the actor task.
     ///
     /// Visibility is `pub(in crate::context)` — only
     /// `crate::context::supervisor::supervisor` constructs actors
-    /// (commit 6's `Supervisor::spawn_actor`).
+    /// (the test-only [`Self::new_skeleton`] is also `pub(in
+    /// crate::context)` for the same reason).
     ///
-    /// `dead_code` allow: the only production caller is
-    /// `Supervisor::spawn_actor`, which is itself only exercised in
-    /// `#[cfg(test)]` until the lifecycle handler migrates in commit 9.
-    /// The non-test build sees `new` as uncalled because no production
-    /// path yet invokes `spawn_actor` — the allow is removed when that
-    /// path wires up.
+    /// # Construction of auxiliary fields
+    ///
+    /// - `ttl_timer`, `governance_timeout` start as `None`. Handler
+    ///   migrations arm them lazily on first use (TTL config present,
+    ///   governance proposal landed).
+    /// - `last_persisted_at` starts at `Instant::now()` so a fresh
+    ///   actor's first coalescing window runs for the full duration
+    ///   before the first persist.
+    /// - `dirty` starts `false` — no mutations yet.
+    ///
+    /// # `context_id` derivation
+    ///
+    /// The canonical context ID lives on `state.context_id` as
+    /// `[u8; 32]`. The actor's `String` copy is derived at
+    /// construction-time by hex-encoding the 32-byte hash, which
+    /// matches the string form `ContextManager` uses throughout the
+    /// shim. Callers therefore do not need to pass `context_id`
+    /// separately — it is sourced from the state payload.
+    #[allow(dead_code)] // first production caller is 12b.2b
+    pub(in crate::context) fn new(
+        state: state::PerContextState,
+        deps: deps::ActorDeps,
+        inbox: mpsc::Receiver<ContextCommand>,
+    ) -> Self {
+        let context_id = hex_encode_context_id(&state.context_id);
+        Self {
+            context_id,
+            inbox,
+            state: Some(state),
+            deps: Some(deps),
+            ttl_timer: None,
+            governance_timeout: None,
+            last_persisted_at: std::time::Instant::now(),
+            dirty: false,
+        }
+    }
+
+    /// Construct a skeleton actor without state or deps. Used by the
+    /// pre-12b.2a test fixtures and by
+    /// [`crate::context::supervisor::supervisor::Supervisor::spawn_actor`]
+    /// for contexts whose state still lives on the legacy
+    /// `ContextManager` (every production context during the
+    /// 12b.2a → 12b.2b window).
+    ///
+    /// The skeleton's `run()` loop drains commands from the inbox and
+    /// ACKs each with the same `Err(NotImplemented)` response the
+    /// pre-12b.2a dispatch produced. This is deliberate: flipping the
+    /// dispatch path for one handler while state still lives on the
+    /// manager would silently break the other nine shim handlers. See
+    /// `.docs/adrs/ADR-049-actor-per-context.md` §Commit ladder row
+    /// 12b.2b for the atomic migration plan.
+    ///
+    /// Visibility matches [`Self::new`]: `pub(in crate::context)`.
+    ///
+    /// `dead_code` allow: the first production caller is 12b.2b's
+    /// atomic messaging migration, which deletes the skeleton path
+    /// and routes every spawn through [`Self::new`] with real state.
+    /// Until then this constructor is test-only for the module's
+    /// existing unit tests.
     #[allow(dead_code)]
-    pub(in crate::context) const fn new(
+    pub(in crate::context) fn new_skeleton(
         context_id: String,
         inbox: mpsc::Receiver<ContextCommand>,
     ) -> Self {
-        Self { context_id, inbox }
+        Self {
+            context_id,
+            inbox,
+            state: None,
+            deps: None,
+            ttl_timer: None,
+            governance_timeout: None,
+            // `Instant::now()` initializes the coalescing window even
+            // though the skeleton dispatch never reads it — avoids
+            // carrying a magic-value sentinel. When 12b.2b removes the
+            // skeleton path this field is populated identically via
+            // [`Self::new`].
+            last_persisted_at: std::time::Instant::now(),
+            dirty: false,
+        }
     }
 
     /// Dispatch loop. See plan §"ContextActor" for the full
@@ -734,7 +861,7 @@ mod tests {
     #[tokio::test]
     async fn actor_acks_placeholder_command_with_not_implemented() {
         let (tx, rx) = mpsc::channel::<ContextCommand>(1);
-        let actor = ContextActor::new("ctx-42".to_owned(), rx);
+        let actor = ContextActor::new_skeleton("ctx-42".to_owned(), rx);
         let actor_handle = tokio::spawn(actor.run());
 
         let handle = ContextActorHandle::from_sender(tx);
@@ -752,7 +879,7 @@ mod tests {
     #[tokio::test]
     async fn actor_exits_on_inbox_close() {
         let (tx, rx) = mpsc::channel::<ContextCommand>(1);
-        let actor = ContextActor::new("ctx-1".to_owned(), rx);
+        let actor = ContextActor::new_skeleton("ctx-1".to_owned(), rx);
         let actor_handle = tokio::spawn(actor.run());
 
         // Drop every sender; actor should observe `None` on recv and
@@ -769,7 +896,7 @@ mod tests {
     #[tokio::test]
     async fn actor_pause_acks_ok_and_keeps_running() {
         let (tx, rx) = mpsc::channel::<ContextCommand>(1);
-        let actor = ContextActor::new("ctx-1".to_owned(), rx);
+        let actor = ContextActor::new_skeleton("ctx-1".to_owned(), rx);
         let actor_handle = tokio::spawn(actor.run());
 
         let handle = ContextActorHandle::from_sender(tx);
@@ -788,7 +915,7 @@ mod tests {
     #[tokio::test]
     async fn actor_shutdown_command_exits_loop_promptly() {
         let (tx, rx) = mpsc::channel::<ContextCommand>(1);
-        let actor = ContextActor::new("ctx-1".to_owned(), rx);
+        let actor = ContextActor::new_skeleton("ctx-1".to_owned(), rx);
         let actor_handle = tokio::spawn(actor.run());
 
         let handle = ContextActorHandle::from_sender(tx);
@@ -798,5 +925,180 @@ mod tests {
             .await
             .expect("actor must exit promptly after Shutdown")
             .unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-049 commit 12b.2a — state-carrying `ContextActor::new` tests
+    // -----------------------------------------------------------------
+
+    /// Minimal event log provider for the `ContextActor::new` test.
+    /// Accepts every call, returns OK for every append, never appends
+    /// anything to a real log — the 12b.2a dispatch does not exercise
+    /// the event-log path, so the stub is never actually touched.
+    struct TestEventLog;
+    impl crate::context::builder::ContextEventLogProvider for TestEventLog {
+        fn init_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: &str,
+            _actor: &str,
+            _payload: Option<&serde_json::Value>,
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+        fn destroy_event_log(
+            &self,
+            _id: &[u8; 32],
+        ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+            Ok(())
+        }
+    }
+
+    /// Minimal persistence stub for the `ContextActor::new` test.
+    /// Returns empty reads and silently accepts every write.
+    struct TestPersistence;
+    impl crate::context::manager::ContextPersistence for TestPersistence {
+        fn persist_context(
+            &self,
+            _: &str,
+            _: &crate::context::manager::ContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_context(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<crate::context::manager::ContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn persist_broadcast(
+            &self,
+            _: &str,
+            _: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn load_broadcast(
+            &self,
+            _: &str,
+        ) -> Result<
+            Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(None)
+        }
+        fn delete_context(&self, _: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+        fn list_persisted_contexts(
+            &self,
+        ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Assemble a supervisor-backed `ActorDeps` bundle for the
+    /// `actor_with_state_acks_placeholder_with_not_implemented` test.
+    /// Extracted so the test function stays below the `too_many_lines`
+    /// clippy threshold.
+    fn new_test_deps() -> deps::ActorDeps {
+        use crate::context::supervisor::supervisor::{Supervisor, SupervisorConfig};
+        use crate::context::supervisor::{ProtocolRepositorySagaJournal, SagaJournal};
+        use scp_identity::DID;
+        use scp_platform::testing::InMemoryStorage;
+        use std::sync::Arc;
+
+        let crypto: Box<dyn scp_protocol::context::builder::ContextCryptoProvider> =
+            Box::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+                "did:dht:z6MktestActorNew".to_owned(),
+            ));
+        let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
+            Box::new(crate::context::builder::NotConfiguredTransportProvider);
+        let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
+            Box::new(TestEventLog);
+        let manager = Arc::new(crate::context::manager::ContextManager::new(
+            crypto,
+            transport,
+            event_log,
+            Arc::new(|_| None),
+        ));
+
+        let persistence: Arc<dyn crate::context::manager::ContextPersistence> =
+            Arc::new(TestPersistence);
+        let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
+            InMemoryStorage::new(),
+        )));
+        let supervisor = Arc::new(Supervisor::new(
+            persistence.clone(),
+            journal,
+            SupervisorConfig::default(),
+        ));
+        supervisor.attach_context_manager(&manager).unwrap();
+
+        let mls: Arc<dyn crate::crypto::mls::backend::MlsBackend> =
+            Arc::new(crate::crypto::mls::production_backend::ProductionMlsBackend::new());
+        let hpke: Arc<dyn crate::crypto::hpke_backend::HpkeBackend> =
+            Arc::new(crate::crypto::hpke_backend::ProductionHpkeBackend::new());
+        let mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter> =
+            Arc::new(
+                crate::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(Arc::new(
+                    InMemoryStorage::new(),
+                )),
+            );
+        let kp_store = crate::context::supervisor::key_package_actor::KeyPackageStoreActor::spawn(
+            DID("did:example:actor-with-state-test".to_owned()),
+        );
+        supervisor
+            .build_actor_deps_from_attached(persistence, mls, hpke, mls_storage, kp_store)
+            .expect("build_actor_deps_from_attached")
+    }
+
+    /// `ContextActor::new` constructs an actor that owns `PerContextState`
+    /// + `ActorDeps` directly (12b.2a infrastructure path). The dispatch
+    /// loop's behaviour is unchanged in 12b.2a (still ACKs
+    /// `NotImplemented`); this test just asserts the struct is
+    /// constructible and the run-loop processes commands.
+    ///
+    /// Integration-level coverage of the full
+    /// `build_actor_deps_from_attached` path lives in
+    /// `crates/scp-runtime/tests/actor_deps_complete.rs` +
+    /// `spawn_actor_with_state` unit tests in
+    /// `crates/scp-runtime/src/context/supervisor/supervisor.rs`; this
+    /// unit test focuses on the actor struct's constructor + run-loop.
+    #[tokio::test]
+    async fn actor_with_state_acks_placeholder_with_not_implemented() {
+        let deps = new_test_deps();
+        let state = state::PerContextState::new_for_test_encrypted(
+            [0x42u8; 32],
+            1_700_000_000,
+            scp_identity::DID("did:example:admin".to_owned()),
+        );
+
+        let (tx, rx) = mpsc::channel::<ContextCommand>(4);
+        let actor = ContextActor::new(state, deps, rx);
+        let actor_task = tokio::spawn(actor.run());
+
+        let handle = ContextActorHandle::from_sender(tx);
+        // Skeleton dispatch still fires in 12b.2a — actor owns state
+        // + deps, but the run loop has not yet been rewired to read
+        // them. Assert the `NotImplemented` ACK proves the loop picks
+        // up commands from the inbox.
+        let err = handle
+            .send(|reply| ContextCommand::Messaging(MessagingCommand::Placeholder { reply }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ContextError::NotImplemented(_)));
+
+        handle.send_shutdown().await.unwrap();
+        actor_task.await.unwrap();
     }
 }

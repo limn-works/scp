@@ -18,7 +18,7 @@
 //! [`ContextCryptoProvider`]: scp_protocol::context::builder::ContextCryptoProvider
 //! [`ContextManager`]: crate::context::manager::ContextManager
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[allow(
     clippy::disallowed_types,
     reason = "`MlsCryptoProvider` itself is deleted in commit 12 of ADR-049 (actor refactor); all Mutex fields are the exact primitives the actor replaces. See plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
@@ -229,6 +229,105 @@ struct ContextCryptoState {
     recv_sequence_tracker: HashMap<String, (u64, u64)>,
 }
 
+// ---------------------------------------------------------------------------
+// OwnedMlsCryptoState — destructive-move payload for actor ownership transfer
+// ---------------------------------------------------------------------------
+
+/// Owned per-context MLS crypto state moved out of
+/// [`MlsCryptoProvider::contexts`] by [`MlsCryptoProvider::take_crypto_state`]
+/// (ADR-049 commit 12b.2a).
+///
+/// Mirrors the private [`ContextCryptoState`] struct above — one public
+/// `pub` field per legacy field, plus the `send_sequence` counter so
+/// callers can seed an actor-side
+/// [`crate::context::actor::SendSequenceTracker`] at take-time. After
+/// `take_crypto_state` returns `Ok(OwnedMlsCryptoState)`, the provider's
+/// `contexts[ctx_id]` entry is absent and subsequent `seal` / `open` /
+/// `with_context` calls targeting that context return
+/// [`ContextError::CryptoFailed`] with a "context state owned by actor"
+/// message. The invariant is tracked by
+/// [`MlsCryptoProvider::taken_context_ids`] — a post-refactor set that
+/// distinguishes "state has been taken" from "state was never created"
+/// so the error message is actionable.
+///
+/// # Scope — infrastructure only
+///
+/// Commit 12b.2a does NOT move any production state into actor ownership.
+/// `take_crypto_state` is callable but no production site calls it yet;
+/// the legacy `create_mls_group` still populates `contexts` via the
+/// [`ContextCryptoProvider`] trait impl, and the legacy `seal` / `open`
+/// path continues to operate on `contexts[ctx_id]`. Commit 12b.2b is the
+/// first site that invokes `take_crypto_state` to atomically migrate every
+/// messaging handler's state into actor ownership at spawn time — see
+/// `.docs/adrs/ADR-049-actor-per-context.md` §Commit ladder row 12b.2b.
+///
+/// # Why every field is `pub`
+///
+/// This type is a move payload, not a domain struct. Callers (the actor
+/// construction helper in 12b.2b) destructure it field-by-field to build
+/// the actor-side [`crate::context::actor::ContextCryptoState`]. The
+/// legacy `ContextCryptoState` keeps its fields private because it is
+/// internal to the provider; the owned mirror here is the FFI-boundary
+/// shape between the provider and the actor.
+pub struct OwnedMlsCryptoState {
+    /// The `OpenMLS` group handle for this context.
+    pub mls_group: ScpMlsGroup,
+    /// Local member's AES-256 sender key.
+    pub sender_key: SenderKey,
+    /// Per-member sender-key store.
+    pub sender_key_store: SenderKeyStore,
+    /// Sender-key epoch counter.
+    pub sender_key_epoch: u64,
+    /// Send-side sequence counter at take-time. Callers seed their
+    /// actor-side [`crate::context::actor::SendSequenceTracker`] with this
+    /// value via
+    /// [`crate::context::actor::SendSequenceTracker::from_persisted`] so
+    /// the actor picks up where the provider left off (preserves AAD
+    /// byte-identity — see `crates/scp-runtime/src/context/actor/sequence.rs`
+    /// §"Sequence numbering convention").
+    pub send_sequence: u64,
+    /// Pending sender-key distribution messages (target DID, serialized
+    /// message). Not yet drained to transport at take-time; actor
+    /// replays via its own transport provider.
+    pub pending_distributions: Vec<(String, Vec<u8>)>,
+    /// Nonce dedup cache for sender-key requests (replay protection).
+    pub nonce_dedup: NonceDedup,
+    /// Remote members' X25519 wrapping public keys (by DID).
+    pub member_wrapping_keys: HashMap<String, [u8; 32]>,
+    /// Receive-side sender-key sequence tracker (by DID →
+    /// `(last_epoch, last_sequence)`).
+    pub recv_sequence_tracker: HashMap<String, (u64, u64)>,
+}
+
+// SECURITY: Redacts the MLS group (holds OpenMLS epoch secrets) and
+// sender key (raw AES-256 key material). Other fields are counters or
+// byte-array maps that already redact on their own. Manual impl —
+// `ScpMlsGroup` does not derive `Debug` at the library boundary.
+impl std::fmt::Debug for OwnedMlsCryptoState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedMlsCryptoState")
+            .field("mls_group", &"[REDACTED]")
+            .field("sender_key", &"[REDACTED]")
+            .field("sender_key_store", &self.sender_key_store)
+            .field("sender_key_epoch", &self.sender_key_epoch)
+            .field("send_sequence", &self.send_sequence)
+            .field(
+                "pending_distributions",
+                &format_args!("[{} entries]", self.pending_distributions.len()),
+            )
+            .field("nonce_dedup", &self.nonce_dedup)
+            .field(
+                "member_wrapping_keys",
+                &format_args!("[{} entries]", self.member_wrapping_keys.len()),
+            )
+            .field(
+                "recv_sequence_tracker",
+                &format_args!("[{} entries]", self.recv_sequence_tracker.len()),
+            )
+            .finish()
+    }
+}
+
 /// State retained for a pending Welcome-based join operation.
 ///
 /// When [`MlsCryptoProvider::prepare_key_package_for_join`] generates a key
@@ -300,6 +399,42 @@ pub struct MlsCryptoProvider {
         reason = "`MlsCryptoProvider` itself is deleted in commit 12 of ADR-049 (actor refactor); pending-join state splits into `PerContextState.welcome_scratchpad` + `KeyPackageStoreActor.reserved`. See plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
     )]
     pending_joins: Mutex<Option<PendingJoinState>>,
+    /// Contexts whose crypto state has been destructively moved into a
+    /// [`crate::context::actor::ContextActor`] via
+    /// [`Self::take_crypto_state`] (ADR-049 commit 12b.2a).
+    ///
+    /// Tracked separately from the `contexts` map so [`Self::with_context`]
+    /// can distinguish "context was never created" (returns the legacy
+    /// `no MLS group for this context` error) from "state was taken by
+    /// the actor runtime" (returns an actionable
+    /// `context state owned by actor` error). The two failure modes have
+    /// different call-site remediations — the former indicates a
+    /// create-before-send ordering bug, the latter indicates a caller
+    /// reaching through the provider after actor ownership has been
+    /// transferred (post-12b.2b that caller should route through the
+    /// actor's mailbox instead).
+    ///
+    /// # Lifecycle
+    ///
+    /// - Insert: on successful [`Self::take_crypto_state`].
+    /// - Remove: never in this commit — actor ownership is one-way during
+    ///   the 12b.2a → 12f window. Commit 12f deletes the provider
+    ///   entirely; until then a taken context stays taken for the
+    ///   provider's lifetime.
+    ///
+    /// # Why a `HashSet` rather than a sentinel in `contexts`
+    ///
+    /// Storing a sentinel `ContextCryptoState` variant in `contexts`
+    /// would require an enum with a `Taken` variant, touching every
+    /// `with_context` / field access across the provider. A separate
+    /// set is a surgical addition — only [`Self::take_crypto_state`]
+    /// writes it, only [`Self::with_context`] reads it, and both sites
+    /// hold their respective locks for exactly the membership check.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "`MlsCryptoProvider` itself is deleted in commit 12 of ADR-049 (actor refactor); this tracking set is removed alongside the struct when the actor owns the authoritative state end-to-end. See plan §Commit ladder in `~/.claude/plans/generic-moseying-lightning.md`."
+    )]
+    taken_context_ids: Mutex<HashSet<[u8; 32]>>,
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -323,15 +458,129 @@ impl MlsCryptoProvider {
             wrapping_public_key: Mutex::new(wrapping_public_key),
             wrapping_secret_key: Mutex::new(Zeroizing::new(wrapping_secret_key)),
             pending_joins: Mutex::new(None),
+            taken_context_ids: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Destructively move the per-context MLS crypto state out of this
+    /// provider and return it as an [`OwnedMlsCryptoState`] the caller
+    /// can hand to a [`crate::context::actor::ContextActor`] at spawn
+    /// time (ADR-049 commit 12b.2a).
+    ///
+    /// After `Ok` return:
+    /// - `self.contexts[context_id]` is absent (`HashMap::remove`d).
+    /// - `context_id` is recorded in [`Self::taken_context_ids`].
+    /// - Every subsequent [`Self::with_context`] /
+    ///   [`ContextCryptoProvider::seal`] /
+    ///   [`ContextCryptoProvider::open`] on `context_id` returns
+    ///   [`ContextError::CryptoFailed`] with the
+    ///   `context state owned by actor` message.
+    ///
+    /// # Invariant
+    ///
+    /// Actor ownership is one-way during the 12b.2a → 12f migration
+    /// window. Once taken, a context's crypto state does not return to
+    /// the provider — the actor becomes the sole authority for its
+    /// lifetime. This matches plan §"`MlsCryptoProvider` dissolution":
+    /// production lookups (publish, subscribe, etc.) reach the crypto
+    /// state only through the actor's mailbox post-12b.2b.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if no entry exists in
+    ///   `contexts` for `context_id`. The error message distinguishes
+    ///   "never created" from "already taken" by inspecting the
+    ///   `taken_context_ids` set.
+    /// - [`ContextError::CryptoFailed`] if the internal `Mutex` is
+    ///   poisoned (caller should treat this as fatal — the provider is
+    ///   now inconsistent).
+    ///
+    /// # Scope — infrastructure only
+    ///
+    /// This commit wires the move path but no production call site
+    /// invokes it yet. The first production caller arrives in commit
+    /// 12b.2b with the atomic messaging-handler migration.
+    pub fn take_crypto_state(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<OwnedMlsCryptoState, ContextError> {
+        // Hold the contexts lock and the taken-set lock in a consistent
+        // order (contexts first) across every writer, so no deadlock
+        // under concurrent `take_crypto_state` + `with_context`.
+        let mut contexts = self
+            .contexts
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        let Some(state) = contexts.remove(context_id) else {
+            // Distinguish "never created" from "already taken" so the
+            // error is actionable. Drop the contexts lock before taking
+            // the taken-set lock — we don't need to hold both for the
+            // membership check.
+            drop(contexts);
+            let taken = self
+                .taken_context_ids
+                .lock()
+                .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+            if taken.contains(context_id) {
+                return Err(ContextError::CryptoFailed(
+                    "context state owned by actor".to_owned(),
+                ));
+            }
+            return Err(ContextError::ContextNotRegistered(format!(
+                "no MLS group for context {}",
+                hex::encode(context_id),
+            )));
+        };
+        // Remove first, then record in the taken set. If the taken-set
+        // write fails the context entry is gone but the guard won't fire
+        // — fail loudly so the caller can retry or treat the provider
+        // as poisoned.
+        {
+            let mut taken = self
+                .taken_context_ids
+                .lock()
+                .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+            taken.insert(*context_id);
+        }
+        // Map the private struct field-for-field onto the public owned
+        // payload. This is the one place where the private-to-public
+        // shape translation happens; 12b.2b downstream consumes
+        // `OwnedMlsCryptoState` exclusively.
+        let ContextCryptoState {
+            mls_group,
+            sender_key,
+            sender_key_store,
+            sender_key_epoch,
+            send_sequence,
+            pending_distributions,
+            nonce_dedup,
+            member_wrapping_keys,
+            recv_sequence_tracker,
+        } = state;
+        Ok(OwnedMlsCryptoState {
+            mls_group,
+            sender_key,
+            sender_key_store,
+            sender_key_epoch,
+            send_sequence,
+            pending_distributions,
+            nonce_dedup,
+            member_wrapping_keys,
+            recv_sequence_tracker,
+        })
     }
 
     /// Returns a reference to the per-context MLS group state.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::CryptoFailed`] if no MLS group exists for the
-    /// given context ID.
+    /// - [`ContextError::CryptoFailed`] with `"no MLS group for this context"`
+    ///   if the context was never created (or its state was evicted).
+    /// - [`ContextError::CryptoFailed`] with
+    ///   `"context state owned by actor"` if the state was destructively
+    ///   moved via [`Self::take_crypto_state`] (ADR-049 commit 12b.2a).
+    ///   Callers seeing this error must route through the actor's
+    ///   mailbox — the provider no longer owns the state.
     fn with_context<F, R>(&self, context_id: &[u8; 32], f: F) -> Result<R, ContextError>
     where
         F: FnOnce(&mut ContextCryptoState) -> Result<R, ContextError>,
@@ -340,10 +589,25 @@ impl MlsCryptoProvider {
             .contexts
             .lock()
             .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
-        let state = contexts.get_mut(context_id).ok_or_else(|| {
-            ContextError::CryptoFailed("no MLS group for this context".to_string())
-        })?;
-        f(state)
+        if let Some(state) = contexts.get_mut(context_id) {
+            return f(state);
+        }
+        // Context is not in the map — distinguish "never created" from
+        // "actor took ownership". Drop the contexts lock before the
+        // membership check; we don't need both locks at once.
+        drop(contexts);
+        let taken = self
+            .taken_context_ids
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        if taken.contains(context_id) {
+            return Err(ContextError::CryptoFailed(
+                "context state owned by actor".to_owned(),
+            ));
+        }
+        Err(ContextError::CryptoFailed(
+            "no MLS group for this context".to_string(),
+        ))
     }
 
     /// Creates the SCP credential for the local member.
@@ -3464,6 +3728,167 @@ mod tests {
                     msg.contains("replay or reorder"),
                     "expected replay/reorder rejection, got: {msg}"
                 );
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-049 commit 12b.2a — `take_crypto_state` tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn take_crypto_state_removes_entry_from_provider() {
+        // Create a two-member context via the legacy path, then take
+        // the state. Post-take: the provider's `contexts` map has no
+        // entry for this context_id, the `taken_context_ids` set
+        // does, and the returned `OwnedMlsCryptoState` carries the
+        // expected mls group + sender key + counter values.
+        let (alice, _bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
+
+        // Capture the sender_key_epoch before take so we can compare
+        // to the returned owned value.
+        let epoch_before = {
+            let contexts = alice.contexts.lock().unwrap();
+            contexts.get(&ctx_id).unwrap().sender_key_epoch
+        };
+
+        let owned = alice
+            .take_crypto_state(&ctx_id)
+            .expect("take_crypto_state succeeds for live context");
+        assert_eq!(owned.sender_key_epoch, epoch_before);
+        // send_sequence starts at 0 — setup_alice_bob_two_party does
+        // not call seal().
+        assert_eq!(owned.send_sequence, 0);
+
+        // `contexts` map now has no entry for this id.
+        {
+            let contexts = alice.contexts.lock().unwrap();
+            assert!(!contexts.contains_key(&ctx_id));
+        }
+        // `taken_context_ids` records the take.
+        {
+            let taken = alice.taken_context_ids.lock().unwrap();
+            assert!(taken.contains(&ctx_id));
+        }
+    }
+
+    #[test]
+    fn take_crypto_state_missing_context_returns_not_registered() {
+        let provider = make_provider();
+        let ctx_id = [9u8; 32];
+        let err = provider
+            .take_crypto_state(&ctx_id)
+            .expect_err("take on unknown context must error");
+        match err {
+            ContextError::ContextNotRegistered(msg) => {
+                assert!(
+                    msg.contains("no MLS group for context"),
+                    "expected 'no MLS group' message, got: {msg}",
+                );
+            }
+            other => panic!("expected ContextNotRegistered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn take_crypto_state_double_take_returns_owned_by_actor() {
+        // First take succeeds. Second take sees the id in
+        // `taken_context_ids` and returns the "owned by actor"
+        // error instead of the generic `no MLS group` error.
+        let (alice, _bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
+
+        let _owned = alice.take_crypto_state(&ctx_id).unwrap();
+
+        let err = alice
+            .take_crypto_state(&ctx_id)
+            .expect_err("second take must error");
+        match err {
+            ContextError::CryptoFailed(msg) => {
+                assert_eq!(msg, "context state owned by actor");
+            }
+            other => panic!("expected CryptoFailed('owned by actor'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seal_after_take_returns_owned_by_actor() {
+        // After `take_crypto_state`, the legacy `seal` path on the
+        // same context must return `CryptoFailed('context state
+        // owned by actor')` so callers learn to route through the
+        // actor mailbox instead.
+        let (alice, _bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+        let _owned = alice.take_crypto_state(&ctx_id).unwrap();
+
+        let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let routing_id = ctx_routing_id(&ctx_id);
+
+        let err = alice
+            .seal(&ctx_id, &inner, &routing_id, 300)
+            .expect_err("seal on a taken context must error");
+        match err {
+            ContextError::CryptoFailed(msg) => {
+                assert_eq!(msg, "context state owned by actor");
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_after_take_returns_owned_by_actor() {
+        // Companion to `seal_after_take`: the `open` path also
+        // errors with the same message.
+        let (alice, bob, ctx_id, alice_did) = setup_alice_bob_two_party();
+
+        // Seal a message via alice BEFORE taking the state so we
+        // have a valid ciphertext to feed into bob's open.
+        let inner = build_test_inner(&ctx_id, &alice_did, 0, 0);
+        let routing_id = ctx_routing_id(&ctx_id);
+        let sealed = alice.seal(&ctx_id, &inner, &routing_id, 300).unwrap();
+
+        // Now take bob's state — open on bob's side should error.
+        let _owned = bob.take_crypto_state(&ctx_id).unwrap();
+        let err = bob
+            .open(&ctx_id, &sealed)
+            .expect_err("open on a taken context must error");
+        match err {
+            ContextError::CryptoFailed(msg) => {
+                assert_eq!(msg, "context state owned by actor");
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_context_distinguishes_never_created_from_taken() {
+        // `with_context` (the internal accessor) returns the generic
+        // "no MLS group for this context" error when the id was
+        // never created, and the "context state owned by actor"
+        // error when it was taken. The distinction matters for
+        // actionable diagnostics.
+        let (alice, _bob, ctx_id, _alice_did) = setup_alice_bob_two_party();
+
+        // Never-created id.
+        let other_id = [0xAAu8; 32];
+        let err_never = alice
+            .with_context(&other_id, |_state| Ok(()))
+            .expect_err("never-created errors");
+        match err_never {
+            ContextError::CryptoFailed(msg) => {
+                assert_eq!(msg, "no MLS group for this context");
+            }
+            other => panic!("expected CryptoFailed, got {other:?}"),
+        }
+
+        // Take and retry — same id now surfaces the "owned by
+        // actor" message.
+        let _owned = alice.take_crypto_state(&ctx_id).unwrap();
+        let err_taken = alice
+            .with_context(&ctx_id, |_state| Ok(()))
+            .expect_err("taken errors");
+        match err_taken {
+            ContextError::CryptoFailed(msg) => {
+                assert_eq!(msg, "context state owned by actor");
             }
             other => panic!("expected CryptoFailed, got {other:?}"),
         }
