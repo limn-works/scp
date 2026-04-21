@@ -146,6 +146,7 @@ fn context_crypto_state_default_exhaustive_field_witness() {
         pending_distributions,
         nonce_dedup,
         member_wrapping_keys,
+        recv_sequence_tracker,
         access_key_store,
     } = c;
 
@@ -158,6 +159,10 @@ fn context_crypto_state_default_exhaustive_field_witness() {
     assert_eq!(sender_key_epoch, 0);
     assert!(pending_distributions.is_empty());
     assert!(member_wrapping_keys.is_empty());
+    assert!(
+        recv_sequence_tracker.is_empty(),
+        "recv_sequence_tracker (MLS sender-key anti-replay) starts empty",
+    );
 
     // Sub-stores: these types already Debug-redact; touching them
     // compiles only if the field exists.

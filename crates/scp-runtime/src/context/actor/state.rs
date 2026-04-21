@@ -365,6 +365,33 @@ pub struct ContextCryptoState {
     /// (provider.rs:226).
     pub member_wrapping_keys: HashMap<String, [u8; 32]>,
 
+    /// Receive-side sequence tracking for MLS replay detection.
+    /// Maps `sender_did` -> (`last_epoch`, `last_sequence`). Mirror of
+    /// legacy field
+    /// `MlsCryptoProvider::ContextCryptoState::recv_sequence_tracker`
+    /// at `crates/scp-runtime/src/crypto/mls/provider.rs:229`.
+    ///
+    /// # Why this lives on `ContextCryptoState` (not `PerContextState`)
+    ///
+    /// The receive-side MLS sender-key anti-replay is encrypted-mode-
+    /// specific: broadcast contexts track per-author replay protection
+    /// on [`BroadcastState::recv_sequence_trackers`] instead (spec
+    /// §5.14). Placing this field on the encrypted variant mirrors
+    /// that split.
+    ///
+    /// # Distinct from `recv_tracker` on `PerContextState`
+    ///
+    /// [`PerContextState::recv_tracker`](PerContextState::recv_tracker)
+    /// is the actor-shape per-member WIRE-sequence tracker used by the
+    /// ContextManager-level reorder / delivery path. This field is the
+    /// MLS sender-key layer `(epoch, sequence)` pair that [`open`]
+    /// reads in the provider (see provider.rs:1211-1221 for the
+    /// authoritative algorithm). Commit 12b.2 migrates that deliver-
+    /// path read/write onto this field.
+    ///
+    /// [`open`]: crate::crypto::mls::provider::MlsCryptoProvider::open
+    pub recv_sequence_tracker: HashMap<String, (u64, u64)>,
+
     /// Per-member access-key store for content-encryption-key wrapping
     /// (spec §9.17, ADR-038). Scoped to encrypted contexts: legacy
     /// stored this on
@@ -413,6 +440,10 @@ impl std::fmt::Debug for ContextCryptoState {
                 "member_wrapping_keys",
                 &format_args!("[{} entries]", self.member_wrapping_keys.len()),
             )
+            .field(
+                "recv_sequence_tracker",
+                &format_args!("[{} entries]", self.recv_sequence_tracker.len()),
+            )
             .field("access_key_store", &self.access_key_store)
             .finish()
     }
@@ -428,6 +459,7 @@ impl Default for ContextCryptoState {
             pending_distributions: Vec::new(),
             nonce_dedup: NonceDedup::new(),
             member_wrapping_keys: HashMap::new(),
+            recv_sequence_tracker: HashMap::new(),
             access_key_store: AccessKeyStore::new(),
         }
     }
@@ -1080,6 +1112,7 @@ mod tests {
             pending_distributions,
             nonce_dedup,
             member_wrapping_keys,
+            recv_sequence_tracker,
             access_key_store,
         } = c;
 
@@ -1090,6 +1123,10 @@ mod tests {
         assert!(pending_distributions.is_empty());
         let _ = &nonce_dedup;
         assert!(member_wrapping_keys.is_empty());
+        assert!(
+            recv_sequence_tracker.is_empty(),
+            "recv_sequence_tracker starts empty",
+        );
         let _ = &access_key_store;
     }
 

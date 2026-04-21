@@ -29,6 +29,57 @@
 //! the existing `MembershipState::rollback_sequence_number` semantics in
 //! `crates/scp-protocol/src/context/membership.rs` (saturating subtract
 //! by 1) — no semantic change is introduced here.
+//!
+//! # Sequence numbering convention (AAD byte-identity)
+//!
+//! The MLS sender-key layer (spec §9.16.1, ADR-007) binds each
+//! encryption to the `(epoch, sequence)` pair as AAD. The legacy
+//! [`MlsCryptoProvider::seal`] algorithm at
+//! `crates/scp-runtime/src/crypto/mls/provider.rs:1051-1107` uses the
+//! CURRENT counter value as the sequence-field input to the AAD
+//! construction, THEN increments the counter (post-increment step at
+//! provider.rs:1107). That convention is 0-based: the first message
+//! encrypts with `sequence = 0` in its AAD and the counter advances
+//! to `1` after the payload is handed to the transport.
+//!
+//! The actor-side [`SequenceReservation::reserve`] returns the
+//! POST-increment value (the reserved slot for this send — first
+//! reservation returns `1`, not `0`). This divergence is structural:
+//! the RAII reservation advances the counter at the moment of intent-
+//! to-send, so the guard can roll back on `?`-early-return or panic
+//! without re-using a number that an in-flight younger reservation
+//! may already be using.
+//!
+//! **Handlers producing byte-identical wire output MUST read
+//! [`SendSequenceTracker::last_issued`] BEFORE reserving** to obtain
+//! the pre-increment value for the AAD, then call
+//! [`SequenceReservation::reserve`] to mark the slot consumed:
+//!
+//! ```rust,ignore
+//! // AAD uses the pre-increment value (matches legacy
+//! // provider.rs:1081 `state.send_sequence` read order).
+//! let aad_sequence = state.send_tracker.last_issued();
+//! let reservation = SequenceReservation::reserve(&mut state.send_tracker);
+//! // `aad_sequence` feeds into the sender-layer AEAD; the reservation's
+//! // `number()` is the new send-sequence recorded in the event log /
+//! // membership tracker for the wire-level layer.
+//! let ciphertext = encrypt_sender_layer(
+//!     &state.sender_key,
+//!     payload,
+//!     ctx_str,
+//!     local_did,
+//!     state.sender_key_epoch,
+//!     aad_sequence, // NOT reservation.number()
+//! )?;
+//! ```
+//!
+//! Feeding `reservation.number()` as the AAD sequence (instead of
+//! `last_issued()`) is a byte-identity regression and will cause
+//! receivers running the legacy decrypt path to reject every message
+//! with an AAD-mismatch failure. This is the sole known pitfall when
+//! migrating handlers off the legacy `seal`.
+//!
+//! [`MlsCryptoProvider::seal`]: crate::crypto::mls::provider::MlsCryptoProvider
 
 // ---------------------------------------------------------------------------
 // SendSequenceTracker
@@ -106,8 +157,27 @@ impl SendSequenceTracker {
         // youngest outstanding reservation, by construction.
     }
 
-    /// Return the last-issued number without mutating. Convenience for
-    /// snapshot persist and tests.
+    /// Return the last-issued number without mutating.
+    ///
+    /// # Use sites
+    ///
+    /// 1. **Snapshot persist** — caller reads the high-water mark to
+    ///    serialize alongside other per-actor state (plan §"Persistence
+    ///    protocol").
+    /// 2. **Tests** — assert tracker position after a sequence of
+    ///    reserve / rollback operations.
+    /// 3. **AAD byte-identity (critical)** — handlers migrating off the
+    ///    legacy [`MlsCryptoProvider::seal`] path MUST read
+    ///    `last_issued()` BEFORE calling
+    ///    [`SequenceReservation::reserve`] to obtain the pre-increment
+    ///    value required by the sender-layer AEAD AAD. See the module
+    ///    doc "Sequence numbering convention (AAD byte-identity)" for
+    ///    the full convention and a code example. Feeding the reserved
+    ///    (post-increment) number into the AAD is a byte-identity
+    ///    regression that will cause receivers running the legacy
+    ///    decrypt path to reject every message.
+    ///
+    /// [`MlsCryptoProvider::seal`]: crate::crypto::mls::provider::MlsCryptoProvider
     #[must_use]
     pub const fn last_issued(&self) -> u64 {
         self.last_issued
@@ -137,6 +207,28 @@ impl SendSequenceTracker {
 ///
 /// The `Drop` impl is the actual mechanism — both `?`-early-return and
 /// panic unwind call destructors of in-scope locals.
+///
+/// # AAD sequence: read `last_issued()` BEFORE `reserve()`
+///
+/// [`reserve`](Self::reserve) returns the POST-increment value (first
+/// reservation returns `1`). The legacy MLS sender-key layer binds the
+/// CURRENT (pre-increment) counter value as AAD at
+/// `crates/scp-runtime/src/crypto/mls/provider.rs:1081`, then
+/// post-increments at provider.rs:1107. To preserve byte-identical
+/// wire output, handlers MUST read
+/// [`SendSequenceTracker::last_issued`] BEFORE this call to obtain the
+/// AAD sequence value:
+///
+/// ```rust,ignore
+/// let aad_sequence = state.send_tracker.last_issued(); // pre-increment
+/// let reservation = SequenceReservation::reserve(&mut state.send_tracker);
+/// // Feed `aad_sequence` into the sender-layer AEAD.
+/// // `reservation.number()` is the wire-layer sequence (event log,
+/// // membership tracker) — NOT the AAD sequence.
+/// ```
+///
+/// See the module doc "Sequence numbering convention (AAD byte-
+/// identity)" for the full rationale.
 pub struct SequenceReservation<'a> {
     tracker: &'a mut SendSequenceTracker,
     reserved: u64,
@@ -356,5 +448,84 @@ mod tests {
         r.commit();
         // Post-commit: the reservation is permanent.
         assert_eq!(t.last_issued(), n);
+    }
+
+    /// AAD byte-identity convention: `last_issued()` BEFORE
+    /// [`SequenceReservation::reserve`] returns the value the legacy
+    /// [`MlsCryptoProvider::seal`] path uses as the sender-layer AAD
+    /// sequence component (0-based, pre-increment). After the
+    /// reservation is created, [`SequenceReservation::number`] returns
+    /// the wire-layer sequence (1-based, post-increment).
+    ///
+    /// This test pins both semantics together so a future refactor
+    /// that changes either one is caught before it ships.
+    ///
+    /// [`MlsCryptoProvider::seal`]: crate::crypto::mls::provider::MlsCryptoProvider
+    #[test]
+    fn last_issued_before_reserve_yields_legacy_aad_sequence() {
+        let mut t = SendSequenceTracker::new();
+
+        // First message: legacy seal uses AAD sequence 0, then advances
+        // to 1. Actor-side: read last_issued() (=0) pre-reserve, then
+        // reserve (returns 1, advances high-water mark to 1).
+        let aad_0 = t.last_issued();
+        let r = SequenceReservation::reserve(&mut t);
+        assert_eq!(aad_0, 0, "pre-reservation AAD value matches legacy");
+        assert_eq!(
+            r.number(),
+            1,
+            "reservation returns post-increment wire-layer sequence",
+        );
+        r.commit();
+
+        // Second message: legacy AAD sequence is 1, tracker advances
+        // to 2. Actor-side: last_issued() is 1 now, reserve returns 2.
+        let aad_1 = t.last_issued();
+        let r = SequenceReservation::reserve(&mut t);
+        assert_eq!(aad_1, 1);
+        assert_eq!(r.number(), 2);
+        r.commit();
+
+        // Third message: same pattern.
+        let aad_2 = t.last_issued();
+        let r = SequenceReservation::reserve(&mut t);
+        assert_eq!(aad_2, 2);
+        assert_eq!(r.number(), 3);
+        r.commit();
+
+        assert_eq!(t.last_issued(), 3);
+    }
+
+    /// When a reservation is rolled back (e.g. encryption fails,
+    /// transport times out), the NEXT send must reuse the freed slot
+    /// for BOTH the AAD pre-increment read and the wire-layer number.
+    /// Without this, a rolled-back message would leak a sequence gap
+    /// visible in the AAD to the next recipient that processes the
+    /// retry — an identity-divergence bug that the byte-identity
+    /// contract forbids.
+    #[test]
+    fn last_issued_reflects_rollback_for_aad_continuity() {
+        let mut t = SendSequenceTracker::new();
+
+        // First attempt: AAD is 0, reserve returns 1 — then drop
+        // without commit (simulates an early `?` return).
+        {
+            let aad_0 = t.last_issued();
+            let r = SequenceReservation::reserve(&mut t);
+            assert_eq!(aad_0, 0);
+            assert_eq!(r.number(), 1);
+            // Drop here, no commit → tracker rolls back to 0.
+        }
+        assert_eq!(t.last_issued(), 0, "rollback returned tracker to 0");
+
+        // Retry: AAD pre-increment read is still 0 — the legacy path
+        // would reuse sequence 0 for the re-send, and the actor path
+        // must do the same.
+        let aad_retry = t.last_issued();
+        let r = SequenceReservation::reserve(&mut t);
+        assert_eq!(aad_retry, 0, "retry AAD matches legacy-reuse semantics");
+        assert_eq!(r.number(), 1);
+        r.commit();
+        assert_eq!(t.last_issued(), 1);
     }
 }
