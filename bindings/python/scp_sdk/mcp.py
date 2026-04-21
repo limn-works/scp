@@ -1,32 +1,31 @@
-"""MCP (Model Context Protocol) adapter for SCP.
+"""MCP (Model Context Protocol) adapter types for SCP.
 
-Wraps the Rust ``scp-mcp`` crate via the ``_scp_core`` PyO3 bridge layer,
-providing:
+Phase 4 PR 5 Agent B+C (#1549) collapsed :class:`McpServer` and
+:class:`McpClient` into pure handle wrappers. Use
+:meth:`scp_sdk.SCP.mcp_serve` to start a server and
+:meth:`scp_sdk.SCP.mcp_client_connect_stdio` /
+:meth:`scp_sdk.SCP.mcp_client_connect_sse` to connect a client. Every
+subsequent operation (``list_tools``, ``invoke``, ``stop``,
+``disconnect``, etc.) lives on :class:`scp_sdk.SCP`.
 
-- :func:`serve_mcp` -- starts an MCP server that dynamically exposes tools
-  from the agent's active SCP contexts.
-- :class:`McpClient` -- connects to external MCP servers and wraps tool
-  results with SCP provenance metadata.
+Data classes (:class:`McpProvenance`, :class:`McpToolDefinition`,
+:class:`McpToolResult`) and stdio-allowlist controls
+(:func:`configure_stdio_allowlist`, :func:`disable_stdio_allowlist`,
+:func:`reset_stdio_allowlist`, :func:`get_stdio_allowlist`) remain at
+module scope. The allowlist is process-wide static state in the Rust
+bridge, not an :class:`SCP`-scoped resource.
 
-Transport parameter accepts ``"stdio"`` (line-delimited JSON over
-stdin/stdout) or ``"sse"`` (HTTP with Server-Sent Events).
-
-See ``.docs/adrs/phase-3.md`` ADR-015 for the full design.
+See ``.docs/adrs/phase-3.md`` ADR-015 for the full design and ADR-048
+for the façade consolidation rationale.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from scp_sdk.errors import TransportError, ValidationError
-
-if TYPE_CHECKING:
-    from scp_sdk.context import Context
-    from scp_sdk.identity import Identity
-    from scp_sdk.scp import SCP
 
 logger = logging.getLogger("scp_sdk")
 
@@ -58,6 +57,7 @@ DEFAULT_STDIO_ALLOWLIST: frozenset[str] = frozenset(
     }
 )
 
+
 # ---------------------------------------------------------------------------
 # Lazy bridge import
 # ---------------------------------------------------------------------------
@@ -75,23 +75,6 @@ def _bridge() -> Any:
             "Install scp-python with: pip install scp-python",
             code="SCP-MCP-10001",
         ) from exc
-
-
-def _resolve_bridge(scp: SCP) -> Any:
-    """Return the effective bridge object for MCP operations.
-
-    Tests patch ``scp_sdk.mcp._bridge`` to return a ``MagicMock`` with
-    ``py_mcp_*`` attributes that stand in for the live bridge. This
-    helper returns that mock when detected so the existing tests still
-    route through it. Production code sees the real ``_scp_core`` module
-    (whose ``py_mcp_*`` methods moved onto :class:`SCP` in Phase 4 PR 4)
-    and falls through to ``scp._native`` so calls dispatch on the
-    :class:`SCP` instance's methods.
-    """
-    bridge = _bridge()
-    if hasattr(bridge, "_mock_name"):
-        return bridge
-    return scp._native
 
 
 # ---------------------------------------------------------------------------
@@ -157,120 +140,41 @@ class McpToolResult:
 
 
 # ---------------------------------------------------------------------------
-# McpServer
+# McpServer / McpClient — pure handle wrappers
 # ---------------------------------------------------------------------------
 
 
 class McpServer:
-    """An MCP server that exposes SCP context tools to MCP-compatible models.
+    """Opaque handle to a running MCP server.
 
-    Created by :func:`serve_mcp`.  The server dynamically exposes tools
-    from the agent's active SCP contexts, namespaced by context ID
-    (e.g. ``context_a/send_message``).
-
-    Tools are capability-filtered: only tools the agent's role permits
-    are listed.  Built-in tools per context include ``send_message``,
-    ``read_messages``, and ``list_members``.
+    Construct via :meth:`scp_sdk.SCP.mcp_serve`. All lifecycle operations
+    (``stop``, ``wait``, ``info``) live on :class:`scp_sdk.SCP` — pass
+    ``server._raw_handle`` to invoke them.
     """
 
-    __slots__ = ("_contexts", "_handle", "_identity", "_scp", "_stopped", "_transport")
+    __slots__ = ("_raw_handle",)
 
-    def __init__(
-        self,
-        handle: Any,
-        identity: Identity,
-        contexts: list[Context],
-        transport: str,
-        scp: SCP,
-    ) -> None:
-        self._handle = handle
-        self._identity = identity
-        self._contexts = list(contexts)
-        self._transport = transport
-        self._scp = scp
-        self._stopped = False
+    def __init__(self, handle: Any) -> None:
+        self._raw_handle = handle
 
-    @property
-    def transport(self) -> str:
-        """The transport mode (``"stdio"`` or ``"sse"``)."""
-        return self._transport
 
-    @property
-    def contexts(self) -> list[Context]:
-        """The active SCP contexts being served."""
-        return list(self._contexts)
+class McpClient:
+    """Opaque handle to a connected MCP client.
 
-    async def stop(self) -> None:
-        """Stop the MCP server gracefully.
+    Construct via :meth:`scp_sdk.SCP.mcp_client_connect_stdio` or
+    :meth:`scp_sdk.SCP.mcp_client_connect_sse`. All operations
+    (``list_tools``, ``invoke``, ``disconnect``, ``info``) live on
+    :class:`scp_sdk.SCP` — pass ``client._raw_handle`` to invoke them.
+    """
 
-        Raises:
-            TransportError: If shutdown fails.
-        """
-        if self._stopped:
-            return
-        logger.info("Stopping MCP server (transport=%s)", self._transport)
-        instance = _resolve_bridge(self._scp)
-        await asyncio.to_thread(instance.py_mcp_server_stop, self._handle)
-        self._stopped = True
-        logger.debug("MCP server stopped")
+    __slots__ = ("_raw_handle",)
 
-    # -- Async context manager ----------------------------------------------
-
-    async def __aenter__(self) -> McpServer:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: Any,
-    ) -> None:
-        """Stop the server on exit from the ``async with`` block.
-
-        Errors during cleanup are logged but never raised.
-        """
-        try:
-            await self.stop()
-        except Exception:
-            logger.debug(
-                "cleanup: failed to stop MCP server",
-                exc_info=True,
-            )
-
-    # -- Finalizer (GC safety for long-running processes) -------------------
-
-    def __del__(self) -> None:
-        """Stop the server if not already stopped.
-
-        Called by the garbage collector. Errors are silently suppressed.
-        The server's owning :class:`SCP` is stored on the instance so the
-        finalizer can dispatch on it without touching module globals that
-        may be in teardown.
-        """
-        try:
-            if self._stopped:
-                return
-        except Exception:
-            # _stopped may not exist if __init__ was never completed.
-            return
-        try:
-            self._scp._native.py_mcp_server_stop(self._handle)
-            self._stopped = True
-        except Exception:
-            pass
-
-    def __repr__(self) -> str:
-        ctx_ids = [c.context_id for c in self._contexts]
-        return f"McpServer(transport={self._transport!r}, contexts={ctx_ids!r})"
+    def __init__(self, handle: Any) -> None:
+        self._raw_handle = handle
 
 
 # ---------------------------------------------------------------------------
-# serve_mcp
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# McpClient
+# Stdio allowlist controls — process-wide static state, not SCP-scoped.
 # ---------------------------------------------------------------------------
 
 
@@ -295,12 +199,6 @@ def configure_stdio_allowlist(
     Raises:
         ValidationError: If any entry contains path separators, NUL
             bytes, or is empty.
-
-    Example::
-
-        from scp_sdk.mcp import configure_stdio_allowlist
-
-        configure_stdio_allowlist(additional_binaries=["my-custom-server"])
     """
     if not additional_binaries:
         return
@@ -324,12 +222,6 @@ def disable_stdio_allowlist(
 
     Raises:
         ValidationError: If *i_trust_all_commands* is not ``True``.
-
-    Example::
-
-        from scp_sdk.mcp import disable_stdio_allowlist
-
-        disable_stdio_allowlist(i_trust_all_commands=True)
     """
     if not i_trust_all_commands:
         raise ValidationError(
@@ -353,12 +245,6 @@ def reset_stdio_allowlist() -> None:
 
     Restores the default binaries, removes any additions, and
     re-enables allowlist enforcement (clears unrestricted mode).
-
-    Example::
-
-        from scp_sdk.mcp import reset_stdio_allowlist
-
-        reset_stdio_allowlist()
     """
     bridge = _bridge()
     bridge.py_mcp_reset_stdio_allowlist()
@@ -373,278 +259,67 @@ def get_stdio_allowlist() -> dict[str, Any]:
 
         - ``"allowed"``: sorted list of allowed binary names
         - ``"unrestricted"``: ``True`` if the allowlist is bypassed
-
-    Example::
-
-        from scp_sdk.mcp import get_stdio_allowlist
-
-        state = get_stdio_allowlist()
-        print(state["allowed"])       # ['bun', 'bunx', 'deno', ...]
-        print(state["unrestricted"])  # False
     """
     bridge = _bridge()
     return bridge.py_mcp_get_stdio_allowlist()
 
 
-class McpClient:
-    """Client for consuming external MCP servers with SCP provenance wrapping.
+def validate_client_connect(
+    transport: str,
+    *,
+    command: list[str] | None = None,
+    url: str | None = None,
+) -> None:
+    """Validate MCP client connect parameters before FFI dispatch.
 
-    Connects to external MCP servers via stdio or SSE, lists their tools,
-    and invokes them with SCP provenance metadata attached to every result.
-
-    Use :meth:`connect` to create an instance.
-
-    Example::
-
-        from scp_sdk.mcp import McpClient
-
-        client = await McpClient.connect("stdio", command=["uvx", "some-mcp-server"])
-        tools = await client.list_tools()
-        result = await client.invoke(
-            tool="external_tool",
-            input={"key": "value"},
-            context=my_context,
-            identity=my_identity,
-        )
+    Raises :class:`~scp_sdk.errors.ValidationError` with a canonical
+    error code when a parameter is missing or the stdio command is not
+    in the allowlist. This is the same validation the old
+    :meth:`McpClient.connect` factory performed — it's still exposed so
+    callers can pre-check arguments without round-tripping through the
+    bridge.
     """
+    if transport not in _VALID_TRANSPORTS:
+        raise ValidationError(
+            f"transport must be 'stdio' or 'sse', got {transport!r}",
+            code="SCP-MCP-10002",
+        )
 
-    __slots__ = ("_command", "_disconnected", "_handle", "_scp", "_transport")
+    if transport == "stdio" and not command:
+        raise ValidationError(
+            "command is required for stdio transport",
+            code="SCP-MCP-10004",
+        )
 
-    def __init__(self, handle: Any, transport: str, command: list[str] | None, scp: SCP) -> None:
-        self._handle = handle
-        self._transport = transport
-        self._command = command
-        self._scp = scp
-        self._disconnected = False
+    if transport == "sse" and not url:
+        raise ValidationError(
+            "url is required for sse transport",
+            code="SCP-MCP-10005",
+        )
 
-    @classmethod
-    async def connect(
-        cls,
-        scp: SCP,
-        transport: str,
-        *,
-        command: list[str] | None = None,
-        url: str | None = None,
-    ) -> McpClient:
-        """Connect to an external MCP server.
+    if transport == "stdio" and command:
+        import os
 
-        Args:
-            transport: Transport mode -- ``"stdio"`` to spawn a subprocess,
-                or ``"sse"`` to connect via HTTP/SSE.
-            command: For ``"stdio"`` transport, the command and arguments to
-                spawn (e.g. ``["uvx", "some-mcp-server"]``). The first
-                element must be a bare binary name in the stdio allowlist
-                (see :func:`configure_stdio_allowlist`).
-            url: For ``"sse"`` transport, the URL of the SSE endpoint.
+        binary = command[0]
+        basename = os.path.basename(binary)
 
-        Returns:
-            A connected :class:`McpClient` instance.
-
-        Raises:
-            ValidationError: If transport is invalid, required parameters
-                are missing, or the command is not in the stdio allowlist.
-            TransportError: If the connection fails.
-
-        Example::
-
-            client = await McpClient.connect(
-                "stdio",
-                command=["uvx", "some-mcp-server"],
-            )
-        """
-        if transport not in _VALID_TRANSPORTS:
+        if binary != basename:
             raise ValidationError(
-                f"transport must be 'stdio' or 'sse', got {transport!r}",
-                code="SCP-MCP-10002",
+                f"command must be a bare binary name, not a path: "
+                f"'{binary}'. The OS will resolve it via PATH.",
+                code="SCP-MCP-10006",
             )
 
-        if transport == "stdio" and not command:
+        state = get_stdio_allowlist()
+        if not state["unrestricted"] and basename not in state["allowed"]:
+            allowed = sorted(state["allowed"])
             raise ValidationError(
-                "command is required for stdio transport",
-                code="SCP-MCP-10004",
+                f"command '{basename}' is not in the MCP stdio allowlist. "
+                f"Allowed: {allowed}. "
+                f"Call configure_stdio_allowlist("
+                f"additional_binaries=['{basename}']) first.",
+                code="SCP-MCP-10006",
             )
-
-        if transport == "sse" and not url:
-            raise ValidationError(
-                "url is required for sse transport",
-                code="SCP-MCP-10005",
-            )
-
-        # Pre-validate the command binary against the allowlist before
-        # crossing the FFI boundary. This gives a Python-native error with
-        # actionable guidance.
-        if transport == "stdio" and command:
-            import os
-
-            binary = command[0]
-            basename = os.path.basename(binary)
-
-            if binary != basename:
-                raise ValidationError(
-                    f"command must be a bare binary name, not a path: "
-                    f"'{binary}'. The OS will resolve it via PATH.",
-                    code="SCP-MCP-10006",
-                )
-
-            state = get_stdio_allowlist()
-            if not state["unrestricted"] and basename not in state["allowed"]:
-                allowed = sorted(state["allowed"])
-                raise ValidationError(
-                    f"command '{basename}' is not in the MCP stdio allowlist. "
-                    f"Allowed: {allowed}. "
-                    f"Call configure_stdio_allowlist("
-                    f"additional_binaries=['{basename}']) first.",
-                    code="SCP-MCP-10006",
-                )
-
-        logger.info(
-            "Connecting MCP client: transport=%s, command=%s, url=%s",
-            transport,
-            command,
-            url,
-        )
-
-        instance = _resolve_bridge(scp)
-
-        if transport == "stdio":
-            handle = await asyncio.to_thread(instance.py_mcp_client_connect_stdio, command)
-        else:
-            handle = await asyncio.to_thread(instance.py_mcp_client_connect_sse, url)
-
-        client = cls(handle=handle, transport=transport, command=command, scp=scp)
-        logger.info("MCP client connected (transport=%s)", transport)
-        return client
-
-    async def list_tools(self) -> list[McpToolDefinition]:
-        """List available tools from the external MCP server.
-
-        Returns:
-            A list of :class:`McpToolDefinition` objects.
-
-        Raises:
-            TransportError: If the server communication fails.
-        """
-        instance = _resolve_bridge(self._scp)
-        raw_tools = await asyncio.to_thread(instance.py_mcp_client_list_tools, self._handle)
-        return [
-            McpToolDefinition(
-                name=t["name"],
-                description=t.get("description"),
-                input_schema=t.get("inputSchema", {}),
-            )
-            for t in raw_tools
-        ]
-
-    async def invoke(
-        self,
-        tool: str,
-        input: dict[str, Any],
-        context: Context,
-        identity: Identity,
-    ) -> McpToolResult:
-        """Invoke an external tool with SCP provenance wrapping.
-
-        Calls the external MCP tool and wraps the result with provenance
-        metadata recording the source tool, invoking agent, context, and
-        timestamp.
-
-        Args:
-            tool: The name of the external tool to invoke.
-            input: The tool's input arguments.
-            context: The SCP context for provenance tracking.
-            identity: The SCP identity for signing / provenance.
-
-        Returns:
-            An :class:`McpToolResult` with content and provenance.
-
-        Raises:
-            ToolError: If the tool invocation fails.
-            TransportError: If server communication fails.
-        """
-        instance = _resolve_bridge(self._scp)
-        raw = await asyncio.to_thread(
-            instance.py_mcp_client_invoke,
-            self._handle,
-            tool,
-            input,
-            context.context_id,
-            identity.did,
-        )
-
-        provenance = McpProvenance(
-            source=raw["provenance"]["source"],
-            invoked_by=raw["provenance"]["invoked_by"],
-            context=raw["provenance"]["context"],
-            timestamp=raw["provenance"]["timestamp"],
-        )
-
-        return McpToolResult(
-            content=raw.get("content", []),
-            is_error=raw.get("is_error", False),
-            provenance=provenance,
-        )
-
-    async def disconnect(self) -> None:
-        """Disconnect from the external MCP server.
-
-        Raises:
-            TransportError: If disconnection fails.
-        """
-        if self._disconnected:
-            return
-        logger.info("Disconnecting MCP client (transport=%s)", self._transport)
-        instance = _resolve_bridge(self._scp)
-        await asyncio.to_thread(instance.py_mcp_client_disconnect, self._handle)
-        self._disconnected = True
-        logger.debug("MCP client disconnected")
-
-    # -- Async context manager ----------------------------------------------
-
-    async def __aenter__(self) -> McpClient:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: Any,
-    ) -> None:
-        """Disconnect the client on exit from the ``async with`` block.
-
-        Errors during cleanup are logged but never raised.
-        """
-        try:
-            await self.disconnect()
-        except Exception:
-            logger.debug(
-                "cleanup: failed to disconnect MCP client",
-                exc_info=True,
-            )
-
-    # -- Finalizer (GC safety for long-running processes) -------------------
-
-    def __del__(self) -> None:
-        """Disconnect the client if not already disconnected.
-
-        Called by the garbage collector. Errors are silently suppressed.
-        The client's owning :class:`SCP` is stored on the instance so the
-        finalizer can dispatch on it without touching module globals that
-        may be in teardown.
-        """
-        try:
-            if self._disconnected:
-                return
-        except Exception:
-            # _disconnected may not exist if __init__ was never completed.
-            return
-        try:
-            self._scp._native.py_mcp_client_disconnect(self._handle)
-            self._disconnected = True
-        except Exception:
-            pass
-
-    def __repr__(self) -> str:
-        return f"McpClient(transport={self._transport!r}, command={self._command!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +331,7 @@ def cli_main() -> None:
     """CLI entry point for ``scp-mcp serve``.
 
     Parses command-line arguments and starts an MCP server for a given
-    SCP identity.  Suitable for integration with MCP hosts that launch
+    SCP identity. Suitable for integration with MCP hosts that launch
     servers as subprocesses.
 
     Usage::
@@ -664,6 +339,7 @@ def cli_main() -> None:
         scp-mcp serve --identity <did> --relay <relay_url> --transport stdio
     """
     import argparse
+    import asyncio
 
     parser = argparse.ArgumentParser(
         prog="scp-mcp",
@@ -704,15 +380,8 @@ async def _cli_serve(did: str, relay_url: str, transport: str) -> None:
     Loads the identity, connects to the relay, discovers active contexts,
     and starts the MCP server. Owns its own :class:`SCP` instance —
     CLI entry points always construct a fresh instance (ADR-048).
-
-    Args:
-        did: The DID string of the identity to serve.
-        relay_url: The relay URL to connect to.
-        transport: The MCP transport mode (``"stdio"`` or ``"sse"``).
     """
-    from scp_sdk.identity import Identity
     from scp_sdk.scp import SCP
-    from scp_sdk.transport import connect_relay
 
     logger.info(
         "scp-mcp serve: identity=%s, relay=%s, transport=%s",
@@ -721,48 +390,32 @@ async def _cli_serve(did: str, relay_url: str, transport: str) -> None:
         transport,
     )
 
-    # CLI entry point constructs its own SCP instance.
-    scp = SCP()
+    with SCP() as scp:
+        # Step 1: Load the identity.
+        await scp.identity_load(did)
 
-    # Step 1: Load the identity.
-    await Identity.load(scp, did)
+        # Step 2: Connect to the relay.
+        await scp.transport_connect(relay_url)
 
-    # Step 2: Connect to the relay.
-    await connect_relay(scp, relay_url)
+        # Step 3: Load active contexts via the bridge.
+        context_handles = await scp.mcp_load_contexts(did, relay_url)
 
-    # Step 3: Load active contexts via the bridge.
-    native = scp._native
-    context_handles = await asyncio.to_thread(native.py_mcp_load_contexts, did, relay_url)
+        # Step 4: Start the MCP server.
+        context_ids = [h["context_id"] for h in context_handles]
+        handle = await scp.mcp_serve(did, context_ids, transport)
 
-    # Step 4: Start the MCP server.
-    context_ids = [h["context_id"] for h in context_handles]
-    handle = await asyncio.to_thread(native.py_mcp_serve, did, context_ids, transport)
+        logger.info(
+            "MCP server running: %d contexts, transport=%s",
+            len(context_ids),
+            transport,
+        )
 
-    logger.info(
-        "MCP server running: %d contexts, transport=%s",
-        len(context_ids),
-        transport,
-    )
-
-    # Block until the server exits (stdin EOF for stdio, signal for SSE).
-    await _wait_for_shutdown(scp, handle, transport)
-
-
-async def _wait_for_shutdown(scp: SCP, handle: Any, transport: str) -> None:
-    """Wait for the MCP server to shut down.
-
-    For stdio transport, waits until stdin is closed (EOF).
-    For SSE transport, waits until a termination signal is received.
-    """
-    native = scp._native
-    try:
-        # The bridge provides a blocking wait that we run in a thread
-        # to avoid blocking the asyncio event loop.
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, native.py_mcp_server_wait, handle)
-    except KeyboardInterrupt:
-        logger.info("Received interrupt, shutting down MCP server")
-        await asyncio.to_thread(native.py_mcp_server_stop, handle)
+        # Block until the server exits (stdin EOF for stdio, signal for SSE).
+        try:
+            await scp.mcp_server_wait(handle)
+        except KeyboardInterrupt:
+            logger.info("Received interrupt, shutting down MCP server")
+            await scp.mcp_server_stop(handle)
 
 
 __all__ = [
@@ -777,4 +430,5 @@ __all__ = [
     "disable_stdio_allowlist",
     "get_stdio_allowlist",
     "reset_stdio_allowlist",
+    "validate_client_connect",
 ]

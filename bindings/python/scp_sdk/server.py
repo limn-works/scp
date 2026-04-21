@@ -1,31 +1,17 @@
-"""Server-side SDK wrappers for relay and application node lifecycle.
+"""Server-side SDK handle wrappers for relay and application node lifecycle.
 
-Provides :class:`Relay` and :class:`Node` classes that wrap the PyO3 bridge
-functions ``py_relay_start_in_memory`` / ``py_relay_start_local`` and
-``py_node_start_in_memory`` / ``py_node_start_local``.
+Phase 4 PR 5 Agent B+C (#1549) collapsed :class:`Relay` and :class:`Node`
+into pure handle wrappers. Use :meth:`scp_sdk.SCP.relay_start_in_memory`,
+:meth:`scp_sdk.SCP.relay_start_local`,
+:meth:`scp_sdk.SCP.node_start_in_memory`, and
+:meth:`scp_sdk.SCP.node_start_local` to construct them.
 
-Both classes support ``async with`` context-manager usage for automatic
-shutdown:
-
-.. code-block:: python
-
-    async with await Relay.start_in_memory() as relay:
-        print(relay.relay_url)
-
-    async with await Node.start_in_memory() as node:
-        print(node.relay_url, node.did)
-
-:class:`Node` also exposes broadcast deployment lifecycle methods
-(SCP-296, spec §18.11.8):
-
-.. code-block:: python
-
-    async with await Node.start_in_memory() as node:
-        await node.enable_site_projection(context_id, broadcast_key_hex,
-                                          author_did, "open", config)
-        count = await node.commit_deploy(context_id, deploy_id)
-        await node.rollback_deploy(context_id, deploy_id)
-        await node.disable_site_projection(context_id)
+Handle-level methods on the PyO3 objects — ``shutdown``, ``serve``,
+``http_url``, the broadcast deployment lifecycle on Node
+(``enable_site_projection``, ``commit_deploy``, ``rollback_deploy``,
+``disable_site_projection``) — remain available because the PyO3 bridge
+exposes them directly on the handle type. No :class:`SCP` dispatch is
+needed for those calls.
 
 Gated behind the ``server`` feature in ``scp-ffi-common``. Not available
 for WASM (ADR-034).
@@ -35,78 +21,54 @@ from __future__ import annotations
 
 import asyncio
 from types import TracebackType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from scp_sdk.context import validate_admission, validate_broadcast_key_hex
 
 if TYPE_CHECKING:
-    import _scp_core
-
     from scp_sdk.context import SiteConfig
-    from scp_sdk.identity import Identity
     from scp_sdk.scp import SCP
 
 
 class Relay:
     """Opaque handle to a running SCP relay server.
 
-    Use the static factory methods :meth:`start_in_memory` or
-    :meth:`start_local` to create an instance. Call :meth:`shutdown` to
-    stop the relay, or use ``async with`` for automatic cleanup.
+    Construct via :meth:`scp_sdk.SCP.relay_start_in_memory` or
+    :meth:`scp_sdk.SCP.relay_start_local`. Call :meth:`shutdown` to stop
+    the relay, or use ``async with`` for automatic cleanup.
     """
 
-    __slots__ = ("_handle",)
+    __slots__ = ("_raw_handle",)
 
-    def __init__(self, handle: _scp_core.RelayHandle) -> None:
-        self._handle = handle
+    def __init__(self, handle: Any) -> None:
+        self._raw_handle = handle
+
+    @classmethod
+    def _from_handle(cls, _scp: SCP | None, raw: Any) -> Relay:
+        """Internal constructor used by :class:`scp_sdk.SCP`."""
+        return cls(raw)
 
     @property
     def relay_url(self) -> str:
         """The WebSocket URL clients should connect to (e.g. ``ws://127.0.0.1:PORT/scp/v1``)."""
-        return self._handle.relay_url  # type: ignore[no-any-return]
+        return self._raw_handle.relay_url  # type: ignore[no-any-return]
 
     @property
     def relay_port(self) -> int:
         """The port the relay is listening on."""
-        return self._handle.relay_port  # type: ignore[no-any-return]
+        return self._raw_handle.relay_port  # type: ignore[no-any-return]
 
     @property
     def is_shutdown(self) -> bool:
         """``True`` if :meth:`shutdown` has already been called."""
-        return self._handle.is_shutdown  # type: ignore[no-any-return]
-
-    @staticmethod
-    async def start_in_memory(scp: SCP) -> Relay:
-        """Start a relay with in-memory blob storage on an OS-assigned port.
-
-        Returns a :class:`Relay` whose :attr:`relay_url` property contains
-        the WebSocket URL for clients.
-
-        Args:
-            scp: The :class:`scp_sdk.SCP` instance that owns the relay.
-        """
-        handle = await asyncio.to_thread(scp._native.relay_start_in_memory)
-        return Relay(handle)
-
-    @staticmethod
-    async def start_local(scp: SCP, data_dir: str) -> Relay:
-        """Start a relay with redb-backed blob storage on an OS-assigned port.
-
-        Opens (or creates) a redb database at ``<data_dir>/blobs.redb``.
-
-        Args:
-            scp: The :class:`scp_sdk.SCP` instance that owns the relay.
-            data_dir: Directory for persistent blob storage.
-        """
-        handle = await asyncio.to_thread(scp._native.relay_start_local, data_dir)
-        return Relay(handle)
+        return self._raw_handle.is_shutdown  # type: ignore[no-any-return]
 
     async def shutdown(self) -> None:
         """Signal the relay to stop accepting new connections.
 
         In-flight connection handlers drain naturally. Idempotent.
         """
-        await asyncio.to_thread(self._handle.shutdown)
+        await asyncio.to_thread(self._raw_handle.shutdown)
 
     async def __aenter__(self) -> Relay:
         return self
@@ -127,30 +89,40 @@ class Node:
     """Opaque handle to a running SCP application node.
 
     An application node includes a running relay server, a generated DID
-    identity, and (optionally) persistent storage. Use the static factory
-    methods :meth:`start_in_memory` or :meth:`start_local` to create an
-    instance.
+    identity, and (optionally) persistent storage. Construct via
+    :meth:`scp_sdk.SCP.node_start_in_memory` or
+    :meth:`scp_sdk.SCP.node_start_local`.
     """
 
-    __slots__ = ("_handle",)
+    __slots__ = ("_raw_handle",)
 
-    def __init__(self, handle: _scp_core.NodeHandle) -> None:
-        self._handle = handle
+    def __init__(self, handle: Any) -> None:
+        self._raw_handle = handle
+
+    @classmethod
+    def _from_handle(cls, _scp: SCP | None, raw: Any) -> Node:
+        """Internal constructor used by :class:`scp_sdk.SCP`."""
+        return cls(raw)
 
     @property
     def relay_url(self) -> str:
         """The WebSocket URL for this node's relay (e.g. ``ws://127.0.0.1:PORT/scp/v1``)."""
-        return self._handle.relay_url  # type: ignore[no-any-return]
+        return self._raw_handle.relay_url  # type: ignore[no-any-return]
 
     @property
     def relay_port(self) -> int:
         """The port the node's relay is listening on."""
-        return self._handle.relay_port  # type: ignore[no-any-return]
+        return self._raw_handle.relay_port  # type: ignore[no-any-return]
 
     @property
     def did(self) -> str:
         """The node's DID string (e.g. ``did:dht:z6Mk...``)."""
-        return self._handle.did  # type: ignore[no-any-return]
+        return self._raw_handle.did  # type: ignore[no-any-return]
+
+    @property
+    def is_shutdown(self) -> bool:
+        """``True`` if :meth:`shutdown` has already been called."""
+        return self._raw_handle.is_shutdown  # type: ignore[no-any-return]
 
     async def http_url(self) -> str | None:
         """Return the HTTP URL of the background server, or ``None`` if not serving.
@@ -158,72 +130,7 @@ class Node:
         Returns the literal bind address, which may contain ``0.0.0.0`` if the
         server was bound to the unspecified address.
         """
-        return await asyncio.to_thread(self._handle.http_url)  # type: ignore[no-any-return]
-
-    @property
-    def is_shutdown(self) -> bool:
-        """``True`` if :meth:`shutdown` has already been called."""
-        return self._handle.is_shutdown  # type: ignore[no-any-return]
-
-    @staticmethod
-    async def start_in_memory(
-        scp: SCP,
-        identity: Identity | None = None,
-    ) -> Node:
-        """Start a full application node with in-memory storage.
-
-        When ``identity`` is provided, the node uses that pre-existing identity
-        instead of generating a fresh one -- the same DID persists across node
-        restarts (identity portability).  When ``None``, a fresh ephemeral
-        identity is generated automatically.
-
-        Auto-wires in-memory key custody, in-memory storage, in-memory DHT
-        client, self-signed TLS, and a relay on an OS-assigned port.
-
-        Args:
-            scp: The :class:`scp_sdk.SCP` instance that owns the node.
-            identity: Optional pre-existing :class:`~scp_sdk.identity.Identity`
-                to use.  If provided, the node uses this identity instead of
-                generating a fresh DID.  The identity must have been created
-                via :meth:`~scp_sdk.identity.Identity.create` in the same
-                process (it must exist in the bridge identity registry).
-        """
-        did = identity.did if identity is not None else None
-        handle = await asyncio.to_thread(scp._native.node_start_in_memory, did)
-        return Node(handle)
-
-    @staticmethod
-    async def start_local(
-        scp: SCP,
-        data_dir: str,
-        identity: Identity | None = None,
-        passphrase: str | None = None,
-    ) -> Node:
-        """Start a full application node with file-backed storage.
-
-        When ``identity`` is provided, the node uses that pre-existing identity
-        instead of generating one -- the same DID persists across node restarts
-        (identity portability).  When ``None``, the node creates or reloads a
-        persistent identity via ``FileKeyCustody``.  The ``passphrase``
-        parameter is required in this mode.
-
-        No passphrase is required when ``identity`` is provided.
-
-        Opens (or creates) persistent storage at ``<data_dir>/storage/``
-        and a redb blob database at ``<data_dir>/blobs.redb``.
-
-        Args:
-            scp: The :class:`scp_sdk.SCP` instance that owns the node.
-            data_dir: Directory for persistent storage.
-            identity: Optional pre-existing :class:`~scp_sdk.identity.Identity`
-                to use.  If provided, the node uses this identity instead of
-                generating a fresh one.
-            passphrase: Passphrase for Argon2id key derivation (encrypts the
-                key file at rest).  Required when ``identity`` is ``None``.
-        """
-        did = identity.did if identity is not None else None
-        handle = await asyncio.to_thread(scp._native.node_start_local, data_dir, did, passphrase)
-        return Node(handle)
+        return await asyncio.to_thread(self._raw_handle.http_url)  # type: ignore[no-any-return]
 
     async def serve(self, bind_addr: str | None = None) -> str:
         """Start the HTTP server in the background.
@@ -249,14 +156,14 @@ class Node:
             RuntimeError: If the server is already running or binding fails.
             ValueError: If ``bind_addr`` is not a valid socket address.
         """
-        return await asyncio.to_thread(self._handle.serve, bind_addr)  # type: ignore[no-any-return]
+        return await asyncio.to_thread(self._raw_handle.serve, bind_addr)  # type: ignore[no-any-return]
 
     async def shutdown(self) -> None:
         """Signal the node to stop (relay + background tasks).
 
         In-flight connection handlers drain naturally. Idempotent.
         """
-        await asyncio.to_thread(self._handle.shutdown)
+        await asyncio.to_thread(self._raw_handle.shutdown)
 
     async def __aenter__(self) -> Node:
         return self
@@ -285,22 +192,6 @@ class Node:
         3. Neither provided — auto-resolves using the node's identity DID.
 
         Providing ``broadcast_key_hex`` without ``author_did`` is an error.
-
-        Args:
-            context_id: The context ID to project.
-            admission: ``"open"`` or ``"gated"``.
-            config: :class:`~scp_sdk.context.SiteConfig` with hostname,
-                index path, and deploy limits.
-            broadcast_key_hex: 32-byte AES-256 broadcast key as a
-                64-character hex string, or ``None`` for auto-lookup.
-            author_did: DID of the broadcast key owner, or ``None``
-                for auto-lookup using the node's DID.
-
-        Raises:
-            ValueError: If parameters are invalid or ``broadcast_key_hex``
-                is provided without ``author_did``.
-            RuntimeError: If the underlying node operation fails or
-                auto-lookup cannot find the key.
         """
         validate_admission(admission)
         if broadcast_key_hex is not None and author_did is None:
@@ -311,7 +202,7 @@ class Node:
         if broadcast_key_hex is not None:
             validate_broadcast_key_hex(broadcast_key_hex)
         await asyncio.to_thread(
-            self._handle.enable_site_projection,
+            self._raw_handle.enable_site_projection,
             context_id,
             admission,
             config.hostname,
@@ -325,52 +216,18 @@ class Node:
         )
 
     async def commit_deploy(self, context_id: str, deploy_id: str) -> int:
-        """Commit a deploy for a projected context (§18.11.11).
-
-        Scans blobs matching the ``deploy_id``, decrypts each to extract
-        metadata, builds an immutable path index, and atomically swaps the
-        serving pointer.
-
-        Args:
-            context_id: The projected context ID.
-            deploy_id: The deploy identifier (hex, from publish).
-
-        Returns:
-            The number of assets in the committed deploy.
-
-        Raises:
-            RuntimeError: If the context is not projected or commit fails.
-        """
+        """Commit a deploy for a projected context (§18.11.11)."""
         return await asyncio.to_thread(  # type: ignore[no-any-return]
-            self._handle.commit_deploy, context_id, deploy_id
+            self._raw_handle.commit_deploy, context_id, deploy_id
         )
 
     async def rollback_deploy(self, context_id: str, deploy_id: str) -> None:
-        """Roll back to a previous deploy for a projected context (§18.11.11).
-
-        Sets the path index pointer to a previous deploy within the
-        retention window.
-
-        Args:
-            context_id: The projected context ID.
-            deploy_id: The deploy identifier to roll back to.
-
-        Raises:
-            RuntimeError: If the context is not projected or deploy not found.
-        """
-        await asyncio.to_thread(self._handle.rollback_deploy, context_id, deploy_id)
+        """Roll back to a previous deploy for a projected context (§18.11.11)."""
+        await asyncio.to_thread(self._raw_handle.rollback_deploy, context_id, deploy_id)
 
     async def disable_site_projection(self, context_id: str) -> None:
-        """Deactivate HTTP broadcast projection for a context.
-
-        Removes the projected context from the registry and drops all
-        retained epoch keys. Idempotent — calling on a non-projected
-        context is a no-op.
-
-        Args:
-            context_id: The context ID to stop projecting.
-        """
-        await asyncio.to_thread(self._handle.disable_site_projection, context_id)
+        """Deactivate HTTP broadcast projection for a context."""
+        await asyncio.to_thread(self._raw_handle.disable_site_projection, context_id)
 
     async def __aexit__(
         self,

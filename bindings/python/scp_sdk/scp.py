@@ -44,6 +44,7 @@ from types import TracebackType
 from typing import Any
 
 from scp_sdk.errors import ScpError
+from scp_sdk.types import CustodyType
 
 __all__ = ["SCP"]
 
@@ -280,8 +281,23 @@ class SCP:
         verification_method: str,
         platform_id: str | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.create_identity_link_attestation``."""
-        return await asyncio.to_thread(
+        """Create an identity link attestation (§3.5).
+
+        Returns an :class:`~scp_sdk.identity.IdentityAttestation` on success.
+        Raises :class:`~scp_sdk.errors.IdentityError` when the bridge does
+        not expose attestation creation (missing FFI feature).
+        """
+        import json
+
+        from scp_sdk.errors import IdentityError
+        from scp_sdk.identity import IdentityAttestation
+
+        if not hasattr(self._native, "create_identity_link_attestation"):
+            raise IdentityError(
+                "Identity link attestation creation is not yet available in the bridge",
+                "SCP-ATTEST-9010",
+            )
+        result_json = await asyncio.to_thread(
             self._native.create_identity_link_attestation,
             did,
             platform,
@@ -290,67 +306,182 @@ class SCP:
             verification_method,
             platform_id,
         )
+        data = json.loads(result_json) if isinstance(result_json, str) else result_json
+        return IdentityAttestation._from_dict(data)
 
     async def identity_add_agent_key(self, identity: Any) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_add_agent_key``."""
-        return await asyncio.to_thread(self._native.identity_add_agent_key, identity)
+        """Delegate to ``_scp_core.SCP.identity_add_agent_key`` (returns :class:`Identity`)."""
+        from scp_sdk.identity import Identity
+
+        raw = await asyncio.to_thread(self._native.identity_add_agent_key, identity)
+        return Identity(raw)
 
     async def identity_attest_device(self, identity_did: str) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_attest_device``."""
+        """Delegate to ``_scp_core.SCP.identity_attest_device``.
+
+        Raises :class:`~scp_sdk.errors.IdentityError` when the bridge was
+        not built with the ``allow_in_memory_custody`` feature.
+        """
+        from scp_sdk.errors import IdentityError
+
+        if not hasattr(self._native, "identity_attest_device"):
+            raise IdentityError(
+                "Device attestation requires the 'allow_in_memory_custody' feature",
+                "SCP-IDENT-1050",
+            )
         return await asyncio.to_thread(self._native.identity_attest_device, identity_did)
 
-    async def identity_create(self, custody: str) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_create``."""
-        return await asyncio.to_thread(self._native.identity_create, custody)
+    async def identity_create(self, custody: CustodyType | str = CustodyType.FILE) -> Any:
+        """Delegate to ``_scp_core.SCP.identity_create`` (returns :class:`Identity`)."""
+        from scp_sdk.identity import Identity
 
-    async def identity_create_with_agent_key(self, custody: str) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_create_with_agent_key``."""
-        return await asyncio.to_thread(self._native.identity_create_with_agent_key, custody)
+        custody_str = custody.value if isinstance(custody, CustodyType) else custody
+        raw = await asyncio.to_thread(self._native.identity_create, custody_str)
+        return Identity(raw)
+
+    async def identity_create_with_agent_key(
+        self, custody: CustodyType | str = CustodyType.FILE
+    ) -> Any:
+        """Delegate to ``_scp_core.SCP.identity_create_with_agent_key``.
+
+        Returns an :class:`Identity` wrapper.
+        """
+        from scp_sdk.identity import Identity
+
+        custody_str = custody.value if isinstance(custody, CustodyType) else custody
+        raw = await asyncio.to_thread(self._native.identity_create_with_agent_key, custody_str)
+        return Identity(raw)
 
     async def identity_execute_custody_migration(
         self, did: str, target: str, context_ids: list[str]
-    ) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_execute_custody_migration``."""
-        return await asyncio.to_thread(
+    ) -> dict[str, Any]:
+        """Delegate to ``_scp_core.SCP.identity_execute_custody_migration``.
+
+        Returns the migration outcome dict parsed from the bridge's JSON
+        payload (§3.2.1).
+        """
+        import json
+
+        result_json = await asyncio.to_thread(
             self._native.identity_execute_custody_migration, did, target, context_ids
         )
+        return json.loads(result_json) if isinstance(result_json, str) else result_json
 
-    async def identity_execute_recovery(self, did: str, tier: str, context_ids: list[str]) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_execute_recovery``."""
-        return await asyncio.to_thread(
+    async def identity_execute_recovery(
+        self, did: str, tier: str, context_ids: list[str]
+    ) -> dict[str, Any]:
+        """Delegate to ``_scp_core.SCP.identity_execute_recovery``.
+
+        Returns the recovery outcome dict parsed from the bridge's JSON
+        payload (§9.12).
+        """
+        import json
+
+        result_json = await asyncio.to_thread(
             self._native.identity_execute_recovery, did, tier, context_ids
         )
+        return json.loads(result_json) if isinstance(result_json, str) else result_json
 
-    async def identity_link_attestations(self, did: str) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_link_attestations``."""
-        return await asyncio.to_thread(self._native.identity_link_attestations, did)
+    async def identity_link_attestations(self, did: str) -> list[Any]:
+        """List identity link attestations for *did* (§3.5).
+
+        Returns a list of :class:`~scp_sdk.identity.IdentityAttestation`
+        instances. Raises :class:`~scp_sdk.errors.IdentityError` when the
+        bridge does not expose the endpoint.
+        """
+        import json
+
+        from scp_sdk.errors import IdentityError
+        from scp_sdk.identity import IdentityAttestation
+
+        if not hasattr(self._native, "identity_link_attestations"):
+            raise IdentityError(
+                "Identity link attestation listing is not yet available in the bridge",
+                "SCP-ATTEST-9011",
+            )
+        result_json = await asyncio.to_thread(self._native.identity_link_attestations, did)
+        items = json.loads(result_json) if isinstance(result_json, str) else result_json
+        return [IdentityAttestation._from_dict(item) for item in items]
 
     async def identity_load(self, did: str) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_load``."""
-        return await asyncio.to_thread(self._native.identity_load, did)
+        """Delegate to ``_scp_core.SCP.identity_load`` (returns :class:`Identity`)."""
+        from scp_sdk.identity import Identity
+
+        raw = await asyncio.to_thread(self._native.identity_load, did)
+        return Identity(raw)
 
     async def identity_migrate(self, identity: Any) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_migrate``."""
-        return await asyncio.to_thread(self._native.identity_migrate, identity)
+        """Delegate to ``_scp_core.SCP.identity_migrate`` (returns :class:`Identity`)."""
+        from scp_sdk.identity import Identity
+
+        raw = await asyncio.to_thread(self._native.identity_migrate, identity)
+        return Identity(raw)
 
     async def identity_remove_agent_key(self, identity: Any) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_remove_agent_key``."""
-        return await asyncio.to_thread(self._native.identity_remove_agent_key, identity)
+        """Delegate to ``_scp_core.SCP.identity_remove_agent_key`` (returns :class:`Identity`)."""
+        from scp_sdk.identity import Identity
+
+        raw = await asyncio.to_thread(self._native.identity_remove_agent_key, identity)
+        return Identity(raw)
+
+    async def identity_renew_attestation(self, did: str, attestation_id: str) -> Any:
+        """Renew an identity link attestation (§3.5.2).
+
+        Returns an :class:`~scp_sdk.identity.IdentityAttestation` with a
+        refreshed ``verified_at`` timestamp. Raises
+        :class:`~scp_sdk.errors.IdentityError` when the bridge does not
+        expose renewal.
+        """
+        import json
+
+        from scp_sdk.errors import IdentityError
+        from scp_sdk.identity import IdentityAttestation
+
+        if not hasattr(self._native, "identity_renew_attestation"):
+            raise IdentityError(
+                "Identity link attestation renewal is not yet available in the bridge",
+                "SCP-ATTEST-9013",
+            )
+        result_json = await asyncio.to_thread(
+            self._native.identity_renew_attestation, did, attestation_id
+        )
+        data = json.loads(result_json) if isinstance(result_json, str) else result_json
+        return IdentityAttestation._from_dict(data)
 
     async def identity_resolve(self, did: str) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_resolve``."""
-        return await asyncio.to_thread(self._native.identity_resolve, did)
+        """Resolve a DID to its DID Document (returns :class:`DIDDocument`)."""
+        from scp_sdk.identity import _bridge_doc_to_dataclass
+
+        raw = await asyncio.to_thread(self._native.identity_resolve, did)
+        return _bridge_doc_to_dataclass(raw)
 
     async def identity_rotate_agent_key(self, identity: Any) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_rotate_agent_key``."""
-        return await asyncio.to_thread(self._native.identity_rotate_agent_key, identity)
+        """Delegate to ``_scp_core.SCP.identity_rotate_agent_key`` (returns :class:`Identity`)."""
+        from scp_sdk.identity import Identity
+
+        raw = await asyncio.to_thread(self._native.identity_rotate_agent_key, identity)
+        return Identity(raw)
 
     async def identity_rotate_key(self, identity: Any) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_rotate_key``."""
-        return await asyncio.to_thread(self._native.identity_rotate_key, identity)
+        """Delegate to ``_scp_core.SCP.identity_rotate_key`` (returns :class:`Identity`)."""
+        from scp_sdk.identity import Identity
+
+        raw = await asyncio.to_thread(self._native.identity_rotate_key, identity)
+        return Identity(raw)
 
     async def identity_verify_device_attestation(self, did: str, token_base64: str) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_verify_device_attestation``."""
+        """Delegate to ``_scp_core.SCP.identity_verify_device_attestation``.
+
+        Raises :class:`~scp_sdk.errors.IdentityError` when the bridge was
+        not built with the ``allow_in_memory_custody`` feature.
+        """
+        from scp_sdk.errors import IdentityError
+
+        if not hasattr(self._native, "identity_verify_device_attestation"):
+            raise IdentityError(
+                "Device attestation verification requires the 'allow_in_memory_custody' feature",
+                "SCP-IDENT-1051",
+            )
         return await asyncio.to_thread(
             self._native.identity_verify_device_attestation, did, token_base64
         )
@@ -359,8 +490,19 @@ class SCP:
         """Delegate to ``_scp_core.SCP.init_storage``."""
         return await asyncio.to_thread(self._native.init_storage, storage_type)
 
-    async def remove_identity_link_attestation(self, did: str, attestation_id: str) -> Any:
-        """Delegate to ``_scp_core.SCP.remove_identity_link_attestation``."""
+    async def remove_identity_link_attestation(self, did: str, attestation_id: str) -> bool:
+        """Remove an identity link attestation.
+
+        Returns ``True`` if the attestation existed and was removed,
+        ``False`` if no attestation with that ID was present.
+        """
+        from scp_sdk.errors import IdentityError
+
+        if not hasattr(self._native, "remove_identity_link_attestation"):
+            raise IdentityError(
+                "Identity link attestation removal is not yet available in the bridge",
+                "SCP-ATTEST-9012",
+            )
         return await asyncio.to_thread(
             self._native.remove_identity_link_attestation, did, attestation_id
         )
@@ -402,8 +544,11 @@ class SCP:
         return await asyncio.to_thread(self._native.context_close, handle, identity_did)
 
     async def context_create(self, identity_did: str, params: dict[str, Any]) -> Any:
-        """Delegate to ``_scp_core.SCP.context_create``."""
-        return await asyncio.to_thread(self._native.context_create, identity_did, params)
+        """Delegate to ``_scp_core.SCP.context_create`` (returns :class:`Context`)."""
+        from scp_sdk.context import Context
+
+        raw = await asyncio.to_thread(self._native.context_create, identity_did, params)
+        return Context(raw, identity_did=identity_did)
 
     async def context_drain_events(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.context_drain_events``."""
@@ -418,8 +563,13 @@ class SCP:
         return await asyncio.to_thread(self._native.context_handle_ttl_expiry, handle)
 
     async def context_import(self, data: Any) -> Any:
-        """Delegate to ``_scp_core.SCP.context_import``."""
-        return await asyncio.to_thread(self._native.context_import, data)
+        """Delegate to ``_scp_core.SCP.context_import`` (returns :class:`Context`)."""
+        from scp_sdk.context import Context
+
+        raw = await asyncio.to_thread(self._native.context_import, data)
+        if raw is None:
+            return None
+        return Context(raw)
 
     async def context_is_member(self, handle: Any, did: str) -> Any:
         """Delegate to ``_scp_core.SCP.context_is_member``."""
@@ -505,8 +655,10 @@ class SCP:
         parent_token: str,
         capabilities: list[str],
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.ucan_delegate``."""
-        return await asyncio.to_thread(
+        """Delegate to ``_scp_core.SCP.ucan_delegate`` (returns :class:`UcanToken`)."""
+        from scp_sdk.ucan import UcanToken
+
+        raw = await asyncio.to_thread(
             self._native.ucan_delegate,
             context_id,
             delegator_did,
@@ -514,6 +666,7 @@ class SCP:
             parent_token,
             capabilities,
         )
+        return UcanToken._from_bridge(raw)
 
     async def ucan_mint(
         self,
@@ -522,10 +675,13 @@ class SCP:
         capabilities: list[str],
         proofs: list[str] | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.ucan_mint``."""
-        return await asyncio.to_thread(
+        """Delegate to ``_scp_core.SCP.ucan_mint`` (returns :class:`UcanToken`)."""
+        from scp_sdk.ucan import UcanToken
+
+        raw = await asyncio.to_thread(
             self._native.ucan_mint, context_id, member_did, capabilities, proofs
         )
+        return UcanToken._from_bridge(raw)
 
     async def ucan_revoke(self, context_id: str, token: str, revoker_did: str) -> Any:
         """Delegate to ``_scp_core.SCP.ucan_revoke``."""
@@ -760,32 +916,91 @@ class SCP:
     # region MCP
 
     async def mcp_client_connect_sse(self, url: str) -> Any:
-        """Delegate to ``_scp_core.SCP.py_mcp_client_connect_sse``."""
-        return await asyncio.to_thread(self._native.py_mcp_client_connect_sse, url)
+        """Connect an MCP client via SSE transport (returns :class:`McpClient`)."""
+        from scp_sdk.mcp import McpClient, validate_client_connect
+
+        validate_client_connect("sse", url=url)
+        raw = await asyncio.to_thread(self._native.py_mcp_client_connect_sse, url)
+        return McpClient(raw)
 
     async def mcp_client_connect_stdio(self, command: list[str]) -> Any:
-        """Delegate to ``_scp_core.SCP.py_mcp_client_connect_stdio``."""
-        return await asyncio.to_thread(self._native.py_mcp_client_connect_stdio, command)
+        """Connect an MCP client via stdio transport (returns :class:`McpClient`)."""
+        from scp_sdk.mcp import McpClient, validate_client_connect
 
-    async def mcp_client_disconnect(self, handle: str) -> Any:
-        """Delegate to ``_scp_core.SCP.py_mcp_client_disconnect``."""
-        return await asyncio.to_thread(self._native.py_mcp_client_disconnect, handle)
+        validate_client_connect("stdio", command=command)
+        raw = await asyncio.to_thread(self._native.py_mcp_client_connect_stdio, command)
+        return McpClient(raw)
 
-    async def mcp_client_info(self, handle: str) -> Any:
-        """Delegate to ``_scp_core.SCP.py_mcp_client_info``."""
-        return await asyncio.to_thread(self._native.py_mcp_client_info, handle)
+    async def mcp_client_disconnect(self, handle: Any) -> Any:
+        """Delegate to ``_scp_core.SCP.py_mcp_client_disconnect``.
+
+        Accepts an :class:`McpClient` instance (extracting the raw
+        bridge handle via ``_raw_handle``) or a raw handle directly.
+        """
+        from scp_sdk.mcp import McpClient
+
+        raw = handle._raw_handle if isinstance(handle, McpClient) else handle
+        return await asyncio.to_thread(self._native.py_mcp_client_disconnect, raw)
+
+    async def mcp_client_info(self, handle: Any) -> Any:
+        """Delegate to ``_scp_core.SCP.py_mcp_client_info``.
+
+        Accepts an :class:`McpClient` instance (extracting the raw
+        bridge handle via ``_raw_handle``) or a raw handle directly.
+        """
+        from scp_sdk.mcp import McpClient
+
+        raw = handle._raw_handle if isinstance(handle, McpClient) else handle
+        return await asyncio.to_thread(self._native.py_mcp_client_info, raw)
 
     async def mcp_client_invoke(
-        self, handle: str, tool_name: str, input: dict[str, Any], context_id: str, identity_did: str
+        self, handle: Any, tool_name: str, input: dict[str, Any], context_id: str, identity_did: str
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.py_mcp_client_invoke``."""
-        return await asyncio.to_thread(
-            self._native.py_mcp_client_invoke, handle, tool_name, input, context_id, identity_did
+        """Delegate to ``_scp_core.SCP.py_mcp_client_invoke``.
+
+        Returns an :class:`~scp_sdk.mcp.McpToolResult` wrapping the raw
+        bridge result with SCP provenance metadata.
+        """
+        from scp_sdk.mcp import McpClient, McpProvenance, McpToolResult
+
+        raw_handle = handle._raw_handle if isinstance(handle, McpClient) else handle
+        raw = await asyncio.to_thread(
+            self._native.py_mcp_client_invoke,
+            raw_handle,
+            tool_name,
+            input,
+            context_id,
+            identity_did,
+        )
+        provenance = McpProvenance(
+            source=raw["provenance"]["source"],
+            invoked_by=raw["provenance"]["invoked_by"],
+            context=raw["provenance"]["context"],
+            timestamp=raw["provenance"]["timestamp"],
+        )
+        return McpToolResult(
+            content=raw.get("content", []),
+            is_error=raw.get("is_error", False),
+            provenance=provenance,
         )
 
-    async def mcp_client_list_tools(self, handle: str) -> Any:
-        """Delegate to ``_scp_core.SCP.py_mcp_client_list_tools``."""
-        return await asyncio.to_thread(self._native.py_mcp_client_list_tools, handle)
+    async def mcp_client_list_tools(self, handle: Any) -> list[Any]:
+        """Delegate to ``_scp_core.SCP.py_mcp_client_list_tools``.
+
+        Returns a list of :class:`~scp_sdk.mcp.McpToolDefinition`.
+        """
+        from scp_sdk.mcp import McpClient, McpToolDefinition
+
+        raw_handle = handle._raw_handle if isinstance(handle, McpClient) else handle
+        raw_tools = await asyncio.to_thread(self._native.py_mcp_client_list_tools, raw_handle)
+        return [
+            McpToolDefinition(
+                name=t["name"],
+                description=t.get("description"),
+                input_schema=t.get("inputSchema", {}),
+            )
+            for t in raw_tools
+        ]
 
     async def mcp_load_contexts(self, identity_did: str, _relay_url: str) -> Any:
         """Delegate to ``_scp_core.SCP.py_mcp_load_contexts``."""
@@ -804,22 +1019,43 @@ class SCP:
         transport: str,
         ucan_token: str | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.py_mcp_serve``."""
-        return await asyncio.to_thread(
+        """Delegate to ``_scp_core.SCP.py_mcp_serve`` (returns :class:`McpServer`)."""
+        from scp_sdk.mcp import McpServer
+
+        raw = await asyncio.to_thread(
             self._native.py_mcp_serve, identity_did, context_ids, transport, ucan_token
         )
+        return McpServer(raw)
 
-    async def mcp_server_info(self, handle: str) -> Any:
-        """Delegate to ``_scp_core.SCP.py_mcp_server_info``."""
-        return await asyncio.to_thread(self._native.py_mcp_server_info, handle)
+    async def mcp_server_info(self, handle: Any) -> Any:
+        """Delegate to ``_scp_core.SCP.py_mcp_server_info``.
 
-    async def mcp_server_stop(self, handle: str) -> Any:
-        """Delegate to ``_scp_core.SCP.py_mcp_server_stop``."""
-        return await asyncio.to_thread(self._native.py_mcp_server_stop, handle)
+        Accepts an :class:`McpServer` instance or a raw bridge handle.
+        """
+        from scp_sdk.mcp import McpServer
 
-    async def mcp_server_wait(self, handle: str) -> Any:
-        """Delegate to ``_scp_core.SCP.py_mcp_server_wait``."""
-        return await asyncio.to_thread(self._native.py_mcp_server_wait, handle)
+        raw = handle._raw_handle if isinstance(handle, McpServer) else handle
+        return await asyncio.to_thread(self._native.py_mcp_server_info, raw)
+
+    async def mcp_server_stop(self, handle: Any) -> Any:
+        """Delegate to ``_scp_core.SCP.py_mcp_server_stop``.
+
+        Accepts an :class:`McpServer` instance or a raw bridge handle.
+        """
+        from scp_sdk.mcp import McpServer
+
+        raw = handle._raw_handle if isinstance(handle, McpServer) else handle
+        return await asyncio.to_thread(self._native.py_mcp_server_stop, raw)
+
+    async def mcp_server_wait(self, handle: Any) -> Any:
+        """Delegate to ``_scp_core.SCP.py_mcp_server_wait``.
+
+        Accepts an :class:`McpServer` instance or a raw bridge handle.
+        """
+        from scp_sdk.mcp import McpServer
+
+        raw = handle._raw_handle if isinstance(handle, McpServer) else handle
+        return await asyncio.to_thread(self._native.py_mcp_server_wait, raw)
 
     async def registry_cleanup(self) -> Any:
         """Delegate to ``_scp_core.SCP.py_registry_cleanup``."""
@@ -862,26 +1098,75 @@ class SCP:
         return await asyncio.to_thread(self._native.transport_reliability, adapter_index)
 
     async def transport_status(self) -> Any:
-        """Delegate to ``_scp_core.SCP.transport_status``."""
-        return await asyncio.to_thread(self._native.transport_status)
+        """Delegate to ``_scp_core.SCP.transport_status`` (returns :class:`TransportStatus`)."""
+        from scp_sdk.transport import TransportStatus
+
+        raw = await asyncio.to_thread(self._native.transport_status)
+        return TransportStatus(
+            connected=raw.connected,
+            relay_url=raw.relay_url,
+            latency_ms=raw.latency_ms,
+        )
 
     # endregion Transport
 
     # region Event Log
 
     async def event_log_checkpoint(self, context_id: str, identity_did: str, epoch: int) -> Any:
-        """Delegate to ``_scp_core.SCP.event_log_checkpoint``."""
-        return await asyncio.to_thread(
+        """Delegate to ``_scp_core.SCP.event_log_checkpoint``.
+
+        Returns a :class:`~scp_sdk.event_log.SignedCheckpoint` with an
+        Ed25519 signature over the canonical checkpoint fields.
+        """
+        from scp_sdk.event_log import SignedCheckpoint
+
+        raw = await asyncio.to_thread(
             self._native.event_log_checkpoint, context_id, identity_did, epoch
         )
+        return SignedCheckpoint(
+            context_id=raw.context_id,
+            sender_did=raw.sender_did,
+            event_count=raw.event_count,
+            merkle_root=raw.merkle_root,
+            epoch=raw.epoch,
+            timestamp=raw.timestamp,
+            signature=raw.signature,
+        )
 
-    async def event_log_query(self, context_id: str, filter: dict[str, Any] | None = None) -> Any:
-        """Delegate to ``_scp_core.SCP.event_log_query``."""
-        return await asyncio.to_thread(self._native.event_log_query, context_id, filter)
+    async def event_log_query(
+        self, context_id: str, filter: dict[str, Any] | None = None
+    ) -> list[Any]:
+        """Delegate to ``_scp_core.SCP.event_log_query``.
+
+        Returns a list of :class:`~scp_sdk.event_log.Event` dataclasses.
+        """
+        from scp_sdk.event_log import Event
+
+        raw_events = await asyncio.to_thread(self._native.event_log_query, context_id, filter)
+        return [
+            Event(
+                event_type=e.event_type,
+                actor_did=e.actor_did,
+                timestamp=e.timestamp,
+                payload=e.payload,
+                sequence=e.sequence,
+            )
+            for e in raw_events
+        ]
 
     async def event_log_verify(self, context_id: str, claim: dict[str, Any]) -> Any:
-        """Delegate to ``_scp_core.SCP.event_log_verify``."""
-        return await asyncio.to_thread(self._native.event_log_verify, context_id, claim)
+        """Delegate to ``_scp_core.SCP.event_log_verify``.
+
+        Returns a :class:`~scp_sdk.event_log.Proof` dataclass.
+        """
+        from scp_sdk.event_log import Proof
+
+        raw = await asyncio.to_thread(self._native.event_log_verify, context_id, claim)
+        return Proof(
+            verified=raw.verified,
+            proof_type=raw.proof_type,
+            details=raw.details,
+        )
 
     # endregion Event Log
 
@@ -975,17 +1260,54 @@ class SCP:
 
     # region SCPID
 
-    async def scpid_challenge(self, audience: str, ttl_seconds: int) -> Any:
-        """Delegate to ``_scp_core.SCP.scpid_challenge``."""
-        return await asyncio.to_thread(self._native.scpid_challenge, audience, ttl_seconds)
+    async def scpid_challenge(self, audience: str, ttl_seconds: int = 300) -> Any:
+        """Delegate to ``_scp_core.SCP.scpid_challenge``.
+
+        Returns an :class:`~scp_sdk.auth.ScpIdChallenge` parsed from the
+        bridge's JSON payload.
+        """
+        from scp_sdk.auth import ScpIdChallenge
+
+        raw = await asyncio.to_thread(self._native.scpid_challenge, audience, ttl_seconds)
+        return ScpIdChallenge.from_json(raw) if isinstance(raw, str) else raw
 
     async def scpid_sign(self, did: str, signing_key_id: str, challenge_json: str) -> Any:
-        """Delegate to ``_scp_core.SCP.scpid_sign``."""
-        return await asyncio.to_thread(self._native.scpid_sign, did, signing_key_id, challenge_json)
+        """Delegate to ``_scp_core.SCP.scpid_sign``.
+
+        Returns an :class:`~scp_sdk.auth.ScpIdResponse` parsed from the
+        bridge's JSON payload.
+        """
+        from scp_sdk.auth import ScpIdResponse
+
+        raw = await asyncio.to_thread(self._native.scpid_sign, did, signing_key_id, challenge_json)
+        return ScpIdResponse.from_json(raw) if isinstance(raw, str) else raw
 
     async def scpid_verify(self, response_json: str, challenge_json: str) -> Any:
-        """Delegate to ``_scp_core.SCP.scpid_verify``."""
-        return await asyncio.to_thread(self._native.scpid_verify, response_json, challenge_json)
+        """Delegate to ``_scp_core.SCP.scpid_verify``.
+
+        Returns an :class:`~scp_sdk.auth.ScpIdAuthentication` when the
+        bridge reports a successful verification. If the bridge returns
+        a raw result dict, it is converted into the typed dataclass.
+        """
+        from scp_sdk.auth import ScpIdAuthentication
+
+        raw = await asyncio.to_thread(self._native.scpid_verify, response_json, challenge_json)
+        if isinstance(raw, str):
+            import json as _json
+
+            data = _json.loads(raw)
+            return ScpIdAuthentication(
+                did=data["did"],
+                signing_key_id=data["signing_key_id"],
+                signed_at=data["signed_at"],
+            )
+        if isinstance(raw, dict):
+            return ScpIdAuthentication(
+                did=raw["did"],
+                signing_key_id=raw["signing_key_id"],
+                signed_at=raw["signed_at"],
+            )
+        return raw
 
     # endregion SCPID
 
@@ -1119,10 +1441,29 @@ class SCP:
         input: dict[str, Any],
         invoker_did: str,
         ucan_token: str,
-        chain_depth: int,
+        chain_depth: int = 0,
         proof_tokens: list[str] | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_invoke_cross_context``."""
+        """Delegate to ``_scp_core.SCP.tool_invoke_cross_context``.
+
+        Validates ``chain_depth`` is an integer in the closed range
+        ``0..255`` (u8 on the bridge side). Rejects ``bool`` (Python's
+        ``bool`` passes ``isinstance(..., int)``) and floats, matching the
+        pre-Phase-4 validation the free function performed before
+        crossing FFI.
+        """
+        from scp_sdk.errors import ValidationError
+
+        if (
+            isinstance(chain_depth, bool)
+            or not isinstance(chain_depth, int)
+            or chain_depth < 0
+            or chain_depth > 255
+        ):
+            raise ValidationError(
+                f"chain_depth must be an integer in range 0-255, got {chain_depth!r}",
+                code="SCP-VALID-7002",
+            )
         return await asyncio.to_thread(
             self._native.tool_invoke_cross_context,
             source_context_id,
@@ -1146,7 +1487,22 @@ class SCP:
     async def tool_session_create(
         self, context_id: str, tool_id: str, source_context_id: str, ttl_seconds: int | None = None
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.tool_session_create``."""
+        """Delegate to ``_scp_core.SCP.tool_session_create``.
+
+        Validates ``ttl_seconds`` is a non-negative integer or ``None``.
+        Rejects ``bool`` (which passes ``isinstance(..., int)``) and
+        floats, matching the pre-Phase-4 validation the free function
+        performed before crossing FFI.
+        """
+        from scp_sdk.errors import ValidationError
+
+        if ttl_seconds is not None and (
+            isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int) or ttl_seconds < 0
+        ):
+            raise ValidationError(
+                f"ttl_seconds must be a non-negative integer or None, got {ttl_seconds!r}",
+                code="SCP-VALID-7002",
+            )
         return await asyncio.to_thread(
             self._native.tool_session_create, context_id, tool_id, source_context_id, ttl_seconds
         )
@@ -1344,24 +1700,36 @@ class SCP:
     # region Server
 
     async def node_start_in_memory(self, identity_did: str | None = None) -> Any:
-        """Delegate to ``_scp_core.SCP.node_start_in_memory``."""
-        return await asyncio.to_thread(self._native.node_start_in_memory, identity_did)
+        """Delegate to ``_scp_core.SCP.node_start_in_memory`` (returns :class:`Node`)."""
+        from scp_sdk.server import Node
+
+        raw = await asyncio.to_thread(self._native.node_start_in_memory, identity_did)
+        return Node(raw)
 
     async def node_start_local(
         self, data_dir: str, identity_did: str | None = None, passphrase: str | None = None
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.node_start_local``."""
-        return await asyncio.to_thread(
+        """Delegate to ``_scp_core.SCP.node_start_local`` (returns :class:`Node`)."""
+        from scp_sdk.server import Node
+
+        raw = await asyncio.to_thread(
             self._native.node_start_local, data_dir, identity_did, passphrase
         )
+        return Node(raw)
 
     async def relay_start_in_memory(self) -> Any:
-        """Delegate to ``_scp_core.SCP.relay_start_in_memory``."""
-        return await asyncio.to_thread(self._native.relay_start_in_memory)
+        """Delegate to ``_scp_core.SCP.relay_start_in_memory`` (returns :class:`Relay`)."""
+        from scp_sdk.server import Relay
+
+        raw = await asyncio.to_thread(self._native.relay_start_in_memory)
+        return Relay(raw)
 
     async def relay_start_local(self, data_dir: str) -> Any:
-        """Delegate to ``_scp_core.SCP.relay_start_local``."""
-        return await asyncio.to_thread(self._native.relay_start_local, data_dir)
+        """Delegate to ``_scp_core.SCP.relay_start_local`` (returns :class:`Relay`)."""
+        from scp_sdk.server import Relay
+
+        raw = await asyncio.to_thread(self._native.relay_start_local, data_dir)
+        return Relay(raw)
 
     # endregion Server
 

@@ -1,25 +1,21 @@
-"""Transport configuration and relay connection helpers for the SCP Python SDK.
+"""Transport configuration data types for the SCP Python SDK.
 
-Provides :class:`TransportConfig` for configuring relay connections and
-helper functions for connecting to and querying SCP relays.  Wraps the
-:class:`scp_sdk.SCP` methods ``transport_connect`` and ``transport_status``
-(see ADR-013 S5).
+Phase 4 PR 5 Agent B+C (#1549) collapsed the transport helpers into
+methods on :class:`scp_sdk.SCP`. :func:`connect_relay` is replaced by
+:meth:`scp_sdk.SCP.transport_connect`;
+:func:`transport_status` is replaced by
+:meth:`scp_sdk.SCP.transport_status`.
 
-See ``.docs/adrs/phase-3.md`` ADR-014 and ``.docs/standards/python.md``
-for conventions.
+The two remaining exports are pure data classes.
+
+See ``.docs/adrs/phase-3.md`` ADR-014 and ADR-048 (the SCP multi-instance
+façade consolidation).
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-from scp_sdk.errors import TransportError
-
-if TYPE_CHECKING:
-    from scp_sdk.scp import SCP
 
 logger = logging.getLogger("scp_sdk")
 
@@ -51,15 +47,12 @@ class TransportStatus:
 class TransportConfig:
     """Configuration for an SCP transport relay connection.
 
-    Provides typed configuration and convenience methods for connecting
-    to an SCP relay.
-
     Example::
 
         scp = SCP()
         config = TransportConfig(relay_url="wss://relay.example.com")
-        await config.connect(scp)
-        status = await config.status(scp)
+        await scp.transport_connect(config.relay_url)
+        status = await scp.transport_status()
         print(status.connected)  # True
     """
 
@@ -71,54 +64,6 @@ class TransportConfig:
 
     #: Maximum number of reconnection attempts on failure.
     max_retries: int = 3
-
-    async def connect(self, scp: SCP) -> None:
-        """Connect to the configured relay.
-
-        Establishes a transport connection to :attr:`relay_url`.
-
-        Args:
-            scp: The :class:`scp_sdk.SCP` instance whose transport is
-                being configured.
-
-        Raises:
-            TransportError: If the connection fails.
-        """
-        logger.debug("Connecting to relay %s", self.relay_url)
-        try:
-            await asyncio.to_thread(scp._native.transport_connect, self.relay_url)
-        except Exception as exc:  # propagate PyO3 transport errors
-            raise TransportError(
-                f"transport_connect({self.relay_url}) failed: {exc}",
-                code="SCP-TRANS-5001",
-            ) from exc
-        logger.info("Connected to relay %s", self.relay_url)
-
-    async def status(self, scp: SCP) -> TransportStatus:
-        """Query the current transport connection status.
-
-        Args:
-            scp: The :class:`scp_sdk.SCP` instance whose transport is
-                being queried.
-
-        Returns:
-            A :class:`TransportStatus` with connection state, relay URL,
-            and latency.
-
-        Raises:
-            TransportError: If querying transport status fails.
-        """
-        raw = await asyncio.to_thread(scp._native.transport_status)
-        return TransportStatus(
-            connected=raw.connected,
-            relay_url=raw.relay_url,
-            latency_ms=raw.latency_ms,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Module-level convenience functions
-# ---------------------------------------------------------------------------
 
 
 __all__ = [

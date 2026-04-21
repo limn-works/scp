@@ -7,19 +7,23 @@ and shared enums for building agents and applications on top of SCP.
 Usage::
 
     import scp_sdk
-    from scp_sdk import SCP, Identity, Context, ToolDefinition
+    from scp_sdk import SCP
+    from scp_sdk.types import CustodyType
 
     # Caller-owned instance — every operation routes through scp.*
     with SCP() as scp:
-        identity = await scp.identity_create("in_memory")
+        identity = await scp.identity_create(CustodyType.IN_MEMORY)
 
 See ``.docs/adrs/phase-3.md`` ADR-014 and ADR-048 for the full SDK design.
 
-Phase 4 PR 5 (#1549) collapsed the module-level free-function façade onto
-:class:`SCP` methods. Every call that previously took ``scp: SCP`` as the
-first positional argument is now a method on the :class:`SCP` instance
-(``await scp.foo(...)``). Pure helpers that take no ``SCP`` (data-only
-validators, enum utilities, address parsers) remain at module scope.
+Phase 4 PR 5 (#1549) collapsed the module-level namespace classes onto
+:class:`SCP` methods. :class:`Identity`, :class:`Context`,
+:class:`Relay`, :class:`Node`, :class:`McpServer`, :class:`McpClient`,
+and :class:`UcanToken` are now pure handle / data wrappers. Every
+operation that previously lived as a namespace static or instance method
+is a method on the :class:`SCP` instance — pass ``obj._raw_handle`` (or
+the handle-holding wrapper directly) where the bridge expects an opaque
+handle.
 """
 
 from __future__ import annotations
@@ -78,7 +82,7 @@ from scp_sdk.errors import (
     UcanPermissionError,
     ValidationError,
 )
-from scp_sdk.event_log import Checkpoint, Event, EventLog, Proof
+from scp_sdk.event_log import Checkpoint, Event, Proof, SignedCheckpoint
 from scp_sdk.governance import GovernanceActionResult
 from scp_sdk.identity import DIDDocument, Identity, IdentityAttestation, RevocationStatus
 from scp_sdk.mcp import (
@@ -193,7 +197,6 @@ __all__ = [
     "DiscoveryMethod",
     "Endorsement",
     "Event",
-    "EventLog",
     "GovernanceActionResult",
     "Identity",
     "IdentityAttestation",
@@ -224,6 +227,7 @@ __all__ = [
     "ScpIdChallenge",
     "ScpIdResponse",
     "ShadowStatus",
+    "SignedCheckpoint",
     "SiteConfig",
     "SourceType",
     "TestVector",
