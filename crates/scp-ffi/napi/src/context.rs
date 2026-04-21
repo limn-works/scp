@@ -19,7 +19,6 @@ use scp_core::context::{ContextHandle, ContextState};
 use scp_identity::DID;
 use scp_primitives::Clock;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::traits::KeyCustody;
@@ -454,7 +453,15 @@ pub async fn context_create(
         .as_ref()
         .map(|id| id.active_signing_key);
 
-    let context_id = format!("ctx-{}", Uuid::new_v4());
+    // Spec §18.4.1: context IDs MUST be 64-char lowercase hex so they
+    // embed in `scp://context/<context_id_hex>` URIs. Mirrors PyO3's
+    // `generate_context_id` in `crates/scp-ffi/src/types.rs`.
+    let context_id = {
+        use rand::Rng;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill(&mut bytes);
+        hex::encode(bytes)
+    };
     let creator_did = identity.inner.did.clone();
 
     // Parse consequence_rules from params (ADR-017, #1531). Accepts either a
@@ -4172,7 +4179,7 @@ mod tests {
     async fn context_create_threads_consequence_rules_and_config() {
         crate::runtime::init_context_manager_for_test();
 
-        let identity = crate::identity::identity_create("in_memory".to_owned())
+        let identity = crate::identity::identity_create("in_memory".to_owned(), None)
             .await
             .expect("identity_create should succeed");
 
@@ -4226,7 +4233,7 @@ mod tests {
     async fn context_create_rejects_revoke_access_when_config_disallows() {
         crate::runtime::init_context_manager_for_test();
 
-        let identity = crate::identity::identity_create("in_memory".to_owned())
+        let identity = crate::identity::identity_create("in_memory".to_owned(), None)
             .await
             .expect("identity_create should succeed");
 
@@ -4263,7 +4270,7 @@ mod tests {
     async fn context_join_rejects_malformed_spending_ucan_jwt() {
         crate::runtime::init_context_manager_for_test();
 
-        let identity = crate::identity::identity_create("in_memory".to_owned())
+        let identity = crate::identity::identity_create("in_memory".to_owned(), None)
             .await
             .expect("identity_create should succeed");
 
@@ -4302,7 +4309,7 @@ mod tests {
     async fn context_join_accepts_none_spending_ucan_jwt() {
         crate::runtime::init_context_manager_for_test();
 
-        let identity = crate::identity::identity_create("in_memory".to_owned())
+        let identity = crate::identity::identity_create("in_memory".to_owned(), None)
             .await
             .expect("identity_create should succeed");
 

@@ -129,23 +129,46 @@ pub fn scpid_challenge(audience: String, ttl_seconds: u32) -> Result<String, JsE
 /// the canonical hash per §3.11.3, signs it with Ed25519, and returns
 /// the SCPID response as a JSON string.
 ///
+/// The optional `signed_at_override` parameter substitutes the Unix
+/// millisecond timestamp used for `signed_at` in the canonical hash.
+/// It is only accepted when this crate is built with the `testing`
+/// feature (cross-bridge parity harness, ADR-046); production WASM
+/// bundles reject any non-`undefined` value.
+///
 /// # Errors
 ///
 /// Returns `JsError` if `signing_key_id` is invalid, the challenge JSON
 /// is malformed, the challenge has expired, the DID is not registered,
-/// or the signing operation fails.
+/// `signed_at_override` is supplied on a non-testing build or outside
+/// the challenge window, or the signing operation fails.
 ///
 /// # JS usage
 ///
 /// ```js
 /// const responseJson = scpid_sign(did, "#active", challengeJson);
+/// // Testing harness only:
+/// const pinned = scpid_sign(did, "#active", challengeJson, 1_700_000_000_000n);
 /// ```
 #[wasm_bindgen]
+#[allow(clippy::too_many_lines)] // linear validation/signing body; factoring helpers
+// would just move the same control flow behind indirection.
 pub fn scpid_sign(
     did: String,
     signing_key_id: String,
     challenge_json: String,
+    signed_at_override: Option<u64>,
 ) -> Result<String, JsError> {
+    // Reject `signed_at_override` on non-testing builds.
+    #[cfg(not(feature = "testing"))]
+    if signed_at_override.is_some() {
+        return Err(ScpWasmError::Validation {
+            message: "signed_at_override requires the `testing` feature — not available \
+                      in production WASM builds"
+                .to_owned(),
+            code: codes::VALID_7007.to_owned(),
+        }
+        .into_js());
+    }
     // Validate signing_key_id.
     let (key_fragment, key_id) = match signing_key_id.as_str() {
         "#active" => ("#active", SigningKeyId::Active),
@@ -182,7 +205,8 @@ pub fn scpid_sign(
         .into_js());
     }
 
-    // Check challenge expiry.
+    // Check challenge expiry against wall-clock time — the override
+    // cannot bypass expiry. Matches scp-runtime's scpid_sign.
     let now_ms = crate::time::now_ms_u64();
     if now_ms > challenge.expires_at {
         return Err(ScpWasmError::Identity {
@@ -201,7 +225,24 @@ pub fn scpid_sign(
         .into_js());
     }
 
-    let signed_at = now_ms;
+    // Resolve `signed_at`: use the override when supplied (testing), else
+    // the current wall-clock time. Override must lie inside the challenge
+    // window so the resulting response is acceptable to a relying party.
+    let signed_at = if let Some(override_ms) = signed_at_override {
+        if override_ms < challenge.issued_at || override_ms > challenge.expires_at {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "signed_at_override {override_ms} outside challenge window [{}, {}]",
+                    challenge.issued_at, challenge.expires_at
+                ),
+                code: codes::VALID_7007.to_owned(),
+            }
+            .into_js());
+        }
+        override_ms
+    } else {
+        now_ms
+    };
 
     // Build canonical hash (§3.11.3) using scp-protocol's canonical_hash.
     let hash = canonical_hash(

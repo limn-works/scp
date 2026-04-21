@@ -280,7 +280,15 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
         // silently ignores (spec §13.4).
         validate_min_protocol_version(&params).map_err(ScpWasmError::into_js)?;
 
-        let context_id = format!("ctx-{}", uuid::Uuid::new_v4().as_hyphenated());
+        // Spec §18.4.1: context IDs MUST be 64-char lowercase hex so they
+        // embed in `scp://context/<context_id_hex>` URIs. Mirrors PyO3's
+        // `generate_context_id` in `crates/scp-ffi/src/types.rs`.
+        let context_id = {
+            use rand_core::RngCore;
+            let mut bytes = [0u8; 32];
+            rand_core::OsRng.fill_bytes(&mut bytes);
+            hex::encode(bytes)
+        };
 
         with_manager(|mgr| mgr.create_context(&context_id, &identity_did, &params))
             .map_err(ScpWasmError::into_js)?;

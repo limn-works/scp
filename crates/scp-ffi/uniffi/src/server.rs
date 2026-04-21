@@ -855,7 +855,7 @@ mod tests {
         use crate::bridge::identity_create;
 
         let identity = rt()
-            .block_on(identity_create("in_memory".to_owned()))
+            .block_on(identity_create("in_memory".to_owned(), None))
             .unwrap();
         let expected_did = identity.did();
 
@@ -882,7 +882,7 @@ mod tests {
         use crate::bridge::identity_create;
 
         let identity = rt()
-            .block_on(identity_create("in_memory".to_owned()))
+            .block_on(identity_create("in_memory".to_owned(), None))
             .unwrap();
         let expected_did = identity.did();
 

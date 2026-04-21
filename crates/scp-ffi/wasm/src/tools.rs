@@ -407,7 +407,8 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
         // dropping entries (aligned with NAPI bridge SCP-VALID-7037).
         let test_vectors = validate_test_vectors(&def).map_err(ScpWasmError::into_js)?;
 
-        let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
+        // Shared with every other bridge via `scp_ffi_common::tool_id`.
+        let tool_id = scp_ffi_common::tool_id::generate_tool_id(&name);
 
         let (implementation_hash, signature, cost, registered_at) = parse_provenance_fields(&def)?;
 
@@ -508,10 +509,15 @@ pub fn tool_invoke(
         match ucan_token {
             Some(ref token) if !token.is_empty() => {
                 crate::ucan::validate_tool_ucan_wasm(&context_id, &tool_id, token, &identity_did)
-                    .map_err(|e| {
+                    .map_err(|(msg, code)| {
+                    // Prefer the UCAN-consolidation code (parse/capability
+                    // classification from the helper); fall back to the
+                    // generic `PERM_3000` tool-authorization code for
+                    // non-parse failures (validation pipeline, state
+                    // lookup) that don't carry a `UcanError`.
                     ScpWasmError::Permission {
-                        message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
-                        code: codes::PERM_3000.to_owned(),
+                        message: format!("UCAN authorization failed for tool '{tool_id}': {msg}"),
+                        code: code.unwrap_or(codes::PERM_3000).to_owned(),
                     }
                     .into_js()
                 })?;
@@ -618,12 +624,15 @@ pub fn tool_invoke_cross_context(
             .into());
         }
         crate::ucan::validate_tool_ucan_wasm(&target_id, &tool_id, &ucan_token, &invoker_did)
-            .map_err(|e| {
+            .map_err(|(msg, code)| {
+                // Prefer the UCAN-consolidation code; fall back to the
+                // generic `PERM_3000` tool-authorization code for
+                // non-parse failures.
                 ScpWasmError::Permission {
                     message: format!(
-                        "UCAN authorization failed for cross-context tool '{tool_id}': {e}"
+                        "UCAN authorization failed for cross-context tool '{tool_id}': {msg}"
                     ),
-                    code: codes::PERM_3000.to_owned(),
+                    code: code.unwrap_or(codes::PERM_3000).to_owned(),
                 }
                 .into_js()
             })?;
@@ -731,10 +740,13 @@ pub fn tool_session_invoke(
             &ucan_token,
             &invoker_did,
         )
-        .map_err(|e| {
+        .map_err(|(msg, code)| {
+            // Prefer the UCAN-consolidation code; fall back to the
+            // generic `PERM_3000` tool-authorization code for
+            // non-parse failures.
             ScpWasmError::Permission {
-                message: format!("UCAN authorization failed for tool '{tool_id_for_ucan}': {e}"),
-                code: codes::PERM_3000.to_owned(),
+                message: format!("UCAN authorization failed for tool '{tool_id_for_ucan}': {msg}"),
+                code: code.unwrap_or(codes::PERM_3000).to_owned(),
             }
             .into_js()
         })?;

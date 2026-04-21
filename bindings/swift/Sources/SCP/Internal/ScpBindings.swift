@@ -928,6 +928,17 @@ public protocol IdentityProtocol: AnyObject, Sendable {
      */
     func rotateKey() async throws  -> Identity
     
+    /**
+     * Returns the hex-encoded Ed25519 verifying-key bytes for the
+     * identity key (VM `#0`, the DID-deriving key), or `null` if this
+     * handle was loaded without live key material.
+     *
+     * Under a deterministic `seed`, this value is byte-identical across
+     * every bridge (ADR-046). See the `verifying_key_hex` field docs
+     * for why `#0` rather than `#active`.
+     */
+    func verifyingKey()  -> String?
+    
 }
 /**
  * Opaque handle to an SCP identity.
@@ -1210,6 +1221,22 @@ open func rotateKey()async throws  -> Identity  {
             liftFunc: FfiConverterTypeIdentity_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+    
+    /**
+     * Returns the hex-encoded Ed25519 verifying-key bytes for the
+     * identity key (VM `#0`, the DID-deriving key), or `null` if this
+     * handle was loaded without live key material.
+     *
+     * Under a deterministic `seed`, this value is byte-identical across
+     * every bridge (ADR-046). See the `verifying_key_hex` field docs
+     * for why `#0` rather than `#active`.
+     */
+open func verifyingKey() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_identity_verifying_key(self.uniffiClonePointer(),$0
+    )
+})
 }
     
 
@@ -9223,6 +9250,30 @@ fileprivate struct FfiConverterOptionTypeIdentity: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeTransportManager: FfiConverterRustBuffer {
+    typealias SwiftType = TransportManager?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeTransportManager.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeTransportManager.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeDataProvenance: FfiConverterRustBuffer {
     typealias SwiftType = DataProvenance?
 
@@ -11295,36 +11346,17 @@ public func identityAttestDevice(identity: Identity)async throws  -> String  {
  * on mobile devices — use `"platform"` (Secure Enclave / Android Keystore)
  * in production. See GitHub issue #88 and ADR-006.
  */
-public func identityCreate(custody: String)async throws  -> Identity  {
+public func identityCreate(custody: String, seed: Data?)async throws  -> Identity  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_identity_create(FfiConverterString.lower(custody)
+                uniffi_scp_ffi_uniffi_fn_func_identity_create(FfiConverterString.lower(custody),FfiConverterOptionData.lower(seed)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
             liftFunc: FfiConverterTypeIdentity_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Creates an identity link attestation for an external platform identity.
- *
- * See spec §3.5.1, §3.5.2.
- */
-public func identityCreateLinkAttestation(identity: Identity, platform: String, handle: String, proof: String, verificationMethod: String, platformId: String?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_identity_create_link_attestation(FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(platform),FfiConverterString.lower(handle),FfiConverterString.lower(proof),FfiConverterString.lower(verificationMethod),FfiConverterOptionString.lower(platformId)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -11512,22 +11544,6 @@ public func identityMigrate(identity: Identity)async throws  -> Identity  {
             liftFunc: FfiConverterTypeIdentity_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
-}
-/**
- * Removes an identity link attestation by its ID.
- *
- * Returns `true` if the attestation was found and removed, `false` if the
- * DID is not in the identity custody registry or the attestation was not found.
- *
- * See spec §3.5.1.
- */
-public func identityRemoveLinkAttestation(did: String, attestationId: String) -> Bool  {
-    return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_scp_ffi_uniffi_fn_func_identity_remove_link_attestation(
-        FfiConverterString.lower(did),
-        FfiConverterString.lower(attestationId),$0
-    )
-})
 }
 /**
  * Resolves a DID to its document.
@@ -12690,34 +12706,6 @@ public func scpidChallenge(audience: String, ttlSeconds: UInt64)throws  -> Strin
 })
 }
 /**
- * Signs an SCPID challenge with the identity's key (§3.11.3).
- *
- * Selects the appropriate signing key (`#active` or `#agent`) from the
- * identity handle, and produces a signed SCPID response as a JSON string.
- *
- * # Arguments
- *
- * * `identity` — The identity handle (from `identity_create`).
- * * `signing_key_id` — `"#active"` or `"#agent"`.
- * * `challenge_json` — JSON string of the challenge (from [`scpid_challenge`]).
- *
- * # Errors
- *
- * Returns `ScpError::Validation` if `signing_key_id` is invalid or the
- * challenge JSON is malformed.
- * Returns `ScpError::Identity` if the identity has no agent key when
- * `#agent` is requested, or if signing fails.
- */
-public func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_scpid_sign(
-        FfiConverterTypeIdentity_lower(identity),
-        FfiConverterString.lower(signingKeyId),
-        FfiConverterString.lower(challengeJson),$0
-    )
-})
-}
-/**
  * Verifies a signed SCPID response against the original challenge (§3.11.4).
  *
  * Resolves the signer's DID document via the global production DID resolver
@@ -13257,18 +13245,26 @@ public func transportDisconnect(manager: TransportManager)async throws   {
 /**
  * Returns the current transport connection status.
  *
- * Reflects actual connection state: `connected` is `true` only if the
- * underlying relay adapter is still held by the manager.
+ * When `manager` is provided, reflects the actual connection state of that
+ * handle: `connected` is `true` only if the underlying relay adapter is
+ * still held by the manager.
+ *
+ * When `manager` is `None`, returns a stateless snapshot derived from the
+ * process-wide `BridgeInstance` transport state. This mirrors the `PyO3` /
+ * WASM bridges, which expose a handleless probe: callers can observe the
+ * default disconnected shape (`connected: false`, `relay_url: None`,
+ * `latency_ms: None`) before ever calling `transport_connect`, without
+ * needing to construct a `TransportManager` handle.
  *
  * # Errors
  *
  * Returns `ScpError::Transport` if querying the transport status fails.
  */
-public func transportStatus(manager: TransportManager)async throws  -> TransportStatus  {
+public func transportStatus(manager: TransportManager?)async throws  -> TransportStatus  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_transport_status(FfiConverterTypeTransportManager_lower(manager)
+                uniffi_scp_ffi_uniffi_fn_func_transport_status(FfiConverterOptionTypeTransportManager.lower(manager)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -13788,10 +13784,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_attest_device() != 31559) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create() != 29652) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create_link_attestation() != 17272) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create() != 24164) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_create_with_agent_key() != 42821) {
@@ -13813,9 +13806,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_migrate() != 37096) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_remove_link_attestation() != 27338) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_resolve() != 4675) {
@@ -13992,9 +13982,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_scpid_challenge() != 19241) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scpid_sign() != 52365) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_scpid_verify() != 37844) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14052,7 +14039,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_transport_disconnect() != 43896) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_transport_status() != 49151) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_transport_status() != 14919) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_create_challenge() != 37813) {
@@ -14125,6 +14112,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_key() != 21897) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_verifying_key() != 19807) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_commit_deploy() != 10847) {

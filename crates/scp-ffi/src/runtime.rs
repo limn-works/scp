@@ -64,7 +64,9 @@ use scp_core::context::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::manager::{ContextManager, ContextPersistence};
-use scp_core::context::providers::ProtocolRepositoryContextBridge;
+use scp_core::context::providers::{
+    MerkleEventLogProvider, ProtocolRepositoryContextBridge, ProtocolRepositoryEventLogBridge,
+};
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
 use scp_core::crypto::ucan::nonce::NonceTracker;
@@ -944,7 +946,7 @@ pub fn init_context_manager(local_did: &str) {
     let cm_arc = build_context_manager(
         crypto,
         Box::new(NotConfiguredTransportProvider),
-        Box::new(NoOpEventLogProvider),
+        build_event_log_provider(),
         persistence,
     );
 
@@ -1019,7 +1021,7 @@ pub fn init_context_manager_for_test() {
     let cm_arc = build_context_manager(
         Box::new(NoOpCryptoProvider),
         Box::new(scp_core::context::LocalTransportProvider),
-        Box::new(NoOpEventLogProvider),
+        build_event_log_provider(),
         persistence,
     );
 
@@ -1131,6 +1133,37 @@ impl ContextPersistence for ArcContextPersistence {
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.list_persisted_contexts()
+    }
+}
+
+/// Constructs a persistent [`MerkleEventLogProvider`] backed by the global
+/// storage provider if initialized, or a non-persistent one otherwise.
+///
+/// Mirrors `scp-ffi-napi`'s `build_event_log_provider` (see
+/// `crates/scp-ffi/napi/src/runtime.rs`). The persistent provider writes event
+/// entries to encrypted in-memory storage via `ProtocolRepositoryEventLogBridge`,
+/// so `ContextCreated` (appended by `builder_create_context`) survives across
+/// manager calls and is visible to `py_event_log_query`.
+///
+/// This replaced `NoOpEventLogProvider` so that the `PyO3` bridge emits the
+/// same initial `ContextCreated` event as the NAPI, WASM, and `UniFFI`
+/// bridges (cross-bridge parity, ADR-046 `OP_EVENT_LOG_APPEND`).
+fn build_event_log_provider() -> Box<dyn ContextEventLogProvider> {
+    let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
+        return Box::new(MerkleEventLogProvider::new());
+    };
+    match bi.storage_provider() {
+        Some(StorageProvider::InMemoryEncrypted(storage)) => {
+            let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+            let bridge = ProtocolRepositoryEventLogBridge::new(protocol_repository);
+            Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+        }
+        Some(StorageProvider::Sqlite(storage)) => {
+            let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+            let bridge = ProtocolRepositoryEventLogBridge::new(protocol_repository);
+            Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+        }
+        None => Box::new(MerkleEventLogProvider::new()),
     }
 }
 

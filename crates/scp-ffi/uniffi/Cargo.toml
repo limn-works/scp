@@ -25,6 +25,10 @@ default = ["server"]
 allow_in_memory_custody = ["scp-platform/testing"]
 # Shared relay/node startup code. Pulls in scp-node and scp-platform/filesystem.
 server = ["scp-ffi-common/server", "dep:scp-node"]
+# Testing-only affordances (see scp-ffi/Cargo.toml for rationale). MUST NOT
+# be enabled in production mobile builds; the parity harness (ADR-046)
+# enables it.
+testing = ["scp-core/testing"]
 
 [dependencies]
 uniffi = { version = "0.29", features = ["tokio", "cli"] }

@@ -171,9 +171,17 @@ public enum ScpId {
     }
 
     /// Default sign function — delegates to UniFFI
-    /// ``scpidSign(identity:signingKeyId:challengeJson:)``.
+    /// ``scpidSign(identity:signingKeyId:challengeJson:signedAtOverride:)``.
+    /// The `signedAtOverride` argument is a testing-feature parity affordance
+    /// (ADR-046) rejected on production builds; the SDK wrapper always passes
+    /// `nil` so `signed_at` reflects the real wall clock.
     public static let defaultSign: SignFn = { identity, signingKeyId, challengeJson in
-        try scpidSign(identity: identity, signingKeyId: signingKeyId, challengeJson: challengeJson)
+        try scpidSign(
+            identity: identity,
+            signingKeyId: signingKeyId,
+            challengeJson: challengeJson,
+            signedAtOverride: nil
+        )
     }
 
     /// Default verify function — delegates to UniFFI

@@ -241,7 +241,7 @@ struct IdentityTests {
         let mockIdentity = MockIdentity(did: "did:dht:z6MkCreated", custodyType: "in_memory")
         var receivedCustody: String?
 
-        let mockCreate: IdentityBridge.CreateFn = { custody in
+        let mockCreate: IdentityBridge.CreateFn = { custody, _ in
             receivedCustody = custody
             return mockIdentity
         }
@@ -253,7 +253,7 @@ struct IdentityTests {
 
     @Test("createIdentity propagates bridge errors")
     func createIdentityPropagatesErrors() async throws {
-        let mockCreate: IdentityBridge.CreateFn = { _ in
+        let mockCreate: IdentityBridge.CreateFn = { _, _ in
             throw ScpError.Identity(
                 msg: "in_memory custody not available",
                 code: "SCP-IDENT-1008"

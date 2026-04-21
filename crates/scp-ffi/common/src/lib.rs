@@ -18,6 +18,8 @@
 
 pub mod bridge_state;
 pub mod error_codes;
+pub mod tool_id;
+pub mod ucan_errors;
 pub mod validate;
 
 mod bridge_id;

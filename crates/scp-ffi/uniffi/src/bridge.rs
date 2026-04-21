@@ -697,9 +697,13 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpError {
 
 impl From<scp_core::crypto::ucan::UcanError> for ScpError {
     fn from(e: scp_core::crypto::ucan::UcanError) -> Self {
+        // Canonical UCAN→error-code mapping — see `scp-ffi/src/error.rs`
+        // for the full rationale. All bridges route through the shared
+        // `scp_ffi_common::ucan_errors` module.
+        let code = scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned();
         Self::Permission {
             msg: format!("{e} — check token format, signatures, time bounds, and capability chain"),
-            code: codes::PERM_3001.to_owned(),
+            code,
         }
     }
 }
@@ -1400,6 +1404,16 @@ pub struct Identity {
     /// `None` for in-memory and external custody.
     #[allow(dead_code)]
     pub(crate) callback_custody: Option<Arc<CallbackKeyCustody>>,
+    /// Hex-encoded Ed25519 verifying-key bytes for the identity key
+    /// (VM `#0`, the key that derives the DID). 64 hex chars = 32 raw
+    /// bytes. `None` for externally loaded identities without live key
+    /// material.
+    ///
+    /// Uses `identity_key` (not `#active`) because the WASM bridge has a
+    /// simplified single-key model; exposing the identity key gives
+    /// byte-exact cross-bridge parity under a deterministic `seed`
+    /// (ADR-046).
+    pub(crate) verifying_key_hex: Option<String>,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
     /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
@@ -1435,6 +1449,18 @@ impl Identity {
             CustodyMethod::Software => "software".to_owned(),
             CustodyMethod::External => "external".to_owned(),
         }
+    }
+
+    /// Returns the hex-encoded Ed25519 verifying-key bytes for the
+    /// identity key (VM `#0`, the DID-deriving key), or `null` if this
+    /// handle was loaded without live key material.
+    ///
+    /// Under a deterministic `seed`, this value is byte-identical across
+    /// every bridge (ADR-046). See the `verifying_key_hex` field docs
+    /// for why `#0` rather than `#active`.
+    #[must_use]
+    pub fn verifying_key(&self) -> Option<String> {
+        self.verifying_key_hex.clone()
     }
 
     /// Rotates the active signing key for this identity (async).
@@ -1476,6 +1502,12 @@ impl Identity {
                 .await
                 .map_err(ScpError::from)?;
 
+            let verifying_key_hex = callback
+                .public_key(&new_identity.identity_key)
+                .await
+                .ok()
+                .map(|pk| hex::encode(pk.as_bytes()));
+
             let handle = Arc::new(Self {
                 did: new_identity.did.clone(),
                 custody_type: self.custody_type.clone(),
@@ -1484,6 +1516,7 @@ impl Identity {
                 #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody: None,
                 callback_custody: self.callback_custody.clone(),
+                verifying_key_hex,
                 instance_id: self.instance_id,
             });
             increment_handle_count();
@@ -1498,6 +1531,13 @@ impl Identity {
                 .await
                 .map_err(ScpError::from)?;
 
+            let verifying_key_hex = custody
+                .0
+                .public_key(&new_identity.identity_key)
+                .await
+                .ok()
+                .map(|pk| hex::encode(pk.as_bytes()));
+
             let handle = Arc::new(Self {
                 did: new_identity.did.clone(),
                 custody_type: CustodyMethod::InMemory,
@@ -1505,6 +1545,7 @@ impl Identity {
                 core_document: Some(new_document),
                 in_memory_custody: self.in_memory_custody.clone(),
                 callback_custody: None,
+                verifying_key_hex,
                 instance_id: self.instance_id,
             });
             increment_handle_count();
@@ -1635,6 +1676,13 @@ impl Identity {
                         .await
                         .map_err(ScpError::from)?;
 
+                    let verifying_key_hex = custody
+                        .0
+                        .public_key(&updated_identity.identity_key)
+                        .await
+                        .ok()
+                        .map(|pk| hex::encode(pk.as_bytes()));
+
                     let handle = Arc::new(Self {
                         did,
                         custody_type,
@@ -1642,6 +1690,7 @@ impl Identity {
                         core_document: Some(updated_doc),
                         in_memory_custody,
                         callback_custody: None,
+                        verifying_key_hex,
                         instance_id,
                     });
                     increment_handle_count();
@@ -1721,12 +1770,20 @@ impl Identity {
             let instance_id = self.instance_id;
             let dht = make_dht_with_signer(custody)?;
 
+            let custody_for_key = custody.clone();
             runtime()
                 .spawn(async move {
                     let (updated_identity, updated_doc) = dht
                         .remove_agent_key(&identity_clone, &doc_clone)
                         .await
                         .map_err(ScpError::from)?;
+
+                    let verifying_key_hex = custody_for_key
+                        .0
+                        .public_key(&updated_identity.identity_key)
+                        .await
+                        .ok()
+                        .map(|pk| hex::encode(pk.as_bytes()));
 
                     let handle = Arc::new(Self {
                         did,
@@ -1735,6 +1792,7 @@ impl Identity {
                         core_document: Some(updated_doc),
                         in_memory_custody,
                         callback_custody: None,
+                        verifying_key_hex,
                         instance_id,
                     });
                     increment_handle_count();
@@ -1819,6 +1877,13 @@ impl Identity {
                         .await
                         .map_err(ScpError::from)?;
 
+                    let verifying_key_hex = custody
+                        .0
+                        .public_key(&updated_identity.identity_key)
+                        .await
+                        .ok()
+                        .map(|pk| hex::encode(pk.as_bytes()));
+
                     let handle = Arc::new(Self {
                         did,
                         custody_type,
@@ -1826,6 +1891,7 @@ impl Identity {
                         core_document: Some(updated_doc),
                         in_memory_custody,
                         callback_custody: None,
+                        verifying_key_hex,
                         instance_id,
                     });
                     increment_handle_count();
@@ -2422,8 +2488,23 @@ fn ensure_did_resolver_initialized(handle: tokio::runtime::Handle) -> Result<(),
 /// on mobile devices — use `"platform"` (Secure Enclave / Android Keystore)
 /// in production. See GitHub issue #88 and ADR-006.
 #[uniffi::export]
-pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError> {
+pub async fn identity_create(
+    custody: String,
+    seed: Option<Vec<u8>>,
+) -> Result<Arc<Identity>, ScpError> {
     let custody_method = parse_custody_method(&custody)?;
+
+    // Validate the optional 32-byte seed at the FFI boundary. A seed is
+    // only meaningful for the in_memory custody path (ADR-046).
+    let seed_bytes: Option<[u8; 32]> = match seed.as_deref() {
+        None => None,
+        Some(bytes) => Some(
+            <[u8; 32]>::try_from(bytes).map_err(|_| ScpError::Validation {
+                msg: format!("seed must be exactly 32 bytes, got {}", bytes.len()),
+                code: codes::VALID_7007.to_owned(),
+            })?,
+        ),
+    };
 
     runtime()
         .spawn(async move {
@@ -2434,6 +2515,7 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                     // mobile builds MUST NOT enable this feature. See #88.
                     #[cfg(not(feature = "allow_in_memory_custody"))]
                     {
+                        let _ = seed_bytes; // silence unused warning when feature-gated out
                         Err(ScpError::Identity {
                             msg: "\"in_memory\" custody is not available in this build \
                                       — enable the \"allow_in_memory_custody\" feature for \
@@ -2456,11 +2538,27 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                         // that are indices into `key_custody`'s internal store.
                         // Dropping `key_custody` destroys all private key material
                         // and renders those handles dangling.
-                        let key_custody =
-                            Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+                        //
+                        // When `seed` is supplied, the custody is backed by a
+                        // deterministic RNG (`StdRng::from_seed`), making
+                        // subsequent `generate_keypair` calls produce byte-
+                        // identical Ed25519 keys across bridges.
+                        let in_memory = seed_bytes.map_or_else(
+                            InMemoryKeyCustody::new,
+                            InMemoryKeyCustody::from_seed_bytes,
+                        );
+                        let key_custody = Arc::new(OpaqueInMemoryKeyCustody(in_memory));
                         let dht = DidDht::new();
                         let (identity, document) =
                             dht.create(&key_custody.0).await.map_err(ScpError::from)?;
+
+                        // Snapshot the #active verifying-key bytes for parity.
+                        let verifying_key_hex = key_custody
+                            .0
+                            .public_key(&identity.identity_key)
+                            .await
+                            .ok()
+                            .map(|pk| hex::encode(pk.as_bytes()));
 
                         // Initialize the production DID resolver for UCAN
                         // validation (H4 — matching PyO3/NAPI behavior).
@@ -2474,6 +2572,7 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                             core_document: Some(document),
                             in_memory_custody: Some(key_custody),
                             callback_custody: None,
+                            verifying_key_hex,
                             instance_id: crate::runtime::default_instance_id()?,
                         });
                         increment_handle_count();
@@ -2481,6 +2580,13 @@ pub async fn identity_create(custody: String) -> Result<Arc<Identity>, ScpError>
                     }
                 }
                 CustodyMethod::Platform | CustodyMethod::Software => {
+                    if seed_bytes.is_some() {
+                        return Err(ScpError::Validation {
+                            msg: "`seed` parameter is only valid for custody=\"in_memory\""
+                                .to_owned(),
+                            code: codes::VALID_7007.to_owned(),
+                        });
+                    }
                     // Platform and software custody require a wired
                     // KeyCustodyProvider (ADR-006 platform abstraction).
                     // Use `identity_create_with_custody` to inject a
@@ -2552,6 +2658,12 @@ pub async fn identity_create_with_custody(
                 .await
                 .map_err(ScpError::from)?;
 
+            let verifying_key_hex = callback_custody
+                .public_key(&identity.identity_key)
+                .await
+                .ok()
+                .map(|pk| hex::encode(pk.as_bytes()));
+
             // Ensure BridgeInstance exists so init_did_resolver can store the
             // resolver. This matches the PyO3/NAPI identity_create pattern.
             crate::runtime::ensure_bridge_instance();
@@ -2566,6 +2678,7 @@ pub async fn identity_create_with_custody(
                 #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody: None,
                 callback_custody: Some(callback_custody),
+                verifying_key_hex,
                 instance_id: crate::runtime::default_instance_id()?,
             });
             increment_handle_count();
@@ -2614,6 +2727,10 @@ pub async fn identity_load(did: String) -> Result<Arc<Identity>, ScpError> {
                 #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody: None,
                 callback_custody: None,
+                // External DIDs loaded by string have no live key material —
+                // parity-test consumers only need `verifying_key` for
+                // locally-created identities.
+                verifying_key_hex: None,
                 instance_id: crate::runtime::default_instance_id()?,
             });
             increment_handle_count();
@@ -3164,7 +3281,15 @@ pub async fn context_create(
         .spawn(async move {
             validate_did(&identity.did)?;
 
-            let context_id = format!("ctx-{}", Uuid::new_v4());
+            // Spec §18.4.1: context IDs MUST be 64-char lowercase hex so they
+            // embed in `scp://context/<context_id_hex>` URIs. Mirrors PyO3's
+            // `generate_context_id` in `crates/scp-ffi/src/types.rs`.
+            let context_id = {
+                use rand::Rng;
+                let mut bytes = [0u8; 32];
+                rand::thread_rng().fill(&mut bytes);
+                hex::encode(bytes)
+            };
 
             // Convert bridge ContextParams to scp-core ContextParams.
             let core_params = bridge_params_to_core(&params)?;
@@ -3977,7 +4102,8 @@ pub async fn tool_register(
                 })?,
             };
 
-            let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
+            // Shared with every other bridge via `scp_ffi_common::tool_id`.
+            let tool_id = scp_ffi_common::tool_id::generate_tool_id(&definition.name);
 
             let cost = definition.cost.map(|c| scp_core::context::tools::ToolCost {
                 amount: c.amount,
@@ -5154,16 +5280,40 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
 
 /// Returns the current transport connection status.
 ///
-/// Reflects actual connection state: `connected` is `true` only if the
-/// underlying relay adapter is still held by the manager.
+/// When `manager` is provided, reflects the actual connection state of that
+/// handle: `connected` is `true` only if the underlying relay adapter is
+/// still held by the manager.
+///
+/// When `manager` is `None`, returns a stateless snapshot derived from the
+/// process-wide `BridgeInstance` transport state. This mirrors the `PyO3` /
+/// WASM bridges, which expose a handleless probe: callers can observe the
+/// default disconnected shape (`connected: false`, `relay_url: None`,
+/// `latency_ms: None`) before ever calling `transport_connect`, without
+/// needing to construct a `TransportManager` handle.
 ///
 /// # Errors
 ///
 /// Returns `ScpError::Transport` if querying the transport status fails.
 #[uniffi::export]
-pub async fn transport_status(manager: Arc<TransportManager>) -> Result<TransportStatus, ScpError> {
-    crate::uniffi_check_handle!(manager);
-    Ok(manager.status())
+pub async fn transport_status(
+    manager: Option<Arc<TransportManager>>,
+) -> Result<TransportStatus, ScpError> {
+    if let Some(mgr) = manager {
+        crate::uniffi_check_handle!(mgr);
+        return Ok(mgr.status());
+    }
+    // Handleless probe — consult the BridgeInstance directly. If the
+    // bridge has not been initialized yet, or holds no transport, the
+    // result is the default disconnected snapshot. This never fails;
+    // callers use it to check state before connecting.
+    let connected = crate::runtime::bridge_instance()
+        .ok()
+        .is_some_and(|bi| bi.core.has_transport());
+    Ok(TransportStatus {
+        connected,
+        relay_url: None,
+        latency_ms: None,
+    })
 }
 
 /// Disconnects from the current SCP relay.
@@ -6639,36 +6789,27 @@ pub async fn ucan_validate(
                 DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
             };
 
-            // Step 1: Parse the UCAN token.
-            let parsed_token = parse_ucan(&token).map_err(|e| ScpError::Permission {
-                msg: format!("malformed UCAN token: {e}"),
-                code: codes::PERM_3002.to_owned(),
-            })?;
+            // Step 1: Parse the UCAN token. All UcanError results map to
+            // SCP-PERM-3001 via the canonical `From<UcanError> for ScpError`
+            // impl, matching PyO3 and NAPI so malformed-token diagnostics
+            // share a code across bridges.
+            let parsed_token = parse_ucan(&token).map_err(ScpError::from)?;
 
-            // Parse the required capability URI.
-            let required_cap: CapabilityUri =
-                capability
-                    .parse()
-                    .map_err(
-                        |e: scp_core::crypto::ucan::UcanError| ScpError::Permission {
-                            msg: format!("invalid capability URI '{capability}': {e}"),
-                            code: codes::PERM_3002.to_owned(),
-                        },
-                    )?;
+            // Parse the required capability URI. `UcanError::parse` failures
+            // flow through the same canonical mapping as token parse errors.
+            let required_cap: CapabilityUri = capability.parse().map_err(ScpError::from)?;
 
             // Determine the presenting agent DID: explicit parameter or token audience.
             let agent_did = presenting_agent_did
                 .as_deref()
                 .unwrap_or(&parsed_token.payload.aud);
 
-            // Build proof resolver from optional proof tokens.
+            // Build proof resolver from optional proof tokens. Malformed proof
+            // tokens surface the same SCP-PERM-3001 code (canonical UcanError).
             let mut proofs = std::collections::HashMap::new();
             if let Some(ref tokens) = proof_tokens {
                 for encoded in tokens {
-                    let proof_token = parse_ucan(encoded).map_err(|e| ScpError::Permission {
-                        msg: format!("malformed proof token: {e}"),
-                        code: codes::PERM_3002.to_owned(),
-                    })?;
+                    let proof_token = parse_ucan(encoded).map_err(ScpError::from)?;
                     let cid = scp_core::crypto::ucan::mint::compute_cid(&proof_token);
                     proofs.insert(cid, proof_token);
                 }
@@ -6708,12 +6849,7 @@ pub async fn ucan_validate(
                         clock: &scp_primitives::SystemClock,
                     };
 
-                    validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(|e| {
-                        ScpError::Permission {
-                            msg: format!("UCAN validation failed: {e}"),
-                            code: codes::PERM_3002.to_owned(),
-                        }
-                    })
+                    validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpError::from)
                 })
                 .ok_or_else(|| ScpError::Permission {
                     msg: format!("context '{}' not found in UCAN registry", handle.context_id),
@@ -7194,15 +7330,15 @@ pub async fn event_log_query(
     filter_json: Option<String>,
 ) -> Result<Vec<Event>, ScpError> {
     crate::uniffi_check_handle!(handle);
+    // Lifecycle gate — required by `uniffi_check_ready_coverage` test
+    // (see #1646). Every Category A/B export that touches
+    // `CoreFields` / `ContextManager` state must invoke one of the
+    // ready-check entry points. We resolve the default bridge instance
+    // up-front so a shut-down bridge fails fast before the manager
+    // lookup below.
+    let _bi = crate::runtime::default_bridge_instance()?;
     runtime()
         .spawn(async move {
-            // Ensure UCAN state (which contains the event log) is registered.
-            crate::runtime::ensure_ucan_registered(
-                &handle.context_id,
-                &handle.creator_did,
-                &handle.ceiling_strings,
-            );
-
             // Parse optional filter JSON.
             let filter: Option<serde_json::Value> = match filter_json {
                 Some(ref json_str) => {
@@ -7216,23 +7352,27 @@ pub async fn event_log_query(
                 None => None,
             };
 
+            // Accept both snake_case (existing UniFFI contract) and camelCase
+            // (cross-bridge parity harness sends from TypeScript) spellings for
+            // every filter field so the same filter surface works through every
+            // code path below. Mirrors NAPI (`event_log.rs`).
             let filter_event_type = filter
                 .as_ref()
-                .and_then(|f| f.get("event_type"))
-                .and_then(|v| v.as_str())
+                .and_then(|f| f.get("event_type").or_else(|| f.get("eventType")))
+                .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
             let filter_actor_did = filter
                 .as_ref()
-                .and_then(|f| f.get("actor_did"))
-                .and_then(|v| v.as_str())
+                .and_then(|f| f.get("actor_did").or_else(|| f.get("actorDid")))
+                .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
             let filter_after_seq = filter
                 .as_ref()
-                .and_then(|f| f.get("after_sequence"))
+                .and_then(|f| f.get("after_sequence").or_else(|| f.get("afterSequence")))
                 .and_then(serde_json::Value::as_u64);
             let filter_before_seq = filter
                 .as_ref()
-                .and_then(|f| f.get("before_sequence"))
+                .and_then(|f| f.get("before_sequence").or_else(|| f.get("beforeSequence")))
                 .and_then(serde_json::Value::as_u64);
             #[allow(clippy::cast_possible_truncation)]
             let filter_limit = filter
@@ -7240,6 +7380,80 @@ pub async fn event_log_query(
                 .and_then(|f| f.get("limit"))
                 .and_then(serde_json::Value::as_u64)
                 .map(|v| v as usize);
+
+            // Try the ContextManager's authoritative Merkle event log first —
+            // the lifecycle events (`ContextCreated`, `MemberJoined`, …) are
+            // appended there by `MerkleEventLogProvider`, NOT into the
+            // per-context UCAN state log. NAPI (`napi/src/event_log.rs`)
+            // solved the same fresh-context parity issue this way. Falls back
+            // to the UCAN state log below if the manager has no entries.
+            let context_id_str = handle.context_id.clone();
+            let ctx_id_bytes = scp_core::context::context_id_bytes(&context_id_str);
+            let manager_entries = crate::runtime::context_manager()
+                .ok()
+                .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten());
+
+            if let Some(entries) = manager_entries
+                && !entries.is_empty()
+            {
+                let mut results: Vec<Event> = Vec::new();
+                for (idx, entry) in entries.iter().enumerate() {
+                    let sequence = idx as u64;
+                    if let Some(after) = filter_after_seq
+                        && sequence <= after
+                    {
+                        continue;
+                    }
+                    if let Some(before) = filter_before_seq
+                        && sequence >= before
+                    {
+                        continue;
+                    }
+                    if let Some(ref et) = filter_event_type
+                        && entry.event != *et
+                    {
+                        continue;
+                    }
+                    // `EventLogEntry` does not carry an actor DID in the bridge
+                    // mapping (NAPI sets this to an empty string too); an
+                    // `actor_did` filter can only match the empty string.
+                    if let Some(ref actor) = filter_actor_did
+                        && !actor.is_empty()
+                    {
+                        continue;
+                    }
+
+                    let payload_json = serde_json::json!({
+                        "hash": hex::encode(entry.hash),
+                    })
+                    .to_string();
+
+                    results.push(Event {
+                        event_type: entry.event.clone(),
+                        actor_did: String::new(),
+                        timestamp: entry.timestamp,
+                        payload_json,
+                        sequence,
+                    });
+
+                    if let Some(lim) = filter_limit
+                        && results.len() >= lim
+                    {
+                        break;
+                    }
+                }
+
+                return Ok(results);
+            }
+
+            // Ensure UCAN state (which contains the event log) is registered
+            // for the fallback path that reads from the per-context UCAN
+            // state event log.
+            crate::runtime::ensure_ucan_registered(
+                &handle.context_id,
+                &handle.creator_did,
+                &handle.ceiling_strings,
+            );
 
             // Pre-compute timestamp for the fallback summary event outside the
             // closure so we can propagate clock errors properly.
@@ -11793,6 +12007,13 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
                             .await
                             .map_err(ScpError::from)?;
 
+                        let verifying_key_hex = key_custody
+                            .0
+                            .public_key(&identity.identity_key)
+                            .await
+                            .ok()
+                            .map(|pk| hex::encode(pk.as_bytes()));
+
                         // Initialize the production DID resolver for UCAN validation.
                         crate::runtime::ensure_bridge_instance();
                         ensure_did_resolver_initialized(tokio::runtime::Handle::current())?;
@@ -11804,6 +12025,7 @@ pub async fn identity_create_with_agent_key(custody: String) -> Result<Arc<Ident
                             core_document: Some(document),
                             in_memory_custody: Some(key_custody),
                             callback_custody: None,
+                            verifying_key_hex,
                             instance_id: crate::runtime::default_instance_id()?,
                         });
                         increment_handle_count();
@@ -11923,6 +12145,11 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
 
                 let new_did = new_identity.did.clone();
                 let has_agent = new_document.has_agent_key();
+                let verifying_key_hex =
+                    kc.0.public_key(&new_identity.identity_key)
+                        .await
+                        .ok()
+                        .map(|pk| hex::encode(pk.as_bytes()));
                 let handle = Arc::new(Identity {
                     did: new_identity.did.clone(),
                     custody_type,
@@ -11931,6 +12158,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     #[cfg(feature = "allow_in_memory_custody")]
                     in_memory_custody: custody_arc,
                     callback_custody,
+                    verifying_key_hex,
                     instance_id,
                 });
                 increment_handle_count();
@@ -11986,6 +12214,11 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     .map_err(ScpError::from)?;
 
                 let new_did = new_identity.did.clone();
+                let verifying_key_hex = cc
+                    .public_key(&new_identity.identity_key)
+                    .await
+                    .ok()
+                    .map(|pk| hex::encode(pk.as_bytes()));
                 let handle = Arc::new(Identity {
                     did: new_identity.did.clone(),
                     custody_type,
@@ -11994,6 +12227,7 @@ pub async fn identity_migrate(identity: Arc<Identity>) -> Result<Arc<Identity>, 
                     #[cfg(feature = "allow_in_memory_custody")]
                     in_memory_custody: None,
                     callback_custody: Some(Arc::clone(cc)),
+                    verifying_key_hex,
                     instance_id,
                 });
                 increment_handle_count();
@@ -12932,9 +13166,22 @@ pub fn scpid_sign(
     identity: Arc<Identity>,
     signing_key_id: String,
     challenge_json: String,
+    signed_at_override: Option<u64>,
 ) -> Result<String, ScpError> {
     crate::uniffi_check_handle!(identity);
     use scp_core::identity::scpid_sign as core_sign;
+
+    // Reject `signed_at_override` on non-testing builds: the override is a
+    // parity-harness affordance (ADR-046), not a production API.
+    #[cfg(not(feature = "testing"))]
+    if signed_at_override.is_some() {
+        return Err(ScpError::Validation {
+            msg:
+                "signed_at_override requires the scp-core `testing` feature — not available in production builds"
+                    .to_owned(),
+            code: codes::VALID_7007.to_owned(),
+        });
+    }
 
     let key_id = parse_scpid_signing_key_id(&signing_key_id)?;
 
@@ -12986,6 +13233,7 @@ pub fn scpid_sign(
         &identity.did,
         key_id,
         &challenge,
+        signed_at_override,
     ));
 
     let response = response.map_err(|e| ScpError::Identity {
@@ -13627,6 +13875,7 @@ mod tests {
             #[cfg(feature = "allow_in_memory_custody")]
             in_memory_custody: None,
             callback_custody: None,
+            verifying_key_hex: None,
             instance_id,
         })
     }
@@ -14496,6 +14745,7 @@ mod tests {
             &identity.did,
             scp_identity::SigningKeyId::Active,
             &challenge,
+            None,
         )
         .await
         .unwrap();

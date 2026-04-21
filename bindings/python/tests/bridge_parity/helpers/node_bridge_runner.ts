@@ -1,0 +1,915 @@
+#!/usr/bin/env bun
+/**
+ * Long-lived Bun JSON-RPC server for cross-bridge parity testing.
+ *
+ * Reads length-prefixed JSON requests on stdin, dispatches to either the
+ * NAPI bridge or the WASM bridge based on the `bridge_mode` field, and
+ * writes length-prefixed JSON responses on stdout.
+ *
+ * Wire format (HTTP-style):
+ *
+ *     Content-Length: N\r\n
+ *     \r\n
+ *     <N bytes of JSON>
+ *
+ * Request: `{id, op, args, bridge_mode}` where bridge_mode is "napi" or "wasm".
+ * Response: either `{id, ok: true, result: {...}}` on success
+ *           or `{id, ok: false, error: {type, code, message}}` on bridge error.
+ *
+ * Bridge selection is explicit — NO auto-fallback. If the requested bridge
+ * cannot be loaded, the response is an error. The harness surfaces this
+ * as a test failure, not a skip.
+ *
+ * Note: the field is named `bridge_mode` rather than `mode` to avoid a
+ * name collision with the DOM `RequestMode` type (DOM types are pulled
+ * in by the TypeScript default `lib`). TypeScript merges same-named
+ * properties across declarations, and `Request` / `mode` are DOM globals.
+ *
+ * See ADR-046 and `../runner_client.py`.
+ */
+
+// ---------------------------------------------------------------------------
+// Frame I/O
+// ---------------------------------------------------------------------------
+
+const decoder = new TextDecoder();
+const encoder = new TextEncoder();
+
+// Persistent reader and buffer. `Bun.stdin.stream()` must be called once
+// for the lifetime of the process — calling it repeatedly loses bytes
+// because each call returns a fresh ReadableStream that does not share
+// position state with prior readers.
+const stdinReader = Bun.stdin.stream().getReader();
+let inputBuffer = new Uint8Array(0);
+
+function appendToBuffer(chunk: Uint8Array): void {
+  const out = new Uint8Array(inputBuffer.length + chunk.length);
+  out.set(inputBuffer, 0);
+  out.set(chunk, inputBuffer.length);
+  inputBuffer = out;
+}
+
+function findSubsequence(haystack: Uint8Array, needle: Uint8Array): number {
+  outer: for (let i = 0; i + needle.length <= haystack.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+const HEADER_TERMINATOR = new Uint8Array([13, 10, 13, 10]);
+
+/** Reads one length-prefixed frame from stdin. Returns null on EOF. */
+async function readFrame(): Promise<unknown | null> {
+  // Wait for header terminator.
+  while (findSubsequence(inputBuffer, HEADER_TERMINATOR) < 0) {
+    const { done, value } = await stdinReader.read();
+    if (done) {
+      if (inputBuffer.length === 0) return null;
+      throw new Error(
+        `EOF while reading header (buffer size=${inputBuffer.length})`,
+      );
+    }
+    if (value) appendToBuffer(value);
+  }
+
+  const headerEnd = findSubsequence(inputBuffer, HEADER_TERMINATOR);
+  const headerText = decoder.decode(inputBuffer.subarray(0, headerEnd));
+  const match = headerText.match(/Content-Length:\s*(\d+)/i);
+  if (!match) {
+    throw new Error(`missing Content-Length header, got: ${headerText}`);
+  }
+  const lengthStr = match[1] ?? "";
+  const contentLength = Number.parseInt(lengthStr, 10);
+
+  const bodyStart = headerEnd + HEADER_TERMINATOR.length;
+
+  // Wait until the body is fully in the buffer.
+  while (inputBuffer.length - bodyStart < contentLength) {
+    const { done, value } = await stdinReader.read();
+    if (done) {
+      throw new Error(
+        `EOF while reading body (got ${inputBuffer.length - bodyStart}/${contentLength} bytes)`,
+      );
+    }
+    if (value) appendToBuffer(value);
+  }
+
+  const body = inputBuffer.subarray(bodyStart, bodyStart + contentLength);
+  const text = decoder.decode(body);
+
+  // Advance the buffer past the consumed frame.
+  inputBuffer = inputBuffer.slice(bodyStart + contentLength);
+
+  return JSON.parse(text);
+}
+
+async function writeFrame(payload: unknown): Promise<void> {
+  const body = JSON.stringify(payload);
+  const bodyBytes = encoder.encode(body);
+  const header = `Content-Length: ${bodyBytes.length}\r\n\r\n`;
+  const headerBytes = encoder.encode(header);
+  const out = new Uint8Array(headerBytes.length + bodyBytes.length);
+  out.set(headerBytes, 0);
+  out.set(bodyBytes, headerBytes.length);
+  // Await the write so each frame is fully flushed before the next.
+  await Bun.write(Bun.stdout, out);
+}
+
+// ---------------------------------------------------------------------------
+// Bridge loading — explicit, no auto-fallback
+// ---------------------------------------------------------------------------
+
+// biome-ignore lint/suspicious/noExplicitAny: bridge interfaces are complex
+type AnyBridge = any;
+
+let napiBridge: AnyBridge | null = null;
+let wasmBridge: AnyBridge | null = null;
+let wasmModule: AnyBridge | null = null;
+
+const NAPI_MODULE_PATH =
+  "../../../../../bindings/typescript/src/internal/native";
+const WASM_MODULE_PATH =
+  "../../../../../bindings/typescript/src/internal/wasm";
+const WASM_RAW_PATH =
+  "../../../../../bindings/typescript/node_modules/@limn-works/scp-ts-wasm/scp_ffi_wasm.js";
+
+async function loadNapi(): Promise<AnyBridge> {
+  if (napiBridge !== null) return napiBridge;
+  const { createNativeBridge } = await import(NAPI_MODULE_PATH);
+  napiBridge = createNativeBridge();
+  return napiBridge;
+}
+
+async function loadWasm(): Promise<{
+  bridge: AnyBridge;
+  raw: AnyBridge;
+}> {
+  if (wasmBridge !== null && wasmModule !== null) {
+    return { bridge: wasmBridge, raw: wasmModule };
+  }
+  const wasmInternal = await import(WASM_MODULE_PATH);
+  await wasmInternal.initWasm();
+  wasmBridge = wasmInternal.createWasmBridge();
+  // Bun resolves imports relative to the .ts file, not cwd. Use a
+  // relative path so the @limn-works/scp-ts-wasm package is found via
+  // bindings/typescript/node_modules (the only place we wire it).
+  wasmModule = await import(WASM_RAW_PATH);
+  return { bridge: wasmBridge, raw: wasmModule };
+}
+
+function resetBridgeCaches(): void {
+  // Drop references so the next `load*()` call re-imports and re-
+  // initializes. Bun's module cache still holds the underlying ESM, so
+  // we are only resetting the SCP-side wrapper state (ContextManager,
+  // identity registries, etc. that the bridges create at init time).
+  napiBridge = null;
+  wasmBridge = null;
+  wasmModule = null;
+}
+
+/**
+ * Emit a one-shot startup diagnostic so operators can see which bridge
+ * modules resolved and where. This is the exact failure mode the harness
+ * was built to catch: if a path typo or symlink causes WASM to be loaded
+ * where NAPI was expected, this line makes it obvious.
+ *
+ * Paths are emitted as repo-root-relative so public CI logs do not leak
+ * developer/runner filesystem layout (absolute home paths, hostnames,
+ * runner IDs embedded in paths, etc.). We compute the repo root from
+ * this file's location rather than trusting an env var, which keeps the
+ * diagnostic correct regardless of caller cwd.
+ */
+async function emitStartupDiagnostic(): Promise<void> {
+  const path = await import("node:path");
+  // This file is bindings/python/tests/bridge_parity/helpers/
+  // node_bridge_runner.ts, so the repo root is 5 levels up.
+  const repoRoot = path.resolve(import.meta.dir, "../../../../..");
+  const rel = (p: string): string => {
+    const r = path.relative(repoRoot, p);
+    // If the resolved path escapes the repo (shouldn't happen for the
+    // in-tree bridges, but could for a symlinked node_modules), fall
+    // back to a fingerprint rather than leaking the absolute path.
+    if (r.startsWith("..") || path.isAbsolute(r)) {
+      const hasher = new Bun.CryptoHasher("sha256");
+      hasher.update(p);
+      return `sha256:${hasher.digest("hex").slice(0, 16)}`;
+    }
+    return r;
+  };
+  // Each resolver is wrapped in its own try/catch so one failure does
+  // not mask the other: if napi resolution throws, we still attempt
+  // wasm resolution, and vice versa. The collision check below relies
+  // on both variables being independently populated (or null on
+  // individual failure), NOT on the whole block having succeeded.
+  let napiResolved: string | null = null;
+  let wasmResolved: string | null = null;
+  let wasmRawResolved: string | null = null;
+  const resolveErrors: Record<string, string> = {};
+  try {
+    napiResolved = Bun.resolveSync(NAPI_MODULE_PATH, import.meta.dir);
+  } catch (err) {
+    resolveErrors.napi = String(err);
+  }
+  try {
+    wasmResolved = Bun.resolveSync(WASM_MODULE_PATH, import.meta.dir);
+  } catch (err) {
+    resolveErrors.wasm = String(err);
+  }
+  try {
+    wasmRawResolved = Bun.resolveSync(WASM_RAW_PATH, import.meta.dir);
+  } catch (err) {
+    resolveErrors.wasm_raw = String(err);
+  }
+  if (Object.keys(resolveErrors).length > 0) {
+    process.stderr.write(
+      `${JSON.stringify({
+        event: "bridge_parity_runner_resolve_error",
+        errors: resolveErrors,
+      })}\n`,
+    );
+  }
+  process.stderr.write(
+    `${JSON.stringify({
+      event: "bridge_parity_runner_loaded",
+      napi: napiResolved === null ? null : rel(napiResolved),
+      wasm: wasmResolved === null ? null : rel(wasmResolved),
+      wasm_raw: wasmRawResolved === null ? null : rel(wasmRawResolved),
+    })}\n`,
+  );
+  // Defense-in-depth against the exact failure mode this diagnostic
+  // exists to surface: if a symlink, typo, or misconfigured
+  // node_modules layout causes NAPI and WASM to point at the same
+  // byte-for-byte module, the harness can no longer tell the two
+  // bridges apart — every "cross-bridge" test would silently be
+  // same-bridge. Refuse to start in that case. This runs OUTSIDE the
+  // resolve try/catch so a genuine collision fails hard even when
+  // individual resolve paths happened to succeed.
+  if (
+    napiResolved !== null &&
+    wasmResolved !== null &&
+    napiResolved === wasmResolved
+  ) {
+    throw new Error(
+      "bridge resolution collision: napi and wasm resolved to the same path — runner cannot distinguish them",
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Op dispatch
+// ---------------------------------------------------------------------------
+
+type BridgeMode = "napi" | "wasm";
+
+// Named `BridgeRequest` (not `Request`) and the field `bridgeMode` (not
+// `mode`) to avoid collisions with the DOM `Request` / `RequestMode`
+// globals that Bun's type package pulls in transitively.
+interface BridgeRequest {
+  id: number;
+  op: string;
+  args: Record<string, unknown>;
+  bridgeMode: BridgeMode;
+}
+
+interface OkResponse {
+  id: number;
+  ok: true;
+  result: Record<string, unknown>;
+}
+
+interface ErrResponse {
+  id: number;
+  ok: false;
+  error: { type: string; code: string; message: string };
+}
+
+function toErr(id: number, err: unknown): ErrResponse {
+  if (err instanceof Error) {
+    const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
+    return {
+      id,
+      ok: false,
+      error: {
+        type: err.constructor.name,
+        code: codeMatch ? codeMatch[0] : "UNKNOWN",
+        message: err.message,
+      },
+    };
+  }
+  return {
+    id,
+    ok: false,
+    error: { type: "unknown", code: "UNKNOWN", message: String(err) },
+  };
+}
+
+async function dispatch(req: BridgeRequest): Promise<OkResponse | ErrResponse> {
+  try {
+    switch (req.op) {
+      case "identity_create":
+        return { id: req.id, ok: true, result: await opIdentityCreate(req) };
+      case "context_create":
+        return { id: req.id, ok: true, result: await opContextCreate(req) };
+      case "invalid_capability_rejected":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opInvalidCapability(req),
+        };
+      case "event_log_append":
+        return { id: req.id, ok: true, result: await opEventLogAppend(req) };
+      case "sign_message":
+        return { id: req.id, ok: true, result: await opSignMessage(req) };
+      case "tool_register":
+        return { id: req.id, ok: true, result: await opToolRegister(req) };
+      case "ucan_mint":
+        return { id: req.id, ok: true, result: await opUcanMint(req) };
+      case "ucan_validate_malformed":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opUcanValidateMalformed(req),
+        };
+      case "transport_status":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opTransportStatus(req),
+        };
+      case "event_log_query_filtered":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opEventLogQueryFiltered(req),
+        };
+      default:
+        return {
+          id: req.id,
+          ok: false,
+          error: {
+            type: "UnknownOp",
+            code: "TEST-PARITY-1001",
+            message: `unknown op: ${req.op}`,
+          },
+        };
+    }
+  } catch (err: unknown) {
+    return toErr(req.id, err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Op implementations
+// ---------------------------------------------------------------------------
+
+// Converts a hex string (expected 64 chars = 32 bytes) to the native seed
+// representation for the target bridge. NAPI accepts Node `Buffer`; WASM
+// accepts a `Uint8Array`. Both surface in Rust as the same 32 bytes.
+function seedFromHex(hex: string | undefined, forWasm: boolean): unknown {
+  if (hex === undefined) return undefined;
+  if (hex.length !== 64) {
+    throw new Error(
+      `seed_hex must be 64 chars (32 bytes), got ${hex.length}`,
+    );
+  }
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) {
+    bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return forWasm ? bytes : Buffer.from(bytes);
+}
+
+async function opIdentityCreate(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  const custody = String(req.args.custody ?? "in_memory");
+  const seedHex =
+    typeof req.args.seed_hex === "string" ? req.args.seed_hex : undefined;
+  if (req.bridgeMode === "napi") {
+    // Go through the raw napi addon (not the TS SDK wrapper) because the
+    // wrapper's `identityCreate(custody)` signature intentionally drops
+    // the optional `seed` parameter — seeded identity creation is a
+    // parity-harness affordance, not a public SDK surface. The raw
+    // addon's `identityCreate(custody, seed?: Buffer)` is what the
+    // bridge tests exercise directly.
+    const addon = await loadNapiAddon();
+    const seed = seedFromHex(seedHex, false);
+    const handle = await addon.identityCreate(custody, seed);
+    return {
+      did: handle.did,
+      custody,
+      verifying_key: handle.verifyingKey ?? handle.verifying_key ?? null,
+    };
+  }
+  const { raw } = await loadWasm();
+  const seed = seedFromHex(seedHex, true);
+  const handle = await raw.identity_create(custody, seed);
+  return {
+    did: handle.did,
+    custody,
+    verifying_key: handle.verifyingKey ?? handle.verifying_key ?? null,
+  };
+}
+
+async function opContextCreate(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  const params = (req.args.params as Record<string, unknown>) ?? {
+    name: "parity-test",
+    mode: "encrypted",
+  };
+  if (req.bridgeMode === "napi") {
+    const bridge = await loadNapi();
+    const identity = await bridge.identityCreate("in_memory");
+    const handle = await bridge.contextCreate(identity, JSON.stringify(params));
+    return {
+      context_id: handle.contextId,
+      creator_did: identity.did,
+      mode: String(params.mode),
+    };
+  }
+  const { raw } = await loadWasm();
+  const identity = await raw.identity_create("in_memory");
+  const handle = await raw.context_create(identity.did, JSON.stringify(params));
+  return {
+    context_id: handle.contextId ?? handle.context_id,
+    creator_did: identity.did,
+    mode: String(params.mode),
+  };
+}
+
+async function opInvalidCapability(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  const fakeDid =
+    "did:dht:znevercreatednevercreatednevercreatednevercreated";
+  const badChallenge =
+    '{"protocol":"scpid/1","nonce":"00","audience":"x","issued_at":0,"expires_at":0}';
+  try {
+    if (req.bridgeMode === "napi") {
+      const bridge = await loadNapi();
+      bridge.scpidSign(fakeDid, "#active", badChallenge);
+    } else {
+      const { raw } = await loadWasm();
+      raw.scpid_sign(fakeDid, "#active", badChallenge);
+    }
+  } catch (err: unknown) {
+    if (err instanceof Error) {
+      const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
+      return {
+        error: {
+          type: err.constructor.name,
+          code: codeMatch ? codeMatch[0] : "UNKNOWN",
+          message: err.message,
+        },
+      };
+    }
+    return {
+      error: { type: "unknown", code: "UNKNOWN", message: String(err) },
+    };
+  }
+  return {
+    error: { type: "none", code: "NONE", message: "no error raised" },
+  };
+}
+
+async function opEventLogAppend(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  if (req.bridgeMode === "napi") {
+    const bridge = await loadNapi();
+    const identity = await bridge.identityCreate("in_memory");
+    const handle = await bridge.contextCreate(
+      identity,
+      JSON.stringify({ name: "parity-elog", mode: "encrypted" }),
+    );
+    const events = await bridge.eventLogQuery(handle, undefined);
+    const first = events[0];
+    if (!first) return { event_count: 0, first_event_type: "", first_sequence: 0 };
+    return {
+      event_count: events.length,
+      first_event_type: String(first.eventType),
+      first_sequence: Number(first.sequence ?? 0),
+    };
+  }
+  const { raw } = await loadWasm();
+  const identity = await raw.identity_create("in_memory");
+  const handle = await raw.context_create(
+    identity.did,
+    JSON.stringify({ name: "parity-elog", mode: "encrypted" }),
+  );
+  const eventsJson = await raw.event_log_query(handle, undefined);
+  const events = JSON.parse(eventsJson) as Array<{
+    eventType?: string;
+    event_type?: string;
+    sequence?: number;
+  }>;
+  const first = events[0];
+  if (!first) return { event_count: 0, first_event_type: "", first_sequence: 0 };
+  return {
+    event_count: events.length,
+    first_event_type: String(first.eventType ?? first.event_type ?? ""),
+    first_sequence: Number(first.sequence ?? 0),
+  };
+}
+
+// -- ops 6-10 -------------------------------------------------------------
+
+// Shared tool registration body — pinned across bridges in
+// `seed_operations.py::OP_TOOL_REGISTER`. Keep the shape aligned with
+// the scp-core ToolRegistration: name, description, schema {input,
+// output}, operator_did. Schemas carry 2 fields each to satisfy
+// `MIN_SCHEMA_FIELDS = 2` in `validate_specificity_floor` — one side
+// must declare at least two distinct properties.
+const PARITY_TOOL_NAME = "parity_probe";
+const PARITY_TOOL_SCHEMA = {
+  input: {
+    type: "object",
+    properties: {
+      x: { type: "integer" },
+      label: { type: "string" },
+    },
+  },
+  output: {
+    type: "object",
+    properties: {
+      y: { type: "integer" },
+      status: { type: "string" },
+    },
+  },
+};
+const PARITY_TOOL_CEILING = [
+  "messages:read",
+  "messages:write",
+  "tool:register",
+  "tool_invoke:*",
+];
+
+async function opToolRegister(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  const ceiling = (req.args.ceiling as string[]) ?? PARITY_TOOL_CEILING;
+  const params = { name: "parity-tools", mode: "encrypted", ceiling };
+  if (req.bridgeMode === "napi") {
+    const bridge = await loadNapi();
+    const identity = await bridge.identityCreate("in_memory");
+    const handle = await bridge.contextCreate(identity, JSON.stringify(params));
+    const toolId = await bridge.toolRegister(handle, {
+      name: PARITY_TOOL_NAME,
+      description: "parity harness probe tool",
+      inputSchema: PARITY_TOOL_SCHEMA.input,
+      outputSchema: PARITY_TOOL_SCHEMA.output,
+      operator: identity.did,
+    });
+    return { tool_id: toolId };
+  }
+  const { raw } = await loadWasm();
+  const identity = await raw.identity_create("in_memory");
+  const handle = await raw.context_create(identity.did, JSON.stringify(params));
+  // WASM tool_register takes a definition JSON with `schema` (input) and
+  // `outputSchema` fields at the top level (see scp-ffi/wasm/src/tools.rs).
+  const toolDef = {
+    name: PARITY_TOOL_NAME,
+    description: "parity harness probe tool",
+    schema: PARITY_TOOL_SCHEMA.input,
+    outputSchema: PARITY_TOOL_SCHEMA.output,
+    operatorDid: identity.did,
+  };
+  const toolId = await raw.tool_register(handle, JSON.stringify(toolDef));
+  return { tool_id: toolId };
+}
+
+async function opUcanMint(req: BridgeRequest): Promise<Record<string, unknown>> {
+  const memberDid = String(req.args.member_did);
+  const capabilities = (req.args.capabilities as string[]) ?? ["messages:read"];
+  const ceiling = (req.args.ceiling as string[]) ?? ["messages:read"];
+  const params = { name: "parity-ucan", mode: "encrypted", ceiling };
+  if (req.bridgeMode === "napi") {
+    const bridge = await loadNapi();
+    const identity = await bridge.identityCreate("in_memory");
+    const handle = await bridge.contextCreate(identity, JSON.stringify(params));
+    const token = await bridge.ucanMint(handle, memberDid, capabilities);
+    return {
+      issuer: token.issuer,
+      audience: token.audience,
+      capability_count: token.capabilities.length,
+    };
+  }
+  const { raw } = await loadWasm();
+  const identity = await raw.identity_create("in_memory");
+  const handle = await raw.context_create(identity.did, JSON.stringify(params));
+  const token = await raw.ucan_mint(
+    handle,
+    memberDid,
+    JSON.stringify(capabilities),
+  );
+  // WASM returns capabilities as a JSON-encoded string; NAPI returns an array.
+  const caps = JSON.parse(token.capabilitiesJson ?? "[]") as string[];
+  return {
+    issuer: token.issuer,
+    audience: token.audience,
+    capability_count: caps.length,
+  };
+}
+
+async function opUcanValidateMalformed(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  const ceiling = (req.args.ceiling as string[]) ?? ["messages:read"];
+  const params = { name: "parity-ucan-v", mode: "encrypted", ceiling };
+  const badToken = "not.a.jwt";
+  const capability = "scp:ctx:any/messages:read";
+  try {
+    if (req.bridgeMode === "napi") {
+      const bridge = await loadNapi();
+      const identity = await bridge.identityCreate("in_memory");
+      const handle = await bridge.contextCreate(
+        identity,
+        JSON.stringify(params),
+      );
+      await bridge.ucanValidate(handle, badToken, capability);
+    } else {
+      const { raw } = await loadWasm();
+      const identity = await raw.identity_create("in_memory");
+      const handle = await raw.context_create(
+        identity.did,
+        JSON.stringify(params),
+      );
+      await raw.ucan_validate(handle, badToken, capability, identity.did, undefined);
+    }
+  } catch (err: unknown) {
+    if (err instanceof Error) {
+      const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
+      return {
+        error: {
+          type: err.constructor.name,
+          code: codeMatch ? codeMatch[0] : "UNKNOWN",
+        },
+      };
+    }
+    return { error: { type: "unknown", code: "UNKNOWN" } };
+  }
+  return { error: { type: "none", code: "NONE" } };
+}
+
+// Lazy handle to the raw napi-rs native addon. The Bridge wrapper returned
+// by `createNativeBridge()` requires handles for every call, so the parity
+// runner needs direct addon access to exercise handleless probes.
+// biome-ignore lint/suspicious/noExplicitAny: raw addon has no TS typings
+let napiAddon: any = null;
+
+async function loadNapiAddon(): Promise<typeof napiAddon> {
+  if (napiAddon !== null) return napiAddon;
+  const platformMap: Record<string, string> = {
+    "linux-x64": "@limn-works/scp-ts-napi-linux-x64-gnu",
+    "linux-arm64": "@limn-works/scp-ts-napi-linux-arm64-gnu",
+    "darwin-x64": "@limn-works/scp-ts-napi-darwin-x64",
+    "darwin-arm64": "@limn-works/scp-ts-napi-darwin-arm64",
+    "win32-x64": "@limn-works/scp-ts-napi-win32-x64-msvc",
+  };
+  const key = `${process.platform}-${process.arch}`;
+  const packageName = platformMap[key];
+  if (packageName === undefined) {
+    throw new Error(`parity runner: no NAPI addon for platform ${key}`);
+  }
+  const { createRequire } = await import("node:module");
+  // Resolve via a file inside bindings/typescript so Node's module
+  // resolution walks the TS workspace's node_modules tree (where CI
+  // wires `@limn-works/scp-ts-napi-linux-x64-gnu`). `import.meta.url`
+  // points into bindings/python/tests/bridge_parity/helpers/, which
+  // sits in a different subtree and cannot see the NAPI addon package.
+  const typescriptAnchor = new URL(
+    "../../../../../bindings/typescript/package.json",
+    import.meta.url,
+  ).href;
+  const req = createRequire(typescriptAnchor);
+  napiAddon = req(packageName);
+  return napiAddon;
+}
+
+async function opTransportStatus(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  // PyO3, WASM, NAPI, and UniFFI all expose a stateless, handleless
+  // `transport_status` call. PyO3/WASM take no argument; NAPI/UniFFI
+  // accept an optional manager and fall back to a BridgeInstance-level
+  // probe when omitted. In the parity harness we always exercise the
+  // handleless path — no transport_connect round-trip, no relay
+  // fixture — so every bridge returns the disconnected shape.
+  if (req.bridgeMode === "napi") {
+    const addon = await loadNapiAddon();
+    // Passing `null` opts into the handleless stateless probe.
+    const status = await addon.transportStatus(null);
+    return {
+      connected: status.connected ?? false,
+      relay_url: status.relayUrl ?? status.relay_url ?? null,
+      latency_ms: status.latencyMs ?? status.latency_ms ?? null,
+    };
+  }
+  const { raw } = await loadWasm();
+  const status = raw.transport_status();
+  return {
+    connected: status.connected ?? false,
+    relay_url: status.relayUrl ?? status.relay_url ?? null,
+    latency_ms: status.latencyMs ?? status.latency_ms ?? null,
+  };
+}
+
+async function opEventLogQueryFiltered(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  const filter = (req.args.filter as Record<string, unknown>) ?? {
+    event_type: "ContextCreated",
+  };
+  const params = { name: "parity-elog-f", mode: "encrypted" };
+  if (req.bridgeMode === "napi") {
+    const bridge = await loadNapi();
+    const identity = await bridge.identityCreate("in_memory");
+    const handle = await bridge.contextCreate(identity, JSON.stringify(params));
+    const events = await bridge.eventLogQuery(handle, filter);
+    const first = events[0];
+    return {
+      event_count: events.length,
+      first_event_type: first ? String(first.eventType) : "",
+    };
+  }
+  const { raw } = await loadWasm();
+  const identity = await raw.identity_create("in_memory");
+  const handle = await raw.context_create(identity.did, JSON.stringify(params));
+  const eventsJson = await raw.event_log_query(handle, JSON.stringify(filter));
+  const events = JSON.parse(eventsJson) as Array<{
+    eventType?: string;
+    event_type?: string;
+  }>;
+  const first = events[0];
+  return {
+    event_count: events.length,
+    first_event_type: first
+      ? String(first.eventType ?? first.event_type ?? "")
+      : "",
+  };
+}
+
+async function opSignMessage(req: BridgeRequest): Promise<Record<string, unknown>> {
+  const audience = String(
+    req.args.audience ?? "https://parity-test.example.com",
+  );
+  const ttl = Number(req.args.ttl_seconds ?? 60);
+  const seedHex =
+    typeof req.args.seed_hex === "string" ? req.args.seed_hex : undefined;
+  // Optional `signed_at_override` (ms since epoch). When present, both
+  // bridges pin `signed_at` to the same value so Ed25519 signatures are
+  // byte-exact across PyO3/NAPI/UniFFI/WASM under the shared seed.
+  const signedAtOverride =
+    typeof req.args.signed_at_override === "number"
+      ? Number(req.args.signed_at_override)
+      : undefined;
+  if (req.bridgeMode === "napi") {
+    // Use the raw addon: the TS SDK wrapper's `identityCreate(custody)` and
+    // `scpidSign(did, keyId, challengeJson)` intentionally drop `seed` and
+    // `signed_at_override` respectively — those are parity-harness
+    // affordances gated at the bridge layer, not public SDK surface. The
+    // raw addon exposes the full signatures the bridge registers.
+    const addon = await loadNapiAddon();
+    const seed = seedFromHex(seedHex, false);
+    const identity = await addon.identityCreate("in_memory", seed);
+    const challenge = addon.scpidChallenge(audience, ttl);
+    // Rewrite challenge fields so issued_at/expires_at cover the override.
+    const patched = patchChallengeForOverride(challenge, signedAtOverride);
+    const overrideArg =
+      signedAtOverride === undefined ? null : BigInt(signedAtOverride);
+    const responseJson = addon.scpidSign(
+      identity.did,
+      "#active",
+      patched,
+      overrideArg,
+    );
+    const response = JSON.parse(responseJson);
+    return {
+      protocol: response.protocol,
+      did: response.did,
+      signing_key_id: response.signing_key_id,
+      signature: response.signature,
+    };
+  }
+  const { raw } = await loadWasm();
+  const seed = seedFromHex(seedHex, true);
+  const identity = await raw.identity_create("in_memory", seed);
+  const challenge = raw.scpid_challenge(audience, ttl);
+  const patched = patchChallengeForOverride(challenge, signedAtOverride);
+  const overrideArg =
+    signedAtOverride === undefined ? undefined : BigInt(signedAtOverride);
+  const responseJson = raw.scpid_sign(
+    identity.did,
+    "#active",
+    patched,
+    overrideArg,
+  );
+  const response = JSON.parse(responseJson);
+  return {
+    protocol: response.protocol,
+    did: response.did,
+    signing_key_id: response.signing_key_id,
+    signature: response.signature,
+  };
+}
+
+/// When a `signed_at_override` is supplied, the challenge must match
+/// the pinned fixture used by the Python harness AND the scp-runtime
+/// golden-value test. We REPLACE the bridge-issued challenge with the
+/// pinned one so every bridge feeds `scpid_sign` the same canonical
+/// hash inputs. `expires_at` is set far in the future (year 2286) so
+/// wall-clock expiry can't trip the bridge-side expiry check.
+function patchChallengeForOverride(
+  _challengeJson: string,
+  override: number | undefined,
+): string {
+  if (override === undefined) {
+    return _challengeJson;
+  }
+  return JSON.stringify({
+    protocol: "scpid/1.0",
+    nonce: PARITY_NONCE_HEX,
+    audience: "https://parity-test.example.com",
+    issued_at: override,
+    expires_at: PARITY_CHALLENGE_EXPIRES_AT_MS,
+  });
+}
+
+/// Fixed 32-byte nonce used when `signed_at_override` pins the SCPID
+/// response. Must match `bindings/python/tests/bridge_parity/seed_operations.py`
+/// (PARITY_NONCE_HEX).
+const PARITY_NONCE_HEX = "aa".repeat(32);
+/// Year-2286 timestamp — far enough in the future that wall-clock
+/// expiry cannot trip the SCPID expiry check. Must match the
+/// Python harness's PARITY_CHALLENGE_EXPIRES_AT_MS.
+const PARITY_CHALLENGE_EXPIRES_AT_MS = 9_999_999_999_000;
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<void> {
+  await emitStartupDiagnostic();
+  while (true) {
+    let req: unknown;
+    try {
+      req = await readFrame();
+    } catch (err) {
+      await writeFrame({
+        id: 0,
+        ok: false,
+        error: {
+          type: "FrameError",
+          code: "TEST-PARITY-1000",
+          message: String(err),
+        },
+      });
+      continue;
+    }
+
+    if (req === null) break; // EOF
+
+    if (
+      typeof req !== "object" ||
+      req === null ||
+      !("op" in req) ||
+      !("bridgeMode" in req)
+    ) {
+      await writeFrame({
+        id: 0,
+        ok: false,
+        error: {
+          type: "ProtocolError",
+          code: "TEST-PARITY-1002",
+          message: "malformed request",
+        },
+      });
+      continue;
+    }
+
+    const typed = req as BridgeRequest;
+
+    if (typed.op === "shutdown") {
+      await writeFrame({ id: typed.id ?? 0, ok: true, result: {} });
+      break;
+    }
+
+    if (typed.op === "reset") {
+      resetBridgeCaches();
+      await writeFrame({ id: typed.id ?? 0, ok: true, result: {} });
+      continue;
+    }
+
+    const response = await dispatch(typed);
+    await writeFrame(response);
+  }
+}
+
+main().catch((err) => {
+  console.error("node_bridge_runner fatal:", err);
+  process.exit(1);
+});
