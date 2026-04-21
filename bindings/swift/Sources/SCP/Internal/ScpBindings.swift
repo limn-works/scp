@@ -1910,22 +1910,30 @@ public func FfiConverterTypeRelayHandle_lower(_ value: RelayHandle) -> UnsafeMut
  * The SCP instance — a caller-owned handle that wraps a
  * [`UniffiBridgeInstance`].
  *
- * Generated as `class SCP` in both Swift and Kotlin.
+ * Generated as `class SCP` in both Swift and Kotlin. Phase D (#1695,
+ * ADR-048) deleted the process-wide default instance: every caller now
+ * constructs an explicit `SCP()` and the handles it mints are rejected
+ * on any other instance via [`check-handle-affinity`][affinity].
+ *
+ * The native `shutdown` parameter is milliseconds (`u64`) — the SDK
+ * wrappers present it as seconds for consumer ergonomics.
+ *
+ * [affinity]: ../../../../scripts/check-handle-affinity.sh
  *
  * # Swift usage
  *
  * ```swift
  * let scp = SCP()                                // fresh in-memory instance
- * let shared = try SCP.defaultInstance()         // process-wide default
- * try await scp.shutdown(timeoutSecs: 5)         // graceful shutdown
+ * let identity = try await scp.identityCreate(custody: "in_memory")
+ * try await scp.shutdown(timeoutMillis: 5_000)   // graceful shutdown
  * ```
  *
  * # Kotlin usage
  *
  * ```kotlin
  * val scp = SCP()                                // fresh in-memory instance
- * val shared = SCP.defaultInstance()             // process-wide default
- * scp.shutdown(timeoutSecs = 5uL)                // suspend fun, graceful shutdown
+ * val identity = scp.identityCreate(custody = "in_memory")
+ * scp.shutdown(timeoutMillis = 5_000uL)          // suspend fun, graceful shutdown
  * ```
  */
 public protocol ScpProtocol: AnyObject, Sendable {
@@ -3050,22 +3058,30 @@ public protocol ScpProtocol: AnyObject, Sendable {
  * The SCP instance — a caller-owned handle that wraps a
  * [`UniffiBridgeInstance`].
  *
- * Generated as `class SCP` in both Swift and Kotlin.
+ * Generated as `class SCP` in both Swift and Kotlin. Phase D (#1695,
+ * ADR-048) deleted the process-wide default instance: every caller now
+ * constructs an explicit `SCP()` and the handles it mints are rejected
+ * on any other instance via [`check-handle-affinity`][affinity].
+ *
+ * The native `shutdown` parameter is milliseconds (`u64`) — the SDK
+ * wrappers present it as seconds for consumer ergonomics.
+ *
+ * [affinity]: ../../../../scripts/check-handle-affinity.sh
  *
  * # Swift usage
  *
  * ```swift
  * let scp = SCP()                                // fresh in-memory instance
- * let shared = try SCP.defaultInstance()         // process-wide default
- * try await scp.shutdown(timeoutSecs: 5)         // graceful shutdown
+ * let identity = try await scp.identityCreate(custody: "in_memory")
+ * try await scp.shutdown(timeoutMillis: 5_000)   // graceful shutdown
  * ```
  *
  * # Kotlin usage
  *
  * ```kotlin
  * val scp = SCP()                                // fresh in-memory instance
- * val shared = SCP.defaultInstance()             // process-wide default
- * scp.shutdown(timeoutSecs = 5uL)                // suspend fun, graceful shutdown
+ * val identity = scp.identityCreate(custody = "in_memory")
+ * scp.shutdown(timeoutMillis = 5_000uL)          // suspend fun, graceful shutdown
  * ```
  */
 open class Scp: ScpProtocol, @unchecked Sendable {
