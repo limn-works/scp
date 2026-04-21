@@ -129,34 +129,31 @@ Regression tests at `crates/scp-ffi/src/transport.rs::tests`, `crates/scp-ffi/sr
 ### Shutdown-timeout integer width across FFI bridges
 
 At the FFI boundary the `shutdown(timeout)` argument is carried as
-milliseconds in an unsigned integer. The three non-WASM bridges disagree on
-width:
+milliseconds in an unsigned 64-bit integer uniformly across all three
+non-WASM bridges:
 
-- **NAPI**: `u32` (max ≈ 4 294 967 295 ms ≈ 49.7 days).
-- **UniFFI**: `u64` (max ≈ 5 × 10¹¹ years — effectively unbounded).
+- **NAPI**: `u64`, exposed as JS `BigInt` (widened from `u32` in #1692).
+- **UniFFI**: `u64`.
 - **PyO3**: `u64` via Python `int`.
 
 The user-facing API is uniform — seconds at the SDK layer in every language
 (`TimeInterval` in Swift, `Duration` in Kotlin, `float` in Python, `number`
-in TypeScript). Each SDK wrapper clamps to its bridge's maximum before
-crossing FFI and treats out-of-range or non-finite inputs as "wait forever
-within the bridge's representable range". Swift's clamp uses `>= Double(UInt64.max) / 1000.0`
-(not `>`) because `Double(UInt64.max) == 2⁶⁴` after IEEE-754 rounding — a
-strict `>` would let the exact-boundary value trap in the subsequent cast
-(round 3 bug-catcher finding).
+in TypeScript). Each SDK wrapper clamps non-finite and out-of-range inputs
+to a safe representable maximum before crossing FFI (TypeScript uses
+`Number.MAX_SAFE_INTEGER` ms; Swift uses `>= Double(UInt64.max) / 1000.0`
+to avoid an IEEE-754 rounding trap at the exact boundary — round-3
+bug-catcher finding).
 
-Rationale for the NAPI/UniFFI asymmetry: JavaScript's `Number` safely
-represents integers up to 2⁵³−1, so a `u64` at the NAPI boundary would
-force callers onto `BigInt` — a real ergonomic tax for a shutdown timeout
-that in practice never exceeds a few seconds. `u32` covers any realistic
-value (49 days is far beyond any sensible deployment timeout) without the
-`BigInt` friction. Swift/Kotlin have native 64-bit integer ergonomics, so
-UniFFI exposes `u64` there without penalty. PyO3's `u64` matches UniFFI
-because Python's `int` is unbounded anyway — no ergonomic cost.
+The earlier NAPI/UniFFI asymmetry (`u32` on NAPI to avoid forcing JS
+callers onto `BigInt`) was rejected in #1692 in favor of uniform
+semantics. The cost of `BigInt` at the NAPI boundary for a shutdown
+timeout is trivial — the TypeScript SDK wrapper always accepts a plain
+`number` and coerces once before the FFI call — and the benefit of
+cross-bridge uniformity (one code path, one cap, one invariant) outweighs
+the ergonomic tax.
 
-This asymmetry is intentional and documented; it does NOT affect
-semantics. Any SDK caller passing a value larger than its bridge's maximum
-gets deterministic clamping at the boundary, not silent truncation.
+Any SDK caller passing a value larger than the clamp cap gets
+deterministic clamping at the boundary, not silent truncation.
 
 ### ADR numbering disambiguation (ADR-043)
 
