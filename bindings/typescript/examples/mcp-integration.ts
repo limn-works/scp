@@ -1,75 +1,87 @@
 /**
- * MCP integration: expose SCP tools via MCP JSON-RPC server.
+ * MCP integration: expose SCP tools via an MCP JSON-RPC server, then
+ * connect as an MCP client to a remote server.
+ *
+ * Post-Phase-4 (ADR-048): all bridge operations route through an
+ * explicit `SCP` instance. The free-function shims (`serveMcp`,
+ * `connectMcp`, `connectMcpStdio`) were removed — use
+ * `scp.mcpServerCreate`, `scp.mcpClientConnectSse`, and the other
+ * `scp.mcp*` methods directly.
+ *
+ * Run: bun run examples/mcp-integration.ts
  */
 
-import { Context, Identity } from "@limn-works/scp-ts";
-import { connectMcp, serveMcp } from "@limn-works/scp-ts/mcp";
+import { SCP, defineToolDefinition } from "../src/index";
 
 async function main(): Promise<void> {
-  const identity = await Identity.create({ custody: "in_memory" });
+  const scp = new SCP();
+  try {
+    const identity = await scp.identityCreate("in_memory");
 
-  // Create a context with tool capabilities
-  const ctx = await Context.create(identity, {
-    ceiling: [
-      "messages:read",
-      "messages:write",
-      "tool:invoke:*",
-      "tool:register",
-    ],
-    memoryScope: "ephemeral",
-    governance: "single_admin",
-  });
+    // Create a context with tool capabilities.
+    const ctx = await scp.contextCreate(
+      identity,
+      JSON.stringify({
+        ceiling: ["messages:read", "messages:write", "tool:invoke:*", "tool:register"],
+        memoryScope: "ephemeral",
+        governance: "single_admin",
+      }),
+    );
 
-  // Register a tool in the context
-  await ctx.registerTool({
-    name: "summarize",
-    description: "Summarize text content",
-    inputSchema: {
-      type: "object",
-      properties: { text: { type: "string" } },
-      required: ["text"],
-    },
-    outputSchema: {
-      type: "object",
-      properties: { summary: { type: "string" } },
-    },
-    operator: identity.did,
-  });
-
-  // Start an MCP server exposing context tools on stdio
-  const server = await serveMcp(ctx, {
-    tools: [
-      {
-        name: "summarize",
-        description: "Summarize text content",
-        inputSchema: {
-          type: "object",
-          properties: { text: { type: "string" } },
-          required: ["text"],
-        },
-        outputSchema: {
-          type: "object",
-          properties: { summary: { type: "string" } },
-        },
-        operator: identity.did,
+    // Register a tool in the context.
+    const tool = defineToolDefinition({
+      name: "summarize",
+      description: "Summarize text content",
+      inputSchema: {
+        type: "object",
+        properties: { text: { type: "string" } },
+        required: ["text"],
       },
-    ],
-  });
-  console.log("MCP server running, exposing tools");
+      outputSchema: {
+        type: "object",
+        properties: { summary: { type: "string" } },
+      },
+      operator: identity.did,
+    });
+    await scp.toolRegister(ctx._rawHandle, tool);
 
-  // Or connect as an MCP client to a remote server
-  const client = await connectMcp({ serverUrl: "http://localhost:8080/mcp" });
-  const tools = await client.listTools();
-  console.log(`Remote server offers ${tools.length} tool(s)`);
+    // Start an MCP server exposing context tools on stdio.
+    const server = await scp.mcpServerCreate({
+      identityDid: identity.did,
+      contextIds: [ctx.contextId],
+      transport: "stdio",
+    });
+    console.log("MCP server running, exposing tools");
 
-  const result = await client.invokeTool("summarize", {
-    text: "SCP is a protocol for...",
-  });
-  console.log("Result:", result);
+    try {
+      // Or connect as an MCP client to a remote server.
+      const client = await scp.mcpClientConnectSse("http://localhost:8080/mcp");
+      try {
+        const tools = await scp.mcpClientListTools(client);
+        console.log(`Remote server offers ${tools.length} tool(s)`);
 
-  await client.disconnect();
-  await server.stop();
-  await ctx.close();
+        const result = await scp.mcpClientInvoke(
+          client,
+          "summarize",
+          JSON.stringify({ text: "SCP is a protocol for..." }),
+          ctx.contextId,
+          identity.did,
+        );
+        console.log("Result:", result);
+      } finally {
+        await scp.mcpClientDisconnect(client);
+      }
+    } finally {
+      await scp.mcpServerStop(server);
+    }
+
+    await scp.contextClose(ctx._rawHandle, identity.did);
+  } finally {
+    await scp.shutdown(5);
+  }
 }
 
-main().catch(console.error);
+main().catch((error: unknown) => {
+  console.error("Demo failed:", error);
+  process.exit(1);
+});
