@@ -17,28 +17,36 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { createRequire } from "node:module";
 import type { BridgeMode } from "../src/bridge";
-import { SCP } from "../src/scp";
+import { __getNativeScp, SCP } from "../src/scp";
 
 // ---------------------------------------------------------------------------
 // Guard: skip all tests if the native NAPI binding is unavailable.
 // ---------------------------------------------------------------------------
 
 type NativeBridge = Awaited<ReturnType<typeof import("../src/internal/bridge").getBridge>>;
-type ServerAddon = {
-  relayStartInMemory(): Promise<{
-    readonly relayUrl: string;
-    readonly relayPort: number;
-    readonly isShutdown: boolean;
-    shutdown(): void;
-  }>;
-  transportConnect(relayUrl: string): Promise<unknown>;
-  configureRelayTransport(relayUrl: string, localDid: string): Promise<void>;
-};
+
+// Post-ADR-048 (#1549 Phase 4 PR 4): relay/transport bootstrap methods no
+// longer exist as module-level free functions on the raw addon. They are
+// instance methods on the NAPI `Scp` class. We reach them through the raw
+// native handle attached to the `SCP` wrapper via `__getNativeScp`.
+//
+// A small set of stateless helpers deliberately remain as module-level
+// free functions on the raw addon — `discovery_*`, `context_discover`,
+// `bridge_evaluate_trust`, `bridge_register`, `scp_version`. They touch
+// no bridge state, so they never needed instance-scoping (see the
+// "sub-slice B" comment in `crates/scp-ffi/napi/src/scp.rs`). These calls
+// dispatch through `rawAddon` below rather than through the `SCP` wrapper.
+// biome-ignore lint/suspicious/noExplicitAny: the native SCP class is untyped
+type NativeScp = any;
+// biome-ignore lint/suspicious/noExplicitAny: the native addon module is untyped
+type NativeAddon = any;
 
 let bridge: NativeBridge | null = null;
-let serverAddon: ServerAddon | null = null;
 let scp: SCP | null = null;
+let nativeScp: NativeScp | null = null;
+let rawAddon: NativeAddon = null;
 let skipReason = "";
 
 try {
@@ -46,9 +54,19 @@ try {
   const { createNativeBridge } = await import("../src/internal/native.js");
   scp = new SCP();
   bridge = createNativeBridge(scp);
+  // Grab the raw native handle for the handful of methods that the SDK
+  // `Bridge` wrapper does not expose (relay startup, relay-transport
+  // configuration). These live on the NAPI `Scp` class as the per-instance
+  // replacements for the deleted free functions.
+  nativeScp = __getNativeScp(scp);
+  if (typeof nativeScp.relayStartInMemory !== "function") {
+    skipReason = "native SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
+    bridge = null;
+    nativeScp = null;
+  }
 
-  // Load the server addon for relay + transport operations
-  const { createRequire } = await import("node:module");
+  // Also load the raw addon — it still exports the stateless module-level
+  // helpers (discovery, bridge_evaluate_trust, bridge_register).
   const req = createRequire(import.meta.url);
   const platform = process.platform;
   const arch = process.arch;
@@ -60,10 +78,8 @@ try {
     "win32-x64": "@limn-works/scp-ts-napi-win32-x64-msvc",
   };
   const pkg = platformMap[`${platform}-${arch}`];
-  if (pkg) {
-    serverAddon = req(pkg) as ServerAddon;
-  } else {
-    skipReason = `No native addon for ${platform}-${arch}`;
+  if (pkg !== undefined) {
+    rawAddon = req(pkg) as NativeAddon;
   }
 } catch (e: unknown) {
   const msg = e instanceof Error ? e.message : String(e);
@@ -71,42 +87,60 @@ try {
 }
 
 // When the bridge is unavailable, define a single test that reports the skip.
-if (bridge === null || serverAddon === null) {
+if (bridge === null || nativeScp === null || scp === null || rawAddon === null) {
   describe("Real NAPI bridge E2E (SKIPPED)", () => {
     test.skip(`all tests skipped: ${skipReason}`, () => {});
   });
 } else {
-  // Capture the bridge in a const for type narrowing.
+  // Capture bridge and native handle in consts for type narrowing.
   const napi = bridge;
-  const addon = serverAddon;
+  const nativeHandle = nativeScp;
+  const scpInstance = scp;
+  const addon = rawAddon;
 
   // ---------------------------------------------------------------------------
   // Relay lifecycle state
   // ---------------------------------------------------------------------------
 
-  let relayHandle: Awaited<ReturnType<typeof addon.relayStartInMemory>> | null = null;
+  // The relay handle is an opaque `NapiRelayHandle` minted by the SCP that
+  // owns it — handle affinity (#1549 Phase 4) rejects cross-instance use
+  // with `SCP-PERM-3030`, so everything below operates against `scpInstance`
+  // / `nativeHandle` exclusively.
+  let relayHandle: {
+    readonly relayUrl: string;
+    readonly relayPort: number;
+    readonly isShutdown: boolean;
+    shutdown(): void;
+  } | null = null;
 
   beforeAll(async () => {
-    // Start an in-memory relay on an ephemeral port
-    relayHandle = await addon.relayStartInMemory();
+    // Start an in-memory relay on an ephemeral port. `relayStartInMemory`
+    // is a per-instance method on the NAPI `Scp` class post-ADR-048
+    // (was `addon.relayStartInMemory()` before PR 4).
+    const handle = await nativeHandle.relayStartInMemory();
+    relayHandle = handle;
 
     // Bootstrap identity first to get a DID for MLS credential identity.
     // This must happen BEFORE configureRelayTransport because the
-    // ContextManager OnceLock is set by whichever call wins the race.
+    // ContextManager is initialized lazily by whichever per-instance call
+    // wins the race.
     const bootstrap = await napi.identityCreate("in_memory");
 
     // Configure the ContextManager with a relay-backed transport provider.
     // configureRelayTransport creates a relay connection and wraps it in
     // RelayTransportProvider, so contextSend publishes encrypted payloads
-    // through the relay. Must be called BEFORE any contextCreate (which
-    // triggers init_context_manager via OnceLock).
-    await addon.configureRelayTransport(relayHandle.relayUrl, bootstrap.did);
+    // through the relay. Must be called BEFORE any contextCreate.
+    //
+    // Post-ADR-048 this is a per-instance method on the `Scp` class.
+    await nativeHandle.configureRelayTransport(handle.relayUrl, bootstrap.did);
 
     // Establish a SECOND WebSocket connection for contextSubscribe.
-    // contextSubscribe uses the global RELAY_ADAPTER (set by
-    // transportConnect) for its subscription stream, separate from the
-    // ContextManager's transport provider.
-    await addon.transportConnect(relayHandle.relayUrl);
+    // contextSubscribe uses the bridge's transport manager for its
+    // subscription stream, separate from the ContextManager's transport
+    // provider. `napi.transportConnect` dispatches through the same SCP
+    // instance (the `Bridge` wrapper routes every call through
+    // `scpInstance`).
+    await napi.transportConnect(handle.relayUrl);
   });
 
   // ---------------------------------------------------------------------------
@@ -116,13 +150,19 @@ if (bridge === null || serverAddon === null) {
   afterAll(async () => {
     // Shutdown timeout is in milliseconds after #1549 Phase 4 unit
     // unification — 1000 ms (1 second) gives pending tasks time to
-    // drain without stalling the suite. `napi.shutdown` is now async
-    // (returns `Promise<void>`); previously sync — fire-and-forget
-    // would clear bridge state mid-test in later tests. The `napi`
-    // handle is the `BridgeApi` wrapper — it keeps a `number`-valued
-    // `shutdown(ms)` signature through the #1692 NAPI `u64` widening;
-    // the wrapper converts to `BigInt` internally before crossing FFI.
+    // drain without stalling the suite. `napi.shutdown` is the `Bridge`
+    // wrapper, which keeps a `number`-valued signature and coerces to
+    // `bigint` internally before crossing the FFI boundary (#1692 NAPI
+    // `u64` widening).
+    //
+    // The shutdown call goes through the single `SCP` instance that
+    // owns every handle minted above, so the suite never risks
+    // cross-instance affinity rejections (`SCP-PERM-3030`).
     await napi.shutdown(1000);
+    // Reference the `scpInstance` handle explicitly so the suite's
+    // type-narrowing keeps it live through `afterAll` — otherwise the
+    // variable would appear unused to the linter after the bridge call.
+    void scpInstance;
     if (relayHandle && !relayHandle.isShutdown) {
       relayHandle.shutdown();
     }
@@ -612,14 +652,16 @@ if (bridge === null || serverAddon === null) {
 
   describe("Discovery (real NAPI)", () => {
     test("parses a discovery handle address", () => {
-      const result = napi.discoveryParseAddress("alice@cooking-community");
+      // `discoveryParseAddress` is a stateless module-level helper — not
+      // on the `Scp` class. Dispatch through the raw addon post-ADR-048.
+      const result = addon.discoveryParseAddress("alice@cooking-community");
       const parsed = JSON.parse(result);
       expect(parsed.type).toBe("DiscoveryHandle");
       expect(parsed.local_part).toBe("alice");
     });
 
     test("parses a domain handle address", () => {
-      const result = napi.discoveryParseAddress("alice@example.com");
+      const result = addon.discoveryParseAddress("alice@example.com");
       const parsed = JSON.parse(result);
       expect(parsed.type).toBe("DomainHandle");
       expect(parsed.local_part).toBe("alice");
@@ -627,35 +669,35 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("creates a discovery query with capabilities", () => {
-      const result = napi.discoveryCreateQuery(["code_review"], undefined, undefined);
+      const result = addon.discoveryCreateQuery(["code_review"], undefined, undefined);
       expect(typeof result).toBe("string");
       const parsed = JSON.parse(result);
       expect(parsed.capability_filter).toContain("code_review");
     });
 
     test("creates a discovery query with keywords", () => {
-      const result = napi.discoveryCreateQuery(undefined, ["rust", "security"], undefined);
+      const result = addon.discoveryCreateQuery(undefined, ["rust", "security"], undefined);
       const parsed = JSON.parse(result);
       expect(parsed.keywords).toContain("rust");
       expect(parsed.keywords).toContain("security");
     });
 
     test("creates an empty discovery query", () => {
-      const result = napi.discoveryCreateQuery(undefined, undefined, undefined);
+      const result = addon.discoveryCreateQuery(undefined, undefined, undefined);
       expect(typeof result).toBe("string");
       // Should be valid JSON.
       JSON.parse(result);
     });
 
     test("normalizes an address (lowercases and trims)", () => {
-      const result = napi.discoveryNormalizeAddress("  ALICE@Cooking  ");
+      const result = addon.discoveryNormalizeAddress("  ALICE@Cooking  ");
       expect(result).toBe("alice@cooking");
     });
 
     test("discovers contexts from an scp:// URI", async () => {
       const uri =
         "scp://context/deadbeef?relay=wss%3A%2F%2Frelay.example.com%2Fscp%2Fv1&mode=broadcast";
-      const raw = await napi.contextDiscover(uri);
+      const raw = await addon.contextDiscover(uri);
       const results = JSON.parse(raw);
       expect(Array.isArray(results)).toBe(true);
       expect(results.length).toBe(1);
@@ -664,7 +706,7 @@ if (bridge === null || serverAddon === null) {
     });
 
     test("rejects discovery with an invalid query", async () => {
-      await expect(napi.contextDiscover("not-a-did-or-uri")).rejects.toThrow();
+      await expect(addon.contextDiscover("not-a-did-or-uri")).rejects.toThrow();
     });
   });
 
@@ -809,46 +851,59 @@ if (bridge === null || serverAddon === null) {
   // ---------------------------------------------------------------------------
 
   describe("Bridge trust (real NAPI)", () => {
+    // `bridgeEvaluateTrust` and `bridgeRegister` are stateless module-level
+    // helpers on the raw addon — not on the `Scp` class. Post-ADR-048 the
+    // test calls dispatch through `addon` directly. The raw addon returns
+    // camelCase keys (napi-rs `#[napi(object)]` default); the Bridge
+    // wrapper's snake_case normalization no longer applies here so the
+    // assertions below read the camelCase shape.
     test("evaluates trust for native non-bridged action (highest tier)", () => {
-      const tier = napi.bridgeEvaluateTrust(false, true, "shadow");
+      const tier = addon.bridgeEvaluateTrust(false, true, "shadow");
       expect(typeof tier).toBe("number");
       // Native + non-bridged should be highest trust.
       expect(tier).toBe(3);
     });
 
     test("evaluates trust for shadow bridged action (lowest tier)", () => {
-      const tier = napi.bridgeEvaluateTrust(true, false, "shadow");
+      const tier = addon.bridgeEvaluateTrust(true, false, "shadow");
       expect(typeof tier).toBe("number");
       expect(tier).toBeLessThan(3);
     });
 
     test("evaluates trust for claimed bridged action", () => {
-      const tier = napi.bridgeEvaluateTrust(true, false, "claimed");
+      const tier = addon.bridgeEvaluateTrust(true, false, "claimed");
       expect(typeof tier).toBe("number");
       // Claimed should be higher trust than shadow when bridged.
-      const shadowTier = napi.bridgeEvaluateTrust(true, false, "shadow");
+      const shadowTier = addon.bridgeEvaluateTrust(true, false, "shadow");
       expect(tier).toBeGreaterThanOrEqual(shadowTier);
     });
 
     test("registers a bridge connector", () => {
-      const reg = napi.bridgeRegister(
+      const reg = addon.bridgeRegister(
         "ctx-bridge-test",
         "did:key:operator",
         "did:key:governance",
         "discord",
         "relay",
       );
-      expect(reg.bridge_id).toBeTruthy();
-      expect(reg.operator_did).toBe("did:key:operator");
+      // Raw addon returns camelCase keys.
+      expect(reg.bridgeId).toBeTruthy();
+      expect(reg.operatorDid).toBe("did:key:operator");
       expect(reg.platform).toBe("discord");
       expect(reg.mode).toBe("relay");
       expect(reg.status).toBe("active");
-      expect(reg.context_id).toBe("ctx-bridge-test");
+      expect(reg.contextId).toBe("ctx-bridge-test");
     });
 
     test("rejects self-approval (operator === governance)", () => {
       expect(() =>
-        napi.bridgeRegister("ctx-self", "did:key:operator", "did:key:operator", "discord", "relay"),
+        addon.bridgeRegister(
+          "ctx-self",
+          "did:key:operator",
+          "did:key:operator",
+          "discord",
+          "relay",
+        ),
       ).toThrow(/approver cannot be the same/);
     });
 
@@ -869,7 +924,7 @@ if (bridge === null || serverAddon === null) {
         "api",
         "cooperative",
       ] as const satisfies readonly BridgeMode[]) {
-        const reg = napi.bridgeRegister(`ctx-${mode}`, "did:key:op", "did:key:gov", "slack", mode);
+        const reg = addon.bridgeRegister(`ctx-${mode}`, "did:key:op", "did:key:gov", "slack", mode);
         expect(reg.status).toBe("active");
       }
     });
@@ -1117,7 +1172,7 @@ if (bridge === null || serverAddon === null) {
       expect(napi.provenanceCheckChainDepth(prov.chain_depth, undefined)).toBe(true);
 
       // Create a discovery query for the destination context.
-      const queryJson = napi.discoveryCreateQuery(["messages:read"], ["collaboration"], 3600);
+      const queryJson = addon.discoveryCreateQuery(["messages:read"], ["collaboration"], 3600);
       const query = JSON.parse(queryJson);
       expect(query.capability_filter).toContain("messages:read");
       expect(query.keywords).toContain("collaboration");
