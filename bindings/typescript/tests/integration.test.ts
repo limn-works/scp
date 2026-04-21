@@ -749,19 +749,40 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       ).toThrow(/invalid|unsupported|nonexistent/);
     });
 
-    // NOTE: both `scp.identityExecuteRecovery` and
-    // `scp.identityExecuteCustodyMigration` are sync-typed on the SDK
-    // wrapper but the underlying NAPI binding requires a tokio
-    // runtime — they throw SCP-IDENT-1027 / SCP-IDENT-1028 ("tokio
-    // runtime not available") when invoked from outside a tokio
-    // context. Coverage of the happy path is deferred pending a bridge
-    // fix (report attached). What we *can* assert at the SDK layer is
-    // that the sync entry point rejects obviously invalid DIDs.
+    // NAPI `identity_execute_recovery` / `identity_execute_custody_migration`
+    // previously relied on `Handle::try_current()` which fails on the
+    // napi-rs worker thread (no tokio context). Phase 4 PR 5 fix
+    // (commit 78102c871) switched both to `crate::runtime().block_on(...)`
+    // using the module-local tokio runtime; happy-path calls now succeed.
     it("scp.identityExecuteRecovery rejects an unknown tier synchronously", () => {
-      // Target tier must be one of the spec tiers (agent / subject /
-      // device). An empty context list with an unknown tier must fail
-      // before the tokio-requiring work runs.
+      // Target tier must be one of the spec tiers (agent / active_signing /
+      // identity_key). An unknown tier fails at the validation branch
+      // before any async work is driven.
       expect(() => scp.identityExecuteRecovery("did:dht:z6Nope", "nonexistent-tier", [])).toThrow();
+    });
+
+    it("scp.identityExecuteRecovery returns a JSON result on the happy path", async () => {
+      // Use a real identity so the DID is well-formed.
+      const identity = await scp.identityCreate("in_memory");
+      const resultJson = scp.identityExecuteRecovery(identity.did, "agent", []);
+      expect(typeof resultJson).toBe("string");
+      // The orchestrator returns a structured result with at least
+      // `did`, `tier`, and `completed_contexts` fields per spec §3.6.
+      const parsed = JSON.parse(resultJson) as Record<string, unknown>;
+      expect(parsed).toHaveProperty("tier");
+      expect(parsed).toHaveProperty("did");
+    });
+
+    it("scp.identityExecuteCustodyMigration surfaces the NotConfigured backend error", async () => {
+      // The NAPI bridge uses a NotConfigured migration backend by
+      // design — callers inject a real one through the SDK wrapper.
+      // Crossing the tokio barrier now succeeds (Phase 4 PR 5 fix);
+      // the orchestrator then fails with SCP-IDENT-1025 inside the
+      // backend. This assertion exercises that the async path runs.
+      const identity = await scp.identityCreate("in_memory");
+      expect(() => scp.identityExecuteCustodyMigration(identity.did, "software", [])).toThrow(
+        /SCP-IDENT-1025|not configured/i,
+      );
     });
 
     it("identityRotateKey is exposed on the raw NAPI handle", async () => {
