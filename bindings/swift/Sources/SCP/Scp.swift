@@ -92,8 +92,8 @@ public final class SCP: @unchecked Sendable {
     /// ``StorageConfig/inMemory`` variant; callers who want a Swift-native
     /// `URL` + `Data` surface over the SQLite variant should prefer
     /// ``SCP/withStorage(sqliteDir:key:)``.
-    public static func withStorage(_ config: StorageConfig) -> SCP {
-        SCP(inner: Scp.withStorage(config: config))
+    public static func withStorage(_ config: StorageConfig) throws -> SCP {
+        try SCP(inner: Scp.withStorage(config: config))
     }
 
     /// Constructs an `SCP` backed by a `SQLCipher`-encrypted database at
@@ -126,8 +126,8 @@ public final class SCP: @unchecked Sendable {
     /// - Returns: A fresh `SCP` wrapping a persistent bridge instance.
     ///
     /// Closes #1260, #1491 (Swift SDK surface).
-    public static func withStorage(sqliteDir: URL, key: Data) -> SCP {
-        SCP(inner: Scp.withStorage(config: .sqlite(path: sqliteDir.path, key: key)))
+    public static func withStorage(sqliteDir: URL, key: Data) throws -> SCP {
+        try SCP(inner: Scp.withStorage(config: .sqlite(path: sqliteDir.path, key: key)))
     }
 
     /// The monotonic identifier for this bridge instance, unique per

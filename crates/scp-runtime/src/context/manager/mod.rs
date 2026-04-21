@@ -2348,10 +2348,47 @@ impl ContextManager {
     /// `restore_context` that find no entry for a known context have no
     /// reconnect signal and will silently drop the context. With this
     /// snapshot, the reconnection pipeline fires on the next resume.
+    ///
+    /// **Data-loss guard (bug-catcher retro, PR 2):** If a prior non-degraded
+    /// snapshot already exists for this context, leave it alone. Transient
+    /// lock contention (e.g. a concurrent task holding the mutex for more
+    /// than 250ms) must not overwrite a previously-good snapshot with one
+    /// whose `mls_crypto_state` is empty. The prior snapshot is still
+    /// authoritative; the degraded marker is only useful when there is
+    /// **no** persisted state to lean on.
     fn persist_degraded_snapshot(&self, context_id: &str) {
         let Some(ref persistence) = self.persistence else {
             return;
         };
+        // Check whether a good (non-degraded) snapshot already exists.
+        // If so, preserve it — the prior state is authoritative and
+        // 250ms of contention is a lock-contention signal, not a
+        // context-state signal.
+        match persistence.load_context(context_id) {
+            Ok(Some(existing)) if !existing.needs_reconnect => {
+                tracing::debug!(
+                    context_id = %context_id,
+                    "skipping degraded snapshot write — prior good snapshot exists; \
+                     preserving authoritative state"
+                );
+                return;
+            }
+            Ok(_) => {
+                // No snapshot, or existing snapshot already marked
+                // degraded — overwrite is safe and necessary.
+            }
+            Err(e) => {
+                // Load failed — log and proceed with degraded write as
+                // a best-effort attempt. Refusing to write here would
+                // leave `restore_context` with no reconnect signal.
+                tracing::warn!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to load existing snapshot before degraded write; \
+                     proceeding with degraded snapshot"
+                );
+            }
+        }
         // Try to pull the context's current params and membership from
         // the contexts map without locking the mutex (we already know
         // the lock is held). Fall back to minimal fields if the context

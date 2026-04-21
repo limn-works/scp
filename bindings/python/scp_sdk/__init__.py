@@ -161,7 +161,7 @@ from scp_sdk.provenance import (
     check_chain_depth,
     evaluate_provenance_quality,
 )
-from scp_sdk.scp import SCP
+from scp_sdk.scp import SCP, InMemoryStorage, SqliteStorage, StorageConfig
 from scp_sdk.server import Node, Relay
 from scp_sdk.sync import classify_offline, get_policy, run_sync
 from scp_sdk.tools import (
@@ -243,6 +243,7 @@ __all__ = [
     "Identity",
     "IdentityAttestation",
     "IdentityError",
+    "InMemoryStorage",
     "McpClient",
     "McpProvenance",
     "McpServer",
@@ -271,6 +272,8 @@ __all__ = [
     "ShadowStatus",
     "SiteConfig",
     "SourceType",
+    "SqliteStorage",
+    "StorageConfig",
     "TestVector",
     "ToolCost",
     "ToolDefinition",

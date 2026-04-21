@@ -49,6 +49,8 @@ The class is named after the protocol, not after internal plumbing. This matches
 
 Every shared helper in `scp-ffi-common` operates on `&dyn BridgeInstanceCore`. Per-bridge callers pass their concrete instance. The four `Box<dyn Any>` slots introduced in Phase 4a are removed. Type safety is compile-time; there are no runtime downcasts. This satisfies the CLAUDE.md rule "enforce mechanically — type system over documentation."
 
+**Approved exemption — shared-variant types for storage-backed repositories.** The rule "per-bridge concrete structs, no shared type-erased slots" has one deliberate carve-out: types that enumerate a **closed, protocol-level** set of storage backends. `ProtocolRepoVariant { InMemory(…), Sqlite(…) }` is the canonical case. It is not bridge plumbing — the variants are dictated by `StorageConfig` (itself protocol-shaped: in-memory vs. persistent SQLCipher), the `Storage` trait is `scp_platform`-level, and every non-WASM bridge dispatches identically over the same arms. Duplicating the enum into `NapiProtocolRepoVariant` + `UniffiProtocolRepoVariant` + `PyProtocolRepoVariant` produces three identical match statements with no extra type safety — each bridge already owns its own concrete instance type, so the enum lives on a per-bridge field without ambiguity. The exemption is **narrow**: it applies only to closed-set enums whose variants trace to a protocol-level configuration type (today: `StorageConfig`). It does not re-admit `Box<dyn Any>`, runtime downcasts, or open-ended trait objects — those remain rejected per Phase 4a. `ProtocolRepoVariant` has been promoted into `scp-ffi-common` so the three bridges share the single definition; the carve-out is documented here so future maintainers do not re-litigate the decision.
+
 ### 3. Default-instance façade remains as a sunset scaffold
 
 `DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<{Py,Napi,Uniffi}BridgeInstance>>` (renamed from `BRIDGE_INSTANCE`; the concrete type varies per bridge — `PyBridgeInstance` in PyO3, `NapiBridgeInstance` in NAPI, `UniffiBridgeInstance` in UniFFI) stays in each bridge for one deprecation window. Existing free-function exports (`py_context_create`, `napi context_create`, UniFFI `context_create`) continue to work by forwarding to `SCP::default()`. Each forward emits a one-time deprecation warning per function name:
@@ -264,3 +266,17 @@ PR 3 closes the following issues:
 - **#1260** — UniFFI `ContextManager` persistence threading.
 - **#1678** — Async `resume` + multi-relay reconnect.
 - **#1342** — UniFFI real crypto; `FfiBridgeCrypto` deleted.
+
+### Non-SCP handle `instanceId` getters — known low-risk enumeration surface
+
+Every NAPI handle type (`NapiContextHandle`, `NapiIdentity`, `NapiUcanToken`, `NapiMcpServerHandle`, `NapiMcpClientHandle`, `NapiTestingHandle`, …) exposes a JS-visible `instanceId` getter via `#[napi(getter, js_name = "instanceId")]`. The getter returns the u64 as a JS string (u64 exceeds `Number.MAX_SAFE_INTEGER`) so the handle-affinity macro on the Rust side can read the value via `handle.instance_id()` — a separate inherent method used by `napi_check_handle!`.
+
+The getter is **redundant with the Rust-side method for affinity enforcement** — the macro calls the inherent `instance_id()` method on the Rust type, not the JS property. The getter exists so JS-side test harnesses and diagnostic code can correlate handles to the `Scp` instance that minted them.
+
+A defence-in-depth hardening would either:
+- mark the getters `#[napi(getter, skip)]` so the JS property is invisible at runtime (the Rust-side affinity check still sees the u64), or
+- gate the getter behind an authorisation check that verifies the caller holds the `Scp` instance that minted the handle.
+
+Both impose friction on legitimate tooling (e.g. `handle.instanceId === scp.instanceId` assertions in SDK tests) without reducing the risk surface meaningfully: an attacker who can execute JS in-process already has FFI reach, so enumerating `instanceId` across handles yields no capability they do not already have.
+
+Documented here so future security reviewers don't re-litigate: the getter stays. Any migration must coordinate with the SDK test harnesses and the handle-affinity macro. PR #1690 retro LOW.

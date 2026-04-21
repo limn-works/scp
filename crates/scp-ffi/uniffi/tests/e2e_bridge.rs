@@ -340,11 +340,11 @@ async fn context_join_and_leave() {
         .unwrap();
 
     // Check membership
-    let count = context_member_count(handle.clone()).await;
+    let count = context_member_count(handle.clone()).await.unwrap();
     assert_eq!(count, Some(2), "Should have 2 members after join");
-    assert!(context_is_member(handle.clone(), bob.did()).await);
+    assert!(context_is_member(handle.clone(), bob.did()).await.unwrap());
 
-    let dids = context_member_dids(handle.clone()).await;
+    let dids = context_member_dids(handle.clone()).await.unwrap();
     assert!(dids.contains(&bob.did()), "Member list should contain Bob");
     assert!(
         dids.contains(&alice.did()),
@@ -353,9 +353,9 @@ async fn context_join_and_leave() {
 
     // Bob leaves
     context_leave(handle.clone(), bob.clone()).await.unwrap();
-    let count_after = context_member_count(handle.clone()).await;
+    let count_after = context_member_count(handle.clone()).await.unwrap();
     assert_eq!(count_after, Some(1), "Should have 1 member after leave");
-    assert!(!context_is_member(handle.clone(), bob.did()).await);
+    assert!(!context_is_member(handle.clone(), bob.did()).await.unwrap());
 }
 
 /// C5 parity: `context_join` must accept the optional `spending_ucan_jwt`
@@ -400,7 +400,7 @@ async fn context_join_accepts_none_spending_ucan_jwt() {
     context_join(handle.clone(), bob.clone(), None)
         .await
         .unwrap();
-    let count = context_member_count(handle).await;
+    let count = context_member_count(handle).await.unwrap();
     assert_eq!(count, Some(2), "join with None spending UCAN must succeed");
 }
 
@@ -524,7 +524,7 @@ async fn context_member_role_returns_role_for_creator() {
         .await
         .unwrap();
 
-    let role = context_member_role(handle, alice.did()).await;
+    let role = context_member_role(handle, alice.did()).await.unwrap();
     assert!(role.is_some(), "Creator should have a role");
     let role_str = role.unwrap();
     // The role may be returned as a string name or as a debug representation.
@@ -603,7 +603,9 @@ async fn broadcast_lifecycle() {
     let _ = count;
 
     // Check is_subscriber
-    let is_sub = broadcast_is_subscriber(handle.clone(), "did:dht:zFake".to_owned()).await;
+    let is_sub = broadcast_is_subscriber(handle.clone(), "did:dht:zFake".to_owned())
+        .await
+        .unwrap();
     assert!(!is_sub, "Non-existent DID should not be subscriber");
 }
 

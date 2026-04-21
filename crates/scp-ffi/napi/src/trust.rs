@@ -16,7 +16,6 @@ use scp_ffi_common::error_codes as codes;
 use std::sync::Arc;
 
 use napi_derive::napi;
-use scp_ffi_common::trust_store::InMemoryFfiTrustStore;
 
 use crate::error::ScpNapiError;
 
@@ -306,11 +305,17 @@ pub fn aggregate_trust_input(
             validation_error(&format!("failed to parse challenge_results JSON: {e}"))
         })?;
 
-    // Use persistent storage if the global ProtocolRepository is initialized,
-    // otherwise fall back to an ephemeral in-memory store. See issue #502.
-    // Dispatches over `ProtocolRepoVariant` so SQLite-backed bridges route
+    // Dispatch over `ProtocolRepoVariant` so SQLite-backed bridges route
     // trust attestations into the same SQLCipher database as context
-    // snapshots and event log entries.
+    // snapshots and event log entries. See issue #502.
+    //
+    // If the default bridge is not yet initialized, that is a bridge
+    // initialization bug — the trust aggregation surface should never be
+    // reachable before `ensure_bridge_instance` has run. The former silent
+    // fallback to an ephemeral in-memory store produced a split-brain: the
+    // caller's `SCP({storage: sqlite})` writes landed in SQLCipher while
+    // trust aggregations — invisibly — landed in an empty ephemeral store.
+    // Surface the bug as `SCP-VALID-7005` instead.
     match crate::runtime::protocol_repository() {
         Some(crate::runtime::ProtocolRepoVariant::InMemory(repo)) => {
             let handle = crate::runtime().handle().clone();
@@ -348,19 +353,13 @@ pub fn aggregate_trust_input(
             )
             .map_err(|e| validation_error(&e.to_string()))
         }
-        None => scp_ffi_common::trust_store::populate_and_aggregate(
-            InMemoryFfiTrustStore::new(),
-            &context_id,
-            &subject_did,
-            cached_attestations,
-            &challenge_results,
-            &events,
-            merkle_root,
-            &consequence_rules,
-            &threshold_requirements,
-            &attestor_sets,
-        )
-        .map_err(|e| validation_error(&e.to_string())),
+        None => Err(napi::Error::from(ScpNapiError::Validation {
+            message: "bridge storage not initialized — trust aggregation is \
+                      unreachable until the default NapiBridgeInstance is \
+                      allocated (bridge init bug)"
+                .to_owned(),
+            code: codes::VALID_7005.to_owned(),
+        })),
     }
 }
 

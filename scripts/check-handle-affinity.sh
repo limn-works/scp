@@ -6,7 +6,7 @@
 # WHAT THIS CHECKS
 # ---------------------------------------------------------------------------
 # Every FFI function in one of the three non-WASM bridges
-#   crates/scp-ffi/src/        (PyO3   — #[pyfunction])
+#   crates/scp-ffi/src/        (PyO3   — #[pyfunction] / #[pymethods])
 #   crates/scp-ffi/napi/src/   (NAPI   — #[napi])
 #   crates/scp-ffi/uniffi/src/ (UniFFI — #[uniffi::export])
 # whose signature includes a parameter whose type ends in one of the handle
@@ -21,6 +21,19 @@
 # This guarantees that a handle minted by one `SCP` instance cannot be used
 # against a different `SCP` instance within the same process. Mismatches
 # return the error code SCP-PERM-3030 at runtime.
+#
+# Two shapes are covered:
+#   1. Free functions annotated with the bridge attribute directly
+#      (e.g. `#[pyfunction] fn foo(handle: &CtxHandle)`).
+#   2. Methods inside an FFI-exported `impl` block
+#      (e.g. `#[napi] impl Scp { fn foo(&self, handle: &CtxHandle) }`
+#      or `#[pymethods] impl Scp { fn foo(&self, handle: &CtxHandle) }`
+#      or `#[uniffi::export] impl Scp { fn foo(&self, handle: Arc<CtxHandle>) }`).
+#
+# Shape 2 is load-bearing for the SCP multi-instance migration (PR 4+,
+# issue #1687) — as handle-taking operations move from free functions to
+# `Scp` instance methods, the gate must catch a missing affinity check on
+# the method as it would on a free function.
 #
 # ---------------------------------------------------------------------------
 # WHEN THIS RUNS
@@ -121,11 +134,18 @@ for suffix in "${HANDLE_SUFFIXES[@]}"; do
     fi
 done
 
-# Per-bridge: directory, attribute, expected macro.
+# Per-bridge: directory, free-function attribute, impl-block attribute,
+# expected macro.
+#
+# The free-function attribute is the one that precedes a `fn` directly
+# (e.g. `#[pyfunction] fn foo()`). The impl-block attribute is the one
+# that precedes `impl Scp { ... }` (e.g. `#[pymethods] impl Scp { fn ... }`).
+# For NAPI and UniFFI the two attributes are the same; for PyO3 they
+# differ (`#[pyfunction]` vs `#[pymethods]`).
 BRIDGES=(
-    "pyo3|crates/scp-ffi/src|pyfunction|pyscp_check_handle"
-    "napi|crates/scp-ffi/napi/src|napi|napi_check_handle"
-    "uniffi|crates/scp-ffi/uniffi/src|uniffi::export|uniffi_check_handle"
+    "pyo3|crates/scp-ffi/src|pyfunction|pymethods|pyscp_check_handle"
+    "napi|crates/scp-ffi/napi/src|napi|napi|napi_check_handle"
+    "uniffi|crates/scp-ffi/uniffi/src|uniffi::export|uniffi::export|uniffi_check_handle"
 )
 
 TOTAL_CHECKED=0
@@ -155,7 +175,8 @@ scan_bridge() {
     local bridge_name="$1"
     local bridge_dir="$2"
     local attr="$3"
-    local macro_name="$4"
+    local impl_attr="$4"
+    local macro_name="$5"
 
     if [[ ! -d "$bridge_dir" ]]; then
         printf '%swarning:%s bridge dir %s does not exist, skipping %s\n' \
@@ -170,6 +191,7 @@ scan_bridge() {
             awk \
                 -v FILE="$file" \
                 -v ATTR="$attr" \
+                -v IMPL_ATTR="$impl_attr" \
                 -v MACRO="$macro_name" \
                 -v HANDLE_REGEX="$HANDLE_REGEX" '
             BEGIN {
@@ -187,6 +209,15 @@ scan_bridge() {
                 body_fn_line = 0
                 body_param_type = ""
                 body_found_macro = 0
+                # impl-block tracking: when we see the impl-block attribute
+                # followed by `impl ... {`, every `fn` method inside the
+                # block is subject to the same handle-affinity check as a
+                # free-function FFI export. We track nesting via a single
+                # depth counter (outer-most `{` of the impl block opens;
+                # matching `}` closes).
+                pending_impl_attr = 0
+                in_impl_depth = 0
+                impl_block_open = 0
             }
 
             # Track cfg(test) depth by counting braces after a `mod X {` that
@@ -243,6 +274,29 @@ scan_bridge() {
                     next
                 }
 
+                # Look for the impl-block attribute preceding an
+                # FFI-exported impl (e.g. `#[pymethods] impl Scp { ... }`
+                # or `#[napi] impl Scp { ... }`). Flag pending_impl_attr
+                # so the next `impl ... {` line opens an impl-tracked
+                # block. Note: impl_attr may equal attr (napi, uniffi)
+                # so we must check impl-first so a line like `#[napi]
+                # impl Scp {` opens the impl block rather than being
+                # consumed as a free-function attribute.
+                #
+                # Only arm pending_impl_attr at the top level (not inside
+                # an existing impl block). Inside an impl, the same
+                # attribute decorates methods, not nested impls — treating
+                # it as pending_impl_attr would cause the gate to latch
+                # onto the NEXT `impl ... {` in the file (e.g. a private
+                # helper impl below the exported one) and spuriously
+                # flag its methods.
+                impl_attr_pat = "#\\[" IMPL_ATTR "(\\]|\\()"
+                if (in_impl_depth == 0 && match(line, impl_attr_pat)) {
+                    pending_impl_attr = 1
+                    saw_attr = 1
+                    next
+                }
+
                 # Look for the bridge attribute. Match either the bare
                 # attribute (`#[pyfunction]`, `#[napi]`, `#[uniffi::export]`)
                 # or with arguments (`#[napi(...)]`, `#[pyo3(...)]`).
@@ -257,6 +311,61 @@ scan_bridge() {
                 # main attribute (e.g. pyo3 signature, napi(ts_return_type)).
                 if (saw_attr && match(line, /^[[:space:]]*#\[/)) {
                     next
+                }
+
+                # If pending_impl_attr is set and we encounter an
+                # `impl ... {` line, open a tracked impl block. The
+                # opening `{` is counted as depth 1; subsequent `{` and
+                # `}` lines balance it. When depth returns to 0, the
+                # block closes.
+                if (pending_impl_attr && match(line, /^[[:space:]]*impl[[:space:]]/)) {
+                    # Count braces on this line. Typical pattern has the
+                    # opening `{` on the same line as `impl Scp`.
+                    o = gsub(/\{/, "{", line)
+                    c = gsub(/\}/, "}", line)
+                    in_impl_depth += (o - c)
+                    pending_impl_attr = 0
+                    saw_attr = 0
+                    next
+                }
+                # pending_impl_attr is armed but this line is neither a
+                # continuation attribute nor an impl header. The usual
+                # reason is that the attribute decorated a free
+                # function (e.g. `#[napi] pub fn foo()` — napi uses the
+                # same attribute for free fns and impl blocks). Leave
+                # saw_attr set (the free-function path will consume
+                # it), but disarm pending_impl_attr so the NEXT `impl`
+                # in the file is not mistakenly treated as the target
+                # of this attribute.
+                if (pending_impl_attr && match(line, /^[[:space:]]*$/) == 0 \
+                    && match(line, /^[[:space:]]*#\[/) == 0) {
+                    pending_impl_attr = 0
+                }
+
+                # Inside an impl-tracked block, balance every line so we
+                # close when the outermost `}` lands. We also run the
+                # free-function-like fn detection below for every
+                # `fn` we encounter inside the block.
+                if (in_impl_depth > 0) {
+                    o = gsub(/\{/, "{", line)
+                    c = gsub(/\}/, "}", line)
+                    # Detect `fn ...` lines as implicitly bridge-exported.
+                    # Skip if this line starts a private / non-exported
+                    # helper (we treat all `fn` inside a bridge-exported
+                    # impl block as exported — UniFFI/NAPI/pymethods
+                    # only expose what the impl attribute covers, and
+                    # private methods are a future concern tracked by
+                    # the NAPI `#[napi(skip)]` / UniFFI `#[uniffi::method]`
+                    # visibility flags).
+                    if (!collecting && match(line, /^[[:space:]]*(pub[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/)) {
+                        saw_attr = 1
+                    }
+                    in_impl_depth += (o - c)
+                    if (in_impl_depth <= 0) {
+                        in_impl_depth = 0
+                    }
+                    # Fall through so the fn-detection block below
+                    # consumes the `fn` line on the same pass.
                 }
 
                 # Start of a function signature.
@@ -427,16 +536,16 @@ TMPDIR_RESULT=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_RESULT"' EXIT
 
 for entry in "${BRIDGES[@]}"; do
-    IFS='|' read -r bridge_name bridge_dir attr macro_name <<< "$entry"
+    IFS='|' read -r bridge_name bridge_dir attr impl_attr macro_name <<< "$entry"
     out_file="$TMPDIR_RESULT/$bridge_name.out"
-    scan_bridge "$bridge_name" "$bridge_dir" "$attr" "$macro_name" > "$out_file"
+    scan_bridge "$bridge_name" "$bridge_dir" "$attr" "$impl_attr" "$macro_name" > "$out_file"
 done
 
 # ---------------------------------------------------------------------------
 # Aggregate results
 # ---------------------------------------------------------------------------
 for entry in "${BRIDGES[@]}"; do
-    IFS='|' read -r bridge_name bridge_dir attr macro_name <<< "$entry"
+    IFS='|' read -r bridge_name bridge_dir attr impl_attr macro_name <<< "$entry"
     out_file="$TMPDIR_RESULT/$bridge_name.out"
     [[ -s "$out_file" ]] || continue
 

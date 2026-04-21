@@ -9139,63 +9139,52 @@ pub async fn broadcast_handle_key_request(
 
 /// Returns the number of broadcast subscribers for a context.
 ///
-/// Returns `None` if the context is not registered or not a broadcast context.
+/// Returns `Ok(None)` if the context is not a broadcast context. Returns
+/// `Err(ScpError)` if the handle is foreign or the bridge is not
+/// initialized — callers must not silently collapse these into a
+/// missing-context signal (PR #1690 retro: commit 14's hard-error
+/// contract).
 #[uniffi::export]
-pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u64> {
-    let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(handle);
-        Ok(())
-    })();
-    if check.is_err() {
-        return None;
-    }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return None;
-    };
-    manager
+pub async fn broadcast_subscriber_count(
+    handle: Arc<ContextHandle>,
+) -> Result<Option<u64>, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    let manager = crate::runtime::context_manager_expect()?;
+    Ok(manager
         .broadcast_subscriber_count(&handle.context_id)
         .await
-        .map(|n| n as u64)
+        .map(|n| n as u64))
 }
 
 /// Returns `true` if the given DID is a broadcast subscriber.
+///
+/// Returns `Err(ScpError)` if the handle is foreign or the bridge is not
+/// initialized; do not silently collapse those conditions into `false`.
 #[uniffi::export]
-pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) -> bool {
-    let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(handle);
-        Ok(())
-    })();
-    if check.is_err() {
-        return false;
-    }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return false;
-    };
-    manager
+pub async fn broadcast_is_subscriber(
+    handle: Arc<ContextHandle>,
+    did: String,
+) -> Result<bool, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    let manager = crate::runtime::context_manager_expect()?;
+    Ok(manager
         .is_broadcast_subscriber(&handle.context_id, &did)
-        .await
+        .await)
 }
 
 /// Returns the broadcast admission policy for a context.
 ///
-/// Returns the policy as a string: `"Open"` or `"Gated"`.
-/// Returns `None` if the context is not a broadcast context.
+/// Returns `Ok(Some(policy))` with the policy as a string (`"Open"` or
+/// `"Gated"`), `Ok(None)` if the context is not a broadcast context, and
+/// `Err(ScpError)` for handle-affinity or bridge-not-initialized errors.
 #[uniffi::export]
-pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
-    let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(handle);
-        Ok(())
-    })();
-    if check.is_err() {
-        return None;
-    }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return None;
-    };
-    manager
+pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Result<Option<String>, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    let manager = crate::runtime::context_manager_expect()?;
+    Ok(manager
         .broadcast_admission(&handle.context_id)
         .await
-        .map(|a| format!("{a:?}"))
+        .map(|a| format!("{a:?}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -9204,76 +9193,58 @@ pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
 
 /// Returns the current member count for a context.
 ///
-/// Returns `None` if the context is not registered.
+/// Returns `Ok(None)` if the context is not registered; `Err(ScpError)`
+/// for handle-affinity or bridge-not-initialized errors — these are
+/// programmer / lifecycle bugs, not a missing-context signal.
 #[uniffi::export]
-pub async fn context_member_count(handle: Arc<ContextHandle>) -> Option<u64> {
-    let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(handle);
-        Ok(())
-    })();
-    if check.is_err() {
-        return None;
-    }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return None;
-    };
-    manager
+pub async fn context_member_count(handle: Arc<ContextHandle>) -> Result<Option<u64>, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    let manager = crate::runtime::context_manager_expect()?;
+    Ok(manager
         .member_count(&handle.context_id)
         .await
-        .map(|n| n as u64)
+        .map(|n| n as u64))
 }
 
 /// Returns `true` if the given DID is a member of the context.
+///
+/// Returns `Err(ScpError)` for handle-affinity or bridge-not-initialized
+/// errors — callers must not silently collapse those into `false`.
 #[uniffi::export]
-pub async fn context_is_member(handle: Arc<ContextHandle>, did: String) -> bool {
-    let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(handle);
-        Ok(())
-    })();
-    if check.is_err() {
-        return false;
-    }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return false;
-    };
-    manager.is_member(&handle.context_id, &did).await
+pub async fn context_is_member(handle: Arc<ContextHandle>, did: String) -> Result<bool, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    let manager = crate::runtime::context_manager_expect()?;
+    Ok(manager.is_member(&handle.context_id, &did).await)
 }
 
 /// Returns all member DIDs for a context.
+///
+/// Returns `Err(ScpError)` for handle-affinity or bridge-not-initialized
+/// errors — callers must not silently collapse those into an empty list,
+/// which would look like "context has no members" to the caller.
 #[uniffi::export]
-pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Vec<String> {
-    let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(handle);
-        Ok(())
-    })();
-    if check.is_err() {
-        return Vec::new();
-    }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return Vec::new();
-    };
-    manager.member_dids(&handle.context_id).await
+pub async fn context_member_dids(handle: Arc<ContextHandle>) -> Result<Vec<String>, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    let manager = crate::runtime::context_manager_expect()?;
+    Ok(manager.member_dids(&handle.context_id).await)
 }
 
 /// Returns the role assignment for a specific member as a JSON string.
 ///
-/// Returns `None` if the member is not found or the context is not registered.
+/// Returns `Ok(None)` if the member is not found or the context is not
+/// registered; `Err(ScpError)` for handle-affinity or bridge-not-
+/// initialized errors.
 #[uniffi::export]
-pub async fn context_member_role(handle: Arc<ContextHandle>, did: String) -> Option<String> {
-    let check: Result<(), ScpError> = (|| {
-        crate::uniffi_check_handle!(handle);
-        Ok(())
-    })();
-    if check.is_err() {
-        return None;
-    }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return None;
-    };
-    manager
+pub async fn context_member_role(
+    handle: Arc<ContextHandle>,
+    did: String,
+) -> Result<Option<String>, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    let manager = crate::runtime::context_manager_expect()?;
+    Ok(manager
         .member_role(&handle.context_id, &did)
         .await
-        .map(|r| format!("{r:?}"))
+        .map(|r| format!("{r:?}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -10060,8 +10031,6 @@ pub fn aggregate_trust_input(
     cached_attestations_json: String,
     challenge_results_json: String,
 ) -> Result<String, ScpError> {
-    use scp_ffi_common::trust_store::InMemoryFfiTrustStore;
-
     if context_id.is_empty() {
         return Err(ScpError::Validation {
             msg: "context_id must not be empty".to_owned(),
@@ -10128,11 +10097,17 @@ pub fn aggregate_trust_input(
             code: codes::VALID_7049.to_owned(),
         })?;
 
-    // Use persistent storage if the global ProtocolRepository is initialized,
-    // otherwise fall back to an ephemeral in-memory store. See issue #502.
-    // Dispatches over `ProtocolRepoVariant` so SQLite-backed bridges route
+    // Dispatch over `ProtocolRepoVariant` so SQLite-backed bridges route
     // trust attestations into the same SQLCipher database as context
-    // snapshots and event log entries.
+    // snapshots and event log entries. See issue #502.
+    //
+    // If the default bridge is not yet initialized, that is a bridge
+    // initialization bug — the trust aggregation surface should never be
+    // reachable before `ensure_bridge_instance` has run. The former silent
+    // fallback to an ephemeral in-memory store produced a split-brain: the
+    // caller's `SCP({storage: sqlite})` writes landed in SQLCipher while
+    // trust aggregations — invisibly — landed in an empty ephemeral store.
+    // Surface the bug as `SCP-VALID-7005` instead.
     match crate::runtime::protocol_repository() {
         Some(crate::runtime::ProtocolRepoVariant::InMemory(repo)) => {
             let handle = crate::runtime().handle().clone();
@@ -10180,21 +10155,12 @@ pub fn aggregate_trust_input(
                 code: codes::VALID_7052.to_owned(),
             })
         }
-        None => scp_ffi_common::trust_store::populate_and_aggregate(
-            InMemoryFfiTrustStore::new(),
-            &context_id,
-            &subject_did,
-            cached_attestations,
-            &challenge_results,
-            &events,
-            merkle_root,
-            &consequence_rules,
-            &threshold_requirements,
-            &attestor_sets,
-        )
-        .map_err(|e| ScpError::Validation {
-            msg: e.to_string(),
-            code: codes::VALID_7052.to_owned(),
+        None => Err(ScpError::Validation {
+            msg: "bridge storage not initialized — trust aggregation is \
+                  unreachable until the default UniffiBridgeInstance is \
+                  allocated (bridge init bug)"
+                .to_owned(),
+            code: codes::VALID_7005.to_owned(),
         }),
     }
 }

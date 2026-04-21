@@ -75,6 +75,14 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+/// Per-URL timeout for the parallel relay reconnect pass in
+/// [`CoreFields::reconnect_transport_if_pending`]. Bounds the worst case
+/// when a single slow (or attacker-controlled) relay would otherwise
+/// stall the entire reconnect. 5 seconds accommodates real-world TLS +
+/// relay handshake overhead while still failing fast on an unresponsive
+/// peer. See red-hat RED-1003.
+const RECONNECT_PER_URL_TIMEOUT: Duration = Duration::from_secs(5);
+
 use crate::IdentityBackedDidResolver;
 use crate::bridge_state::BridgeContextState;
 
@@ -995,7 +1003,11 @@ impl CoreFields {
     /// shutdown and we must not resurrect it by admitting a late writer.
     /// Without this guard, a concurrent `add_relay_url` racing with a
     /// shutdown-triggered `relay_urls.clear()` could leave a stale URL in
-    /// the set that a subsequent `resume` would try to dial.
+    /// the set that a subsequent `resume` would try to dial. The
+    /// `is_shutdown()` check is performed twice — once fast-path before
+    /// acquiring the lock, and once after — to close the TOCTOU window
+    /// between the first check and the insert (symmetric with
+    /// [`register_shutdown_hook`]).
     ///
     /// If the `relay_urls` mutex is poisoned (a previous caller panicked
     /// while holding it), the URL is silently dropped and a warning is
@@ -1006,6 +1018,19 @@ impl CoreFields {
         }
         match self.relay_urls.lock() {
             Ok(mut guard) => {
+                // Re-check `is_shutdown` after acquiring the lock to close
+                // the TOCTOU window between the check above and the insert
+                // below. Without this, a concurrent `shutdown()` could drain
+                // and clear the `relay_urls` set (inside
+                // `shutdown_core_async`) after we saw `is_shutdown() ==
+                // false` but before our insert, leaving a stale URL in a
+                // set that a subsequent `resume()` would try to dial.
+                // Matches the symmetric re-check pattern in
+                // [`register_shutdown_hook`].
+                if self.is_shutdown() {
+                    drop(guard);
+                    return;
+                }
                 guard.insert(url);
             }
             Err(_) => {
@@ -1100,41 +1125,88 @@ impl CoreFields {
         // single adapter, so calling it in a loop and set_transport'ing each
         // time would keep only the last URL's adapter. Using `builder()` +
         // `add_adapter` preserves multi-relay semantics.
-        let mut manager = scp_transport::TransportManager::builder();
-        let mut first_failure: Option<LifecycleError> = None;
-        let mut connected_count = 0_usize;
+        //
+        // Dial every URL in parallel with a per-URL timeout. A serial loop
+        // would let a single slow (or attacker-controlled) relay stall
+        // reconnect against every remaining relay in the pending set —
+        // reducing the multi-relay tolerance the caller paid for to the
+        // slowest link. A 5s ceiling per URL bounds the worst case while
+        // still accommodating real-world TLS + relay handshake overhead.
+        // See red-hat RED-1003.
+        let mut join_set: tokio::task::JoinSet<(
+            String,
+            Result<scp_transport::native::adapter::NativeRelayAdapter, String>,
+        )> = tokio::task::JoinSet::new();
         for url in urls {
             let sourced = scp_transport::relay::connection::SourcedRelayUrl {
                 url: url.clone(),
                 source: scp_transport::relay::connection::RelayUrlSource::Explicit,
             };
-            let adapter = match scp_transport::native::adapter::NativeRelayAdapter::connect_sourced(
-                &sourced,
-                Some(&profile),
-            )
-            .await
-            {
-                Ok(a) => a,
-                Err(e) => {
+            let profile_for_task = profile; // TransportProfile is Copy
+            let url_for_task = url.clone();
+            join_set.spawn(async move {
+                let outcome = match tokio::time::timeout(
+                    RECONNECT_PER_URL_TIMEOUT,
+                    scp_transport::native::adapter::NativeRelayAdapter::connect_sourced(
+                        &sourced,
+                        Some(&profile_for_task),
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(adapter)) => Ok(adapter),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_elapsed) => Err(format!(
+                        "connect timeout after {}s",
+                        RECONNECT_PER_URL_TIMEOUT.as_secs()
+                    )),
+                };
+                (url_for_task, outcome)
+            });
+        }
+        // Collect every result. Sort by URL before registering adapters so
+        // the adapter ordering inside `TransportManager` is deterministic
+        // regardless of network-timing jitter across the spawned tasks.
+        let mut results: Vec<(String, Result<_, _>)> = Vec::new();
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok(pair) => results.push(pair),
+                Err(join_err) => {
+                    tracing::warn!(
+                        error = %join_err,
+                        "reconnect_transport_if_pending: spawned task panicked — \
+                         ignoring this URL for this reconnect cycle"
+                    );
+                }
+            }
+        }
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut manager = scp_transport::TransportManager::builder();
+        let mut first_failure: Option<LifecycleError> = None;
+        let mut connected_count = 0_usize;
+        for (url, outcome) in results {
+            match outcome {
+                Ok(adapter) => {
+                    // `add_adapter` may return an `EvictionOutcome` if we hit the
+                    // connection budget; we don't surface it here because the
+                    // caller's reconnect intent is best-effort multi-relay.
+                    let _eviction = manager.add_adapter(Box::new(adapter));
+                    connected_count += 1;
+                }
+                Err(reason) => {
                     tracing::warn!(
                         url = %url,
-                        error = %e,
+                        error = %reason,
                         "reconnect_transport_if_pending: relay reconnect failed — leaving URL in pending set for retry"
                     );
                     if first_failure.is_none() {
                         first_failure = Some(LifecycleError::ReconnectFailed {
                             url: url.clone(),
-                            reason: e.to_string(),
+                            reason,
                         });
                     }
-                    continue;
                 }
-            };
-            // `add_adapter` may return an `EvictionOutcome` if we hit the
-            // connection budget; we don't surface it here because the
-            // caller's reconnect intent is best-effort multi-relay.
-            let _eviction = manager.add_adapter(Box::new(adapter));
-            connected_count += 1;
+            }
         }
         // Only install the manager if at least one adapter is registered —
         // installing an empty manager would make later relay operations fail
@@ -2044,11 +2116,17 @@ impl HandleAffinityError {
 
 impl std::fmt::Display for HandleAffinityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Sanitized message: internal ids are not interesting to end users
-        // but are preserved in `Debug` for operator correlation.
+        // Sanitized message: internal ids stay out of the user-visible
+        // string (they are preserved in `Debug` for operator correlation).
+        // The recovery hint points the caller at the mechanical fix —
+        // use the SCP instance that minted the handle, or mint a fresh
+        // handle from the SCP instance the caller intends to operate on.
+        // See PR #1690 retro api-design MAJOR.
         write!(
             f,
-            "handle belongs to a different SCP instance — operation rejected"
+            "handle belongs to a different SCP instance — use the SCP \
+             instance that created this handle (check \
+             scp.instance_id matches handle.instance_id)"
         )
     }
 }
@@ -3195,6 +3273,43 @@ mod tests {
     }
 
     #[test]
+    fn add_relay_url_race_with_shutdown_never_leaks_urls() {
+        // Regression: if `add_relay_url`'s `is_shutdown()` check happens
+        // outside the lock, a concurrent shutdown can clear the URL set
+        // between the check and the insert. The post-condition of a
+        // completed shutdown is that `pending_relay_urls()` is empty; if
+        // the race leaves any URL behind, a subsequent `resume()` would
+        // dial a relay the caller already walked away from.
+        //
+        // Run 50 trials × 100 concurrent URL adds racing against shutdown.
+        // Each trial constructs a fresh instance, launches a writer thread
+        // pushing 100 distinct URLs, concurrently shuts the instance down,
+        // joins both, and asserts the post-shutdown URL set is empty.
+        use std::thread;
+        for trial in 0..50 {
+            let instance = Arc::new(CoreFields::with_context_manager(test_context_manager()));
+            let writer_instance = Arc::clone(&instance);
+            let writer = thread::spawn(move || {
+                for i in 0..100 {
+                    writer_instance.add_relay_url(format!("wss://relay{i}.example.com"));
+                }
+            });
+            let shutdown_instance = Arc::clone(&instance);
+            let shutter = thread::spawn(move || {
+                shutdown_instance.shutdown();
+            });
+            writer.join().unwrap();
+            shutter.join().unwrap();
+            assert!(
+                instance.pending_relay_urls().is_empty(),
+                "trial {trial}: relay URLs leaked past shutdown — \
+                 add_relay_url admitted a writer after shutdown cleared the set"
+            );
+            assert!(!instance.has_pending_relay_urls());
+        }
+    }
+
+    #[test]
     fn clear_transport_preserves_relay_urls() {
         let instance = CoreFields::with_context_manager(test_context_manager());
         instance
@@ -3269,6 +3384,50 @@ mod tests {
         assert!(
             instance.pending_relay_urls().contains(&unreachable),
             "failing URL must remain in pending set for retry"
+        );
+    }
+
+    // Red-hat RED-1003: multi-relay reconnect must dial in parallel with
+    // per-URL timeouts, so one slow relay cannot serialize behind itself
+    // the dials for every other pending relay. With the serial-loop
+    // implementation, three unreachable hosts would take roughly
+    // 3 × (full TCP connect timeout) seconds; with the parallel
+    // implementation + 5s per-URL timeout, they complete in ~5s.
+    //
+    // We assert only that the total elapsed time is bounded well below
+    // the serial worst case — we do not assert an exact parallel lower
+    // bound because `NativeRelayAdapter::connect_sourced` may surface
+    // DNS or route-unreachable errors faster than the 5s ceiling. The
+    // test is a regression guard: if someone reintroduces the serial
+    // loop, this deadline trips.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconnect_transport_if_pending_dials_urls_in_parallel() {
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        // Three reserved TEST-NET-1 addresses, different ports — each
+        // unroutable and distinct, so the OS cannot coalesce.
+        for port in [10_000_u16, 10_001, 10_002] {
+            instance.add_relay_url(format!("ws://192.0.2.1:{port}/"));
+        }
+
+        let start = std::time::Instant::now();
+        let result = instance.reconnect_transport_if_pending().await;
+        let elapsed = start.elapsed();
+
+        // Must surface a ReconnectFailed rather than succeed.
+        assert!(
+            matches!(result, Err(LifecycleError::ReconnectFailed { .. })),
+            "unreachable URLs must surface as ReconnectFailed, got {result:?}"
+        );
+        // Parallel + 5s-per-URL timeout: upper bound ~5s + scheduling
+        // slack. Serial 3-URL loop with a per-URL ceiling >= 5s would
+        // exceed 15s. Use a generous 10s ceiling to avoid CI flakes from
+        // slow runners while still tripping on a regression to a serial
+        // loop that lets the per-URL ceiling accumulate.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "3 unreachable URLs must complete in under 10s with parallel \
+             dials — got {elapsed:?}. A serial loop would compound each \
+             URL's 5s timeout."
         );
     }
 
