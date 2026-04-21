@@ -446,7 +446,7 @@ ChallengeVerification {
      | SchemaMatch   { schema: JsonSchema }              // output must validate against schema
      | ContainsAll   { required: Vec<String> }           // output must contain all strings
      | ContainsNone  { forbidden: Vec<String> }          // output must contain none of these
-     | CustomEval    { evaluator_tool_id: ToolId }       // a registered tool evaluates the output
+     | CustomEval    { evaluator_outlet_id: OutletId }   // a registered outlet evaluates the output
    ```
 
 2. **Challenge execution.** The challenged agent processes each `TestCase` and returns results:
@@ -807,18 +807,28 @@ Any value with bits 24..31 set is rejected at mint with `SCP-TOOL-6114` (`caveat
 assert(days_of_week & !0x7Fu8 == 0u8)
 ```
 
-Any value with bit 7 set is rejected at mint with `SCP-TOOL-6114` (slug `days-of-week-high-bit-set`) and at narrow with `AttenuationViolation`. This closes the symmetric 1-bit covert-channel that would otherwise let a caller carry ambient data in the bit 7 slot alongside the intended day restriction.
+Any value with bit 7 set is rejected at mint with `SCP-TOOL-6114` (slug `days-of-week-high-bit-set`) and at narrow with `AttenuationViolation`. Double-sided enforcement is required: the mint check prevents a root-minted token from smuggling data in bit 7, and the narrow check catches any delegated token that attempts to set bit 7 on a child derived from a valid parent — closing the symmetric 1-bit covert-channel that would otherwise let a caller carry ambient data in the bit 7 slot alongside the intended day restriction.
+
+Both the `hours_of_day` high-bits check and the `days_of_week` bit-7 check run at mint AND at every narrow step; either side's failure is fatal. The mint-side assertion prevents a forged root from entering the delegation graph; the narrow-side assertion catches a parent-child pair where the child introduces high bits even if the parent was clean.
 
 **Mint limits.** At token mint time, the issuing SDK MUST enforce the following structural bounds:
 
 | Limit | Bound |
 |-------|-------|
-| Caveats per attestation | ≤ 8 |
+| Caveats per attestation | ≤ 8 populated non-`origin_kind` fields (the 12th field `origin_kind` is a structural attenuation invariant and does NOT count against this cap) |
 | `input_schema` serialized size | ≤ 4 KiB |
 | `input_schema` nesting depth | ≤ 8 |
 | List-typed field length (`allowed_adapters`, `allowed_target_dids`, `enum`) | ≤ 16 entries |
 
 Mints that exceed these limits are rejected at the SDK boundary with `SCP-TOOL-6114` (`caveat-mint-limit-exceeded`). The limits exist so that caveat parsing has predictable cost and cannot be turned into a DoS vector via pathologically large attestations.
+
+**Root-UCAN `origin_kind` consistency check.** At root-token mint time (no parent delegation), the mint-time validator MUST verify that `caveats.origin_kind` is compatible with the root UCAN's capability stem. For every capability in the root token:
+
+- If the stem is `outlet_query:*` or `outlet_query:{id}`, then `caveats.origin_kind` MUST be `OutletKind::Query` (or absent, in which case it is inferred as Query per §6.2.0.3 "inferred from the stem" rule).
+- If the stem is `outlet_call:*` or `outlet_call:{id}`, then `caveats.origin_kind` MUST be `OutletKind::Action` (or absent, inferred as Action).
+- A token mixing stems of different kinds MUST declare `caveats.origin_kind` absent; the inference then fails on the first ambiguous delegation and the chain is rejected at Step 7b.
+
+A mismatch between the stem's kind and an explicitly declared `caveats.origin_kind` is rejected at mint with `SCP-TOOL-6114` slug `origin-kind-stem-mismatch`. This is the root-side counterpart to the child-vs-parent `AttenuationViolation::OriginKindMismatch` equality check: together, the two checks make "`origin_kind` is bound to the signed UCAN chain" operationally true end-to-end (the mint check pins the root value; the narrow check preserves it through every delegation). Without the mint check, a forged root UCAN could declare any `origin_kind` that was self-consistent with the `narrow()` rule (equality) — the declared kind would then propagate unchallenged through the whole chain until the hop-target runtime check fires, at which point any emitted failure event has already leaked information about the forged origin. The mint check catches the forgery at root-token creation, before the chain can be delegated or exercised.
 
 **Runtime enforcement pipeline.** Caveats are enforced at three points in the UCAN validation pipeline:
 

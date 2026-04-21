@@ -36,7 +36,7 @@ This means:
 Apps interact with the protocol through a **capability declaration** — a structured, machine-readable manifest of what protocol capabilities the app needs. The protocol validates the declaration against the context's capability ceiling and the user's granted permissions, then provides exactly what was requested.
 
 ```
-App → Protocol:  "I need: messaging, member_list, tool_invoke(tool_a, tool_b)"
+App → Protocol:  "I need: messaging, member_list, outlet_call(outlet_a, outlet_b)"
 Protocol → App:  "Granted. Here are your interfaces."
 
 App → Protocol:  "I need: messaging, member_list, invite_members"
@@ -202,7 +202,7 @@ CallToolResult        →  collected stream  (Data + End chunks flattened)
 isError               →  OutletError envelope (§5.4.4)
 ```
 
-**Kind projection (§5.4.2).** MCP has no concept of Query/Action. When SCP outlets are exposed over MCP, the translator prefixes `outlet_id` with `query/` or `call/` in the MCP-facing view so MCP-consuming models can tell them apart lexically (e.g., the SCP outlet `current_weather` with `kind: Query` surfaces as MCP tool `query/current_weather`). When MCP tools are exposed into SCP, the translator defaults `kind: Action` unless the upstream MCP server advertises the SCP-specific `x-scp-kind` JSON Schema extension.
+**Kind projection (§5.4.2).** MCP has no concept of Query/Action. When SCP outlets are exposed over MCP, the translator prefixes `outlet_id` with `query.` or `call.` in the MCP-facing view so MCP-consuming models can tell them apart lexically (e.g., the SCP outlet `current_weather` with `kind: Query` surfaces as MCP tool `query.current_weather`). The `.` delimiter is chosen deliberately over `/` because MCP JSON-RPC reserves `/` as the method-separator convention (e.g., `tools/list`, `tools/call`); a `/` inside `tool.name` would conflict with MCP-routing parsers that split on `/`. The `.` character is unambiguous in MCP tool names and matches the dot-separated slug convention used elsewhere in SCP (e.g., error slugs `authorization.denied`). When MCP tools are exposed into SCP, the translator defaults `kind: Action` unless the upstream MCP server advertises the SCP-specific `x-scp-kind` JSON Schema extension.
 
 **Streaming projection (§5.4.5).** MCP today uses synchronous call/result. The translator collects chunks on the SCP side before responding to MCP. Streaming-aware MCP extensions (if standardized) can be mapped to SCP's `OutletStreamChunk` at a later revision; the wire types (`OutletStreamOpen/Chunk/Credit`) are already defined to accommodate direct mapping.
 

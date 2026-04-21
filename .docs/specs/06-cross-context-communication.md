@@ -6,24 +6,24 @@ Agents cannot cross contexts at the protocol level. This is absolute. An agent i
 
 Information may cross context boundaries through two protocol-level mechanisms:
 
-1. **Cross-context tool interfaces (§6.2)** — asymmetric, structured, request/response. One context queries another's tool. Governed by both contexts per call.
+1. **Cross-context outlet interfaces (§6.2)** — asymmetric, structured, request/response. One context queries another's outlet. Governed by both contexts per call.
 2. **Multi-parent child contexts (§5.13)** — symmetric, full context. A shared space governed by multiple parent contexts. Members from different parents interact as peers.
 
 Both mechanisms require explicit consent from all involved contexts. Neither allows agents to directly access another context's state. The first is for service-style interactions; the second is for collaborative ones.
 
-## 6.2 Context-to-Context Tool Interfaces
+## 6.2 Context-to-Context Outlet Interfaces
 
-### 6.2.0 Tool Interface Transport
+### 6.2.0 Outlet Interface Transport
 
-Cross-context tool calls require a physical transport mechanism to bridge the boundary between two isolated contexts. Two protocol-level mechanisms provide this:
+Cross-context outlet calls require a physical transport mechanism to bridge the boundary between two isolated contexts. Two protocol-level mechanisms provide this:
 
-1. **Shared-member bridging (primary).** When a human participates in both contexts, their SDK bridges tool requests and responses locally. The human's agent in Context A makes a tool call targeting Context B; the SDK routes the request through the human's membership in Context B, executes the call under Context B's governance, and returns the response to Context A. No relay-level cross-context routing is needed — the bridge operates entirely within the human's local SDK. Both contexts' governance is enforced: Context A's outbound policy and Context B's inbound policy are validated before the call proceeds. The human's SDK is the transport, and both event logs record the interaction with full provenance.
+1. **Shared-member bridging (primary).** When a human participates in both contexts, their SDK bridges outlet requests and responses locally. The human's agent in Context A makes an outlet call targeting Context B; the SDK routes the request through the human's membership in Context B, executes the call under Context B's governance, and returns the response to Context A. No relay-level cross-context routing is needed — the bridge operates entirely within the human's local SDK. Both contexts' governance is enforced: Context A's outbound policy and Context B's inbound policy are validated before the call proceeds. The human's SDK is the transport, and both event logs record the interaction with full provenance.
 
-2. **Multi-parent child contexts (fallback).** For cases without a shared member, a child context with parents from both the source and target contexts can serve as a bridge (§5.13). The child context inherits capability ceilings from both parents (intersection). Members from both parent contexts who join the child context can mediate tool calls within the child's governed space. This is heavier than shared-member bridging but covers the case where no single human has membership in both contexts.
+2. **Multi-parent child contexts (fallback).** For cases without a shared member, a child context with parents from both the source and target contexts can serve as a bridge (§5.13). The child context inherits capability ceilings from both parents (intersection). Members from both parent contexts who join the child context can mediate outlet calls within the child's governed space. This is heavier than shared-member bridging but covers the case where no single human has membership in both contexts.
 
-These two mechanisms cover all cross-context tool call scenarios. Direct agent-to-agent communication is not needed — tool interfaces with stateful sessions (§6.2.1) provide the same functional coverage (negotiation, coordination, multi-step workflows) with stronger security guarantees: every interaction is context-governed, schema-declared, rate-limited, and auditable. The context governs the tool call, not the agent.
+These two mechanisms cover all cross-context outlet call scenarios. Direct agent-to-agent communication is not needed — outlet interfaces with stateful sessions (§6.2.1) provide the same functional coverage (negotiation, coordination, multi-step workflows) with stronger security guarantees: every interaction is context-governed, schema-declared, rate-limited, and auditable. The context governs the outlet call, not the agent.
 
-Contexts can expose tool endpoints to other contexts. **The context governs the tool call, not the agent.** An agent in Context A does not directly contact Context B — the agent requests from Context A, Context A's governance decides whether to permit the outbound call, and Context B's governance decides whether to permit the inbound call and how to respond. Both contexts mediate. The agent never directly touches the other context.
+Contexts can expose outlet endpoints to other contexts. **The context governs the outlet call, not the agent.** An agent in Context A does not directly contact Context B — the agent requests from Context A, Context A's governance decides whether to permit the outbound call, and Context B's governance decides whether to permit the inbound call and how to respond. Both contexts mediate. The agent never directly touches the other context.
 
 This is the mechanism for all structured inter-agent interaction across context boundaries. Both contexts' governance models, capability ceilings, and role permissions gate every interaction.
 
@@ -32,20 +32,20 @@ Properties:
 - Both contexts opt in explicitly (bidirectional consent at the context level, not the agent level — see §6.2.0.1 for the consent protocol).
 - Data flows through defined function signatures, not through agent memory or discretion.
 - Auditable: every call through an interface is logged in both contexts' event logs with full provenance (§7.7).
-- Tool interfaces carry provenance: data received through an interface carries its origin context, invoking agent, timestamp, and chain depth (§7.7.1).
+- Outlet interfaces carry provenance: data received through an interface carries its origin context, invoking agent, timestamp, and chain depth (§7.7.1).
 - Rate-limited: both contexts can enforce rate limits on interface calls (see §6.2.0.2 for defaults).
-- **Chain depth limit.** Cross-context tool calls carry a `chain_depth` counter, incremented on each hop. A tool call at maximum depth cannot trigger further cross-context tool calls. Context-configurable via `ContextParams::max_chain_depth` (default: 8, range [1, 255]). There is no protocol hard maximum — chain depth is a context concern, and provenance quality naturally degrades with depth. This bounds amplification and makes transitive provenance degradation mechanically enforced (§9.2.1, §24.4, ADR-043).
-- **Schema constraints.** Tool schemas must satisfy a structural specificity floor at registration time — no unbounded string-only interfaces, minimum two distinct fields in input or output. This prevents degenerate broad-schema tools that function as arbitrary message channels (§9.2.1).
-- **Tool-level costs.** Individual tools may declare per-invocation costs in their registration metadata (§5.4). These are additive with context-level costs and carry their own payee DID. Cross-context tool calls inherit the target tool's cost structure. See §19.3 for economic policy and §19.2.2 for the payment integration sequence.
+- **Chain depth limit.** Cross-context outlet calls carry a `chain_depth` counter, incremented on each hop. An outlet call at maximum depth cannot trigger further cross-context outlet calls. Context-configurable via `ContextParams::max_chain_depth` (default: 8, range [1, 255]). There is no protocol hard maximum — chain depth is a context concern, and provenance quality naturally degrades with depth. This bounds amplification and makes transitive provenance degradation mechanically enforced (§9.2.1, §24.4, ADR-043).
+- **Schema constraints.** Outlet schemas must satisfy a structural specificity floor at registration time — no unbounded string-only interfaces, minimum two distinct fields in input or output. This prevents degenerate broad-schema outlets that function as arbitrary message channels (§9.2.1).
+- **Outlet-level costs.** Individual outlets may declare per-invocation costs in their registration metadata (§5.4). These are additive with context-level costs and carry their own payee DID. Cross-context outlet calls inherit the target outlet's cost structure. See §19.3 for economic policy and §19.2.2 for the payment integration sequence.
 
 #### 6.2.0.1 Bidirectional Consent Protocol
 
-Tool interface creation requires explicit consent from both the exposing context and the consuming context. The consent protocol:
+Outlet interface creation requires explicit consent from both the exposing context and the consuming context. The consent protocol:
 
-1. **Interface proposal.** An admin in Context A proposes exposing a tool to Context B via a governance action:
+1. **Interface proposal.** An admin in Context A proposes exposing an outlet to Context B via a governance action:
    ```
-   ProposeToolInterface {
-     tool_id:        ToolId,       // Tool to expose
+   ProposeOutletInterface {
+     outlet_id:      OutletId,     // Outlet to expose
      target_context: ContextId,    // Context B
      outbound_policy: OutboundPolicy,
      max_calls_per_minute: u32,    // Rate limit for this interface
@@ -53,36 +53,64 @@ Tool interface creation requires explicit consent from both the exposing context
    ```
    This proposal follows Context A's governance model (§5.9).
 
-2. **Outbound policy validation.** Context A validates that `tool:interface` is in its ceiling (§5.3) and the proposer holds the `tool:interface` capability.
+2. **Outbound policy validation.** Context A validates that `outlet:interface` is in its ceiling (§5.3) and the proposer holds the `outlet:interface` capability.
 
 3. **Interface offer.** On governance approval, Context A publishes an `InterfaceOffer` to its event log:
    ```
    InterfaceOffer {
-     offer_id:       [u8; 32],     // SHA-256(context_a_id || tool_id || context_b_id || timestamp)
+     offer_id:       [u8; 32],     // domain-separated, length-prefixed hash — see below
      source_context: ContextId,    // Context A
      target_context: ContextId,    // Context B
-     tool_schema:    ToolRegistration, // Full tool schema (§5.4.1)
+     outlet_schema:  OutletRegistration, // Full outlet schema (§5.4.1)
      outbound_policy: OutboundPolicy,
      expires_at:     u64,          // Offer expires if not accepted within 7 days
    }
    ```
 
+   **`offer_id` construction.** `offer_id` is a SHA-256 over a domain-separated, length-prefixed preimage so that field splits cannot produce collisions (matching §5.4.1 and §9.5.1):
+
+   ```
+   offer_id = SHA-256(
+     "SCP-OUTLET-OFFER-ID-V1:"
+     || len_be32(context_a_id) || context_a_id     // UTF-8 bytes
+     || len_be32(outlet_id)    || outlet_id        // UTF-8 bytes
+     || len_be32(context_b_id) || context_b_id     // UTF-8 bytes
+     || timestamp_be                                // 8 bytes, big-endian u64
+   )
+   ```
+
+   The `SCP-OUTLET-OFFER-ID-V1:` separator is registered in §9.18.2.
+
 4. **Acceptance.** A shared member carries the offer to Context B (shared-member bridging). Context B's governance decides whether to accept:
    ```
-   AcceptToolInterface {
+   AcceptOutletInterface {
      offer_id:       [u8; 32],
      inbound_policy: InboundPolicy,
    }
    ```
-   This follows Context B's governance model. Acceptance creates an `InterfaceEstablished` event in both event logs.
+   This follows Context B's governance model. Acceptance creates an `InterfaceEstablished` event in both event logs. The `InterfaceEstablished` event records `epoch_a` (Context A's MLS epoch counter at accept time) and `epoch_b` (Context B's MLS epoch counter at accept time) so verifiers can deterministically recompute `hop_salt` against the accept-epoch for any source_chain entry emitted during this interface's lifetime.
 
-   **`hop_salt` derivation.** The `InterfaceEstablished` event carries a `hop_salt: [u8; 32]` used to pseudonymize `source_chain.context_id` entries for observers who are not members of each hop (§5.4.4). The salt is deterministically derived from both contexts' MLS exporter keys so no raw random sampling is required, revocation of the interface rotates the salt automatically on re-establishment, and the salt cannot be chosen by either party alone:
+   **`hop_salt` derivation and lifecycle.** The `hop_salt: [u8; 32]` is used to pseudonymize `source_chain.context_id` entries for observers who are not members of each hop (§5.4.4). The salt is NOT stored as a persisted random blob; it is **derived on demand** from each context's current MLS exporter every time it is needed (pseudonymization at wrap time, verification at audit time). Both contexts independently compute the same salt whenever the same `(context_a_id, context_b_id, epoch_a, epoch_b)` tuple is presented. Revocation of the interface rotates the salt automatically on re-establishment (the re-accepted epochs will differ); normal epoch advancement within an interface rotates the salt automatically without bookkeeping.
 
    ```
-   // Both contexts derive the same 32-byte salt independently at acceptance time.
+   // Both contexts derive the same 32-byte salt independently on demand.
    // MLS_EXPORTER(label, context, length) is the RFC 9420 §8.5 export primitive.
-   ikm_a = MLS_EXPORTER("scp-context-hop-salt-v1", b"", 32)  // exporter on Context A's current epoch
-   ikm_b = MLS_EXPORTER("scp-context-hop-salt-v1", b"", 32)  // exporter on Context B's current epoch
+   // Each context uses its PEER's context_id as the label suffix — this ensures
+   // that ikm derived from Context A's exporter for the A↔B interface cannot be
+   // reused to pseudonymize any A↔C interface (different label → different key).
+   canonical_peer_id_a = context_b_id   // Context A uses Context B's id as suffix
+   canonical_peer_id_b = context_a_id   // Context B uses Context A's id as suffix
+
+   ikm_a = MLS_EXPORTER(
+     "scp-context-hop-salt-v1:" || canonical_peer_id_a,
+     b"",
+     32,
+   )  // exporter on Context A's current epoch, labeled with Context B's id
+   ikm_b = MLS_EXPORTER(
+     "scp-context-hop-salt-v1:" || canonical_peer_id_b,
+     b"",
+     32,
+   )  // exporter on Context B's current epoch, labeled with Context A's id
 
    // Canonical concatenation: lexicographically smaller context_id first, so both sides agree.
    ordered = if context_a_id < context_b_id { (ikm_a, ikm_b) } else { (ikm_b, ikm_a) }
@@ -98,16 +126,22 @@ Tool interface creation requires explicit consent from both the exposing context
    //   len_be32(min_id) || min_id || len_be32(max_id) || max_id
    ```
 
-   Because MLS exporter keys rotate on every epoch advance, `hop_salt` rotates naturally with each context's epoch progression without any interface-level bookkeeping. Revoking and re-establishing the interface also forces a fresh salt (each side re-exports on whatever epoch is current at re-acceptance). The `SCP-CONTEXT-HOP-SALT-V1:` separator is registered in §9.18.2. Both contexts store the derived salt in their interface state record; cross-context error wrapping (§5.4.4) reads the salt from this record when pseudonymizing hops.
+   **Why the label suffix is required (cross-interface reuse closure).** Without the peer-context suffix on the exporter label, both `ikm_a` for the A↔B interface and `ikm_a'` for an independent A↔C interface would be derived from the same MLS exporter key material (Context A's `"scp-context-hop-salt-v1"` export at the current epoch). Any party who established an interface with Context A and learned `ikm_a` would then be able to derive the `hop_salt` for every other interface Context A had with any other context — breaking the per-pair isolation the pseudonymization relies on. Including the peer's `context_id` in the MLS exporter label makes each per-pair IKM derive from a unique export key (each context produces a distinct exporter key per peer), so knowledge of `ikm_a` for one interface does not compromise pseudonymization for any other.
 
-5. **Teardown.** Either context can revoke the interface at any time via governance action `RevokeToolInterface { interface_id }`. Revocation is unilateral — no consent from the other side is needed. An `InterfaceRevoked` event is recorded in the revoking context's event log.
+   **Symmetry.** Context A and Context B use reciprocal labels — A's label is suffixed with B's id, B's label is suffixed with A's id. Because `hop_salt` HKDF-combines `ikm_a || ikm_b` after lexicographic ordering, and both sides agree on the ordering (ascending `context_id`), both sides compute byte-identical salts. The canonical-ordering step is what makes the construction symmetric despite the asymmetric label suffixes.
+
+   **Historic verifiability.** A `source_chain` entry emitted at hop time under epoch `(e_a, e_b)` is verifiable at audit time by recomputing `hop_salt` from the event-log record of the `InterfaceEstablished` event's recorded `(epoch_a, epoch_b)` — this freezes the epochs used for that particular hop even after the contexts have advanced further. Epoch advancement after a hop was logged does not invalidate the pseudonym already emitted; it only rotates the pseudonyms emitted by future hops.
+
+   The `SCP-CONTEXT-HOP-SALT-V1:` prefix (used both in the MLS exporter label family and in the HKDF info string) is registered in §9.18.2. Neither context stores a persistent `hop_salt` blob — they store only the accept-time `(epoch_a, epoch_b)` plus the peer's `context_id` (already present in the interface state), and rederive when needed.
+
+5. **Teardown.** Either context can revoke the interface at any time via governance action `RevokeOutletInterface { interface_id }`. Revocation is unilateral — no consent from the other side is needed. An `InterfaceRevoked` event is recorded in the revoking context's event log.
 
 **Outbound and inbound policies:**
 
 ```
 OutboundPolicy {
   allowed_callers:      Vec<DID>,   // DIDs in Context A authorized to use this interface.
-                                    // Empty = any member with tool:interface capability.
+                                    // Empty = any member with outlet:interface capability.
   max_calls_per_minute: u32,        // Rate limit from Context A's perspective.
   max_payload_bytes:    u32,        // Maximum request payload size. Default: 65536 (64 KiB).
   require_provenance:   bool,       // Whether responses must carry provenance. Default: true.
@@ -123,9 +157,9 @@ InboundPolicy {
 
 Outbound policy is set by Context A (the exposing context). Inbound policy is set by Context B (the consuming context). Both policies are enforced — a call must satisfy BOTH to proceed. The effective rate limit is `min(outbound.max_calls_per_minute, inbound.max_calls_per_minute)`.
 
-#### 6.2.0.2 Tool Interface Rate Limit Defaults
+#### 6.2.0.2 Outlet Interface Rate Limit Defaults
 
-Rate limits for cross-context tool interfaces use a sliding window counter with the following defaults:
+Rate limits for cross-context outlet interfaces use a sliding window counter with the following defaults:
 
 | Parameter | Default | Configurable range |
 |-----------|---------|-------------------|
@@ -134,7 +168,7 @@ Rate limits for cross-context tool interfaces use a sliding window counter with 
 | Burst allowance | 5 (calls above limit within 1 second) | 0 - 50 |
 | Window duration | 60 seconds (sliding) | 10 - 3600 seconds |
 
-**Enforcement semantics.** When a rate limit is exceeded, the call is rejected with error code `TOOL_INTERFACE_RATE_LIMITED` (code 4030). The response includes a `Retry-After` header indicating seconds until the next call will be accepted. Calls are NOT queued — rate-limited calls fail immediately. The caller's SDK MAY retry after the indicated delay.
+**Enforcement semantics.** When a rate limit is exceeded, the call is rejected with error code `OUTLET_INTERFACE_RATE_LIMITED` (code 4030). The response includes a `Retry-After` header indicating seconds until the next call will be accepted. Calls are NOT queued — rate-limited calls fail immediately. The caller's SDK MAY retry after the indicated delay.
 
 **Per-caller vs. per-interface limits.** Both limits are enforced independently. A single caller is limited to 10 calls/minute by default; all callers combined are limited to 60 calls/minute per interface. This prevents a single caller from monopolizing an interface.
 
@@ -183,25 +217,25 @@ Outlet streams (§5.4.5) cross context boundaries under the same §6.2 tool-inte
 - **UCAN check locus.** UCAN is validated ONCE at stream open (§5.4.5). Mid-stream revocation terminates at the next executor checkpoint, but already-emitted chunks remain authorized.
 - **Event log recording.** Each of the two contexts records exactly one `OutletInvokedEvent` for the stream, with the same `stream_manifest_hash` (§5.4.5). Cross-context provenance (§7.7) chains the two events via the `source_chain` field on the error envelope (when the stream fails) or on the final `End.provenance` (when it succeeds).
 
-### 6.2.1 Stateful Tool Sessions
+### 6.2.1 Stateful Outlet Sessions
 
-Tool interfaces support optional session-based multi-turn interaction. A tool can accept a session identifier and maintain state across sequential invocations. This enables multi-step workflows (negotiation, coordination, iterative refinement) within the governed tool call framework.
+Outlet interfaces support optional session-based multi-turn interaction. An outlet can accept a session identifier and maintain state across sequential invocations. This enables multi-step workflows (negotiation, coordination, iterative refinement) within the governed outlet call framework.
 
 ```
 // First call: initiate a scheduling session
-Context A → Context B tool "schedule_meeting":
+Context A → Context B outlet "schedule_meeting":
   input:  { action: "propose", times: ["Tue 3pm", "Thu 2pm"] }
   output: { session_id: "sched:abc123", status: "pending", counter: ["Tue 4pm"] }
 
 // Second call: continue the session
-Context A → Context B tool "schedule_meeting":
+Context A → Context B outlet "schedule_meeting":
   input:  { session_id: "sched:abc123", action: "accept", time: "Tue 4pm" }
   output: { session_id: "sched:abc123", status: "confirmed", time: "Tue 4pm" }
 ```
 
-Session state is maintained by the tool's context (Context B), not by the calling agent. Each call in the session is individually governed — Context A's governance permits each outbound call, Context B's governance permits each inbound call. The session does not create a persistent channel; it is a sequence of governed tool calls that share state via an opaque session identifier.
+Session state is maintained by the outlet's context (Context B), not by the calling agent. Each call in the session is individually governed — Context A's governance permits each outbound call, Context B's governance permits each inbound call. The session does not create a persistent channel; it is a sequence of governed outlet calls that share state via an opaque session identifier.
 
-Sessions have an optional TTL set by the tool's context. When set, expired sessions are garbage-collected automatically. Sessions without a TTL persist for the lifetime of the context — appropriate for app-hosted sessions (games, workspaces, collaborative tools) where the context itself is the session's lifecycle boundary. Contexts enforce a per-caller session cap, context-configurable via `ContextParams::session_cap` (default: 1000 concurrent sessions per calling context), to prevent session exhaustion attacks regardless of TTL (§9.2.1, ADR-043). Session state is internal to the tool's context and not visible to the calling context beyond the tool's defined output schema.
+Sessions have an optional TTL set by the outlet's context. When set, expired sessions are garbage-collected automatically. Sessions without a TTL persist for the lifetime of the context — appropriate for app-hosted sessions (games, workspaces, collaborative tools) where the context itself is the session's lifecycle boundary. Contexts enforce a per-caller session cap, context-configurable via `ContextParams::session_cap` (default: 1000 concurrent sessions per calling context), to prevent session exhaustion attacks regardless of TTL (§9.2.1, ADR-043). Session state is internal to the outlet's context and not visible to the calling context beyond the outlet's defined output schema.
 
 **Session chain-amplification binding.** A session inherits the `origin_kind` (§6.2.0.3) of the first call that created it. Every subsequent call routed through the session (identified by `session_id` in the input) is treated by the runtime as carrying the session's recorded `origin_kind`, regardless of any new UCAN presented by the caller or any `origin_kind` claim in a later delegation. Concretely: if a session was opened by a `Query`-originated call, every call through that session is treated as `origin_kind = Query` for amplification-rule purposes, and any attempt to call an Action outlet through the session is rejected with `AmplificationViolation`. This prevents async self-triggered amplification — a `Query`-originated session cannot "mature" into an Action session by the caller later presenting an Action-rooted UCAN.
 
@@ -320,7 +354,7 @@ These are conventions, not mandates — contexts with discovery tools can add cu
 
 ### 6.2.3 Broadcast Context Interactions
 
-Tool interfaces (§6.2) work with broadcast contexts. A broadcast context can expose tools via the standard tool interface mechanism — the context's governance mediates, the tool schemas are declared, and calls are logged. Tool invocation requires the invoker to hold the appropriate UCAN (`ToolInvoke` or `ToolInvokeAll`), which is governed by the broadcast context's role system.
+Outlet interfaces (§6.2) work with broadcast contexts. A broadcast context can expose outlets via the standard outlet interface mechanism — the context's governance mediates, the outlet schemas are declared, and calls are logged. Outlet invocation requires the invoker to hold the appropriate UCAN (`OutletQuery`/`OutletQueryAll` for Query outlets, `OutletCall`/`OutletCallAll` for Action outlets per §5.4.2.1), which is governed by the broadcast context's role system.
 
 **Mixed-mode nesting (§5.13).** Child contexts may have a different `ContextMode` than their parents. A Broadcast child of Encrypted parents enables public read access to curated content from a private group. An Encrypted child of Broadcast parents enables private discussion among subscribers. Ceiling inheritance, eligibility enforcement, and lifecycle coupling operate identically regardless of mode.
 
@@ -330,11 +364,11 @@ Tool interfaces (§6.2) work with broadcast contexts. A broadcast context can ex
 
 The human coordinates across their own contexts locally. Their local agent orchestration — unconstrained by the protocol — handles cross-context intelligence. For the human's own agents, the human remains the bridge — local coordination across their own contexts requires no network-level mechanism.
 
-Two protocol-level mechanisms formalize cross-context relationships: tool interfaces (§6.2) for asymmetric service-style interactions, and multi-parent child contexts (§5.13) for symmetric collaboration. Both require governance consent from all involved contexts. The human's local coordination handles everything that doesn't need to be on the network — and when a cross-context relationship should be visible, governed, and persistent, a multi-parent child context makes the bridge structural rather than implicit.
+Two protocol-level mechanisms formalize cross-context relationships: outlet interfaces (§6.2) for asymmetric service-style interactions, and multi-parent child contexts (§5.13) for symmetric collaboration. Both require governance consent from all involved contexts. The human's local coordination handles everything that doesn't need to be on the network — and when a cross-context relationship should be visible, governed, and persistent, a multi-parent child context makes the bridge structural rather than implicit.
 
 **Two-tier interaction model.** The protocol provides two tiers of cross-agent communication with different overhead appropriate to different risk profiles:
 
 - **Shared contexts** (bilateral or multi-party) for lightweight, symmetric, low-ceremony communication. A message in a shared context is encrypt-send-decrypt with no per-message governance overhead. All the protocol's trust and encryption properties apply. This is the equivalent of a text message.
-- **Tool interfaces** for formal, structured, asymmetric cross-context data exchange. Full governance mediation on both sides, schema-declared data flow, audit logging, rate limiting, provenance attachment. This is the equivalent of an API call.
+- **Outlet interfaces** for formal, structured, asymmetric cross-context data exchange. Full governance mediation on both sides, schema-declared data flow, audit logging, rate limiting, provenance attachment. This is the equivalent of an API call.
 
-Agents use whichever tier fits the interaction. Lightweight coordination ("are you available?", "quick update") flows through shared contexts. Formal cross-context data queries flow through tool interfaces. Both are governed; the difference is in ceremony and auditability per interaction.
+Agents use whichever tier fits the interaction. Lightweight coordination ("are you available?", "quick update") flows through shared contexts. Formal cross-context data queries flow through outlet interfaces. Both are governed; the difference is in ceremony and auditability per interaction.
