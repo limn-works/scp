@@ -1,11 +1,17 @@
 //! TTL management and context close operations.
+//!
+//! # Lifecycle / `ttl_close` hoist (commit 12c.2 of ADR-049)
+//!
+//! Every inherent method in this file is a one-line forwarder to a
+//! corresponding free function in
+//! [`crate::context::lifecycle_helpers`] with explicit-collaborator
+//! signatures. The outer shim (including every forwarder in this file)
+//! is deleted in a later ADR-049 commit once the actor handler bodies
+//! in [`crate::context::actor::handlers::ttl_close`] own the TTL / close
+//! path.
 
-use super::{
-    Arc, Capability, CloseResult, ContextError, ContextEvent, ContextHandle, ContextManager, DID,
-    GovernanceModelConfig, TtlExtension, instrument, require_active, ttl,
-};
+use super::{CloseResult, ContextError, ContextHandle, ContextManager, DID, instrument};
 
-#[allow(clippy::significant_drop_tightening)]
 impl ContextManager {
     /// Initiates cooperative context closure.
     ///
@@ -28,23 +34,27 @@ impl ContextManager {
     /// `Active`. Returns [`ContextError::PermissionDenied`] if the context
     /// uses a multi-admin governance model (use governance proposal path
     /// instead) or if the initiator lacks `ContextClose` capability.
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::close_context`] free function
+    /// (ADR-049 commit 12c.2). Deleted in a later commit alongside every
+    /// other `ContextManager` lifecycle surface.
     #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn close_context(
         &self,
         handle: &ContextHandle,
         initiator_did: &DID,
     ) -> Result<CloseResult, ContextError> {
-        self.close_context_with_key(handle, initiator_did, None)
-            .await
+        crate::context::lifecycle_helpers::close_context(self, handle, initiator_did).await
     }
 
     /// Closes a context with an optional signing key for final checkpoint
     /// generation (§9.9.3).
     ///
-    /// When `signing_key` is provided, a final consistency checkpoint is
-    /// force-created before the context transitions to `Closing`. When `None`,
-    /// checkpoint creation is skipped (best-effort: the send path will have
-    /// already created periodic checkpoints).
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::close_context_with_key`] free
+    /// function (ADR-049 commit 12c.2). Deleted in a later commit
+    /// alongside every other `ContextManager` lifecycle surface.
     ///
     /// # Errors
     ///
@@ -58,121 +68,21 @@ impl ContextManager {
         initiator_did: &DID,
         signing_key: Option<&ed25519_dalek::SigningKey>,
     ) -> Result<CloseResult, ContextError> {
-        let context_id = handle.context_id().to_owned();
-
-        // Check governance model: multi-admin contexts must route through
-        // governance (SCP-270, ADR-031). Only SingleAdmin contexts can use
-        // the direct close_context path.
-        // Capture generation for confused-deputy detection on reacquire.
-        let (role_state, ctx_gen) = {
-            let (guard, ctx_gen) = self
-                .lock_context(&context_id)
-                .await
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let ctx = &*guard;
-
-            // State check inside lock -- eliminates TOCTOU race.
-            require_active(&ctx.handle)?;
-
-            // Gate: multi-admin models must use governance path.
-            if !matches!(
-                ctx.governance.engine.model_config(),
-                GovernanceModelConfig::SingleAdmin { .. }
-            ) {
-                return Err(ContextError::PermissionDenied(
-                    "multi-admin contexts must close through governance \
-                     (propose GovernanceAction::CloseContext)"
-                        .to_owned(),
-                ));
-            }
-
-            (ctx.role_state.clone(), ctx_gen)
-        };
-        // Lock dropped before async ttl::close_context call.
-
-        // Delegate to ttl::close_context for the actual logic (async).
-        let result =
-            ttl::close_context(handle, initiator_did, &role_state, self.event_log.as_ref()).await?;
-
-        // Cancel TTL timer, governance timeout task, drop broadcast state,
-        // and emit close notification (second lock acquisition with generation
-        // check for confused-deputy detection + ContextClose TOCTOU re-check).
-        {
-            if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
-                let ctx = &mut *guard;
-
-                // Fix C: Re-check ContextClose capability under the cleanup lock.
-                // If capability was revoked between the first lock and this
-                // reacquire, the state transition already happened (can't undo),
-                // but we log a warning for auditability.
-                if !ctx
-                    .role_state
-                    .member_has_capability(initiator_did.as_ref(), &Capability::ContextClose)
-                {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        initiator_did = %initiator_did,
-                        "ContextClose capability revoked between lock acquisitions — \
-                         state transition already committed, proceeding with cleanup"
-                    );
-                }
-
-                ctx.ttl.timer.cancel();
-                ctx.governance.timeout_task.cancel();
-                // Drop broadcast context state -- keys are zeroed by Zeroize.
-                ctx.broadcast_context = None;
-
-                // §9.10.4: clear pseudonym state on close. The local pseudonym
-                // is derived from secret key material; zeroing it prevents
-                // leaking the routing ID after context teardown.
-                ctx.local_pseudonym = None;
-                ctx.pseudonym_registry.clear();
-
-                // Participation decay: clear participation cache and cooldown
-                // state on context close (#1530).
-                ctx.governance.decay_participation();
-
-                // Final checkpoint before close (§9.9.3): force-create a
-                // checkpoint to capture the terminal event log state. This
-                // ensures equivocation detection covers the full context
-                // lifetime. Best-effort: skip if no signing key is available.
-                if let Some(sk) = signing_key {
-                    let cp = self.force_create_checkpoint(&context_id, ctx, initiator_did, sk);
-                    tracing::debug!(
-                        context_id = %context_id,
-                        event_count = cp.event_count,
-                        "final checkpoint created on close (§9.9.3)"
-                    );
-                }
-
-                let close_event = ContextEvent::SystemClose {
-                    initiator_did: initiator_did.clone(),
-                };
-                ctx.emit_event(close_event, &context_id, self.event_tx.as_ref());
-            }
-        }
-
-        self.update_context_gauges();
-
-        // Persist context state after close (best-effort).
-        if self.has_persistence()
-            && let Ok(guard) = self.relock_context(&ctx_gen).await
-        {
-            let ctx = &*guard;
-            let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(&context_id, snapshot);
-        }
-
-        Ok(result)
+        crate::context::lifecycle_helpers::close_context_with_key(
+            self,
+            handle,
+            initiator_did,
+            signing_key,
+        )
+        .await
     }
 
     /// Completes context closure.
     ///
-    /// Destroys MLS group state and sender keys, issues relay deletion
-    /// requests for ephemeral/summary scopes, transitions from `Closing`
-    /// to `Closed`, and appends the final `ContextClosed` event.
-    ///
-    /// See ADR-008 acceptance criterion 6.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::finalize_close`] free function
+    /// (ADR-049 commit 12c.2). Deleted in a later commit alongside every
+    /// other `ContextManager` lifecycle surface.
     ///
     /// # Errors
     ///
@@ -180,31 +90,15 @@ impl ContextManager {
     /// or if destruction operations fail.
     #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn finalize_close(&self, handle: &ContextHandle) -> Result<(), ContextError> {
-        let context_id = handle.context_id().to_owned();
-
-        ttl::finalize_close(
-            handle,
-            self.crypto.as_ref(),
-            self.transport.as_ref(),
-            self.event_log.as_ref(),
-        )
-        .await?;
-
-        // Delete persisted state after finalize (best-effort).
-        if let Some(ref persistence) = self.persistence {
-            let _ = persistence.delete_context(&context_id);
-        }
-
-        Ok(())
+        crate::context::lifecycle_helpers::finalize_close(self, handle).await
     }
 
     /// Handles automatic TTL expiry.
     ///
-    /// Transitions from `Active` to `Expired`, destroys keys per memory
-    /// scope, issues relay deletion requests for ephemeral/summary scopes,
-    /// and appends `ContextExpired` to the event log.
-    ///
-    /// See ADR-008 acceptance criterion 7 and spec §5.10/§5.11.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::handle_ttl_expiry`] free
+    /// function (ADR-049 commit 12c.2). Deleted in a later commit
+    /// alongside every other `ContextManager` lifecycle surface.
     ///
     /// # Errors
     ///
@@ -212,95 +106,21 @@ impl ContextManager {
     /// in `Active` state.
     #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn handle_ttl_expiry(&self, handle: &ContextHandle) -> Result<(), ContextError> {
-        let context_id = handle.context_id().to_owned();
-
-        // Capture generation before async expiry work for confused-deputy
-        // detection on reacquire.
-        let ctx_gen = {
-            let (_guard, generation) = self
-                .lock_context(&context_id)
-                .await
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            generation
-        };
-
-        // Async TTL expiry logic -- no lock held. Pass transport for
-        // best-effort relay ciphertext deletion (§5.11).
-        let result = ttl::try_ttl_expiry_cleanup(
-            handle,
-            self.crypto.as_ref(),
-            Some(self.transport.as_ref()),
-            self.event_log.as_ref(),
-            0,
-        )
-        .await;
-
-        // Cancel governance timeout task, decay participation, and emit
-        // appropriate event (lock acquired, then dropped, with generation check).
-        {
-            if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
-                let ctx = &mut *guard;
-                ctx.governance.timeout_task.cancel();
-                // Participation decay on TTL expiry (#1530): clear
-                // participation cache and cooldown state so stale data does
-                // not carry over if the context is later restored.
-                ctx.governance.decay_participation();
-                if result.is_complete() {
-                    let event = ContextEvent::Expired;
-                    ctx.emit_event(event, &context_id, self.event_tx.as_ref());
-                } else {
-                    let event = ContextEvent::ExpiryFailed {
-                        reason: result.to_string(),
-                        state_transitioned: result.state_transitioned(),
-                        mls_destroyed: result.mls_destroyed(),
-                        sender_key_destroyed: result.sender_key_destroyed(),
-                        event_logged: result.event_logged(),
-                    };
-                    ctx.emit_event(event, &context_id, self.event_tx.as_ref());
-                }
-            } else {
-                tracing::warn!(
-                    context_id = %context_id,
-                    "handle_ttl_expiry: generation mismatch — skipping state mutation"
-                );
-            }
-        }
-
-        // Persist context state after TTL expiry (best-effort).
-        if self.has_persistence()
-            && let Ok(guard) = self.relock_context(&ctx_gen).await
-        {
-            let ctx = &*guard;
-            let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(&context_id, snapshot);
-        }
-
-        if result.has_failures() {
-            let msg = result.errors().join("; ");
-            return Err(
-                if !result.mls_destroyed() || !result.sender_key_destroyed() {
-                    ContextError::CryptoFailed(msg)
-                } else {
-                    ContextError::EventLogFailed(msg)
-                },
-            );
-        }
-
-        Ok(())
+        crate::context::lifecycle_helpers::handle_ttl_expiry(self, handle).await
     }
 
     /// Proposes a TTL extension. Records consent from the given member.
     ///
-    /// If all members have consented (unanimous), returns `true` indicating
-    /// the extension was approved. The caller should then call
-    /// [`reset_ttl_timer`](Self::reset_ttl_timer) with the new duration.
-    ///
-    /// See ADR-008 acceptance criterion 9 / spec section 5.10.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::propose_ttl_extension`] free
+    /// function (ADR-049 commit 12c.2). Deleted in a later commit
+    /// alongside every other `ContextManager` lifecycle surface.
     ///
     /// # Errors
     ///
     /// Returns [`ContextError::MembershipFailed`] if the context is not
     /// registered. Returns [`ContextError::MemberNotFound`] if the member
+    /// is not in the context.
     #[instrument(skip_all, fields(context_id))]
     pub async fn propose_ttl_extension(
         &self,
@@ -308,41 +128,21 @@ impl ContextManager {
         member_did: &DID,
         proposed_duration: std::time::Duration,
     ) -> Result<bool, ContextError> {
-        // All checks and mutation within a single lock acquisition.
-        let ctx_arc = self
-            .get_context_arc(context_id)
-            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut guard = ctx_arc.lock().await;
-        let ctx = &mut *guard;
-
-        if !ctx.membership.contains(member_did) {
-            return Err(ContextError::MemberNotFound(member_did.to_string()));
-        }
-
-        let member_count = ctx.membership.count();
-
-        // Initialize extension proposal if not already in progress.
-        let extension = ctx
-            .ttl
-            .extension
-            .get_or_insert_with(|| TtlExtension::new(proposed_duration, member_count));
-
-        extension.add_consent(member_did.clone());
-        let unanimous = extension.is_unanimous();
-
-        // Persist context state after proposal consent (best-effort).
-        if self.has_persistence() {
-            let ctx_snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(context_id, ctx_snapshot);
-        }
-
-        Ok(unanimous)
+        crate::context::lifecycle_helpers::propose_ttl_extension(
+            self,
+            context_id,
+            member_did,
+            proposed_duration,
+        )
+        .await
     }
 
     /// Resets the TTL timer after a successful unanimous extension.
     ///
-    /// Cancels the old timer and spawns a new one with the given duration.
-    /// Clears the extension proposal state.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::reset_ttl_timer`] free
+    /// function (ADR-049 commit 12c.2). Deleted in a later commit
+    /// alongside every other `ContextManager` lifecycle surface.
     #[instrument(skip_all, fields(context_id))]
     pub async fn reset_ttl_timer(
         &self,
@@ -350,135 +150,23 @@ impl ContextManager {
         new_duration: std::time::Duration,
         handle: ContextHandle,
     ) {
-        // Cancel old timer and clear extension state (lock, then drop).
-        {
-            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
-                let mut guard = ctx_arc.lock().await;
-                let ctx = &mut *guard;
-                ctx.ttl.timer.cancel();
-                ctx.ttl.extension = None;
-            }
-        }
-
-        self.spawn_ttl_timer(context_id, new_duration, handle).await;
-
-        // Persist context state after TTL reset (best-effort).
-        if self.has_persistence()
-            && let Ok(ctx_arc) = self.get_context_arc(context_id)
-        {
-            let guard = ctx_arc.lock().await;
-            let ctx = &*guard;
-            let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(context_id, snapshot);
-        }
+        crate::context::lifecycle_helpers::reset_ttl_timer(self, context_id, new_duration, handle)
+            .await;
     }
 
     /// Spawns a TTL timer for the given context.
     ///
-    /// When the timer fires, it runs [`ttl::run_ttl_expiry_with_retries`]
-    /// which:
-    /// - Transitions the context from `Active` to `Expired`.
-    /// - For `Ephemeral` and `Summary` memory scopes: destroys MLS group
-    ///   state and sender keys via the crypto provider.
-    /// - Logs a `ContextExpired` event to the event log.
-    ///
-    /// On success, emits [`ContextEvent::Expired`] to the receive buffer.
-    /// If all retries fail, emits [`ContextEvent::ExpiryFailed`] so the
-    /// application layer can observe and react to the failure.
-    ///
-    /// This matches the behavior of [`TtlTimer::spawn`] and ensures key
-    /// destruction and event logging use the manager's shared providers.
-    pub(super) async fn spawn_ttl_timer(
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::spawn_ttl_timer`] free
+    /// function (ADR-049 commit 12c.2). Deleted in a later commit
+    /// alongside every other `ContextManager` lifecycle surface.
+    pub(crate) async fn spawn_ttl_timer(
         &self,
         context_id: &str,
         duration: std::time::Duration,
         handle: ContextHandle,
     ) {
-        // Extract the cancel Notify and generation under lock, then drop.
-        let (cancel, spawn_generation) = {
-            let Ok(arc) = self.get_context_arc(context_id) else {
-                return;
-            };
-            let ctx = arc.lock().await;
-            (ctx.ttl.timer.cancel.clone(), ctx.generation)
-        };
-
-        // Clone Arc-wrapped providers so the spawned task can perform
-        // key destruction, relay deletion, and event logging on TTL expiry.
-        let crypto = Arc::clone(&self.crypto);
-        let transport = Arc::clone(&self.transport);
-        let event_log = Arc::clone(&self.event_log);
-        let event_tx = self.event_tx.clone();
-        let contexts_ref = self.contexts_arc();
-        let context_id_owned = context_id.to_owned();
-
-        let abort_handle = {
-            let mut task_set = self.task_set.lock().await;
-            task_set.spawn(async move {
-                tokio::select! {
-                    () = tokio::time::sleep(duration) => {
-                        // Timer fired. Run cleanup with exponential backoff
-                        // retries (SCP-169, #612). Pass transport so relay
-                        // ciphertext deletion happens on timer-initiated expiry
-                        // (§5.11, #612 finding 2).
-                        let result = ttl::run_ttl_expiry_with_retries(
-                            &handle,
-                            crypto.as_ref(),
-                            Some(transport.as_ref()),
-                            event_log.as_ref(),
-                            &cancel,
-                        ).await;
-
-                        // Emit event to the receive buffer and decay governance
-                        // state under a single lock acquisition (matches the
-                        // synchronous handle_ttl_expiry path; H8 fix).
-                        if let Some(entry) = contexts_ref.get(&context_id_owned) {
-                            let ctx_arc = entry.value().clone();
-                            drop(entry);
-                            let mut guard = ctx_arc.lock().await;
-                            let ctx = &mut *guard;
-                            // Generation check: if the context was removed
-                            // and recreated since this timer was spawned,
-                            // the timer belongs to the old context — skip.
-                            if ctx.generation != spawn_generation {
-                                tracing::warn!(
-                                    context_id = %context_id_owned,
-                                    spawn_generation,
-                                    current_generation = ctx.generation,
-                                    "TTL timer fired for stale context generation; skipping"
-                                );
-                            } else if result.is_complete() {
-                                let event = ContextEvent::Expired;
-                                ctx.emit_event(event, &context_id_owned, event_tx.as_ref());
-                                ctx.governance.timeout_task.cancel();
-                                ctx.governance.decay_participation();
-                            } else {
-                                let event = ContextEvent::ExpiryFailed {
-                                    reason: result.to_string(),
-                                    state_transitioned: result.state_transitioned(),
-                                    mls_destroyed: result.mls_destroyed(),
-                                    sender_key_destroyed: result.sender_key_destroyed(),
-                                    event_logged: result.event_logged(),
-                                };
-                                ctx.emit_event(event, &context_id_owned, event_tx.as_ref());
-                                ctx.governance.timeout_task.cancel();
-                                ctx.governance.decay_participation();
-                            }
-                        }
-                    }
-                    () = cancel.notified() => {
-                        // Timer was cancelled.
-                    }
-                }
-            })
-        };
-
-        // Store the abort handle for cancel/is_active checks (lock, then drop).
-        let context_id_for_store = context_id.to_owned();
-        if let Ok(ctx_arc) = self.get_context_arc(&context_id_for_store) {
-            let mut guard = ctx_arc.lock().await;
-            let ctx = &mut *guard;
-            ctx.ttl.timer.task = Some(abort_handle);
-        }
+        crate::context::lifecycle_helpers::spawn_ttl_timer(self, context_id, duration, handle)
+            .await;
     }
 }

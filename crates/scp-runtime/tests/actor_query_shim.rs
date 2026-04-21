@@ -27,7 +27,10 @@
     // (`ContextManager`, `Supervisor`, etc.) for readability; clippy's
     // `doc_markdown` asks for backticks but the test file has no
     // user-facing rustdoc consumers.
-    clippy::doc_markdown
+    clippy::doc_markdown,
+    // ADR-049 commit 12c.2: lifecycle hoist inflates some test-path
+    // futures past clippy's 16 KB stack budget.
+    clippy::large_futures
 )]
 
 use std::sync::Arc;

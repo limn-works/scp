@@ -173,7 +173,12 @@ async fn dispatch_inner(view: &MutationStateView<'_>, cmd: LifecycleCommand) -> 
             reply,
         } => handle_export_context(view, context_id, exporter_did, reply).await,
         LifecycleCommand::ImportContext { export, reply } => {
-            handle_import_context(view, export, reply).await
+            // Box::pin — the per-variant import future crosses clippy's
+            // 16 KB stack budget (ContextExport ~2 KB + the full
+            // PerContextState-construction locals inside the hoisted
+            // `lifecycle_helpers::import_context` body). Boxing moves the
+            // state onto the heap for this variant only.
+            Box::pin(handle_import_context(view, export, reply)).await
         }
     }
 }
@@ -407,8 +412,11 @@ async fn handle_import_context(
     let context_id = export.snapshot.context_id.clone();
 
     // Unbox at the last possible moment to minimize stack-held size
-    // across the delegated await.
-    let import_fut = manager.import_context(*export);
+    // across the delegated await. `Box::pin` the inner future so the
+    // hoisted `lifecycle_helpers::import_context` body's 12 KB+ locals
+    // do not inflate `handle_import_context`'s own future past clippy's
+    // 16 KB stack budget (ADR-049 commit 12c.2).
+    let import_fut = Box::pin(manager.import_context(*export));
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, import_fut).await {
         Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),

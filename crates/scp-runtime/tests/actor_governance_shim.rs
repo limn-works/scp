@@ -28,6 +28,9 @@
     clippy::doc_markdown,
     clippy::disallowed_types,
     clippy::missing_const_for_fn,
+    // ADR-049 commit 12c.2: lifecycle hoist inflates some test-path
+    // futures past clippy's 16 KB stack budget.
+    clippy::large_futures,
 )]
 
 use std::sync::Arc;

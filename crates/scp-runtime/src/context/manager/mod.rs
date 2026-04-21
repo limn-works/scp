@@ -24,7 +24,7 @@ use super::governance::timeout::{
     DeadlockDetectionState, GovernanceTimeoutTask, collect_active_voters,
     process_pending_proposals, update_detection_state,
 };
-use super::ttl::{self, CloseResult, TtlExtension, TtlTimer};
+use super::ttl::{CloseResult, TtlExtension, TtlTimer};
 use scp_identity::DID;
 use scp_primitives::Clock;
 use scp_protocol::context::broadcast::{
@@ -68,13 +68,13 @@ use zeroize::Zeroizing;
 mod broadcast;
 pub(crate) mod economy;
 pub(crate) mod governance;
-mod lifecycle;
+pub(crate) mod lifecycle;
 pub(crate) mod messaging;
 mod queries;
 pub(crate) mod standing;
 mod tools;
 mod trust_recovery;
-mod ttl_close;
+pub(crate) mod ttl_close;
 
 // ---------------------------------------------------------------------------
 // Protocol-level collection size limits (§5.9)
@@ -266,7 +266,7 @@ pub struct CommitFaultMarker {
 ///
 /// Used by both `join_context` and `execute_add_member` to avoid
 /// duplicating the emission logic.
-fn push_welcome_event(
+pub(crate) fn push_welcome_event(
     ctx: &mut PerContextState,
     context_id: &str,
     creator_did: &DID,
@@ -943,12 +943,12 @@ pub trait ContextPersistence: Send + Sync {
 /// module.
 pub(crate) struct GovernanceState {
     /// The governance engine for this context (ADR-031, spec §5.9).
-    engine: Box<dyn GovernanceEngine>,
+    pub(crate) engine: Box<dyn GovernanceEngine>,
     /// Proposal IDs that have already been executed, mapped to the unix
     /// timestamp (seconds) when they were marked executed. Prevents replay of
     /// approved governance proposals (defense-in-depth). Entries older than
     /// [`EXECUTED_PROPOSALS_TTL_SECS`] are evicted on each insert.
-    executed_proposals: HashMap<ProposalId, u64>,
+    pub(crate) executed_proposals: HashMap<ProposalId, u64>,
     /// Approved proposals pending execution, tracked for conflict detection (ADR-031 §7).
     ///
     /// Maps proposal ID to a tuple `(proposal, monotonic_seq, approved_at_unix_secs)`:
@@ -961,7 +961,7 @@ pub(crate) struct GovernanceState {
     /// - `approved_at_unix_secs` — wall-clock Unix timestamp at approval,
     ///   retained for audit / event emission only. Never used for
     ///   conflict ordering.
-    approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
+    pub(crate) approved_proposals: HashMap<ProposalId, (GovernanceProposal, u64, u64)>,
     /// Monotonic counter for assigning proposal sequence numbers (H10, ADR-031 §7).
     ///
     /// Incremented every time `detect_and_handle_conflicts` inserts a new
@@ -970,28 +970,28 @@ pub(crate) struct GovernanceState {
     /// process restarts. On `import_context` (untrusted), reset
     /// conservatively to `approved_proposals.len() as u64` — see
     /// `lifecycle::import_context`.
-    next_proposal_seq: u64,
+    pub(crate) next_proposal_seq: u64,
     /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
     /// Contains the conflicting proposal IDs and freeze start timestamp.
-    freeze: Option<(ProposalId, ProposalId, u64)>,
+    pub(crate) freeze: Option<(ProposalId, ProposalId, u64)>,
     /// Governance timeout task (SCP-271, ADR-031 §5).
-    timeout_task: GovernanceTimeoutTask,
+    pub(crate) timeout_task: GovernanceTimeoutTask,
     /// Per-context deadlock detection tracking (ADR-031 §10).
-    deadlock: DeadlockDetectionState,
+    pub(crate) deadlock: DeadlockDetectionState,
     /// Governance threshold signers (for `ThresholdApproval` model).
-    threshold_signers: Vec<DID>,
+    pub(crate) threshold_signers: Vec<DID>,
     /// Governance threshold value (quorum requirement).
-    threshold_value: u32,
+    pub(crate) threshold_value: u32,
     /// Pending ceiling modification awaiting notification period (M7, §5.3.2).
-    pending_ceiling_modification: Option<PendingCeilingModification>,
+    pub(crate) pending_ceiling_modification: Option<PendingCeilingModification>,
     /// Pending economic policy change awaiting notification period (§19.3).
-    pending_economic_policy_change: Option<PendingEconomicPolicyChange>,
+    pub(crate) pending_economic_policy_change: Option<PendingEconomicPolicyChange>,
     /// Dynamically registered tools (beyond initial `ContextParams.tools`).
-    registered_tools: Vec<ToolRegistration>,
+    pub(crate) registered_tools: Vec<ToolRegistration>,
     /// Established cross-context tool interfaces (§6.2).
-    tool_interfaces: Vec<ToolInterface>,
+    pub(crate) tool_interfaces: Vec<ToolInterface>,
     /// Pruning policy override (ADR-030 §6).
-    pruning_policy: Option<PruningPolicy>,
+    pub(crate) pruning_policy: Option<PruningPolicy>,
     /// Mutable economic policy (§19.3, ADR-033).
     pub(crate) economic_policy: Option<EconomicPolicy>,
     /// Per-member cumulative budget tracker for governance-approved spending
@@ -1000,12 +1000,12 @@ pub(crate) struct GovernanceState {
     pub(crate) budget_tracker: MemberBudgetTracker,
     /// Last known member set for departure detection in the timeout loop.
     /// Compared each tick to the current member set to identify departures.
-    last_known_members: HashSet<DID>,
+    pub(crate) last_known_members: HashSet<DID>,
     /// Members who have undergone a governance-triggered epoch reset
     /// (`ResetMember`, ADR-029 Tier 3) since the last timeout tick.
     /// Drained each tick and passed to `process_pending_proposals` so
     /// their votes on pending proposals are invalidated (ADR-031 §5).
-    pending_epoch_resets: Vec<DID>,
+    pub(crate) pending_epoch_resets: Vec<DID>,
     /// Consequence rules declared at context creation (ADR-017, #1531).
     pub(crate) consequence_rules: Vec<ConsequenceRule>,
     /// Sender velocity tracker for anti-spam and consequence evaluation (§19.7, #1537).
@@ -1024,7 +1024,7 @@ pub(crate) struct GovernanceState {
     /// Cooldown tracking for consequence rules: maps `rule_index` to the Unix
     /// timestamp (seconds) until which the rule should not re-fire. Prevents
     /// repeated consequence dispatch within a rule's evaluation window.
-    cooldown_until: HashMap<usize, u64>,
+    pub(crate) cooldown_until: HashMap<usize, u64>,
     /// Spec §19.7 per-DID escalating-cost message pricing configuration.
     ///
     /// Bundles base cost, escalation tiers, and floor/cap clamps. The
@@ -1059,7 +1059,7 @@ pub(crate) struct GovernanceState {
     /// the member submitted governance proposals. Used by `check_proposer_eligibility` to
     /// enforce `max_governance_proposals_per_window` from `EarnedCapacityPolicy`.
     /// Entries outside the sliding window are evicted on each check.
-    proposal_timestamps: HashMap<String, Vec<u64>>,
+    pub(crate) proposal_timestamps: HashMap<String, Vec<u64>>,
 }
 
 impl GovernanceState {
@@ -1067,7 +1067,7 @@ impl GovernanceState {
     ///
     /// Called on context close so stale participation records and cooldown
     /// timers don't carry over if the context is re-created (#1530).
-    fn decay_participation(&mut self) {
+    pub(crate) fn decay_participation(&mut self) {
         self.participation_cache.clear();
         self.cooldown_until.clear();
         self.proposal_timestamps.clear();
@@ -1110,20 +1110,20 @@ pub(crate) struct EpochState {
     /// `Revoke`, `ResetMember`). Used to populate
     /// `GovernanceActionExecuted.resulting_epoch` and
     /// `GovernanceContext.current_epoch`.
-    mls_epoch: u64,
+    pub(crate) mls_epoch: u64,
     /// MLS-governance epoch coordinator (ADR-031 §8, issue #630).
     ///
     /// Records the auditable link between governance proposal approvals and
     /// resulting MLS epoch advances. Instantiated per context and updated
     /// after each membership-affecting governance action execution.
-    coordinator: EpochCoordinator,
+    pub(crate) coordinator: EpochCoordinator,
     /// Epoch grace window store (§23.11).
     ///
     /// Tracks which old epochs are still within their grace window after
     /// epoch advances. Persisted alongside the context snapshot and restored
     /// on startup. Used by the MLS decrypt path to determine whether to
     /// attempt decryption for a given past epoch.
-    grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore,
+    pub(crate) grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore,
     /// Whether this context needs to re-enter the reconnection protocol
     /// (§23.3) before processing new messages (§23.11 inconsistent state
     /// fallback step 3). Set during `restore_context` when grace store
@@ -1131,7 +1131,7 @@ pub(crate) struct EpochState {
     /// completes successfully. The SDK MUST check this flag when message
     /// processing begins for this context and initiate the reconnection
     /// protocol if set.
-    needs_reconnect: bool,
+    pub(crate) needs_reconnect: bool,
 }
 
 /// Access control state (CEK wrapping, key store).
@@ -1148,7 +1148,7 @@ pub(crate) struct AccessControlState {
     /// Members excluded from future CEK wrapping (`Revoke { access: AccessScope::Write }`,
     /// ADR-038, §9.17). This is a cryptographic exclusion list, NOT an
     /// application-level capability suspension.
-    read_exclusion_list: HashSet<DID>,
+    pub(crate) read_exclusion_list: HashSet<DID>,
     /// Per-member access key store for content encryption key wrapping
     /// (ADR-038, §9.17). Keys are generated when members join and used
     /// by `wrap_content`/`unwrap_content` in the message pipeline.
@@ -1267,9 +1267,9 @@ impl GovernanceState {
 /// module.
 pub(crate) struct TtlState {
     /// TTL timer management (SCP-021).
-    timer: TtlTimer,
+    pub(crate) timer: TtlTimer,
     /// Active TTL extension proposal, if any (SCP-021).
-    extension: Option<TtlExtension>,
+    pub(crate) extension: Option<TtlExtension>,
 }
 
 /// Wire format for pseudonym announcements sent as MLS application messages.
@@ -1393,7 +1393,7 @@ pub(crate) struct PerContextState {
     /// return) drops the reservation and rolls this counter back. The
     /// legacy `MembershipState` tracker is still authoritative for wire
     /// sequence numbers during the shim period.
-    send_tracker: crate::context::actor::SendSequenceTracker,
+    pub(crate) send_tracker: crate::context::actor::SendSequenceTracker,
 }
 
 impl PerContextState {
@@ -1647,7 +1647,7 @@ pub(crate) struct ContextGeneration {
 ///
 /// Returns [`ContextCreationError`] if the governance model parameters are
 /// invalid (e.g., threshold > signers, empty voter sets).
-fn create_governance_engine(
+pub(crate) fn create_governance_engine(
     model: &GovernanceModel,
     creator_did: &DID,
     key_resolver: KeyResolver,
@@ -1682,7 +1682,7 @@ fn create_governance_engine(
 ///
 /// Returns the (possibly empty) grace store and a flag indicating whether
 /// the context needs to re-enter the reconnection protocol (§23.3).
-fn restore_grace_store_from_snapshot(
+pub(crate) fn restore_grace_store_from_snapshot(
     context_id: &str,
     snapshot: &ContextSnapshot,
 ) -> (crate::crypto::mls::epoch_grace::EpochGraceStore, bool) {
@@ -1752,7 +1752,7 @@ fn restore_grace_store_from_snapshot(
 /// # Errors
 ///
 /// Returns [`ContextError`] if the engine cannot be reconstructed.
-fn restore_governance_engine_from_snapshot(
+pub(crate) fn restore_governance_engine_from_snapshot(
     snapshot: &ContextSnapshot,
     key_resolver: KeyResolver,
 ) -> Result<Box<dyn GovernanceEngine>, ContextError> {
@@ -1842,7 +1842,9 @@ fn restore_governance_engine_from_snapshot(
 /// # Errors
 ///
 /// Returns [`ContextCreationError::CreationFailed`] with a descriptive message.
-fn validate_governance_model(model: &GovernanceModel) -> Result<(), ContextCreationError> {
+pub(crate) fn validate_governance_model(
+    model: &GovernanceModel,
+) -> Result<(), ContextCreationError> {
     match model {
         GovernanceModel::SingleAdmin => Ok(()),
         GovernanceModel::Threshold { threshold, signers } => {
@@ -1918,7 +1920,7 @@ fn require_migrating_out(handle: &ContextHandle) -> Result<(), ContextError> {
 
 /// Validates that a [`GovernanceModel`] variant is consistent with a
 /// [`GovernanceModelConfig`] variant. Returns a creation error on mismatch.
-fn validate_governance_consistency(
+pub(crate) fn validate_governance_consistency(
     model: &GovernanceModel,
     config: &GovernanceModelConfig,
 ) -> Result<(), ContextCreationError> {
@@ -1956,7 +1958,7 @@ fn validate_governance_consistency(
 ///
 /// Validates configuration parameters (threshold bounds, empty signers,
 /// `min_participation_bps` range) and returns a creation error on invalid input.
-fn build_governance_engine(
+pub(crate) fn build_governance_engine(
     config: GovernanceModelConfig,
     initial_voters: Vec<DID>,
     key_resolver: KeyResolver,
@@ -2003,7 +2005,7 @@ fn build_governance_engine(
 ///
 /// Returns the minted tokens. The tokens are also stored in the context's
 /// role state by the caller.
-fn mint_governance_tokens(
+pub(crate) fn mint_governance_tokens(
     context_id: &str,
     creator_did: &DID,
     engine: &dyn GovernanceEngine,
@@ -2838,7 +2840,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::ContextNotRegistered`] if the context is
     /// not in the map.
-    pub(super) fn get_context_arc(
+    pub(crate) fn get_context_arc(
         &self,
         context_id: &str,
     ) -> Result<Arc<Mutex<PerContextState>>, ContextError> {
@@ -3066,6 +3068,44 @@ impl ContextManager {
         self.event_tx.as_ref()
     }
 
+    /// Cheap reference to the manager's optional persistence provider.
+    /// Used by the hoisted
+    /// `lifecycle_helpers::{finalize_close, load_persisted_context_state}`
+    /// free functions so they can delete / read per-context state from the
+    /// underlying store without cloning the `Arc` (ADR-049 commit 12c.2).
+    /// Non-feature-gated — the hoisted free functions are compiled in
+    /// every build configuration.
+    #[must_use]
+    pub(crate) const fn persistence_ref(&self) -> Option<&Arc<dyn ContextPersistence>> {
+        self.persistence.as_ref()
+    }
+
+    /// Cheap reference to the manager's per-context generation counter.
+    /// Used by the hoisted `lifecycle_helpers::{create_context,
+    /// import_context}` free functions so they can stamp new
+    /// [`PerContextState::generation`] values without going through a
+    /// private field (ADR-049 commit 12c.2).
+    ///
+    /// Note: `insert_context` already stamps a fresh generation when
+    /// inserting, so call sites typically read `fetch_add` for the
+    /// `PerContextState::generation` field's initial value — the later
+    /// `insert_context` stamp overwrites it.
+    #[must_use]
+    pub(crate) const fn next_generation_ref(&self) -> &std::sync::atomic::AtomicU64 {
+        &self.next_generation
+    }
+
+    /// Cheap reference to the manager's shared task-set. Used by the
+    /// hoisted `lifecycle_helpers::spawn_ttl_timer` free function so it
+    /// can install the per-context TTL timer into the same `JoinSet` as
+    /// the legacy method (ADR-049 commit 12c.2). Returns
+    /// `&Arc<Mutex<JoinSet<()>>>` so callers can `Arc::clone` only when
+    /// they need ownership for a spawned task.
+    #[must_use]
+    pub(crate) const fn task_set_ref(&self) -> &Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>> {
+        &self.task_set
+    }
+
     /// Cheap reference to the manager's optional event fan-out channel.
     /// Used by the actor-deps builder to populate
     /// [`ActorDeps::event_tx`](crate::context::actor::deps::ActorDeps::event_tx).
@@ -3106,20 +3146,18 @@ impl ContextManager {
     // Deleted in commit 12 with the shim itself.
     // -------------------------------------------------------------------
 
-    /// Public shim accessor for the crate-private
-    /// [`Self::spawn_ttl_timer`]. The actor-shape
-    /// [`TtlCloseCommand::StartTtlTimer`](crate::context::actor::commands::TtlCloseCommand::StartTtlTimer)
-    /// handler needs to install a TTL timer from outside the `manager/`
-    /// submodule; exposing this thin `pub(crate)` wrapper keeps the
-    /// underlying `pub(super)` internal while the shim exists. Commit 12
-    /// deletes both this wrapper and the legacy method.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::start_ttl_timer`] free
+    /// function (ADR-049 commit 12c.2). Deleted in a later commit
+    /// alongside every other `ContextManager` lifecycle surface.
     pub(crate) async fn start_ttl_timer(
         &self,
         context_id: &str,
         duration: std::time::Duration,
         handle: crate::context::ContextHandle,
     ) {
-        self.spawn_ttl_timer(context_id, duration, handle).await;
+        crate::context::lifecycle_helpers::start_ttl_timer(self, context_id, duration, handle)
+            .await;
     }
 
     /// Last-issued actor-shape send-sequence number for a context.
@@ -3156,7 +3194,7 @@ impl ContextManager {
     /// [`relock_context`](Self::relock_context) can detect remove-and-recreate
     /// races.
     #[allow(clippy::needless_pass_by_value)] // DashMap::entry takes ownership
-    pub(super) fn insert_context(
+    pub(crate) fn insert_context(
         &self,
         context_id: String,
         mut state: PerContextState,
@@ -3178,7 +3216,7 @@ impl ContextManager {
     }
 
     /// Remove a context from the map, returning its state `Arc` if it existed.
-    pub(super) fn remove_context(&self, context_id: &str) -> Option<Arc<Mutex<PerContextState>>> {
+    pub(crate) fn remove_context(&self, context_id: &str) -> Option<Arc<Mutex<PerContextState>>> {
         self.contexts.remove(context_id).map(|(_, v)| v)
     }
 
@@ -3195,7 +3233,7 @@ impl ContextManager {
 
     /// Clone the `Arc<DashMap>` for use in spawned background tasks that
     /// outlive the borrow of `&self`.
-    pub(super) fn contexts_arc(&self) -> Arc<DashMap<String, Arc<Mutex<PerContextState>>>> {
+    pub(crate) fn contexts_arc(&self) -> Arc<DashMap<String, Arc<Mutex<PerContextState>>>> {
         Arc::clone(&self.contexts)
     }
 
@@ -3249,7 +3287,7 @@ impl ContextManager {
     /// Called after mutations that change context count or buffer state.
     /// Takes the contexts lock, so callers must NOT hold it. Best-effort:
     /// if no metrics recorder is installed, these are no-ops (#1467).
-    fn update_context_gauges(&self) {
+    pub(crate) fn update_context_gauges(&self) {
         crate::metrics::set_active_contexts(self.context_count());
         // Collect Arcs first to release DashMap shard locks.
         let arcs = self.collect_context_arcs();
@@ -3309,7 +3347,11 @@ impl ContextManager {
 
     /// Persists a broadcast context snapshot if a persistence provider is
     /// configured. Best-effort: logs errors but does not propagate.
-    fn persist_broadcast_snapshot(&self, context_id: &str, snapshot: &BroadcastContextSnapshot) {
+    pub(crate) fn persist_broadcast_snapshot(
+        &self,
+        context_id: &str,
+        snapshot: &BroadcastContextSnapshot,
+    ) {
         if let Some(ref persistence) = self.persistence
             && let Err(e) = persistence.persist_broadcast(context_id, snapshot)
         {
@@ -3325,7 +3367,7 @@ impl ContextManager {
     /// (SCP-227). Derives admission policy from `template_id` and registers
     /// the creator as the first author. Persists the initial broadcast state
     /// for crash recovery.
-    fn init_broadcast_context(
+    pub(crate) fn init_broadcast_context(
         &self,
         context_id: &str,
         params: &ContextParams,
@@ -3354,7 +3396,7 @@ impl ContextManager {
     }
 
     /// Persists context and broadcast state if a persistence provider is configured.
-    async fn persist_context_and_broadcast(&self, context_id: &str) {
+    pub(crate) async fn persist_context_and_broadcast(&self, context_id: &str) {
         if self.has_persistence()
             && let Ok(arc) = self.get_context_arc(context_id)
         {
@@ -3502,7 +3544,7 @@ impl ContextManager {
 
 /// Uses the canonical SHA-256 context ID byte derivation.
 /// Delegates to [`scp_protocol::context::context_id_bytes`] to match builder.rs.
-fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
+pub(crate) fn context_id_to_bytes(context_id: &str) -> [u8; 32] {
     scp_protocol::context::context_id_bytes(context_id)
 }
 
@@ -3551,6 +3593,13 @@ const fn _assert_send_sync() {
     clippy::match_same_arms,
     clippy::type_complexity,
     clippy::similar_names,
-    clippy::items_after_statements
+    clippy::items_after_statements,
+    // ADR-049 commit 12c.2: hoisting lifecycle methods into
+    // `context/lifecycle_helpers.rs` inlines their full bodies at every
+    // call-site, which inflates some test-path futures past clippy's
+    // 16 KB stack budget. Tests legitimately exercise the full lifecycle
+    // pipeline; `Box::pin`-ing every call-site would add churn without
+    // improving runtime behavior.
+    clippy::large_futures
 )]
 mod tests;

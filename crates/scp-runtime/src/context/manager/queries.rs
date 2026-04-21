@@ -691,7 +691,7 @@ impl ContextManager {
     ///
     /// Used by `close_context` to ensure a final checkpoint is always
     /// generated before context archival (§9.9.3).
-    pub(super) fn force_create_checkpoint(
+    pub(crate) fn force_create_checkpoint(
         &self,
         context_id: &str,
         ctx: &mut super::PerContextState,

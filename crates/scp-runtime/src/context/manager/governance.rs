@@ -5392,7 +5392,7 @@ impl ContextManager {
     /// The task stops when the context is no longer `Active` or when
     /// cancelled via [`GovernanceTimeoutTask::cancel()`].
     #[allow(clippy::too_many_lines)] // Five-phase task spawn closure; phases are factored into helper methods.
-    pub(super) async fn start_governance_timeout_task(&self, context_id: &str) {
+    pub(crate) async fn start_governance_timeout_task(&self, context_id: &str) {
         let contexts = self.contexts_arc();
         let clock = Arc::clone(&self.clock);
         let event_log = Arc::clone(&self.event_log);
@@ -5913,7 +5913,7 @@ impl ContextManager {
     /// Returns [`ContextError::EventLogFailed`] if the durable event log
     /// append fails (rare; persistence is best-effort, but a failed log
     /// append indicates a deeper subsystem fault).
-    pub(super) async fn try_broadcast_commit_or_enqueue(
+    pub(crate) async fn try_broadcast_commit_or_enqueue(
         &self,
         context_id: &str,
         commit_bytes: Vec<u8>,

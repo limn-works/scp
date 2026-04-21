@@ -40,7 +40,22 @@ const MANAGER_SRC: &str = concat!(
     // FIRST occurrence — picks up the real hoisted bodies rather than
     // the forwarders. When the forwarders are deleted in commit 12f this
     // ordering becomes a no-op; it remains correct.
+    //
+    // Commit 12c.2 of ADR-049 extends the same hoist pattern to the
+    // lifecycle / ttl_close domain: `create_context`, `join_context`,
+    // `leave_context`, `close_context`, `export_context`,
+    // `import_context`, `start_ttl_timer`, `propose_ttl_extension`,
+    // `reset_ttl_timer`, `handle_ttl_expiry`, `finalize_close`, and
+    // their domain-internal transitives (`close_context_with_key`,
+    // `finalize_create`, `join_context_membership`,
+    // `capture_join_payment`, `spawn_ttl_timer`,
+    // `drain_and_deliver_sender_keys`). `lifecycle_helpers.rs` is
+    // concatenated BEFORE `manager/lifecycle.rs` and
+    // `manager/ttl_close.rs` for the same first-match reason — any
+    // pipeline-wiring assertion that names one of these methods must
+    // witness the hoisted body, not the forwarder.
     include_str!("../../../../crates/scp-runtime/src/context/messaging_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/messaging.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/broadcast.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/governance.rs"),

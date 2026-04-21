@@ -142,12 +142,12 @@ async fn dispatch_inner(view: &MutationStateView<'_>, cmd: GovernanceCommand) ->
             payload,
             approve,
             reply,
-        } => handle_vote_on_proposal(view, *payload, approve, reply).await,
+        } => Box::pin(handle_vote_on_proposal(view, *payload, approve, reply)).await,
         GovernanceCommand::ApproveGovernanceProposal { payload, reply } => {
-            handle_approve_governance_proposal(view, *payload, reply).await
+            Box::pin(handle_approve_governance_proposal(view, *payload, reply)).await
         }
         GovernanceCommand::RejectGovernanceProposal { payload, reply } => {
-            handle_reject_governance_proposal(view, *payload, reply).await
+            Box::pin(handle_reject_governance_proposal(view, *payload, reply)).await
         }
         GovernanceCommand::WithdrawGovernanceVote {
             context_id,
@@ -159,7 +159,7 @@ async fn dispatch_inner(view: &MutationStateView<'_>, cmd: GovernanceCommand) ->
                 .await
         }
         GovernanceCommand::ExecuteGovernanceAction { payload, reply } => {
-            handle_execute_governance_action(view, *payload, reply).await
+            Box::pin(handle_execute_governance_action(view, *payload, reply)).await
         }
         GovernanceCommand::GetProposal {
             context_id,
@@ -213,13 +213,24 @@ async fn handle_propose_governance_action(
     let context_id = p.context_id.clone();
     let signing_key = p.signing_key.to_signing_key();
 
+    // Box::pin the propose future — the underlying governance path's
+    // 16 KB+ locals crosses clippy's stack budget for async futures
+    // (ADR-049 commit 12c.2 observed this after the lifecycle / ttl_close
+    // hoist tightened some call-graph futures adjacent to the governance
+    // path). Boxing moves the state onto the heap.
     let propose_fut = async move {
-        manager
-            .propose_governance_action(&p.context_id, &p.proposer_did, p.action, &signing_key)
-            .await
+        Box::pin(manager.propose_governance_action(
+            &p.context_id,
+            &p.proposer_did,
+            p.action,
+            &signing_key,
+        ))
+        .await
     };
 
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, propose_fut).await {
+    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, propose_fut))
+        .await
+    {
         Ok(Ok(tuple)) => (Outcome::ok_mutated(()), Ok(tuple)),
         Ok(Err(e)) => {
             let sketch = outcome_error_sketch(&e);
@@ -251,18 +262,21 @@ async fn handle_propose_governance_action_checked(
     let context_id = p.context_id.clone();
     let signing_key = p.signing_key.to_signing_key();
 
+    // Box::pin — see the rationale on the sibling
+    // `handle_propose_governance_action`.
     let propose_fut = async move {
-        manager
-            .propose_governance_action_checked(
-                &p.context_id,
-                &p.proposer_did,
-                p.action,
-                &signing_key,
-            )
-            .await
+        Box::pin(manager.propose_governance_action_checked(
+            &p.context_id,
+            &p.proposer_did,
+            p.action,
+            &signing_key,
+        ))
+        .await
     };
 
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, propose_fut).await {
+    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, propose_fut))
+        .await
+    {
         Ok(Ok(outcome_val)) => (Outcome::ok_mutated(()), Ok(outcome_val)),
         Ok(Err(e)) => {
             let sketch = outcome_error_sketch(&e);
@@ -306,20 +320,23 @@ async fn handle_vote_on_proposal(
             .await
     };
 
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, vote_fut).await {
-        Ok(Ok(tuple)) => (Outcome::ok_mutated(()), Ok(tuple)),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err_mutated(sketch), Err(e))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "vote_on_proposal exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
+    // Box::pin — governance futures cross clippy's 16 KB stack budget
+    // (ADR-049 commit 12c.2). See sibling `handle_propose_governance_action`.
+    let (outcome, reply_result) =
+        match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, vote_fut)).await {
+            Ok(Ok(tuple)) => (Outcome::ok_mutated(()), Ok(tuple)),
+            Ok(Err(e)) => {
+                let sketch = outcome_error_sketch(&e);
+                (Outcome::err_mutated(sketch), Err(e))
+            }
+            Err(_elapsed) => {
+                let err = ContextError::TransportTimeout(format!(
+                    "vote_on_proposal exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                ));
+                let sketch = outcome_error_sketch(&err);
+                (Outcome::err_mutated(sketch), Err(err))
+            }
+        };
 
     let _ = reply.send(reply_result);
     outcome
@@ -344,7 +361,10 @@ async fn handle_approve_governance_proposal(
             .await
     };
 
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, approve_fut).await {
+    // Box::pin — see sibling `handle_propose_governance_action`.
+    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, approve_fut))
+        .await
+    {
         Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok(status)),
         Ok(Err(e)) => {
             let sketch = outcome_error_sketch(&e);
@@ -382,7 +402,10 @@ async fn handle_reject_governance_proposal(
             .await
     };
 
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reject_fut).await {
+    // Box::pin — see sibling `handle_propose_governance_action`.
+    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, reject_fut))
+        .await
+    {
         Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok(status)),
         Ok(Err(e)) => {
             let sketch = outcome_error_sketch(&e);

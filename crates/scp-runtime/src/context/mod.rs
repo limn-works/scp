@@ -32,6 +32,7 @@ pub mod app_sandbox;
 pub mod builder;
 pub mod export_import;
 pub mod governance;
+pub(crate) mod lifecycle_helpers;
 pub mod manager;
 pub(crate) mod messaging_helpers;
 pub mod policy;

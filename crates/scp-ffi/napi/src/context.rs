@@ -3489,8 +3489,10 @@ pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
     crate::runtime::init_context_manager(&export.exporter_did.0);
 
     let manager = context_manager()?;
-    manager
-        .import_context(export)
+    // Box::pin — `import_context` builds a large `PerContextState` in-place
+    // (ADR-049 commit 12c.2 hoist); the resulting future crosses clippy's
+    // 16 KB stack budget without heap-boxing.
+    Box::pin(manager.import_context(export))
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
     Ok(context_id)

@@ -4,15 +4,13 @@ use std::collections::VecDeque;
 
 use super::{
     AccessControlState, Arc, BroadcastAdmission, BroadcastContext, Capability, CapabilityCeiling,
-    CommitOperation, ContextCreationError, ContextError, ContextEvent, ContextHandle,
-    ContextManager, ContextMode, ContextParams, ContextRoleState, ContextSnapshot, ContextState,
-    DID, DeadlockDetectionState, EpochCoordinator, EpochState, GovernanceModel,
-    GovernanceModelConfig, GovernanceState, GovernanceTimeoutTask, HashMap, HashSet, KeyPackage,
-    MemberBudgetTracker, MembershipState, PerContextState, ReceiveBuffer, TemplateId, TtlState,
-    TtlTimer, build_governance_engine, builder_create_context, context_id_to_bytes,
-    create_governance_engine, instrument, mint_governance_tokens, push_welcome_event,
-    require_active, restore_governance_engine_from_snapshot, restore_grace_store_from_snapshot,
-    roles, validate_governance_consistency, validate_governance_model,
+    ContextCreationError, ContextError, ContextHandle, ContextManager, ContextMode, ContextParams,
+    ContextRoleState, ContextSnapshot, ContextState, DID, DeadlockDetectionState, EpochCoordinator,
+    EpochState, GovernanceModelConfig, GovernanceState, GovernanceTimeoutTask, HashMap, HashSet,
+    KeyPackage, MemberBudgetTracker, MembershipState, PerContextState, ReceiveBuffer, TemplateId,
+    TtlState, TtlTimer, build_governance_engine, builder_create_context, context_id_to_bytes,
+    instrument, mint_governance_tokens, restore_governance_engine_from_snapshot,
+    restore_grace_store_from_snapshot, validate_governance_consistency,
 };
 
 /// Builds an [`IdentityDepthAssessment`] for a member in a context.
@@ -84,7 +82,7 @@ pub(super) fn build_identity_assessment(
 /// Called from `create_context` to catch internal callers that bypass FFI
 /// validation. Rejects control characters, HTML-special characters, and
 /// overly long strings.
-fn validate_consequence_rules(
+pub fn validate_consequence_rules(
     rules: &[scp_protocol::trust::consequence::ConsequenceRule],
     config: &scp_protocol::context::params::ConsequenceConfig,
 ) -> Result<(), ContextCreationError> {
@@ -118,7 +116,7 @@ pub(super) const MAX_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
 /// Mirrors the WASM bridge `validate_imported_snapshot` policy
 /// (`crates/scp-ffi/wasm/src/manager.rs`), but applied to the runtime
 /// `ContextManager` paths that the WASM bridge does not exercise.
-fn sanitize_cooldown_until(
+pub fn sanitize_cooldown_until(
     cooldown_until: &mut HashMap<usize, u64>,
     consequence_rules: &[scp_protocol::trust::consequence::ConsequenceRule],
     now: u64,
@@ -157,7 +155,7 @@ fn sanitize_cooldown_until(
 /// create-time path and returns [`ContextCreationError`]. This variant
 /// is used by `import_context` and `restore_context` so the bridge
 /// translators surface the canonical `SCP-CTX-2092` code.
-fn validate_consequence_rules_for_import(
+pub fn validate_consequence_rules_for_import(
     rules: &[scp_protocol::trust::consequence::ConsequenceRule],
     config: &scp_protocol::context::params::ConsequenceConfig,
 ) -> Result<(), ContextError> {
@@ -182,7 +180,7 @@ fn validate_consequence_rules_for_import(
 /// assessment is constructed with an empty signal set. Contexts that set a
 /// sybil policy with non-trivial requirements will reject members until
 /// signal providers are wired in at a higher layer.
-pub(super) fn evaluate_sybil_resistance(
+pub fn evaluate_sybil_resistance(
     ctx: &PerContextState,
     member_did: &DID,
     now: u64,
@@ -202,7 +200,7 @@ pub(super) fn evaluate_sybil_resistance(
 }
 
 /// Initializes participation record and records budget spend for a new member (#1530, #1537).
-fn post_join_bookkeeping(
+pub fn post_join_bookkeeping(
     ctx: &mut PerContextState,
     context_id: &str,
     member_did: &DID,
@@ -242,7 +240,7 @@ fn post_join_bookkeeping(
 /// customization will land via governance in a follow-up PR.
 #[allow(clippy::unnecessary_wraps)] // Option return kept for forward compat
 // with per-context pricing customization landing via governance.
-fn derive_message_pricing(
+pub fn derive_message_pricing(
     _economic_policy: Option<&scp_protocol::economy::types::EconomicPolicy>,
 ) -> Option<scp_protocol::economy::antispam::ContextMessagePricingConfig> {
     Some(scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default())
@@ -258,7 +256,7 @@ fn derive_message_pricing(
 /// Returns the deducted cost (if any) so the caller can carry it in an
 /// `EconomyTicket` and drain all refundable economic state together via
 /// `rollback_economy_ticket` on subsequent failure (F4 escrow pattern).
-fn enforce_join_economy(
+pub fn enforce_join_economy(
     ctx: &mut PerContextState,
     joiner_did: &DID,
     now: u64,
@@ -636,20 +634,6 @@ impl ContextManager {
         }
     }
 
-    /// Generates the initial access key store for context creation (§9.17.2).
-    fn generate_initial_access_key_store(
-        context_id: &str,
-        creator_did: &DID,
-    ) -> scp_protocol::crypto::access_keys::AccessKeyStore {
-        let mut store = scp_protocol::crypto::access_keys::AccessKeyStore::new();
-        let key = scp_protocol::crypto::access_keys::generate_access_key(
-            context_id,
-            creator_did.as_ref(),
-        );
-        store.set(context_id, creator_did.as_ref(), key);
-        store
-    }
-
     /// Returns `true` if the given context needs to re-enter the
     /// reconnection protocol (§23.3) before processing new messages.
     ///
@@ -902,40 +886,16 @@ impl ContextManager {
     /// Returns [`ContextError`] if the context does not exist or event log
     /// export fails.
     #[instrument(skip_all, fields(context_id))]
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::export_context`] free
+    /// function (ADR-049 commit 12c.2). Deleted in a later commit
+    /// alongside every other `ContextManager` lifecycle surface.
     pub async fn export_context(
         &self,
         context_id: &str,
         exporter_did: DID,
     ) -> Result<crate::context::export_import::ContextExport, ContextError> {
-        let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-
-        let snapshot = {
-            let ctx_arc = self.get_context_arc(context_id).map_err(|_| {
-                ContextError::MembershipFailed(format!(
-                    "context '{context_id}' not found — cannot export"
-                ))
-            })?;
-            let guard = ctx_arc.lock().await;
-            let ctx = &*guard;
-            Self::snapshot_context(ctx)
-        };
-
-        let event_log_data = self
-            .event_log
-            .export_event_log_data(&ctx_id_bytes)
-            .unwrap_or_default();
-
-        // MLS state is empty until #333 (MLS integration) lands.
-        let mls_state = Vec::new();
-
-        crate::context::export_import::create_export(
-            snapshot,
-            event_log_data,
-            mls_state,
-            exporter_did,
-            crate::context::export_import::ExportScope::Full,
-            &*self.clock,
-        )
+        crate::context::lifecycle_helpers::export_context(self, context_id, exporter_did).await
     }
 
     /// Imports a previously exported context into this manager.
@@ -987,397 +947,16 @@ impl ContextManager {
     /// rules`, `consequence_config`, `cooldown_until`. The latter is
     /// clamped to a bounded horizon and out-of-bound rule indices are
     /// dropped.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::import_context`] free
+    /// function (ADR-049 commit 12c.2). Deleted in a later commit
+    /// alongside every other `ContextManager` lifecycle surface.
     #[instrument(skip_all)]
-    #[allow(clippy::too_many_lines)] // Reimport guard adds 10 lines to an already-100-line function.
     pub async fn import_context(
         &self,
         export: crate::context::export_import::ContextExport,
     ) -> Result<ContextHandle, ContextError> {
-        // 1. Validate export.
-        crate::context::export_import::validate_export_for_import(&export)?;
-        // C3: Validate consequence rules on import. Uses
-        // validate_against_config to enforce the opt-in gate for
-        // RevokeAccess even on imported snapshots and rejects with the
-        // canonical SCP-CTX-2092 envelope so SDK callers can detect
-        // structural rejection by `.code` rather than message body.
-        validate_consequence_rules_for_import(
-            &export.snapshot.consequence_rules,
-            &export.snapshot.context_params.consequence_config,
-        )?;
-
-        let context_id = export.snapshot.context_id.clone();
-        let ctx_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
-
-        // 2. Check context existence BEFORE importing event log data.
-        //    If the context is Active, we must reject early — otherwise the
-        //    event log import at step 3 would overwrite the Active context's
-        //    Merkle chain before we discover the conflict.
-        {
-            if let Ok(ctx_arc) = self.get_context_arc(&context_id) {
-                let existing = ctx_arc.lock().await;
-                let is_replaceable = existing.handle.try_read_state().is_some_and(|s| {
-                    matches!(
-                        s,
-                        ContextState::Closing
-                            | ContextState::Closed
-                            | ContextState::Expired
-                            | ContextState::Tombstoned
-                    )
-                });
-                if !is_replaceable {
-                    return Err(ContextError::MembershipFailed(format!(
-                        "context '{context_id}' already exists — cannot import"
-                    )));
-                }
-                // §23.17 Invariant 3: capture per-sender epoch floors BEFORE
-                // destroying crypto state so they can be validated against the
-                // incoming snapshot (replay-based floor regression guard).
-                let local_epoch_floors = self.crypto.export_sender_key_epochs(&ctx_id_bytes);
-
-                // Clean up old crypto state before reimport.
-                let _ = self.crypto.destroy_mls_group(&ctx_id_bytes);
-                let _ = self.crypto.destroy_sender_key(&ctx_id_bytes);
-
-                // Restore incoming crypto state (if the export carries any).
-                if !export.mls_state.is_empty() {
-                    self.crypto
-                        .restore_crypto_state(&ctx_id_bytes, &export.mls_state)
-                        .map_err(|e| {
-                            ContextError::PersistenceFailed(format!(
-                                "import: crypto state restore failed: {e}"
-                            ))
-                        })?;
-                }
-
-                // §23.17 Invariant 3: validate that no per-sender epoch floor
-                // regresses, and merge local floors back (max-merge) to preserve
-                // Invariant 4.  On failure, roll back the restored crypto state.
-                if let Err(e) = self.crypto.validate_and_merge_epoch_floors(
-                    &ctx_id_bytes,
-                    local_epoch_floors,
-                    crate::crypto::mls::provider::MAX_EPOCH_ADVANCE,
-                ) {
-                    // Rollback: destroy the just-restored crypto state so the
-                    // provider is not left with partially-merged floors.
-                    let _ = self.crypto.destroy_mls_group(&ctx_id_bytes);
-                    let _ = self.crypto.destroy_sender_key(&ctx_id_bytes);
-                    return Err(e);
-                }
-            } else if !export.mls_state.is_empty() {
-                // Fresh slot (no prior context): restore crypto state directly.
-                // No local floors to defend — `validate_and_merge_epoch_floors`
-                // is a no-op when `local_floors` is empty, so the ceiling guard
-                // does not apply on this path. We still restore so MLS group
-                // and sender keys are available immediately after import.
-                self.crypto
-                    .restore_crypto_state(&ctx_id_bytes, &export.mls_state)
-                    .map_err(|e| {
-                        ContextError::PersistenceFailed(format!(
-                            "import: crypto state restore failed: {e}"
-                        ))
-                    })?;
-            }
-        }
-        // Lock dropped — safe to proceed with event log import.
-
-        // 3. Import event log data if present.
-        if !export.event_log_data.is_empty() {
-            self.event_log
-                .import_event_log_data(&ctx_id_bytes, &export.event_log_data)?;
-        }
-
-        // 4. Reconstruct the ContextHandle.
-        let handle = ContextHandle::new(context_id.clone(), export.snapshot.context_params.clone());
-
-        // Transition to the state from the snapshot.
-        match &export.snapshot.state {
-            ContextState::Active => {
-                handle.transition_to(&ContextState::Active).await?;
-            }
-            ContextState::Creating => {
-                // Already in Creating state, nothing to do.
-            }
-            other => {
-                return Err(ContextError::InvalidState(format!(
-                    "cannot import context in {other} state — only Active and Creating are supported"
-                )));
-            }
-        }
-
-        // 5. Reconstruct governance engine from snapshot.
-        let governance_engine =
-            restore_governance_engine_from_snapshot(&export.snapshot, self.key_resolver.clone())?;
-
-        // 6. Build PerContextState from the snapshot.
-        let initial_members: HashSet<DID> = export
-            .snapshot
-            .membership
-            .members()
-            .map(|m| m.did.clone())
-            .collect();
-
-        // F6: Validate and sanitize persisted anti-spam snapshot state
-        // BEFORE reconstructing the trackers. Tampered imports that
-        // carry future timestamps (which would let a malicious sender
-        // "pre-consume" future capacity) are rejected; stale entries
-        // are clamped. Matches restore_context policy verbatim.
-        let now_for_validation = self.clock.now_secs();
-        let hrl_config = export
-            .snapshot
-            .hard_rate_limit_config
-            .clone()
-            .unwrap_or_else(scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults);
-        hrl_config.validate().map_err(|e| {
-            ContextError::PersistenceFailed(format!(
-                "import: hard-rate-limit config validation failed: {e}"
-            ))
-        })?;
-        let mut hrl_state = export.snapshot.hard_rate_limit_state.clone();
-        scp_protocol::economy::antispam::TokenBucketLimiter::validate_and_sanitize_snapshot(
-            &mut hrl_state,
-            &hrl_config,
-            now_for_validation,
-            scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
-        )
-        .map_err(|e| {
-            ContextError::PersistenceFailed(format!(
-                "import: hard-rate-limit snapshot validation failed: {e}"
-            ))
-        })?;
-        let validated_velocity_tracker = match export.snapshot.velocity_tracker_state.clone() {
-            Some(vts) => {
-                let mut entries = vts.entries;
-                scp_protocol::economy::antispam::SenderVelocityTracker
-                    ::validate_and_sanitize_snapshot(
-                        &mut entries,
-                        60,
-                        now_for_validation,
-                        scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
-                    )
-                    .map_err(|e| {
-                        ContextError::PersistenceFailed(format!(
-                            "import: velocity snapshot validation failed: {e}"
-                        ))
-                    })?;
-                scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(60, entries)
-            }
-            None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
-        };
-        let validated_message_pricing = export
-            .snapshot
-            .message_pricing
-            .clone()
-            .or_else(|| derive_message_pricing(export.snapshot.economic_policy.as_ref()));
-        if let Some(ref pricing) = validated_message_pricing {
-            pricing.validate().map_err(|e| {
-                ContextError::PersistenceFailed(format!(
-                    "import: message pricing config validation failed: {e}"
-                ))
-            })?;
-        }
-
-        // C3: Clamp imported `cooldown_until` to a bounded horizon and
-        // drop entries with out-of-range rule indices, mirroring the
-        // WASM bridge `validate_imported_snapshot` policy. Without
-        // this, an attacker can ship `cooldown_until[i] = u64::MAX` and
-        // permanently disable a consequence rule.
-        let mut sanitized_cooldown_until = export.snapshot.cooldown_until.clone();
-        sanitize_cooldown_until(
-            &mut sanitized_cooldown_until,
-            &export.snapshot.consequence_rules,
-            now_for_validation,
-            "import",
-        );
-
-        let per_context = PerContextState {
-            generation: self
-                .next_generation
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            handle: handle.clone(),
-            membership: export.snapshot.membership,
-            role_state: export.snapshot.role_state,
-            receive_buffer: ReceiveBuffer::new(),
-            broadcast_context: None,
-            migration_state: None,
-            governance: GovernanceState {
-                engine: governance_engine,
-                executed_proposals: {
-                    let now = self.clock.now_secs();
-                    export
-                        .snapshot
-                        .executed_proposals
-                        .into_iter()
-                        .map(|id| (id, now))
-                        .collect()
-                },
-                // C3: Wipe `approved_proposals`. Importing the
-                // exporter's approved-but-not-yet-executed proposals
-                // lets a malicious snapshot pre-load forged
-                // `RemoveMember` entries — `check_proposer_eligibility`
-                // would then permanently block the victim from
-                // proposing. The legitimate set is rebuilt from the
-                // imported event log on next governance evaluation.
-                // H10: Reset next_proposal_seq as well — the exporter
-                // could carry an arbitrary value (e.g. u64::MAX) to
-                // rewind the importing instance's seq space and
-                // reintroduce collision windows. Since approved_proposals
-                // is wiped, reset to 0.
-                next_proposal_seq: 0,
-                approved_proposals: HashMap::new(),
-                freeze: export.snapshot.governance_freeze,
-                timeout_task: GovernanceTimeoutTask::new(),
-                deadlock: DeadlockDetectionState::default(),
-                threshold_signers: export.snapshot.threshold_signers,
-                threshold_value: export.snapshot.threshold_value,
-                pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
-                pending_economic_policy_change: export.snapshot.pending_economic_policy_change,
-                registered_tools: export.snapshot.registered_tools,
-                tool_interfaces: export.snapshot.tool_interfaces,
-                pruning_policy: export.snapshot.pruning_policy,
-                message_pricing: validated_message_pricing,
-                hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
-                    hrl_config, hrl_state,
-                ),
-                economic_policy: export.snapshot.economic_policy,
-                // C3: Wipe `budget_tracker`. Budgets are per-instance
-                // economic grants from `ApproveSpend` actions; a peer
-                // import that carried `budget_tracker` could pre-fund
-                // any DID for arbitrary spend on the importing node.
-                budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
-                last_known_members: initial_members,
-                pending_epoch_resets: Vec::new(),
-                consequence_rules: export.snapshot.consequence_rules,
-                velocity_tracker: validated_velocity_tracker,
-                // C3: Wipe `participation_cache`. The cache is
-                // rebuilt lazily from the imported event log on
-                // next proposer-eligibility check (see
-                // `check_proposer_eligibility`). Inheriting the
-                // exporter's cache lets it forge low-participation
-                // verdicts against any DID it picks.
-                participation_cache: HashMap::new(),
-                cooldown_until: sanitized_cooldown_until,
-                // IMPORT path (not restore): start with a FRESH
-                // spending-nonce tracker regardless of what the
-                // export carries. Three reasons:
-                //   1. Nonce tracker state is per-local-instance
-                //      anti-replay state with no meaning in an
-                //      inter-instance transfer.
-                //   2. The exporter may be untrusted; a malicious
-                //      export could pre-populate the tracker with
-                //      up to `DEFAULT_MAX_CAPACITY` attacker-chosen
-                //      entries, a DoS on local memory with no
-                //      forgery benefit.
-                //   3. The importing instance has not yet consumed
-                //      any spending UCANs — a fresh tracker cannot
-                //      reopen a replay window.
-                // The public-scope stripper already applies this
-                // invariant; full-scope import matches. The
-                // `restore_context` local-reload path MUST still
-                // rehydrate from `spending_nonce_tracker_state` —
-                // this divergence is deliberate.
-                spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
-                    context_id.clone(),
-                    Arc::clone(&self.clock),
-                ),
-                revoked_spending_ucan_cids: HashSet::new(),
-                // C3: Wipe `proposal_timestamps`. Earned-capacity rate
-                // limits (§9.3) are per-instance counters. Inheriting
-                // the exporter's history lets it starve victims of
-                // proposal slots — every imported timestamp is a free
-                // bite out of the importing node's enforcement window.
-                proposal_timestamps: HashMap::new(),
-            },
-            epoch: EpochState {
-                mls_epoch: export.snapshot.mls_epoch,
-                coordinator: EpochCoordinator::from_records(
-                    export.snapshot.epoch_coordination_records,
-                    &context_id,
-                ),
-                grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
-                needs_reconnect: false,
-            },
-            access: AccessControlState {
-                read_exclusion_list: export.snapshot.read_exclusion_list,
-                access_key_store: export.snapshot.access_key_store,
-            },
-            ttl: TtlState {
-                timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
-                extension: None,
-            },
-            sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
-            reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
-            // PR #1606 C6: import path starts with an empty commit retry
-            // queue and no fail-close marker. Pending commits in the source
-            // export are not portable across instances — they reference the
-            // exporter's MLS state which is not transferred via import.
-            pending_commits: VecDeque::new(),
-            commit_fault: None,
-            // Checkpoint tracking (§9.9.3): fresh counters for imported contexts.
-            checkpoint_events_since: 0,
-            checkpoint_last_time_secs: self.clock.now_secs(),
-            checkpoints: Vec::new(),
-            // Fresh Merkle tree for imported contexts. Proofs cover
-            // post-import events only (same rationale as restore_context).
-            merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
-            // §9.10.4: pseudonym state is local-instance — wiped on import.
-            // The importing member must re-derive and re-announce.
-            local_pseudonym: None,
-            pseudonym_registry: HashMap::new(),
-            // ADR-049 commit 8: fresh actor-shape tracker on import.
-            send_tracker: crate::context::actor::SendSequenceTracker::new(),
-        };
-
-        // 7. Register the context.
-        //    Re-check replaceability under the lock to close the TOCTOU gap
-        //    between step 2 (which dropped the lock for event log import) and
-        //    this insertion. A concurrent `create_context` or `import_context`
-        //    could have registered an Active context in the meantime.
-        {
-            if let Ok(ctx_arc) = self.get_context_arc(&context_id) {
-                let existing = ctx_arc.lock().await;
-                let is_replaceable = existing.handle.try_read_state().is_some_and(|s| {
-                    matches!(
-                        s,
-                        ContextState::Closing
-                            | ContextState::Closed
-                            | ContextState::Expired
-                            | ContextState::Tombstoned
-                    )
-                });
-                if !is_replaceable {
-                    return Err(ContextError::MembershipFailed(format!(
-                        "context '{context_id}' was concurrently registered during import"
-                    )));
-                }
-            }
-            self.remove_context(&context_id);
-            self.insert_context(context_id.clone(), per_context)
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-        }
-
-        self.update_context_gauges();
-
-        // Start governance timeout task (ADR-031 §5).
-        self.start_governance_timeout_task(&context_id).await;
-
-        // 8. Persist if persistence is configured.
-        if self.has_persistence()
-            && let Ok(ctx_arc) = self.get_context_arc(&context_id)
-        {
-            let guard = ctx_arc.lock().await;
-            let ctx = &*guard;
-            let snap = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(&context_id, snap);
-        }
-
-        // 9. Re-spawn TTL timer if there was remaining TTL.
-        if let Some(remaining_secs) = export.snapshot.ttl_remaining_secs {
-            let duration = std::time::Duration::from_secs(remaining_secs);
-            self.spawn_ttl_timer(&context_id, duration, handle.clone())
-                .await;
-        }
-
-        Ok(handle)
+        crate::context::lifecycle_helpers::import_context(self, export).await
     }
 
     /// Creates a new SCP context with the two-phase commit pattern.
@@ -1407,7 +986,10 @@ impl ContextManager {
     /// persists.
     ///
     /// See ADR-008 acceptance criterion 2.
-    #[allow(clippy::too_many_lines)] // Context creation initializes many subsystems including pseudonym routing.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::create_context`] free
+    /// function (ADR-049 commit 12c.2). Deleted in a later commit
+    /// alongside every other `ContextManager` lifecycle surface.
     #[instrument(skip_all, fields(context_id = %context_id))]
     pub async fn create_context(
         &self,
@@ -1416,143 +998,14 @@ impl ContextManager {
         creator_did: DID,
         local_pseudonym: Option<[u8; 32]>,
     ) -> Result<ContextHandle, ContextCreationError> {
-        // Defense-in-depth: verify creator's SDK version satisfies min_protocol_version.
-        params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
-        validate_governance_model(&params.governance)?;
-        validate_consequence_rules(&params.consequence_rules, &params.consequence_config)?;
-        scp_protocol::economy::policy::validate_economic_policy_metrics(
-            params.economic_policy.as_ref(),
-        )
-        .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-        let governance_engine =
-            create_governance_engine(&params.governance, &creator_did, self.key_resolver.clone())?;
-        let handle = builder_create_context(
-            context_id.clone(),
-            params.clone(),
-            self.crypto.as_ref(),
-            self.transport.as_ref(),
-            self.event_log.as_ref(),
-            creator_did.as_ref(),
-        )
-        .await?;
-        let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
-        let role_state =
-            ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![], &*self.clock)
-                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-        let mut membership = MembershipState::new();
-        let creator_tokens = role_state
-            .assignments
-            .get(creator_did.as_ref())
-            .map(|a| a.tokens.clone())
-            .unwrap_or_default();
-        membership.add_member(creator_did.clone(), "admin".into(), creator_tokens);
-        let broadcast_context = self.init_broadcast_context(&context_id, &params, &creator_did)?;
-        let (initial_threshold_signers, initial_threshold_value) = match &params.governance {
-            GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
-            _ => (Vec::new(), 0),
-        };
-        let initial_access_key_store =
-            Self::generate_initial_access_key_store(&context_id, &creator_did);
-        let initial_members: HashSet<DID> = membership.members().map(|m| m.did.clone()).collect();
-        let per_context = PerContextState {
-            generation: self
-                .next_generation
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            handle: handle.clone(),
-            membership,
-            governance: GovernanceState {
-                engine: governance_engine,
-                executed_proposals: HashMap::new(),
-                approved_proposals: HashMap::new(),
-                // H10: fresh contexts start with a zero monotonic counter.
-                next_proposal_seq: 0,
-                freeze: None,
-                timeout_task: GovernanceTimeoutTask::new(),
-                deadlock: DeadlockDetectionState::default(),
-                threshold_signers: initial_threshold_signers,
-                threshold_value: initial_threshold_value,
-                pending_ceiling_modification: None,
-                pending_economic_policy_change: None,
-                registered_tools: Vec::new(),
-                tool_interfaces: Vec::new(),
-                pruning_policy: None,
-                message_pricing: derive_message_pricing(params.economic_policy.as_ref()),
-                hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::new(
-                    scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults(),
-                ),
-                economic_policy: params.economic_policy.clone(),
-                budget_tracker: MemberBudgetTracker::new(),
-                last_known_members: initial_members,
-                pending_epoch_resets: Vec::new(),
-                consequence_rules: params.consequence_rules.clone(),
-                velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
-                participation_cache: HashMap::new(),
-                cooldown_until: HashMap::new(),
-                spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
-                    context_id.clone(),
-                    Arc::clone(&self.clock),
-                ),
-                revoked_spending_ucan_cids: HashSet::new(),
-                proposal_timestamps: HashMap::new(),
-            },
-            role_state,
-            receive_buffer: ReceiveBuffer::new(),
-            broadcast_context,
-            migration_state: None,
-            epoch: EpochState {
-                mls_epoch: 0,
-                coordinator: EpochCoordinator::new(),
-                grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
-                needs_reconnect: false,
-            },
-            access: AccessControlState {
-                read_exclusion_list: HashSet::new(),
-                access_key_store: initial_access_key_store,
-            },
-            ttl: TtlState {
-                timer: TtlTimer::with_clock(Arc::clone(&self.clock)),
-                extension: None,
-            },
-            sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
-            reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
-            // PR #1606 C6: fresh contexts start with an empty commit retry
-            // queue and no fail-close marker.
-            pending_commits: VecDeque::new(),
-            commit_fault: None,
-            // Checkpoint tracking (§9.9.3): fresh counters for new contexts.
-            checkpoint_events_since: 0,
-            checkpoint_last_time_secs: self.clock.now_secs(),
-            checkpoints: Vec::new(),
-            merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
-            // §9.10.4: pseudonym routing. Only meaningful for encrypted
-            // contexts; broadcast contexts ignore this field.
+        crate::context::lifecycle_helpers::create_context(
+            self,
+            context_id,
+            params,
+            creator_did,
             local_pseudonym,
-            pseudonym_registry: HashMap::new(),
-            // ADR-049 commit 8: fresh actor-shape tracker at creation.
-            send_tracker: crate::context::actor::SendSequenceTracker::new(),
-        };
-
-        // Atomic check-and-insert — eliminates TOCTOU race between
-        // contains_key and insert.
-        self.insert_context(context_id.clone(), per_context)?;
-        self.finalize_create(&context_id, params.ttl, &handle).await;
-        Ok(handle)
-    }
-
-    /// Post-creation finalization: gauges, governance timeout, persistence, TTL timer.
-    async fn finalize_create(
-        &self,
-        context_id: &str,
-        ttl: Option<std::time::Duration>,
-        handle: &ContextHandle,
-    ) {
-        self.update_context_gauges();
-        self.start_governance_timeout_task(context_id).await;
-        self.persist_context_and_broadcast(context_id).await;
-        if let Some(ttl_duration) = ttl {
-            self.spawn_ttl_timer(context_id, ttl_duration, handle.clone())
-                .await;
-        }
+        )
+        .await
     }
 
     /// Creates a new SCP context without tracking membership state.
@@ -1884,7 +1337,10 @@ impl ContextManager {
     /// Returns [`ContextError`] if:
     /// - The context is not in `Active` state.
     /// - The key package is invalid.
-    #[allow(clippy::too_many_lines)]
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::join_context`] free
+    /// function (ADR-049 commit 12c.2). Deleted in a later commit
+    /// alongside every other `ContextManager` lifecycle surface.
     #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn join_context(
         &self,
@@ -1893,270 +1349,62 @@ impl ContextManager {
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
         local_pseudonym: Option<[u8; 32]>,
     ) -> Result<(), ContextError> {
-        let context_id = handle.context_id().to_owned();
-        let context_id_bytes = context_id_to_bytes(&context_id);
-        let member_did = key_package.owner_did.clone();
+        crate::context::lifecycle_helpers::join_context(
+            self,
+            handle,
+            key_package,
+            spending_ucan,
+            local_pseudonym,
+        )
+        .await
+    }
 
-        // Fast-fail: reject obviously incompatible versions before expensive
-        // crypto ops (MLS group join, sender key derivation). Looks up the
-        // stored context's params (not the caller-supplied handle params)
-        // so this check is authoritative even when the caller passes an
-        // ephemeral handle with default params (e.g. UniFFI bridge).
-        {
-            let ctx_arc = self
-                .get_context_arc(&context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let guard = ctx_arc.lock().await;
-            let ctx = &*guard;
-            ctx.handle
-                .params()
-                .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
-        }
+    /// Performs the membership state mutations for `join_context` (Phase 4).
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::join_context_membership`]
+    /// free function (ADR-049 commit 12c.2). Retained for signature
+    /// stability during the commits-9-to-11 migration window; deleted
+    /// in a later commit alongside every other `ContextManager`
+    /// lifecycle surface.
+    #[allow(dead_code)] // Forwarder preserved for symmetry; see doc comment.
+    pub(crate) async fn join_context_membership(
+        &self,
+        context_id: &str,
+        member_did: &DID,
+        add_output: scp_protocol::context::builder::AddMemberOutput,
+    ) -> Result<(), ContextError> {
+        crate::context::lifecycle_helpers::join_context_membership(
+            self, context_id, member_did, add_output,
+        )
+        .await
+    }
 
-        // Validate key package before any mutations (idempotent, no lock needed).
-        let kp_bytes = key_package.mls_key_package_bytes.as_deref();
-        self.crypto.validate_key_package(&member_did, kp_bytes)?;
-
-        // Phase 1: Economy enforcement + sybil check under lock (budget deduction).
-        // This happens BEFORE any crypto mutations so that a rejected payment
-        // never grants MLS group access or sender keys.
-        // Capture generation for confused-deputy detection on rollback reacquire.
-        let (ticket, ctx_gen) = {
-            let (mut guard, ctx_gen) = self
-                .lock_context(&context_id)
-                .await
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let ctx = &mut *guard;
-
-            // State check inside lock -- eliminates TOCTOU race.
-            require_active(&ctx.handle)?;
-
-            // Defense-in-depth: re-check version compatibility under the
-            // mutation lock. The early check above uses a separate lock
-            // acquisition, so governance could theoretically change the
-            // min_protocol_version between the two. This eliminates that
-            // TOCTOU window.
-            ctx.handle
-                .params()
-                .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
-
-            // Economy enforcement (#1537, #1593) — auto-accept guard + join cost + spending UCAN.
-            // Budget deduction happens here. The adapter escrow (authorize/complete/void)
-            // runs after the lock is dropped. On adapter failure, the F4 EconomyTicket
-            // rollback restores the deducted amount AND the velocity+hard-rate state.
-            // M13: Sybil resistance check BEFORE economy enforcement so that
-            // a rejected sybil attacker doesn't consume budget. Fail-closed.
-            evaluate_sybil_resistance(ctx, &member_did, self.clock.now_secs())?;
-
-            // Defense-in-depth hard rate limit on joins (Matrix-style token
-            // bucket). On any subsequent failure we refund the token.
-            let now_secs = self.clock.now_secs();
-            if !ctx
-                .governance
-                .hard_rate_limit
-                .try_consume(&member_did, now_secs)
-            {
-                return Err(ContextError::RateLimited {
-                    resource: "join".to_owned(),
-                    message: "hard rate limit exceeded for joiner".to_owned(),
-                });
-            }
-            // Record the join in the velocity tracker so subsequent §19.7
-            // escalation observes the same activity surface as message sends.
-            // F5: capture the rollback token so a join failure refunds
-            // THIS entry specifically rather than racing concurrent joiners.
-            let velocity_token = ctx
-                .governance
-                .velocity_tracker
-                .record_message(&member_did, now_secs);
-
-            let deducted_cost = match enforce_join_economy(
-                ctx,
-                &member_did,
-                now_secs,
-                spending_ucan,
-                &context_id,
-                &*self.clock,
-                &self.key_resolver,
-            ) {
-                Ok(cost) => cost,
-                Err(e) => {
-                    // No ticket exists yet — roll back inline under lock.
-                    ctx.governance
-                        .velocity_tracker
-                        .rollback(&member_did, velocity_token);
-                    ctx.governance.hard_rate_limit.refund(&member_did);
-                    return Err(e);
-                }
-            };
-            // F4: wrap the Phase 1 state in an EconomyTicket so every
-            // downstream error path (adapter, MLS, sender-key) is forced
-            // to roll back velocity + hard_rate_limit + budget, not just
-            // the budget.
-            (
-                super::economy::EconomyTicket {
-                    actor_did: member_did.clone(),
-                    deducted_cost,
-                    velocity_token,
-                    needs_hard_rate_limit_refund: true,
-                    consumed: false,
-                },
-                ctx_gen,
-            )
-        };
-
-        // Phase 2: Authorize payment (escrow hold) BEFORE any crypto mutation.
-        // If authorization fails, rollback the ticket — no MLS state was touched.
-        let auth = match self
-            .authorize_paid_action(
-                scp_protocol::economy::types::PaidActionType::ContextJoin,
-                &member_did,
-                &context_id,
-            )
-            .await
-        {
-            Ok(auth) => auth,
-            Err(payment_err) => {
-                super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
-                return Err(payment_err);
-            }
-        };
-
-        // Phase 3: MLS add_member + sender key distribution (crypto mutations).
-        // On failure: void escrow + rollback ticket. No MLS rollback needed
-        // because add_member itself failed (no state change occurred).
-        let add_output = match self
-            .crypto
-            .add_member(&context_id_bytes, &member_did, kp_bytes)
-        {
-            Ok(output) => output,
-            Err(e) => {
-                if let Some(a) = auth {
-                    self.void_paid_action(a, &context_id).await;
-                }
-                super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
-                return Err(e);
-            }
-        };
-
-        if let Err(e) = self
-            .crypto
-            .distribute_sender_key(&context_id_bytes, &member_did)
-        {
-            // Sender key distribution failed after MLS add — rollback MLS state.
-            let _ = self.crypto.remove_member(&context_id_bytes, &member_did);
-            let _ = self
-                .crypto
-                .remove_member_sender_key(&context_id_bytes, &member_did);
-            if let Some(a) = auth {
-                self.void_paid_action(a, &context_id).await;
-            }
-            super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
-            return Err(e);
-        }
-
-        // Drain pending HPKE-sealed sender key distribution messages and
-        // deliver them via the MLS management channel (§9.16.2).
-        //
-        // CRITICAL: distributions MUST be MLS-wrapped via
-        // `mls_encrypt_management` so the receive-side dispatcher
-        // (`decrypt_and_dispatch`) recognizes them as
-        // `OpenResult::Management` and routes them through
-        // `process_incoming_sender_key`. Sending the raw HPKE-sealed
-        // bytes via `transport.send_message` would fail to deserialize
-        // as an `OuterEnvelope` on the joiner side, causing silent
-        // distribution loss (recoverable only via `SenderKeyRequest`).
-        //
-        // Helper semantics (matches the rotation path used by
-        // `execute_remove_member`, `leave_context`, and `execute_rotate_content_keys`):
-        //   - Drain failure (catastrophic, e.g. lock poisoned) → propagated
-        //     and forces full rollback below.
-        //   - Per-target encrypt/send failure → warned and continued. The
-        //     joiner falls back to `SenderKeyRequest` to recover the key.
-        //
-        // Ordering invariant: this point is reached AFTER `add_member`
-        // has merged the pending Commit on the inviter side, so the
-        // inviter's MLS group already includes the new joiner in the
-        // post-add epoch. The joiner can decrypt this management message
-        // once they process the Welcome (delivered out-of-band via the
-        // `WelcomeGenerated` event). If the joiner receives the
-        // management message before the Welcome, their `crypto.open()`
-        // call fails to decrypt and the `SenderKeyRequest` fallback
-        // recovers the key.
-        if let Err(e) = self.drain_and_deliver_sender_keys(&context_id, &context_id_bytes) {
-            // Drain failed catastrophically — roll back MLS state, sender
-            // key, escrow, and economy ticket so the join is fully aborted.
-            let _ = self.crypto.remove_member(&context_id_bytes, &member_did);
-            let _ = self
-                .crypto
-                .remove_member_sender_key(&context_id_bytes, &member_did);
-            if let Some(a) = auth {
-                self.void_paid_action(a, &context_id).await;
-            }
-            super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
-            return Err(e);
-        }
-
-        // Phase 4: Membership mutation under lock. On failure: void escrow +
-        // rollback ticket + rollback MLS state.
-        if let Err(e) = self
-            .join_context_membership(&context_id, &member_did, add_output)
-            .await
-        {
-            let _ = self.crypto.remove_member(&context_id_bytes, &member_did);
-            let _ = self
-                .crypto
-                .remove_member_sender_key(&context_id_bytes, &member_did);
-            if let Some(a) = auth {
-                self.void_paid_action(a, &context_id).await;
-            }
-            super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
-            return Err(e);
-        }
-
-        // Phase 4.5: Store local pseudonym after membership mutation succeeds.
-        // The pseudonym was pre-derived by the FFI bridge; storing it here
-        // makes it available for subsequent send_message fan-out (§9.10.4).
-        if let Some(pseudonym) = local_pseudonym
-            && let Ok(ctx_arc) = self.get_context_arc(&context_id)
-        {
-            let mut guard = ctx_arc.lock().await;
-            let ctx = &mut *guard;
-            ctx.local_pseudonym = Some(pseudonym);
-        }
-
-        // Phase 5: Capture the escrow hold after all mutations succeeded.
-        // Consume the ticket — commit returns the deducted cost for the
-        // capture step and marks the ticket as committed so the Drop
-        // guard stays quiet.
-        let deducted_cost = super::economy::commit_economy_ticket(ticket);
-        self.capture_join_payment(auth, &member_did, &context_id, deducted_cost)
-            .await;
-
-        // Append MemberJoined event to event log.
-        self.event_log.append_context_event(
-            &context_id_bytes,
-            "MemberJoined",
-            member_did.as_ref(),
-        )?;
-        {
-            if let Ok(ctx_arc) = self.get_context_arc(&context_id) {
-                let mut guard = ctx_arc.lock().await;
-                let ctx = &mut *guard;
-                ctx.checkpoint_events_since += 1;
-            }
-        }
-        // Persist context state after join (best-effort).
-        if self.has_persistence()
-            && let Ok(ctx_arc) = self.get_context_arc(&context_id)
-        {
-            let guard = ctx_arc.lock().await;
-            let ctx = &*guard;
-            let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(&context_id, snapshot);
-        }
-
-        Ok(())
+    /// Captures the escrow hold after a successful join (Phase 5 of
+    /// `join_context`).
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::capture_join_payment`]
+    /// free function (ADR-049 commit 12c.2). Retained for signature
+    /// stability during the commits-9-to-11 migration window; deleted
+    /// in a later commit alongside every other `ContextManager`
+    /// lifecycle surface.
+    #[allow(dead_code)] // Forwarder preserved for symmetry; see doc comment.
+    pub(crate) async fn capture_join_payment(
+        &self,
+        auth: Option<super::economy::PaidActionAuthorization>,
+        member_did: &DID,
+        context_id: &str,
+        deducted_cost: Option<scp_protocol::economy::types::Amount>,
+    ) {
+        crate::context::lifecycle_helpers::capture_join_payment(
+            self,
+            auth,
+            member_did,
+            context_id,
+            deducted_cost,
+        )
+        .await;
     }
 
     /// Sends a `PseudonymAnnouncement` to inform other members of this
@@ -2217,122 +1465,6 @@ impl ContextManager {
         }
     }
 
-    /// Performs the membership state mutations for `join_context` (Phase 4).
-    ///
-    /// Extracted to keep `join_context` within the clippy `too_many_lines` limit.
-    /// Acquires the contexts lock, verifies Active state, then performs
-    /// bookkeeping, role assignment, membership add, access key generation,
-    /// and event buffer pushes.
-    async fn join_context_membership(
-        &self,
-        context_id: &str,
-        member_did: &DID,
-        add_output: scp_protocol::context::builder::AddMemberOutput,
-    ) -> Result<(), ContextError> {
-        let ctx_arc = self
-            .get_context_arc(context_id)
-            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut guard = ctx_arc.lock().await;
-        let ctx = &mut *guard;
-
-        require_active(&ctx.handle)?;
-
-        post_join_bookkeeping(
-            ctx,
-            context_id,
-            member_did,
-            self.clock.now_secs(),
-            &*self.event_log,
-        );
-
-        // Add member to role state.
-        ctx.role_state.members.insert(member_did.to_string());
-
-        // Assign default "member" role.
-        //
-        // H2 (related): Use system_assign_role to bypass the RoleAssign
-        // capability check. The join handshake is a self-service flow that
-        // already passed economy / sybil / capacity / version gates above —
-        // re-checking `RoleAssign` against the creator would silently fail
-        // every join after the creator has been demoted out of an admin
-        // role. The default "member" role assignment carries no ambient
-        // authority (it's the protocol-defined floor), so there is nothing
-        // to authorize a second time. See `enforce_assign_role` and the
-        // governance dispatch path in governance.rs for the same pattern.
-        let creator_did = ctx.role_state.creator_did.clone();
-        let tokens =
-            roles::system_assign_role(&mut ctx.role_state, member_did, "member", &*self.clock)
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
-
-        // Add to membership tracking.
-        ctx.membership
-            .add_member(member_did.clone(), "member".into(), tokens);
-
-        // Generate access key for the new member (§9.17.2 step 2).
-        // The inviter stores the key so `send_message` can wrap content
-        // for this recipient. Key distribution to the joiner happens
-        // via the Welcome payload / out-of-band key exchange.
-        let member_access_key =
-            scp_protocol::crypto::access_keys::generate_access_key(context_id, member_did);
-        ctx.access
-            .access_key_store
-            .set(context_id, member_did, member_access_key);
-
-        // Emit MemberJoined event to receive buffer.
-        let join_event = ContextEvent::MemberJoined {
-            member_did: member_did.clone(),
-            role_name: "member".into(),
-        };
-        ctx.emit_event(join_event, context_id, self.event_tx.as_ref());
-
-        // Emit WelcomeGenerated event if the add produced a Welcome message.
-        push_welcome_event(
-            ctx,
-            context_id,
-            &DID(creator_did),
-            member_did,
-            add_output,
-            self.event_tx.as_ref(),
-        );
-
-        Ok(())
-    }
-
-    /// Captures the escrow hold after a successful join (Phase 5 of `join_context`).
-    ///
-    /// Best-effort: if capture fails, logs a warning but does NOT roll back
-    /// the budget and does NOT fail the join (the member was already added).
-    /// The service was rendered, so the budget deduction stands (H8).
-    ///
-    /// On failure a `PaymentCaptureFailed` entry is appended to the event log
-    /// and pushed to the receive buffer to provide a durable audit trail (H19).
-    async fn capture_join_payment(
-        &self,
-        auth: Option<super::economy::PaidActionAuthorization>,
-        member_did: &DID,
-        context_id: &str,
-        deducted_cost: Option<scp_protocol::economy::types::Amount>,
-    ) {
-        if let Some(a) = auth
-            && let Err(e) = self.complete_paid_action(a, member_did, context_id).await
-        {
-            // H8: do NOT rollback budget — service was delivered (member joined).
-            tracing::warn!(
-                context_id,
-                "payment capture failed after successful join: {e}"
-            );
-            // H19: append durable audit record to event log + receive buffer.
-            self.record_payment_capture_failure(
-                context_id,
-                "join_context",
-                member_did,
-                &e.to_string(),
-                deducted_cost,
-            )
-            .await;
-        }
-    }
-
     /// Removes a member from a context.
     ///
     /// Authorization: the caller must either be removing themselves
@@ -2351,7 +1483,10 @@ impl ContextManager {
     /// - The context is not in `Active` state.
     /// - The caller is neither the member being removed nor holds `MemberRemove`.
     /// - The member is not found.
-    #[allow(clippy::too_many_lines)]
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::leave_context`] free
+    /// function (ADR-049 commit 12c.2). Deleted in a later commit
+    /// alongside every other `ContextManager` lifecycle surface.
     #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn leave_context(
         &self,
@@ -2359,205 +1494,23 @@ impl ContextManager {
         caller_did: &DID,
         member_did: &DID,
     ) -> Result<(), ContextError> {
-        let context_id = handle.context_id().to_owned();
-        let context_id_bytes = context_id_to_bytes(&context_id);
-
-        // Determine broadcast mode + authorization in a single lock acquire.
-        // PR #1606 C6: also check the commit fault marker so a fail-closed
-        // context refuses further leave operations until an operator
-        // acknowledges the fault.
-        // Use lock_context to capture a generation token for confused-deputy
-        // detection in subsequent lock scopes (Phase B).
-        let (is_broadcast, ctx_gen) = {
-            let (guard, generation) = self.lock_context(&context_id).await?;
-            let ctx = &*guard;
-            // Authorization: self-removal always allowed; otherwise MemberRemove required.
-            if caller_did != member_did
-                && !ctx
-                    .role_state
-                    .member_has_capability(caller_did, &Capability::MemberRemove)
-            {
-                return Err(ContextError::PermissionDenied(
-                    "caller lacks permission to remove this member".into(),
-                ));
-            }
-            Self::check_commit_fault(ctx)?;
-            (ctx.broadcast_context.is_some(), generation)
-        };
-
-        // Crypto operations -- no lock held. Skip for broadcast mode (no MLS).
-        // H9: MLS group removal FIRST (hard security boundary), then sender
-        // key cleanup as best-effort. MLS removal is the cryptographic
-        // enforcement; sender key removal is defense-in-depth (§9.16).
-        if !is_broadcast {
-            let remove_output = self.crypto.remove_member(&context_id_bytes, member_did)?;
-            if let Err(e) = self
-                .crypto
-                .remove_member_sender_key(&context_id_bytes, member_did)
-            {
-                tracing::warn!(
-                    context_id = %context_id,
-                    member = %member_did,
-                    error = %e,
-                    "remove_member_sender_key failed after MLS removal — \
-                     sender key layer may retain stale key"
-                );
-            }
-
-            // Broadcast the MLS Commit to remaining members so they can
-            // advance their group epoch and ratchet key material. PR #1606 C6:
-            // on transport failure, the commit is durably enqueued for retry.
-            self.try_broadcast_commit_or_enqueue(
-                &context_id,
-                remove_output.commit_bytes,
-                CommitOperation::LeaveContext {
-                    member_did: member_did.clone(),
-                },
-                member_did.as_ref(),
-            )
-            .await?;
-
-            // Rotate the local sender key and distribute to remaining members (§9.16.4).
-            // M23: Non-fatal — MLS removal above is the hard security boundary.
-            // If rotation fails, log but continue: returning Err here would leave
-            // the system inconsistent (MLS removed, but caller thinks leave failed).
-            if let Err(e) = self.crypto.rotate_sender_key(&context_id_bytes) {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "rotate_sender_key failed after leave — \
-                     remaining members retain old sender key"
-                );
-            }
-            if let Err(e) = self.drain_and_deliver_sender_keys(&context_id, &context_id_bytes) {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to deliver rotated sender keys after leave"
-                );
-            }
-        }
-
-        // Atomic state check + membership removal + count check within single lock.
-        // Use relock_context for generation verification (Phase B).
-        let should_close = {
-            let mut guard = self.relock_context(&ctx_gen).await?;
-            let ctx = &mut *guard;
-
-            // State check inside lock -- eliminates TOCTOU race.
-            require_active(&ctx.handle)?;
-
-            // For broadcast contexts, unsubscribe from the BroadcastContext.
-            // rotate_keys=true for forward secrecy after departure.
-            if let Some(ref mut bc) = ctx.broadcast_context {
-                // Ignore MemberNotFound -- the member may be an author who was
-                // never a subscriber. Propagate all other errors (e.g.
-                // CryptoFailed from epoch overflow during key rotation).
-                match bc.unsubscribe(member_did, true) {
-                    Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
-                    Err(e) => return Err(e),
-                }
-            }
-
-            if !ctx.membership.remove_member(member_did) {
-                return Err(ContextError::MemberNotFound(member_did.to_string()));
-            }
-
-            // Remove from role state.
-            ctx.role_state.members.remove(member_did.as_ref());
-            ctx.role_state.assignments.remove(member_did.as_ref());
-            ctx.role_state
-                .member_capabilities
-                .remove(member_did.as_ref());
-
-            // Destroy the departing member's access key (§9.17.2, ADR-038).
-            ctx.access
-                .access_key_store
-                .remove(&context_id, member_did.as_ref());
-
-            // §9.10.4: remove the departing member's pseudonym routing ID.
-            ctx.pseudonym_registry.remove(member_did);
-
-            // Emit MemberLeft event to receive buffer.
-            let left_event = ContextEvent::MemberLeft {
-                member_did: member_did.clone(),
-            };
-            ctx.emit_event(left_event, &context_id, self.event_tx.as_ref());
-
-            ctx.membership.count() == 0
-        };
-        // Lock dropped.
-
-        // Append MemberLeft event to event log.
-        self.event_log.append_context_event(
-            &context_id_bytes,
-            "MemberLeft",
-            member_did.as_ref(),
-        )?;
-        // Use relock_context for generation verification (Phase B).
-        if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
-            let ctx = &mut *guard;
-            ctx.checkpoint_events_since += 1;
-        } else {
-            tracing::warn!(
-                context_id = %context_id,
-                "leave_context: generation mismatch — checkpoint counter not incremented"
-            );
-        }
-        // Persist context state after leave (best-effort).
-        if self.has_persistence()
-            && let Ok(guard) = self.relock_context(&ctx_gen).await
-        {
-            let ctx = &*guard;
-            let snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(&context_id, snapshot);
-        }
-
-        // If member count reaches zero, transition to Closing.
-        if should_close {
-            handle.transition_to(&ContextState::Closing).await?;
-        }
-
-        Ok(())
+        crate::context::lifecycle_helpers::leave_context(self, handle, caller_did, member_did).await
     }
 
     /// Drains pending sender key distribution messages and delivers them
-    /// via transport (§9.16.2). Called after `rotate_sender_key` to send
-    /// HPKE-sealed sender key responses to remaining members.
-    pub(super) fn drain_and_deliver_sender_keys(
+    /// via transport (§9.16.2). Legacy one-line forwarder to the hoisted
+    /// [`crate::context::lifecycle_helpers::drain_and_deliver_sender_keys`]
+    /// free function (ADR-049 commit 12c.2). Deleted in a later commit
+    /// alongside every other `ContextManager` lifecycle surface.
+    pub(crate) fn drain_and_deliver_sender_keys(
         &self,
         context_id: &str,
         context_id_bytes: &[u8; 32],
     ) -> Result<(), ContextError> {
-        let pending = self
-            .crypto
-            .drain_pending_sender_key_messages(context_id_bytes)?;
-        if !pending.is_empty() {
-            let routing_id = scp_protocol::context::context_routing_id(context_id);
-            for (target_did, message) in pending {
-                tracing::debug!(
-                    target_did = %target_did,
-                    context_id = %context_id,
-                    message_len = message.len(),
-                    "MLS-encrypting and sending rotated sender key distribution"
-                );
-                match self.crypto.mls_encrypt_management(
-                    context_id_bytes,
-                    &message,
-                    &routing_id,
-                    super::messaging::DEFAULT_BLOB_TTL_SECS,
-                ) {
-                    Ok(sealed) => {
-                        if let Err(e) = self.transport.send_message(&routing_id, &sealed) {
-                            tracing::warn!(target_did = %target_did, context_id = %context_id, error = %e, "failed to send rotated sender key");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(target_did = %target_did, context_id = %context_id, error = %e, "MLS encryption of sender key distribution failed");
-                    }
-                }
-            }
-        }
-        Ok(())
+        crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            self,
+            context_id,
+            context_id_bytes,
+        )
     }
 }
