@@ -32,6 +32,7 @@ The rename is total:
 - Capability URIs in ceilings: `tool:invoke:*` → `outlet:query:*` / `outlet:call:*`.
 - Canonical hash separator: `SCP-TOOL-REGISTRATION-V1:` → `SCP-OUTLET-REGISTRATION-V2:` (new suffix reflects new preimage, not just a namespace change — see §5 below).
 - Event variants: `ToolInvoked` etc. → `OutletInvoked` etc.; event log discriminants renumbered into a new band so any stale pre-rename event logs fail verification rather than silently replaying under the wrong vocabulary.
+- Context templates: `scp:template/tool-interface` → `scp:template/outlet-interface` (template ID is part of context metadata; a renamed template ID means pre-rename templates hash differently and are not silently honored — deliberate hard break, same rationale as the rest of the rename).
 - Error code prefix: **retained** as `SCP-TOOL-` within the 6100-6199 sub-block. Rationale: `scripts/check-error-codes.sh` indexes prefixes in a closed set; adding a new top-level prefix requires coordinated changes across every language SDK's error surface and every CI gate. Sub-block allocation within the existing prefix is the forward-compatible path. The slug (`slug` field on `OutletError`) carries the `outlet.` semantic prefix; the code carries the legacy `SCP-TOOL-` prefix.
 - MCP boundary: `scp-mcp` translates lexically at the boundary (§8.5.1). Inside SCP everything is an outlet; externally, MCP clients see `tools/list` and `tools/call` preserved on the wire.
 
@@ -57,7 +58,7 @@ Session amplification (§6.2.1): sessions inherit the `origin_kind` of the first
 
 ### 3. Scoped UCAN invocation caveats — structured typed fields only
 
-Caveats live in the UCAN `nb` field as an `InvocationCaveats` struct (§7.3.8) with 11 typed, optional fields: `amount_max_per_call`, `amount_max_cumulative`, `valid_from`, `valid_until`, `hours_of_day`, `days_of_week`, `max_calls`, `rate_window`, `input_schema`, `allowed_adapters`, `allowed_target_dids`. Mint-time limits enforce ≤ 8 populated fields, ≤ 4 KiB serialized `input_schema`, ≤ 8 nesting depth, ≤ 16 list entries.
+Caveats live in the UCAN `nb` field as an `InvocationCaveats` struct (§7.3.8) with 12 typed, optional fields: `amount_max_per_call`, `amount_max_cumulative`, `valid_from`, `valid_until`, `hours_of_day`, `days_of_week`, `max_calls`, `rate_window`, `input_schema`, `allowed_adapters`, `allowed_target_dids`, `origin_kind`. Mint-time limits enforce ≤ 8 populated fields (excluding `origin_kind`, which is a structural attenuation invariant and does not count against the user-facing ≤ 8 cap), ≤ 4 KiB serialized `input_schema`, ≤ 8 nesting depth, ≤ 16 list entries.
 
 `narrow()` attenuation is per-field:
 
@@ -95,7 +96,7 @@ Tags 7, 9, 10 are **reserved for forward-compatible evolution**. They were draft
 
 ### 5. Streaming-native invocation (every call is a stream)
 
-Every invocation is a stream per §5.4.5. `OutletResponse` is deleted. The wire types are `OutletStreamOpen`, `OutletStreamChunk` (with `sig: Ed25519Signature`), `OutletStreamCredit`, and a tagged `ChunkPayload` union (Data / Progress / End / Error). Canonical JCS encoding places `"type"` first in every `ChunkPayload` variant so a canonical-hashed chunk is classified before any field is read.
+Every invocation is a stream per §5.4.5. `OutletResponse` is deleted. The wire types are `OutletStreamOpen`, `OutletStreamChunk` (with `sig: Ed25519Signature`), `OutletStreamCredit`, and a tagged `ChunkPayload` union (Data / Progress / End / Error). The variant discriminator field is named `@type` (leading `@`) so that under RFC 8785 JCS sort order it precedes every body-field key in every variant — a canonical-hashed chunk is classified before any body field is read. (The draft used `"type"`, but under JCS `type` sorts AFTER all lowercase-letter body keys; `@type` is the minimal change that actually delivers the "classify first" property.)
 
 - **Per-chunk operator signature** over `SHA-256("SCP-OUTLET-CHUNK-SIG-V1:" || request_id || sequence_be || SHA-256(canonical_jcs(payload)))` closes the equivocation gap where an operator could stream different sequences to different members and commit a manifest of only one.
 - **`caveats_binding`** over `SHA-256("SCP-OUTLET-CAVEAT-BIND-V1:" || canonical_jcs(effective_caveats))` commits the open to the exact caveat set validated at check time.
@@ -144,6 +145,7 @@ Several PRDs in `main.json` were marked `done` against tool-era acceptance crite
 - **Every OutletExecutor is wrapped in `catch_unwind`.** A panic inside an executor maps to `SCP-TOOL-6130` (handler-panic) with an operator-attributable integrity-failure signal. The SDK's own bugs are not conflated with operator-originated failures.
 - **Stream billing is escrow-based.** An operator who begins serving chunks against a caller whose escrow is insufficient never gets started; an operator whose stream is terminated mid-way bills only for cancel-ack-bounded billable chunks. The economic layer stays consistent across partial streams.
 - **Cross-instance handle reuse across separate SCP instances is independent of this ADR.** ADR-048 handled that concern; outlets inherit the handle-affinity discipline established there.
+- **Ratchet invariant (monotonicity).** Every coverage ratchet touched by this ADR — `bridge_ratchet_baseline.json`, `ratchet/once-lock-count.json`, `ffi_conformance.rs` assertion counts, `pipeline_wiring.rs` assertion counts, SDK capability matrix cell counts — is NON-INCREASING in the weakening direction. Additive expansion (new operations, new assertions) is always permitted; removal, weakening, or exemption of an existing counter requires explicit human approval per the CLAUDE.md worktree invariant. The outlet redesign is a rename + expansion: every existing mechanical enforcement count stays at or above its pre-rename value, and new entries (streaming, caveats, error envelope, classification) are layered on top. Cleaning up the one-time bookkeeping cost of the rename itself (e.g., deleting a `ToolRegistration` type and replacing it with `OutletRegistration`) counts as an identifier change, not a ratchet regression; no check count drops as a result.
 
 ## Notes
 
