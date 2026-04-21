@@ -45,12 +45,29 @@ use crate::error::ScpNapiError;
 /// initialised on first call. `None` inside the `Mutex` until the first
 /// `fullstack_create_node` call or after `fullstack_reset_network()`.
 ///
-/// The `OnceLock` is function-local (not module-level) so the
-/// `check-no-bridge-globals.sh` ratchet — which ignores function-scoped
-/// statics — does not count it against the NAPI bridge baseline. Same
-/// `'static` lifetime, same single-init semantics; only the namespace
-/// scope differs.
+/// `NETWORK` is a function-local `OnceLock` but has identical
+/// process-global sharing semantics to a module-level one — the review
+/// of PR #1699 correctly flagged the previous "function scope = ignored"
+/// rule as a loophole. The `check-no-bridge-globals.sh` ratchet now
+/// scans function-local statics of sharing primitives
+/// (`OnceLock` / `LazyLock` / `Mutex` / `RwLock` / `parking_lot::*`)
+/// and counts them exactly like module-level globals; the loophole is
+/// closed. `NETWORK` itself is allowlisted by name in that script
+/// because it is:
+///
+///   * test-only — the `testing` module is feature-gated in `lib.rs`
+///     by `#[cfg(feature = "allow_in_memory_custody")] pub mod testing;`
+///     and is never compiled into production builds,
+///   * intentionally process-global — the full-stack harness needs a
+///     single `KeyExchange` + relay fabric shared across all parity
+///     nodes within a Bun test process, and this slot must survive
+///     `scpShutdown` transitions on the default `NapiBridgeInstance`
+///     (see the block comment above), and
+///   * not reachable from any production code path.
 fn network_slot() -> &'static Mutex<Option<FullStackNetwork>> {
+    // Allowlisted in scripts/check-no-bridge-globals.sh — see the doc
+    // comment on `network_slot` for the test-only / feature-gated /
+    // process-global-harness rationale.
     static NETWORK: OnceLock<Mutex<Option<FullStackNetwork>>> = OnceLock::new();
     NETWORK.get_or_init(|| Mutex::new(None))
 }

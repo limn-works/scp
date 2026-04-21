@@ -134,87 +134,160 @@ mod canonical_attestation {
 
 /// Per-identity state stored in the WASM-local registry.
 ///
-/// Private key fields are wrapped in [`zeroize::Zeroizing`] and the struct
+/// Two variants enforce the spec §3.2.1 two-key invariant at the type level:
+///
+/// * [`IdentityRecord::Local`] — A locally-created identity holding both the
+///   `#0` identity key and the distinct `#active` signing key, plus an
+///   optional `#agent` key. Produced by [`identity_create`],
+///   [`identity_create_with_agent_key`], [`identity_rotate_key`], and
+///   [`identity_migrate`]. Can sign.
+/// * [`IdentityRecord::Resolved`] — A DID-resolution-only handle carrying
+///   just the `#0` public key and custody-type metadata. Produced when the
+///   bridge knows a DID exists (e.g. after a future JS-driven DID resolve
+///   path inserts one) but has no retained private key material. Cannot
+///   sign — [`sign_with_identity`] returns [`codes::IDENT_1028`] on these.
+///
+/// Private key fields are wrapped in [`zeroize::Zeroizing`] and the enum
 /// implements [`ZeroizeOnDrop`] so that key material is overwritten with zeros
 /// when the entry is removed from the registry or replaced. `Clone` is
 /// intentionally NOT derived — cloning would scatter unprotected copies of
 /// private keys through WASM linear memory.
 #[derive(Zeroize, ZeroizeOnDrop)]
-struct IdentityEntry {
-    /// Ed25519 signing key bytes (32 bytes). Stored to produce real Ed25519
-    /// signatures for device attestation and other identity operations.
+enum IdentityRecord {
+    /// Locally-created identity with retained key material for `#0` and
+    /// `#active`, and an optional `#agent` key.
     ///
-    /// This is the DID-deriving "identity key" (`#0`) per spec §3.2.1.
-    /// The distinct `#active` signing key lives in
-    /// [`IdentityEntry::active_signing_key_bytes`]; this field serves as
-    /// a fallback when a legacy entry lacks the distinct active key.
-    ///
-    /// Wrapped in `Zeroizing` for defense-in-depth: WASM linear memory is
-    /// readable by same-origin JS, so key material must be zeroed on drop.
-    signing_key_bytes: zeroize::Zeroizing<[u8; 32]>,
-    /// Ed25519 public key bytes (32 bytes).
-    public_key_bytes: [u8; 32],
-    /// Custody type string. Retained for future use when custody operations
-    /// are wired (e.g., signing, key rotation).
-    #[allow(dead_code)]
-    custody_type: String,
-    /// Agent signing key bytes (32 bytes), if an agent key has been bound.
-    ///
-    /// Wrapped in `Zeroizing` for defense-in-depth (same rationale as
-    /// `signing_key_bytes`).
-    agent_signing_key_bytes: Option<zeroize::Zeroizing<[u8; 32]>>,
-    /// Distinct `#active` signing key (spec §3.2.1).
-    ///
-    /// Every SCP identity has two distinct Ed25519 keys: `#0` (the
-    /// identity key, from which the `did:dht` DID is derived) and
-    /// `#active` (the active signing key, used for day-to-day signing).
-    /// The scp-core bridges generate both as two separate Ed25519
+    /// `active_signing_key_bytes` is NOT `Option` — spec §3.2.1 mandates a
+    /// distinct `#active` key, and the type system now enforces it. The
+    /// scp-core bridges generate both keys as two separate Ed25519
     /// keypairs during `DidDht::create` (see `scp-identity/src/dht.rs`).
     /// Under `InMemoryKeyCustody::from_seed_bytes`, they consume the
     /// deterministic seed stream in sequence: `seed[0..32]` → identity
-    /// key, `seed[32..64]` → active signing key.
+    /// key, `seed[32..64]` → active signing key. This bridge mirrors
+    /// that sequence in both production (`OsRng`) and testing (seeded
+    /// `StdRng`) builds — see ADR-046 for cross-bridge parity.
+    Local {
+        /// Ed25519 signing key bytes (32 bytes) for the DID-deriving
+        /// identity key (`#0`). Used to sign device attestations and
+        /// identity link attestations; NEVER used for day-to-day
+        /// `#active` signatures (those go through
+        /// `active_signing_key_bytes`).
+        ///
+        /// Wrapped in `Zeroizing` for defense-in-depth: WASM linear
+        /// memory is readable by same-origin JS, so key material must be
+        /// zeroed on drop.
+        signing_key_bytes: zeroize::Zeroizing<[u8; 32]>,
+        /// Distinct `#active` signing key (spec §3.2.1). Used by
+        /// [`sign_with_identity`] for `"#active"` signatures and
+        /// published under the `#active` VM in
+        /// [`resolve_did_document_fields`].
+        ///
+        /// Wrapped in `Zeroizing` (same rationale as
+        /// `signing_key_bytes`).
+        active_signing_key_bytes: zeroize::Zeroizing<[u8; 32]>,
+        /// Ed25519 public key bytes (32 bytes) — the `#0` VM's public
+        /// key, i.e. the DID-deriving identity key's public half.
+        public_key_bytes: [u8; 32],
+        /// Custody type string. Retained for future use when custody
+        /// operations are wired (e.g., signing, key rotation).
+        #[allow(dead_code)]
+        custody_type: String,
+        /// Agent signing key bytes (32 bytes), if an agent key has been
+        /// bound. Used by [`sign_with_identity`] for `"#agent"`
+        /// signatures.
+        ///
+        /// Wrapped in `Zeroizing` (same rationale as
+        /// `signing_key_bytes`).
+        agent_signing_key_bytes: Option<zeroize::Zeroizing<[u8; 32]>>,
+    },
+    /// Resolved-by-DID handle: carries only the `#0` public key and
+    /// custody-type metadata. No local signing capability — attempts to
+    /// sign return [`codes::IDENT_1028`]. The JS side is responsible for
+    /// performing DHT resolution and presenting the full DID document;
+    /// this variant exists so the bridge can expose public-key-only
+    /// reads (`resolve_did_document_fields`) without pretending to have
+    /// sign capability.
     ///
-    /// This field stores the distinct `#active` key bytes. It is always
-    /// compiled in (production and testing) so that WASM matches the
-    /// two-key model mandated by the spec, aligning with the other
-    /// bridges (`PyO3`, `NAPI`, `UniFFI`). `sign_with_identity` uses this key
-    /// for `"#active"` signatures when present; `resolve_did_document_fields`
-    /// publishes its verifying key under the `#active` VM.
-    ///
-    /// The field remains `Option` because existing call sites construct
-    /// `IdentityEntry` in contexts where a distinct active key is not
-    /// available (e.g. `WasmIdentity::fromDid`, key rotation input
-    /// without a new distinct active key). Those callers set this to
-    /// `None`, in which case `#active` falls back to `signing_key_bytes`
-    /// for backward compatibility with single-key handles. The
-    /// happy-path `identity_create` always populates it — see
-    /// ADR-046 for the cross-bridge parity harness context.
-    active_signing_key_bytes: Option<zeroize::Zeroizing<[u8; 32]>>,
+    /// No public bridge function constructs a `Resolved` record today
+    /// — all current constructors (`identity_create`,
+    /// `identity_create_with_agent_key`, `identity_rotate_key`,
+    /// `identity_migrate`) produce `Local`. `Resolved` exists as a
+    /// type-level capacity for future resolution paths (e.g. the JS
+    /// side passing a DHT-resolved DID document back across the
+    /// boundary) and as a structural guard against the silent-fallback
+    /// bug the `Option`-based model permitted (review round 12
+    /// MINOR-4). The dead-code attribute is kept local to this variant
+    /// so that the rest of the enum still surfaces unused fields.
+    #[allow(dead_code)]
+    Resolved {
+        /// Ed25519 public key bytes (32 bytes) — the `#0` VM's public
+        /// key, i.e. the DID-deriving identity key's public half.
+        public_key_bytes: [u8; 32],
+        /// Custody type string. Retained for future use when custody
+        /// operations are wired.
+        #[allow(dead_code)]
+        custody_type: String,
+    },
 }
 
-impl std::fmt::Debug for IdentityEntry {
+impl IdentityRecord {
+    /// Returns the `#0` identity public key bytes for both variants.
+    fn public_key_bytes(&self) -> [u8; 32] {
+        match self {
+            Self::Local {
+                public_key_bytes, ..
+            }
+            | Self::Resolved {
+                public_key_bytes, ..
+            } => *public_key_bytes,
+        }
+    }
+
+    /// Returns the custody type string for both variants.
+    #[cfg(test)]
+    fn custody_type(&self) -> &str {
+        match self {
+            Self::Local { custody_type, .. } | Self::Resolved { custody_type, .. } => {
+                custody_type.as_str()
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for IdentityRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut ds = f.debug_struct("IdentityEntry");
-        ds.field("signing_key_bytes", &"[REDACTED]")
-            .field("public_key_bytes", &self.public_key_bytes)
-            .field("custody_type", &self.custody_type)
-            .field(
-                "agent_signing_key_bytes",
-                &if self.agent_signing_key_bytes.is_some() {
-                    "[REDACTED]"
-                } else {
-                    "[None]"
-                },
-            )
-            .field(
-                "active_signing_key_bytes",
-                &if self.active_signing_key_bytes.is_some() {
-                    "[REDACTED]"
-                } else {
-                    "[None]"
-                },
-            );
-        ds.finish()
+        match self {
+            Self::Local {
+                public_key_bytes,
+                custody_type,
+                agent_signing_key_bytes,
+                ..
+            } => {
+                let mut ds = f.debug_struct("IdentityRecord::Local");
+                ds.field("signing_key_bytes", &"[REDACTED]")
+                    .field("active_signing_key_bytes", &"[REDACTED]")
+                    .field("public_key_bytes", public_key_bytes)
+                    .field("custody_type", custody_type)
+                    .field(
+                        "agent_signing_key_bytes",
+                        &if agent_signing_key_bytes.is_some() {
+                            "[REDACTED]"
+                        } else {
+                            "[None]"
+                        },
+                    );
+                ds.finish()
+            }
+            Self::Resolved {
+                public_key_bytes,
+                custody_type,
+            } => {
+                let mut ds = f.debug_struct("IdentityRecord::Resolved");
+                ds.field("public_key_bytes", public_key_bytes)
+                    .field("custody_type", custody_type);
+                ds.finish()
+            }
+        }
     }
 }
 
@@ -256,7 +329,7 @@ use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 thread_local! {
     /// Maps DID strings to identity state. WASM is single-threaded, so
     /// `RefCell` is sufficient. Capped at [`WASM_IDENTITY_REGISTRY_CAP`].
-    static IDENTITY_REGISTRY: RefCell<HashMap<String, IdentityEntry>> =
+    static IDENTITY_REGISTRY: RefCell<HashMap<String, IdentityRecord>> =
         RefCell::new(HashMap::new());
 
     /// Maps new DID → old DID for migration links. Used by `identity_resolve`
@@ -322,30 +395,48 @@ pub(crate) fn resolve_verification_method_key(did: &str, kid: &str) -> Result<[u
             .get(did)
             .ok_or_else(|| format!("DID '{did}' not found in identity registry"))?;
 
-        match kid {
+        match (entry, kid) {
             // `#active` must mirror `sign_with_identity`'s key-selection
             // logic. Per spec §3.2.1, the active signing key is distinct
-            // from the identity key for every SCP identity. Derive the
-            // verifying key from the stored active signing key when
-            // present so that sign/verify stays paired. Falls back to
-            // `public_key_bytes` only when an entry was constructed
-            // without a distinct active key (e.g. legacy handles).
-            "#active" => {
-                if let Some(sk_bytes) = entry.active_signing_key_bytes.as_deref() {
-                    let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
-                    return Ok(sk.verifying_key().to_bytes());
-                }
-                Ok(entry.public_key_bytes)
+            // from the identity key for every SCP identity. The
+            // `IdentityRecord::Local` variant carries the real active
+            // signing key and its verifying key is derived here.
+            (
+                IdentityRecord::Local {
+                    active_signing_key_bytes,
+                    ..
+                },
+                "#active",
+            ) => {
+                let sk = ed25519_dalek::SigningKey::from_bytes(active_signing_key_bytes);
+                Ok(sk.verifying_key().to_bytes())
             }
-            "#agent" => {
-                let agent_sk_bytes = entry.agent_signing_key_bytes.as_ref().ok_or_else(|| {
+            (
+                IdentityRecord::Local {
+                    agent_signing_key_bytes,
+                    ..
+                },
+                "#agent",
+            ) => {
+                let agent_sk_bytes = agent_signing_key_bytes.as_ref().ok_or_else(|| {
                     format!("no agent key bound for DID '{did}' — cannot verify kid '#agent'")
                 })?;
                 let sk = ed25519_dalek::SigningKey::from_bytes(agent_sk_bytes);
                 Ok(sk.verifying_key().to_bytes())
             }
-            _ => Err(format!(
-                "unrecognized verification method '{kid}' on DID '{did}' \
+            // Resolved-by-DID handles carry only the `#0` public key —
+            // the `#active` and `#agent` verifying keys would need to
+            // come from a DHT resolution, which this bridge does not
+            // perform. Fail closed rather than silently returning `#0`
+            // under `#active` (which would violate spec §3.2.1 two-key
+            // parity).
+            (IdentityRecord::Resolved { .. }, "#active" | "#agent") => Err(format!(
+                "DID '{did}' was resolved from a DID string without local key material — \
+                 cannot verify kid '{kid}'; create a local identity via identity_create or \
+                 perform DHT resolution on the JS side"
+            )),
+            (_, other) => Err(format!(
+                "unrecognized verification method '{other}' on DID '{did}' \
                  (expected '#active' or '#agent')"
             )),
         }
@@ -396,9 +487,27 @@ fn derive_export_hmac_key(did: &str) -> Result<zeroize::Zeroizing<[u8; 32]>, Scp
             code: codes::CTX_2020.to_owned(),
         })?;
 
+        // Export HMAC requires the identity's signing key (IKM). Only a
+        // `Local` record carries key material; a `Resolved` record is a
+        // DID-resolution-only handle that cannot derive an HMAC key.
+        let signing_key_bytes = match entry {
+            IdentityRecord::Local {
+                signing_key_bytes, ..
+            } => signing_key_bytes,
+            IdentityRecord::Resolved { .. } => {
+                return Err(ScpWasmError::Identity {
+                    message: format!(
+                        "identity '{did}' was resolved from a DID string without local \
+                         key material — cannot compute export HMAC"
+                    ),
+                    code: codes::IDENT_1028.to_owned(),
+                });
+            }
+        };
+
         // HKDF-SHA256: extract(salt=[], ikm=signing_key) then
         // expand(info=EXPORT_HMAC_DOMAIN, len=32).
-        let prk = hkdf_extract_sha256(&[], entry.signing_key_bytes.as_ref()).map_err(|e| {
+        let prk = hkdf_extract_sha256(&[], signing_key_bytes.as_ref()).map_err(|e| {
             ScpWasmError::Identity {
                 message: format!("HKDF extract failed: {e}"),
                 code: codes::CTX_2020.to_owned(),
@@ -1021,12 +1130,12 @@ pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
             )?;
             map.insert(
                 did.clone(),
-                IdentityEntry {
+                IdentityRecord::Local {
                     signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
+                    active_signing_key_bytes,
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
                     agent_signing_key_bytes: None,
-                    active_signing_key_bytes: Some(active_signing_key_bytes),
                 },
             );
             Ok::<(), JsValue>(())
@@ -1066,35 +1175,65 @@ fn resolve_did_document_fields(did: &str) -> ResolvedDocumentFields {
     // Look up public key bytes from the local identity registry.
     // Only extract public keys — never clone private key material
     // out of the registry. Derive agent public key inside the closure.
+    // `ResolvedKeyInfo` carries the three potential public keys a record
+    // can contribute to the DID document. `Local` populates
+    // `active_pub_bytes` and may populate `agent_pub_bytes`; `Resolved`
+    // populates neither (the JS side would resolve those from the DHT).
+    //
+    // All fields share the `_pub_bytes` suffix because each is a raw
+    // Ed25519 public key for a distinct VM (`#0`, `#active`, `#agent`)
+    // — the suffix is the most precise name, and renaming would lose
+    // that parity across the three VMs.
+    #[allow(clippy::struct_field_names)]
+    struct ResolvedKeyInfo {
+        identity_pub_bytes: [u8; 32],
+        active_pub_bytes: Option<[u8; 32]>,
+        agent_pub_bytes: Option<[u8; 32]>,
+    }
+
     let key_info = IDENTITY_REGISTRY.with(|reg| {
         let map = reg.borrow();
-        map.get(did).map(|entry| {
-            let agent_pub_bytes = entry.agent_signing_key_bytes.as_ref().map(|sk_bytes| {
-                let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
-                sk.verifying_key().to_bytes()
-            });
-            // Per spec §3.2.1, every SCP identity has a distinct
-            // `#active` signing key. When present (populated by
-            // `identity_create`) we emit its real verifying key under
-            // the `#active` VM so that signatures verify. For legacy
-            // handles without a stored distinct active key, `#active`
-            // falls back to the identity key (single-key behaviour).
-            let active_pub_bytes = entry.active_signing_key_bytes.as_ref().map(|sk_bytes| {
-                let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
-                sk.verifying_key().to_bytes()
-            });
-            (entry.public_key_bytes, active_pub_bytes, agent_pub_bytes)
+        map.get(did).map(|entry| match entry {
+            IdentityRecord::Local {
+                public_key_bytes,
+                active_signing_key_bytes,
+                agent_signing_key_bytes,
+                ..
+            } => {
+                let agent_pub_bytes = agent_signing_key_bytes.as_ref().map(|sk_bytes| {
+                    let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+                    sk.verifying_key().to_bytes()
+                });
+                // Per spec §3.2.1, every SCP `Local` identity has a
+                // distinct `#active` signing key. Emit its real
+                // verifying key under the `#active` VM so that
+                // signatures verify.
+                let active_sk = ed25519_dalek::SigningKey::from_bytes(active_signing_key_bytes);
+                ResolvedKeyInfo {
+                    identity_pub_bytes: *public_key_bytes,
+                    active_pub_bytes: Some(active_sk.verifying_key().to_bytes()),
+                    agent_pub_bytes,
+                }
+            }
+            IdentityRecord::Resolved {
+                public_key_bytes, ..
+            } => ResolvedKeyInfo {
+                identity_pub_bytes: *public_key_bytes,
+                active_pub_bytes: None,
+                agent_pub_bytes: None,
+            },
         })
     });
 
     let (verification_methods_json, authentication_json, assertion_methods_json) = key_info
         .map_or_else(
             || ("[]".to_owned(), "[]".to_owned(), "[]".to_owned()),
-            |(pub_bytes, active_pub_bytes, agent_pub_bytes)| {
-                // Build verification methods for ALL keys in the identity
-                // per ADR-039: #0 (Identity Key), #active (Active Signing
-                // Key), and optionally #agent (Agent Signing Key).
-                let identity_multibase = format!("z{}", zbase32_encode(&pub_bytes));
+            |info| {
+                // Build verification methods for ALL keys known to the
+                // bridge per ADR-039: #0 (Identity Key), #active (Active
+                // Signing Key, `Local` only), and optionally #agent
+                // (Agent Signing Key, `Local` only).
+                let identity_multibase = format!("z{}", zbase32_encode(&info.identity_pub_bytes));
 
                 // #0 — Identity Key (DID-deriving key, never rotates).
                 let mut vms = vec![serde_json::json!({
@@ -1104,29 +1243,29 @@ fn resolve_did_document_fields(did: &str) -> ResolvedDocumentFields {
                     "publicKeyMultibase": identity_multibase,
                 })];
 
-                // #active — Active Signing Key (Human Signing Key). Per
-                // spec §3.2.1, this is a distinct key from #0. When the
-                // entry carries a real `active_signing_key_bytes`
-                // (populated by `identity_create`), emit its verifying
-                // key; otherwise fall back to the identity key's public
-                // bytes (legacy handles without a stored distinct active
-                // key).
-                let active_multibase = active_pub_bytes.map_or_else(
-                    || identity_multibase.clone(),
-                    |b| format!("z{}", zbase32_encode(&b)),
-                );
-                vms.push(serde_json::json!({
-                    "id": format!("{did}#active"),
-                    "type": "Ed25519VerificationKey2020",
-                    "controller": did,
-                    "publicKeyMultibase": active_multibase,
-                }));
+                let mut auth: Vec<serde_json::Value> = Vec::new();
+                let mut assertion: Vec<serde_json::Value> = Vec::new();
 
-                let mut auth = vec![serde_json::json!(format!("{did}#active"))];
-                let mut assertion = vec![serde_json::json!(format!("{did}#active"))];
+                // #active — Active Signing Key (Human Signing Key). Per
+                // spec §3.2.1, this is a distinct key from #0; we only
+                // publish it when the bridge has the real material
+                // (`Local` variant). `Resolved` records omit `#active`
+                // entirely — the JS side must supply it via DHT
+                // resolution.
+                if let Some(active_bytes) = info.active_pub_bytes {
+                    let active_multibase = format!("z{}", zbase32_encode(&active_bytes));
+                    vms.push(serde_json::json!({
+                        "id": format!("{did}#active"),
+                        "type": "Ed25519VerificationKey2020",
+                        "controller": did,
+                        "publicKeyMultibase": active_multibase,
+                    }));
+                    auth.push(serde_json::json!(format!("{did}#active")));
+                    assertion.push(serde_json::json!(format!("{did}#active")));
+                }
 
                 // #agent — Agent Signing Key (ADR-039), included when present.
-                if let Some(agent_bytes) = agent_pub_bytes {
+                if let Some(agent_bytes) = info.agent_pub_bytes {
                     let agent_multibase = format!("z{}", zbase32_encode(&agent_bytes));
                     vms.push(serde_json::json!({
                         "id": format!("{did}#agent"),
@@ -1266,12 +1405,12 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
             )?;
             map.insert(
                 did.clone(),
-                IdentityEntry {
+                IdentityRecord::Local {
                     signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
+                    active_signing_key_bytes,
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
                     agent_signing_key_bytes: Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
-                    active_signing_key_bytes: Some(active_signing_key_bytes),
                 },
             );
             Ok::<(), JsValue>(())
@@ -1308,23 +1447,43 @@ pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, J
     let agent_pub = agent_key.verifying_key();
     let agent_multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
 
-    // Store the agent signing key in the identity registry.
+    // Store the agent signing key in the identity registry. Only a
+    // `Local` record can carry an agent key; `Resolved` handles do not
+    // have retained key material and cannot host an agent key.
     let did = identity.did.clone();
-    let found = IDENTITY_REGISTRY.with(|reg| {
+    let status = IDENTITY_REGISTRY.with(|reg| {
         let mut map = reg.borrow_mut();
-        if let Some(entry) = map.get_mut(&did) {
-            entry.agent_signing_key_bytes = Some(zeroize::Zeroizing::new(agent_key.to_bytes()));
-            true
-        } else {
-            false
+        match map.get_mut(&did) {
+            Some(IdentityRecord::Local {
+                agent_signing_key_bytes,
+                ..
+            }) => {
+                *agent_signing_key_bytes = Some(zeroize::Zeroizing::new(agent_key.to_bytes()));
+                AgentKeyMutationStatus::Updated
+            }
+            Some(IdentityRecord::Resolved { .. }) => AgentKeyMutationStatus::NotLocal,
+            None => AgentKeyMutationStatus::NotFound,
         }
     });
-    if !found {
-        return Err(ScpWasmError::Identity {
-            message: format!("identity not found in registry: {did}"),
-            code: codes::IDENT_1009.to_owned(),
+    match status {
+        AgentKeyMutationStatus::Updated => {}
+        AgentKeyMutationStatus::NotFound => {
+            return Err(ScpWasmError::Identity {
+                message: format!("identity not found in registry: {did}"),
+                code: codes::IDENT_1009.to_owned(),
+            }
+            .into_js());
         }
-        .into_js());
+        AgentKeyMutationStatus::NotLocal => {
+            return Err(ScpWasmError::Identity {
+                message: format!(
+                    "identity '{did}' was resolved from a DID string without local \
+                     key material — cannot add an agent key"
+                ),
+                code: codes::IDENT_1028.to_owned(),
+            }
+            .into_js());
+        }
     }
 
     Ok(WasmIdentity {
@@ -1336,6 +1495,16 @@ pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, J
         // the original `verifying_key` carries through.
         verifying_key_hex: identity.verifying_key_hex.clone(),
     })
+}
+
+/// Outcome of a registry mutation that writes to the agent-key slot.
+/// Exists so callers can distinguish "DID not in registry" from
+/// "DID in registry but the record is a `Resolved` handle that cannot
+/// host key material."
+enum AgentKeyMutationStatus {
+    Updated,
+    NotFound,
+    NotLocal,
 }
 
 /// Rotates the agent signing key for an identity (ADR-039).
@@ -1360,23 +1529,42 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
     let agent_pub = agent_key.verifying_key();
     let agent_multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
 
-    // Store the new agent signing key in the identity registry.
+    // Store the new agent signing key in the identity registry. Only a
+    // `Local` record can host an agent key.
     let did = identity.did.clone();
-    let found = IDENTITY_REGISTRY.with(|reg| {
+    let status = IDENTITY_REGISTRY.with(|reg| {
         let mut map = reg.borrow_mut();
-        if let Some(entry) = map.get_mut(&did) {
-            entry.agent_signing_key_bytes = Some(zeroize::Zeroizing::new(agent_key.to_bytes()));
-            true
-        } else {
-            false
+        match map.get_mut(&did) {
+            Some(IdentityRecord::Local {
+                agent_signing_key_bytes,
+                ..
+            }) => {
+                *agent_signing_key_bytes = Some(zeroize::Zeroizing::new(agent_key.to_bytes()));
+                AgentKeyMutationStatus::Updated
+            }
+            Some(IdentityRecord::Resolved { .. }) => AgentKeyMutationStatus::NotLocal,
+            None => AgentKeyMutationStatus::NotFound,
         }
     });
-    if !found {
-        return Err(ScpWasmError::Identity {
-            message: format!("identity not found in registry: {did}"),
-            code: codes::IDENT_1011.to_owned(),
+    match status {
+        AgentKeyMutationStatus::Updated => {}
+        AgentKeyMutationStatus::NotFound => {
+            return Err(ScpWasmError::Identity {
+                message: format!("identity not found in registry: {did}"),
+                code: codes::IDENT_1011.to_owned(),
+            }
+            .into_js());
         }
-        .into_js());
+        AgentKeyMutationStatus::NotLocal => {
+            return Err(ScpWasmError::Identity {
+                message: format!(
+                    "identity '{did}' was resolved from a DID string without local \
+                     key material — cannot rotate an agent key"
+                ),
+                code: codes::IDENT_1028.to_owned(),
+            }
+            .into_js());
+        }
     }
 
     Ok(WasmIdentity {
@@ -1424,10 +1612,16 @@ pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsEr
 
             // Take the agent key bytes from the old entry before removing it.
             // `take()` moves the inner value out without cloning; the remaining
-            // entry is zeroized on drop via `remove()`.
-            let agent_key_bytes = map
-                .get_mut(&old_did)
-                .and_then(|entry| entry.agent_signing_key_bytes.take());
+            // entry is zeroized on drop via `remove()`. Only `Local` records
+            // carry an agent key — a `Resolved` record has no key material
+            // to carry forward.
+            let agent_key_bytes = match map.get_mut(&old_did) {
+                Some(IdentityRecord::Local {
+                    agent_signing_key_bytes,
+                    ..
+                }) => agent_signing_key_bytes.take(),
+                Some(IdentityRecord::Resolved { .. }) | None => None,
+            };
             map.remove(&old_did);
 
             check_registry_capacity(
@@ -1440,12 +1634,12 @@ pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsEr
 
             map.insert(
                 new_did.clone(),
-                IdentityEntry {
+                IdentityRecord::Local {
                     signing_key_bytes: zeroize::Zeroizing::new(new_key.to_bytes()),
+                    active_signing_key_bytes: new_active_bytes,
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
                     agent_signing_key_bytes: agent_key_bytes,
-                    active_signing_key_bytes: Some(new_active_bytes),
                 },
             );
 
@@ -1479,19 +1673,28 @@ pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsEr
         .map_err(|e| JsError::new(&format!("{e:?}")))?;
 
     // Derive agent key state from the registry entry (authoritative) rather
-    // than copying from the input handle, which may be stale.
+    // than copying from the input handle, which may be stale. Only
+    // `Local` records can carry an agent key.
     let (has_agent, agent_multibase) = IDENTITY_REGISTRY.with(|reg| {
         let map = reg.borrow();
-        map.get(&new_did).map_or((false, None), |entry| {
-            entry
-                .agent_signing_key_bytes
-                .as_ref()
-                .map_or((false, None), |sk_bytes| {
-                    let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
-                    let pub_bytes = sk.verifying_key().to_bytes();
-                    (true, Some(format!("z{}", zbase32_encode(&pub_bytes))))
-                })
-        })
+        match map.get(&new_did) {
+            Some(IdentityRecord::Local {
+                agent_signing_key_bytes: Some(sk_bytes),
+                ..
+            }) => {
+                let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+                let pub_bytes = sk.verifying_key().to_bytes();
+                (true, Some(format!("z{}", zbase32_encode(&pub_bytes))))
+            }
+            Some(
+                IdentityRecord::Local {
+                    agent_signing_key_bytes: None,
+                    ..
+                }
+                | IdentityRecord::Resolved { .. },
+            )
+            | None => (false, None),
+        }
     });
 
     Ok(WasmIdentity {
@@ -1521,23 +1724,43 @@ pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
     }
 
     // Clear the agent signing key from the identity registry to prevent
-    // the key material from lingering in WASM linear memory.
+    // the key material from lingering in WASM linear memory. Only
+    // `Local` records host an agent key; for `Resolved` there is no key
+    // to clear, so fail-closed with a distinct error.
     let did = identity.did.clone();
-    let found = IDENTITY_REGISTRY.with(|reg| {
+    let status = IDENTITY_REGISTRY.with(|reg| {
         let mut map = reg.borrow_mut();
-        if let Some(entry) = map.get_mut(&did) {
-            entry.agent_signing_key_bytes = None;
-            true
-        } else {
-            false
+        match map.get_mut(&did) {
+            Some(IdentityRecord::Local {
+                agent_signing_key_bytes,
+                ..
+            }) => {
+                *agent_signing_key_bytes = None;
+                AgentKeyMutationStatus::Updated
+            }
+            Some(IdentityRecord::Resolved { .. }) => AgentKeyMutationStatus::NotLocal,
+            None => AgentKeyMutationStatus::NotFound,
         }
     });
-    if !found {
-        return Err(ScpWasmError::Identity {
-            message: format!("identity not found in registry: {did}"),
-            code: codes::IDENT_1011.to_owned(),
+    match status {
+        AgentKeyMutationStatus::Updated => {}
+        AgentKeyMutationStatus::NotFound => {
+            return Err(ScpWasmError::Identity {
+                message: format!("identity not found in registry: {did}"),
+                code: codes::IDENT_1011.to_owned(),
+            }
+            .into_js());
         }
-        .into_js());
+        AgentKeyMutationStatus::NotLocal => {
+            return Err(ScpWasmError::Identity {
+                message: format!(
+                    "identity '{did}' was resolved from a DID string without local \
+                     key material — cannot remove an agent key"
+                ),
+                code: codes::IDENT_1028.to_owned(),
+            }
+            .into_js());
+        }
     }
 
     Ok(WasmIdentity {
@@ -1569,7 +1792,7 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
         // identity; both keys are drawn independently from OsRng.
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
         let active_signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-        let active_signing_key_bytes = Some(zeroize::Zeroizing::new(active_signing_key.to_bytes()));
+        let active_signing_key_bytes = zeroize::Zeroizing::new(active_signing_key.to_bytes());
         let verifying_key = signing_key.verifying_key();
         let pub_bytes = verifying_key.to_bytes();
         let new_did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
@@ -1603,12 +1826,12 @@ pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
             )?;
             map.insert(
                 new_did.clone(),
-                IdentityEntry {
+                IdentityRecord::Local {
                     signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
+                    active_signing_key_bytes,
                     public_key_bytes: pub_bytes,
                     custody_type: custody.clone(),
                     agent_signing_key_bytes,
-                    active_signing_key_bytes,
                 },
             );
             Ok::<(), JsValue>(())
@@ -1702,7 +1925,29 @@ pub fn identity_attest_device(did: String) -> Promise {
                 .into()
             })?;
 
-            let signing_key = ed25519_dalek::SigningKey::from_bytes(&entry.signing_key_bytes);
+            // Device attestation signs with the DID-deriving `#0`
+            // identity key. Only `Local` records carry that key
+            // material; `Resolved` handles are public-key-only and
+            // cannot produce attestation signatures.
+            let signing_key_bytes = match entry {
+                IdentityRecord::Local {
+                    signing_key_bytes, ..
+                } => signing_key_bytes,
+                IdentityRecord::Resolved { .. } => {
+                    return Err::<[u8; 64], JsValue>(
+                        ScpWasmError::Identity {
+                            message: format!(
+                                "identity '{did}' was resolved from a DID string \
+                                 without local key material — cannot attest device"
+                            ),
+                            code: codes::IDENT_1028.to_owned(),
+                        }
+                        .into_js()
+                        .into(),
+                    );
+                }
+            };
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(signing_key_bytes);
             let signature = signing_key.sign(&payload);
             Ok::<[u8; 64], JsValue>(signature.to_bytes())
         })?;
@@ -1828,10 +2073,11 @@ pub fn identity_verify_device_attestation(did: String, token_base64: String) -> 
         }
 
         // Look up only the public key bytes from the registry — never
-        // clone private key material out.
+        // clone private key material out. Both variants expose the `#0`
+        // public key via `IdentityRecord::public_key_bytes`.
         let pub_key_bytes = IDENTITY_REGISTRY.with(|reg| {
             let map = reg.borrow();
-            map.get(&did).map(|entry| entry.public_key_bytes)
+            map.get(&did).map(IdentityRecord::public_key_bytes)
         });
 
         let Some(pub_bytes) = pub_key_bytes else {
@@ -1895,28 +2141,40 @@ pub fn identity_load(did: String) -> Promise {
         let (custody_type, has_agent_key, agent_pub_multibase, verifying_key_hex) =
             IDENTITY_REGISTRY.with(|reg| {
                 let map = reg.borrow();
-                map.get(&did).map_or_else(
-                    || ("js_custody".to_owned(), false, None, None),
-                    |entry| {
-                        let has_agent = entry.agent_signing_key_bytes.is_some();
-                        let agent_pub = if has_agent {
-                            // Derive public key from agent signing key for the multibase field.
-                            entry.agent_signing_key_bytes.as_ref().map(|sk_bytes| {
-                                let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
-                                let pk = ed25519_dalek::VerifyingKey::from(&sk);
-                                format!("z{}", zbase32_encode(&pk.to_bytes()))
-                            })
-                        } else {
-                            None
-                        };
+                match map.get(&did) {
+                    Some(IdentityRecord::Local {
+                        public_key_bytes,
+                        custody_type,
+                        agent_signing_key_bytes,
+                        ..
+                    }) => {
+                        let agent_pub = agent_signing_key_bytes.as_ref().map(|sk_bytes| {
+                            // Derive public key from agent signing key
+                            // for the multibase field.
+                            let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+                            let pk = ed25519_dalek::VerifyingKey::from(&sk);
+                            format!("z{}", zbase32_encode(&pk.to_bytes()))
+                        });
                         (
-                            entry.custody_type.clone(),
-                            has_agent,
+                            custody_type.clone(),
+                            agent_pub.is_some(),
                             agent_pub,
-                            Some(hex::encode(entry.public_key_bytes)),
+                            Some(hex::encode(*public_key_bytes)),
                         )
-                    },
-                )
+                    }
+                    Some(IdentityRecord::Resolved {
+                        public_key_bytes,
+                        custody_type,
+                    }) => (
+                        custody_type.clone(),
+                        // `Resolved` handles never carry an agent key —
+                        // they have no retained key material at all.
+                        false,
+                        None,
+                        Some(hex::encode(*public_key_bytes)),
+                    ),
+                    None => ("js_custody".to_owned(), false, None, None),
+                }
             });
 
         Ok(JsValue::from(WasmIdentity {
@@ -1995,7 +2253,13 @@ pub fn identity_execute_recovery(
 /// `signing_key_id` must be `"#active"` or `"#agent"`.
 ///
 /// This is `pub(crate)` so the `scpid` module can reuse identity key lookup
-/// without exposing the `IdentityEntry` struct or `IDENTITY_REGISTRY`.
+/// without exposing the `IdentityRecord` enum or `IDENTITY_REGISTRY`.
+///
+/// Signing is a privilege of [`IdentityRecord::Local`]; a
+/// [`IdentityRecord::Resolved`] handle carries no private key material and
+/// any signing attempt returns [`codes::IDENT_1028`] (identity key handle
+/// error) — a structural refusal that the `Option`-based fallback model
+/// could only express as a silent fallback to `#0`.
 pub(crate) fn sign_with_identity(
     did: &str,
     signing_key_id: &str,
@@ -2019,16 +2283,41 @@ pub(crate) fn sign_with_identity(
                 code: codes::IDENT_1001.to_owned(),
             })?;
 
+        // Only `Local` records carry signing keys. A `Resolved` handle
+        // was produced from a bare DID string (e.g. a future DHT
+        // resolution path) and has no private key material — refuse
+        // structurally rather than falling back to `#0` (spec §3.2.1
+        // two-key invariant).
+        let (signing_key_bytes, active_signing_key_bytes, agent_signing_key_bytes) = match entry {
+            IdentityRecord::Local {
+                signing_key_bytes,
+                active_signing_key_bytes,
+                agent_signing_key_bytes,
+                ..
+            } => (
+                signing_key_bytes,
+                active_signing_key_bytes,
+                agent_signing_key_bytes,
+            ),
+            IdentityRecord::Resolved { .. } => {
+                return Err(crate::error::ScpWasmError::Identity {
+                    message: format!(
+                        "identity '{did}' was resolved from a DID string without local \
+                         signing keys — use a local identity created via identity_create \
+                         instead"
+                    ),
+                    code: codes::IDENT_1028.to_owned(),
+                });
+            }
+        };
+
         let key_bytes: &[u8; 32] = match signing_key_id {
             // Per spec §3.2.1, `#active` is a distinct signing key from
-            // `#0`. Use the stored distinct key when present; fall back
-            // to the identity key only for legacy entries that lack a
-            // separate active key. See `IdentityEntry::active_signing_key_bytes`.
-            "#active" => entry
-                .active_signing_key_bytes
-                .as_deref()
-                .unwrap_or(&entry.signing_key_bytes),
-            "#agent" => entry.agent_signing_key_bytes.as_deref().ok_or_else(|| {
+            // `#0`. The `Local` variant always carries the real active
+            // key — no silent fallback to `signing_key_bytes`.
+            "#active" => active_signing_key_bytes,
+            // Suppress the unused binding for `#agent`-only branches.
+            "#agent" => agent_signing_key_bytes.as_deref().ok_or_else(|| {
                 crate::error::ScpWasmError::Identity {
                     message: format!(
                         "identity '{did}' has no agent signing key — \
@@ -2046,6 +2335,13 @@ pub(crate) fn sign_with_identity(
                 });
             }
         };
+
+        // `signing_key_bytes` is intentionally unused under `#active` /
+        // `#agent`; it is kept in the pattern destructuring so that
+        // future `#0` signing paths can adopt it without widening the
+        // match. Silence the unused warning without suppressing the
+        // binding.
+        let _ = signing_key_bytes;
 
         let signing_key = ed25519_dalek::SigningKey::from_bytes(key_bytes);
         let signature = signing_key.sign(data);
@@ -2277,7 +2573,9 @@ pub fn identity_create_link_attestation(
         // Compute canonical signing bytes via the shared function (§9.5.1).
         let canonical = compute_attestation_canonical_bytes(&attestation)?;
 
-        // Sign inside the registry closure.
+        // Sign inside the registry closure. Link attestations sign
+        // with the `#0` identity key (§3.5.2). Only `Local` records
+        // carry it; `Resolved` handles refuse structurally.
         let signature_bytes = IDENTITY_REGISTRY.with(|reg| {
             let map = reg.borrow();
             let entry = map.get(&did).ok_or_else(|| -> JsValue {
@@ -2289,7 +2587,26 @@ pub fn identity_create_link_attestation(
                 .into()
             })?;
 
-            let signing_key = ed25519_dalek::SigningKey::from_bytes(&entry.signing_key_bytes);
+            let signing_key_bytes = match entry {
+                IdentityRecord::Local {
+                    signing_key_bytes, ..
+                } => signing_key_bytes,
+                IdentityRecord::Resolved { .. } => {
+                    return Err::<[u8; 64], JsValue>(
+                        ScpWasmError::Identity {
+                            message: format!(
+                                "identity '{did}' was resolved from a DID string \
+                                 without local key material — cannot sign a link \
+                                 attestation"
+                            ),
+                            code: codes::IDENT_1028.to_owned(),
+                        }
+                        .into_js()
+                        .into(),
+                    );
+                }
+            };
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(signing_key_bytes);
             let signature = signing_key.sign(&canonical);
             Ok::<[u8; 64], JsValue>(signature.to_bytes())
         })?;
@@ -2622,23 +2939,28 @@ pub(crate) mod test_helpers {
     ///
     /// Used by `ucan::tests` for E2E integration tests that exercise the full
     /// `validate_ucan_full` pipeline with real cryptography (issue #1012).
+    ///
+    /// The spec §3.2.1 two-key invariant is now type-enforced via
+    /// [`IdentityRecord::Local`], so this helper generates a distinct
+    /// `#active` key alongside `#0` and `#agent`.
     pub fn register_identity_with_agent_key()
     -> (String, ed25519_dalek::SigningKey, ed25519_dalek::SigningKey) {
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
         let pub_bytes = signing_key.verifying_key().to_bytes();
         let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
 
+        let active_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
         let agent_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
 
         IDENTITY_REGISTRY.with(|reg| {
             reg.borrow_mut().insert(
                 did.clone(),
-                IdentityEntry {
+                IdentityRecord::Local {
                     signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
+                    active_signing_key_bytes: zeroize::Zeroizing::new(active_key.to_bytes()),
                     public_key_bytes: pub_bytes,
                     custody_type: "in_memory".to_owned(),
                     agent_signing_key_bytes: Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
-                    active_signing_key_bytes: None,
                 },
             );
         });
@@ -2661,50 +2983,59 @@ pub(crate) mod test_helpers {
 mod tests {
     use super::*;
 
-    /// Helper: generate an Ed25519 keypair and register it in `IDENTITY_REGISTRY`.
-    /// Returns `(did, public_key_bytes)`.
-    fn register_identity() -> (String, [u8; 32]) {
+    /// Helper: generate an Ed25519 identity key plus a distinct `#active`
+    /// signing key (spec §3.2.1) and register the pair in
+    /// `IDENTITY_REGISTRY`. Returns `(did, identity_pub_bytes, active_pub_bytes)`.
+    fn register_identity() -> (String, [u8; 32], [u8; 32]) {
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
         let pub_bytes = signing_key.verifying_key().to_bytes();
         let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+
+        let active_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let active_pub_bytes = active_key.verifying_key().to_bytes();
+
         IDENTITY_REGISTRY.with(|reg| {
             reg.borrow_mut().insert(
                 did.clone(),
-                IdentityEntry {
+                IdentityRecord::Local {
                     signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
+                    active_signing_key_bytes: zeroize::Zeroizing::new(active_key.to_bytes()),
                     public_key_bytes: pub_bytes,
                     custody_type: "in_memory".to_owned(),
                     agent_signing_key_bytes: None,
-                    active_signing_key_bytes: None,
                 },
             );
         });
-        (did, pub_bytes)
+        (did, pub_bytes, active_pub_bytes)
     }
 
-    /// Helper: generate an Ed25519 keypair and register it with an agent key
-    /// in `IDENTITY_REGISTRY`. Returns `(did, identity_pub_bytes, agent_pub_bytes)`.
-    fn register_identity_with_agent() -> (String, [u8; 32], [u8; 32]) {
+    /// Helper: generate an Ed25519 identity key plus a distinct `#active`
+    /// signing key and an agent key, and register them in
+    /// `IDENTITY_REGISTRY`. Returns
+    /// `(did, identity_pub_bytes, active_pub_bytes, agent_pub_bytes)`.
+    fn register_identity_with_agent() -> (String, [u8; 32], [u8; 32], [u8; 32]) {
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
         let pub_bytes = signing_key.verifying_key().to_bytes();
         let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
 
+        let active_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let active_pub_bytes = active_key.verifying_key().to_bytes();
         let agent_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
         let agent_pub_bytes = agent_key.verifying_key().to_bytes();
 
         IDENTITY_REGISTRY.with(|reg| {
             reg.borrow_mut().insert(
                 did.clone(),
-                IdentityEntry {
+                IdentityRecord::Local {
                     signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
+                    active_signing_key_bytes: zeroize::Zeroizing::new(active_key.to_bytes()),
                     public_key_bytes: pub_bytes,
                     custody_type: "in_memory".to_owned(),
                     agent_signing_key_bytes: Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
-                    active_signing_key_bytes: None,
                 },
             );
         });
-        (did, pub_bytes, agent_pub_bytes)
+        (did, pub_bytes, active_pub_bytes, agent_pub_bytes)
     }
 
     /// Helper: clean up thread-local state after each test to avoid cross-test
@@ -2749,8 +3080,9 @@ mod tests {
     fn test_resolve_known_did_basic() {
         cleanup_registries();
 
-        let (did, pub_bytes) = register_identity();
-        let expected_multibase = format!("z{}", zbase32_encode(&pub_bytes));
+        let (did, pub_bytes, active_pub_bytes) = register_identity();
+        let identity_multibase = format!("z{}", zbase32_encode(&pub_bytes));
+        let active_multibase = format!("z{}", zbase32_encode(&active_pub_bytes));
 
         let fields = resolve_did_document_fields(&did);
 
@@ -2763,15 +3095,19 @@ mod tests {
         assert_eq!(vms[0]["id"], format!("{did}#0"));
         assert_eq!(vms[0]["type"], "Ed25519VerificationKey2020");
         assert_eq!(vms[0]["controller"], did);
-        assert_eq!(vms[0]["publicKeyMultibase"], expected_multibase);
+        assert_eq!(vms[0]["publicKeyMultibase"], identity_multibase);
 
-        // #active — Active Signing Key. This test's helper sets
-        // `active_signing_key_bytes: None`, so `#active` falls back to
-        // the identity key's multibase (legacy handle behaviour).
+        // #active — Active Signing Key. Per spec §3.2.1 the two keys
+        // must differ, so the `IdentityRecord::Local` variant always
+        // emits a distinct `#active` multibase.
         assert_eq!(vms[1]["id"], format!("{did}#active"));
         assert_eq!(vms[1]["type"], "Ed25519VerificationKey2020");
         assert_eq!(vms[1]["controller"], did);
-        assert_eq!(vms[1]["publicKeyMultibase"], expected_multibase);
+        assert_eq!(vms[1]["publicKeyMultibase"], active_multibase);
+        assert_ne!(
+            identity_multibase, active_multibase,
+            "spec §3.2.1 requires #0 and #active to be distinct keys"
+        );
 
         // Authentication and assertionMethod reference #active.
         let auth: Vec<serde_json::Value> =
@@ -2798,8 +3134,9 @@ mod tests {
     fn test_resolve_with_agent_key() {
         cleanup_registries();
 
-        let (did, pub_bytes, agent_pub_bytes) = register_identity_with_agent();
+        let (did, pub_bytes, active_pub_bytes, agent_pub_bytes) = register_identity_with_agent();
         let identity_multibase = format!("z{}", zbase32_encode(&pub_bytes));
+        let active_multibase = format!("z{}", zbase32_encode(&active_pub_bytes));
         let agent_multibase = format!("z{}", zbase32_encode(&agent_pub_bytes));
 
         let fields = resolve_did_document_fields(&did);
@@ -2813,9 +3150,13 @@ mod tests {
         assert_eq!(vms[0]["id"], format!("{did}#0"));
         assert_eq!(vms[0]["publicKeyMultibase"], identity_multibase);
 
-        // #active — Active Signing Key
+        // #active — Active Signing Key (distinct from #0 per spec §3.2.1).
         assert_eq!(vms[1]["id"], format!("{did}#active"));
-        assert_eq!(vms[1]["publicKeyMultibase"], identity_multibase);
+        assert_eq!(vms[1]["publicKeyMultibase"], active_multibase);
+        assert_ne!(
+            identity_multibase, active_multibase,
+            "spec §3.2.1 requires #0 and #active to be distinct keys"
+        );
 
         // #agent — Agent Signing Key (ADR-039)
         assert_eq!(vms[2]["id"], format!("{did}#agent"));
@@ -2844,7 +3185,7 @@ mod tests {
     fn test_resolve_with_migration_link() {
         cleanup_registries();
 
-        let (did, _pub_bytes) = register_identity();
+        let (did, _pub_bytes, _active_pub_bytes) = register_identity();
         let old_did = "did:dht:zOldDid12345";
 
         // Simulate a migration: new DID maps to old DID.
@@ -3095,12 +3436,12 @@ mod tests {
         IDENTITY_REGISTRY.with(|reg| {
             reg.borrow_mut().insert(
                 did.clone(),
-                IdentityEntry {
+                IdentityRecord::Local {
                     signing_key_bytes: zeroize::Zeroizing::new(identity_key.to_bytes()),
+                    active_signing_key_bytes: zeroize::Zeroizing::new(active_bytes),
                     public_key_bytes: identity_pub_bytes,
                     custody_type: "in_memory".to_owned(),
                     agent_signing_key_bytes: None,
-                    active_signing_key_bytes: Some(zeroize::Zeroizing::new(active_bytes)),
                 },
             );
         });
@@ -3148,20 +3489,20 @@ mod tests {
         cleanup_registries();
     }
 
-    /// Regression test for the legacy fallback path: when an
-    /// `IdentityEntry` has no distinct `active_signing_key_bytes`
-    /// (e.g. constructed via the test helper, or after an identity-key
-    /// rotation/migration that drops the old active key), `#active`
-    /// resolves to the identity key. This exercises the fallback branch
-    /// of `sign_with_identity` and `resolve_verification_method_key` to
-    /// ensure the two-key un-gating didn't regress legacy handles.
+    /// Sign/verify round-trip exercising the production (non-seeded)
+    /// path on an `IdentityRecord::Local` record. With the two-key
+    /// invariant now type-enforced, every `Local` record carries a
+    /// distinct `#active` key — there is no legacy fallback to
+    /// regress. This test proves that `sign_with_identity(#active)`
+    /// and `resolve_verification_method_key(#active)` stay paired on
+    /// the no-seed code path.
     #[test]
     fn test_sign_verify_active_roundtrip_production() {
         use ed25519_dalek::{Signature, Verifier};
 
         cleanup_registries();
 
-        let (did, pub_bytes) = register_identity();
+        let (did, identity_pub_bytes, active_pub_bytes) = register_identity();
 
         let message = b"scp-production-roundtrip";
         let sig_bytes = sign_with_identity(&did, "#active", message)
@@ -3171,18 +3512,117 @@ mod tests {
         let resolved_pub_bytes = resolve_verification_method_key(&did, "#active")
             .expect("resolve_verification_method_key(#active) should succeed");
 
-        // Fallback path: `#active` resolves to the identity key when
-        // no distinct active key is stored.
+        // The resolver must return the active signing key's verifying
+        // key, NOT the identity key's — the two are distinct by spec
+        // §3.2.1 and the type system forbids the former fallback.
         assert_eq!(
-            resolved_pub_bytes, pub_bytes,
-            "fallback path must resolve #active to the identity public key"
+            resolved_pub_bytes, active_pub_bytes,
+            "resolver must return the active signing key's verifying key"
+        );
+        assert_ne!(
+            resolved_pub_bytes, identity_pub_bytes,
+            "resolver must NOT return the identity key's verifying key for #active"
         );
 
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&resolved_pub_bytes)
             .expect("resolved public key bytes should decode to a valid Ed25519 verifying key");
         verifying_key
             .verify(message, &signature)
-            .expect("sign/verify round-trip must succeed on fallback path");
+            .expect("sign/verify round-trip must succeed");
+
+        cleanup_registries();
+    }
+
+    /// Adversarial-review round 12 MINOR-4 regression test: a
+    /// [`IdentityRecord::Resolved`] handle has no retained key
+    /// material and MUST NOT sign. The old `Option`-based model
+    /// silently fell back to `signing_key_bytes` (the `#0` identity
+    /// key) when `active_signing_key_bytes` was `None`, violating the
+    /// spec §3.2.1 two-key invariant whenever a future call site
+    /// constructed such a handle. The enum split makes that impossible
+    /// at the type level: this test exercises the explicit refusal
+    /// path on both `#active` and `#agent` to prove the structural
+    /// guarantee and pins the error code.
+    #[test]
+    fn resolved_handle_cannot_sign_active() {
+        cleanup_registries();
+
+        // Fabricate a `Resolved` record directly in the registry —
+        // there is no public bridge function that constructs one
+        // today, but the type split means any future caller who does
+        // insert a `Resolved` handle cannot accidentally produce a
+        // signature against it.
+        let pub_bytes = [0xAAu8; 32];
+        let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+        IDENTITY_REGISTRY.with(|reg| {
+            reg.borrow_mut().insert(
+                did.clone(),
+                IdentityRecord::Resolved {
+                    public_key_bytes: pub_bytes,
+                    custody_type: "js_custody".to_owned(),
+                },
+            );
+        });
+
+        // Sanity: the accessor helpers work on both variants.
+        IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            let entry = map.get(&did).expect("record must be present");
+            assert_eq!(entry.public_key_bytes(), pub_bytes);
+            assert_eq!(entry.custody_type(), "js_custody");
+        });
+
+        // `#active` must refuse structurally with IDENT_1028.
+        let err_active = sign_with_identity(&did, "#active", b"payload")
+            .expect_err("Resolved handle must refuse to sign #active");
+        match err_active {
+            ScpWasmError::Identity {
+                ref code,
+                ref message,
+            } => {
+                assert_eq!(
+                    code,
+                    codes::IDENT_1028,
+                    "Resolved #active refusal must use IDENT_1028; got {code}"
+                );
+                assert!(
+                    message.contains("resolved from a DID string"),
+                    "refusal message should explain the cause: {message}"
+                );
+            }
+            other => panic!("expected Identity error, got: {other:?}"),
+        }
+
+        // `#agent` must refuse with the same structural error — the
+        // refusal predates the kid-specific match arms.
+        let err_agent = sign_with_identity(&did, "#agent", b"payload")
+            .expect_err("Resolved handle must refuse to sign #agent");
+        match err_agent {
+            ScpWasmError::Identity { ref code, .. } => {
+                assert_eq!(
+                    code,
+                    codes::IDENT_1028,
+                    "Resolved #agent refusal must use IDENT_1028; got {code}"
+                );
+            }
+            other => panic!("expected Identity error, got: {other:?}"),
+        }
+
+        // Verifying-key resolution also refuses rather than silently
+        // returning `#0` under `#active`.
+        let resolver_err = resolve_verification_method_key(&did, "#active")
+            .expect_err("resolver must refuse Resolved #active");
+        assert!(
+            resolver_err.contains("resolved from a DID string"),
+            "resolver refusal message should explain the cause: {resolver_err}"
+        );
+
+        // `identity_verify_device_attestation`-style public-key reads
+        // continue to work on a `Resolved` record — `public_key_bytes`
+        // is available on both variants.
+        let resolved_pub = IDENTITY_REGISTRY
+            .with(|reg| reg.borrow().get(&did).map(IdentityRecord::public_key_bytes));
+        assert_eq!(resolved_pub, Some(pub_bytes));
 
         cleanup_registries();
     }

@@ -23,9 +23,19 @@
 # PR and the ratchet count will drop with it. The gate fails if the count
 # goes **up** — i.e. a new module-level static was added.
 #
-# Function-local `static` declarations (e.g. `static COUNTER: AtomicU64` inside
-# a helper fn) are not module-level globals; they are naturally scoped and
-# ignored by this gate.
+# Function-local `static` declarations are scanned too when their type matches
+# a process-global *sharing* primitive:
+#   OnceLock<…>, LazyLock<…>, Mutex<…>, RwLock<…>,
+#   parking_lot::Mutex<…>, parking_lot::RwLock<…>.
+# These primitives all have the same 'static lifetime and cross-invocation
+# sharing semantics as a module-level static — moving the declaration into a
+# function body only changes the *namespace*, not the process-global behavior.
+# A PR #1699 review flagged the old "function-local means ignored" rule as a
+# loophole; widening here closes it.
+#
+# Function-local statics of *naturally function-scoped* types — atomics
+# (`AtomicU64`, `AtomicBool`, …) used as local counters/flags, `Cell`,
+# `RefCell` — remain ignored: they are not cross-invocation sharing primitives.
 #
 # Test-gated statics (inside `#[cfg(test)]` or `mod tests`) are ignored —
 # tests are allowed to use whatever local singletons they need.
@@ -40,7 +50,11 @@
 # HOW TO FIX A FAILURE
 # ---------------------------------------------------------------------------
 # The usual cause: a new `static FOO: OnceLock<Bar> = OnceLock::new();` was
-# added at module scope. Do one of:
+# added at module scope — or inside a helper fn body with one of the
+# process-global sharing types (OnceLock / LazyLock / Mutex / RwLock /
+# parking_lot::Mutex / parking_lot::RwLock). Function scope does NOT
+# launder process-global semantics — it only changes the namespace. Do
+# one of:
 #
 #   1. Move the state onto `PyBridgeInstance` / `NapiBridgeInstance` /
 #      `UniffiBridgeInstance` (or their `CoreFields`) as a typed field. This
@@ -103,6 +117,13 @@ ALLOWLIST=(
     HANDLE_COUNT
     SHARED_DHT_CLIENT
     INSTANCE_ID_COUNTER
+    # NETWORK: function-local `static NETWORK: OnceLock<Mutex<Option<FullStackNetwork>>>`
+    # in crates/scp-ffi/napi/src/testing.rs — process-global by necessity for the
+    # cross-test-file full-stack harness. The `testing` module is feature-gated
+    # behind `allow_in_memory_custody` in lib.rs (`#[cfg(feature = "allow_in_memory_custody")] pub mod testing;`)
+    # and is never compiled into production builds. See the doc-comment on the
+    # declaration itself for the full rationale (PR #1699 review follow-up).
+    NETWORK
 )
 
 # Per-bridge: label, directory
@@ -130,19 +151,26 @@ is_allowlisted() {
 # Scan one bridge.
 #
 # Emits one of:
-#   ALLOW<TAB>file<TAB>line<TAB>name<TAB>type    — allowlisted
-#   ONCE<TAB>file<TAB>line<TAB>name<TAB>type     — `Once` init guard (allowlisted)
-#   COUNT<TAB>file<TAB>line<TAB>name<TAB>type    — counted against ratchet
-#   TEST<TAB>file<TAB>line<TAB>name<TAB>type     — test-gated, ignored
+#   ALLOW<TAB>file<TAB>line<TAB>name<TAB>type         — allowlisted (module- or fn-local)
+#   ONCE<TAB>file<TAB>line<TAB>name<TAB>type          — `Once` init guard (allowlisted)
+#   COUNT<TAB>file<TAB>line<TAB>name<TAB>type         — module-level, counted against ratchet
+#   COUNT_FN_LOCAL<TAB>file<TAB>line<TAB>name<TAB>type — function-local sharing primitive, counted
+#   TEST<TAB>file<TAB>line<TAB>name<TAB>type          — test-gated, ignored
 #
 # Strategy:
 #   - Walk each `.rs` under the bridge dir line-by-line.
 #   - Track `#[cfg(test)]` / `mod tests {` scope via brace balance.
-#   - Skip function bodies by tracking brace depth: any `static` declaration
-#     at brace depth > 0 is function-local and ignored.
-#   - Recognize `static NAME: TYPE` at brace depth 0 as a module-level
-#     static. The type portion (everything after `:`) is used to detect
-#     `std::sync::Once` init guards — those are always allowlisted.
+#   - At brace depth 0 (module level), every `static NAME: TYPE` is a
+#     candidate. Name determines ALLOW, type determines ONCE; fallback is
+#     COUNT.
+#   - At brace depth > 0 (function body), only `static NAME: TYPE` where
+#     `TYPE` starts with / contains one of the process-global *sharing*
+#     primitives (`OnceLock`, `LazyLock`, `Mutex`, `RwLock`,
+#     `parking_lot::Mutex`, `parking_lot::RwLock`) is a candidate. Atomics
+#     and `Cell` / `RefCell` are function-scoped by design and ignored.
+#     Candidates are tagged ALLOW (by name) or COUNT_FN_LOCAL (counted
+#     against the ratchet as a regular global would be). ONCE init guards
+#     at function scope are rare but still tagged ONCE if they match.
 # ---------------------------------------------------------------------------
 scan_bridge() {
     local bridge_name="$1"
@@ -221,13 +249,21 @@ scan_bridge() {
                     pending_cfg_test = 0
                 }
 
-                # If we are at brace_depth 0 AND NOT in a test scope,
-                # look for a module-level static.
-                # Patterns:
+                # Look for a `static NAME: TYPE ...` declaration whenever we
+                # are NOT in a test scope. Two cases:
+                #   - brace_depth == 0: module-level static (always a
+                #     candidate). Tagged ALLOW / ONCE / COUNT.
+                #   - brace_depth  > 0: function-local static. Only a
+                #     candidate when TYPE is a process-global *sharing*
+                #     primitive (OnceLock / LazyLock / Mutex / RwLock /
+                #     parking_lot::Mutex / parking_lot::RwLock). Atomics
+                #     and Cell/RefCell are ignored. Tagged ALLOW / ONCE /
+                #     COUNT_FN_LOCAL.
+                # Patterns recognized:
                 #   static NAME: TYPE = ... ;
                 #   pub static NAME: TYPE = ... ;
                 #   pub(crate) static NAME: TYPE = ... ;
-                if (brace_depth == 0 && in_test_depth == 0) {
+                if (in_test_depth == 0) {
                     sp = "^[[:space:]]*(pub(\\([a-z]+\\))?[[:space:]]+)?static[[:space:]]+"
                     if (match(line, sp "[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:")) {
                         # Extract name: everything between `static` and `:`.
@@ -249,20 +285,44 @@ scan_bridge() {
                         # reporting.
                         gsub(/[[:space:]]+/, " ", type_str)
 
-                        # Determine tag.
-                        if (name in allow_map) {
-                            tag = "ALLOW"
-                        } else if (match(type_str, /(^|::)Once([^A-Za-z0-9_]|$)/)) {
-                            # Once init guards (std::sync::Once or
-                            # parking_lot::Once) are treated as allowlisted
-                            # — they exist to run a one-shot init closure.
-                            tag = "ONCE"
-                        } else {
-                            tag = "COUNT"
+                        # Detect a function-local sharing primitive. We
+                        # match either a bare identifier followed by `<`
+                        # or end-of-type, or a `parking_lot::` qualified
+                        # form — these are the types whose semantics are
+                        # unchanged by function scope.
+                        is_sharing_type = 0
+                        if (match(type_str, /(^|[^A-Za-z0-9_:])(OnceLock|LazyLock|Mutex|RwLock)([^A-Za-z0-9_]|$)/)) {
+                            is_sharing_type = 1
+                        } else if (match(type_str, /parking_lot::(Mutex|RwLock)([^A-Za-z0-9_]|$)/)) {
+                            is_sharing_type = 1
                         }
 
-                        printf("%s\t%s\t%d\t%s\t%s\n",
-                            tag, FILE, NR, name, type_str)
+                        # Skip function-local statics whose type is NOT a
+                        # sharing primitive — those are naturally
+                        # function-scoped (atomics, Cell, RefCell, etc.).
+                        if (brace_depth == 0 || is_sharing_type) {
+                            # Determine tag.
+                            if (name in allow_map) {
+                                tag = "ALLOW"
+                            } else if (match(type_str, /(^|::)Once([^A-Za-z0-9_]|$)/)) {
+                                # Once init guards (std::sync::Once or
+                                # parking_lot::Once) are treated as
+                                # allowlisted — they exist to run a
+                                # one-shot init closure.
+                                tag = "ONCE"
+                            } else if (brace_depth > 0) {
+                                # Function-local sharing primitive that
+                                # is neither allowlisted nor a `Once`
+                                # init guard — count it as a global by
+                                # any other name.
+                                tag = "COUNT_FN_LOCAL"
+                            } else {
+                                tag = "COUNT"
+                            }
+
+                            printf("%s\t%s\t%d\t%s\t%s\n",
+                                tag, FILE, NR, name, type_str)
+                        }
                     }
                 }
 
@@ -363,12 +423,18 @@ for entry in "${BRIDGES[@]}"; do
     IFS='|' read -r bridge_name _ <<< "$entry"
     out_file="$TMPDIR_RESULT/$bridge_name.out"
 
-    count_n=$(grep -c $'^COUNT\t' "$out_file" 2>/dev/null || true)
+    count_mod_n=$(grep -c $'^COUNT\t' "$out_file" 2>/dev/null || true)
+    count_fn_n=$(grep -c $'^COUNT_FN_LOCAL\t' "$out_file" 2>/dev/null || true)
     allow_n=$(grep -c $'^ALLOW\t' "$out_file" 2>/dev/null || true)
     once_n=$(grep -c $'^ONCE\t' "$out_file" 2>/dev/null || true)
-    count_n=${count_n:-0}
+    count_mod_n=${count_mod_n:-0}
+    count_fn_n=${count_fn_n:-0}
     allow_n=${allow_n:-0}
     once_n=${once_n:-0}
+    # Function-local sharing-primitive statics are counted against the
+    # ratchet exactly like module-level ones — function scope doesn't
+    # change process-global semantics.
+    count_n=$((count_mod_n + count_fn_n))
 
     baseline="$(baseline_for "$bridge_name")"
 
@@ -389,11 +455,16 @@ for entry in "${BRIDGES[@]}"; do
             "$C_RED" $((count_n - baseline)) "$C_RESET" >&2
         printf '    new/unratcheted statics:\n' >&2
         while IFS=$'\t' read -r tag file line name type_str; do
-            [[ "$tag" == "COUNT" ]] || continue
-            printf '      %s%s:%s%s  %sstatic %s%s  (%s%s%s)\n' \
+            case "$tag" in
+                COUNT) scope_label="" ;;
+                COUNT_FN_LOCAL) scope_label=" ${C_YELLOW}[fn-local]${C_RESET}" ;;
+                *) continue ;;
+            esac
+            printf '      %s%s:%s%s  %sstatic %s%s  (%s%s%s)%s\n' \
                 "$C_DIM" "$file" "$line" "$C_RESET" \
                 "$C_YELLOW" "$name" "$C_RESET" \
-                "$C_DIM" "$type_str" "$C_RESET" >&2
+                "$C_DIM" "$type_str" "$C_RESET" \
+                "$scope_label" >&2
         done < "$out_file"
         TOTAL_FAIL=$((TOTAL_FAIL + 1))
     elif [[ "$count_n" -lt "$baseline" ]]; then

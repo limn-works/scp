@@ -16,15 +16,28 @@
 /// Contract (pinned by `OP_TOOL_REGISTER` across all four bridges):
 ///
 /// * Prepends the literal prefix `tool-`.
-/// * Replaces every ASCII space with `-`.
-/// * Lowercases the whole string (ASCII-case).
+/// * Splits on Unicode whitespace (`str::split_whitespace`) — ASCII
+///   space, tab, newline, NBSP (U+00A0), ideographic space (U+3000),
+///   etc. — collapses consecutive whitespace to a single hyphen, and
+///   trims leading/trailing whitespace.
+/// * Rejoins tokens with `-`.
+/// * Full Unicode lowercase via `str::to_lowercase`.
 ///
-/// Non-ASCII whitespace and other characters pass through unchanged —
-/// the parity gate only exercises ASCII inputs, and widening the
-/// character class here would be a silent cross-bridge divergence.
+/// The previous implementation (`name.replace(' ', "-")`) was ASCII-only:
+/// `"Search\u{A0}Tool"` (NBSP) would round-trip as `"tool-search\u{A0}tool"`
+/// and collide with other systems that Unicode-normalise whitespace
+/// upstream. Unicode-splitting makes the derivation identifier-stable
+/// across the full whitespace character class at the cost of a silent
+/// collapse of consecutive ASCII spaces (`"a  b"` → `"tool-a-b"`, was
+/// `"tool-a--b"`). The parity gate (`OP_TOOL_REGISTER`) continues to
+/// pin the ASCII happy path byte-exactly.
+///
+/// Provenance: `.docs/adrs/ADR-046-bridge-parity-harness.md`
+/// adversarial round 12 MINOR-5.
 #[must_use]
 pub fn generate_tool_id(name: &str) -> String {
-    format!("tool-{}", name.replace(' ', "-").to_lowercase())
+    let joined = name.split_whitespace().collect::<Vec<_>>().join("-");
+    format!("tool-{}", joined.to_lowercase())
 }
 
 #[cfg(test)]
@@ -47,5 +60,33 @@ mod tests {
     #[test]
     fn empty_name_is_tool_prefix_only() {
         assert_eq!(generate_tool_id(""), "tool-");
+    }
+
+    #[test]
+    fn unicode_whitespace_splits_like_ascii_space() {
+        // NBSP (U+00A0) between words — was previously passed through
+        // unchanged (silent cross-system divergence when another layer
+        // Unicode-normalises whitespace). Now splits the same as a
+        // regular space.
+        assert_eq!(generate_tool_id("Search\u{A0}Tool"), "tool-search-tool");
+        // Ideographic space (U+3000) + mixed Unicode whitespace.
+        assert_eq!(generate_tool_id("My\u{3000}Tool"), "tool-my-tool");
+    }
+
+    #[test]
+    fn consecutive_whitespace_collapses_to_single_hyphen() {
+        assert_eq!(generate_tool_id("a  b"), "tool-a-b");
+        assert_eq!(generate_tool_id("a\t b"), "tool-a-b");
+    }
+
+    #[test]
+    fn leading_and_trailing_whitespace_is_stripped() {
+        assert_eq!(generate_tool_id("  padded  "), "tool-padded");
+    }
+
+    #[test]
+    fn unicode_case_is_folded() {
+        // `str::to_lowercase` is Unicode-aware.
+        assert_eq!(generate_tool_id("Ça Ira"), "tool-ça-ira");
     }
 }

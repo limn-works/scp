@@ -622,6 +622,50 @@ def _validate_code_sites(rule_id: str, sites: list) -> list[str]:
     return errors
 
 
+def _validate_code_sites_vs_parse_blindspots(
+    rule_id: str, applies_to: list[str], sites: list
+) -> list[str]:
+    """Fail if any cited code_site lands in `KNOWN_PARSE_ERROR_FILES`.
+
+    The parse-error allowlist is load-bearing — tree-sitter-rust can't
+    parse three wasm-bindgen extern "C" opaque-type files, so the call
+    walker treats them as empty. That's fine when no rule's enforcement
+    target falls in one of those files, but an author who adds a wasm
+    rule pointing at `context.rs` / `custody.rs` / `storage.rs` would
+    silently short-circuit enforcement — the walker would never observe
+    the call, and the rule would report "required_callee not found"
+    as expected for every other file while happily accepting the
+    parse-blind file as "compliant by inability to read".
+
+    This check runs per-rule: if `applies_to` includes `wasm` AND any
+    `code_sites` entry's path is in the allowlist, refuse to load the
+    rule. The allowlist still exists for the walker (the other rules'
+    code lookups in unrelated files keep working); the cross-check
+    only fires when a rule *targets* a parse-blind file.
+    """
+    errors: list[str] = []
+    if "wasm" not in applies_to:
+        return errors
+    for entry in sites:
+        site = _parse_code_site(entry)
+        if site is None:
+            continue
+        try:
+            rel = str(site.path.relative_to(REPO_ROOT))
+        except ValueError:
+            continue
+        if rel in KNOWN_PARSE_ERROR_FILES:
+            errors.append(
+                f"{rule_id}: code_sites entry '{site.raw}' points at "
+                f"'{rel}', which is in KNOWN_PARSE_ERROR_FILES — the "
+                f"call walker cannot parse this file, so any wasm rule "
+                f"targeting it silently skips enforcement. Move the "
+                f"enforcement target to a parseable site, or remove "
+                f"the file from the allowlist."
+            )
+    return errors
+
+
 def _warn_code_site_bitrot(rule_id: str, required_callee: str, sites: list) -> None:
     """Emit a non-fatal warning if the cited window doesn't mention the callee.
 
@@ -723,6 +767,14 @@ def _validate_rule_shape(rule: dict, index: int) -> list[str]:
         # Validate that each code_sites entry resolves to a real file/line.
         if isinstance(code_sites, list) and code_sites:
             errors.extend(_validate_code_sites(rid, code_sites))
+            # Additionally: a wasm rule whose enforcement target lands in a
+            # tree-sitter-parse-blind file silently skips enforcement.
+            if isinstance(applies_to, list):
+                errors.extend(
+                    _validate_code_sites_vs_parse_blindspots(
+                        rid, [str(t) for t in applies_to], code_sites
+                    )
+                )
 
     return errors
 
