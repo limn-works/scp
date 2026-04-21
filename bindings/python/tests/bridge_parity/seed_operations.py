@@ -854,7 +854,8 @@ OP_EVENT_LOG_FILTERED = OpSpec(
 #   - UniFFI `scpid_sign(identity: Identity, …)` takes an opaque handle,
 #     not a DID string — it never performs the registry lookup the other
 #     bridges do. To exercise the same unregistered-DID code path, the
-#     Kotlin/Swift runners call `identity_resolve(FAKE_DID)` instead:
+#     Kotlin/Swift runners call the UniFFI `identityResolve` entrypoint
+#     with the fake DID instead:
 #     the fake DID's 64-char zbase32 suffix decodes to 40 bytes (not the
 #     32 required by did:dht), so `DidDht::extract_public_key` returns
 #     `IdentityError::InvalidDidFormat` locally — no DHT round-trip — and

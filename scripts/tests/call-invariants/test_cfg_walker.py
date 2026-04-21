@@ -90,7 +90,11 @@ def _eval_attribute(src: str) -> bool:
         ("#[cfg(test)]", True, "bare_test"),
         ("#[cfg(not(test))]", False, "not_test_is_production"),
         ("#[cfg(all(test, unix))]", True, "all_with_test"),
-        ('#[cfg(any(test, feature="x"))]', True, "any_with_test"),
+        # any(test, feature="x"): compiles when `test OR feature="x"`. When
+        # `feature="x"` is enabled WITHOUT test, the item is reachable in
+        # production — so it is NOT test-only. (Pre-split-fold walkers
+        # misclassified this as test-gated; see ADR-046 MINOR-1 rev.)
+        ('#[cfg(any(test, feature="x"))]', False, "any_with_test_has_production_path"),
         ("#[cfg(all(not(test), unix))]", False, "all_not_test_is_production"),
         # any(not(test), feature="y") — production path exists (when feature y
         # AND NOT test). Conservatively: production-reachable, NOT test-gated.
