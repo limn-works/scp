@@ -1,6 +1,6 @@
 {
   "project": "scp",
-  "description": "The largest terminology + feature overhaul in SCP to date: (1) rename every 'tool' to 'outlet' across the Rust core, 4 FFI bridges, 4 SDKs, event log, UCAN stems, canonical hash domain separators, enforcement files, and specs — hard break, no migrations, no aliases (MCP wire boundary keeps 'tool' via a lexical translator in scp-mcp); (2) introduce OutletKind { Query, Action } with structural floor at registration, ReadOnlyInvocation guard at runtime, split UCAN stems (outlet_query:*, outlet_call:*) with a fixed two-step parser that closes the 'outlet_query:call:foo' parser-differential, per-kind chain depth and rate tiers, chain amplification rule (Query→Action forbidden) bound to the UCAN delegation chain; (3) add scoped UCAN invocation caveats — structured typed fields in `nb`, `narrow()` attenuation with lexical-equality-only regex pattern narrowing (regex containment is undecidable), 24-bit mask-width assertion on hours_of_day, conservative JSON Schema narrowing with a closed keyword whitelist, CaveatCounterStore for rate/cumulative accounting, mint limits, whole-token revocation; (4) replace the lossy boolean/string error path with a structured OutletError envelope carrying 8 root classes, RetryPolicy enum, MessagePack wire tags 1-6 + 8 for forward compat (tags 7/9/10 reserved; `_unknown_fields` round-trip), query-oracle collapse on Authorization errors, per-class typed `detail` schema preventing covert-channel abuse, message-PII redaction, source_chain with HMAC-pseudonymized context_ids per hop, compact code taxonomy (~15 codes with class-prefixed slugs) in the SCP-TOOL-6100-6199 sub-block, sealed SDK hierarchies with TypeScript `instanceof` survival across napi-rs; (5) make invocation streaming-native — every call is an OutletStreamOpen + OutletStreamChunk + OutletStreamCredit sequence with `chain_depth: u8` matching §24.4, ChunkPayload variant-tagged with 'type' first in JCS, per-chunk Ed25519 operator signatures closing the equivocation gap, caveats_binding committing the stream to the exact narrowed caveats, RFC 6962 0x00/0x01 tag bytes on the chunk manifest Merkle tree under SCP-OUTLET-CHUNK-V1, OutletResponse eliminated, credit-based backpressure with escrow-at-open + per-chunk billing + cancel-ack-bounded refund semantics, ONE OutletInvokedEvent per stream at terminal chunk carrying chunks_billed, SDK idioms per language (AsyncIterator, AsyncIterable, AsyncThrowingStream, Flow) with a unified invoke() returning a handle that is both awaitable and iterable. Deferred per discussion #1698: relay-hosted Query result cache (§5.4.3 stub), per-chunk inclusion-proof API (manifest-root commitment kept), error envelope tags 7/9/10 (reserved for related_code / i18n_key / trace_id). Scope: ~2,300 occurrences across ~172 files.",
+  "description": "The largest terminology + feature overhaul in SCP to date: (1) rename every 'tool' to 'outlet' across the Rust core, 4 FFI bridges, 4 SDKs, event log, UCAN stems, canonical hash domain separators, enforcement files, and specs — hard break, no migrations, no aliases (MCP wire boundary keeps 'tool' via a lexical translator in scp-mcp); (2) introduce OutletKind { Query, Action } with structural floor at registration, ReadOnlyInvocation guard at runtime, split UCAN stems (outlet_query:*, outlet_call:*) with a fixed two-step parser that closes the 'outlet_query:call:foo' parser-differential, per-kind chain depth and rate tiers, chain amplification rule (Query→Action forbidden) bound to the UCAN delegation chain; (3) add scoped UCAN invocation caveats — structured typed fields in `nb`, `narrow()` attenuation with lexical-equality-only regex pattern narrowing (regex containment is undecidable), 24-bit mask-width assertion on hours_of_day, conservative JSON Schema narrowing with a closed keyword whitelist, CaveatCounterStore for rate/cumulative accounting, mint limits, whole-token revocation; (4) replace the lossy boolean/string error path with a structured OutletError envelope carrying 8 root classes, RetryPolicy enum, MessagePack wire tags 1-6 + 8 for forward compat (tags 7/9/10 reserved; `_unknown_fields` round-trip), query-oracle collapse on Authorization errors, per-class typed `detail` schema preventing covert-channel abuse, message-PII redaction, source_chain with HMAC-pseudonymized context_ids per hop, compact code taxonomy (~15 codes with class-prefixed slugs) in the SCP-TOOL-6100-6199 sub-block, sealed SDK hierarchies with TypeScript `instanceof` survival across napi-rs; (5) make invocation streaming-native — every call is an OutletStreamOpen + OutletStreamChunk + OutletStreamCredit sequence with `chain_depth: u8` matching §24.4, ChunkPayload variant-tagged with '@type' first in JCS (leading '@' sorts before lowercase body keys under RFC 8785), per-chunk Ed25519 operator signatures closing the equivocation gap, caveats_binding committing the stream to the exact narrowed caveats, RFC 6962 0x00/0x01 tag bytes on the chunk manifest Merkle tree under SCP-OUTLET-CHUNK-V1, OutletResponse eliminated, credit-based backpressure with escrow-at-open + per-chunk billing + cancel-ack-bounded refund semantics, ONE OutletInvokedEvent per stream at terminal chunk carrying chunks_billed, SDK idioms per language (AsyncIterator, AsyncIterable, AsyncThrowingStream, Flow) with a unified invoke() returning a handle that is both awaitable and iterable. Deferred per discussion #1698: relay-hosted Query result cache (§5.4.3 stub), per-chunk inclusion-proof API (manifest-root commitment kept), error envelope tags 7/9/10 (reserved for related_code / i18n_key / trace_id). Scope: ~2,300 occurrences across ~172 files.",
   "gates": [
     {
       "id": "gate-rename",
@@ -73,7 +73,8 @@
       "stories": [
         "SCP-OUT-032",
         "SCP-OUT-033",
-        "SCP-OUT-034",
+        "SCP-OUT-034a",
+        "SCP-OUT-034b",
         "SCP-OUT-035",
         "SCP-OUT-036",
         "SCP-OUT-037",
@@ -97,17 +98,23 @@
         ".docs/specs/08-products-and-apps-in-the-graph.md",
         ".docs/specs/09-security-model.md",
         ".docs/specs/19-economic-governance.md",
-        ".docs/specs/17-persistence-and-storage.md"
+        ".docs/specs/17-persistence-and-storage.md",
+        ".docs/specs/25-test-vectors.md"
       ],
-      "description": "Bulk rename of every prose and wire-format reference from 'tool' to 'outlet' in the seven affected spec files, following the artifact-flow invariant — specs first, code later. Scope: section headings (except §6.2 'Tool Interface' which remains for continuity of the interface concept, but §6.2.0 prose, §6.2.1 'Stateful Outlet Sessions', and code-facing identifiers are renamed), wire-format type names (ToolRegistration → OutletRegistration, ToolCost → OutletCost, ToolInvoked → OutletInvoked, etc.), UCAN capability stems (tool:invoke → outlet:invoke in prose; split into outlet_query/outlet_call is SCP-OUT-020), CostSchedule field names (per_tool_invoke → per_outlet_invoke), PaidActionType variants (ToolInvoke → OutletInvoke), domain separator strings in prose (SCP-TOOL-REGISTRATION-V1 → SCP-OUTLET-REGISTRATION-V2), and tabled per-row references in §19.15.2 and elsewhere. The new §5.4/§5.4.1/§5.4.2/§5.4.3/§5.4.4/§5.4.5/§6.2.0.3/§6.2.0.4/§6.2.0.5/§7.3.8/§8.5.1 sections already exist (added during PRD drafting); this story covers the remaining prose. Boundary exception: §8.5 MCP prose retains 'tool' where it refers to MCP-side vocabulary; §8.5.1 documents the translation. The shared prefix SCP-TOOL- in error codes is retained (see SCP-OUT-041). This story also folds in the four former spec-audit gate-opener stories (originally SCP-OUT-016/027/034/043) whose only work was verifying cross-references to §5.4.2, §7.3.8, §5.4.4, and §5.4.5; plus BLOCKER fixes from the review (§5.3.1 / §5.5.1 capability URIs switch from tool:* to outlet:query:* / outlet:call:*; §5.4.5 chain_depth width fixed to u8 per §24.4 and ADR-043).",
+      "description": "Bulk rename of every prose and wire-format reference from 'tool' to 'outlet' in the seven affected spec files, following the artifact-flow invariant — specs first, code later. Scope: section headings (§6.2 'Context-to-Context Outlet Interfaces' and all subsections renamed; §6.2.0 'Outlet Interface Transport', §6.2.0.2 'Outlet Interface Rate Limit Defaults', §6.2.1 'Stateful Outlet Sessions'; code-facing identifiers renamed), wire-format type names (ToolRegistration → OutletRegistration, ToolCost → OutletCost, ToolInvoked → OutletInvoked, ProposeToolInterface → ProposeOutletInterface, AcceptToolInterface → AcceptOutletInterface, RevokeToolInterface → RevokeOutletInterface, ToolId → OutletId, tool_id → outlet_id, tool_schema → outlet_schema, etc.), UCAN capability stems (tool:invoke → outlet:invoke in prose; split into outlet_query/outlet_call is SCP-OUT-020), CostSchedule field names (per_tool_invoke → per_outlet_call per the caveats-stem split — see OUT-002 AC-8), PaidActionType variants (ToolInvoke → OutletCall per the Query/Action split), domain separator strings in prose (SCP-TOOL-REGISTRATION-V1 → SCP-OUTLET-REGISTRATION-V2, SCP-OFFER-ID-V1 → SCP-OUTLET-OFFER-ID-V1), and tabled per-row references in §19.15.2 and elsewhere. Round-3 residual renames: §17.3 (store_tool → store_outlet, load_tool → load_outlet, list_tools → list_outlets, tool/{tool_id} → outlet/{outlet_id}, tool_session/{session_id} → outlet_session/{session_id}), §7.3.4 (evaluator_tool_id: ToolId → evaluator_outlet_id: OutletId), §25.15 (tool-abc123 fixture → outlet-abc123; SCP-OFFER-ID-V1 → SCP-OUTLET-OFFER-ID-V1; stale 0xb9f0cd digest flagged for recomputation), §8.5 pseudocode (tool_invoke(tool_a, tool_b) → outlet_call(outlet_a, outlet_b)). Round-3 V1 preimage rename: SCP-OUTLET-CAVEAT-BIND-V2 → SCP-OUTLET-CAVEAT-BIND-V1 and SCP-OUTLET-CHUNK-SIG-V2 → SCP-OUTLET-CHUNK-SIG-V1 everywhere (nothing shipped under V2). Boundary exception: §8.5 MCP prose retains 'tool' where it refers to MCP-side vocabulary; §8.5.1 documents the translation (and updates the MCP delimiter to dot: `query.current_weather` rather than `query/current_weather`, per API MAJOR 27). The shared prefix SCP-TOOL- in error codes is retained (see SCP-OUT-041).",
       "acceptanceCriteria": [
         "grep -rn 'ToolRegistration\\|ToolCost\\|ToolInvoked\\b\\|ToolCancel\\|ToolRequest\\|ToolResponse\\|ToolSchema\\|ToolInterface' .docs/specs/ returns 0",
-        "grep -rn 'per_tool_invoke' .docs/specs/ returns 0",
-        "grep -rn 'PaidActionType.*ToolInvoke\\|\"ToolInvoke\"' .docs/specs/ returns 0",
+        "grep -rn 'per_tool_invoke\\|per_outlet_invoke' .docs/specs/ returns 0 (round-3: per_outlet_invoke is obsolete — use per_outlet_call for the Action stem per §19.15.2; see OUT-002 AC-8)",
+        "grep -rn 'PaidActionType.*ToolInvoke\\|\"ToolInvoke\"\\|PaidActionType::OutletInvoke\\b' .docs/specs/ returns 0 (Capability enum split to OutletQuery/OutletCall; no OutletInvoke variant)",
         "grep -rn 'SCP-TOOL-REGISTRATION-V1' .docs/specs/ returns 0",
-        "grep -rn 'tool:invoke\\|tool:register' .docs/specs/ returns 0 (capability URIs — every occurrence renamed to outlet:query:* / outlet:call:* / outlet:register)",
+        "grep -rn 'SCP-OUTLET-CHUNK-SIG-V2\\|SCP-OUTLET-CAVEAT-BIND-V2' .docs/specs/ .docs/adrs/ .docs/prds/ returns 0 (V1 is the first-ship label)",
+        "grep -rn '\"SCP-OFFER-ID-V1' .docs/specs/ returns 0 (renamed to SCP-OUTLET-OFFER-ID-V1 everywhere)",
+        "grep -rn 'ProposeToolInterface\\|AcceptToolInterface\\|RevokeToolInterface' .docs/specs/ returns 0",
+        "grep -rn '\\btool_id\\b\\|\\btool_schema\\b' .docs/specs/06-cross-context-communication.md .docs/specs/05-contexts.md .docs/specs/17-persistence-and-storage.md .docs/specs/07-trust-validation-and-capabilities.md returns 0 (§5, §6, §17, §7 are fully renamed)",
+        "grep -rn 'tool:invoke\\|tool:register\\|tool:interface' .docs/specs/ returns 0 (capability URIs — every occurrence renamed to outlet:query:* / outlet:call:* / outlet:register / outlet:interface)",
         "grep -rn 'tool_interface_count' .docs/specs/ returns 0 (field renamed to outlet_interface_count in §5.7)",
         "grep -rn 'scp:template/tool-interface' .docs/specs/ returns 0 (template ID renamed to scp:template/outlet-interface; hard break per ADR-049)",
+        "grep -c '\"SCP-OUTLET-OFFER-ID-V1:\"' .docs/specs/09-security-model.md returns >= 1 (new domain separator registered)",
         "§5.12 'scp:template/coordination' ceiling lists outlet:query:*, outlet:call:* (not tool:invoke:*)",
         "§5.12 'scp:template/public-broadcast' + 'scp:template/gated-broadcast' ceilings list outlet:register, outlet:query:*, outlet:call:* (not tool:register, tool:invoke:*)",
         "§5.12 'scp:template/outlet-interface' block exists (template ID renamed from scp:template/tool-interface)",
@@ -118,15 +125,18 @@
         "§19.3 economic policy prose uses outlet_call:* and per_outlet_call (not tool:invoke:* and per_tool_invoke)",
         "§19.3 Query outlet cost contract text contains NO reference to a shared operator-signed cache (§5.4.3 is deferred per discussion #1698); the structural floor stands alone",
         "§19.10 'scp:template/paid-service' description uses per_outlet_call and extends scp:template/outlet-interface",
-        "§19.15.2 CostSchedule table row for per_outlet_call exists; row for per_tool_invoke does not",
-        "§19.15.2 PaidActionType OutletCall variant listed; ToolInvoke variant not listed",
+        "§19.15.2 CostSchedule table row for per_outlet_call exists; row for per_tool_invoke does not; §19.15.2 PaidActionType OutletCall variant listed; ToolInvoke variant not listed",
         "§5.3.1 Exhaustive Capability Categories table lists outlet:query:*, outlet:query:{outlet_id}, outlet:call:*, outlet:call:{outlet_id} and does NOT list tool:* / tool:invoke:*",
         "§5.5.1 Default Role Set uses outlet:query:* / outlet:call:* in admin, moderator, member permission lists; observer cannot hold any outlet:*",
         "§5.4.5 OutletStreamOpen.chain_depth is u8 (matching §24.4 width and ADR-043); grep -n 'chain_depth: *u16' .docs/specs/05-contexts.md returns 0",
+        "§17.3 renames (round-3): grep -n 'store_tool\\b\\|load_tool\\b\\|list_tools\\b\\|tool/{tool_id}\\|tool_session/' .docs/specs/17-persistence-and-storage.md returns 0; §17.3 store_outlet/load_outlet/list_outlets defined; outlet/{outlet_id} and outlet_session/{session_id} key conventions present",
+        "§7.3.4 rename (round-3): grep -n 'evaluator_tool_id: *ToolId' .docs/specs/07-trust-validation-and-capabilities.md returns 0; 'evaluator_outlet_id: OutletId' present",
+        "§25.15 renames (round-3): grep -n 'tool-abc123\\|\"SCP-OFFER-ID-V1:\"\\b' .docs/specs/25-test-vectors.md returns 0; fixture now uses outlet-abc123 and SCP-OUTLET-OFFER-ID-V1",
+        "§8.5 pseudocode rename (round-3): grep -n 'tool_invoke(' .docs/specs/08-products-and-apps-in-the-graph.md returns 0; pseudocode now cites outlet_call(outlet_a, outlet_b)",
+        "§8.5.1 MCP delimiter (round-3): grep -n 'query/\\|call/' .docs/specs/08-products-and-apps-in-the-graph.md inside the Kind projection block returns 0; translator uses `query.outlet_id` and `call.outlet_id` (dot delimiter, not slash)",
         "Section headings renamed: any '## X.Y Tools' becomes '## X.Y Outlets'; sub-headings likewise, except MCP §8.5 and the literal word 'Tool' inside a quoted MCP identifier",
         "All occurrences of 'tool interface' in prose become 'outlet interface' except §8.5 MCP prose and §8.5.1 translation table",
-        "PRD validator passes (python3.12 scripts/validate-prd.py) — every sources[].section still resolves to an existing heading after the renames",
-        "No heading referenced by any other PRD story in this file is renamed without updating that story's sources array (validator enforces this)"
+        "PRD validator passes (python3.12 scripts/validate-prd.py) — every sources[].section still resolves to an existing heading after the renames"
       ],
       "actionItems": [
         "Enumerate every match of /\\btool\\b/ (case-insensitive) in .docs/specs/ and classify: rename / MCP-boundary / leave",
@@ -234,7 +244,7 @@
         "crates/scp-protocol/src/economy/antispam.rs",
         "crates/scp-protocol/src/lib.rs"
       ],
-      "description": "Rename the tool subsystem of scp-protocol to outlets. Directory `src/context/tools/` becomes `src/context/outlets/`. All exported types carrying the Tool prefix (ToolRegistration, ToolCost, ToolId, ToolSchema, ToolTestVector, ToolRegistry, ToolInterface, ToolLifecycleEvent, ToolIntegrityStatus, ToolSummary) are renamed to the Outlet prefix. The `tool_id` field becomes `outlet_id` everywhere. The canonical hash domain separator constant `SCP_TOOL_REGISTRATION_V1` is deleted and replaced with `SCP_OUTLET_REGISTRATION_V2`. `ToolCost` → `OutletCost`. The UCAN capability variants in `roles.rs` are renamed `ToolInvoke{outlet_id}` → `OutletInvoke{outlet_id}` and `ToolInvokeAll` → `OutletInvokeAll` (the split into `OutletQuery`/`OutletCall` is SCP-OUT-020). Economy types `PaidActionType::ToolInvoke` → `PaidActionType::OutletInvoke`; `CostSchedule::per_tool_invoke` → `per_outlet_invoke`. The canonical hash scope now includes a kind byte per §5.4.1 but the actual kind field is added in SCP-OUT-017 — this story uses a placeholder 0x01 (Action) so signatures remain valid across the rename commit. No stubs; all call sites updated.",
+      "description": "Rename the tool subsystem of scp-protocol to outlets. Directory `src/context/tools/` becomes `src/context/outlets/`. All exported types carrying the Tool prefix (ToolRegistration, ToolCost, ToolId, ToolSchema, ToolTestVector, ToolRegistry, ToolInterface, ToolLifecycleEvent, ToolIntegrityStatus, ToolSummary) are renamed to the Outlet prefix. The `tool_id` field becomes `outlet_id` everywhere. The canonical hash domain separator constant `SCP_TOOL_REGISTRATION_V1` is deleted and replaced with `SCP_OUTLET_REGISTRATION_V2`. `ToolCost` → `OutletCost`. The UCAN capability variants in `roles.rs` land directly as `OutletQuery(OutletId)` / `OutletQueryAll` / `OutletCall(OutletId)` / `OutletCallAll` per §5.4.2.1 and ADR-049 — there is NO transitional `OutletInvoke` variant. Economy types `PaidActionType::ToolInvoke` → `PaidActionType::OutletCall` (matching the Action stem); `CostSchedule::per_tool_invoke` → `per_outlet_call` (matching the Action stem; `per_outlet_invoke` was an intermediate draft name and is NOT used — see round-3 rename). The canonical hash scope now includes a kind byte per §5.4.1 but the actual kind field is added in SCP-OUT-017 — this story uses a placeholder 0x01 (Action) so signatures remain valid across the rename commit. No stubs; all call sites updated.",
       "acceptanceCriteria": [
         "Directory crates/scp-protocol/src/context/outlets/ exists with files mod.rs, lifecycle.rs, integrity.rs, interface.rs, registry.rs, schema.rs, summary.rs",
         "Directory crates/scp-protocol/src/context/tools/ does not exist",
@@ -245,8 +255,9 @@
         "grep -rn 'SCP-TOOL-REGISTRATION-V1\\|SCP_TOOL_REGISTRATION_V1' crates/scp-protocol/src/ returns 0",
         "Capability enum defines OutletQuery(OutletId), OutletQueryAll, OutletCall(OutletId), OutletCallAll (the split landed directly — no transitional OutletInvoke variant per ADR-049 hard break); OutletInvoke / OutletInvokeAll variants do NOT exist",
         "grep -rn 'ToolInvoke\\|OutletInvoke\\b\\|OutletInvokeAll' crates/scp-protocol/src/context/roles.rs returns 0 (no tool-era variant and no transitional OutletInvoke alias)",
-        "PaidActionType enum has OutletInvoke variant; no ToolInvoke variant",
-        "CostSchedule struct has per_outlet_invoke field; no per_tool_invoke field",
+        "PaidActionType enum has OutletCall variant; no ToolInvoke variant; no OutletInvoke variant (per round-3: the Action stem is outlet_call: so the PaidActionType follows the stem name)",
+        "CostSchedule struct has per_outlet_call field; no per_tool_invoke field; no per_outlet_invoke field (per round-3: stem-aligned naming)",
+        "grep -rn 'per_outlet_invoke\\|\"OutletInvoke\"\\|PaidActionType::OutletInvoke\\b' crates/scp-protocol/src/ returns 0 (round-3 enforcement — these intermediate draft names must not ship)",
         "OutletRegistration::signature scope includes a kind_byte (placeholder 0x01 for Action) per §5.4.1",
         "cargo build -p scp-protocol succeeds",
         "cargo test -p scp-protocol succeeds (tests in this crate updated to new names)",
@@ -256,8 +267,8 @@
         "git mv crates/scp-protocol/src/context/tools crates/scp-protocol/src/context/outlets",
         "Rename file content: all ToolX identifiers → OutletX in the moved directory",
         "Update pub use statements in crates/scp-protocol/src/context/mod.rs and src/lib.rs",
-        "Update Capability enum in roles.rs",
-        "Update PaidActionType and CostSchedule in economy/mod.rs",
+        "Update Capability enum in roles.rs — land directly as OutletQuery/OutletQueryAll/OutletCall/OutletCallAll (no OutletInvoke intermediate)",
+        "Update PaidActionType variant from ToolInvoke to OutletCall and CostSchedule field from per_tool_invoke to per_outlet_call in economy/mod.rs (round-3 stem-aligned naming)",
         "Replace SCP_TOOL_REGISTRATION_V1 with SCP_OUTLET_REGISTRATION_V2 and extend preimage with kind_byte = 0x01",
         "Update all in-crate call sites",
         "Run cargo clippy -p scp-protocol --all-targets and fix warnings",
@@ -393,7 +404,7 @@
         },
         {
           "file": ".docs/specs/06-cross-context-communication.md",
-          "section": "### 6.2.0 Tool Interface Transport"
+          "section": "### 6.2.0 Outlet Interface Transport"
         },
         {
           "file": ".docs/adrs/ADR-049-outlet-redesign.md",
@@ -515,7 +526,7 @@
         "Python: grep -rn 'class Tool\\|import Tool\\|from .tools' bindings/python/scp_sdk/ returns 0",
         "Python: Context.outlets returns an OutletNamespace with methods register, invoke, update, get, list, verify, deregister",
         "Python: OutletNamespace.sessions (SessionsNamespace: open/invoke/close) and OutletNamespace.offers (OffersNamespace: propose/accept/revoke/list) exist",
-        "Python: ctx.outlets.invoke_cross_context(target, outlet_id, input, ucan) exists; no top-level Context.invoke_outlet_cross_context exists",
+        "Python: ctx.outlets.invoke_cross_context(options: InvokeCrossContextOptions) exists (dataclass-keyword options form per API MAJOR 22: `invoke_cross_context(target=..., outlet_id=..., input=..., ucan=...)` — positional invocation with two string params is rejected to prevent silent target/outlet_id swap); no top-level Context.invoke_outlet_cross_context exists",
         "Python: ctx.outlets.invoke(id, input) returns an InvocationHandle supporting `await handle` (returns End.aggregate) and `async for chunk in handle` (yields OutletStreamChunk); single method — no separate invoke_stream at the public surface",
         "Python: caveats helpers scp_sdk.caveats.spending_cap, caveats.time_bounded, caveats.rate_limited, caveats.for_target return builders with .build() → InvocationCaveats",
         "Python: _scp_core.pyi reflects the outlet-prefixed surface",
@@ -523,25 +534,27 @@
         "TypeScript: file bindings/typescript/src/outlets.ts exists; src/tools.ts does not",
         "TypeScript: grep -rn 'export class Tool\\|export interface Tool\\|from [\"\\.]+tools' bindings/typescript/src/ returns 0",
         "TypeScript: Context.outlets getter returns an OutletNamespace class with methods register/invoke/update/get/list/verify/deregister and sub-namespaces sessions (open/invoke/close) and offers (propose/accept/revoke/list)",
-        "TypeScript: ctx.outlets.invokeCrossContext(target, outletId, input, ucan) exists; no top-level ctx.invokeOutletCrossContext exists",
+        "TypeScript: ctx.outlets.invokeCrossContext(options: InvokeCrossContextOptions) exists (options-object form per API MAJOR 22: `invokeCrossContext({ target, outletId, input, ucan })` — the options-object is the ONLY form at the public surface; positional form with two adjacent strings is not exposed to prevent silent target/outletId swap); no top-level ctx.invokeOutletCrossContext exists",
         "TypeScript: ctx.outlets.invoke(id, input) returns an InvocationHandle that is both `PromiseLike<Aggregate>` and `AsyncIterable<OutletStreamChunk>`; single method — no separate invokeStream at the public surface",
         "TypeScript: import { caveats } from '@limn-works/scp-ts'; caveats.spendingCap, caveats.timeBounded, caveats.rateLimited, caveats.forTarget each return a builder with .build()",
         "TypeScript: bun run lint/format/check/test pass",
         "Swift: file bindings/swift/Sources/SCP/Outlets.swift exists; Tools.swift does not",
         "Swift: Context.outlets returns an OutletNamespace with methods register/invoke/update/get/list/verify/deregister and sub-namespaces sessions and offers",
-        "Swift: ctx.outlets.invokeCrossContext(target:outletId:input:ucan:) exists; no top-level Context.invokeOutletCrossContext(...)",
+        "Swift: ctx.outlets.invokeCrossContext(target:outletId:input:ucan:) exists (Swift-native labeled-argument form is already unambiguous; options-object wrapper is NOT required for Swift per API MAJOR 22 — Swift's labeled-argument style is the per-language idiom for disambiguation); no top-level Context.invokeOutletCrossContext(...)",
         "Swift: ctx.outlets.invoke(id:input:) returns an InvocationHandle conforming to both `AsyncSequence` (chunks) and offering `await handle.aggregate` (End.aggregate); one method, two consumption paths",
         "Swift: Caveats.spendingCap / Caveats.timeBounded / Caveats.rateLimited / Caveats.forTarget return builders with .build() → InvocationCaveats",
         "Swift: swiftlint --strict and swiftformat --lint pass; swift test green",
-        "Kotlin: public interface OutletsApi with suspend fun register, invoke, update, get, list, verify, deregister; sub-interfaces sessions (open/invoke/close) and offers (propose/accept/revoke/list)",
-        "Kotlin: ctx.outlets.invokeCrossContext(target, outletId, input, ucan) suspend function exists; no top-level Context.invokeOutletCrossContext(...)",
+        "Kotlin: public interface OutletNamespace (renamed from OutletsApi for cross-SDK parity per simplifier MAJOR 25) with suspend fun register, invoke, update, get, list, verify, deregister; sub-interfaces sessions (open/invoke/close) and offers (propose/accept/revoke/list); grep -rn 'OutletsApi\\b' bindings/kotlin/ returns 0",
+        "Kotlin: ctx.outlets.invokeCrossContext(options: InvokeCrossContextOptions) suspend function exists (options-builder form with target, outletId, input, ucan fields to prevent positional-argument swap with string-typed target and outletId); no top-level Context.invokeOutletCrossContext(...)",
         "Kotlin: ctx.outlets.invoke(id, input) returns an InvocationHandle exposing `suspend fun aggregate(): Aggregate` and `fun asFlow(): Flow<OutletStreamChunk>`; single registration in the namespace",
         "Kotlin: Caveats.spendingCap, Caveats.timeBounded, Caveats.rateLimited, Caveats.forTarget builder functions → InvocationCaveats",
         "Kotlin: ./gradlew detekt and ./gradlew test pass",
         "SDK capability matrix updated: outlets namespace and its sub-namespaces listed uniformly across all four SDKs with identical verb set",
         "Deleted test files test_tools.py, tools.test.ts, ToolsTests.swift, and any Kotlin tools-test source do not exist",
         "README snippets / quickstart examples updated from tool to outlet vocabulary; no broken links (cross-check with docs lint)",
-        "TypeScript error-class `instanceof` survival across napi-rs is owned by SCP-OUT-031 (sealed-hierarchy + fixture round-trip); this story imports the resulting types and does not duplicate the guard"
+        "TypeScript error-class `instanceof` survival across napi-rs is owned by SCP-OUT-031 (sealed-hierarchy + fixture round-trip); this story imports the resulting types and does not duplicate the guard",
+        "InvocationHandle aggregate consistency (API MAJOR 21): the handle IS the future of aggregate — Python `await handle` yields Aggregate; TypeScript `await handle` (PromiseLike<Aggregate>) yields Aggregate; Swift `await handle.aggregate` property yields Aggregate; Kotlin `handle.aggregate()` suspend method yields Aggregate. Per-language tests assert the aggregate-consumption path exists and returns End.aggregate.",
+        "Developer-docs note: `ctx.outlets.sessions.invoke` and `ctx.outlets.invoke` are distinct namespaces (API MAJOR 26): `ctx.outlets.invoke(id, input)` opens a non-session stream; `ctx.outlets.sessions.invoke(session_id, input)` routes through an existing session (§6.2.1.1). Quickstart documents both and grep -c 'ctx\\.outlets\\.sessions\\.invoke' README returns >= 1 per SDK."
       ],
       "actionItems": [
         "Python: git mv scp_sdk/tools.py → scp_sdk/outlets.py and tests/test_tools.py → tests/test_outlets.py; introduce OutletNamespace / SessionsNamespace / OffersNamespace; implement the InvocationHandle union (awaitable + async iterable); implement caveats helpers; regenerate _scp_core.pyi",
@@ -593,7 +606,7 @@
         "crates/scp-mcp/src/translator.rs",
         "crates/scp-mcp/tests/translator.rs"
       ],
-      "description": "Add a purely lexical `Translator` to `scp-mcp` that rewrites identifiers in both directions across the MCP boundary per §8.5.1. Wire shape is preserved: `tools/list` ↔ `outlet list`, `tools/call` ↔ `outlet invoke`, `tool.name` ↔ `outlet_id`, `tool.inputSchema` ↔ `schema.input`, etc. The translator is stateless; each message is translated in isolation. Two functions: `mcp_to_scp(value: serde_json::Value) -> serde_json::Value` and `scp_to_mcp(value: serde_json::Value) -> serde_json::Value`. Kind projection: SCP outlets with `kind: Query` surface as MCP tool names prefixed `query/`; MCP tools inbound default to `Action` unless `x-scp-kind` extension is present (classification per SCP-OUT-017 — this story scaffolds the logic but the kind enum is added in the classification gate). Until SCP-OUT-017 lands, the translator uses a sentinel `OutletKind::Action` to preserve wire correctness.",
+      "description": "Add a purely lexical `Translator` to `scp-mcp` that rewrites identifiers in both directions across the MCP boundary per §8.5.1. Wire shape is preserved: `tools/list` ↔ `outlet list`, `tools/call` ↔ `outlet invoke`, `tool.name` ↔ `outlet_id`, `tool.inputSchema` ↔ `schema.input`, etc. The translator is stateless; each message is translated in isolation. Two functions: `mcp_to_scp(value: serde_json::Value) -> serde_json::Value` and `scp_to_mcp(value: serde_json::Value) -> serde_json::Value`. Kind projection: SCP outlets with `kind: Query` surface as MCP tool names prefixed `query.` (dot delimiter per API MAJOR 27 — MCP's JSON-RPC method convention uses `/` as separator, so outlet IDs inside tool.name must use `.` to avoid collision); MCP tools inbound default to `Action` unless `x-scp-kind` extension is present (classification per SCP-OUT-017 — this story scaffolds the logic but the kind enum is added in the classification gate). Until SCP-OUT-017 lands, the translator uses a sentinel `OutletKind::Action` to preserve wire correctness.",
       "acceptanceCriteria": [
         "File crates/scp-mcp/src/translator.rs exists and is re-exported from lib.rs",
         "Function mcp_to_scp translates tools/list, tools/call, CallToolRequest, CallToolResult, tool.name, tool.description, tool.inputSchema, tool.outputSchema, tools/list_changed, isError",
@@ -605,6 +618,9 @@
         "Allowlist (crates/scp-mcp/src/allowlist.rs) uses outlet_id vocabulary internally but still serializes MCP-facing tool.name when exposing to MCP clients",
         "cargo test -p scp-mcp passes",
         "grep -rn 'fn register_tool\\|fn invoke_tool' crates/scp-mcp/src/ returns 0 except where explicitly part of MCP JSON-RPC method names (\"tools/list\", \"tools/call\") — these are MCP wire identifiers",
+        "MCP kind projection uses DOT delimiter, not slash (API MAJOR 27): scp_to_mcp on an SCP outlet with id='current_weather' kind=Query produces MCP tool.name='query.current_weather'; kind=Action produces 'call.current_weather'. Unit test: `grep -c 'query/\\|call/' crates/scp-mcp/src/translator.rs` returns 0; `grep -c '\"query\\.\"\\|\"call\\.\"' crates/scp-mcp/src/translator.rs` returns >= 1",
+        "Unit test: mcp_to_scp on MCP tool.name='query.current_weather' produces SCP outlet with kind=Query and outlet_id='current_weather' (strip the dot-prefix on inbound)",
+        "Unit test: mcp_to_scp on MCP tool.name='query/current_weather' (slash delimiter from a non-conforming MCP client) is translated as outlet_id='query/current_weather' with kind=Action default (no kind-prefix interpretation on slash — only the dot delimiter projects kind)",
         "README or module doc documents the translator with example SCP↔MCP round trips"
       ],
       "actionItems": [
@@ -1119,7 +1135,7 @@
       "sources": [
         {
           "file": ".docs/specs/06-cross-context-communication.md",
-          "section": "#### 6.2.0.2 Tool Interface Rate Limit Defaults"
+          "section": "#### 6.2.0.2 Outlet Interface Rate Limit Defaults"
         },
         {
           "file": ".docs/specs/05-contexts.md",
@@ -1201,34 +1217,46 @@
         "crates/scp-protocol/src/trust/mod.rs",
         "crates/scp-protocol/src/trust/ucan.rs"
       ],
-      "description": "Define the `InvocationCaveats` struct and `RateWindow` helper per §7.3.8. Implement serde serialization (MessagePack via rmp_serde for wire, canonical JCS for hashing). Implement mint-time limit enforcement as a constructor `InvocationCaveats::try_new(fields) -> Result<Self, CaveatMintError>` that checks: ≤ 8 non-None fields (the 8 caveats-per-attestation limit refers to the count of populated caveat fields), input_schema serialized size ≤ 4 KiB, input_schema nesting depth ≤ 8, list fields ≤ 16 entries. Errors: SCP-TOOL-6114 (caveat-mint-limit-exceeded) — new within the 6100-6199 sub-block.",
+      "description": "Define the `InvocationCaveats` struct and `RateWindow` helper per §7.3.8. Implement serde serialization (MessagePack via rmp_serde for wire, canonical JCS for hashing). Implement mint-time limit enforcement as a constructor `InvocationCaveats::try_new(fields) -> Result<Self, CaveatMintError>` that checks: ≤ 8 populated non-origin_kind fields (origin_kind is a structural attenuation invariant and does NOT count against the user-facing cap per §7.3.8 mint-limits), input_schema serialized size ≤ 4 KiB, input_schema nesting depth ≤ 8, list fields ≤ 16 entries. Also: root-UCAN mint-time consistency check — when the caveat set is attached to a root UCAN (no parent delegation), origin_kind (if explicitly declared) MUST match the root stem (outlet_query: ⇒ Query; outlet_call: ⇒ Action); mismatch returns CaveatMintError::OriginKindStemMismatch with slug 'origin-kind-stem-mismatch'. Errors: SCP-TOOL-6114 (caveat-mint-limit-exceeded, origin-kind-stem-mismatch) — within the 6100-6199 sub-block.",
       "acceptanceCriteria": [
-        "struct InvocationCaveats exists in crates/scp-protocol/src/trust/caveats.rs with all 11 fields from §7.3.8",
+        "struct InvocationCaveats exists in crates/scp-protocol/src/trust/caveats.rs with all 12 fields from §7.3.8 (11 typed caveats + origin_kind)",
         "struct RateWindow { max: u32, window_secs: u32 } exists",
         "All fields Option-typed except RateWindow inner fields",
         "Serde tag naming matches §7.3.8 ('amountMaxPerCall' etc. in camelCase for UCAN `nb` JSON compatibility; MessagePack uses the same strings for consistency)",
-        "InvocationCaveats::try_new enforces ≤ 8 populated caveats, ≤ 4 KiB serialized input_schema, ≤ 8 nesting depth (JSON Schema depth counted via traversal), ≤ 16 entries for allowed_adapters / allowed_target_dids",
+        "InvocationCaveats::try_new enforces ≤ 8 populated non-origin_kind caveats (origin_kind is a structural attenuation invariant exempt from the cap per §7.3.8 mint-limits), ≤ 4 KiB serialized input_schema, ≤ 8 nesting depth (JSON Schema depth counted via traversal), ≤ 16 entries for allowed_adapters / allowed_target_dids",
+        "Unit test: InvocationCaveats with 8 non-origin_kind fields populated AND origin_kind = Some(Query) succeeds (origin_kind does NOT count toward the 8-field cap)",
+        "Unit test: InvocationCaveats with 9 non-origin_kind fields populated fails regardless of origin_kind",
         "try_new returns CaveatMintError::TooManyCaveats / SchemaTooLarge / SchemaTooDeep / ListTooLong",
         "Error envelope code SCP-TOOL-6114 slug 'caveat-mint-limit-exceeded' wired",
         "JSON Schema depth counter respects both object nesting and array nesting",
         "Round-trip serde test: serialize to MessagePack and JCS, deserialize back, field-equal",
         "Round-trip test: non-camelCase field names fail to deserialize",
         "cargo test -p scp-protocol succeeds",
-        "hours_of_day is stored as u32 but the semantic mask is 24 bits; InvocationCaveats::try_new asserts `hours_of_day.unwrap_or(0) & !0x00FF_FFFF == 0` — a set high bit is rejected with CaveatMintError::HoursOfDayHighBitsSet",
+        "hours_of_day is stored as u32 but the semantic mask is 24 bits; InvocationCaveats::try_new asserts `hours_of_day.unwrap_or(0) & !0x00FF_FFFF == 0` — a set high bit is rejected with CaveatMintError::HoursOfDayHighBitsSet (matches §7.3.8 mint-side assertion)",
         "Unit test: hours_of_day = 0x01FF_FFFF (bit 24 set) fails try_new with HoursOfDayHighBitsSet",
         "Unit test: hours_of_day = 0x00FF_FFFF (all 24 low bits set) succeeds",
-        "Unit test: hours_of_day = None (field absent) succeeds"
+        "Unit test: hours_of_day = None (field absent) succeeds",
+        "days_of_week high-bit assertion: InvocationCaveats::try_new asserts `days_of_week.unwrap_or(0) & !0x7F == 0` — a set bit 7 is rejected with CaveatMintError::DaysOfWeekHighBitSet (matches §7.3.8 mint-side assertion; symmetric to hours_of_day)",
+        "Unit test: days_of_week = 0x80 (bit 7 set) fails try_new with DaysOfWeekHighBitSet",
+        "Unit test: days_of_week = 0x7F (all 7 low bits set) succeeds",
+        "Root-UCAN origin_kind stem consistency: InvocationCaveats::try_new_for_root(caveats, stems: &[Capability]) returns Err(CaveatMintError::OriginKindStemMismatch) when origin_kind is Some and disagrees with any stem in the root capability set (outlet_query:* ⇒ Query; outlet_call:* ⇒ Action); error code SCP-TOOL-6114 slug 'origin-kind-stem-mismatch'",
+        "Unit test: root caveats with origin_kind = Action but stem 'outlet_query:foo' fails with OriginKindStemMismatch",
+        "Unit test: root caveats with origin_kind = None and stem 'outlet_query:foo' succeeds (inference path; no explicit value to reject)",
+        "Unit test: root caveats with origin_kind = Query and stem 'outlet_query:foo' succeeds",
+        "narrow() equality on origin_kind: narrow(parent, child) returns Err(AttenuationViolation::OriginKindMismatch) when child.origin_kind != parent.origin_kind (including None vs Some) — this AC is a narrow-layer rule owned by SCP-OUT-019; this story only defines the error variant presence"
       ],
       "actionItems": [
-        "Define the struct and helper",
-        "Implement try_new with four structural checks",
+        "Define the struct and helper (12 fields: 11 typed caveats + origin_kind)",
+        "Implement try_new with four structural checks; exclude origin_kind from the ≤ 8 cap",
+        "Implement try_new_for_root with the root-stem consistency check",
         "Implement canonical JCS serialization (wrapper over serde_json_canonicalizer)",
         "Implement JSON Schema depth-counter helper",
         "Add round-trip, size-limit, depth-limit, list-limit, and camelCase tests",
         "Document in rustdoc with §7.3.8 citation",
-        "Add the 24-bit mask assertion to try_new (and any narrow-time helper)",
-        "Extend CaveatMintError with HoursOfDayHighBitsSet",
-        "Add the three hours_of_day unit tests"
+        "Add the 24-bit hours_of_day mask assertion to try_new (and any narrow-time helper)",
+        "Add the 7-bit days_of_week mask assertion to try_new",
+        "Extend CaveatMintError with HoursOfDayHighBitsSet, DaysOfWeekHighBitSet, OriginKindStemMismatch",
+        "Add the hours_of_day, days_of_week, and origin_kind stem-mismatch unit tests"
       ],
       "blockedBy": [
         "SCP-OUT-001"
@@ -1271,8 +1299,15 @@
         "Rule: allowed_adapters — child is Vec subset of parent (None parent, Some child introduces a bound)",
         "Rule: allowed_target_dids — same subset logic",
         "Rule: input_schema — conservative JSON Schema narrowing (only whitelisted keywords may introduce narrowing)",
+        "JSON Schema narrowing — each of the 9 admissible keywords from §7.3.8 has at least one positive test (narrows OK) and one negative test (AttenuationViolation): enum, const, minimum, maximum, minLength, maxLength, pattern, required, additionalProperties:false. grep -c 'fn test_narrow_.*enum\\|fn test_narrow_.*const\\|fn test_narrow_.*minimum\\|fn test_narrow_.*maximum\\|fn test_narrow_.*minLength\\|fn test_narrow_.*maxLength\\|fn test_narrow_.*pattern\\|fn test_narrow_.*required\\|fn test_narrow_.*additionalProperties' crates/scp-protocol/src/trust/caveats.rs returns >= 18",
         "JSON Schema narrowing: enum narrows iff child.enum ⊂ parent.enum (Set semantics)",
-        "JSON Schema narrowing: minimum only narrows (child >= parent)",
+        "JSON Schema narrowing: const narrows iff child.const == parent.const (or parent had no const)",
+        "JSON Schema narrowing: minimum narrows iff child >= parent (child tightens the lower bound)",
+        "JSON Schema narrowing: maximum narrows iff child <= parent (child tightens the upper bound)",
+        "JSON Schema narrowing: minLength narrows iff child >= parent",
+        "JSON Schema narrowing: maxLength narrows iff child <= parent",
+        "JSON Schema narrowing: required is superset narrowing (child.required ⊇ parent.required)",
+        "JSON Schema narrowing: additionalProperties: false may narrow (parent without → child with) but MUST NOT relax (parent false → child true fails)",
         "JSON Schema narrowing: unknown keyword in child triggers AttenuationViolation",
         "Unit test for each rule (positive and negative)",
         "Property test: narrow is transitive — A narrow B AND B narrow C implies A narrow C",
@@ -1542,11 +1577,14 @@
         "Forward-compat: an OutletError envelope received with a field at tag 11 deserializes cleanly; the unknown tag is preserved in _unknown_fields and round-trips byte-identical on re-serialization (matches §5.4.4 future-tag policy)",
         "Forward-compat: an envelope received with a field at tag 7, 9, or 10 (reserved) deserializes with the value stored in _unknown_fields (receiver does not interpret the tag; ensures future protocol evolution does not break old SDKs)",
         "message field byte length is capped at 1024; constructor OutletError::new returns OutletErrorConstructionFailed::MessageTooLong when exceeded",
-        "detail field type-checks against a per-class schema at construction time (§5.4.4 table); a Protocol-class OutletError with detail shaped like Input-class detail is rejected with DetailShapeMismatch"
+        "message is a registered catalog key (§5.4.4 round-3): OutletRegistration carries message_catalog: Vec<MessageTemplate> (each template bounded at 1 KiB UTF-8, catalog bounded at 256 entries per outlet); OutletError::new rejects any message not present in the registered catalog for that outlet with OutletErrorConstructionFailed::UnregisteredMessageKey. Unit test: a message catalog-miss is rejected with the typed error; a catalog-hit succeeds.",
+        "message ⊄ input defense-in-depth (§5.4.4 round-3): in addition to the catalog rule, OutletError::new enforces that no 4-byte window of the resolved message template is a substring of canonical_jcs(input). Violation rejects with OutletErrorConstructionFailed::InputEchoDetected. Unit test: catalog entry with a 4+-byte window copied from input fails at construction.",
+        "detail field type-checks against a per-class schema at construction time (§5.4.4 table); a Protocol-class OutletError with detail shaped like Input-class detail is rejected with DetailShapeMismatch",
+        "Execution class panic detail uses panic_location_hash: [u8; 32] (full SHA-256, not truncated 16-byte per round-3 fix). Unit test: OutletError with class=Execution detail={panic_location_hash: [u8; 32]} round-trips; a 16-byte panic_location_hash is wire-rejected as DetailShapeMismatch."
       ],
       "actionItems": [
         "Define struct OutletError with the 7 fields listed in §5.4.4 (no i18n_key, no trace_id, no related_code)",
-        "Implement the per-class detail schema enforcement (see SCP-OUT-025 for the canonical table)",
+        "Implement the per-class detail schema enforcement (see SCP-OUT-025 for the canonical table) — panic_location_hash is [u8; 32] (full SHA-256)",
         "Implement the message-length cap",
         "Add round-trip tests for MessagePack and JSON",
         "Add forward-compat tests covering tag 7/9/10 (reserved) and tag 11 (future)",
@@ -1777,7 +1815,10 @@
         "Unit test: two independent interface relationships (Context A ↔ B and A ↔ C) produce different pseudonyms for the same B context_id when A is the observer but A is not a member of B (each relationship uses its own per-pair salt — no cross-relationship correlation)",
         "Query oracle collapse: when the outermost caller holds neither outlet_query:{id} nor outlet_call:{id} on the innermost outlet, the wrapped error's code is SCP-TOOL-6110 with slug 'authorization.denied' regardless of the underlying cause (missing outlet, deregistered outlet, kind-mismatch); an attacker cannot distinguish the three by observing the error (matches §5.4.4 oracle-collapse rule)",
         "Test: caller with no stem receives SCP-TOOL-6110 'authorization.denied' for a missing outlet, a deregistered outlet, and a kind-mismatch outlet — all three produce the same code and slug",
-        "Test: caller with outlet_query:{id} on a Query outlet that DOESN'T exist receives a more-specific error (OutletDeregistered / KindMismatch) — disambiguation is allowed when the caller holds at least one matching stem"
+        "Test: caller with outlet_query:{id} on a Query outlet that DOESN'T exist receives a more-specific error (OutletDeregistered / KindMismatch) — disambiguation is allowed when the caller holds at least one matching stem",
+        "AmplificationViolation collapse (§5.4.4 round-3): AmplificationViolation collapses to 'authorization.denied' for callers who do NOT hold BOTH outlet_query:{id} AND outlet_call:{id} on the hop target. Only a caller holding both stems observes the disambiguated slug. Test: caller holding only outlet_query:{id} (but not outlet_call:{id}) observing an amplification attempt receives 'authorization.denied'; caller holding BOTH stems receives 'authorization.amplification-violation'",
+        "Trail-length padding (§5.4.4 round-3): when any hop is opaque to the caller, source_chain is length-padded to max_chain_depth with collapsed entries so the caller cannot distinguish a 3-hop chain from a 7-hop chain. Padded entries carry context_id = HMAC-SHA-256 of a per-stream 32-byte pad seed, hop_index = (true_k + pad_offset), wrapped_code = SCP-TOOL-6110, slug = 'authorization.denied'. Test: caller with no membership observing a 3-hop chain receives source_chain of length max_chain_depth (e.g., 8 with default); the last 5 entries have collapsed wrapped_codes. Test: caller with full visibility (membership on every hop) observes the true 3-length source_chain (no padding).",
+        "Test: pad-entry context_ids do not correlate across independent streams — two different streams produce different pad seeds; re-invoking the same outlet under the same interface twice produces different pad entries in each error's source_chain"
       ],
       "actionItems": [
         "Implement wrap_cross_context_error",
@@ -1798,7 +1839,7 @@
         },
         {
           "file": ".docs/specs/06-cross-context-communication.md",
-          "section": "## 6.2 Context-to-Context Tool Interfaces"
+          "section": "## 6.2 Context-to-Context Outlet Interfaces"
         },
         {
           "file": ".docs/adrs/ADR-049-outlet-redesign.md",
@@ -1923,9 +1964,9 @@
       ],
       "description": "Define the streaming wire types per §5.4.5: OutletStreamOpen, OutletStreamChunk, OutletStreamCredit, ChunkPayload (4-variant enum: Data, Progress, End, Error), StreamTerminalStatus. Delete OutletResponse (the old non-streaming response type inherited from ToolResponse) entirely — there is no transitional alias. Add serde numeric field tags where the spec pins them. Provide a helper `ChunkPayload::is_terminal() -> bool` that returns true for End and Error { terminal: true }.",
       "acceptanceCriteria": [
-        "struct OutletStreamOpen exists with fields request_id: [u8; 16], outlet_id: String, input: Value, invoker_did: DID, ucan: Vec<u8>, caveats_binding: [u8; 32], chain_depth: u8, credit_window: u32, timeout_ms: u32",
-        "struct OutletStreamChunk exists with fields request_id, sequence: u64, payload: ChunkPayload",
-        "struct OutletStreamCredit exists with fields request_id, grant: u32",
+        "struct OutletStreamOpen exists with fields request_id: [u8; 16], outlet_id: String, input: Value, invoker_did: DID, ucan: Vec<u8>, caveats_binding: [u8; 32], chain_depth: u8, credit_window: u32, estimated_chunk_count: u32, session_id: Option<String>, timeout_ms: u32 — grep -n 'estimated_chunk_count' crates/scp-protocol/src/context/outlets/stream.rs returns a line declaring the u32 field; grep -n 'session_id: Option<String>' returns a line declaring the optional session binding",
+        "struct OutletStreamChunk exists with fields request_id, sequence: u64, payload: ChunkPayload, sig: Ed25519Signature — grep -n 'sig: Ed25519Signature\\|sig: \\[u8; 64\\]' crates/scp-protocol/src/context/outlets/stream.rs returns a line declaring the chunk signature",
+        "struct OutletStreamCredit exists with fields request_id, grant: u32, monotonic_seq: u64, sig: Ed25519Signature — all four fields present (grep verifies monotonic_seq and sig lines)",
         "enum ChunkPayload exists with 4 variants: Data { value }, Progress { pct: u16, note: Option<String> }, End { aggregate, provenance, execution_time_ms }, Error { code, message, terminal: bool }",
         "ChunkPayload::is_terminal returns true for End and Error{ terminal: true }, false otherwise",
         "enum StreamTerminalStatus { Ok, Error(String), Cancelled } exists",
@@ -1935,23 +1976,35 @@
         "Round-trip test on a 100-chunk stream",
         "cargo test -p scp-protocol succeeds",
         "OutletStreamOpen.chain_depth field type is `u8` (matches §24.4 width [0, 255] and ADR-043)",
-        "OutletStreamOpen.caveats_binding type is `[u8; 32]` and is the SHA-256 over 'SCP-OUTLET-CAVEAT-BIND-V1:' || canonical_jcs(effective_caveats) where effective_caveats is the narrowed InvocationCaveats at open time; a later chunk whose request_id matches but whose effective caveats differ is a binding mismatch and causes the stream to terminate with OutletErrorClass::Authorization::AttenuationViolation (code SCP-TOOL-6110 slug authorization.attenuation-violation)",
-        "OutletStreamChunk includes sig: [u8; 64] (Ed25519); sig preimage is SHA-256('SCP-OUTLET-CHUNK-SIG-V1:' || request_id || sequence_be || SHA-256(canonical_jcs(payload))) where sequence_be is 8 bytes big-endian; verify_chunk_signature(&chunk, &operator_pk) returns true iff the sig matches the preimage",
-        "ChunkPayload canonical JCS encoding places 'type' as the FIRST field in every variant (alphabetical key order places it ahead of 'value', 'pct', 'note', 'aggregate', etc.); a conformance test round-trips each variant through canonical_jcs and asserts the first key-byte-offset matches 'type'",
+        "OutletStreamOpen.caveats_binding type is `[u8; 32]` and is the SHA-256 over 'SCP-OUTLET-CAVEAT-BIND-V1:' || len_be32(ucan_cid) || ucan_cid || request_id || len_be32(invoker_did) || invoker_did || estimated_chunk_count_be || canonical_jcs(effective_caveats) — byte-for-byte matching §5.4.5:474-484 (cite spec by line number). A later OutletStreamOpen whose request_id matches the pinned stream but whose effective caveats differ is a binding mismatch and causes the stream to terminate with OutletErrorClass::Authorization::AttenuationViolation (code SCP-TOOL-6110 slug authorization.attenuation-violation)",
+        "OutletStreamChunk includes sig: [u8; 64] (Ed25519); sig preimage is SHA-256('SCP-OUTLET-CHUNK-SIG-V1:' || len_be32(context_id) || context_id || len_be32(outlet_id) || outlet_id || request_id || sequence_be || caveats_binding || SHA-256(canonical_jcs(payload))) where sequence_be is 8 bytes big-endian — byte-for-byte matching §5.4.5:508-519 (cite spec by line number); verify_chunk_signature(&chunk, &operator_pk, context_id, outlet_id, caveats_binding) returns true iff the sig matches the preimage",
+        "OutletStreamCredit.sig preimage is SHA-256('SCP-OUTLET-CREDIT-V1:' || len_be32(context_id) || context_id || len_be32(outlet_id) || outlet_id || request_id || grant_be || monotonic_seq_be || caveats_binding) — byte-for-byte matching §5.4.5 (cite line numbers); stream-identity binding prevents cross-stream grant replay",
+        "ChunkPayload canonical JCS encoding places '@type' as the FIRST field in every variant (RFC 8785 JCS sorts '@' 0x40 before lowercase letters 0x61-0x7A); a conformance test round-trips each variant through canonical_jcs and asserts the first key bytes are '\"@type\"'",
+        "Conformance test: '@type' ordering vs body keys spanning a-z — a synthetic ChunkPayload with body key 'aggregate' and another with 'zeta_field' both canonicalize with '@type' FIRST and the body key SECOND; without the leading '@' (e.g., if a draft used 'type'), 'aggregate' would sort before 'type' — regression test asserts the bug is absent (test is named chunk_payload_type_first_with_body_keys_across_alphabet)",
         "ChunkPayload variant collision guard: two distinct variants canonical-hash to different values even when their non-type fields overlap (test constructs Data{value: ''} and Progress{pct: 0, note: None} and asserts hash inequality after JCS encoding)",
-        "Domain separators SCP-OUTLET-CHUNK-V1:, SCP-OUTLET-CHUNK-SIG-V1:, SCP-OUTLET-CAVEAT-BIND-V1: are registered in .docs/specs/09-security-model.md §9.18.2 Domain Separators table (verified by grep)"
+        "Domain separators SCP-OUTLET-CHUNK-V1:, SCP-OUTLET-CHUNK-SIG-V1:, SCP-OUTLET-CAVEAT-BIND-V1:, SCP-OUTLET-CREDIT-V1:, SCP-OUTLET-OFFER-ID-V1: are registered in .docs/specs/09-security-model.md §9.18.2 Domain Separators table (grep -c '\"SCP-OUTLET-CHUNK-SIG-V1:\"' .docs/specs/09-security-model.md returns >= 1 for each)",
+        "Conformance test: full V2-shape OutletStreamOpen (fully populated — session_id: Some('sess-abc'), estimated_chunk_count: 42, every other field at realistic value) round-trips through each FFI bridge (PyO3, NAPI, UniFFI, WASM) without dropping session_id or estimated_chunk_count; round-trip assertion is byte-equal after serde_json_canonicalizer re-canonicalization",
+        "Session×stream invariants (§6.2.1.1) — session_id carried on open: when OutletStreamOpen.session_id is Some, the runtime validates that the named session exists, is not expired, and whose recorded origin_kind is compatible with the outlet's kind. Mismatch → OutletErrorClass::Protocol::UnknownSession (slug 'protocol.unknown-session') or OutletErrorClass::Authorization::AmplificationViolation (per §6.2.0.3). Unit test: OutletStreamOpen with session_id pointing to an expired session fails with UnknownSession.",
+        "Session×stream invariants (§6.2.1.1) — one concurrent stream per session: a second OutletStreamOpen referencing a session_id that already has a live stream is rejected with OutletErrorClass::Protocol::StreamAlreadyOpen (slug 'protocol.stream-already-open'). Unit test: two concurrent opens against the same session_id — first succeeds, second fails with StreamAlreadyOpen.",
+        "Session×stream invariants (§6.2.1.1) — session owns origin_kind: the stream's effective_caveats.origin_kind MUST equal the session's recorded origin_kind. Mismatch fails at open with AttenuationViolation. Unit test: session opened as Query; subsequent stream declares Action in caveats → AttenuationViolation.",
+        "Session×stream invariants (§6.2.1.1) — session owns caveats_binding: the first stream against a session establishes the session's pinned caveats_binding; every subsequent stream on that session MUST present the same caveats_binding. Mismatch fails at open with AttenuationViolation. Unit test: first stream opens with caveats_binding=X; second stream on same session opens with Y → AttenuationViolation.",
+        "Session×stream invariants (§6.2.1.1) — stream_epoch matches session-epoch at open: each OutletStreamChunk carries stream_epoch (the hosting context's MLS epoch counter at the moment of OutletStreamOpen acceptance). The session independently records session_epoch at session-open time. A stream whose stream_epoch != session_epoch is permitted (sessions persist across epoch advances); the re-encryption bridge on cross-context streaming uses stream_epoch (not session_epoch) for chunk-level re-encryption. Unit test: open session at epoch 5; open stream at epoch 7; stream_epoch=7, session_epoch=5, both recorded separately in their respective state tables; cross-context chunk re-encryption uses stream_epoch=7."
       ],
       "actionItems": [
         "Create stream.rs with all four types",
         "Delete OutletResponse",
         "Add is_terminal helper",
-        "Add round-trip tests",
+        "Add round-trip tests including the full-field V2 OutletStreamOpen per-bridge test",
         "Document in rustdoc",
         "Set OutletStreamOpen.chain_depth type to u8 and update serde tag",
-        "Implement caveats_binding construction and verification",
-        "Implement per-chunk Ed25519 signing and verification with SCP-OUTLET-CHUNK-SIG-V1 preimage",
-        "Implement canonical JCS encoding for ChunkPayload with `type` placed first; add the first-byte-offset test",
-        "Verify §9.18.2 contains the three new separators"
+        "Wire estimated_chunk_count: u32 and session_id: Option<String> fields on OutletStreamOpen",
+        "Wire monotonic_seq: u64 and sig: Ed25519Signature on OutletStreamCredit",
+        "Wire sig: Ed25519Signature on OutletStreamChunk",
+        "Implement caveats_binding construction and verification with the full §5.4.5 preimage (ucan_cid, request_id, invoker_did, estimated_chunk_count, caveats)",
+        "Implement per-chunk Ed25519 signing and verification with SCP-OUTLET-CHUNK-SIG-V1 preimage binding context_id, outlet_id, caveats_binding",
+        "Implement OutletStreamCredit signing and verification with SCP-OUTLET-CREDIT-V1 preimage binding context_id, outlet_id, caveats_binding",
+        "Implement canonical JCS encoding for ChunkPayload with '@type' placed first; add the first-byte-offset test and the alphabet-spanning regression test",
+        "Verify §9.18.2 contains all five separators (CHUNK-V1, CHUNK-SIG-V1, CAVEAT-BIND-V1, CREDIT-V1, OFFER-ID-V1)"
       ],
       "blockedBy": [
         "SCP-OUT-024"
@@ -1960,6 +2013,10 @@
         {
           "file": ".docs/specs/05-contexts.md",
           "section": "### 5.4.5 Progressive Output (Streaming)"
+        },
+        {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "#### 6.2.1.1 Stateful Outlet Sessions × Streaming"
         },
         {
           "file": ".docs/adrs/ADR-049-outlet-redesign.md",
@@ -2019,8 +2076,8 @@
       "details": {}
     },
     {
-      "id": "SCP-OUT-034",
-      "title": "Implement credit-based backpressure + stream billing (escrow, per-chunk, refund) with signed credit grants",
+      "id": "SCP-OUT-034a",
+      "title": "Credit-based backpressure — CreditTracker, signed grants, monotonic_seq, stall timer",
       "gate": "gate-streaming",
       "priority": "P1",
       "severity": "critical",
@@ -2030,45 +2087,29 @@
         "crates/scp-runtime/src/context/outlets/invoke.rs",
         "crates/scp-protocol/src/context/params.rs"
       ],
-      "description": "Implement per-stream credit accounting per §5.4.5 AND the escrow/billing lifecycle. A stream opens with `credit_window` chunks of headroom (default 32, via `ContextParams::stream_window_default`). Each Data/Progress chunk decrements credit; End and Error do NOT. When credit hits 0 and no grant arrives within `stream_credit_stall_secs` (default 30), the framework cancels the stream with `OutletError { code: 'SCP-TOOL-6133', slug: 'execution.credit-stall', terminal: true }`. Every `OutletStreamCredit` MUST carry the invoker's Ed25519 signature over (request_id, grant, monotonic_seq) under domain separator `SCP-OUTLET-CREDIT-V1:`; duplicates and regressions of `monotonic_seq` are rejected as `OutletErrorClass::Authorization::CreditReplay`. Each accepted grant on a non-zero-cost Action outlet tops up escrow by `cost.amount * grant` via `checked_mul`; overflow rejects the grant with `OutletErrorClass::Economic::EscrowOverflow`; insufficient invoker balance rejects with `InsufficientFunds`. At open: escrow = `cost.amount * estimated_chunk_count` (bounded by min(credit_window, caveats.max_calls)). Per chunk: bill `cost.amount` per Data chunk at or below cancel_ack_seq; Progress/End/Error/out-of-bound chunks are never billed. At close: issue PaymentReceipt for chunks_billed * cost.amount and refund unspent escrow. Error-before-first-Data refunds full escrow. Credit-stall cancel (`SCP-TOOL-6133`) releases escrow and chain-depth slot; operator bills for Data chunks already delivered in the stalled window.",
+      "description": "Implement per-stream credit accounting per §5.4.5 (backpressure half of the prior OUT-034, split per round-3 review). A stream opens with `credit_window` chunks of headroom (default 32, via `ContextParams::stream_window_default`). Each Data/Progress chunk decrements credit; End and Error do NOT. When credit hits 0 and no grant arrives within `stream_credit_stall_secs` (default 30), the framework cancels the stream with `OutletError { code: 'SCP-TOOL-6133', slug: 'execution.credit-stall', terminal: true }`. Every `OutletStreamCredit` MUST carry the invoker's Ed25519 signature over (context_id, outlet_id, request_id, grant, monotonic_seq, caveats_binding) under domain separator `SCP-OUTLET-CREDIT-V1:`; duplicates and regressions of `monotonic_seq` are rejected as `OutletErrorClass::Authorization::CreditReplay`. This story covers credit-tracking and stall handling only; escrow/billing semantics move to SCP-OUT-034b.",
       "acceptanceCriteria": [
-        "ContextParams has fields stream_window_default: u32 (default 32) and stream_credit_stall_secs: u32 (default 30) and stream_cancel_ack_secs: u32 (default 5) and stream_ucan_recheck_secs: u32 (default 10) — all registered in §9.18.B Configurable Parameters",
-        "struct CreditTracker with method try_consume(&mut self) -> Result<(), OutOfCredit> and grant(&mut self, additional: u32, monotonic_seq: u64, sig: &Ed25519Signature) -> Result<(), GrantError>",
-        "grant verifies Ed25519 signature over preimage SHA-256('SCP-OUTLET-CREDIT-V1:' || request_id || grant_be || monotonic_seq_be) under invoker_pk recorded at open; invalid signature returns GrantError::SignatureInvalid",
+        "ContextParams has fields stream_window_default: u32 (default 32), stream_credit_stall_secs: u32 (default 30), stream_cancel_ack_secs: u32 (default 5), stream_ucan_recheck_secs: u32 (default 10), max_concurrent_inbound_streams_per_invoker: u32 (default 8), max_concurrent_inbound_streams_per_outlet: u32 (default 128) — all registered in §9.18.B Configurable Parameters",
+        "struct CreditTracker with method try_consume(&mut self) -> Result<(), OutOfCredit> and grant(&mut self, additional: u32, monotonic_seq: u64, sig: &Ed25519Signature, context_id: &str, outlet_id: &str, caveats_binding: &[u8; 32]) -> Result<(), GrantError>",
+        "grant verifies Ed25519 signature over preimage SHA-256('SCP-OUTLET-CREDIT-V1:' || len_be32(context_id) || context_id || len_be32(outlet_id) || outlet_id || request_id || grant_be || monotonic_seq_be || caveats_binding) under invoker_pk recorded at open (matches §5.4.5 byte-for-byte); invalid signature returns GrantError::SignatureInvalid",
         "grant rejects monotonic_seq regressions/duplicates with GrantError::CreditReplay (maps to OutletErrorClass::Authorization slug authorization.credit-replay)",
+        "grant rejects signatures whose preimage context_id/outlet_id/caveats_binding do not match the pinned stream identity with GrantError::StreamIdentityMismatch (maps to OutletErrorClass::Authorization slug authorization.credit-stream-mismatch) — regression test for cross-stream grant replay",
         "Stream framework enforces: Data/Progress decrement credit via try_consume; OutOfCredit pauses the executor",
         "Stream framework starts a stall timer when credit reaches 0; a validly accepted grant cancels the timer; timer firing sends Error { code: 'SCP-TOOL-6133', slug: 'execution.credit-stall', terminal: true }",
         "Executor-timeout (timeout_ms exceeded) sends Error { code: 'SCP-TOOL-6131', slug: 'execution.timeout', terminal: true } — distinct code from credit-stall (alignment with spec §5.4.5)",
         "Test: executor that sends 100 chunks with credit_window=32 and signed grants issued after every 32 chunks completes successfully",
         "Test: executor that sends 33 chunks without a second grant stalls at 32 and receives credit-stall (SCP-TOOL-6133) within 30s",
         "Test: executor that sends Error { terminal: true } with 0 credit still succeeds (terminal chunks don't consume)",
-        "Test: grant with replayed monotonic_seq is rejected as CreditReplay and does NOT advance the counter",
-        "Test: grant with bad signature is rejected as SignatureInvalid and does NOT advance the counter",
-        "Escrow semantics: at OutletStreamOpen for an Action outlet with cost.amount > 0, the runtime reserves escrow = cost.amount * estimated_chunk_count via checked_mul (overflow returns EscrowOverflow); estimated_chunk_count is bounded by min(credit_window, caveats.max_calls.unwrap_or(u32::MAX)); for Query outlets and zero-cost outlets, escrow is 0",
-        "Credit-grant escrow top-up: each validly accepted grant on an Action outlet with non-zero cost auto-tops-up escrow by cost.amount * grant via checked_mul; overflow rejects the grant as EscrowOverflow; insufficient invoker balance rejects as InsufficientFunds; neither failure advances the credit counter",
-        "Per-chunk billing: only Data chunks at or below the cancel-ack sequence are billed (accrue cost.amount each); Progress, End, Error, and chunks with sequence > cancel_ack_seq are NOT billed",
-        "At-close billing: on terminal chunk (End or Error{terminal:true}) the runtime issues PaymentReceipt (§19.15.5) for chunks_billed * cost.amount and refunds (escrow - billed_amount) to the invoker",
-        "Credit-stall cancel (SCP-TOOL-6133) releases escrow and the chain-depth slot; the operator IS billed for Data chunks already delivered in the stalled window",
-        "Error-before-first-Data: a stream that terminates with Error{terminal:true} before any Data chunk refunds the full escrow (operator bills 0)",
-        "chunks_billed recorded in OutletInvokedEvent: event's chunks_billed field equals the number of Data chunks at or below cancel_ack_seq that were validly delivered; chunks_billed derivable from manifest + cancel_ack_seq (an event with mismatched chunks_billed is wire-rejected at log-insert time per §5.4.5); chunks_billed <= stream_chunk_count always",
-        "Billing integration test: 10 Data chunks + End produces chunks_billed=10 and bills 10*cost.amount",
-        "Billing integration test: mid-stream cancel at sequence 5 after 8 Data chunks received; cancel_ack_seq=5; chunks_billed=5 (not 8); escrow refunded for unused 5*cost.amount plus any top-ups",
-        "Billing integration test: credit stall after 3 Data chunks; chunks_billed=3; escrow refunded for (estimated + topped-up - 3)*cost.amount; chain-depth slot released",
         "cargo test -p scp-runtime succeeds"
       ],
       "actionItems": [
-        "Add stream_window_default, stream_credit_stall_secs, stream_cancel_ack_secs, stream_ucan_recheck_secs to ContextParams (all four registered in §9.18.B)",
-        "Implement CreditTracker with signature-verifying grant()",
+        "Add stream_window_default, stream_credit_stall_secs, stream_cancel_ack_secs, stream_ucan_recheck_secs, max_concurrent_inbound_streams_per_invoker, max_concurrent_inbound_streams_per_outlet to ContextParams (all six registered in §9.18.B)",
+        "Implement CreditTracker with signature-verifying grant() that checks context_id/outlet_id/caveats_binding identity binding",
         "Implement monotonic_seq tracking per (request_id) with CAS",
         "Wire try_consume into chunk emission path",
-        "Wire grant signature verification + escrow top-up into OutletStreamCredit handler",
         "Implement stall timer via tokio::time::sleep in a separate task",
         "Distinguish SCP-TOOL-6131 (timeout) from SCP-TOOL-6133 (credit-stall) in error-construction paths",
-        "Implement escrow-at-open via scp-economy helper with checked_mul overflow handling",
-        "Implement per-chunk accrual and refund-on-terminate",
-        "Extend OutletInvokedEvent emission to pass chunks_billed derived from manifest + cancel_ack_seq",
-        "Add the signed-grant unit tests (happy path, replay rejection, bad-signature rejection)",
-        "Add the three billing integration tests"
+        "Add signed-grant unit tests (happy path, replay rejection, bad-signature rejection, stream-identity-mismatch rejection)"
       ],
       "blockedBy": [
         "SCP-OUT-032",
@@ -2078,6 +2119,64 @@
         {
           "file": ".docs/specs/05-contexts.md",
           "section": "### 5.4.5 Progressive Output (Streaming)"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-outlet-redesign.md",
+          "section": "# ADR-049: Outlet Redesign — Rename, Classification, Caveats, Structured Errors, Streaming"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-034b",
+      "title": "Stream billing lifecycle — escrow-at-open, credit-grant top-up, per-chunk accrual, refund, chunks_billed verification",
+      "gate": "gate-streaming",
+      "priority": "P1",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/outlets/stream.rs",
+        "crates/scp-runtime/src/context/outlets/invoke.rs",
+        "crates/scp-runtime/src/context/manager/economy.rs",
+        "crates/scp-event-log/src/lib.rs"
+      ],
+      "description": "Implement the escrow/billing half of the prior OUT-034 (split per round-3 review). At open: escrow = `cost.amount * estimated_chunk_count` (bounded by min(credit_window, caveats.max_calls); estimated_chunk_count is coerced from caveats.max_calls per §5.4.5 when the invoker does not declare an explicit value). Each validly accepted credit grant on a non-zero-cost Action outlet tops up escrow by `cost.amount * grant` via `checked_mul`; overflow rejects the grant with `OutletErrorClass::Economic::EscrowOverflow`; insufficient invoker balance rejects with `InsufficientFunds`. Per chunk: bill `cost.amount` per Data chunk at or below cancel_ack_seq; Progress/End/Error/out-of-bound chunks are never billed. At close: issue PaymentReceipt for `chunks_billed * cost.amount` and refund unspent escrow. Error-before-first-Data refunds full escrow. Credit-stall cancel (SCP-TOOL-6133) releases escrow and chain-depth slot; operator bills for Data chunks already delivered in the stalled window. chunks_billed recorded in OutletInvokedEvent is verifiable against manifest + cancel_ack_seq (mismatched event is wire-rejected).",
+      "acceptanceCriteria": [
+        "Escrow-at-open: at OutletStreamOpen for an Action outlet with cost.amount > 0, the runtime reserves escrow = cost.amount * estimated_chunk_count via checked_mul (overflow returns EscrowOverflow); estimated_chunk_count is bounded by min(credit_window, caveats.max_calls.unwrap_or(u32::MAX)); for Query outlets and zero-cost outlets, escrow is 0",
+        "estimated_chunk_count coercion: when OutletStreamOpen.estimated_chunk_count is derived from caveats, the coercion is caveats.max_calls.map(|n| u32::try_from(n).unwrap_or(u32::MAX)).unwrap_or(u32::MAX) — byte-for-byte matching §5.4.5 (cite line numbers)",
+        "Credit-grant escrow top-up: each validly accepted grant on an Action outlet with non-zero cost auto-tops-up escrow by cost.amount * grant via checked_mul; overflow rejects the grant as EscrowOverflow; insufficient invoker balance rejects as InsufficientFunds; neither failure advances the credit counter",
+        "Per-chunk billing: only Data chunks at or below the cancel-ack sequence are billed (accrue cost.amount each); Progress, End, Error, and chunks with sequence > cancel_ack_seq are NOT billed",
+        "At-close billing: on terminal chunk (End or Error{terminal:true}) the runtime issues PaymentReceipt (§19.15.5) for chunks_billed * cost.amount and refunds (escrow - billed_amount) to the invoker",
+        "Credit-stall cancel (SCP-TOOL-6133) releases escrow and the chain-depth slot; the operator IS billed for Data chunks already delivered in the stalled window",
+        "Error-before-first-Data: a stream that terminates with Error{terminal:true} before any Data chunk refunds the full escrow (operator bills 0)",
+        "chunks_billed recorded in OutletInvokedEvent: event's chunks_billed field equals the number of Data chunks at or below cancel_ack_seq that were validly delivered; chunks_billed derivable from manifest + cancel_ack_seq (an event with mismatched chunks_billed is wire-rejected at log-insert time per §5.4.5); chunks_billed <= stream_chunk_count always",
+        "chunks_billed verification test: construct a stream_manifest with 10 chunks (8 Data + 2 non-Data) and a cancel_ack_seq = 5; runtime derives chunks_billed_ref = |{i : leaf_i.payload.@type == 'data' && i <= 5}| and rejects an OutletInvokedEvent whose recorded chunks_billed != chunks_billed_ref with EventError::ChunksBilledMismatch at log-insert",
+        "Billing integration test: 10 Data chunks + End produces chunks_billed=10 and bills 10*cost.amount",
+        "Billing integration test: mid-stream cancel at sequence 5 after 8 Data chunks received; cancel_ack_seq=5; chunks_billed=5 (not 8); escrow refunded for unused 5*cost.amount plus any top-ups",
+        "Billing integration test: credit stall after 3 Data chunks; chunks_billed=3; escrow refunded for (estimated + topped-up - 3)*cost.amount; chain-depth slot released",
+        "cargo test -p scp-runtime succeeds"
+      ],
+      "actionItems": [
+        "Implement escrow-at-open via scp-economy helper with checked_mul overflow handling",
+        "Wire credit-grant escrow top-up into OutletStreamCredit handler (in addition to credit counter advance from OUT-034a)",
+        "Implement estimated_chunk_count coercion from caveats.max_calls",
+        "Implement per-chunk accrual and refund-on-terminate",
+        "Extend OutletInvokedEvent emission to pass chunks_billed derived from manifest + cancel_ack_seq",
+        "Implement wire-layer rejection in event log for chunks_billed vs manifest mismatch (EventError::ChunksBilledMismatch)",
+        "Add the three billing integration tests and the chunks_billed verification test"
+      ],
+      "blockedBy": [
+        "SCP-OUT-034a",
+        "SCP-OUT-035"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.5 Progressive Output (Streaming)"
+        },
+        {
+          "file": ".docs/specs/19-economic-governance.md",
+          "section": "## 19.3 Economic Policy"
         },
         {
           "file": ".docs/adrs/ADR-049-outlet-redesign.md",
@@ -2209,7 +2308,9 @@
         "crates/scp-ffi/napi/src/outlets.rs",
         "crates/scp-ffi/uniffi/src/scp.udl",
         "crates/scp-ffi/uniffi/src/scp.rs",
-        "crates/scp-ffi/wasm/src/outlets.rs"
+        "crates/scp-ffi/wasm/src/outlets.rs",
+        "bridge_ratchet_baseline.json",
+        "ratchet/once-lock-count.json"
       ],
       "description": "Plumb streaming through all 4 FFI bridges. PyO3: `context_outlet_invoke_stream` returns an async iterator wrapping Python asyncio queue; chunks flow through via a background task. UniFFI: `outlet_invoke_stream` returns an `OutletStreamHandle` with `next() -> Option<OutletStreamChunk>` (polling) AND a callback interface (push). NAPI: `contextOutletInvokeStream` returns an object with AsyncIterator protocol. WASM: `outletInvokeStream` returns an object with `{ next() -> Promise<Option<Chunk>> }`. Each bridge also exposes `outlet_stream_grant_credit(request_id, grant)` and `outlet_stream_cancel(request_id)`.",
       "acceptanceCriteria": [
@@ -2222,7 +2323,7 @@
         "Conformance test (scp-testing): invoke a streaming outlet through each bridge, collect 10 chunks, confirm terminal End chunk, confirm inclusion_proof round-trips",
         "cargo build --workspace --release succeeds for all four bridges",
         "Integration tests per bridge green",
-        "Each bridge exposes a chunk-signature verification surface: `verify_chunk_signature(chunk_bytes, operator_pk) -> bool` (matches the §5.4.5 SCP-OUTLET-CHUNK-SIG-V1 preimage)",
+        "Each bridge exposes a chunk-signature verification surface: `verify_chunk_signature(chunk_bytes, operator_pk, context_id, outlet_id, caveats_binding) -> bool` (matches the §5.4.5 SCP-OUTLET-CHUNK-SIG-V1 preimage which binds context_id, outlet_id, request_id, sequence, caveats_binding, and SHA-256(canonical_jcs(payload)) — cite spec line numbers)",
         "Each bridge exposes a caveats-binding recomputation helper: `compute_caveats_binding(caveats) -> [u8; 32]`",
         "bridge_ratchet_baseline.json is regenerated to include the new streaming FFI exports (grant_credit, cancel, verify_chunk_signature, compute_caveats_binding) across all four bridges; CI ratchet passes",
         "FFI conformance matrix includes the streaming operations (stream open, grant_credit, cancel, verify_chunk_signature, compute_caveats_binding) for all four bridges"
@@ -2239,7 +2340,8 @@
       ],
       "blockedBy": [
         "SCP-OUT-033",
-        "SCP-OUT-034",
+        "SCP-OUT-034a",
+        "SCP-OUT-034b",
         "SCP-OUT-036"
       ],
       "sources": [
@@ -2271,15 +2373,20 @@
       "acceptanceCriteria": [
         "Public SDK surface per SCP-OUT-006: every language exposes exactly ONE public verb — `ctx.outlets.invoke(...)`. There is no `invoke_stream` at the public layer in any of Python/TypeScript/Swift/Kotlin (grep -rn 'invoke_stream\\|invokeStream' bindings/ returns 0 outside of internal wrappers that the user never calls directly)",
         "Python: `handle = ctx.outlets.invoke(id, input)` supports `await handle` -> End.aggregate AND `async for chunk in handle:` -> yields OutletStreamChunk; Progress chunks are observable in the iterator",
-        "Python: handle.grant_credit(grant: int) and handle.cancel() methods exist; grant_credit signs OutletStreamCredit over the SCP-OUTLET-CREDIT-V1 preimage with the invoker key; grant_credit raises on bad grant value",
-        "TypeScript: `handle = ctx.outlets.invoke(id, input)` satisfies `PromiseLike<Aggregate>` AND `AsyncIterable<OutletStreamChunk>`; `handle.grantCredit(grant)` and `handle.cancel()` are callable; Progress chunks observable",
-        "Swift: `handle = try await ctx.outlets.invoke(id:input:)` conforms to `AsyncSequence` (yielding OutletStreamChunk) AND exposes `await handle.aggregate` for End.aggregate; `handle.grantCredit(grant:)` and `handle.cancel()` methods exist",
-        "Kotlin: `handle = ctx.outlets.invoke(id, input)` exposes `suspend fun aggregate(): Aggregate` AND `fun asFlow(): Flow<OutletStreamChunk>`; `suspend fun grantCredit(grant: UInt)` and `suspend fun cancel()` exist",
+        "Python: handle.grant_credit(grant: int) and handle.cancel() methods exist; grant_credit signs OutletStreamCredit over the SCP-OUTLET-CREDIT-V1 preimage (binding context_id, outlet_id, caveats_binding) with the invoker key; grant_credit raises TypeError on negative grant or grant > u32::MAX per API MAJOR 23",
+        "Python: unit test — handle.grant_credit(-1) raises TypeError; handle.grant_credit(2**32) raises TypeError; handle.grant_credit(0) raises ValueError (zero grants are forbidden); handle.grant_credit(10) succeeds",
+        "TypeScript: `handle = ctx.outlets.invoke(id, input)` satisfies `PromiseLike<Aggregate>` AND `AsyncIterable<OutletStreamChunk>`; `handle.grantCredit(grant: number)` and `handle.cancel()` are callable; Progress chunks observable; grantCredit throws RangeError on grant < 0 or grant > 0xFFFFFFFF (API MAJOR 23)",
+        "TypeScript: unit test — handle.grantCredit(-1) throws RangeError; handle.grantCredit(2**32) throws RangeError; handle.grantCredit(10) succeeds",
+        "Swift: `handle = try await ctx.outlets.invoke(id:input:)` conforms to `AsyncSequence` (yielding OutletStreamChunk) AND exposes `await handle.aggregate` for End.aggregate; `handle.grantCredit(grant: UInt32)` and `handle.cancel()` methods exist (Swift's UInt32 type enforces the [0, u32::MAX] range at compile time per API MAJOR 23)",
+        "Kotlin: `handle = ctx.outlets.invoke(id, input)` exposes `suspend fun aggregate(): Aggregate` AND `fun asFlow(): Flow<OutletStreamChunk>`; `suspend fun grantCredit(grant: UInt)` and `suspend fun cancel()` exist (Kotlin's UInt type enforces the [0, u32::MAX] range per API MAJOR 23)",
         "grantCredit increments monotonic_seq per §5.4.5 (strictly monotonic; SDK tracks the counter locally) and signs the preimage with the invoker's identity key",
         "End.aggregate validation matches aggregate_schema per §5.4.5",
+        "InvocationHandle lifecycle guard (API MAJOR 24): calling grantCredit or cancel on a handle whose stream has reached a terminal chunk raises a typed error in each SDK — Python `InvocationHandle.StreamAlreadyClosed`; TypeScript `class StreamAlreadyClosedError extends OutletError`; Swift `OutletError.streamAlreadyClosed`; Kotlin `sealed class StreamAlreadyClosed: OutletError()`",
         "Per-SDK integration test: stream 10 Data chunks + End; iterator yields 11 chunks and the await helper returns End.aggregate",
         "Per-SDK integration test: call grantCredit mid-stream; next chunk admission reflects the new credit",
         "Per-SDK integration test: call cancel mid-stream; terminal chunk arrives within stream_cancel_ack_secs; billing reflects cancel_ack_seq",
+        "Per-SDK integration test: after End chunk arrives, handle.grantCredit(10) raises StreamAlreadyClosed; handle.cancel() raises StreamAlreadyClosed",
+        "Per-SDK integration test: after Error{terminal:true} chunk arrives, handle.grantCredit(10) raises StreamAlreadyClosed",
         "All SDK CI green"
       ],
       "actionItems": [
@@ -2336,7 +2443,8 @@
       ],
       "blockedBy": [
         "SCP-OUT-033",
-        "SCP-OUT-034",
+        "SCP-OUT-034a",
+        "SCP-OUT-034b",
         "SCP-OUT-035",
         "SCP-OUT-037",
         "SCP-OUT-038"
