@@ -620,6 +620,16 @@ public extension SCP {
         try await inner.migrationState(handle: handle)
     }
 
+    /// Forwards to ``Scp/nodeStartInMemory`` on ``inner``.
+    func nodeStartInMemory(identity: Identity?) async throws -> NodeHandle {
+        try await inner.nodeStartInMemory(identity: identity)
+    }
+
+    /// Forwards to ``Scp/nodeStartLocal`` on ``inner``.
+    func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?) async throws -> NodeHandle {
+        try await inner.nodeStartLocal(dataDir: dataDir, identity: identity, passphrase: passphrase)
+    }
+
     /// Forwards to ``Scp/petnameGetForContext`` on ``inner``.
     func petnameGetForContext(ownerDid: String, contextId: String) throws -> String? {
         try inner.petnameGetForContext(ownerDid: ownerDid, contextId: contextId)
@@ -670,6 +680,16 @@ public extension SCP {
         try await inner.registerLocalDid(did: did)
     }
 
+    /// Forwards to ``Scp/relayStartInMemory`` on ``inner``.
+    func relayStartInMemory() async throws -> RelayHandle {
+        try await inner.relayStartInMemory()
+    }
+
+    /// Forwards to ``Scp/relayStartLocal`` on ``inner``.
+    func relayStartLocal(dataDir: String) async throws -> RelayHandle {
+        try await inner.relayStartLocal(dataDir: dataDir)
+    }
+
     /// Forwards to ``Scp/restoreAllContexts`` on ``inner``.
     func restoreAllContexts() async throws -> String {
         try await inner.restoreAllContexts()
@@ -693,6 +713,16 @@ public extension SCP {
     /// Forwards to ``Scp/scopeRegister`` on ``inner``.
     func scopeRegister(scopeContextId: String, name: String, targetContextId: String, relayUrls: [String], registrantDid: String, description: String?, tags: [String]?) throws -> String {
         try inner.scopeRegister(scopeContextId: scopeContextId, name: name, targetContextId: targetContextId, relayUrls: relayUrls, registrantDid: registrantDid, description: description, tags: tags)
+    }
+
+    /// Forwards to ``Scp/scpidSign`` on ``inner``.
+    func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String) throws -> String {
+        try inner.scpidSign(identity: identity, signingKeyId: signingKeyId, challengeJson: challengeJson)
+    }
+
+    /// Forwards to ``Scp/scpidVerify`` on ``inner``.
+    func scpidVerify(responseJson: String, challengeJson: String) throws -> String {
+        try inner.scpidVerify(responseJson: responseJson, challengeJson: challengeJson)
     }
 
     /// Forwards to ``Scp/setEconomicPolicy`` on ``inner``.
