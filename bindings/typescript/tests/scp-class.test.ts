@@ -1,14 +1,13 @@
 /**
- * Tests for the `SCP` class exposed by the NAPI bridge (#1549 Phase 4 PR 1).
+ * Tests for the `SCP` class exposed by the NAPI bridge (#1549 Phase 4).
  *
  * `SCP` is the caller-owned handle that wraps a `NapiBridgeInstance`.
- * Each `SCP` instance has a distinct `instanceId`; `SCP.default()` returns
- * a wrapper around the process-wide default instance so multiple calls
- * share state.
+ * Each `SCP` instance has a distinct `instanceId`. Since PR 4 (ADR-048),
+ * there is no process-wide default instance — every caller constructs
+ * an explicit `new SCP()`.
  *
  * The tests verify:
  * - `new SCP()` constructs a fresh instance with a non-zero `instanceId`.
- * - `SCP.default()` returns the same instance id on repeated calls.
  * - Two fresh `new SCP()` instances have distinct `instanceId`s.
  * - Lifecycle operations (`suspend()`, `resume()`, `shutdown()`) end-to-end.
  *
@@ -52,9 +51,7 @@ try {
   addon = req(packageName);
 
   if (typeof addon.SCP !== "function") {
-    throw new Error(
-      "SCP class not exported from native addon — rebuild with the Phase 4 PR 1 changes",
-    );
+    throw new Error("SCP class not exported from native addon — rebuild with the Phase 4 changes");
   }
 } catch (e: unknown) {
   skipReason =
@@ -65,7 +62,7 @@ try {
 // Tests
 // ---------------------------------------------------------------------------
 
-describe.skipIf(!addon)(`SCP class (Phase 4 PR 1) [${skipReason}]`, () => {
+describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
   test("new SCP() constructs an instance with a non-zero instanceId", () => {
     const scp = new addon.SCP();
     // instanceId is exposed as a string (u64 doesn't fit in a JS number).
@@ -74,12 +71,6 @@ describe.skipIf(!addon)(`SCP class (Phase 4 PR 1) [${skipReason}]`, () => {
     expect(scp.instanceId.length).toBeGreaterThan(0);
     // Basic integer shape.
     expect(/^[0-9]+$/.test(scp.instanceId)).toBe(true);
-  });
-
-  test("SCP.default() returns the same instance id on repeated calls", () => {
-    const a = addon.SCP.default();
-    const b = addon.SCP.default();
-    expect(a.instanceId).toBe(b.instanceId);
   });
 
   test("two fresh new SCP() instances have distinct instanceIds", () => {
@@ -106,24 +97,26 @@ describe.skipIf(!addon)(`SCP class (Phase 4 PR 1) [${skipReason}]`, () => {
     expect(scp.instanceId).not.toBe("0");
   });
 
-  test("handles minted through the default bridge are stamped with the default instance id", async () => {
-    // PR 1 only mints handles through the default bridge (the free-function
-    // façade; per-instance mint methods migrate onto `SCP` in PR 2). This
-    // test therefore verifies the *stamping* invariant — every handle
-    // carries a base-10 u64 `instanceId` string that matches the default
-    // instance's id — not a cross-instance mismatch. Cross-instance
-    // rejection lives in the Rust-side affinity test suite
-    // (`bridge_instance` tests in `crates/scp-ffi/common`) and will gain
-    // a JS-level assertion once PR 2 lands per-instance mint methods.
-    if (typeof addon.identityCreate !== "function") {
-      // No identity API exposed — can't exercise the affinity path.
+  test("handles minted by an SCP instance are stamped with its instanceId", async () => {
+    // Post-ADR-048 demolition: handle minting happens through SCP class
+    // methods (e.g. `scp.identityCreate(...)`), not module-level free
+    // functions. This test asserts the core affinity invariant — every
+    // handle carries the `instanceId` of the SCP that minted it — by
+    // minting an Identity through `scp.identityCreate(...)` and
+    // comparing the stamped id against the owning `scp.instanceId`.
+    // Cross-instance rejection is enforced by the Rust-side
+    // `check-handle-affinity` gate and exercised by the
+    // `bridge_instance` tests in `crates/scp-ffi/common`.
+    const scp = new addon.SCP();
+    if (typeof scp.identityCreate !== "function") {
+      // Addon predates per-instance `identityCreate` — can't exercise
+      // the affinity path here. Covered by the Rust-side test suite.
       return;
     }
-    const defaultInstance = addon.SCP.default();
-    const identity = await addon.identityCreate("in_memory");
+    const identity = await scp.identityCreate("in_memory");
     expect(typeof identity.instanceId).toBe("string");
     expect(identity.instanceId).not.toBe("0");
-    expect(identity.instanceId).toBe(defaultInstance.instanceId);
+    expect(identity.instanceId).toBe(scp.instanceId);
   });
 
   test("suspend / resume round-trip succeeds", async () => {
@@ -170,17 +163,21 @@ describe.skipIf(!addon)(`SCP class (Phase 4 PR 1) [${skipReason}]`, () => {
   test("shutdown(timeoutMillis) resolves without error", async () => {
     const scp = new addon.SCP();
     // Native `SCP.shutdown` takes unsigned milliseconds after the #1549
-    // Phase 4 unit unification — 1000 ms is enough for any pending
+    // Phase 4 unit unification. The NAPI binding widened the parameter
+    // to `u64` (#1692), which napi-rs exposes as JS `BigInt` on the
+    // wire — raw-addon callers must pass a `bigint` literal; the SDK
+    // wrapper (`SCP.shutdown`) performs the `number` → `BigInt`
+    // coercion at the public surface. 1000 ms is enough for any pending
     // tasks and short enough to not stall the suite.
-    await expect(scp.shutdown(1000)).resolves.toBeUndefined();
+    await expect(scp.shutdown(1000n)).resolves.toBeUndefined();
   });
 
   test("shutdown is idempotent — a second call resolves without error", async () => {
     const scp = new addon.SCP();
-    await expect(scp.shutdown(1000)).resolves.toBeUndefined();
+    await expect(scp.shutdown(1000n)).resolves.toBeUndefined();
     // Second call should not throw — AlreadyShutDown maps to a harmless
     // lifecycle observation on the SDK surface.
-    await expect(scp.shutdown(1000)).resolves.toBeUndefined();
+    await expect(scp.shutdown(1000n)).resolves.toBeUndefined();
   });
 });
 
