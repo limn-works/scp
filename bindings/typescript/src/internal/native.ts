@@ -8,16 +8,13 @@
  * optional dependency. If the package is not installed, loading fails with
  * a `TransportError` and an actionable message.
  *
- * Since ADR-048 (#1549 Phase 4 PR 4), all calls are routed through an
- * `SCP` instance's class methods rather than module-level free
- * functions. Callers may supply an explicit {@link SCP} wrapper; when
- * omitted, the bridge uses the process-wide default instance
- * (`SCP.default()`), which mirrors the legacy free-function façade
- * behavior while we deprecate direct free-function use. The handful of
- * free functions that have not yet been ported onto the `SCP` class
- * (e.g. `scpid_*`, `transport_add_relay`) continue to dispatch through
- * the addon — they gain their `SCP` method equivalents in follow-up
- * Rust-side work.
+ * Since ADR-048 (#1549 Phase 4 PR 4), all calls route through the caller-
+ * supplied {@link SCP} instance's class methods rather than module-level
+ * free functions. The process-wide default-instance fallback was deleted
+ * alongside `SCP.default()` in PR 4 — every bridge is constructed with an
+ * explicit SCP. The handful of stateless helpers that remain as addon
+ * free functions (e.g. `scpid_*`, pure validation helpers) do not need an
+ * SCP because they touch no registry state.
  *
  * See ADR-022 in `.docs/adrs/phase-4.md` and ADR-048 for the
  * multi-instance routing design.

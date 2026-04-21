@@ -302,30 +302,27 @@ export interface ScpOptions {
 }
 
 /**
- * Caller-owned SCP instance — the preferred SDK entry point.
+ * Caller-owned SCP instance — the sole SDK entry point.
  *
  * Each `SCP` wraps an independent native `BridgeInstance` (registries,
- * transport, context manager). The free-function façade (`Identity.create`,
- * `Context.create`, etc.) delegates to a process-wide default instance and
- * emits a one-time `console.warn` on first use. Removal target for the
- * façade: two release cycles after Phase 4 merge.
+ * transport, context manager). Phase 4 PR 4 (#1549, ADR-048) deleted
+ * the process-wide default-instance façade and the free-function
+ * shorthands that used it; callers construct an explicit `new SCP()`
+ * and pass it positionally to every SDK entry point.
  *
  * `SCP` is a NAPI-only feature — constructing it in a WASM/browser
- * environment throws `TransportError` (`SCP-TRANS-5001`).
+ * environment throws `ValidationError` (`SCP-VALID-7005`).
  */
 export declare class SCP {
   /** Constructs a fresh `SCP` instance (NAPI-only). */
   constructor(options?: ScpOptions);
-  /** Returns a wrapper around the process-wide default instance. */
-  static default(): SCP;
   /**
    * Monotonic u64 id as a base-10 string (u64 exceeds JS safe-integer
-   * range). Stable across calls on the default instance; unique per
-   * fresh `new SCP()`.
+   * range). Unique per `new SCP()`.
    */
   readonly instanceId: string;
   suspend(): void;
-  resume(): void;
+  resume(): Promise<void>;
   /**
    * @param timeoutSecs Maximum seconds to wait for in-flight tasks.
    *   Defaults to 5.
