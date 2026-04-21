@@ -1711,26 +1711,44 @@ fn syn_scanner_excludes_cfg_test_fn_inside_non_test_module() {
     );
 }
 
-/// Also exercise `any(test, ...)` / `all(test, ...)` / `cfg(test)` — all three
-/// must exclude. This complements MAJOR-1 by covering the positive cases.
+/// Exercise `cfg(test)` and `all(test, ...)` — both are test-ONLY, so
+/// the scanner must exclude them. `any(test, ...)` is tested below as a
+/// production case (it has a production path via the other disjunct).
 #[test]
-fn syn_scanner_excludes_all_test_forms() {
+fn syn_scanner_excludes_test_only_cfgs() {
     const SRC: &str = r#"
         #[cfg(test)]
         fn a() {}
-
-        #[cfg(any(test, feature = "x"))]
-        fn b() {}
 
         #[cfg(all(test, feature = "x"))]
         fn c() {}
     "#;
     let fns = collect_defined_fns(SRC);
-    for name in ["a", "b", "c"] {
+    for name in ["a", "c"] {
         assert!(
             !fns.contains(name),
             "fn `{name}` gated on test should have been excluded — \
              collected: {fns:?}"
         );
     }
+}
+
+/// `#[cfg(any(test, feature = "x"))]` compiles when `test OR feature
+/// = "x"`. With `feature = "x"` enabled and `test` off, the item is
+/// reachable in production — so the scanner MUST keep it in the
+/// collected set (it is a production definition, not a test-only one).
+/// The old walker misclassified this as test-gated; ADR-046 MINOR-1
+/// rev split `all(...)` and `any(...)` folds to fix it.
+#[test]
+fn syn_scanner_includes_any_with_test_and_feature() {
+    const SRC: &str = r#"
+        #[cfg(any(test, feature = "x"))]
+        fn b() {}
+    "#;
+    let fns = collect_defined_fns(SRC);
+    assert!(
+        fns.contains("b"),
+        "fn `b` under `any(test, feature=...)` has a production path \
+         and must be collected — collected: {fns:?}"
+    );
 }
