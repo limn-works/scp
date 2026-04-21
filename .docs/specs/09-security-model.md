@@ -1524,6 +1524,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-OUTLET-CAVEAT-BIND-V1:"` | Outlet stream `caveats_binding` preimage (binds ucan_cid, request_id, invoker_did, estimated_chunk_count) | §5.4.5 |
 | `"SCP-OUTLET-CREDIT-V1:"` | Outlet stream `OutletStreamCredit` invoker signature (binds context_id, outlet_id, caveats_binding) | §5.4.5 |
 | `"SCP-OUTLET-OFFER-ID-V1:"` | Outlet interface offer ID canonical hash (length-prefixed context_a_id, outlet_id, context_b_id, timestamp) | §6.2.0.1 |
+| `"SCP-OUTLET-HOP-PAD-V1:"` | HMAC domain separator for `source_chain` trail-padding pseudonyms. Each pad entry's `context_id` is `HMAC-SHA-256(pad_nonce, "SCP-OUTLET-HOP-PAD-V1:" \|\| slot_index_be)[..32]` under the fresh per-envelope `pad_nonce: [u8; 16]`. | §5.4.4 |
 | `"SCP-CONTEXT-HOP-SALT-V1:"` | HKDF info string for per-interface `hop_salt` derivation (also used as prefix of MLS exporter label family `"scp-context-hop-salt-v1:{peer_context_id}"` — see §6.2.0.1 for per-peer suffix) | §6.2.0.1 |
 | `"SCP-KEY-DESTRUCTION-V1:"` | Key destruction proof | §9.15 |
 | `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
@@ -1573,6 +1574,7 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Label | Used For | Spec Reference |
 |-------|----------|----------------|
 | `"scp-media-key-v1"` | DTLS-SRTP media key derivation from MLS group state | §10.9.1 |
+| `"scp-outlet-message-v1"` | Per-context HMAC key for wire-time opaque `message` field on `OutletError` — catalog key is HMAC'd under the exporter so that the same catalog key produces context-scoped wire bytes and cross-context covert signaling via catalog selection is structurally impossible. | §5.4.4 |
 
 #### 9.18.4 Key and Nonce Sizes
 
@@ -1760,8 +1762,11 @@ The following constants have protocol-defined mechanisms and acceptable ranges, 
 | Outlet stream credit stall timeout | 30s | [1, 3600] | `ContextParams::stream_credit_stall_secs`. Window after credit hits 0 before runtime cancels with `execution.credit-stall`. | §5.4.5 |
 | Outlet stream cancel-ack timeout | 5s | [1, 60] | `ContextParams::stream_cancel_ack_secs`. Window for executor to emit terminal chunk after `OutletCancel`. | §5.4.5 |
 | Outlet stream UCAN revocation re-check interval | 10s | [1, 60] | `ContextParams::stream_ucan_recheck_secs`. Receiver-side re-check cadence for mid-stream revocation; bounds exposure regardless of executor checkpoint behavior. | §5.4.5 |
-| Max concurrent inbound streams per invoker | 8 | [1, u32 max] | `ContextParams::max_concurrent_inbound_streams_per_invoker`. Per-invoker-DID ceiling on open inbound streams; breach rejects `OutletStreamOpen` with `OutletErrorClass::Transport::RateLimited` slug `transport.concurrent-streams-per-invoker`. | §5.4.5 |
-| Max concurrent inbound streams per outlet | 128 | [1, u32 max] | `ContextParams::max_concurrent_inbound_streams_per_outlet`. Per-outlet ceiling on open inbound streams (total fan-in across invokers); breach rejects with `OutletErrorClass::Transport::RateLimited` slug `transport.concurrent-streams-per-outlet`. | §5.4.5 |
+| Max concurrent inbound streams per invoker | 8 | [1, 1024] | `ContextParams::max_concurrent_inbound_streams_per_invoker`. Per-*immediate-previous-hop* DID ceiling on open inbound streams in this context; breach rejects `OutletStreamOpen` with `OutletErrorClass::Transport::RateLimited` slug `transport.concurrent-streams-per-invoker`. | §5.4.5 |
+| Max concurrent inbound streams per origin invoker | 16 | [1, 1024] | `ContextParams::max_concurrent_inbound_streams_per_origin_invoker`. Ceiling against the outermost caller DID in the UCAN delegation chain (the `iss` of the root UCAN), tracked at operator scope across every interface hosted by the same operator DID; breach rejects with `OutletErrorClass::Transport::RateLimited` slug `transport.concurrent-streams-per-origin-invoker`. | §5.4.5, §6.2.0.5 |
+| Max concurrent inbound streams per outlet | 128 | [1, 1024] | `ContextParams::max_concurrent_inbound_streams_per_outlet`. Per-outlet ceiling on open inbound streams (total fan-in across invokers); breach rejects with `OutletErrorClass::Transport::RateLimited` slug `transport.concurrent-streams-per-outlet`. | §5.4.5 |
+| Max trail-padding depth | 16 | Protocol constant (not configurable) | `MAX_TRAIL_PAD_DEPTH` — hard upper bound on `source_chain` padded length. Emitter computes `max_padded_trail_depth = min(ContextParams::max_chain_depth, MAX_TRAIL_PAD_DEPTH)` so envelopes stay bounded even when an operator configures `max_chain_depth = 255`. | §5.4.4 |
+| Interface base-cost floor | Smallest non-zero economic unit in the context's currency | Protocol constant (per currency) | `ContextParams::interface_base_cost_minimum` — floor for the quadratic interface-spam fee (§6.2.0.1). Prevents `base_cost = 0` from defeating the quadratic escalator. | §6.2.0.1 |
 | Relay blob TTL | 604,800s (7d) | [1, infinity] | Relay operator configuration. | §10.5 |
 | Relay republish interval | Derived: `max(ttl - 86400, ttl / 2, 60)` | Derived from TTL | Computed from relay blob TTL. Floor of 60s prevents spin loop at very small TTLs. | §10.5 |
 

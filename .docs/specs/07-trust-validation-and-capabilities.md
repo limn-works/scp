@@ -740,8 +740,10 @@ InvocationCaveats {
   amount_max_cumulative:   Option<Amount>,           // cumulative ceiling across invocations
   valid_from:              Option<u64>,              // Unix seconds; tighter than UCAN nbf
   valid_until:             Option<u64>,              // Unix seconds; tighter than UCAN exp
-  hours_of_day:            Option<u32>,              // UTC hour bitmask; bit i = hour i allowed
-  days_of_week:            Option<u8>,               // bitmask; bit 0 = Sunday, bit 6 = Saturday
+  hours_of_day:            Option<HoursOfDayMask>,   // 24-bit UTC-hour mask newtype over u32;
+                                                     // see "mask-width assertions" below
+  days_of_week:            Option<DaysOfWeekMask>,   // 7-bit weekday mask newtype over u8;
+                                                     // bit 0 = Sunday, bit 6 = Saturday
   max_calls:               Option<u64>,              // absolute invocation cap
   rate_window:             Option<RateWindow>,       // sliding-window rate cap
   input_schema:            Option<JSONSchema>,       // partial schema narrowing the parent's
@@ -752,12 +754,14 @@ InvocationCaveats {
   origin_kind:             Option<OutletKind>,       // §6.2.0.3 amplification — MUST equal
                                                      // the parent's origin_kind at every
                                                      // `narrow()` step (no widening, no
-                                                     // narrowing, no reset). Absence at the
-                                                     // root of the delegation chain means
-                                                     // "inferred from the stem" (outlet_query
-                                                     // ⇒ Query, outlet_call ⇒ Action). Every
-                                                     // non-root delegation MUST carry an
-                                                     // explicit value matching its parent.
+                                                     // narrowing, no reset). Permitted to be
+                                                     // absent only at root-token mint (see
+                                                     // "Root-UCAN origin_kind consistency
+                                                     // check" below); EVERY non-root
+                                                     // delegation MUST materialize an
+                                                     // explicit value — a non-root with
+                                                     // `origin_kind = None` fails narrow with
+                                                     // `AttenuationViolation::OriginKindUnspecified`.
 }
 
 RateWindow {
@@ -777,7 +781,7 @@ RateWindow {
 - `rate_window.window_secs`: child MUST be `<=` parent (shorter window = stricter).
 - `allowed_adapters`, `allowed_target_dids`: child list MUST be a subset of parent's list; child MAY introduce a list where parent had none.
 - `input_schema`: conservative syntactic narrowing only (see below).
-- `origin_kind`: **equality** (`child == parent`). Unlike every other field, `origin_kind` does not narrow — Query and Action are disjoint attack-surface classes, and widening or narrowing across them is forbidden (§6.2.0.3). A non-root delegation whose `origin_kind` differs from its parent's — or is absent while the parent has one set — fails `narrow()` with `AttenuationViolation::OriginKindMismatch`. This is the caveat-layer enforcement of the signed delegation-chain invariant; it makes "origin_kind is bound to the UCAN chain" actually true (the `narrow()` verifier is the only thing that holds child≡parent — without this field, a malicious delegator could inject any `origin_kind` at the nb-reassembly boundary and each hop would accept it as the outermost origin).
+- `origin_kind`: **equality** (`child == parent`) PLUS **explicit on non-root**. Unlike every other field, `origin_kind` does not narrow — Query and Action are disjoint attack-surface classes, and widening or narrowing across them is forbidden (§6.2.0.3). A non-root delegation whose `origin_kind` differs from its parent's fails `narrow()` with `AttenuationViolation::OriginKindMismatch`. A non-root delegation whose `origin_kind == None` fails `narrow()` with `AttenuationViolation::OriginKindUnspecified`, regardless of parent — inheritance is explicit, not ambient (see "Root-UCAN origin_kind consistency check" below for the root-only exception). Together these rules make "origin_kind is bound to the UCAN chain" actually true end-to-end: the root-mint check pins the value against the stem family, and every non-root narrow step materializes the pinned value explicitly into the child's signed caveats.
 
 **Conservative JSON Schema narrowing.** The only admissible narrowing keywords are: `enum`, `const`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `required`, and `additionalProperties: false`. Any other keyword appearing newly in the child's `input_schema` triggers `OutletErrorClass::Authorization::AttenuationViolation`.
 
@@ -793,23 +797,49 @@ For each admissible keyword the narrowing rule is:
 
 Semantic schema subsumption is undecidable in general; conservative syntactic subsetting is what delegating SDKs can implement correctly and auditors can check by eye.
 
-**`hours_of_day` mask width assertion.** `hours_of_day` is declared `Option<u32>` for serde compatibility but is semantically a 24-bit bitmask. Both mint and narrow enforce:
+**Mask-width newtypes (`HoursOfDayMask`, `DaysOfWeekMask`) + `assert_mask_widths` helper.** The two bitmask fields are strongly-typed newtypes whose only constructor is `from_bits(bits) -> Option<Self>`, which rejects any input with high bits set:
 
 ```
-assert(hours_of_day & !0x00FF_FFFFu32 == 0u32)
+pub struct HoursOfDayMask(u32);
+impl HoursOfDayMask {
+  pub fn from_bits(bits: u32) -> Option<Self> {
+    if bits & !0x00FF_FFFF != 0 { None } else { Some(Self(bits)) }
+  }
+  pub fn bits(&self) -> u32 { self.0 }
+}
+
+pub struct DaysOfWeekMask(u8);
+impl DaysOfWeekMask {
+  pub fn from_bits(bits: u8) -> Option<Self> {
+    if bits & !0x7F != 0 { None } else { Some(Self(bits)) }
+  }
+  pub fn bits(&self) -> u8 { self.0 }
+}
 ```
 
-Any value with bits 24..31 set is rejected at mint with `SCP-TOOL-6114` (`caveat-mint-limit-exceeded`, slug `hours-of-day-high-bits-set`) and at narrow with `OutletErrorClass::Authorization::AttenuationViolation`. Without this assertion, a caller could set the high bits of `hours_of_day` to carry ambient data alongside the intended restriction — a covert-channel risk, and a validator-implementation-differential risk if some SDK masked the high bits while another honored them.
+Because the newtypes can only be constructed via `from_bits`, it is **structurally impossible** to assemble an `InvocationCaveats` value with a malformed mask across SDK boundaries (Rust, Python, TypeScript, Swift, Kotlin). The covert-channel surface is closed at the type level, not by runtime asserts.
 
-**`days_of_week` mask width assertion.** `days_of_week` is declared `Option<u8>` and is semantically a 7-bit bitmask (bit 0 = Sunday, bit 6 = Saturday; bit 7 is unused). Both mint and narrow enforce:
+A shared `assert_mask_widths(caveats) -> Result<(), MaskWidthError>` helper is invoked at BOTH the mint site and every narrow step, so the two call sites share a single implementation and future fields joining the mask-newtype family are covered without patching two places. Helper pseudocode:
 
 ```
-assert(days_of_week & !0x7Fu8 == 0u8)
+fn assert_mask_widths(c: &InvocationCaveats) -> Result<(), MaskWidthError> {
+  // Newtype construction has already enforced the bit-width invariant.
+  // This helper is the single assertion site; its presence in the
+  // narrow() path is verified by a round-trip unit test that feeds a
+  // synthesized InvocationCaveats with bogus internal state (bypassing
+  // from_bits via reflection in the test harness) and asserts both mint
+  // and narrow reject.
+  if let Some(mask) = &c.hours_of_day {
+    if mask.bits() & !0x00FF_FFFF != 0 { return Err(MaskWidthError::HoursOfDayHighBitsSet); }
+  }
+  if let Some(mask) = &c.days_of_week {
+    if mask.bits() & !0x7F != 0 { return Err(MaskWidthError::DaysOfWeekHighBitSet); }
+  }
+  Ok(())
+}
 ```
 
-Any value with bit 7 set is rejected at mint with `SCP-TOOL-6114` (slug `days-of-week-high-bit-set`) and at narrow with `AttenuationViolation`. Double-sided enforcement is required: the mint check prevents a root-minted token from smuggling data in bit 7, and the narrow check catches any delegated token that attempts to set bit 7 on a child derived from a valid parent — closing the symmetric 1-bit covert-channel that would otherwise let a caller carry ambient data in the bit 7 slot alongside the intended day restriction.
-
-Both the `hours_of_day` high-bits check and the `days_of_week` bit-7 check run at mint AND at every narrow step; either side's failure is fatal. The mint-side assertion prevents a forged root from entering the delegation graph; the narrow-side assertion catches a parent-child pair where the child introduces high bits even if the parent was clean.
+Mint-time failure returns `SCP-TOOL-6114` (slugs `hours-of-day-high-bits-set`, `days-of-week-high-bit-set`); narrow-time failure returns `OutletErrorClass::Authorization::AttenuationViolation::MaskWidth`. The mint-side assertion prevents a forged root from entering the delegation graph; the narrow-side assertion catches a parent-child pair where the child introduces high bits even if the parent was clean.
 
 **Mint limits.** At token mint time, the issuing SDK MUST enforce the following structural bounds:
 
@@ -822,13 +852,19 @@ Both the `hours_of_day` high-bits check and the `days_of_week` bit-7 check run a
 
 Mints that exceed these limits are rejected at the SDK boundary with `SCP-TOOL-6114` (`caveat-mint-limit-exceeded`). The limits exist so that caveat parsing has predictable cost and cannot be turned into a DoS vector via pathologically large attestations.
 
-**Root-UCAN `origin_kind` consistency check.** At root-token mint time (no parent delegation), the mint-time validator MUST verify that `caveats.origin_kind` is compatible with the root UCAN's capability stem. For every capability in the root token:
+**Root-UCAN `origin_kind` consistency check.** At root-token mint time (no parent delegation), the mint-time validator MUST verify that every capability in the root token belongs to the same `OutletKind`, and that `caveats.origin_kind` is compatible with that kind:
 
-- If the stem is `outlet_query:*` or `outlet_query:{id}`, then `caveats.origin_kind` MUST be `OutletKind::Query` (or absent, in which case it is inferred as Query per §6.2.0.3 "inferred from the stem" rule).
-- If the stem is `outlet_call:*` or `outlet_call:{id}`, then `caveats.origin_kind` MUST be `OutletKind::Action` (or absent, inferred as Action).
-- A token mixing stems of different kinds MUST declare `caveats.origin_kind` absent; the inference then fails on the first ambiguous delegation and the chain is rejected at Step 7b.
+1. **Single-kind stem set required.** The root token's capability set is partitioned by stem family. If the set contains stems from BOTH `outlet_query:*` / `outlet_query:{id}` AND `outlet_call:*` / `outlet_call:{id}`, mint is rejected unconditionally with `SCP-TOOL-6114` slug `origin-kind-mixed-stem-root`. The "inference fails on first ambiguous delegation" escape hatch from earlier drafts is removed — it was unsound, because a mixed-stem root with `caveats.origin_kind = None` could be exercised at one hop under one kind and at a downstream hop under the other, producing different effective `origin_kind` values for different hops in the same chain.
+2. **Stem ⇒ kind derivation on single-kind sets.** With the set guaranteed single-kind, the inferred kind is determined by the stem family: `outlet_query:*` ⇒ `Query`, `outlet_call:*` ⇒ `Action`.
+3. **Explicit `caveats.origin_kind` on the root.** The mint-time validator accepts:
+   - `caveats.origin_kind == Some(inferred_kind)` — explicit agreement with the stem.
+   - `caveats.origin_kind == None` — permitted ONLY because rule (1) has already guaranteed a single-kind set; with a single stem kind, inference is unambiguous and every non-root delegation below rule (4) materializes the inferred value explicitly.
+   - `caveats.origin_kind == Some(other_kind)` — rejected with `SCP-TOOL-6114` slug `origin-kind-stem-mismatch`.
+4. **Non-root delegations MUST materialize `origin_kind` explicitly.** A non-root delegation whose `caveats.origin_kind == None` fails `narrow()` with `AttenuationViolation::OriginKindUnspecified` regardless of parent agreement. This makes the chain's `origin_kind` an explicit, signed, cross-step-equal value rather than an ambient inference that downstream verifiers must recompute. The root's own `None` is permitted because rule (1) already made the root unambiguous and the first-delegation narrow step will materialize the inferred value into the child's caveats (which the root-holder signs by delegating).
 
-A mismatch between the stem's kind and an explicitly declared `caveats.origin_kind` is rejected at mint with `SCP-TOOL-6114` slug `origin-kind-stem-mismatch`. This is the root-side counterpart to the child-vs-parent `AttenuationViolation::OriginKindMismatch` equality check: together, the two checks make "`origin_kind` is bound to the signed UCAN chain" operationally true end-to-end (the mint check pins the root value; the narrow check preserves it through every delegation). Without the mint check, a forged root UCAN could declare any `origin_kind` that was self-consistent with the `narrow()` rule (equality) — the declared kind would then propagate unchallenged through the whole chain until the hop-target runtime check fires, at which point any emitted failure event has already leaked information about the forged origin. The mint check catches the forgery at root-token creation, before the chain can be delegated or exercised.
+The combination of (1) + (3) + (4) eliminates the two-kind inference escape. There is no scenario in the chain where `origin_kind` is ambiguous: either the root declared it explicitly, or the root had a single-kind stem set and the first-layer delegation materialized it explicitly under the narrow rule. The child-vs-parent `AttenuationViolation::OriginKindMismatch` equality check at every subsequent narrow step preserves the value unchanged through the rest of the chain.
+
+Without rule (1), a mixed-stem root with `origin_kind = None` would propagate `None` through any child that also declared `None` — because `None == None` satisfies the equality rule trivially — and the effective `origin_kind` at the hop target would then depend on which capability the caller exercised at that hop. Rejecting mixed-stem roots at mint closes the surface at the single point where the root-signer's intent can be verified (the mint site, where the signer is available). Downstream hops cannot reintroduce the ambiguity because they cannot add stems to the delegation chain (subset constraint) and cannot widen `origin_kind` (equality constraint).
 
 **Runtime enforcement pipeline.** Caveats are enforced at three points in the UCAN validation pipeline:
 

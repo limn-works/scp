@@ -88,16 +88,22 @@ Outlet interface creation requires explicit consent from both the exposing conte
      inbound_policy: InboundPolicy,
    }
    ```
-   This follows Context B's governance model. Acceptance creates an `InterfaceEstablished` event in both event logs. The `InterfaceEstablished` event records `epoch_a` (Context A's MLS epoch counter at accept time) and `epoch_b` (Context B's MLS epoch counter at accept time) so verifiers can deterministically recompute `hop_salt` against the accept-epoch for any source_chain entry emitted during this interface's lifetime.
+   This follows Context B's governance model. Acceptance creates an `InterfaceEstablished` event in both event logs. The `InterfaceEstablished` event records:
 
-   **`hop_salt` derivation and lifecycle.** The `hop_salt: [u8; 32]` is used to pseudonymize `source_chain.context_id` entries for observers who are not members of each hop (§5.4.4). The salt is NOT stored as a persisted random blob; it is **derived on demand** from each context's current MLS exporter every time it is needed (pseudonymization at wrap time, verification at audit time). Both contexts independently compute the same salt whenever the same `(context_a_id, context_b_id, epoch_a, epoch_b)` tuple is presented. Revocation of the interface rotates the salt automatically on re-establishment (the re-accepted epochs will differ); normal epoch advancement within an interface rotates the salt automatically without bookkeeping.
+   - `epoch_a` — Context A's MLS epoch counter at accept time (u64).
+   - `epoch_b` — Context B's MLS epoch counter at accept time (u64).
+   - `ikm_a: [u8; 32]` — the exporter-derived IKM that Context A produced at accept time (computed as shown below), persisted verbatim in the event metadata.
+   - `ikm_b: [u8; 32]` — the exporter-derived IKM that Context B produced at accept time, persisted verbatim in the event metadata.
+
+   The committed `(ikm_a, ikm_b)` pair pins the `hop_salt` derivation at accept time, so historic verifiability does not depend on retaining the underlying MLS epoch exporter keys. Verifiers rederive `hop_salt` deterministically from the committed IKMs at any later time using the HKDF step below. The MLS epoch keys MAY be rotated, destroyed, or forward-secrecy-ratcheted after acceptance without invalidating past `source_chain` pseudonym verification.
+
+   **`hop_salt` derivation and lifecycle.** The `hop_salt: [u8; 32]` is used to pseudonymize `source_chain.context_id` entries for observers who are not members of each hop (§5.4.4). At accept time, each side computes its peer-labeled MLS exporter IKM and commits it into the `InterfaceEstablished` event. Thereafter, `hop_salt` is derived deterministically from the committed `(ikm_a, ikm_b)` — **not** from the live MLS exporter, so it does not degrade with MLS epoch ratcheting and does not require either context to retain obsolete MLS epoch secrets. Revocation of the interface rotates the salt on re-establishment (a fresh pair of IKMs is committed to the new `InterfaceEstablished` event).
 
    ```
-   // Both contexts derive the same 32-byte salt independently on demand.
-   // MLS_EXPORTER(label, context, length) is the RFC 9420 §8.5 export primitive.
-   // Each context uses its PEER's context_id as the label suffix — this ensures
-   // that ikm derived from Context A's exporter for the A↔B interface cannot be
-   // reused to pseudonymize any A↔C interface (different label → different key).
+   // Step 1 — accept-time IKM derivation (run once, by each side, at AcceptOutletInterface).
+   // Each context uses its PEER's context_id as the MLS exporter label suffix — this
+   // ensures that ikm derived from Context A's exporter for the A↔B interface cannot
+   // be reused to pseudonymize any A↔C interface (different label → different key).
    canonical_peer_id_a = context_b_id   // Context A uses Context B's id as suffix
    canonical_peer_id_b = context_a_id   // Context B uses Context A's id as suffix
 
@@ -105,13 +111,16 @@ Outlet interface creation requires explicit consent from both the exposing conte
      "scp-context-hop-salt-v1:" || canonical_peer_id_a,
      b"",
      32,
-   )  // exporter on Context A's current epoch, labeled with Context B's id
+   )  // exporter on Context A's accept-time epoch, labeled with Context B's id.
+      // Persisted in the InterfaceEstablished event metadata.
    ikm_b = MLS_EXPORTER(
      "scp-context-hop-salt-v1:" || canonical_peer_id_b,
      b"",
      32,
-   )  // exporter on Context B's current epoch, labeled with Context A's id
+   )  // exporter on Context B's accept-time epoch, labeled with Context A's id.
+      // Persisted in the InterfaceEstablished event metadata.
 
+   // Step 2 — hop_salt derivation (run on demand from committed IKMs).
    // Canonical concatenation: lexicographically smaller context_id first, so both sides agree.
    ordered = if context_a_id < context_b_id { (ikm_a, ikm_b) } else { (ikm_b, ikm_a) }
 
@@ -130,11 +139,15 @@ Outlet interface creation requires explicit consent from both the exposing conte
 
    **Symmetry.** Context A and Context B use reciprocal labels — A's label is suffixed with B's id, B's label is suffixed with A's id. Because `hop_salt` HKDF-combines `ikm_a || ikm_b` after lexicographic ordering, and both sides agree on the ordering (ascending `context_id`), both sides compute byte-identical salts. The canonical-ordering step is what makes the construction symmetric despite the asymmetric label suffixes.
 
-   **Historic verifiability.** A `source_chain` entry emitted at hop time under epoch `(e_a, e_b)` is verifiable at audit time by recomputing `hop_salt` from the event-log record of the `InterfaceEstablished` event's recorded `(epoch_a, epoch_b)` — this freezes the epochs used for that particular hop even after the contexts have advanced further. Epoch advancement after a hop was logged does not invalidate the pseudonym already emitted; it only rotates the pseudonyms emitted by future hops.
+   **Historic verifiability.** The IKMs are committed verbatim in the `InterfaceEstablished` event metadata at accept time, so any `source_chain` entry emitted during this interface's lifetime is verifiable at any later time by re-running Step 2 against the recorded `(ikm_a, ikm_b)` pair. The MLS layer in SCP does not expose per-epoch-recoverable exporter ratcheting, so the committed-IKM approach is what makes historic verification mechanical; the alternative — retain MLS epoch secrets indefinitely to re-run Step 1 — would conflict with forward secrecy.
 
-   The `SCP-CONTEXT-HOP-SALT-V1:` prefix (used both in the MLS exporter label family and in the HKDF info string) is registered in §9.18.2. Neither context stores a persistent `hop_salt` blob — they store only the accept-time `(epoch_a, epoch_b)` plus the peer's `context_id` (already present in the interface state), and rederive when needed.
+   **Trade-off disclosure.** The committed IKMs are 32-byte pseudo-random values that enter the public event log alongside the epoch counters. This leaks a per-interface, per-accept-time exporter value into the log. The pseudonymization threat model was never to hide `hop_salt` from members of either context (both contexts already derive `hop_salt` locally); it is to prevent non-members from correlating context IDs across hops. Publishing IKMs does NOT degrade that property, because the HMAC of `raw_context_id` under `hop_salt` is still a one-way map for non-members who have neither IKM-keyed knowledge nor membership in either context. Members of BOTH contexts could already reverse the pseudonym for their own interface; the publication changes nothing for them. The publication does NOT extend membership-level pseudonym-reversal to non-members because the HMAC inputs (raw `context_id` values) are still unknown to non-members. Net effect: the security property is unchanged relative to the derive-on-demand construction; the availability property (historic audit after MLS epoch rotation) is strictly improved.
+
+   The `SCP-CONTEXT-HOP-SALT-V1:` prefix (used both in the MLS exporter label family and in the HKDF info string) is registered in §9.18.2. Each context's interface-state entry retains the accept-time `(epoch_a, epoch_b, ikm_a, ikm_b)` and the peer's `context_id`.
 
 5. **Teardown.** Either context can revoke the interface at any time via governance action `RevokeOutletInterface { interface_id }`. Revocation is unilateral — no consent from the other side is needed. An `InterfaceRevoked` event is recorded in the revoking context's event log.
+
+**Interface-spam deterrent (quadratic cost).** Interface establishment is an economic action with an anonymity-set interaction: every additional active A↔X interface that Context A holds narrows the anonymity set under which `hop_salt` pseudonyms from A appear. To deter interface-spam as an anonymity-set-reduction attack, the cost a context pays to establish its `n`-th active interface scales **quadratically** in the count of active interfaces it already holds with the same peer over a rolling 24-hour window. Concretely, if Context A already holds `k` active interfaces with Context B (or with a cluster of contexts operated by a single DID) in the last 24 hours, the cost to establish an additional A↔B interface is `base_cost × (k + 1)^2`, where `base_cost` is set by context economic policy (§19.3) and bounded below by the `ContextParams::interface_base_cost_minimum` (registered in §9.18.B, default: smallest non-zero economic unit in the context's currency). The quadratic escalation makes repeated interface establishment with the same peer economically irrational at low counts (k=1 → 4× base; k=4 → 25× base; k=9 → 100× base), which is sufficient to prevent the attack surface without penalizing legitimate bilateral renegotiation. This rule is additive to the standard `OutletErrorClass::Economic::InsufficientFunds` path — a context without sufficient funds for the quadratic fee fails interface establishment at governance approval time, not at hop time.
 
 **Outbound and inbound policies:**
 
@@ -214,7 +227,8 @@ Outlet streams (§5.4.5) cross context boundaries under the same §6.2 tool-inte
 
 - **`chain_depth` is set at open.** Every chunk inherits the chain depth recorded at the opening cross-context hop. Chunks do not recompute depth. Opening is subject to §6.2.0.3 and §6.2.0.4; chunks after open are not re-checked.
 - **Credit is end-to-end.** Credit grants from the invoker propagate across the bridge to the executor without re-accounting at the bridge.
-- **UCAN check locus.** UCAN is validated ONCE at stream open (§5.4.5). Mid-stream revocation terminates at the next executor checkpoint, but already-emitted chunks remain authorized.
+- **UCAN check locus.** UCAN is validated ONCE at stream open (§5.4.5). Mid-stream revocation terminates at the next `stream_ucan_recheck_secs` cadence tick, receiver-side (§5.4.5 revocation re-check cadence); already-emitted chunks remain authorized.
+- **Concurrent-stream caps apply at both ends of the bridge.** Per §5.4.5 the hop target enforces `max_concurrent_inbound_streams_per_origin_invoker` against the outermost caller DID in the UCAN delegation chain, not the immediate-previous hop. Cross-context delegation-chain rewriting does not reset this ceiling — a caller who narrows through intermediate agents still counts against the single origin-invoker slot at the terminal operator.
 - **Event log recording.** Each of the two contexts records exactly one `OutletInvokedEvent` for the stream, with the same `stream_manifest_hash` (§5.4.5). Cross-context provenance (§7.7) chains the two events via the `source_chain` field on the error envelope (when the stream fails) or on the final `End.provenance` (when it succeeds).
 
 ### 6.2.1 Stateful Outlet Sessions
