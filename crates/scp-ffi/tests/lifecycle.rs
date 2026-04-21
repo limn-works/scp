@@ -19,17 +19,19 @@ use _scp_core::init_runtime;
 use _scp_core::scp::PyScp;
 use pyo3::Python;
 
-/// Consolidated lifecycle roundtrip — suspend/resume roundtrips on the
-/// process-wide default `SCP` instance, exercising the idempotent paths.
+/// Consolidated lifecycle roundtrip — suspend/resume roundtrips on a
+/// caller-owned `PyScp` instance, exercising the idempotent paths.
 ///
 /// Consolidated into a single `#[test]` so that cargo's test runner does not
-/// interleave these assertions on parallel threads. Because the suspended
-/// flag is global and observable from any thread, splitting this into
-/// multiple tests can produce races.
+/// interleave these assertions on parallel threads. Although Phase 4 PR 4
+/// (#1549) deleted the process-wide default bridge, the tokio runtime
+/// and some shutdown bookkeeping remain process-global, so parallel
+/// execution of lifecycle tests can still race.
 ///
 /// Phase 4 PR 4 demolition (#1549): the free-function `scp_suspend` /
-/// `scp_resume` exports were deleted — tests now drive the default `SCP`
-/// instance through `PyScp::new().suspend()` / `.resume()`.
+/// `scp_resume` exports were deleted along with the process-wide default
+/// bridge — tests now drive a freshly constructed `PyScp::new()`
+/// instance through `.suspend()` / `.resume()`.
 #[test]
 fn scp_suspend_resume_roundtrip() {
     // `PyScp::resume` releases the GIL while driving the async
@@ -44,9 +46,11 @@ fn scp_suspend_resume_roundtrip() {
         // initialize it explicitly here.
         init_runtime().expect("init_runtime must succeed");
 
-        // `default_instance` also materialises the process-wide
-        // `DEFAULT_BRIDGE_INSTANCE` if it hasn't been initialised yet. Every
-        // subsequent call returns the same underlying `Arc<PyBridgeInstance>`.
+        // Construct a fresh `PyScp` instance — each call produces a
+        // brand-new `PyBridgeInstance` with its own monotonic
+        // `instance_id`. Phase D (#1695) deleted the prior
+        // `DEFAULT_BRIDGE_INSTANCE`, so there is no shared bridge for
+        // this test to accidentally mutate.
         let scp = PyScp::new();
 
         // Case 1: suspend/resume on a freshly-initialised instance must

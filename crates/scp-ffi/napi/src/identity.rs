@@ -3,11 +3,11 @@
 //! Exposes [`NapiIdentity`] as an opaque JS class and bridge functions for
 //! the identity lifecycle:
 //!
-//! - [`identity_create`] — Creates a new DID identity (returns `Promise<NapiIdentity>`).
-//! - [`identity_create_with_agent_key`] — Creates a new DID identity with an
+//! - `identity_create` — Creates a new DID identity (returns `Promise<NapiIdentity>`).
+//! - `identity_create_with_agent_key` — Creates a new DID identity with an
 //!   agent signing key.
-//! - [`identity_load`] — Loads an existing identity by DID string.
-//! - [`identity_resolve`] — Resolves a DID to its document.
+//! - `identity_load` — Loads an existing identity by DID string.
+//! - `identity_resolve` — Resolves a DID to its document.
 //!
 //! Identity migration (spec §9.12):
 //!

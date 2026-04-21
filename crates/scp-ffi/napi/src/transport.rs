@@ -2,13 +2,13 @@
 //!
 //! Exposes relay connection management to JavaScript:
 //!
-//! - [`transport_connect`] — Connect to an SCP relay (wraps adapter in `TransportManager`).
-//! - [`transport_status`] — Query the current transport connection status.
-//! - [`transport_disconnect`] — Disconnect from the relay.
-//! - [`transport_add_relay`] — Add an additional relay adapter to the manager.
-//! - [`transport_assign_relay_set`] — Assign a relay set for a context.
-//! - [`transport_adapter_count`] — Query the number of registered adapters.
-//! - [`transport_reliability`] — Query reliability score for an adapter.
+//! - `transport_connect` — Connect to an SCP relay (wraps adapter in `TransportManager`).
+//! - `transport_status` — Query the current transport connection status.
+//! - `transport_disconnect` — Disconnect from the relay.
+//! - `transport_add_relay` — Add an additional relay adapter to the manager.
+//! - `transport_assign_relay_set` — Assign a relay set for a context.
+//! - `transport_adapter_count` — Query the number of registered adapters.
+//! - `transport_reliability` — Query reliability score for an adapter.
 //!
 //! # Transport model
 //!
@@ -140,7 +140,7 @@ fn clear_transport_manager_on(bi: &NapiBridgeInstance) -> napi::Result<()> {
 
 /// Current transport connection status.
 ///
-/// Returned by [`transport_status`] and accessible on [`NapiTransportManager`].
+/// Returned by `transport_status` and accessible on [`NapiTransportManager`].
 #[napi(object)]
 pub struct NapiTransportStatus {
     /// `true` if the transport is currently connected to a relay.
@@ -407,7 +407,7 @@ pub(crate) async fn configure_relay_transport_on(
 
 /// Per-adapter reliability score exposed to JavaScript.
 ///
-/// Returned by [`transport_reliability`] and maps to the core
+/// Returned by `transport_reliability` and maps to the core
 /// [`scp_transport::scoring::ReliabilityScore`].
 #[napi(object)]
 pub struct NapiReliabilityScore {

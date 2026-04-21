@@ -2,9 +2,9 @@
 //!
 //! Exposes tool registration, invocation, and verification:
 //!
-//! - [`tool_register`] — Register a tool in a context.
-//! - [`tool_invoke`] — Invoke a tool within a context.
-//! - [`tool_verify`] — Verify a tool against its test vectors.
+//! - `tool_register` — Register a tool in a context.
+//! - `tool_invoke` — Invoke a tool within a context.
+//! - `tool_verify` — Verify a tool against its test vectors.
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 

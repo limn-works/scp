@@ -8,9 +8,9 @@
 //! - [`PyNodeHandle`] -- opaque handle to a running application node (wraps
 //!   both `InMemoryStorage` and `FilesystemStorage` variants via an internal
 //!   enum).
-//! - [`PyScp::relay_start_in_memory`] / [`PyScp::relay_start_local`] -- relay
+//! - `PyScp::relay_start_in_memory` / `PyScp::relay_start_local` -- relay
 //!   startup.
-//! - [`PyScp::node_start_in_memory`] / [`PyScp::node_start_local`] -- node
+//! - `PyScp::node_start_in_memory` / `PyScp::node_start_local` -- node
 //!   startup.
 //!
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`

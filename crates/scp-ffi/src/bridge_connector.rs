@@ -18,15 +18,15 @@
 //!
 //! `SCP` methods (bridge-state accessors):
 //!
-//! - [`PyScp::bridge_create_shadow`] -- Create a shadow identity (uses `bridge_state`).
-//! - [`PyScp::bridge_credential_provision`] -- Provision (store) an encrypted credential.
-//! - [`PyScp::bridge_credential_retrieve`] -- Retrieve and decrypt a credential.
-//! - [`PyScp::bridge_credential_rotate`] -- Rotate (replace) a credential.
-//! - [`PyScp::bridge_credential_revoke`] -- Revoke all credentials for a bridge.
-//! - [`PyScp::bridge_credential_list`] -- List credential types for a bridge.
-//! - [`PyScp::bridge_credential_store_key`] -- Store a bridge credential key.
-//! - [`PyScp::bridge_credential_get_key`] -- Retrieve a bridge credential key.
-//! - [`PyScp::bridge_credential_delete_key`] -- Delete a bridge credential key.
+//! - `PyScp::bridge_create_shadow` -- Create a shadow identity (uses `bridge_state`).
+//! - `PyScp::bridge_credential_provision` -- Provision (store) an encrypted credential.
+//! - `PyScp::bridge_credential_retrieve` -- Retrieve and decrypt a credential.
+//! - `PyScp::bridge_credential_rotate` -- Rotate (replace) a credential.
+//! - `PyScp::bridge_credential_revoke` -- Revoke all credentials for a bridge.
+//! - `PyScp::bridge_credential_list` -- List credential types for a bridge.
+//! - `PyScp::bridge_credential_store_key` -- Store a bridge credential key.
+//! - `PyScp::bridge_credential_get_key` -- Retrieve a bridge credential key.
+//! - `PyScp::bridge_credential_delete_key` -- Delete a bridge credential key.
 //!
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
 //! methods in Phase 4 PR 4 sub-slice E (#1549).

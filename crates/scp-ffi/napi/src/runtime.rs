@@ -72,7 +72,7 @@ pub enum StorageConfig {
     ///
     /// Persists context snapshots, identity state, and the event log
     /// across process restarts. The `key` is raw encryption key material
-    /// wrapped in [`Zeroizing`] so the caller's copy is zeroed after the
+    /// wrapped in `Zeroizing` so the caller's copy is zeroed after the
     /// variant is consumed.
     Sqlite {
         /// Directory the database file is created in.
@@ -751,7 +751,7 @@ fn persistence_box_for_init(bi: &NapiBridgeInstance) -> Box<dyn ContextPersisten
 }
 
 /// Initializes the given bridge instance's [`ContextManager`] with
-/// [`LocalTransportProvider`].
+/// `LocalTransportProvider`.
 ///
 /// Identical to [`init_context_manager`] except the transport provider is
 /// `LocalTransportProvider` (silently succeeds on all send/publish calls)
@@ -761,7 +761,7 @@ fn persistence_box_for_init(bi: &NapiBridgeInstance) -> Box<dyn ContextPersisten
 /// `context_import`** — those functions call `init_context_manager` which
 /// wins the `OnceLock` race if called first.
 ///
-/// Exposed to JS/TS via [`crate::transport::configure_local_transport`] so
+/// Exposed to JS/TS via `crate::transport::configure_local_transport` so
 /// that E2E tests can exercise `contextSend` and `broadcastPublish` without
 /// a real relay server.
 ///
@@ -791,7 +791,7 @@ pub fn init_context_manager_with_local_transport(bi: &NapiBridgeInstance, local_
 }
 
 /// Initializes the given bridge instance's [`ContextManager`] with a
-/// [`RelayTransportProvider`].
+/// `RelayTransportProvider`.
 ///
 /// Identical to [`init_context_manager`] except the transport provider is a
 /// `RelayTransportProvider` wrapping a real `NativeRelayAdapter` connected to
@@ -802,7 +802,7 @@ pub fn init_context_manager_with_local_transport(bi: &NapiBridgeInstance, local_
 /// `context_import`** — those functions call `init_context_manager` which
 /// wins the `OnceLock` race if called first.
 ///
-/// Exposed to JS/TS via [`crate::transport::configure_relay_transport`] so
+/// Exposed to JS/TS via `crate::transport::configure_relay_transport` so
 /// that E2E tests can exercise the full send → relay → subscribe → receive
 /// pipeline.
 ///
@@ -887,13 +887,14 @@ fn event_log_provider_from_existing_repo(
 // `bridge_lifecycle_serial` (and its backing `BRIDGE_LIFECYCLE_SERIAL`
 // `OnceLock`) were deleted in #1549 Phase 4 PR 2 commit 11. They existed
 // solely to serialize the `scp_suspend_resume_roundtrip` test — which
-// mutated the process-global the legacy default suspended flag flag —
+// mutated the legacy process-wide default bridge's suspended flag —
 // against every other test that touched shared bridge state. The
 // roundtrip test has been rewritten to use a caller-owned `Scp::new()`
-// instance (see `scp_class_suspend_resume_roundtrip` in `lib.rs`), so the
-// default instance is never suspended mid-test and the serial is no
-// longer required. Other tests that previously acquired the guard now
-// simply run without it.
+// instance (see `scp_class_suspend_resume_roundtrip` in `lib.rs`), and
+// Phase 4 PR 4 (#1549) subsequently deleted the process-wide default
+// bridge entirely, so no shared suspended flag exists for lifecycle
+// tests to race on and the serial is no longer required. Other tests
+// that previously acquired the guard now simply run without it.
 
 /// Test variant of [`context_manager`] initialization that uses
 /// [`LocalTransportProvider`](scp_core::context::LocalTransportProvider)

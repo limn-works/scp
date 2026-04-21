@@ -3,17 +3,17 @@
 //! Exposes SCP provenance types, quality evaluation, and privacy operations
 //! to Python as methods on the `SCP` class:
 //!
-//! - [`PyScp::evaluate_provenance_quality`] -- Evaluate the provenance
+//! - `PyScp::evaluate_provenance_quality` -- Evaluate the provenance
 //!   quality tier for a given provenance record and source context state.
-//! - [`PyScp::provenance_attach`] -- Attach provenance metadata at
+//! - `PyScp::provenance_attach` -- Attach provenance metadata at
 //!   cross-context boundaries.
-//! - [`PyScp::provenance_check_chain_depth`] -- Check whether a provenance
+//! - `PyScp::provenance_check_chain_depth` -- Check whether a provenance
 //!   chain depth is within the allowed limit.
-//! - [`PyScp::provenance_redact_counterparties`] -- Remove counterparty DIDs
+//! - `PyScp::provenance_redact_counterparties` -- Remove counterparty DIDs
 //!   (§24.3.5).
-//! - [`PyScp::provenance_pseudonymize_counterparties`] -- Replace DIDs with
+//! - `PyScp::provenance_pseudonymize_counterparties` -- Replace DIDs with
 //!   pseudonyms (§24.3.5).
-//! - [`PyScp::provenance_update_source_type`] -- Update source type for state
+//! - `PyScp::provenance_update_source_type` -- Update source type for state
 //!   changes (ADR-019 AC5).
 //!
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`

@@ -50,7 +50,7 @@
 //! opaque types (`NapiIdentity`, `NapiContextHandle`, `NapiUcanToken`,
 //! `NapiTransportManager`) decrement it in their `Drop` impl.
 //!
-//! [`scp_shutdown`] waits (with a configurable timeout, default 5 seconds)
+//! `scp_shutdown` waits (with a configurable timeout, default 5 seconds)
 //! for `HANDLE_COUNT` to reach zero before allowing the tokio runtime to
 //! be dropped. See `sdk-common.md` "FFI Async Bridging Risks" rule 4.
 //!
@@ -59,7 +59,7 @@
 //! Unlike the WASM bridge (which cannot depend on `scp-core` due to tokio's
 //! multi-thread runtime constraint on `wasm32-unknown-unknown`), this bridge
 //! calls `scp-core` directly. The `"in_memory"` custody path in
-//! [`identity_create`](identity::identity_create) uses a real
+//! [`Scp::identity_create`](crate::scp::Scp::identity_create) uses a real
 //! `InMemoryKeyCustody` to
 //! generate a live `did:dht` identity.
 //!
@@ -387,8 +387,10 @@ mod tests {
         // Shutting down a caller-owned `Scp` with a zero-millisecond
         // deadline must return without hanging even if handles are live,
         // mirroring `scp_shutdown_zero_timeout_returns_immediately` but
-        // against an isolated `NapiBridgeInstance`. The default instance
-        // is untouched.
+        // against an isolated `NapiBridgeInstance`. Phase 4 PR 4
+        // (#1549) deleted the process-wide default bridge — every
+        // `Scp::new()` owns its own `NapiBridgeInstance`, so this test
+        // cannot affect any other instance's state.
         //
         // #1692: `Scp::shutdown` takes `napi::bindgen_prelude::BigInt`
         // (u64 on the wire). Build a zero-valued BigInt directly for

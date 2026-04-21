@@ -20,9 +20,11 @@ end-to-end `identity_create → context_create → context_send → suspend
 → restore → context_send` path is exercised at the Rust integration
 layer (`crates/scp-testing/tests/integration/persistence_sdk.rs`)
 because the Python `SCP` class does not yet surface those context
-methods — the free-function façade (`scp_sdk.context_create`) routes
-to the process-global default instance, not to the caller-owned `SCP`
-handle, and that migration is in #1549 PR 4+.
+methods. Phase 4 PR 4 (#1549, ADR-048) deleted the free-function
+façade (`scp_sdk.context_create`, etc.) along with the process-wide
+default bridge it routed through; the remaining SDK wiring to expose
+those operations on the caller-owned `SCP` handle is tracked as
+follow-up work.
 
 Requires the native `_scp_core` extension built via
 `maturin develop --release`. See `.docs/scaffold/python.md`.

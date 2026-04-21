@@ -7,8 +7,8 @@
 //! - [`NapiNodeHandle`] — opaque handle to a running application node (wraps
 //!   both `InMemoryStorage` and `FilesystemStorage` variants via an internal
 //!   enum).
-//! - [`relay_start_in_memory`] / [`relay_start_local`] — relay startup.
-//! - [`node_start_in_memory`] / [`node_start_local`] — node startup.
+//! - `relay_start_in_memory` / `relay_start_local` — relay startup.
+//! - `node_start_in_memory` / `node_start_local` — node startup.
 //!
 //! Gated behind the `server` feature on `scp-ffi-common`. Not available for
 //! WASM (ADR-034).
@@ -143,7 +143,7 @@ async fn auto_wire_context_manager(
 
 /// Opaque handle to a running SCP relay server.
 ///
-/// Created by [`relay_start_in_memory`] or [`relay_start_local`]. The relay
+/// Created by `relay_start_in_memory` or `relay_start_local`. The relay
 /// accepts WebSocket connections at [`relay_url`](NapiRelayHandle::relay_url)
 /// and can be gracefully stopped via [`shutdown`](NapiRelayHandle::shutdown).
 #[napi]
@@ -207,7 +207,7 @@ impl Drop for NapiRelayHandle {
 
 /// Opaque handle to a running SCP application node.
 ///
-/// Created by [`node_start_in_memory`] or [`node_start_local`]. The node
+/// Created by `node_start_in_memory` or `node_start_local`. The node
 /// includes a running relay server, a generated DID identity, and (optionally)
 /// persistent storage. The HTTP server is **not** started automatically —
 /// only the relay is bound.

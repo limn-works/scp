@@ -7,14 +7,14 @@
 //! Operations that produce or mutate the shared `FullStackNetwork` are exposed
 //! as methods on `SCP`:
 //!
-//! - [`PyScp::fullstack_create_node`] -- Create a test node backed by the
+//! - `PyScp::fullstack_create_node` -- Create a test node backed by the
 //!   bridge's shared `FullStackNetwork`.
-//! - [`PyScp::fullstack_reset_network`] -- Reset the shared network.
-//! - [`PyScp::fullstack_create_context`] -- Create an encrypted context owned
+//! - `PyScp::fullstack_reset_network` -- Reset the shared network.
+//! - `PyScp::fullstack_create_context` -- Create an encrypted context owned
 //!   by a node.
-//! - [`PyScp::fullstack_add_member`], [`PyScp::fullstack_join_from_welcome`],
-//!   [`PyScp::fullstack_sync_sender_keys`], [`PyScp::fullstack_send_message`],
-//!   [`PyScp::fullstack_decrypt_message`], [`PyScp::fullstack_remove_member`]
+//! - `PyScp::fullstack_add_member`, `PyScp::fullstack_join_from_welcome`,
+//!   `PyScp::fullstack_sync_sender_keys`, `PyScp::fullstack_send_message`,
+//!   `PyScp::fullstack_decrypt_message`, `PyScp::fullstack_remove_member`
 //!   -- Full-stack membership, messaging, and lifecycle operations.
 //!
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
@@ -80,8 +80,8 @@ fn permissive_key_resolver() -> KeyResolver {
 
 /// Opaque handle to a full-stack test node with real MLS crypto.
 ///
-/// Each node has its own [`ContextManager`] backed by [`E2eCryptoProvider`]
-/// (real MLS + sender keys) with a shared [`KeyExchange`] for coordinating
+/// Each node has its own `ContextManager` backed by `E2eCryptoProvider`
+/// (real MLS + sender keys) with a shared `KeyExchange` for coordinating
 /// Welcome messages and sender keys between nodes.
 #[pyclass(name = "FullStackNode")]
 pub struct PyFullStackNode {

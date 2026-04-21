@@ -22,9 +22,12 @@ import { createRequire } from "node:module";
 import { __clampShutdownMillisForTests, __serializeStorageConfigForTests } from "../src/scp";
 
 // ---------------------------------------------------------------------------
-// Load the raw native addon — `SCP` is exposed directly on the addon, not
-// through the `Bridge` interface (which only covers the free-function
-// façade). The TypeScript SDK wrapper for `SCP` lands in a subsequent PR.
+// Load the raw native addon — `SCP` is exposed directly on the addon.
+// The `Bridge` interface in `internal/bridge.ts` now forwards
+// per-instance calls onto the native `SCP` handle; the free-function
+// façade that the interface used to wrap was deleted in Phase 4 PR 4
+// (#1549, ADR-048). The TypeScript SDK wrapper for `SCP` lives in
+// `src/scp.ts`.
 // ---------------------------------------------------------------------------
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic native addon loading

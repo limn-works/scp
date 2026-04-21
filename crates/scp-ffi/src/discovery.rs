@@ -12,21 +12,21 @@
 //!
 //! `SCP` methods (bridge-state accessors):
 //!
-//! - [`PyScp::petname_set`] -- Set a petname for a DID.
-//! - [`PyScp::petname_remove`] -- Remove a petname from a DID.
-//! - [`PyScp::petname_resolve_did`] -- Resolve a petname to DIDs.
-//! - [`PyScp::petname_resolve_context`] -- Resolve a petname to context IDs.
-//! - [`PyScp::petname_get_for_did`] -- Get the petname assigned to a DID.
-//! - [`PyScp::petname_get_for_context`] -- Get the petname assigned to a context.
-//! - [`PyScp::petname_set_context`] -- Set a petname for a context.
-//! - [`PyScp::petname_remove_context`] -- Remove a petname from a context.
-//! - [`PyScp::handle_register`] -- Register a handle in a context with discovery tools.
-//! - [`PyScp::handle_lookup`] -- Look up a handle in a context with discovery tools.
-//! - [`PyScp::handle_deregister`] -- Deregister a handle from a context with discovery tools.
-//! - [`PyScp::scope_register`] -- Register a scope name (§22.3.5, ADR-043).
-//! - [`PyScp::scope_lookup`] -- Look up a scope name (§22.3.5, ADR-043).
-//! - [`PyScp::scope_deregister`] -- Deregister a scope name (§22.3.5, ADR-043).
-//! - [`PyScp::address_resolve`] -- Resolve an address via multi-path resolution.
+//! - `PyScp::petname_set` -- Set a petname for a DID.
+//! - `PyScp::petname_remove` -- Remove a petname from a DID.
+//! - `PyScp::petname_resolve_did` -- Resolve a petname to DIDs.
+//! - `PyScp::petname_resolve_context` -- Resolve a petname to context IDs.
+//! - `PyScp::petname_get_for_did` -- Get the petname assigned to a DID.
+//! - `PyScp::petname_get_for_context` -- Get the petname assigned to a context.
+//! - `PyScp::petname_set_context` -- Set a petname for a context.
+//! - `PyScp::petname_remove_context` -- Remove a petname from a context.
+//! - `PyScp::handle_register` -- Register a handle in a context with discovery tools.
+//! - `PyScp::handle_lookup` -- Look up a handle in a context with discovery tools.
+//! - `PyScp::handle_deregister` -- Deregister a handle from a context with discovery tools.
+//! - `PyScp::scope_register` -- Register a scope name (§22.3.5, ADR-043).
+//! - `PyScp::scope_lookup` -- Look up a scope name (§22.3.5, ADR-043).
+//! - `PyScp::scope_deregister` -- Deregister a scope name (§22.3.5, ADR-043).
+//! - `PyScp::address_resolve` -- Resolve an address via multi-path resolution.
 //!
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
 //! methods in Phase 4 PR 4 sub-slice D (#1549).

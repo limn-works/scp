@@ -846,7 +846,7 @@ pub enum CustodyMethod {
     Software,
     /// Identity loaded by DID string without local key material.
     ///
-    /// Used by [`identity_load`] to represent an identity whose keys are
+    /// Used by `identity_load` to represent an identity whose keys are
     /// managed externally (e.g., via an injected `KeyCustodyProvider`).
     External,
 }
@@ -1839,7 +1839,7 @@ impl Drop for Identity {
     /// Decrements the global FFI handle count.
     ///
     /// Called when the last `Arc<Identity>` is dropped, releasing the handle.
-    /// This allows [`crate::scp_shutdown`] to detect when all handles are
+    /// This allows `crate::scp_shutdown` to detect when all handles are
     /// gone before tearing down the tokio runtime.
     fn drop(&mut self) {
         decrement_handle_count();
@@ -1959,7 +1959,7 @@ impl Drop for ContextHandle {
     /// Decrements the global FFI handle count.
     ///
     /// Called when the last `Arc<ContextHandle>` is dropped. This allows
-    /// [`crate::scp_shutdown`] to detect when all handles are released
+    /// `crate::scp_shutdown` to detect when all handles are released
     /// before tearing down the tokio runtime.
     fn drop(&mut self) {
         decrement_handle_count();
@@ -2309,7 +2309,7 @@ impl Drop for TransportManager {
     /// Decrements the global FFI handle count.
     ///
     /// Called when the last `Arc<TransportManager>` is dropped. This allows
-    /// [`crate::scp_shutdown`] to detect when all handles are released
+    /// `crate::scp_shutdown` to detect when all handles are released
     /// before tearing down the tokio runtime.
     fn drop(&mut self) {
         decrement_handle_count();
@@ -4821,8 +4821,9 @@ pub fn verify_participation_requirements(
 
 /// Per-instance equivalent of [`uniffi_append_provenance_event`].
 ///
-/// Appends a provenance event to the UCAN event log on `bi` instead of
-/// the process-global default bridge instance.
+/// Appends a provenance event to the UCAN event log on `bi`. Phase D
+/// (#1695, ADR-048) replaces the prior free function that consulted the
+/// deleted process-wide `DEFAULT_BRIDGE_INSTANCE`.
 fn uniffi_append_provenance_event_on(
     bi: &crate::runtime::UniffiBridgeInstance,
     context_id: &str,
@@ -6726,7 +6727,7 @@ use crate::scp::Scp;
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Scp {
-    /// Per-instance equivalent of the free-function [`identity_create`].
+    /// Per-instance equivalent of the free-function `identity_create`.
     ///
     /// Creates a new SCP identity under this instance. Routes through
     /// `&*self.inner` instead of the process-wide
@@ -6734,7 +6735,7 @@ impl Scp {
     /// initialization, handle `instance_id` stamping) is scoped to this
     /// `SCP`.
     ///
-    /// See the documentation on the free [`identity_create`] function for
+    /// See the documentation on the free `identity_create` function for
     /// argument semantics and the `"in_memory"` / `"platform"` custody
     /// distinction (ADR-006, #88).
     pub async fn identity_create(&self, custody: String) -> Result<Arc<Identity>, ScpError> {
@@ -6837,7 +6838,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`identity_create_with_custody`].
+    /// `identity_create_with_custody`.
     ///
     /// Creates a new SCP identity under this instance using an injected
     /// [`KeyCustodyProvider`](crate::KeyCustodyProvider). Routes through
@@ -6885,7 +6886,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`identity_load`].
+    /// Per-instance equivalent of the free-function `identity_load`.
     ///
     /// Loads an external identity handle under this instance. Routes through
     /// `&*self.inner` — the returned handle's `instance_id` is stamped
@@ -6925,7 +6926,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`identity_resolve`].
+    /// Per-instance equivalent of the free-function `identity_resolve`.
     ///
     /// Resolves a DID to its document. DID resolution itself doesn't touch
     /// the instance — the method variant exists for API symmetry with the
@@ -6960,7 +6961,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`identity_attest_device`].
+    /// `identity_attest_device`.
     ///
     /// Rejects any `Identity` whose `instance_id` does not match this
     /// `SCP`'s — cross-instance handle misuse surfaces as
@@ -6977,7 +6978,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`identity_verify_device_attestation`].
+    /// `identity_verify_device_attestation`.
     ///
     /// Verification itself is a pure function — taking `&self` keeps the
     /// method surface uniform.
@@ -6993,7 +6994,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`identity_create_link_attestation`].
+    /// `identity_create_link_attestation`.
     ///
     /// Signs the link attestation with the identity's active signing key
     /// and stores the entry in the per-instance link-attestation and
@@ -7028,7 +7029,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`identity_link_attestations`].
+    /// `identity_link_attestations`.
     ///
     /// Reads the link-attestation registry on `&*self.inner`.
     ///
@@ -7047,7 +7048,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`identity_remove_link_attestation`].
+    /// `identity_remove_link_attestation`.
     ///
     /// Mutates the link-attestation registry on `&*self.inner`.
     ///
@@ -7070,7 +7071,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`identity_verify_link_attestation`].
+    /// `identity_verify_link_attestation`.
     ///
     /// Signature verification is a pure function — taking `&self` keeps
     /// the method surface uniform.
@@ -7095,7 +7096,7 @@ impl Scp {
     // caller's `UniffiBridgeInstance`). The free-function façade was
     // deleted in Phase 4 PR 4 (#1549, ADR-048).
 
-    /// Per-instance equivalent of the free-function [`context_create`].
+    /// Per-instance equivalent of the free-function `context_create`.
     ///
     /// Creates a new SCP context under this instance. Routes through
     /// `&*self.inner` instead of the process-wide
@@ -7104,7 +7105,7 @@ impl Scp {
     /// and the returned handle's `instance_id` stamping are all scoped to
     /// this `SCP`. The context handle is rejected on any other `SCP`.
     ///
-    /// See the documentation on the free [`context_create`] function for
+    /// See the documentation on the free `context_create` function for
     /// argument semantics and MLS group / event-log initialization
     /// details.
     pub async fn context_create(
@@ -7284,12 +7285,12 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`context_join`].
+    /// Per-instance equivalent of the free-function `context_join`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` /
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
     ///
-    /// See the documentation on the free [`context_join`] function for
+    /// See the documentation on the free `context_join` function for
     /// argument semantics and the spending-UCAN AND-composition path.
     pub async fn context_join(
         &self,
@@ -7458,7 +7459,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`context_leave`].
+    /// Per-instance equivalent of the free-function `context_leave`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` /
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -7519,7 +7520,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`context_close`].
+    /// Per-instance equivalent of the free-function `context_close`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` /
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -7662,7 +7663,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`context_send`].
+    /// Per-instance equivalent of the free-function `context_send`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` /
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -7799,7 +7800,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`context_subscribe`].
+    /// Per-instance equivalent of the free-function `context_subscribe`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -7860,7 +7861,7 @@ impl Scp {
     //
     // Part of #1549 Phase 4 PR 4.
 
-    /// Per-instance equivalent of the free-function [`governance_execute`].
+    /// Per-instance equivalent of the free-function `governance_execute`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -7967,7 +7968,7 @@ impl Scp {
         Ok(result)
     }
 
-    /// Per-instance equivalent of the free-function [`governance_propose`].
+    /// Per-instance equivalent of the free-function `governance_propose`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -8036,7 +8037,7 @@ impl Scp {
         Ok(result)
     }
 
-    /// Per-instance equivalent of the free-function [`governance_approve`].
+    /// Per-instance equivalent of the free-function `governance_approve`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -8087,7 +8088,7 @@ impl Scp {
         result
     }
 
-    /// Per-instance equivalent of the free-function [`governance_reject`].
+    /// Per-instance equivalent of the free-function `governance_reject`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -8138,7 +8139,7 @@ impl Scp {
         result
     }
 
-    /// Per-instance equivalent of the free-function [`governance_withdraw`].
+    /// Per-instance equivalent of the free-function `governance_withdraw`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -8188,7 +8189,7 @@ impl Scp {
         result
     }
 
-    /// Per-instance equivalent of the free-function [`governance_get_proposal`].
+    /// Per-instance equivalent of the free-function `governance_get_proposal`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -8225,7 +8226,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`governance_list_proposals`].
+    /// Per-instance equivalent of the free-function `governance_list_proposals`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -8261,7 +8262,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`apply_pending_ceiling_modification`].
+    /// `apply_pending_ceiling_modification`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -8294,7 +8295,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`finalize_close`].
+    /// Per-instance equivalent of the free-function `finalize_close`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -8342,7 +8343,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`create_governance_checkpoint`].
+    /// `create_governance_checkpoint`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -8408,7 +8409,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`add_checkpoint_cosignature`].
+    /// `add_checkpoint_cosignature`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -8466,7 +8467,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`restore_context`].
+    /// Per-instance equivalent of the free-function `restore_context`.
     ///
     /// Routes through `&*self.inner`.
     pub async fn restore_context(&self, context_id: String) -> Result<(), ScpError> {
@@ -8503,7 +8504,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`restore_all_contexts`].
+    /// Per-instance equivalent of the free-function `restore_all_contexts`.
     ///
     /// Routes through `&*self.inner`.
     pub async fn restore_all_contexts(&self) -> Result<String, ScpError> {
@@ -8529,7 +8530,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`tombstone_migrated_context`].
+    /// `tombstone_migrated_context`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -8565,7 +8566,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`migration_state`].
+    /// Per-instance equivalent of the free-function `migration_state`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -8629,7 +8630,7 @@ impl Scp {
     //
     // Part of #1549 Phase 4 PR 4.
 
-    /// Per-instance equivalent of the free-function [`broadcast_subscribe`].
+    /// Per-instance equivalent of the free-function `broadcast_subscribe`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -8671,7 +8672,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`broadcast_unsubscribe`].
+    /// Per-instance equivalent of the free-function `broadcast_unsubscribe`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -8703,7 +8704,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`broadcast_publish`].
+    /// Per-instance equivalent of the free-function `broadcast_publish`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -8794,7 +8795,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`broadcast_publish_asset`].
+    /// `broadcast_publish_asset`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -8948,7 +8949,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`broadcast_publish_assets`].
+    /// `broadcast_publish_assets`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -9115,7 +9116,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`broadcast_block_subscriber`].
+    /// `broadcast_block_subscriber`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -9149,7 +9150,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`broadcast_unblock_subscriber`].
+    /// `broadcast_unblock_subscriber`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -9183,7 +9184,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`broadcast_handle_key_request`].
+    /// `broadcast_handle_key_request`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -9217,7 +9218,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`broadcast_subscriber_count`].
+    /// `broadcast_subscriber_count`.
     ///
     /// Routes through `&*self.inner`. Returns `None` when the handle's
     /// `instance_id` does not match this `SCP`'s.
@@ -9235,7 +9236,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`broadcast_is_subscriber`].
+    /// `broadcast_is_subscriber`.
     ///
     /// Routes through `&*self.inner`. Returns `false` when the handle's
     /// `instance_id` does not match this `SCP`'s.
@@ -9251,7 +9252,7 @@ impl Scp {
             .await
     }
 
-    /// Per-instance equivalent of the free-function [`broadcast_admission`].
+    /// Per-instance equivalent of the free-function `broadcast_admission`.
     ///
     /// Routes through `&*self.inner`. Returns `None` when the handle's
     /// `instance_id` does not match this `SCP`'s.
@@ -9268,7 +9269,7 @@ impl Scp {
             .map(|a| format!("{a:?}"))
     }
 
-    /// Per-instance equivalent of the free-function [`context_member_count`].
+    /// Per-instance equivalent of the free-function `context_member_count`.
     ///
     /// Routes through `&*self.inner`. Returns `None` when the handle's
     /// `instance_id` does not match this `SCP`'s.
@@ -9285,7 +9286,7 @@ impl Scp {
             .map(|n| n as u64)
     }
 
-    /// Per-instance equivalent of the free-function [`context_is_member`].
+    /// Per-instance equivalent of the free-function `context_is_member`.
     ///
     /// Routes through `&*self.inner`. Returns `false` when the handle's
     /// `instance_id` does not match this `SCP`'s.
@@ -9299,7 +9300,7 @@ impl Scp {
         manager.is_member(&handle.context_id, &did).await
     }
 
-    /// Per-instance equivalent of the free-function [`context_member_dids`].
+    /// Per-instance equivalent of the free-function `context_member_dids`.
     ///
     /// Routes through `&*self.inner`. Returns an empty `Vec` when the
     /// handle's `instance_id` does not match this `SCP`'s.
@@ -9313,7 +9314,7 @@ impl Scp {
         manager.member_dids(&handle.context_id).await
     }
 
-    /// Per-instance equivalent of the free-function [`context_member_role`].
+    /// Per-instance equivalent of the free-function `context_member_role`.
     ///
     /// Routes through `&*self.inner`. Returns `None` when the handle's
     /// `instance_id` does not match this `SCP`'s.
@@ -9334,7 +9335,7 @@ impl Scp {
             .map(|r| format!("{r:?}"))
     }
 
-    /// Per-instance equivalent of the free-function [`context_drain_events`].
+    /// Per-instance equivalent of the free-function `context_drain_events`.
     ///
     /// Routes through `&*self.inner`. Returns an empty `Vec` when the
     /// handle's `instance_id` does not match this `SCP`'s.
@@ -9379,7 +9380,7 @@ impl Scp {
     //
     // Part of #1549 Phase 4 PR 4.
 
-    /// Per-instance equivalent of the free-function [`tool_register`].
+    /// Per-instance equivalent of the free-function `tool_register`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -9524,7 +9525,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`tool_invoke`].
+    /// Per-instance equivalent of the free-function `tool_invoke`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -9696,7 +9697,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`tool_verify`].
+    /// Per-instance equivalent of the free-function `tool_verify`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -9738,7 +9739,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`tool_invoke_cross_context`].
+    /// `tool_invoke_cross_context`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -9891,7 +9892,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`tool_session_create`].
+    /// Per-instance equivalent of the free-function `tool_session_create`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -9965,7 +9966,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`tool_session_invoke`].
+    /// Per-instance equivalent of the free-function `tool_session_invoke`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -10106,7 +10107,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`tool_session_close`].
+    /// Per-instance equivalent of the free-function `tool_session_close`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -10137,7 +10138,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`tool_interface_expose`].
+    /// Per-instance equivalent of the free-function `tool_interface_expose`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -10227,7 +10228,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`tool_interface_accept`].
+    /// Per-instance equivalent of the free-function `tool_interface_accept`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -10302,7 +10303,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`tool_interface_revoke`].
+    /// Per-instance equivalent of the free-function `tool_interface_revoke`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -10351,7 +10352,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`access_key_generate`].
+    /// Per-instance equivalent of the free-function `access_key_generate`.
     ///
     /// Routes through `&*self.inner`.
     pub async fn access_key_generate(
@@ -10367,7 +10368,7 @@ impl Scp {
             .map_err(ScpError::from)
     }
 
-    /// Per-instance equivalent of the free-function [`access_key_revoke`].
+    /// Per-instance equivalent of the free-function `access_key_revoke`.
     ///
     /// Routes through `&*self.inner`.
     pub async fn access_key_revoke(
@@ -10383,7 +10384,7 @@ impl Scp {
             .map_err(ScpError::from)
     }
 
-    /// Per-instance equivalent of the free-function [`access_key_restore`].
+    /// Per-instance equivalent of the free-function `access_key_restore`.
     ///
     /// Routes through `&*self.inner`.
     pub async fn access_key_restore(
@@ -10400,7 +10401,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`context_handle_ttl_expiry`].
+    /// `context_handle_ttl_expiry`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -10443,7 +10444,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`context_propose_ttl_extension`].
+    /// `context_propose_ttl_extension`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -10476,7 +10477,7 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function
-    /// [`context_reset_ttl_timer`].
+    /// `context_reset_ttl_timer`.
     ///
     /// Routes through `&*self.inner`. Silently returns when the handle's
     /// `instance_id` does not match this `SCP`'s (matches the free-function
@@ -10501,7 +10502,7 @@ impl Scp {
             .await;
     }
 
-    /// Per-instance equivalent of the free-function [`event_log_query`].
+    /// Per-instance equivalent of the free-function `event_log_query`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -10678,7 +10679,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`event_log_verify`].
+    /// Per-instance equivalent of the free-function `event_log_verify`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -10867,7 +10868,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`event_log_checkpoint`].
+    /// Per-instance equivalent of the free-function `event_log_checkpoint`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` or
     /// `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -10888,7 +10889,7 @@ impl Scp {
         event_log_checkpoint_impl(Arc::clone(&self.inner), handle, identity, epoch).await
     }
 
-    /// Per-instance equivalent of the free-function [`ucan_validate`].
+    /// Per-instance equivalent of the free-function `ucan_validate`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -11007,7 +11008,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`ucan_mint`].
+    /// Per-instance equivalent of the free-function `ucan_mint`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -11034,7 +11035,7 @@ impl Scp {
         ucan_mint_impl(handle, member_did, capabilities, proofs).await
     }
 
-    /// Per-instance equivalent of the free-function [`ucan_revoke`].
+    /// Per-instance equivalent of the free-function `ucan_revoke`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -11113,7 +11114,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`ucan_delegate`].
+    /// Per-instance equivalent of the free-function `ucan_delegate`.
     ///
     /// Routes through `&*self.inner`. Rejects any `ContextHandle` whose
     /// `instance_id` does not match this `SCP`'s.
@@ -11184,7 +11185,7 @@ impl Scp {
     //
     // Part of #1549 Phase 4 PR 4.
 
-    /// Per-instance equivalent of the free-function [`transport_connect`].
+    /// Per-instance equivalent of the free-function `transport_connect`.
     ///
     /// Routes through `&*self.inner`. The returned `TransportManager`
     /// handle's `instance_id` is stamped against this `SCP`'s
@@ -11277,7 +11278,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`transport_status`].
+    /// Per-instance equivalent of the free-function `transport_status`.
     ///
     /// Routes through `&*self.inner`. Rejects any `TransportManager`
     /// whose `instance_id` does not match this `SCP`'s.
@@ -11293,7 +11294,7 @@ impl Scp {
         Ok(manager.status())
     }
 
-    /// Per-instance equivalent of the free-function [`transport_disconnect`].
+    /// Per-instance equivalent of the free-function `transport_disconnect`.
     ///
     /// Routes through `&*self.inner`. Rejects any `TransportManager`
     /// whose `instance_id` does not match this `SCP`'s.
@@ -11346,7 +11347,7 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function [`configure_relay_transport`].
+    /// Per-instance equivalent of the free-function `configure_relay_transport`.
     ///
     /// Routes through `&*self.inner`. Installs a real `MlsCryptoProvider`
     /// and `RelayTransportProvider` on this instance's `ContextManager`.
@@ -11377,7 +11378,7 @@ impl Scp {
         Ok(())
     }
 
-    /// Per-instance equivalent of the free-function [`mcp_server_create`].
+    /// Per-instance equivalent of the free-function `mcp_server_create`.
     ///
     /// Routes through `&*self.inner`. The MCP server registry is
     /// module-level (not per-instance) so the returned opaque handle
@@ -11491,7 +11492,7 @@ impl Scp {
         Ok(handle_id)
     }
 
-    /// Per-instance equivalent of the free-function [`mcp_server_stop`].
+    /// Per-instance equivalent of the free-function `mcp_server_stop`.
     ///
     /// Routes through the module-level MCP server registry (the registry
     /// is not per-instance; the opaque handle string is globally unique).
@@ -11521,7 +11522,7 @@ impl Scp {
         Ok(())
     }
 
-    /// Per-instance equivalent of the free-function [`mcp_client_connect_stdio`].
+    /// Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
     ///
     /// Routes through the module-level MCP client registry.
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
@@ -11557,7 +11558,7 @@ impl Scp {
         Ok(handle_id)
     }
 
-    /// Per-instance equivalent of the free-function [`mcp_client_connect_sse`].
+    /// Per-instance equivalent of the free-function `mcp_client_connect_sse`.
     ///
     /// Routes through the module-level MCP client registry.
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
@@ -11584,7 +11585,7 @@ impl Scp {
         Ok(handle_id)
     }
 
-    /// Per-instance equivalent of the free-function [`mcp_client_disconnect`].
+    /// Per-instance equivalent of the free-function `mcp_client_disconnect`.
     ///
     /// Routes through the module-level MCP client registry.
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
@@ -11602,7 +11603,7 @@ impl Scp {
         Ok(())
     }
 
-    /// Per-instance equivalent of the free-function [`mcp_client_list_tools`].
+    /// Per-instance equivalent of the free-function `mcp_client_list_tools`.
     ///
     /// Routes through the module-level MCP client registry.
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
@@ -11640,7 +11641,7 @@ impl Scp {
             .collect())
     }
 
-    /// Per-instance equivalent of the free-function [`mcp_client_invoke`].
+    /// Per-instance equivalent of the free-function `mcp_client_invoke`.
     ///
     /// Routes through the module-level MCP client registry.
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
@@ -11735,7 +11736,7 @@ impl Scp {
         })
     }
 
-    /// Per-instance equivalent of the free-function [`register_local_did`].
+    /// Per-instance equivalent of the free-function `register_local_did`.
     ///
     /// Routes through `&*self.inner`. Initializes this instance's
     /// `ContextManager` if not yet attached (idempotent) and registers
@@ -11748,7 +11749,7 @@ impl Scp {
         Ok(())
     }
 
-    /// Per-instance equivalent of the free-function [`is_local_did`].
+    /// Per-instance equivalent of the free-function `is_local_did`.
     ///
     /// Routes through `&*self.inner`. Returns `false` if the DID fails
     /// validation or the instance's `ContextManager` cannot be
@@ -11768,7 +11769,7 @@ impl Scp {
         manager.is_local_did(&did_ref).await
     }
 
-    /// Per-instance equivalent of the free-function [`bridge_create_shadow`].
+    /// Per-instance equivalent of the free-function `bridge_create_shadow`.
     ///
     /// Mutates this instance's per-context bridge state. Rejects any
     /// cross-instance caller (the method takes `&self` — the `bi` threaded
@@ -11882,7 +11883,7 @@ impl Scp {
         crate::server::node_start_local_on(&self.inner, data_dir, identity, passphrase).await
     }
 
-    /// Per-instance equivalent of the free-function [`trust_query_score`].
+    /// Per-instance equivalent of the free-function `trust_query_score`.
     ///
     /// Trust event counts are queried from the module-level helper (a
     /// stateless `(0, 0)` stub today — see `runtime::query_trust_event_counts`).
@@ -12078,7 +12079,7 @@ impl Scp {
         Ok(true)
     }
 
-    /// Per-instance equivalent of the free-function [`aggregate_trust_input`].
+    /// Per-instance equivalent of the free-function `aggregate_trust_input`.
     ///
     /// Routes through `&*self.inner` — trust data is populated against
     /// THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`),

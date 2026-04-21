@@ -2,11 +2,11 @@
 //!
 //! Exposes SCP event log operations to Python as methods on the `SCP` class:
 //!
-//! - [`PyScp::event_log_query`] -- Query the context event log with optional
+//! - `PyScp::event_log_query` -- Query the context event log with optional
 //!   filters.
-//! - [`PyScp::event_log_verify`] -- Verify a claim against the event log
+//! - `PyScp::event_log_verify` -- Verify a claim against the event log
 //!   (inclusion/absence proofs).
-//! - [`PyScp::event_log_checkpoint`] -- Generate a signed consistency checkpoint
+//! - `PyScp::event_log_checkpoint` -- Generate a signed consistency checkpoint
 //!   from the current event log state.
 //!
 //! All free `#[pyfunction]` exports were migrated to `#[pymethods] impl PyScp`
@@ -89,7 +89,7 @@ impl PyEvent {
 
 /// A verification proof from the event log, exposed to Python.
 ///
-/// Returned by [`PyScp::event_log_verify`]. Contains the verification result,
+/// Returned by `PyScp::event_log_verify`. Contains the verification result,
 /// the type of proof (inclusion or absence), and proof details as a
 /// JSON-compatible Python object.
 ///

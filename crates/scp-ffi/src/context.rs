@@ -2347,7 +2347,7 @@ impl crate::scp::PyScp {
 
     /// Exports a context's full state as serialized `MessagePack` bytes.
     ///
-    /// The returned bytes are a [`StoredValue<ContextExport>`] envelope per §17.5,
+    /// The returned bytes are a `StoredValue<ContextExport>` envelope per §17.5,
     /// suitable for backup, migration, or transfer to another node.
     ///
     /// # Arguments
@@ -2392,8 +2392,8 @@ impl crate::scp::PyScp {
 
     /// Imports a context from serialized `MessagePack` bytes.
     ///
-    /// The bytes must be a [`StoredValue<ContextExport>`] envelope per §17.5,
-    /// as produced by [`py_context_export`].
+    /// The bytes must be a `StoredValue<ContextExport>` envelope per §17.5,
+    /// as produced by `py_context_export`.
     ///
     /// # Arguments
     ///
@@ -2662,7 +2662,7 @@ impl crate::scp::PyScp {
 
     /// Proposes a governance action for voting.
     ///
-    /// Delegates to [`ContextManager::propose_governance_action_checked`],
+    /// Delegates to `ContextManager::propose_governance_action_checked`,
     /// which validates the proposer's `GovernancePropose` capability before
     /// submitting the proposal to the governance engine.
     ///
@@ -2750,7 +2750,7 @@ impl crate::scp::PyScp {
 
     /// Casts an approval vote on a pending governance proposal.
     ///
-    /// Delegates to [`ContextManager::approve_governance_proposal`], which
+    /// Delegates to `ContextManager::approve_governance_proposal`, which
     /// validates the voter's `GovernanceVote` capability before casting the
     /// vote. If the vote pushes the proposal past quorum, the action is
     /// auto-executed.
@@ -2811,7 +2811,7 @@ impl crate::scp::PyScp {
 
     /// Casts a rejection vote on a pending governance proposal.
     ///
-    /// Delegates to [`ContextManager::reject_governance_proposal`], which
+    /// Delegates to `ContextManager::reject_governance_proposal`, which
     /// validates the voter's `GovernanceVote` capability before casting the
     /// vote.
     ///
@@ -2870,7 +2870,7 @@ impl crate::scp::PyScp {
 
     /// Withdraws a previously cast vote on a pending governance proposal.
     ///
-    /// Delegates to [`ContextManager::withdraw_governance_vote`]. No signing
+    /// Delegates to `ContextManager::withdraw_governance_vote`. No signing
     /// key is required -- withdrawal is the voter's privileged operation on
     /// their own vote.
     ///
@@ -2990,7 +2990,7 @@ impl crate::scp::PyScp {
 
     /// Applies a pending ceiling modification if the notification period has elapsed.
     ///
-    /// Delegates to [`ContextManager::apply_pending_ceiling_modification`].
+    /// Delegates to `ContextManager::apply_pending_ceiling_modification`.
     /// Returns `true` if the modification was applied, `false` if no pending
     /// modification exists or the notification period has not elapsed.
     ///
@@ -3033,7 +3033,7 @@ impl crate::scp::PyScp {
 
     /// Finalizes the cooperative close flow for a context in `Closing` state.
     ///
-    /// Delegates to [`ContextManager::finalize_close`], which transitions
+    /// Delegates to `ContextManager::finalize_close`, which transitions
     /// the context from `Closing` to `Closed`, destroys keys per memory scope,
     /// and records a `ContextClosed` event.
     ///
@@ -3084,7 +3084,7 @@ impl crate::scp::PyScp {
 
     /// Creates a governance checkpoint for a context (ADR-031 §9).
     ///
-    /// Delegates to [`ContextManager::create_governance_checkpoint`].
+    /// Delegates to `ContextManager::create_governance_checkpoint`.
     ///
     /// # Arguments
     ///
@@ -3160,7 +3160,7 @@ impl crate::scp::PyScp {
 
     /// Adds a cosignature to an existing governance checkpoint (ADR-031 §9).
     ///
-    /// Delegates to [`ContextManager::add_checkpoint_cosignature`].
+    /// Delegates to `ContextManager::add_checkpoint_cosignature`.
     ///
     /// # Arguments
     ///
@@ -3226,7 +3226,7 @@ impl crate::scp::PyScp {
 
     /// Restores a single persisted context from storage.
     ///
-    /// Delegates to [`ContextManager::restore_context`]. The context must
+    /// Delegates to `ContextManager::restore_context`. The context must
     /// have been previously persisted and must not already be registered.
     ///
     /// # Arguments
@@ -3275,7 +3275,7 @@ impl crate::scp::PyScp {
 
     /// Restores all persisted contexts from storage.
     ///
-    /// Delegates to [`ContextManager::restore_all_contexts`]. Only contexts
+    /// Delegates to `ContextManager::restore_all_contexts`. Only contexts
     /// in `Active` state are restored; contexts in `Closing`/`Closed`/`Expired`
     /// states are skipped.
     ///
@@ -3433,9 +3433,9 @@ impl crate::scp::PyScp {
 
     /// Publishes a single asset to a broadcast context as structured content (SCP-290).
     ///
-    /// Constructs a [`BroadcastContent`] from the asset entry fields, computes an
+    /// Constructs a `BroadcastContent` from the asset entry fields, computes an
     /// `ETag` from the body, serializes with the magic prefix, and publishes via
-    /// [`ContextManager::publish_broadcast_content`].
+    /// `ContextManager::publish_broadcast_content`.
     ///
     /// Returns a dict with `blob_id` (hex-encoded SHA-256 of the serialized
     /// envelope) and `etag` (hex-encoded SHA-256 of the body).
@@ -4145,7 +4145,7 @@ impl crate::scp::PyScp {
     /// Generates and stores a per-member access key for explicit lifecycle
     /// management.
     ///
-    /// Delegates to [`ContextManager::generate_context_access_key`].
+    /// Delegates to `ContextManager::generate_context_access_key`.
     ///
     /// # Errors
     ///
@@ -4174,7 +4174,7 @@ impl crate::scp::PyScp {
     /// Revokes (removes) a member's access key from the context's access key
     /// store.
     ///
-    /// Delegates to [`ContextManager::revoke_context_access_key`].
+    /// Delegates to `ContextManager::revoke_context_access_key`.
     ///
     /// # Errors
     ///
@@ -4203,7 +4203,7 @@ impl crate::scp::PyScp {
     /// Restores a member's access key by generating a new key at the next
     /// epoch.
     ///
-    /// Delegates to [`ContextManager::restore_context_access_key`].
+    /// Delegates to `ContextManager::restore_context_access_key`.
     ///
     /// # Errors
     ///
@@ -4835,9 +4835,11 @@ mod tests {
 
     #[test]
     fn set_economic_policy_always_rejects_requires_governance() {
-        // Ensure the default bridge instance exists so the affinity check
-        // passes and the governance-rejection path is what errors (not
-        // `SCP-PERM-3030`).
+        // Build a fresh `PyBridgeInstance` via `__bi()` and mint the handle
+        // off of it so the affinity check passes and the
+        // governance-rejection path is what errors (not `SCP-PERM-3030`).
+        // Phase D (#1695) deleted the process-wide default bridge, so
+        // each test must construct its own instance.
         let mut handle = PyContextHandle::new(
             &__bi(),
             "ctx-econ-1".to_owned(),

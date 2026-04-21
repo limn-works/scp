@@ -594,7 +594,7 @@ export interface Bridge {
   // Lifecycle
   version(): string;
   /**
-   * Gracefully shuts down the default bridge instance.
+   * Gracefully shuts down this bridge instance.
    *
    * Awaits in-flight tasks up to `timeoutMillis` milliseconds, aborts any
    * remaining tasks when the deadline expires, clears registries,

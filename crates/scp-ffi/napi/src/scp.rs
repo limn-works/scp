@@ -4,12 +4,14 @@
 //! owns a [`NapiBridgeInstance`] — which in turn owns the `ContextManager`,
 //! transport, and bridge-specific registries.
 //!
-//! PR 1 introduces the type and its constructors plus the lifecycle
-//! methods. Later PRs migrate the free-function façade onto methods on
-//! this class; until then free functions continue to operate on the
-//! default instance (the legacy default bridge in [`crate::runtime`]).
+//! Phase 4 PR 4 (#1549, ADR-048) completed the migration: the
+//! free-function façade and the process-wide default bridge that
+//! backed it were deleted. Every entry point now flows through a
+//! caller-owned `Scp` whose handles are stamped with its
+//! `instance_id`, and cross-instance handle misuse is rejected by the
+//! inline `CoreFields::check_handle` call.
 //!
-//! See #1549 Phase 4 remainder plan (PR 1).
+//! See #1549 Phase 4 remainder plan and ADR-048.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -85,8 +87,9 @@ pub struct Scp {
 impl Scp {
     /// Constructs a fresh `SCP` instance with default in-memory state.
     ///
-    /// Equivalent to [`NapiBridgeInstance::new_napi`]. No state is shared
-    /// with the process-wide default instance.
+    /// Equivalent to [`NapiBridgeInstance::new_napi`]. Each call produces
+    /// a brand-new instance with its own `instance_id`, registries, and
+    /// transport state — no state is shared with any other `SCP`.
     #[napi(constructor)]
     #[allow(clippy::new_without_default)] // napi constructor cannot take Default
     pub fn new() -> napi::Result<Self> {
@@ -219,7 +222,7 @@ impl Scp {
     /// Resumes a suspended bridge instance.
     ///
     /// Clears the suspended flag, then runs any per-bridge async work chained
-    /// by the [`BridgeInstanceCore::resume`] override (transport reconnect
+    /// by the `BridgeInstanceCore::resume` override (transport reconnect
     /// from pending relay URLs, persisted-context restoration).
     #[napi]
     pub async fn resume(&self) -> napi::Result<()> {
@@ -278,22 +281,19 @@ impl Scp {
     // ====================================================================
     // #1549 Phase 4 PR 4 — sub-slice B: identity operations on SCP.
     //
-    // Migrates the `identity_*` free functions in `crate::identity` to
-    // instance methods on [`Scp`] routed through `&*self.inner`. The free
-    // functions are retained until the demolition slice deletes them; both
-    // paths continue to share the per-bridge `NapiBridgeInstance` state —
-    // method callers use their own `SCP`'s instance while free-function
-    // callers use the legacy default bridge.
+    // Hosts the `identity_*` instance methods on [`Scp`] routed through
+    // `&*self.inner`. The free-function façade that these methods
+    // superseded was deleted in the Phase 4 PR 4 demolition slice along
+    // with the process-wide default bridge it operated on (ADR-048).
     // ====================================================================
 
     /// Per-instance equivalent of the free-function `identity_create`.
     ///
     /// Creates a new DID identity under this SCP instance, routing through
-    /// `&*self.inner` instead of the process-global default bridge. Key
-    /// material, registry writes, and the DID resolver are all scoped to
-    /// this `SCP`.
+    /// `&*self.inner`. Key material, registry writes, and the DID
+    /// resolver are all scoped to this `SCP`.
     ///
-    /// See [`crate::identity::identity_create`] for argument semantics.
+    /// See `crate::identity::identity_create` for argument semantics.
     #[napi(js_name = "identityCreate")]
     pub async fn identity_create(
         &self,
@@ -1679,9 +1679,9 @@ impl Scp {
     //
     // Each method delegates to the per-bridge-instance `_on` helpers in
     // [`crate::context`] / [`crate::tools`], routing through `&*self.inner`
-    // so operations are scoped to this `SCP`'s bridge instance rather than
-    // the process-wide default. Free functions are retained until the
-    // demolition slice deletes them.
+    // so operations are scoped to this `SCP`'s bridge instance. The
+    // free-function façade that predated this migration was deleted in
+    // the Phase 4 PR 4 demolition slice (ADR-048).
     // ====================================================================
 
     /// Per-instance equivalent of the free-function `context_create`.
@@ -2582,8 +2582,9 @@ impl Scp {
     // [`crate::ucan`] / [`crate::event_log`] / [`crate::transport`] /
     // [`crate::economy`] / [`crate::trust`] / [`crate::server`], routing
     // through `&*self.inner` so operations are scoped to this `SCP`'s
-    // bridge instance rather than the process-wide default. Free functions
-    // are retained until the demolition slice deletes them.
+    // bridge instance. The free-function façade that predated this
+    // migration was deleted in the Phase 4 PR 4 demolition slice
+    // (ADR-048).
     // ====================================================================
 
     // -------------------------------------------------------------------
@@ -3044,9 +3045,9 @@ impl Scp {
     // Each method delegates to the per-bridge-instance `_on` helpers in
     // [`crate::mcp`] / [`crate::testing`] / [`crate::media`] /
     // [`crate::provenance`] / [`crate::sync`], routing through `&*self.inner`
-    // so operations are scoped to this `SCP`'s bridge instance rather than
-    // the process-wide default. Free functions are retained until the
-    // demolition slice deletes them.
+    // so operations are scoped to this `SCP`'s bridge instance. The
+    // free-function façade that predated this migration was deleted in
+    // the Phase 4 PR 4 demolition slice (ADR-048).
     // ====================================================================
 
     // -------------------------------------------------------------------

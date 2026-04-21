@@ -2,15 +2,15 @@
 //!
 //! Exposes SCP transport operations to Python as methods on the `SCP` class:
 //!
-//! - [`PyScp::transport_connect`] -- Connect to an SCP relay.
-//! - [`PyScp::transport_disconnect`] -- Disconnect from the current relay.
-//! - [`PyScp::transport_status`] -- Query transport connection status.
-//! - [`PyScp::configure_relay_transport`] -- Pre-configure `ContextManager`
+//! - `PyScp::transport_connect` -- Connect to an SCP relay.
+//! - `PyScp::transport_disconnect` -- Disconnect from the current relay.
+//! - `PyScp::transport_status` -- Query transport connection status.
+//! - `PyScp::configure_relay_transport` -- Pre-configure `ContextManager`
 //!   with `RelayTransportProvider`.
-//! - [`PyScp::transport_add_relay`] -- Register an additional relay adapter.
-//! - [`PyScp::transport_assign_relay_set`] -- Assign a relay set for a context.
-//! - [`PyScp::transport_adapter_count`] -- Number of registered adapters.
-//! - [`PyScp::transport_reliability`] -- Per-adapter reliability score.
+//! - `PyScp::transport_add_relay` -- Register an additional relay adapter.
+//! - `PyScp::transport_assign_relay_set` -- Assign a relay set for a context.
+//! - `PyScp::transport_adapter_count` -- Number of registered adapters.
+//! - `PyScp::transport_reliability` -- Per-adapter reliability score.
 //!
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
 //! methods in Phase 4 PR 4 sub-slice D (#1549).
@@ -30,10 +30,10 @@
 //! relay-based context discovery.
 //!
 //! The **currently-connected** relay URL is tracked on the
-//! [`PyBridgeInstance`](crate::runtime::PyBridgeInstance) as
+//! [`PyBridgeInstance`] as
 //! `connected_relay_url: RwLock<Option<String>>`. It is written by
-//! [`py_transport_connect`], cleared by [`py_transport_disconnect`], and
-//! read by [`py_transport_status`]. This is **distinct** from
+//! `py_transport_connect`, cleared by `py_transport_disconnect`, and
+//! read by `py_transport_status`. This is **distinct** from
 //! `CoreFields::relay_url` (in `scp-ffi-common`), which tracks the
 //! **pending** relay URL preserved across suspend/resume so the bridge can
 //! reconnect after the caller calls `resume()`. The two fields intentionally
@@ -270,7 +270,7 @@ impl crate::scp::PyScp {
         })
     }
 
-    /// Pre-configures the [`ContextManager`] with [`RelayTransportProvider`].
+    /// Pre-configures the `ContextManager` with `RelayTransportProvider`.
     ///
     /// **Must be called before any `identity_create` → `context_create` sequence.**
     /// Once the `ContextManager` is initialized (by whichever call arrives first),
@@ -331,7 +331,7 @@ impl crate::scp::PyScp {
     /// Registers an additional relay adapter with the transport manager.
     ///
     /// Connects to the specified relay URL and adds the resulting adapter to
-    /// the bridge instance's [`TransportManager`]. The `transport_connect`
+    /// the bridge instance's `TransportManager`. The `transport_connect`
     /// method must have been called first to initialize the manager.
     ///
     /// # Arguments
@@ -410,7 +410,7 @@ impl crate::scp::PyScp {
 
     /// Assigns a relay set for the given context.
     ///
-    /// Delegates to [`TransportManager::assign_relay_set`] which selects at
+    /// Delegates to `TransportManager::assign_relay_set` which selects at
     /// least `min_relays` adapters per context using round-robin spread to
     /// minimize overlap.
     ///

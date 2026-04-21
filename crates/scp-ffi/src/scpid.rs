@@ -3,9 +3,9 @@
 //! Exposes SCPID challenge generation, signing, and verification to Python
 //! as methods on the `SCP` class:
 //!
-//! - [`PyScp::scpid_challenge`] — Generate an SCPID challenge for a relying party.
-//! - [`PyScp::scpid_sign`] — Sign an SCPID challenge with a registered identity's key.
-//! - [`PyScp::scpid_verify`] — Verify a signed SCPID response (relying-party side).
+//! - `PyScp::scpid_challenge` — Generate an SCPID challenge for a relying party.
+//! - `PyScp::scpid_sign` — Sign an SCPID challenge with a registered identity's key.
+//! - `PyScp::scpid_verify` — Verify a signed SCPID response (relying-party side).
 //!
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
 //! methods in Phase 4 PR 4 sub-slice C (#1549).
@@ -75,7 +75,7 @@ impl crate::scp::PyScp {
     ///
     /// * `did` — The signer's DID (must be registered via `identity_create`).
     /// * `signing_key_id` — `"#active"` or `"#agent"`.
-    /// * `challenge_json` — JSON string of the challenge (from [`PyScp::scpid_challenge`]).
+    /// * `challenge_json` — JSON string of the challenge (from `PyScp::scpid_challenge`).
     ///
     /// # Errors
     ///

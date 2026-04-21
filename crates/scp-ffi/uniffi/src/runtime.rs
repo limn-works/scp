@@ -155,9 +155,10 @@ impl ProtocolRepoVariant {
 ///
 /// Constructed via [`UniffiBridgeInstance::new_uniffi`] /
 /// [`UniffiBridgeInstance::with_persistence_uniffi`] /
-/// [`UniffiBridgeInstance::with_storage_uniffi`]. The default global instance
-/// is lazily allocated into [`DEFAULT_BRIDGE_INSTANCE`]; user-owned instances
-/// (via `#[derive(uniffi::Object)] Scp`) build their own instead.
+/// [`UniffiBridgeInstance::with_storage_uniffi`]. Every caller-owned
+/// `#[derive(uniffi::Object)] Scp` constructs its own instance —
+/// Phase D (#1695, ADR-048) deleted the process-wide
+/// `DEFAULT_BRIDGE_INSTANCE` that earlier revisions lazily allocated.
 ///
 /// Implements [`BridgeInstanceCore`] so shared helpers can operate on
 /// `&dyn BridgeInstanceCore`. `shutdown(timeout)` delegates to
@@ -179,7 +180,9 @@ pub struct UniffiBridgeInstance {
     /// Previously stored type-erased in `CoreFields::identity_registry` AND
     /// as a bridge-local `OnceLock` in `bridge.rs::identity_custody_registry`.
     /// Both paths are unified here: `bridge.rs::identity_custody_registry`
-    /// now returns a reference to this field on the default instance.
+    /// now returns a reference to this field on the caller's own
+    /// `UniffiBridgeInstance` (Phase D, #1695, deleted the process-wide
+    /// default that the earlier `OnceLock` path backed).
     /// Feature-gated because only the `allow_in_memory_custody` build flag
     /// pulls in [`OpaqueInMemoryKeyCustody`](crate::bridge::OpaqueInMemoryKeyCustody).
     /// Cleared on shutdown — drops the `Arc<OpaqueInMemoryKeyCustody>` values
@@ -417,8 +420,9 @@ impl UniffiBridgeInstance {
     ///
     /// Marked `#[allow(dead_code)]` because bridge callers currently reach
     /// the registry via the free helper `bridge::identity_custody_registry()`
-    /// which dereferences this field directly. The typed accessor is kept for
-    /// per-instance callers introduced in later PRs.
+    /// which dereferences this field directly. The typed accessor is kept
+    /// for any future per-instance callers that prefer the typed path; it
+    /// is not gated on any pending work.
     #[cfg(feature = "allow_in_memory_custody")]
     #[must_use]
     #[allow(dead_code)]
@@ -494,7 +498,7 @@ impl UniffiBridgeInstance {
 
 impl UniffiBridgeInstance {
     /// Per-instance equivalent of the module-level
-    /// [`context_manager_expect`] free function.
+    /// `context_manager_expect` free function.
     ///
     /// Returns the attached `ContextManager` if the instance is not suspended
     /// and not shut down. A shutdown bridge is a hard error (not a warning)
@@ -529,7 +533,7 @@ impl UniffiBridgeInstance {
             })
     }
 
-    /// Per-instance equivalent of the module-level [`context_manager`] free
+    /// Per-instance equivalent of the module-level `context_manager` free
     /// function.
     ///
     /// Like [`UniffiBridgeInstance::context_manager_expect`] but treats
@@ -581,7 +585,7 @@ impl UniffiBridgeInstance {
     }
 
     /// Per-instance equivalent of the module-level
-    /// [`init_context_manager_with_did`] free function.
+    /// `init_context_manager_with_did` free function.
     ///
     /// Installs an `MlsCryptoProvider(local_did)` and
     /// `NotConfiguredTransportProvider` on this instance. No-op if a
@@ -610,7 +614,7 @@ impl UniffiBridgeInstance {
     }
 
     /// Per-instance equivalent of the module-level
-    /// [`init_context_manager_with_relay_transport`] free function.
+    /// `init_context_manager_with_relay_transport` free function.
     ///
     /// Installs an `MlsCryptoProvider(local_did)` and a
     /// `RelayTransportProvider` wrapping the supplied `NativeRelayAdapter` on
@@ -639,7 +643,7 @@ impl UniffiBridgeInstance {
     }
 
     /// Per-instance equivalent of the module-level
-    /// [`sync_role_state_from_manager`] free function.
+    /// `sync_role_state_from_manager` free function.
     ///
     /// Validates that the attached `ContextManager` has role state for the
     /// given context after a governance operation. Logs the sync for
@@ -672,7 +676,7 @@ impl UniffiBridgeInstance {
     }
 
     /// Per-instance equivalent of the module-level
-    /// [`with_rate_limit_tracker`] free function.
+    /// `with_rate_limit_tracker` free function.
     ///
     /// Delegates to [`CoreFields::with_rate_limit_tracker`].
     #[allow(dead_code)]
@@ -683,7 +687,7 @@ impl UniffiBridgeInstance {
         self.core.with_rate_limit_tracker(identity_did, f)
     }
 
-    /// Per-instance equivalent of the module-level [`did_resolver`] free
+    /// Per-instance equivalent of the module-level `did_resolver` free
     /// function.
     ///
     /// Returns a cloned `Arc` to the production DID resolver, if one has been
@@ -696,7 +700,7 @@ impl UniffiBridgeInstance {
         self.core.did_resolver().map(Arc::clone)
     }
 
-    /// Per-instance equivalent of the module-level [`init_did_resolver`] free
+    /// Per-instance equivalent of the module-level `init_did_resolver` free
     /// function.
     ///
     /// Wraps the supplied `DidResolver` in an `IdentityBackedDidResolver` and
@@ -714,7 +718,7 @@ impl UniffiBridgeInstance {
             )));
     }
 
-    /// Per-instance equivalent of the module-level [`ensure_ucan_registered`]
+    /// Per-instance equivalent of the module-level `ensure_ucan_registered`
     /// free function.
     ///
     /// Ensures UCAN validation state is registered for `context_id` in this
@@ -754,7 +758,7 @@ impl UniffiBridgeInstance {
         );
     }
 
-    /// Per-instance equivalent of the module-level [`with_ucan_state`] free
+    /// Per-instance equivalent of the module-level `with_ucan_state` free
     /// function.
     ///
     /// Accesses per-context UCAN state on this instance via a closure.
@@ -768,7 +772,7 @@ impl UniffiBridgeInstance {
         Some(f(&mut entry))
     }
 
-    /// Per-instance equivalent of the module-level [`remove_ucan_state`] free
+    /// Per-instance equivalent of the module-level `remove_ucan_state` free
     /// function.
     ///
     /// Removes per-context UCAN state from this instance and evicts the

@@ -2,10 +2,10 @@
 //!
 //! Exposes UCAN token management to JavaScript:
 //!
-//! - [`ucan_validate`] — Validate a UCAN token for a required capability.
-//! - [`ucan_mint`] — Mint a new UCAN token for a context member with real
+//! - `ucan_validate` — Validate a UCAN token for a required capability.
+//! - `ucan_mint` — Mint a new UCAN token for a context member with real
 //!   Ed25519 signing via `InMemoryKeyCustody`.
-//! - [`ucan_revoke`] — Revoke a UCAN token.
+//! - `ucan_revoke` — Revoke a UCAN token.
 //!
 //! # Validation pipeline
 //!

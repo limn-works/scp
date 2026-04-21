@@ -2,18 +2,18 @@
 //!
 //! Exposes economic operations to Python as methods on the `SCP` class:
 //!
-//! - [`PyScp::economy_estimate_cost`] — Estimate cost for an action in a context.
-//! - [`PyScp::economy_policy_requires_payment`] — Check if a policy requires payment.
-//! - [`PyScp::economy_auto_accept_blocked`] — Check if auto-accept is blocked by economics.
-//! - [`PyScp::economy_check_policy_lock`] — Check if economic policy mutation is allowed.
-//! - [`PyScp::economy_validate_policy_change`] — Validate a proposed policy change.
-//! - [`PyScp::economy_evaluate_formula`] — Evaluate a pricing formula against metrics.
-//! - [`PyScp::economy_budget_remaining`] — Query remaining budget for a member.
-//! - [`PyScp::economy_budget_grant`] — Grant spending budget to a member.
-//! - [`PyScp::economy_budget_record_spend`] — Record a spend against a member's budget.
-//! - [`PyScp::economy_antispam_record`] — Record a message for velocity tracking.
-//! - [`PyScp::economy_antispam_velocity`] — Query sender velocity.
-//! - [`PyScp::economy_antispam_escalated_cost`] — Compute escalated cost for a sender.
+//! - `PyScp::economy_estimate_cost` — Estimate cost for an action in a context.
+//! - `PyScp::economy_policy_requires_payment` — Check if a policy requires payment.
+//! - `PyScp::economy_auto_accept_blocked` — Check if auto-accept is blocked by economics.
+//! - `PyScp::economy_check_policy_lock` — Check if economic policy mutation is allowed.
+//! - `PyScp::economy_validate_policy_change` — Validate a proposed policy change.
+//! - `PyScp::economy_evaluate_formula` — Evaluate a pricing formula against metrics.
+//! - `PyScp::economy_budget_remaining` — Query remaining budget for a member.
+//! - `PyScp::economy_budget_grant` — Grant spending budget to a member.
+//! - `PyScp::economy_budget_record_spend` — Record a spend against a member's budget.
+//! - `PyScp::economy_antispam_record` — Record a message for velocity tracking.
+//! - `PyScp::economy_antispam_velocity` — Query sender velocity.
+//! - `PyScp::economy_antispam_escalated_cost` — Compute escalated cost for a sender.
 //!
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
 //! methods in Phase 4 PR 4 sub-slice D (#1549). Pure helpers

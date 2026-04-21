@@ -15,8 +15,8 @@
 //!
 //! `SCP` methods (bridge-state accessors):
 //!
-//! - [`PyScp::trust_query_score`] — Query participation-based trust data for a DID.
-//! - [`PyScp::aggregate_trust_input`] — Aggregate all trust engine layers into
+//! - `PyScp::trust_query_score` — Query participation-based trust data for a DID.
+//! - `PyScp::aggregate_trust_input` — Aggregate all trust engine layers into
 //!   a single [`TrustInput`](scp_core::trust::TrustInput) for agent-level
 //!   evaluation.
 //!

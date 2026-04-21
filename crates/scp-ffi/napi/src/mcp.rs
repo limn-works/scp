@@ -2,13 +2,13 @@
 //!
 //! Exposes MCP server and client operations to Node.js/Bun:
 //!
-//! - [`mcp_server_create`] — Start an MCP server exposing SCP context tools.
-//! - [`mcp_server_stop`] — Stop a running MCP server.
-//! - [`mcp_client_connect_stdio`] — Connect to an external MCP server via stdio.
-//! - [`mcp_client_connect_sse`] — Connect to an external MCP server via SSE.
-//! - [`mcp_client_disconnect`] — Disconnect from an external MCP server.
-//! - [`mcp_client_list_tools`] — List tools from an external MCP server.
-//! - [`mcp_client_invoke`] — Invoke an external MCP tool with SCP provenance.
+//! - `mcp_server_create` — Start an MCP server exposing SCP context tools.
+//! - `mcp_server_stop` — Stop a running MCP server.
+//! - `mcp_client_connect_stdio` — Connect to an external MCP server via stdio.
+//! - `mcp_client_connect_sse` — Connect to an external MCP server via SSE.
+//! - `mcp_client_disconnect` — Disconnect from an external MCP server.
+//! - `mcp_client_list_tools` — List tools from an external MCP server.
+//! - `mcp_client_invoke` — Invoke an external MCP tool with SCP provenance.
 //!
 //! The MCP bridge uses opaque string handles to track server and client
 //! instances in global registries (matching the `UniFFI` bridge pattern).

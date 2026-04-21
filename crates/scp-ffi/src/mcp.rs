@@ -2,19 +2,19 @@
 //!
 //! Exposes SCP MCP operations to Python:
 //!
-//! - [`py_mcp_serve`] -- Start an MCP server exposing SCP context tools.
-//! - [`py_mcp_server_stop`] -- Stop a running MCP server.
-//! - [`py_mcp_server_wait`] -- Block until the MCP server exits.
-//! - [`py_mcp_server_info`] -- Return metadata about a running MCP server.
-//! - [`py_mcp_client_connect_stdio`] -- Connect to an external MCP server via
+//! - `py_mcp_serve` -- Start an MCP server exposing SCP context tools.
+//! - `py_mcp_server_stop` -- Stop a running MCP server.
+//! - `py_mcp_server_wait` -- Block until the MCP server exits.
+//! - `py_mcp_server_info` -- Return metadata about a running MCP server.
+//! - `py_mcp_client_connect_stdio` -- Connect to an external MCP server via
 //!   stdio.
-//! - [`py_mcp_client_connect_sse`] -- Connect to an external MCP server via
+//! - `py_mcp_client_connect_sse` -- Connect to an external MCP server via
 //!   SSE.
-//! - [`py_mcp_client_disconnect`] -- Disconnect from an external MCP server.
-//! - [`py_mcp_client_info`] -- Return metadata about an active MCP client.
-//! - [`py_mcp_client_list_tools`] -- List tools from an external MCP server.
-//! - [`py_mcp_client_invoke`] -- Invoke an external MCP tool with provenance.
-//! - [`py_mcp_load_contexts`] -- Load active contexts for a DID from a relay.
+//! - `py_mcp_client_disconnect` -- Disconnect from an external MCP server.
+//! - `py_mcp_client_info` -- Return metadata about an active MCP client.
+//! - `py_mcp_client_list_tools` -- List tools from an external MCP server.
+//! - `py_mcp_client_invoke` -- Invoke an external MCP tool with provenance.
+//! - `py_mcp_load_contexts` -- Load active contexts for a DID from a relay.
 //!
 //! The MCP bridge uses opaque string handles to track server and client
 //! instances. Handles are stored in a global registry (similar to the
@@ -1498,7 +1498,7 @@ impl crate::scp::PyScp {
 /// Blocks until the MCP server exits.
 ///
 /// For stdio transport, waits until stdin is closed (EOF) or the server is
-/// stopped via [`py_mcp_server_stop`]. For SSE transport, waits until the
+/// stopped via `py_mcp_server_stop`. For SSE transport, waits until the
 /// HTTP server is terminated.
 ///
 /// # Arguments

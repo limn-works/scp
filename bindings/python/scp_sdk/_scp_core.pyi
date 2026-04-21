@@ -712,13 +712,10 @@ def shutdown_runtime(timeout_millis: int) -> None:
     """Shut down the shared tokio runtime (drain for ``timeout_millis`` ms)."""
     ...
 
-def scp_suspend() -> None:
-    """Suspend the process-global default instance (deprecated)."""
-    ...
-
-def scp_resume() -> None:
-    """Resume the process-global default instance (deprecated)."""
-    ...
+# Phase 4 PR 4 (#1549, ADR-048) deleted the ``scp_suspend`` / ``scp_resume``
+# free functions along with the process-wide default bridge they operated
+# against. Lifecycle is now driven per-instance via :meth:`SCP.suspend` /
+# :meth:`SCP.resume`.
 
 # -- pure helper functions (no bridge state) --
 

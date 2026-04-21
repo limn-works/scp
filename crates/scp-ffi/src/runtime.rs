@@ -228,8 +228,8 @@ pub enum StorageConfig {
 /// not `EncryptedStorage` because the sealed trait lives in `scp-platform`
 /// and cannot be implemented here. Call sites that need
 /// [`scp_core::store::ProtocolRepository`] dispatch on the variant and
-/// construct the concrete `ProtocolRepository<S>` directly (see
-/// [`build_persistence_provider`]).
+/// construct the concrete `ProtocolRepository<S>` directly (see the
+/// `build_persistence_provider` helper in this module).
 #[derive(Clone)]
 pub enum StorageProvider {
     /// Encrypted in-memory storage.
@@ -2440,11 +2440,15 @@ mod tests {
         );
     }
 
-    /// A fresh non-default `PyBridgeInstance` must be able to attach its own
-    /// `ContextManager` without any prior operation on the default instance.
+    /// Each freshly constructed `PyBridgeInstance` must be able to attach
+    /// its own `ContextManager` in isolation, with no dependency on any
+    /// other bridge instance.
     ///
-    /// Before the fix, `init_context_manager_for_test()` would silently target
-    /// `DEFAULT_BRIDGE_INSTANCE`, so a non-default `bi` appeared unaffected.
+    /// Before the fix, `init_context_manager_for_test()` silently targeted
+    /// the since-deleted process-wide `DEFAULT_BRIDGE_INSTANCE`, so the
+    /// explicit `bi` passed into it appeared unaffected. Phase D (#1695)
+    /// deleted that default bridge and this test now verifies that two
+    /// independent instances get independent managers.
     #[test]
     fn non_default_bi_gets_its_own_context_manager() {
         let bi_a = PyBridgeInstance::new_py();

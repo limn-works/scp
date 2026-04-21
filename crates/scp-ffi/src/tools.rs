@@ -2,18 +2,18 @@
 //!
 //! Exposes SCP tool operations to Python as methods on the `SCP` class:
 //!
-//! - [`PyScp::tool_register`] — Register a tool in a context (returns tool ID).
-//! - [`PyScp::tool_invoke`] — Invoke a tool (returns JSON-compatible output).
-//! - [`PyScp::tool_verify`] — Verify a tool against its test vectors.
-//! - [`PyScp::tool_invoke_cross_context`] — Invoke a tool across context
+//! - `PyScp::tool_register` — Register a tool in a context (returns tool ID).
+//! - `PyScp::tool_invoke` — Invoke a tool (returns JSON-compatible output).
+//! - `PyScp::tool_verify` — Verify a tool against its test vectors.
+//! - `PyScp::tool_invoke_cross_context` — Invoke a tool across context
 //!   boundaries.
-//! - [`PyScp::tool_session_create`] — Create a stateful tool session.
-//! - [`PyScp::tool_session_invoke`] — Invoke a tool within a session.
-//! - [`PyScp::tool_session_close`] — Close a stateful tool session.
-//! - [`PyScp::tool_interface_expose`] — Expose a tool interface (step 1 of
+//! - `PyScp::tool_session_create` — Create a stateful tool session.
+//! - `PyScp::tool_session_invoke` — Invoke a tool within a session.
+//! - `PyScp::tool_session_close` — Close a stateful tool session.
+//! - `PyScp::tool_interface_expose` — Expose a tool interface (step 1 of
 //!   the §6.2.0.1 bidirectional handshake).
-//! - [`PyScp::tool_interface_accept`] — Accept an exposed interface (step 4).
-//! - [`PyScp::tool_interface_revoke`] — Revoke an interface unilaterally.
+//! - `PyScp::tool_interface_accept` — Accept an exposed interface (step 4).
+//! - `PyScp::tool_interface_revoke` — Revoke an interface unilaterally.
 //!
 //! All free `#[pyfunction]` exports were migrated to `#[pymethods] impl PyScp`
 //! methods in Phase 4 PR 4 sub-slice E (#1549).
@@ -112,7 +112,7 @@ impl PyToolRegistration {
 
 /// Result of verifying a tool against its test vectors.
 ///
-/// Returned by [`py_tool_verify`]. Contains the tool ID, overall pass/fail
+/// Returned by `py_tool_verify`. Contains the tool ID, overall pass/fail
 /// status, and a list of failure messages (empty if all vectors passed).
 #[pyclass(name = "ToolVerificationResult")]
 #[derive(Debug, Clone)]

@@ -14,11 +14,13 @@
 
 use scp_ffi_uniffi::Scp;
 
-/// Consolidated lifecycle roundtrip — suspend/resume roundtrips on the
-/// process-wide default `Scp` instance, exercising the idempotent paths.
+/// Consolidated lifecycle roundtrip — suspend/resume roundtrips on a
+/// caller-owned `Scp` instance, exercising the idempotent paths.
 ///
 /// Consolidated into a single test to avoid cargo's parallel test runner
-/// interleaving concurrent invocations on the same global flag.
+/// interleaving concurrent invocations; although Phase D (#1695) deleted
+/// the process-wide default bridge, some shutdown bookkeeping remains
+/// process-global and parallel lifecycle tests can still race on it.
 ///
 /// Multi-threaded flavor because `resume()` now reaches into async
 /// persistence paths (`ProtocolRepositoryEventLogBridge::store_entries`
@@ -26,8 +28,9 @@ use scp_ffi_uniffi::Scp;
 /// runtime.
 ///
 /// Phase 4 PR 4 demolition (#1549): the free-function `scp_suspend` /
-/// `scp_resume` façade exports were deleted — tests now drive the default
-/// `Scp` instance through `Scp::default_instance().suspend()` / `.resume()`.
+/// `scp_resume` façade exports were deleted along with the process-wide
+/// default bridge — tests now drive a freshly constructed `Scp::new()`
+/// instance through `.suspend()` / `.resume()`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn scp_suspend_resume_roundtrip() {
     // Phase D (#1695): `Scp::default_instance` deleted — use `Scp::new()`.

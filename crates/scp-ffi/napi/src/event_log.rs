@@ -2,8 +2,8 @@
 //!
 //! Exposes event log queries and Merkle proof verification:
 //!
-//! - [`event_log_query`] — Query the context event log with optional filters.
-//! - [`event_log_verify`] — Verify a claim against the event log (Merkle proof).
+//! - `event_log_query` — Query the context event log with optional filters.
+//! - `event_log_verify` — Verify a claim against the event log (Merkle proof).
 //!
 //! See ADR-011 (Event Log) and ADR-022 in `.docs/adrs/`.
 

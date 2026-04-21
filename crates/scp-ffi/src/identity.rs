@@ -3,19 +3,19 @@
 //! Exposes [`PyIdentity`] and [`PyDIDDocument`] as opaque Python objects with
 //! attribute access, plus identity lifecycle methods on the `SCP` class:
 //!
-//! - [`PyScp::init_storage`] — initialises the storage provider.
-//! - [`PyScp::identity_create`] — creates a new DID identity.
-//! - [`PyScp::identity_create_with_agent_key`] — creates a new DID identity
+//! - `PyScp::init_storage` — initialises the storage provider.
+//! - `PyScp::identity_create` — creates a new DID identity.
+//! - `PyScp::identity_create_with_agent_key` — creates a new DID identity
 //!   with an agent signing key.
-//! - [`PyScp::identity_load`] — loads an existing identity from storage.
-//! - [`PyScp::identity_resolve`] — resolves a DID to its document.
-//! - [`PyScp::identity_rotate_key`] — rotates the identity's active signing
+//! - `PyScp::identity_load` — loads an existing identity from storage.
+//! - `PyScp::identity_resolve` — resolves a DID to its document.
+//! - `PyScp::identity_rotate_key` — rotates the identity's active signing
 //!   key.
-//! - [`PyScp::identity_add_agent_key`] — adds an agent signing key to an
+//! - `PyScp::identity_add_agent_key` — adds an agent signing key to an
 //!   identity.
-//! - [`PyScp::identity_rotate_agent_key`] — rotates the agent signing key.
-//! - [`PyScp::identity_remove_agent_key`] — removes the agent signing key.
-//! - [`PyScp::identity_migrate`] — migrates an identity to a new DID.
+//! - `PyScp::identity_rotate_agent_key` — rotates the agent signing key.
+//! - `PyScp::identity_remove_agent_key` — removes the agent signing key.
+//! - `PyScp::identity_migrate` — migrates an identity to a new DID.
 //!
 //! Plus device-attestation and identity-link-attestation methods. All free
 //! `#[pyfunction]` exports were migrated to `#[pymethods] impl PyScp` methods
@@ -526,8 +526,8 @@ fn deserialize_identity_state(data: &[u8]) -> Result<(String, String), ScpPyErro
 impl crate::scp::PyScp {
     /// Initializes the storage provider for identity persistence.
     ///
-    /// Must be called before [`PyScp::identity_create`] or
-    /// [`PyScp::identity_load`] if storage persistence is desired. The storage
+    /// Must be called before `PyScp::identity_create` or
+    /// `PyScp::identity_load` if storage persistence is desired. The storage
     /// provider is scoped to this instance; separate `SCP` instances hold
     /// independent providers.
     ///
@@ -563,7 +563,7 @@ impl crate::scp::PyScp {
     /// # Storage
     ///
     /// If a storage provider has been initialized via
-    /// [`PyScp::init_storage`], the identity state (DID, custody type) is
+    /// `PyScp::init_storage`, the identity state (DID, custody type) is
     /// persisted under the key `identity/{did}/state` after successful
     /// creation (SCP-217).
     ///
@@ -624,7 +624,7 @@ impl crate::scp::PyScp {
 
     /// Creates a new DID identity with an agent signing key.
     ///
-    /// Like [`PyScp::identity_create`], but the resulting identity also has
+    /// Like `PyScp::identity_create`, but the resulting identity also has
     /// an `#agent` verification method in its DID document.
     ///
     /// # Arguments
@@ -702,7 +702,7 @@ impl crate::scp::PyScp {
     /// crypto state in the runtime registry.
     ///
     /// If the identity was created in this process (via
-    /// [`PyScp::identity_create`]), it will be in the registry and this method
+    /// `PyScp::identity_create`), it will be in the registry and this method
     /// succeeds. If the identity was created in a different process with
     /// in-memory custody, the key material is lost and this method returns
     /// `SCP-IDENT-1010`. File-backed custody persists across restarts if the
@@ -1242,7 +1242,7 @@ impl crate::scp::PyScp {
 
     /// Generates a device attestation token for an identity.
     ///
-    /// Uses [`InMemoryDeviceAttestation`] (available only with
+    /// Uses `InMemoryDeviceAttestation` (available only with
     /// `allow_in_memory_custody` feature) to produce a synthetic attestation
     /// token, then attaches it to the identity's DID document via
     /// [`DidDht::attach_device_attestation`].
@@ -1308,7 +1308,7 @@ impl crate::scp::PyScp {
 
     /// Verifies a device attestation token.
     ///
-    /// Uses [`InMemoryDeviceAttestation`] to check the token format.
+    /// Uses `InMemoryDeviceAttestation` to check the token format.
     ///
     /// # Arguments
     ///
@@ -1365,7 +1365,7 @@ impl crate::scp::PyScp {
 
     /// Creates an identity link attestation for an external platform identity.
     ///
-    /// Constructs an [`IdentityLinkAttestation`] with a real Ed25519 signature
+    /// Constructs an `IdentityLinkAttestation` with a real Ed25519 signature
     /// from the identity's active signing key. The attestation is stored in the
     /// identity registry for retrieval via `identity_link_attestations`.
     ///
@@ -1597,8 +1597,8 @@ impl crate::scp::PyScp {
 
     /// Executes the compromise recovery protocol for the given DID.
     ///
-    /// This method creates a [`CompromiseRecoveryOrchestrator`] and a mock
-    /// [`RecoveryBackend`] and runs the 6-step recovery protocol. Step 1 (key
+    /// This method creates a `CompromiseRecoveryOrchestrator` and a mock
+    /// `RecoveryBackend` and runs the 6-step recovery protocol. Step 1 (key
     /// rotation) is represented by the caller-provided `tier` and
     /// `rotated_key_scopes`.
     ///
@@ -1739,7 +1739,7 @@ impl crate::scp::PyScp {
 
     /// Executes the custody migration protocol for the given DID.
     ///
-    /// This method creates a [`CustodyMigrationOrchestrator`] and runs the
+    /// This method creates a `CustodyMigrationOrchestrator` and runs the
     /// 5-step migration protocol using an FFI backend that succeeds for all
     /// operations by default.
     ///

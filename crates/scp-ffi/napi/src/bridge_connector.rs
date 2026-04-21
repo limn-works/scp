@@ -4,7 +4,7 @@
 //!
 //! - [`bridge_evaluate_trust`] -- Evaluate trust level for a bridge action.
 //! - [`bridge_register`] -- Register a bridge connector with a context.
-//! - [`bridge_create_shadow`] -- Create a shadow identity.
+//! - `bridge_create_shadow` -- Create a shadow identity.
 //!
 //! See spec section 12 (Bridge System) and ADR-023.
 

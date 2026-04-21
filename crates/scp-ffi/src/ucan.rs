@@ -2,11 +2,11 @@
 //!
 //! Exposes SCP UCAN operations to Python as methods on the `SCP` class:
 //!
-//! - [`PyScp::ucan_validate`] -- Validate a UCAN token using the full 11-step
+//! - `PyScp::ucan_validate` -- Validate a UCAN token using the full 11-step
 //!   ADR-016 pipeline with Ed25519 signature verification.
-//! - [`PyScp::ucan_mint`] -- Mint a new UCAN token for a member.
-//! - [`PyScp::ucan_delegate`] -- Delegate a UCAN token to another member.
-//! - [`PyScp::ucan_revoke`] -- Revoke a UCAN token.
+//! - `PyScp::ucan_mint` -- Mint a new UCAN token for a member.
+//! - `PyScp::ucan_delegate` -- Delegate a UCAN token to another member.
+//! - `PyScp::ucan_revoke` -- Revoke a UCAN token.
 //!
 //! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
 //! methods in Phase 4 PR 4 sub-slice C (#1549).
