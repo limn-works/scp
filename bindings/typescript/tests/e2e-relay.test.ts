@@ -35,67 +35,51 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { __getNativeScp, SCP } from "../src/scp";
+import { SCP } from "../src/scp";
+import type { Relay } from "../src/server";
 
 // ---------------------------------------------------------------------------
 // Guard: skip if native addon unavailable
 // ---------------------------------------------------------------------------
 //
-// Post-ADR-048 (#1549 Phase 4 PR 4): relay/transport bootstrap methods no
-// longer exist as module-level free functions on the raw addon. They are
-// instance methods on the NAPI `Scp` class, reached via `__getNativeScp`.
+// Post-ADR-048 (#1549 Phase 4 PR 4): every stateful operation dispatches
+// through the caller-owned `SCP` instance. Relay startup, relay-transport
+// configuration, and context subscriptions are all first-class `SCP.*`
+// methods.
 
 type NativeBridge = Awaited<ReturnType<typeof import("../src/internal/bridge").getBridge>>;
-// biome-ignore lint/suspicious/noExplicitAny: the native SCP class is untyped
-type NativeScp = any;
-
-/**
- * Raw message object returned by the NAPI bridge's `contextSubscribe`.
- *
- * napi-rs converts Rust snake_case fields to camelCase. `payload` is
- * `Vec<u8>` which marshals as `number[]` in JS.
- */
-interface NapiRawMessage {
-  senderDid: string;
-  payload: number[];
-  timestamp: number;
-  sequence: number;
-  contextId: string;
-}
 
 let bridge: NativeBridge | null = null;
 let scp: SCP | null = null;
-let nativeScp: NativeScp | null = null;
 let skipReason = "";
 
 try {
   const { createNativeBridge } = await import("../src/internal/native.js");
   scp = new SCP();
   bridge = createNativeBridge(scp);
-  nativeScp = __getNativeScp(scp);
-  if (typeof nativeScp.relayStartInMemory !== "function") {
-    skipReason = "native SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
+  if (typeof (scp as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
+    skipReason = "SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
     bridge = null;
-    nativeScp = null;
+    scp = null;
   }
 } catch (e: unknown) {
   const msg = e instanceof Error ? e.message : String(e);
   skipReason = `Native NAPI bridge not available: ${msg}`;
 }
 
-if (bridge === null || scp === null || nativeScp === null) {
+if (bridge === null || scp === null) {
   describe("E2E relay (SKIPPED)", () => {
     test.skip(`all tests skipped: ${skipReason}`, () => {});
   });
 } else {
   const napi = bridge;
-  const nativeHandle = nativeScp;
+  const scpInstance = scp;
 
   // -------------------------------------------------------------------------
   // Relay lifecycle state
   // -------------------------------------------------------------------------
 
-  let relayHandle: Awaited<ReturnType<typeof nativeHandle.relayStartInMemory>> | null = null;
+  let relayHandle: Relay | null = null;
 
   /** Contexts with active subscriptions that need closing before relay shutdown. */
   const subscribedContexts: Array<{
@@ -105,9 +89,10 @@ if (bridge === null || scp === null || nativeScp === null) {
   }> = [];
 
   beforeAll(async () => {
-    // Start an in-memory relay on an ephemeral port. Post-ADR-048 this is a
-    // per-instance method on the NAPI `Scp` class (was `addon.relayStartInMemory()`).
-    const handle = await nativeHandle.relayStartInMemory();
+    // Start an in-memory relay on an ephemeral port. Post-ADR-048 this
+    // is a first-class method on the SDK's `SCP` class that returns a
+    // `Relay` wrapper around the raw native handle.
+    const handle = await scpInstance.relayStartInMemory();
     relayHandle = handle;
 
     // Bootstrap identity first to get a DID for MLS credential identity.
@@ -120,7 +105,7 @@ if (bridge === null || scp === null || nativeScp === null) {
     // configureRelayTransport creates a relay connection and wraps it in
     // RelayTransportProvider, so contextSend publishes encrypted payloads
     // through the relay. Must be called BEFORE any contextCreate.
-    await nativeHandle.configureRelayTransport(handle.relayUrl, bootstrap.did);
+    await scpInstance.configureRelayTransport(handle.relayUrl, bootstrap.did);
 
     // Establish a SECOND WebSocket connection for contextSubscribe.
     // contextSubscribe uses the bridge's transport manager for its
@@ -152,7 +137,7 @@ if (bridge === null || scp === null || nativeScp === null) {
     // widening — the wrapper coerces to `BigInt` before crossing FFI.
     await napi.shutdown(1000);
     if (relayHandle && !relayHandle.isShutdown) {
-      relayHandle.shutdown();
+      await relayHandle.shutdown();
     }
   });
 
@@ -349,8 +334,11 @@ if (bridge === null || scp === null || nativeScp === null) {
       // subscription and spawns a background task. Signature is now
       // `async` after #1549 Phase 4 PR 1 — the returned Promise
       // resolves once the task is registered against the bridge's
-      // JoinSet.
-      await nativeHandle.contextSubscribe(ctx, alice.did, (_msg: NapiRawMessage | null) => {
+      // JoinSet. Post-ADR-048, the SDK surfaces this via the
+      // caller-owned `scp.contextSubscribe(handle, did, onMessage)`
+      // method; the raw-handle callback also receives a `null` when
+      // the subscription completes (we ignore that here).
+      await scpInstance.contextSubscribe(ctx, alice.did, (_msg: unknown) => {
         // Callback may or may not fire depending on relay delivery.
       });
 
@@ -371,13 +359,13 @@ if (bridge === null || scp === null || nativeScp === null) {
       );
 
       // First subscription succeeds.
-      await nativeHandle.contextSubscribe(ctx, alice.did, () => {});
+      await scpInstance.contextSubscribe(ctx, alice.did, () => {});
       subscribedContexts.push({ handle: ctx, did: alice.did });
 
       // Second subscription to the same context must fail. Async
       // rejection — use `.rejects.toThrow()` rather than
       // sync `.toThrow()`.
-      await expect(nativeHandle.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow(
+      await expect(scpInstance.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow(
         /already subscribed/,
       );
     });
@@ -399,7 +387,7 @@ if (bridge === null || scp === null || nativeScp === null) {
 
       // Subscription to a closed context must fail. Promise-rejection,
       // not synchronous throw.
-      await expect(nativeHandle.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow();
+      await expect(scpInstance.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow();
     });
   });
 

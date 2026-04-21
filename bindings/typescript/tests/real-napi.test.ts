@@ -19,7 +19,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
 import type { BridgeMode } from "../src/bridge";
-import { __getNativeScp, SCP } from "../src/scp";
+import { SCP } from "../src/scp";
+import type { Relay } from "../src/server";
 
 // ---------------------------------------------------------------------------
 // Guard: skip all tests if the native NAPI binding is unavailable.
@@ -27,10 +28,10 @@ import { __getNativeScp, SCP } from "../src/scp";
 
 type NativeBridge = Awaited<ReturnType<typeof import("../src/internal/bridge").getBridge>>;
 
-// Post-ADR-048 (#1549 Phase 4 PR 4): relay/transport bootstrap methods no
-// longer exist as module-level free functions on the raw addon. They are
-// instance methods on the NAPI `Scp` class. We reach them through the raw
-// native handle attached to the `SCP` wrapper via `__getNativeScp`.
+// Post-ADR-048 (#1549 Phase 4 PR 4): every stateful operation dispatches
+// through the caller-owned `SCP` instance. Relay startup, relay-transport
+// configuration, and context subscriptions are all first-class `SCP.*`
+// methods — no private-handle indirection needed.
 //
 // A small set of stateless helpers deliberately remain as module-level
 // free functions on the raw addon — `discovery_*`, `context_discover`,
@@ -38,14 +39,11 @@ type NativeBridge = Awaited<ReturnType<typeof import("../src/internal/bridge").g
 // no bridge state, so they never needed instance-scoping (see the
 // "sub-slice B" comment in `crates/scp-ffi/napi/src/scp.rs`). These calls
 // dispatch through `rawAddon` below rather than through the `SCP` wrapper.
-// biome-ignore lint/suspicious/noExplicitAny: the native SCP class is untyped
-type NativeScp = any;
 // biome-ignore lint/suspicious/noExplicitAny: the native addon module is untyped
 type NativeAddon = any;
 
 let bridge: NativeBridge | null = null;
 let scp: SCP | null = null;
-let nativeScp: NativeScp | null = null;
 let rawAddon: NativeAddon = null;
 let skipReason = "";
 
@@ -54,15 +52,10 @@ try {
   const { createNativeBridge } = await import("../src/internal/native.js");
   scp = new SCP();
   bridge = createNativeBridge(scp);
-  // Grab the raw native handle for the handful of methods that the SDK
-  // `Bridge` wrapper does not expose (relay startup, relay-transport
-  // configuration). These live on the NAPI `Scp` class as the per-instance
-  // replacements for the deleted free functions.
-  nativeScp = __getNativeScp(scp);
-  if (typeof nativeScp.relayStartInMemory !== "function") {
-    skipReason = "native SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
+  if (typeof (scp as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
+    skipReason = "SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
     bridge = null;
-    nativeScp = null;
+    scp = null;
   }
 
   // Also load the raw addon — it still exports the stateless module-level
@@ -87,14 +80,13 @@ try {
 }
 
 // When the bridge is unavailable, define a single test that reports the skip.
-if (bridge === null || nativeScp === null || scp === null || rawAddon === null) {
+if (bridge === null || scp === null || rawAddon === null) {
   describe("Real NAPI bridge E2E (SKIPPED)", () => {
     test.skip(`all tests skipped: ${skipReason}`, () => {});
   });
 } else {
-  // Capture bridge and native handle in consts for type narrowing.
+  // Capture bridge and SCP in consts for type narrowing.
   const napi = bridge;
-  const nativeHandle = nativeScp;
   const scpInstance = scp;
   const addon = rawAddon;
 
@@ -102,22 +94,17 @@ if (bridge === null || nativeScp === null || scp === null || rawAddon === null) 
   // Relay lifecycle state
   // ---------------------------------------------------------------------------
 
-  // The relay handle is an opaque `NapiRelayHandle` minted by the SCP that
-  // owns it — handle affinity (#1549 Phase 4) rejects cross-instance use
-  // with `SCP-PERM-3030`, so everything below operates against `scpInstance`
-  // / `nativeHandle` exclusively.
-  let relayHandle: {
-    readonly relayUrl: string;
-    readonly relayPort: number;
-    readonly isShutdown: boolean;
-    shutdown(): void;
-  } | null = null;
+  // The relay handle is wrapped in the SDK's `Relay` class — minted by
+  // the SCP that owns it — so handle affinity (#1549 Phase 4) rejects
+  // cross-instance use with `SCP-PERM-3030` and everything below
+  // operates against `scpInstance` exclusively.
+  let relayHandle: Relay | null = null;
 
   beforeAll(async () => {
-    // Start an in-memory relay on an ephemeral port. `relayStartInMemory`
-    // is a per-instance method on the NAPI `Scp` class post-ADR-048
-    // (was `addon.relayStartInMemory()` before PR 4).
-    const handle = await nativeHandle.relayStartInMemory();
+    // Start an in-memory relay on an ephemeral port. Post-ADR-048 this
+    // is a first-class method on the SDK's `SCP` class that returns a
+    // `Relay` wrapper around the raw native handle.
+    const handle = await scpInstance.relayStartInMemory();
     relayHandle = handle;
 
     // Bootstrap identity first to get a DID for MLS credential identity.
@@ -131,8 +118,8 @@ if (bridge === null || nativeScp === null || scp === null || rawAddon === null) 
     // RelayTransportProvider, so contextSend publishes encrypted payloads
     // through the relay. Must be called BEFORE any contextCreate.
     //
-    // Post-ADR-048 this is a per-instance method on the `Scp` class.
-    await nativeHandle.configureRelayTransport(handle.relayUrl, bootstrap.did);
+    // Post-ADR-048 this is a first-class method on the SDK's `SCP` class.
+    await scpInstance.configureRelayTransport(handle.relayUrl, bootstrap.did);
 
     // Establish a SECOND WebSocket connection for contextSubscribe.
     // contextSubscribe uses the bridge's transport manager for its
@@ -159,12 +146,8 @@ if (bridge === null || nativeScp === null || scp === null || rawAddon === null) 
     // owns every handle minted above, so the suite never risks
     // cross-instance affinity rejections (`SCP-PERM-3030`).
     await napi.shutdown(1000);
-    // Reference the `scpInstance` handle explicitly so the suite's
-    // type-narrowing keeps it live through `afterAll` — otherwise the
-    // variable would appear unused to the linter after the bridge call.
-    void scpInstance;
     if (relayHandle && !relayHandle.isShutdown) {
-      relayHandle.shutdown();
+      await relayHandle.shutdown();
     }
   });
 
