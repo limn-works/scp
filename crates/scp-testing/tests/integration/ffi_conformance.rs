@@ -1752,3 +1752,50 @@ fn syn_scanner_includes_any_with_test_and_feature() {
          and must be collected — collected: {fns:?}"
     );
 }
+
+/// `#[cfg_attr(test, …)]` is conditional-attribute propagation, NOT a
+/// compile-time gate on the item itself. `cfg_attr(test, deprecated)`
+/// expands to `#[deprecated]` when `test` is on and to nothing when
+/// it's off — either way, the fn is compiled in production. The
+/// walker must treat the fn as production-reachable and keep it in
+/// the collected set. Review round 12 flagged this as a coverage gap
+/// (the walker handled it correctly per ADR-046, but no fixture
+/// proved it). This test locks the behaviour.
+#[test]
+fn syn_scanner_includes_fn_with_cfg_attr_test() {
+    const SRC: &str = r#"
+        #[cfg_attr(test, deprecated = "use bar")]
+        fn foo() {}
+
+        #[cfg_attr(test, allow(dead_code), deprecated)]
+        #[cfg_attr(not(test), inline)]
+        fn bar() {}
+    "#;
+    let fns = collect_defined_fns(SRC);
+    for name in ["foo", "bar"] {
+        assert!(
+            fns.contains(name),
+            "fn `{name}` carries `cfg_attr(test, …)` which is attribute \
+             propagation, not a gate — the fn is compiled in production \
+             and must be collected; collected: {fns:?}"
+        );
+    }
+}
+
+/// Negative case: `#[cfg(test)]` stacked ABOVE `#[cfg_attr(test, …)]`
+/// is still a real test-only gate. The `cfg_attr` underneath is irrelevant
+/// because the outer `cfg(test)` already excludes the fn from production.
+#[test]
+fn syn_scanner_excludes_cfg_test_above_cfg_attr() {
+    const SRC: &str = "
+        #[cfg(test)]
+        #[cfg_attr(test, allow(dead_code))]
+        fn test_only_fn() {}
+    ";
+    let fns = collect_defined_fns(SRC);
+    assert!(
+        !fns.contains("test_only_fn"),
+        "fn `test_only_fn` under `cfg(test)` + `cfg_attr(test, …)` is \
+         test-only and must be excluded; collected: {fns:?}"
+    );
+}
