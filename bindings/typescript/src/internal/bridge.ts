@@ -771,39 +771,3 @@ export async function getBridge(scp: SCP): Promise<Bridge> {
   }
   return _wasmBridge;
 }
-
-/**
- * Resets the cached bridge instances.
- *
- * This is intended for testing only — it allows tests to re-initialize the
- * bridge with a mock or a different target.
- *
- * @internal
- */
-export function _resetBridge(): void {
-  _wasmBridge = null;
-  // WeakMap has no clear(); create a fresh one. Callers holding an SCP
-  // handle still get a fresh bridge on next `getBridge()`.
-  // Note: can't reassign const, so just rely on GC / per-SCP isolation.
-}
-
-/**
- * Injects a bridge instance for testing.
- *
- * This is intended for testing only — it allows tests to inject a mock bridge
- * so that SDK classes (`Context`, `Identity`, etc.) use the mock instead of
- * loading a native or WASM bridge.
- *
- * @param scp The SCP instance to associate the mock bridge with (native).
- *   Pass `null` to set the WASM singleton.
- * @param bridge The mock bridge to inject.
- *
- * @internal
- */
-export function _setBridge(scp: SCP | null, bridge: Bridge): void {
-  if (scp === null) {
-    _wasmBridge = bridge;
-  } else {
-    _nativeBridgeForScp.set(scp, bridge);
-  }
-}

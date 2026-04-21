@@ -238,6 +238,27 @@ export interface ScpOptions {
 const NATIVE_HANDLE: unique symbol = Symbol("scp.nativeHandle");
 
 /**
+ * Module-private symbol for the test-only native-handle mutator. The
+ * setter lives on `SCP` as a symbol-keyed method so test harnesses can
+ * swap the underlying `#native` handle for a mock, but no public or
+ * SDK-internal caller can invoke it without importing the symbol
+ * (which is not exported).
+ *
+ * @internal
+ */
+const NATIVE_SET: unique symbol = Symbol("scp.nativeSet");
+
+/**
+ * Module-private symbol used to smuggle a pre-constructed native handle
+ * into the `SCP` constructor, bypassing the addon-loading path. Only
+ * the test helper `__constructScpWithNativeForTests` knows about this
+ * key — production callers cannot hit it.
+ *
+ * @internal
+ */
+const NATIVE_OVERRIDE: unique symbol = Symbol("scp.nativeOverride");
+
+/**
  * Caller-owned SCP instance — the sole SDK entry point.
  *
  * Each `SCP` wraps an independent native `BridgeInstance`. Every NAPI
@@ -253,8 +274,13 @@ const NATIVE_HANDLE: unique symbol = Symbol("scp.nativeHandle");
  * through unchanged.
  */
 export class SCP {
-  /** The native NAPI `SCP` handle. `readonly` + private so TS consumers can't reach the raw addon surface. */
-  readonly #native: NativeScpInstance;
+  /**
+   * The native NAPI `SCP` handle. Private so TS consumers can't reach
+   * the raw addon surface. `readonly` was dropped so the test-only
+   * `[NATIVE_SET]` mutator can swap the handle — no production code
+   * path reassigns this field.
+   */
+  #native: NativeScpInstance;
 
   /**
    * Constructs a fresh `SCP` instance.
@@ -263,6 +289,15 @@ export class SCP {
    * @throws {ValidationError} If no NAPI addon is available — code `SCP-VALID-7005`.
    */
   constructor(options: ScpOptions = {}) {
+    // Test-only escape hatch: if a pre-built native handle is smuggled
+    // via the (non-exported) `NATIVE_OVERRIDE` symbol, skip addon
+    // loading entirely. Only reachable from `__constructScpWithNativeForTests`.
+    const override = (options as { [NATIVE_OVERRIDE]?: NativeScpInstance })[NATIVE_OVERRIDE];
+    if (override !== undefined) {
+      this.#native = override;
+      return;
+    }
+
     const NativeScp = nativeScp();
     if (options.storage !== undefined) {
       this.#native = NativeScp.withStorage(serializeStorageConfig(options.storage));
@@ -2017,6 +2052,18 @@ export class SCP {
   get [NATIVE_HANDLE](): NativeScpInstance {
     return this.#native;
   }
+
+  /**
+   * Test-only setter for swapping the underlying native handle with a
+   * mock implementation. Symbol-keyed so the method is unreachable
+   * from outside this module without importing `NATIVE_SET`, which is
+   * not exported. Used by `__setNativeForTests` / `mountMockScp`.
+   *
+   * @internal
+   */
+  [NATIVE_SET](native: NativeScpInstance): void {
+    this.#native = native;
+  }
 }
 
 /**
@@ -2027,4 +2074,36 @@ export class SCP {
  */
 export function __getNativeScp(scp: SCP): NativeScpInstance {
   return scp[NATIVE_HANDLE];
+}
+
+/**
+ * Swap the native handle underlying an existing {@link SCP} with a
+ * caller-supplied mock. Intended only for the test harness in
+ * `tests/mock-bridge.ts`; external callers have no legitimate reason
+ * to reach the private `#native` field. The `native` parameter is
+ * typed `unknown` because real callers pass a Proxy or plain object
+ * mimicking the NAPI `Scp` class surface — the structural type is
+ * enforced by the Proxy's method dispatcher, not the TS boundary.
+ *
+ * @internal
+ */
+export function __setNativeForTests(scp: SCP, native: unknown): void {
+  (scp as unknown as { [NATIVE_SET](n: NativeScpInstance): void })[NATIVE_SET](
+    native as NativeScpInstance,
+  );
+}
+
+/**
+ * Construct a fresh {@link SCP} whose `#native` slot is seeded with the
+ * caller-supplied handle, skipping the real addon load. Intended for
+ * `tests/mock-bridge.ts` only — lets tests spin up an `SCP` wrapping a
+ * Proxy-backed mock without requiring `@limn-works/scp-ts-napi-*` to
+ * be installed for the host platform.
+ *
+ * @internal
+ */
+export function __constructScpWithNativeForTests(native: unknown): SCP {
+  return new SCP({
+    [NATIVE_OVERRIDE]: native as NativeScpInstance,
+  } as unknown as ScpOptions);
 }

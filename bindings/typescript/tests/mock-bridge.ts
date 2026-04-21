@@ -1,1994 +1,307 @@
 /**
- * Mock bridge for integration testing.
+ * Mock native `SCP` handle factory for integration testing.
  *
- * Provides an in-memory implementation of the Bridge interface that simulates
- * real runtime behavior without requiring a compiled WASM module or native
- * addon. This enables testing SDK class logic, error propagation, and
- * data flow end-to-end.
+ * After Phase 4 PR 4 (#1549, ADR-048), the TypeScript SDK routes every
+ * stateful operation through the {@link SCP} class, which forwards
+ * calls to its private `#native` handle. This module provides a
+ * Proxy-backed stand-in for that handle so tests can drive the SDK
+ * without loading the real `@limn-works/scp-ts-napi-*` addon.
  *
- * See ADR-022 in `.docs/adrs/phase-4.md`.
+ * Strategy
+ * --------
+ *
+ * The previous mock implemented the flat `Bridge` interface and relied
+ * on `_setBridge(scp, mockBridge)` to swap in a mock. Both the flat
+ * bridge indirection and the namespace-class factories were collapsed
+ * in B1 — every call on a live SDK now lands on a `SCP.*` method, which
+ * dispatches directly to `this.#native.methodName(...)`.
+ *
+ * The mock therefore needs to shadow the NAPI `Scp` class surface
+ * (~181 methods + `instanceId` + `suspend`/`resume`/`shutdown`). Rather
+ * than hand-rolling a full reimplementation, the factory returns a
+ * `Proxy` that:
+ *
+ * 1. Intercepts every `get` on the fake handle.
+ * 2. If the caller has configured a stub for that method name via
+ *    `stub(name, fn)`, routes the call to the stub.
+ * 3. Otherwise returns a safe default:
+ *    - For lifecycle methods (`suspend`, `resume`, `shutdown`), a noop.
+ *    - For `instanceId`, a deterministic string.
+ *    - For any other property access, a function that returns
+ *      `Promise.resolve(undefined)` (async default) or `undefined`
+ *      (sync default). We cannot statically know whether a caller
+ *      intends sync/async, so the Proxy returns a value that works
+ *      under both `await handle.foo()` and `handle.foo()`: a promise
+ *      that also behaves like `undefined` is not possible, so the
+ *      default is `Promise.resolve(undefined)`. Tests that call a
+ *      synchronous method and inspect the return value must configure
+ *      a stub; everything else passes trivially.
+ * 4. Records every invocation for test assertions (method name, args,
+ *    result). Helpers `calls(name?)`, `lastCall(name)`, and `reset()`
+ *    expose the recording.
+ *
+ * A companion helper, `mountMockScp`, constructs a real {@link SCP}
+ * seeded with the mock native handle — bypassing the normal addon
+ * load so tests run even when no platform `@limn-works/scp-ts-napi-*`
+ * package is installed.
+ *
+ * See ADR-048, and the Phase 4 PR 4 (#1549) B-track plan.
  */
 
-import type { BridgeMode, ShadowStatus } from "../src/bridge";
-import type {
-  Bridge,
-  BridgeContextHandle,
-  BridgeIdentityHandle,
-  BridgeTransportHandle,
-  MessageCallback,
-} from "../src/internal/bridge";
-import type {
-  BroadcastAdmissionPolicy,
-  Checkpoint,
-  DIDDocument,
-  Event,
-  EventClaim,
-  EventFilter,
-  Proof,
-  ToolDefinition,
-  ToolVerificationResult,
-  TransportStatus,
-  UcanToken,
-} from "../src/types";
+import { __constructScpWithNativeForTests, __setNativeForTests, type SCP } from "../src/scp";
 
 // ---------------------------------------------------------------------------
-// In-memory state stores
+// Types
 // ---------------------------------------------------------------------------
 
-interface MockIdentity {
-  did: string;
-  custodyType: string;
+/** A single recorded invocation on the mock native handle. */
+export interface MockCall {
+  /** Method name as invoked on the proxy. */
+  readonly method: string;
+  /** Arguments passed to the method. */
+  readonly args: readonly unknown[];
+  /** Whatever the stub or default returned (may be a Promise). */
+  readonly result: unknown;
 }
 
-interface MockSession {
-  sessionId: string;
-  toolId: string;
-  sourceContextId: string;
-  callCount: number;
-  ttlSeconds?: number;
-  createdAt: number;
-}
+/**
+ * A function that stubs out a single method on the mock native handle.
+ * The mock Proxy invokes this with `(...args)` when the matching
+ * method is called; the return value is what the SDK sees.
+ */
+export type MockStub = (...args: readonly unknown[]) => unknown;
 
-interface MockContext {
-  contextId: string;
-  state: string;
-  creatorDid: string;
-  receiveBuffer: Event[];
-  eventLog: Event[];
-  tools: Map<string, ToolDefinition & { handler?: (input: unknown) => unknown }>;
-  members: Set<string>;
-  subscriptions: MessageCallback[];
-  ucans: Map<string, UcanToken>;
-  revokedTokens: Set<string>;
-  economicPolicy: string | null;
-  ttlSecs: number | null;
-  mode: string;
-  broadcastSubscribers: Set<string>;
-  broadcastBlockedSubscribers: Set<string>;
-  broadcastAdmission: BroadcastAdmissionPolicy | null;
-  sessions: Map<string, MockSession>;
-  /** Raw paramsJson string passed to contextCreate (for SDK round-trip tests). */
-  rawParamsJson: string;
-  /** Last spendingUcanJwt passed to contextJoin (for SDK round-trip tests). */
-  lastJoinSpendingUcanJwt?: string | null;
-}
+/**
+ * A mock native `Scp` handle. Conforms structurally to the shape that
+ * the TypeScript SDK's {@link SCP} class expects of its `#native`
+ * field, and carries test-only inspection helpers.
+ */
+export interface MockNativeScp {
+  // ── NAPI `Scp` surface the SDK relies on ───────────────────────────
+  readonly instanceId: string;
+  suspend(): void;
+  resume(): Promise<void>;
+  shutdown(timeoutMillis: bigint): Promise<void>;
+  // Every other property access is dispatched through the Proxy. We
+  // model that with an index signature so TypeScript accepts the many
+  // SDK forwarder call sites (`this.#native.identityCreate`, etc).
+  readonly [method: string]: unknown;
 
-interface MockTransport {
-  relayUrl: string;
-  connected: boolean;
+  // ── Test-inspection helpers (prefixed `__` to stay out of the way) ──
+
+  /**
+   * Configures a stub for a single method. When the SDK calls
+   * `native.<name>(...args)`, the Proxy invokes `fn(...args)` and
+   * returns the result verbatim. Overwrites any previous stub for
+   * the same name; pass `null` to clear a stub.
+   */
+  __stub(name: string, fn: MockStub | null): void;
+
+  /**
+   * Returns the recorded invocations. When `method` is supplied,
+   * returns only calls whose method name matches exactly; otherwise
+   * returns every recorded call in order.
+   */
+  __calls(method?: string): readonly MockCall[];
+
+  /** Returns the most recent recorded call matching the given method, or `undefined`. */
+  __lastCall(method: string): MockCall | undefined;
+
+  /** Clears the call log and all stubs. */
+  __reset(): void;
+
+  /**
+   * Clears the call log but keeps stubs. Useful between assertions
+   * in the same test when a caller wants to reuse the stub setup.
+   */
+  __resetCalls(): void;
 }
 
 // ---------------------------------------------------------------------------
-// Mock bridge factory
+// Internal helpers
 // ---------------------------------------------------------------------------
 
 /**
- * Creates a mock Bridge implementation backed by in-memory state.
- *
- * Supports:
- * - Identity creation with deterministic DIDs
- * - Context creation, join, leave, close with event tracking
- * - Message send/receive with subscription callbacks
- * - Tool registration with optional handler, invocation, and verification
- * - UCAN minting, validation, and revocation
- * - Event log queries with filter support
- * - Transport connect/disconnect
+ * JS runtime / Promise interop hooks. The Proxy returns `undefined`
+ * for these and `has` reports them as absent so `await mock` won't
+ * mistakenly follow a thenable path and `util.inspect(mock)` doesn't
+ * try to spelunk through the dispatcher.
  */
-export function createMockBridge(): Bridge & {
-  /** Access internal state for test assertions. */
-  _identities: Map<string, MockIdentity>;
-  _contexts: Map<string, MockContext>;
-  _transports: Map<string, MockTransport>;
-  _nextId: number;
-  /** Register a tool handler for invocation testing. */
-  _registerToolHandler(
-    contextId: string,
-    toolId: string,
-    handler: (input: unknown) => unknown,
-  ): void;
-} {
-  const identities = new Map<string, MockIdentity>();
-  const contexts = new Map<string, MockContext>();
-  const transports = new Map<string, MockTransport>();
-  let nextId = 1;
+const RUNTIME_HOOKS: ReadonlySet<string | symbol> = new Set<string | symbol>([
+  "then",
+  "catch",
+  "finally",
+  "constructor",
+  "valueOf",
+  "toString",
+  "toJSON",
+  "inspect",
+  Symbol.toPrimitive,
+  Symbol.toStringTag,
+  Symbol.iterator,
+  Symbol.asyncIterator,
+  Symbol.for("nodejs.util.inspect.custom"),
+]);
 
-  function generateDid(): string {
-    const id = nextId++;
-    // Generate a deterministic did:dht string with 52 lowercase base32 chars
-    const base32Chars = "abcdefghijklmnopqrstuvwxyz234567";
-    let suffix = "";
-    let remaining = id;
-    for (let i = 0; i < 52; i++) {
-      suffix += base32Chars[remaining % 32];
-      remaining = Math.floor(remaining / 32);
-    }
-    return `did:dht:${suffix}`;
+/** Methods on the NAPI `Scp` surface that are synchronous by contract. */
+const SYNC_METHODS: ReadonlySet<string> = new Set<string>(["suspend"]);
+
+/**
+ * Default return value for an unstubbed invocation. We return a resolved
+ * promise so `await handle.foo()` succeeds; callers that need a
+ * specific value configure a stub.
+ */
+function defaultReturn(method: string): unknown {
+  if (SYNC_METHODS.has(method)) {
+    return undefined;
   }
+  return Promise.resolve(undefined);
+}
 
-  function generateId(prefix: string): string {
-    return `${prefix}-${nextId++}`;
-  }
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
 
-  function getContextRaw(handle: BridgeContextHandle): MockContext {
-    const ctx = contexts.get(handle.contextId);
-    if (ctx === undefined) {
-      throw new Error(`[SCP-CTX-2001] Context not found: ${handle.contextId}`);
-    }
-    return ctx;
-  }
+/**
+ * Monotonic counter so each `createMockNativeScp()` returns a handle
+ * with a distinct `instanceId`, matching the real NAPI class's
+ * behavior and letting tests pin instances through assertions.
+ */
+let _nextMockInstanceId = 1;
 
-  function getContext(handle: BridgeContextHandle): MockContext {
-    const ctx = getContextRaw(handle);
-    if (ctx.state !== "active") {
-      throw new Error(`[SCP-CTX-2030] Context is not active: ${handle.contextId}`);
-    }
-    return ctx;
-  }
+/**
+ * Builds a Proxy-backed mock native `Scp` handle.
+ *
+ * By default every method returns `Promise.resolve(undefined)` (async
+ * shape) or `undefined` (`suspend` only). Tests that care configure
+ * stubs with `handle.__stub(methodName, fn)`. Tests that only exercise
+ * control flow through the SDK don't need any stubs — the defaults
+ * make every method call a successful no-op.
+ */
+export function createMockNativeScp(options: { instanceId?: string } = {}): MockNativeScp {
+  const stubs = new Map<string, MockStub>();
+  const calls: MockCall[] = [];
+  const instanceId = options.instanceId ?? String(_nextMockInstanceId++);
 
-  const bridge: Bridge & {
-    _identities: Map<string, MockIdentity>;
-    _contexts: Map<string, MockContext>;
-    _transports: Map<string, MockTransport>;
-    _nextId: number;
-    _registerToolHandler(
-      contextId: string,
-      toolId: string,
-      handler: (input: unknown) => unknown,
-    ): void;
-  } = {
-    _identities: identities,
-    _contexts: contexts,
-    _transports: transports,
-    get _nextId() {
-      return nextId;
-    },
+  // The Proxy target is a plain object; we never use it directly — the
+  // `get` trap owns the whole lookup path.
+  const target: Record<string | symbol, unknown> = {};
 
-    _registerToolHandler(
-      contextId: string,
-      toolId: string,
-      handler: (input: unknown) => unknown,
-    ): void {
-      const ctx = contexts.get(contextId);
-      if (ctx === undefined) {
-        throw new Error(`Context not found: ${contextId}`);
+  const handle = new Proxy(target, {
+    get(_target, prop, _receiver): unknown {
+      // Intrinsic properties bypass both stub dispatch and the call log.
+      if (prop === "instanceId") {
+        return instanceId;
       }
-      const tool = ctx.tools.get(toolId);
-      if (tool === undefined) {
-        throw new Error(`Tool not found: ${toolId}`);
-      }
-      (tool as ToolDefinition & { handler?: (input: unknown) => unknown }).handler = handler;
-    },
-
-    // Identity
-    async identityCreate(custody: string): Promise<BridgeIdentityHandle> {
-      const did = generateDid();
-      const identity: MockIdentity = { did, custodyType: custody };
-      identities.set(did, identity);
-      return { did, custodyType: custody };
-    },
-
-    async identityLoad(did: string): Promise<BridgeIdentityHandle> {
-      if (!did.startsWith("did:")) {
-        throw new Error(`[SCP-IDENT-1001] Invalid DID format: ${did}`);
-      }
-      const existing = identities.get(did);
-      if (existing !== undefined) {
-        return { did: existing.did, custodyType: existing.custodyType };
-      }
-      // Create a synthetic handle for loaded DIDs
-      const identity: MockIdentity = { did, custodyType: "in_memory" };
-      identities.set(did, identity);
-      return { did, custodyType: "in_memory" };
-    },
-
-    async identityResolve(did: string): Promise<DIDDocument> {
-      if (!did.startsWith("did:")) {
-        throw new Error(`[SCP-IDENT-1002] Cannot resolve invalid DID: ${did}`);
-      }
-      return {
-        id: did,
-        verificationMethods: [
-          {
-            id: `${did}#0`,
-            type: "Ed25519VerificationKey2020",
-            controller: did,
-            publicKeyMultibase: "z6MkmockPublicKey",
-          },
-        ],
-        authentication: [`${did}#0`],
-        assertionMethods: [`${did}#0`],
-        alsoKnownAs: [],
-        serviceEndpoints: [],
-        hasAgentKey: false,
-      };
-    },
-
-    async identityRotateKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      const identity = identities.get(handle.did);
-      if (identity === undefined) {
-        throw new Error(`[SCP-IDENT-1003] Identity not found: ${handle.did}`);
-      }
-      // Return same DID with rotated key (in-memory, key material is opaque)
-      return { did: handle.did, custodyType: handle.custodyType };
-    },
-
-    // Context
-    async contextCreate(
-      identity: BridgeIdentityHandle,
-      paramsJson: string,
-    ): Promise<BridgeContextHandle> {
-      const params = JSON.parse(paramsJson) as { ttlSeconds?: number; mode?: string };
-      const contextId = generateId("ctx");
-      const mode = params.mode ?? "Encrypted";
-      const ctx: MockContext = {
-        contextId,
-        state: "active",
-        creatorDid: identity.did,
-        receiveBuffer: [],
-        eventLog: [],
-        tools: new Map(),
-        members: new Set([identity.did]),
-        subscriptions: [],
-        ucans: new Map(),
-        revokedTokens: new Set(),
-        economicPolicy: null,
-        ttlSecs: params.ttlSeconds ?? null,
-        mode,
-        broadcastSubscribers: new Set(),
-        broadcastBlockedSubscribers: new Set(),
-        broadcastAdmission: mode === "Broadcast" ? "Open" : null,
-        sessions: new Map(),
-        rawParamsJson: paramsJson,
-      };
-
-      // Record ContextCreated event
-      const createdEvent: Event = {
-        eventType: "ContextCreated",
-        actorDid: identity.did,
-        timestamp: Math.floor(Date.now() / 1000),
-        payload: { contextId },
-        sequence: ctx.eventLog.length,
-      };
-      ctx.receiveBuffer.push(createdEvent);
-      ctx.eventLog.push(createdEvent);
-
-      contexts.set(contextId, ctx);
-      return { contextId, state: "active", creatorDid: identity.did };
-    },
-
-    async contextJoin(
-      handle: BridgeContextHandle,
-      identityDid: string,
-      spendingUcanJwt?: string | null,
-    ): Promise<void> {
-      const ctx = getContext(handle);
-      ctx.lastJoinSpendingUcanJwt = spendingUcanJwt ?? null;
-      ctx.members.add(identityDid);
-      const joinedEvent: Event = {
-        eventType: "MemberJoined",
-        actorDid: identityDid,
-        timestamp: Math.floor(Date.now() / 1000),
-        payload: { memberDid: identityDid },
-        sequence: ctx.eventLog.length,
-      };
-      ctx.receiveBuffer.push(joinedEvent);
-      ctx.eventLog.push(joinedEvent);
-    },
-
-    async contextLeave(handle: BridgeContextHandle, identityDid: string): Promise<void> {
-      const ctx = getContext(handle);
-      ctx.members.delete(identityDid);
-      const leftEvent: Event = {
-        eventType: "MemberLeft",
-        actorDid: identityDid,
-        timestamp: Math.floor(Date.now() / 1000),
-        payload: { memberDid: identityDid },
-        sequence: ctx.eventLog.length,
-      };
-      ctx.receiveBuffer.push(leftEvent);
-      ctx.eventLog.push(leftEvent);
-      // Notify subscriptions that context is done for this member
-      for (const sub of ctx.subscriptions) {
-        sub.onComplete();
-      }
-    },
-
-    async contextClose(handle: BridgeContextHandle, identityDid: string): Promise<void> {
-      const ctx = getContext(handle);
-      ctx.state = "closed";
-      const closedEvent: Event = {
-        eventType: "ContextClosed",
-        actorDid: identityDid,
-        timestamp: Math.floor(Date.now() / 1000),
-        payload: {},
-        sequence: ctx.eventLog.length,
-      };
-      ctx.receiveBuffer.push(closedEvent);
-      ctx.eventLog.push(closedEvent);
-      for (const sub of ctx.subscriptions) {
-        sub.onComplete();
-      }
-    },
-
-    async contextSend(
-      handle: BridgeContextHandle,
-      identityDid: string,
-      payload: Uint8Array,
-      _spendingUcanJwt?: string | null,
-    ): Promise<void> {
-      const ctx = getContext(handle);
-      const sequence = ctx.eventLog.length;
-      const timestamp = Math.floor(Date.now() / 1000);
-
-      const sentEvent: Event = {
-        eventType: "MessageSent",
-        actorDid: identityDid,
-        timestamp,
-        payload: { size: payload.length },
-        sequence,
-      };
-      ctx.receiveBuffer.push(sentEvent);
-      ctx.eventLog.push(sentEvent);
-
-      // Deliver to subscribers
-      for (const sub of ctx.subscriptions) {
-        sub.onMessage({
-          senderDid: identityDid,
-          content: payload,
-          timestamp,
-          sequence,
-          contextId: handle.contextId,
-        });
-      }
-    },
-
-    async contextSubscribe(
-      handle: BridgeContextHandle,
-      _identityDid: string,
-      callback: MessageCallback,
-    ): Promise<void> {
-      const ctx = contexts.get(handle.contextId);
-      if (ctx === undefined) {
-        throw new Error(`[SCP-CTX-2001] Context not found: ${handle.contextId}`);
-      }
-      ctx.subscriptions.push(callback);
-    },
-
-    contextCancelSubscription(_handle: BridgeContextHandle): void {
-      // no-op in mock
-    },
-
-    // Tools
-    async toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string> {
-      const ctx = getContext(handle);
-      const toolId = generateId("tool");
-      ctx.tools.set(toolId, { ...definition });
-
-      const registeredEvent: Event = {
-        eventType: "ToolRegistered",
-        actorDid: handle.creatorDid,
-        timestamp: Math.floor(Date.now() / 1000),
-        payload: { toolId, toolName: definition.name },
-        sequence: ctx.eventLog.length,
-      };
-      ctx.receiveBuffer.push(registeredEvent);
-      ctx.eventLog.push(registeredEvent);
-
-      return toolId;
-    },
-
-    async toolInvoke(
-      handle: BridgeContextHandle,
-      toolId: string,
-      inputJson: string,
-      identityDid: string,
-      ucanToken?: string,
-      _proofTokens?: readonly string[],
-      spendingUcan?: string,
-    ): Promise<string> {
-      const ctx = getContext(handle);
-      const tool = ctx.tools.get(toolId) as
-        | (ToolDefinition & { handler?: (input: unknown) => unknown })
-        | undefined;
-      if (tool === undefined) {
-        throw new Error(`[SCP-TOOL-6001] Tool not found: ${toolId}`);
-      }
-
-      // Validate UCAN token is provided (mirrors WASM bridge behavior)
-      if (ucanToken === undefined || ucanToken === "") {
-        throw new Error("[SCP-VALID-7000] ucan_token is required for tool invocation");
-      }
-
-      // Check token is not revoked
-      if (ctx.revokedTokens.has(ucanToken)) {
-        throw new Error("[SCP-PERM-3001] Token has been revoked");
-      }
-
-      // C4 (#1606): the runtime now routes paid tool invocations
-      // through ContextManager.invoke_tool_with_economy. The mock
-      // doesn't simulate the full economy pipeline but it does
-      // validate that callers passing a spending UCAN are propagating
-      // it through the bridge interface (the real NAPI / UniFFI / PyO3
-      // bridges parse and forward it).
-      const spendingUcanProvided = spendingUcan !== undefined && spendingUcan !== "";
-
-      const input = JSON.parse(inputJson) as unknown;
-      let result: unknown;
-
-      if (tool.handler !== undefined) {
-        result = tool.handler(input);
-      } else {
-        // Default echo behavior when no handler is registered
-        result = { echo: input };
-      }
-
-      const invokedEvent: Event = {
-        eventType: "ToolInvoked",
-        actorDid: identityDid,
-        timestamp: Math.floor(Date.now() / 1000),
-        payload: {
-          toolId,
-          toolName: tool.name,
-          ucanProvided: true,
-          spendingUcanProvided,
-        },
-        sequence: ctx.eventLog.length,
-      };
-      ctx.receiveBuffer.push(invokedEvent);
-      ctx.eventLog.push(invokedEvent);
-
-      return JSON.stringify(result);
-    },
-
-    async toolVerify(handle: BridgeContextHandle, toolId: string): Promise<ToolVerificationResult> {
-      const ctx = getContext(handle);
-      const tool = ctx.tools.get(toolId) as
-        | (ToolDefinition & { handler?: (input: unknown) => unknown })
-        | undefined;
-      if (tool === undefined) {
-        throw new Error(`[SCP-TOOL-6002] Tool not found for verification: ${toolId}`);
-      }
-
-      const failures: string[] = [];
-
-      if (tool.testVectors !== undefined && tool.handler !== undefined) {
-        for (const vector of tool.testVectors) {
-          const actual = tool.handler(vector.input);
-          const actualJson = JSON.stringify(actual);
-          const expectedJson = JSON.stringify(vector.expectedOutput);
-          if (actualJson !== expectedJson) {
-            failures.push(`Vector failed: expected ${expectedJson}, got ${actualJson}`);
+      if (prop === "__stub") {
+        return (name: string, fn: MockStub | null): void => {
+          if (fn === null) {
+            stubs.delete(name);
+            return;
           }
-        }
+          stubs.set(name, fn);
+        };
       }
-
-      return {
-        toolId,
-        passed: failures.length === 0,
-        failures,
-      };
-    },
-
-    // Cross-context tool invocation (spec section 6.2)
-    async toolInvokeCrossContext(
-      sourceHandle: BridgeContextHandle,
-      targetHandle: BridgeContextHandle,
-      toolId: string,
-      inputJson: string,
-      invokerDid: string,
-      _ucanToken: string,
-      chainDepth: number,
-      _proofTokens?: readonly string[],
-    ): Promise<string> {
-      const sourceCtx = getContextRaw(sourceHandle);
-      const targetCtx = getContextRaw(targetHandle);
-
-      if (sourceCtx.state !== "active") {
-        throw new Error(`[SCP-TOOL-6010] Source context in "${sourceCtx.state}" state`);
+      if (prop === "__calls") {
+        return (method?: string): readonly MockCall[] =>
+          method === undefined ? calls.slice() : calls.filter((c) => c.method === method);
       }
-      if (targetCtx.state !== "active") {
-        throw new Error(`[SCP-TOOL-6011] Target context in "${targetCtx.state}" state`);
-      }
-      if (chainDepth > 255) {
-        throw new Error(`[SCP-TOOL-6012] Chain depth ${chainDepth} exceeds maximum 255`);
-      }
-
-      const tool = targetCtx.tools.get(toolId);
-      if (tool === undefined) {
-        throw new Error(`[SCP-TOOL-6002] Tool '${toolId}' not found in target context`);
-      }
-
-      const input = JSON.parse(inputJson);
-      if (tool.handler !== undefined) {
-        const output = tool.handler(input);
-        return JSON.stringify(output);
-      }
-
-      return JSON.stringify({
-        tool: toolId,
-        source_context: sourceCtx.contextId,
-        target_context: targetCtx.contextId,
-        status: "validated",
-        chain_depth: chainDepth,
-        invoker_did: invokerDid,
-        validated_input: input,
-      });
-    },
-
-    // Stateful tool sessions (spec section 6.2.1)
-    async toolSessionCreate(
-      handle: BridgeContextHandle,
-      toolId: string,
-      sourceContextId: string,
-      ttlSeconds?: number,
-    ): Promise<string> {
-      const ctx = getContext(handle);
-      if (ctx.state !== "active") {
-        throw new Error(`[SCP-TOOL-6014] Cannot create session in context in "${ctx.state}" state`);
-      }
-
-      if (!ctx.tools.has(toolId)) {
-        throw new Error(`[SCP-TOOL-6002] Tool '${toolId}' not found`);
-      }
-
-      // Per-caller session cap (1000 per spec §6.2.1, ADR-043)
-      let callerSessions = 0;
-      for (const session of ctx.sessions.values()) {
-        if (session.sourceContextId === sourceContextId) callerSessions++;
-      }
-      if (callerSessions >= 1000) {
-        throw new Error(`[SCP-TOOL-6015] Session cap exceeded for caller '${sourceContextId}'`);
-      }
-
-      const sessionId = `session-${nextId++}`;
-      const session: MockSession = {
-        sessionId,
-        toolId,
-        sourceContextId,
-        callCount: 0,
-        createdAt: Date.now(),
-      };
-      if (ttlSeconds !== undefined) {
-        session.ttlSeconds = ttlSeconds;
-      }
-      ctx.sessions.set(sessionId, session);
-      return sessionId;
-    },
-
-    async toolSessionInvoke(
-      handle: BridgeContextHandle,
-      sessionId: string,
-      inputJson: string,
-      invokerDid: string,
-      _ucanToken: string,
-      _proofTokens?: readonly string[],
-    ): Promise<string> {
-      const ctx = getContext(handle);
-      if (ctx.state !== "active") {
-        throw new Error(`[SCP-TOOL-6017] Cannot invoke session in context in "${ctx.state}" state`);
-      }
-
-      const session = ctx.sessions.get(sessionId);
-      if (session === undefined) {
-        throw new Error(`[SCP-TOOL-6018] Session '${sessionId}' not found`);
-      }
-
-      // Check TTL expiry
-      if (session.ttlSeconds !== undefined) {
-        const elapsed = (Date.now() - session.createdAt) / 1000;
-        if (elapsed > session.ttlSeconds) {
-          ctx.sessions.delete(sessionId);
-          throw new Error(`[SCP-TOOL-6019] Session '${sessionId}' has expired`);
-        }
-      }
-
-      const tool = ctx.tools.get(session.toolId);
-      const input = JSON.parse(inputJson);
-      session.callCount++;
-
-      if (tool?.handler !== undefined) {
-        const output = tool.handler(input);
-        return JSON.stringify(output);
-      }
-
-      return JSON.stringify({
-        tool: session.toolId,
-        session_id: sessionId,
-        status: "validated",
-        call_count: session.callCount,
-        invoker_did: invokerDid,
-        validated_input: input,
-      });
-    },
-
-    async toolSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void> {
-      const ctx = getContext(handle);
-      if (!ctx.sessions.has(sessionId)) {
-        throw new Error(`[SCP-TOOL-6021] Session '${sessionId}' not found`);
-      }
-      ctx.sessions.delete(sessionId);
-    },
-
-    // Transport
-    async transportConnect(relayUrl: string): Promise<BridgeTransportHandle> {
-      const transport: MockTransport = { relayUrl, connected: true };
-      transports.set(relayUrl, transport);
-      return { isConnected: true, relayUrl };
-    },
-
-    async transportStatus(handle: BridgeTransportHandle): Promise<TransportStatus> {
-      return {
-        connected: handle.isConnected,
-        relayUrl: handle.relayUrl,
-        latencyMs: handle.isConnected ? 42 : null,
-      };
-    },
-
-    async transportDisconnect(handle: BridgeTransportHandle): Promise<void> {
-      if (handle.relayUrl !== null) {
-        const transport = transports.get(handle.relayUrl);
-        if (transport !== undefined) {
-          transport.connected = false;
-        }
-      }
-    },
-
-    // UCAN
-    async ucanValidate(
-      handle: BridgeContextHandle,
-      token: string,
-      capability: string,
-    ): Promise<void> {
-      const ctx = getContext(handle);
-
-      if (ctx.revokedTokens.has(token)) {
-        throw new Error(`[SCP-PERM-3001] Token has been revoked`);
-      }
-
-      // Find the token in minted tokens by encoded string
-      let found = false;
-      for (const [_id, ucan] of ctx.ucans) {
-        if (ucan.encoded === token) {
-          // Check if capability is in the token
-          if (!ucan.capabilities.includes(capability)) {
-            throw new Error(`[SCP-PERM-3002] Token does not grant capability: ${capability}`);
+      if (prop === "__lastCall") {
+        return (method: string): MockCall | undefined => {
+          for (let i = calls.length - 1; i >= 0; i--) {
+            const call = calls[i];
+            if (call !== undefined && call.method === method) {
+              return call;
+            }
           }
-          found = true;
-          break;
-        }
-      }
-
-      if (!found) {
-        throw new Error(`[SCP-PERM-3003] Token not recognized in context`);
-      }
-    },
-
-    async ucanMint(
-      handle: BridgeContextHandle,
-      memberDid: string,
-      capabilities: readonly string[],
-    ): Promise<UcanToken> {
-      const ctx = getContext(handle);
-      const tokenId = generateId("ucan");
-      const encoded = `eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.${Buffer.from(
-        JSON.stringify({
-          iss: ctx.creatorDid,
-          aud: memberDid,
-          cap: capabilities,
-          exp: Math.floor(Date.now() / 1000) + 3600,
-        }),
-      ).toString("base64url")}.mock-signature-${tokenId}`;
-
-      const token: UcanToken = {
-        id: tokenId,
-        encoded,
-        issuer: ctx.creatorDid,
-        audience: memberDid,
-        capabilities: [...capabilities],
-        expiresAt: Math.floor(Date.now() / 1000) + 3600,
-      };
-
-      ctx.ucans.set(tokenId, token);
-      return token;
-    },
-
-    async ucanRevoke(
-      handle: BridgeContextHandle,
-      token: string,
-      _revokerDid: string,
-    ): Promise<void> {
-      const ctx = getContext(handle);
-      ctx.revokedTokens.add(token);
-    },
-
-    async ucanDelegate(
-      handle: BridgeContextHandle,
-      delegatorDid: string,
-      delegateeDid: string,
-      parentToken: string,
-      capabilities: readonly string[],
-    ): Promise<UcanToken> {
-      const ctx = getContext(handle);
-
-      // Find the parent token by encoded string
-      let parentUcan: UcanToken | undefined;
-      for (const [_id, ucan] of ctx.ucans) {
-        if (ucan.encoded === parentToken) {
-          parentUcan = ucan;
-          break;
-        }
-      }
-      if (parentUcan === undefined) {
-        throw new Error("[SCP-PERM-3000] Parent token not recognized in context");
-      }
-
-      // Verify delegator matches parent audience (iss/aud chain linkage)
-      if (parentUcan.audience !== delegatorDid) {
-        throw new Error(
-          `[SCP-PERM-3000] Delegator DID '${delegatorDid}' does not match parent token audience '${parentUcan.audience}'`,
-        );
-      }
-
-      // Verify attenuation: requested capabilities must be subset of parent
-      const parentCaps = new Set(parentUcan.capabilities);
-      for (const cap of capabilities) {
-        if (!parentCaps.has(cap)) {
-          throw new Error(`[SCP-PERM-3000] Cannot delegate capability not in parent: ${cap}`);
-        }
-      }
-
-      // Mint the delegated token
-      const tokenId = generateId("ucan");
-      const encoded = `eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.${Buffer.from(
-        JSON.stringify({
-          iss: delegatorDid,
-          aud: delegateeDid,
-          cap: capabilities,
-          prf: [parentUcan.id],
-          exp: Math.floor(Date.now() / 1000) + 3600,
-        }),
-      ).toString("base64url")}.mock-signature-${tokenId}`;
-
-      const token: UcanToken = {
-        id: tokenId,
-        encoded,
-        issuer: delegatorDid,
-        audience: delegateeDid,
-        capabilities: [...capabilities],
-        expiresAt: Math.floor(Date.now() / 1000) + 3600,
-      };
-
-      ctx.ucans.set(tokenId, token);
-      return token;
-    },
-
-    // Event Log
-    async eventLogQuery(
-      handle: BridgeContextHandle,
-      filter: EventFilter | undefined,
-    ): Promise<readonly Event[]> {
-      const ctx = getContext(handle);
-      let events = [...ctx.eventLog];
-
-      if (filter !== undefined) {
-        if (filter.eventType !== undefined) {
-          events = events.filter((e) => e.eventType === filter.eventType);
-        }
-        if (filter.actorDid !== undefined) {
-          events = events.filter((e) => e.actorDid === filter.actorDid);
-        }
-        if (filter.afterSequence !== undefined) {
-          const afterSeq = filter.afterSequence;
-          events = events.filter((e) => e.sequence > afterSeq);
-        }
-        if (filter.beforeSequence !== undefined) {
-          const beforeSeq = filter.beforeSequence;
-          events = events.filter((e) => e.sequence < beforeSeq);
-        }
-        if (filter.limit !== undefined) {
-          events = events.slice(0, filter.limit);
-        }
-      }
-
-      return events;
-    },
-
-    async eventLogVerify(handle: BridgeContextHandle, claim: EventClaim): Promise<Proof> {
-      const ctx = getContext(handle);
-
-      if (claim.type === "inclusion" && claim.leafIndex !== undefined) {
-        const exists = claim.leafIndex < ctx.eventLog.length;
-        return {
-          verified: exists,
-          proofType: "inclusion",
-          details: {
-            leafIndex: claim.leafIndex,
-            treeSize: ctx.eventLog.length,
-          },
+          return undefined;
         };
       }
-
-      return {
-        verified: false,
-        proofType: "absence",
-        details: { reason: "Event not found" },
-      };
-    },
-
-    async eventLogCheckpoint(
-      handle: BridgeContextHandle,
-      _identityDid: string,
-      _epoch: number,
-    ): Promise<Checkpoint> {
-      const ctx = getContext(handle);
-      // Compute a simple mock root hash from event count
-      const root = Buffer.from(`mock-root-${ctx.eventLog.length}`).toString("hex");
-      return {
-        root,
-        eventCount: ctx.eventLog.length,
-        timestamp: Math.floor(Date.now() / 1000),
-      };
-    },
-
-    // TTL
-    async contextTtlRemaining(_handle: BridgeContextHandle): Promise<number | null> {
-      return null;
-    },
-
-    async contextExtendTtl(handle: BridgeContextHandle, additionalSecs: number): Promise<boolean> {
-      const ctx = getContext(handle);
-      if (ctx.ttlSecs !== null) {
-        ctx.ttlSecs += additionalSecs;
-      }
-      return true;
-    },
-
-    async contextHandleTtlExpiry(handle: BridgeContextHandle): Promise<void> {
-      const ctx = getContext(handle);
-      ctx.state = "expired";
-      const expiredEvent: Event = {
-        eventType: "TtlExpired",
-        actorDid: ctx.creatorDid,
-        timestamp: Math.floor(Date.now() / 1000),
-        payload: {},
-        sequence: ctx.eventLog.length,
-      };
-      ctx.receiveBuffer.push(expiredEvent);
-      ctx.eventLog.push(expiredEvent);
-      for (const sub of ctx.subscriptions) {
-        sub.onComplete();
-      }
-    },
-
-    async contextProposeTtlExtension(
-      handle: BridgeContextHandle,
-      _proposerDid: string,
-      extensionSecs: number,
-    ): Promise<boolean> {
-      const ctx = getContext(handle);
-      // In the mock, single-member contexts auto-approve
-      const approved = ctx.members.size <= 1;
-      if (approved && ctx.ttlSecs !== null) {
-        ctx.ttlSecs += extensionSecs;
-      }
-      return approved;
-    },
-
-    async contextResetTtlTimer(
-      handle: BridgeContextHandle,
-      newDurationSecs: number,
-    ): Promise<void> {
-      const ctx = getContext(handle);
-      ctx.ttlSecs = newDurationSecs;
-    },
-
-    async contextExport(handle: BridgeContextHandle): Promise<Uint8Array> {
-      const ctx = getContext(handle);
-      const exportData = {
-        snapshot: {
-          context_id: ctx.contextId,
-          creator_did: ctx.creatorDid,
-          state: ctx.state,
-          members: [...ctx.members],
-          event_count: ctx.eventLog.length,
-          mode: ctx.mode,
-          broadcast_subscribers: [...ctx.broadcastSubscribers],
-          broadcast_blocked_subscribers: [...ctx.broadcastBlockedSubscribers],
-          broadcast_admission: ctx.broadcastAdmission,
-        },
-      };
-      return new TextEncoder().encode(JSON.stringify(exportData));
-    },
-
-    async contextImport(data: Uint8Array): Promise<string> {
-      const json = new TextDecoder().decode(data);
-      let parsed: {
-        snapshot?: {
-          context_id?: string;
-          creator_did?: string;
-          members?: string[];
-          mode?: string;
-          broadcast_subscribers?: string[];
-          broadcast_blocked_subscribers?: string[];
-          broadcast_admission?: BroadcastAdmissionPolicy | null;
+      if (prop === "__reset") {
+        return (): void => {
+          stubs.clear();
+          calls.length = 0;
         };
-      };
-      try {
-        parsed = JSON.parse(json) as typeof parsed;
-      } catch {
-        throw new Error("[SCP-CTX-2032] Invalid export data: malformed JSON");
       }
-      const snapshot = parsed.snapshot;
-      if (snapshot === undefined || snapshot.context_id === undefined) {
-        throw new Error("[SCP-CTX-2032] Invalid export data: missing snapshot");
-      }
-      const contextId = snapshot.context_id;
-      const creatorDid = snapshot.creator_did ?? "did:dht:unknown";
-      const members = snapshot.members ?? [creatorDid];
-      const mode = snapshot.mode ?? "Encrypted";
-      const ctx: MockContext = {
-        contextId,
-        state: "active",
-        creatorDid,
-        receiveBuffer: [],
-        eventLog: [],
-        tools: new Map(),
-        members: new Set(members),
-        subscriptions: [],
-        ucans: new Map(),
-        revokedTokens: new Set(),
-        economicPolicy: null,
-        ttlSecs: null,
-        mode,
-        broadcastSubscribers: new Set(snapshot.broadcast_subscribers ?? []),
-        broadcastBlockedSubscribers: new Set(snapshot.broadcast_blocked_subscribers ?? []),
-        broadcastAdmission: snapshot.broadcast_admission ?? (mode === "Broadcast" ? "Open" : null),
-        sessions: new Map(),
-        rawParamsJson: "",
-      };
-      const importedEvent: Event = {
-        eventType: "ContextImported",
-        actorDid: creatorDid,
-        timestamp: Math.floor(Date.now() / 1000),
-        payload: { contextId },
-        sequence: 0,
-      };
-      ctx.receiveBuffer.push(importedEvent);
-      ctx.eventLog.push(importedEvent);
-      contexts.set(contextId, ctx);
-      return contextId;
-    },
-
-    async contextDrainEvents(handle: BridgeContextHandle): Promise<readonly string[]> {
-      const ctx = getContext(handle);
-      const events = ctx.receiveBuffer.map((e) => JSON.stringify(e));
-      ctx.receiveBuffer.length = 0;
-      return events;
-    },
-
-    // Economic policy (§19.3)
-    async contextSetEconomicPolicy(handle: BridgeContextHandle, policyJson: string): Promise<void> {
-      const ctx = getContext(handle);
-      ctx.economicPolicy = policyJson;
-    },
-
-    async contextGetEconomicPolicy(handle: BridgeContextHandle): Promise<string | null> {
-      const ctx = getContext(handle);
-      return ctx.economicPolicy;
-    },
-
-    // Broadcast operations
-    async broadcastSubscribe(handle: BridgeContextHandle, subscriberDid: string): Promise<void> {
-      const ctx = getContext(handle);
-      if (ctx.mode !== "Broadcast") {
-        throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
-      }
-      if (ctx.broadcastBlockedSubscribers.has(subscriberDid)) {
-        throw new Error("[SCP-CTX-2001] Subscriber is blocked");
-      }
-      ctx.broadcastSubscribers.add(subscriberDid);
-
-      const subscribedEvent: Event = {
-        eventType: "BroadcastSubscribed",
-        actorDid: subscriberDid,
-        timestamp: Math.floor(Date.now() / 1000),
-        payload: { subscriberDid },
-        sequence: ctx.eventLog.length,
-      };
-      ctx.receiveBuffer.push(subscribedEvent);
-      ctx.eventLog.push(subscribedEvent);
-    },
-
-    async broadcastUnsubscribe(
-      handle: BridgeContextHandle,
-      subscriberDid: string,
-      rotateKeys?: boolean,
-    ): Promise<void> {
-      const ctx = getContext(handle);
-      if (ctx.mode !== "Broadcast") {
-        throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
-      }
-      ctx.broadcastSubscribers.delete(subscriberDid);
-
-      const unsubscribedEvent: Event = {
-        eventType: "BroadcastUnsubscribed",
-        actorDid: subscriberDid,
-        timestamp: Math.floor(Date.now() / 1000),
-        payload: { subscriberDid },
-        sequence: ctx.eventLog.length,
-      };
-      ctx.receiveBuffer.push(unsubscribedEvent);
-      ctx.eventLog.push(unsubscribedEvent);
-
-      if (rotateKeys === true) {
-        const rotateEvent: Event = {
-          eventType: "BroadcastKeyRotated",
-          actorDid: handle.creatorDid,
-          timestamp: Math.floor(Date.now() / 1000),
-          payload: { reason: "subscriber_removed", subscriberDid },
-          sequence: ctx.eventLog.length,
+      if (prop === "__resetCalls") {
+        return (): void => {
+          calls.length = 0;
         };
-        ctx.receiveBuffer.push(rotateEvent);
-        ctx.eventLog.push(rotateEvent);
       }
-    },
-
-    async broadcastPublish(
-      handle: BridgeContextHandle,
-      authorDid: string,
-      payload: Uint8Array,
-    ): Promise<void> {
-      const ctx = getContext(handle);
-      if (ctx.mode !== "Broadcast") {
-        throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
-      }
-      if (!ctx.members.has(authorDid)) {
-        throw new Error("[SCP-CTX-2001] Author is not a member of the context");
+      if (RUNTIME_HOOKS.has(prop)) {
+        // JS runtime / Promise interop probes — return undefined so
+        // `await mock` doesn't follow a thenable path and `util.inspect`
+        // doesn't recurse through the dispatcher.
+        return undefined;
       }
 
-      const publishedEvent: Event = {
-        eventType: "BroadcastPublished",
-        actorDid: authorDid,
-        timestamp: Math.floor(Date.now() / 1000),
-        payload: { size: payload.length },
-        sequence: ctx.eventLog.length,
+      // Everything else is treated as a method dispatch. Symbols that
+      // aren't in RUNTIME_HOOKS can't meaningfully round-trip — no
+      // SDK call site uses symbol-keyed lookups on the native handle.
+      if (typeof prop === "symbol") {
+        return undefined;
+      }
+
+      const method = prop;
+      return (...args: readonly unknown[]): unknown => {
+        const stub = stubs.get(method);
+        const result = stub !== undefined ? stub(...args) : defaultReturn(method);
+        calls.push({ method, args: args.slice(), result });
+        return result;
       };
-      ctx.receiveBuffer.push(publishedEvent);
-      ctx.eventLog.push(publishedEvent);
     },
 
-    async broadcastPublishAsset(
-      handle: BridgeContextHandle,
-      _authorDid: string,
-      _asset: { path: string; contentType: string; body: number[] },
-      _deployId: string | null,
-    ): Promise<{ blobId: string; etag: string; deployId: string }> {
-      const ctx = getContext(handle);
-      if (ctx.mode !== "Broadcast") {
-        throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
-      }
-      const did = _deployId ?? `mock-deploy-${Date.now().toString(16)}`;
-      return { blobId: `mock-blob-id-${ctx.eventLog.length}`, etag: "mock-etag", deployId: did };
-    },
-
-    async broadcastPublishAssets(
-      handle: BridgeContextHandle,
-      authorDid: string,
-      assets: { path: string; contentType: string; body: number[] }[],
-      deployId: string | null,
-    ): Promise<{
-      results: { blobId: string; etag: string; deployId: string }[];
-      deployId: string;
-    }> {
-      const did = deployId ?? `mock-deploy-${Date.now().toString(16)}`;
-      const results: { blobId: string; etag: string; deployId: string }[] = [];
-      for (const asset of assets) {
-        const result = await this.broadcastPublishAsset(handle, authorDid, asset, did);
-        results.push(result);
-      }
-      return { results, deployId: did };
-    },
-
-    async broadcastBlockSubscriber(
-      handle: BridgeContextHandle,
-      subscriberDid: string,
-      blockerDid: string,
-    ): Promise<void> {
-      const ctx = getContext(handle);
-      if (ctx.mode !== "Broadcast") {
-        throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
-      }
-      ctx.broadcastSubscribers.delete(subscriberDid);
-      ctx.broadcastBlockedSubscribers.add(subscriberDid);
-
-      const blockedEvent: Event = {
-        eventType: "BroadcastSubscriberBlocked",
-        actorDid: blockerDid,
-        timestamp: Math.floor(Date.now() / 1000),
-        payload: { subscriberDid },
-        sequence: ctx.eventLog.length,
-      };
-      ctx.receiveBuffer.push(blockedEvent);
-      ctx.eventLog.push(blockedEvent);
-    },
-
-    async broadcastUnblockSubscriber(
-      handle: BridgeContextHandle,
-      subscriberDid: string,
-      unblockerDid: string,
-    ): Promise<void> {
-      const ctx = getContext(handle);
-      if (ctx.mode !== "Broadcast") {
-        throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
-      }
-      ctx.broadcastBlockedSubscribers.delete(subscriberDid);
-
-      const unblockedEvent: Event = {
-        eventType: "BroadcastSubscriberUnblocked",
-        actorDid: unblockerDid,
-        timestamp: Math.floor(Date.now() / 1000),
-        payload: { subscriberDid },
-        sequence: ctx.eventLog.length,
-      };
-      ctx.receiveBuffer.push(unblockedEvent);
-      ctx.eventLog.push(unblockedEvent);
-    },
-
-    async broadcastHandleKeyRequest(
-      handle: BridgeContextHandle,
-      authorDid: string,
-      requesterDid: string,
-    ): Promise<string> {
-      const ctx = getContext(handle);
-      if (ctx.mode !== "Broadcast") {
-        throw new Error("[SCP-CTX-2001] Context is not a broadcast context");
-      }
-      if (!ctx.members.has(authorDid)) {
-        throw new Error("[SCP-CTX-2001] Author is not a member of the context");
-      }
-
-      let result: string;
-      if (ctx.broadcastBlockedSubscribers.has(requesterDid)) {
-        result = "Denied(Blocked)";
-      } else if (ctx.broadcastSubscribers.has(requesterDid)) {
-        result = "Granted";
-      } else {
-        result = "Denied(NotSubscribed)";
-      }
-
-      const keyRequestEvent: Event = {
-        eventType: "BroadcastKeyRequestHandled",
-        actorDid: authorDid,
-        timestamp: Math.floor(Date.now() / 1000),
-        payload: { requesterDid, result },
-        sequence: ctx.eventLog.length,
-      };
-      ctx.receiveBuffer.push(keyRequestEvent);
-      ctx.eventLog.push(keyRequestEvent);
-
-      return result;
-    },
-
-    async broadcastSubscriberCount(handle: BridgeContextHandle): Promise<number | null> {
-      const ctx = contexts.get(handle.contextId);
-      if (ctx === undefined || ctx.mode !== "Broadcast") {
-        return null;
-      }
-      return ctx.broadcastSubscribers.size;
-    },
-
-    async broadcastIsSubscriber(handle: BridgeContextHandle, did: string): Promise<boolean> {
-      const ctx = contexts.get(handle.contextId);
-      if (ctx === undefined || ctx.mode !== "Broadcast") {
+    // Report presence for NAPI surface lookups so `'identityCreate' in
+    // handle` returns `true` the way the real NAPI `Scp` class would.
+    // Runtime hooks (`then`, `Symbol.toPrimitive`, etc) report absent
+    // so JS runtime coercion/iteration paths don't false-match.
+    has(_target, prop): boolean {
+      if (RUNTIME_HOOKS.has(prop)) {
         return false;
       }
-      return ctx.broadcastSubscribers.has(did);
-    },
-
-    async broadcastAdmission(
-      handle: BridgeContextHandle,
-    ): Promise<BroadcastAdmissionPolicy | null> {
-      const ctx = contexts.get(handle.contextId);
-      if (ctx === undefined || ctx.mode !== "Broadcast") {
-        return null;
+      if (typeof prop !== "string") {
+        return false;
       }
-      return ctx.broadcastAdmission;
-    },
-
-    // Governance lifecycle (#559)
-    async contextExecuteGovernanceAction(
-      _handle: BridgeContextHandle,
-      _actionJson: string,
-      _proposerDid: string,
-    ): Promise<string> {
-      return JSON.stringify({ status: "executed" });
-    },
-
-    async contextGovernancePropose(
-      _handle: BridgeContextHandle,
-      _actionJson: string,
-      _proposerDid: string,
-    ): Promise<string> {
-      return JSON.stringify({ proposal_id: generateId("proposal") });
-    },
-
-    async contextGovernanceApprove(
-      _handle: BridgeContextHandle,
-      _proposalIdHex: string,
-      _voterDid: string,
-    ): Promise<string> {
-      return JSON.stringify({ status: "approved" });
-    },
-
-    async contextGovernanceReject(
-      _handle: BridgeContextHandle,
-      _proposalIdHex: string,
-      _voterDid: string,
-    ): Promise<string> {
-      return JSON.stringify({ status: "rejected" });
-    },
-
-    async contextGovernanceWithdraw(
-      _handle: BridgeContextHandle,
-      _proposalIdHex: string,
-      _voterDid: string,
-    ): Promise<string> {
-      return JSON.stringify({ status: "withdrawn" });
-    },
-
-    async contextGovernanceGetProposal(
-      _handle: BridgeContextHandle,
-      _proposalIdHex: string,
-    ): Promise<string> {
-      return JSON.stringify({ status: "pending", votes: [] });
-    },
-
-    async contextGovernanceListProposals(_handle: BridgeContextHandle): Promise<string> {
-      return JSON.stringify([]);
-    },
-
-    async contextApplyPendingCeilingModification(
-      _handle: BridgeContextHandle,
-      _currentTimestamp: number,
-    ): Promise<boolean> {
-      return false;
-    },
-
-    async contextFinalizeClose(handle: BridgeContextHandle): Promise<void> {
-      const ctx = contexts.get(handle.contextId);
-      if (ctx !== undefined) {
-        ctx.state = "closed";
-      }
-    },
-
-    async contextCreateGovernanceCheckpoint(
-      _handle: BridgeContextHandle,
-      _checkpointSeq: number,
-      _merkleRootHex: string,
-      _eventCount: number,
-      _lastEventHashHex: string,
-      _stateSnapshotHashHex: string,
-      _creatorDid: string,
-      _creatorSignatureHex: string,
-    ): Promise<string> {
-      return JSON.stringify({ checkpoint_seq: _checkpointSeq, status: "created" });
-    },
-
-    async contextAddCheckpointCosignature(
-      _handle: BridgeContextHandle,
-      _checkpointJson: string,
-      _signerDid: string,
-      _signatureHex: string,
-    ): Promise<string> {
-      return JSON.stringify({ attestation_status: "cosigned" });
-    },
-
-    async contextRestore(_contextId: string): Promise<void> {
-      // Mock: no-op
-    },
-
-    async contextRestoreAll(): Promise<string> {
-      return JSON.stringify([]);
-    },
-
-    // Membership queries
-    async contextMemberCount(handle: BridgeContextHandle): Promise<number | null> {
-      const ctx = contexts.get(handle.contextId);
-      if (ctx === undefined) return null;
-      return ctx.members.size;
-    },
-
-    async contextIsMember(handle: BridgeContextHandle, did: string): Promise<boolean> {
-      const ctx = contexts.get(handle.contextId);
-      if (ctx === undefined) return false;
-      return ctx.members.has(did);
-    },
-
-    async contextMemberDids(handle: BridgeContextHandle): Promise<readonly string[]> {
-      const ctx = contexts.get(handle.contextId);
-      if (ctx === undefined) return [];
-      return [...ctx.members];
-    },
-
-    async contextMemberRole(
-      _handle: BridgeContextHandle,
-      _did: string,
-    ): Promise<import("../src/types").MemberRole | null> {
-      return null;
-    },
-
-    // SCPID authentication (§3.11)
-    scpidChallenge(audience: string, ttlSeconds: number): string {
-      if (audience === "") {
-        throw new Error("[SCP-VALID-7000] audience must not be empty");
-      }
-      if (ttlSeconds <= 0 || ttlSeconds > 300) {
-        throw new Error("[SCP-VALID-7000] ttl_seconds must be between 1 and 300");
-      }
-      const issuedAt = Date.now();
-      const expiresAt = issuedAt + ttlSeconds * 1000;
-      const nonce = Array.from({ length: 64 }, () =>
-        Math.floor(Math.random() * 16).toString(16),
-      ).join("");
-      return JSON.stringify({
-        protocol: "scpid/1.0",
-        nonce,
-        audience,
-        issued_at: issuedAt,
-        expires_at: expiresAt,
-      });
-    },
-
-    scpidSign(did: string, signingKeyId: string, challengeJson: string): string {
-      if (signingKeyId !== "#active" && signingKeyId !== "#agent") {
-        throw new Error(
-          `[SCP-IDENT-1034] invalid signing_key_id '${signingKeyId}': expected '#active' or '#agent'`,
-        );
-      }
-      const challenge = JSON.parse(challengeJson) as {
-        protocol: string;
-        nonce: string;
-        audience: string;
-      };
-      const signedAt = Date.now();
-      const signature = Array.from({ length: 128 }, () =>
-        Math.floor(Math.random() * 16).toString(16),
-      ).join("");
-      return JSON.stringify({
-        protocol: challenge.protocol,
-        did,
-        signing_key_id: signingKeyId,
-        nonce: challenge.nonce,
-        audience: challenge.audience,
-        signed_at: signedAt,
-        signature,
-      });
-    },
-
-    scpidVerify(responseJson: string, _challengeJson: string): string {
-      const response = JSON.parse(responseJson) as {
-        did: string;
-        signing_key_id: string;
-        signed_at: number;
-      };
-      return JSON.stringify({
-        did: response.did,
-        signing_key_id: response.signing_key_id,
-        signed_at: response.signed_at,
-      });
-    },
-
-    // Tool interface (§6.2.0.1)
-    async toolInterfaceExpose(
-      _handle: BridgeContextHandle,
-      _toolId: string,
-      _targetContextId: string,
-      _rateLimitJson?: string,
-    ): Promise<string> {
-      return JSON.stringify({ interface_id: generateId("iface"), status: "exposed" });
-    },
-
-    async toolInterfaceAccept(
-      _handle: BridgeContextHandle,
-      _interfaceJson: string,
-    ): Promise<string> {
-      return JSON.stringify({ status: "accepted" });
-    },
-
-    async toolInterfaceRevoke(
-      _handle: BridgeContextHandle,
-      _interfaceIdHex: string,
-    ): Promise<string> {
-      return JSON.stringify({ status: "revoked" });
-    },
-
-    // Trust Aggregation
-    async aggregateTrustInput(
-      _contextId: string,
-      _subjectDid: string,
-      _eventsJson: string,
-      _merkleRootJson: string,
-      _consequenceRulesJson: string,
-      _thresholdRequirementsJson: string,
-      _attestorSetsJson: string,
-      _cachedAttestationsJson: string,
-      _challengeResultsJson: string,
-    ): Promise<string> {
-      return JSON.stringify({ trust_score: 1.0, details: {} });
-    },
-
-    // Bridge Connector
-    bridgeRegister(
-      contextId: string,
-      operatorDid: string,
-      _governanceDid: string,
-      platform: string,
-      mode: BridgeMode,
-    ): {
-      bridge_id: string;
-      operator_did: string;
-      platform: string;
-      mode: BridgeMode;
-      status: string;
-      context_id: string;
-    } {
-      return {
-        bridge_id: generateId("bridge"),
-        operator_did: operatorDid,
-        platform,
-        mode,
-        status: "active",
-        context_id: contextId,
-      };
-    },
-
-    bridgeEvaluateTrust(
-      _isBridged: boolean,
-      _isNativeTransport: boolean,
-      _shadowStatus: ShadowStatus,
-    ): number {
-      return 3;
-    },
-
-    bridgeCreateShadow(
-      bridgeId: string,
-      platformHandle: string,
-      _bridgeMode: BridgeMode,
-      _contextId: string | undefined,
-    ): {
-      shadow_id: string;
-      platform_handle: string;
-      bridge_id: string;
-      attributed_role: string;
-      provenance_status: ShadowStatus;
-    } {
-      return {
-        shadow_id: generateId("shadow"),
-        platform_handle: platformHandle,
-        bridge_id: bridgeId,
-        attributed_role: "observer",
-        provenance_status: "shadow",
-      };
-    },
-
-    // Discovery
-    discoveryParseAddress(address: string): string {
-      return JSON.stringify({ address, parsed: true });
-    },
-
-    discoveryCreateQuery(
-      _capabilities: string[] | undefined,
-      _keywords: string[] | undefined,
-      _minHistorySecs: number | undefined,
-    ): string {
-      return JSON.stringify({ query_id: generateId("query") });
-    },
-
-    discoveryNormalizeAddress(address: string): string {
-      return address.toLowerCase().trim();
-    },
-
-    async contextDiscover(_query: string): Promise<string> {
-      return JSON.stringify([]);
-    },
-
-    // Petnames (section 22.4)
-    petnameSet(_ownerDid: string, _targetDid: string, _name: string): void {
-      // no-op
-    },
-
-    petnameRemove(_ownerDid: string, _targetDid: string): void {
-      // no-op
-    },
-
-    petnameSetContext(_ownerDid: string, _contextId: string, _name: string): void {
-      // no-op
-    },
-
-    petnameRemoveContext(_ownerDid: string, _contextId: string): void {
-      // no-op
-    },
-
-    petnameResolveDid(_ownerDid: string, _name: string): string {
-      return "";
-    },
-
-    petnameResolveContext(_ownerDid: string, _name: string): string {
-      return "";
-    },
-
-    petnameGetForDid(_ownerDid: string, _targetDid: string): string | null {
-      return null;
-    },
-
-    petnameGetForContext(_ownerDid: string, _contextId: string): string | null {
-      return null;
-    },
-
-    // Handle Registry (section 22.3.1)
-    handleRegister(
-      _discoveryContextId: string,
-      handle: string,
-      _targetJson: string,
-      _registrantDid: string,
-      _description: string | undefined,
-      _tags: string[] | undefined,
-    ): string {
-      return JSON.stringify({ handle, status: "registered" });
-    },
-
-    handleLookup(
-      _discoveryContextId: string,
-      handle: string,
-      _typeFilter: string | undefined,
-    ): string {
-      return JSON.stringify({ handle, results: [] });
-    },
-
-    handleDeregister(_discoveryContextId: string, handle: string, _did: string): string {
-      return JSON.stringify({ handle, status: "deregistered" });
-    },
-
-    // Scope Registry (section 22.3.5, ADR-043)
-    scopeRegister(
-      _scopeContextId: string,
-      _name: string,
-      _targetContextId: string,
-      _relayUrls: string[],
-      _registrantDid: string,
-      _description: string | undefined,
-      _tags: string[] | undefined,
-    ): string {
-      return JSON.stringify({ status: "registered", entry_id: "scope-1" });
-    },
-
-    scopeLookup(_scopeContextId: string, _name: string): string {
-      return JSON.stringify({ results: [] });
-    },
-
-    scopeDeregister(_scopeContextId: string, _name: string, _did: string): string {
-      return JSON.stringify({ removed: true });
-    },
-
-    // Address Resolution (section 22.8)
-    async addressResolve(
-      _ownerDid: string,
-      _address: string,
-      _knownContextsJson: string | undefined,
-    ): Promise<string> {
-      return JSON.stringify([]);
-    },
-
-    // Provenance
-    async evaluateProvenanceQuality(
-      _sourceContext: string | undefined,
-      _sourceType: string,
-      _contextState: string,
-      _counterparties: string[] | undefined,
-    ): Promise<number> {
-      return 1.0;
-    },
-
-    provenanceAttach(
-      sourceContextId: string,
-      _sourceType: string,
-      _memoryScope: string,
-      _members: string[],
-      targetContextId: string,
-      _actorDid: string,
-      _existingChainDepth: number | undefined,
-      _discoveryMethod: string | undefined,
-      _purpose: string | undefined,
-      _counterpartyPolicy: string | undefined,
-    ): string {
-      return JSON.stringify({
-        source_context_id: sourceContextId,
-        target_context_id: targetContextId,
-        chain_depth: 1,
-      });
-    },
-
-    provenanceCheckChainDepth(chainDepth: number, maxDepth: number | undefined): boolean {
-      return maxDepth === undefined || chainDepth <= maxDepth;
-    },
-
-    // Sync
-    syncClassifyOffline(_lastRelayContact: number, _now: number): string {
-      return "online";
-    },
-
-    syncClassifyOfflineCustom(
-      _lastRelayContact: number,
-      _now: number,
-      _tier1ThresholdSecs: number,
-      _tier2ThresholdSecs: number,
-    ): string {
-      return "online";
-    },
-
-    syncGetPolicy(): {
-      tier_1_threshold_secs: number;
-      tier_2_threshold_secs: number;
-      gap_timeout_secs: number;
-      reorder_buffer_capacity: number;
-      max_sequential_commits: number;
-      commit_process_timeout_secs: number;
-      sender_key_timeout_secs: number;
-      reconnection_dedup_window_secs: number;
-    } {
-      return {
-        tier_1_threshold_secs: 300,
-        tier_2_threshold_secs: 3600,
-        gap_timeout_secs: 30,
-        reorder_buffer_capacity: 100,
-        max_sequential_commits: 10,
-        commit_process_timeout_secs: 5,
-        sender_key_timeout_secs: 60,
-        reconnection_dedup_window_secs: 10,
-      };
-    },
-
-    // Identity Advanced
-    async identityCreateWithAgentKey(custody: string): Promise<BridgeIdentityHandle> {
-      const did = generateDid();
-      const identity: MockIdentity = { did, custodyType: custody };
-      identities.set(did, identity);
-      return { did, custodyType: custody };
-    },
-
-    async identityAddAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      return { did: handle.did, custodyType: handle.custodyType };
-    },
-
-    async identityRotateAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      return { did: handle.did, custodyType: handle.custodyType };
-    },
-
-    async identityRemoveAgentKey(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      return { did: handle.did, custodyType: handle.custodyType };
-    },
-
-    async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      const newDid = generateDid();
-      identities.delete(handle.did);
-      identities.set(newDid, { did: newDid, custodyType: handle.custodyType });
-      return { did: newDid, custodyType: handle.custodyType };
-    },
-
-    async identityAttestDevice(_did: string): Promise<string> {
-      return JSON.stringify({ attestation_token: "mock-token" });
-    },
-
-    async identityVerifyDeviceAttestation(_did: string, tokenBase64: string): Promise<boolean> {
-      // Mock: valid tokens contain "mock-token", invalid ones don't
-      return tokenBase64.includes("mock-token");
-    },
-
-    // Identity link attestation (§3.5.1)
-    async identityCreateLinkAttestation(
-      did: string,
-      platform: string,
-      handle: string,
-      _proof: string,
-      verificationMethod: string,
-      platformId: string | null,
-    ): Promise<string> {
-      const now = Date.now();
-      const attestation = {
-        id: `mock-attestation-${now}`,
-        type: "identity_link",
-        issuer: did,
-        subject: did,
-        issued_at: now,
-        claim: {
-          platform,
-          platform_handle: handle,
-          link_type: "self_attestation",
-          ...(platformId != null ? { platform_id: platformId } : {}),
-        },
-        evidence: {
-          method: verificationMethod,
-          proof: "mock-proof",
-          verified_at: now,
-        },
-        revocation: { method: "did_document", endpoint: "/revocations" },
-        signature: Array.from({ length: 64 }, () => 0),
-      };
-      return JSON.stringify(attestation);
-    },
-
-    identityLinkAttestations(_did: string): string {
-      return "[]";
-    },
-
-    identityRemoveLinkAttestation(_did: string, _attestationId: string): boolean {
       return true;
     },
+  }) as unknown as MockNativeScp;
 
-    async identityVerifyLinkAttestation(
-      _attestationJson: string,
-      _issuerPublicKeyHex?: string | null,
-    ): Promise<boolean> {
-      return true;
-    },
+  return handle;
+}
 
-    // Recovery and custody migration (#632, spec §9.12, §3.2.1)
-    async identityExecuteRecovery(
-      did: string,
-      tier: string,
-      _contextIds: string[],
-    ): Promise<string> {
-      return JSON.stringify({
-        did,
-        tier,
-        completed_contexts: [],
-        failed_contexts: [],
-        key_rotation_completed: true,
-      });
-    },
+/**
+ * Constructs a fresh {@link SCP} whose `#native` handle is a
+ * Proxy-backed mock. Equivalent to:
+ *
+ * ```ts
+ * const mock = createMockNativeScp();
+ * const scp = __constructScpWithNativeForTests(mock);
+ * ```
+ *
+ * plus a convenience handle returned alongside the SCP so tests can
+ * configure stubs and inspect the call log.
+ *
+ * @param mockNativeScp Optional pre-built mock. If omitted a fresh
+ *   mock is created. Passing a caller-built mock lets tests share
+ *   setup across multiple SCP instances.
+ */
+export function mountMockScp(mockNativeScp?: MockNativeScp): {
+  scp: SCP;
+  native: MockNativeScp;
+} {
+  const native = mockNativeScp ?? createMockNativeScp();
+  const scp = __constructScpWithNativeForTests(native);
+  return { scp, native };
+}
 
-    async identityExecuteCustodyMigration(
-      did: string,
-      target: string,
-      _contextIds: string[],
-    ): Promise<string> {
-      const validTargets = ["platform_managed", "hardware", "software", "in_memory"];
-      if (!validTargets.includes(target)) {
-        throw new Error(`invalid custody migration target: ${target}`);
-      }
-      return JSON.stringify({
-        did,
-        target,
-        key_generated: true,
-        authorized: true,
-        did_document_rotated: true,
-        ucans_reissued: true,
-        old_key_destroyed: true,
-      });
-    },
-
-    // App Sandboxing (#595, spec §8.4.1, §8.4.2)
-    validateCapabilityDeclaration(
-      _declarationJson: string,
-      _ceilingCapabilities: string[],
-      _roleCapabilities: string[],
-    ): string {
-      return JSON.stringify({ valid: true, errors: [] });
-    },
-
-    checkScopedCapability(
-      _grantedCapabilities: readonly string[],
-      _requiredCapability: string,
-    ): boolean {
-      return true;
-    },
-
-    // Invitation evaluation (§5.x, context.ts)
-    evaluateInvitation(
-      _paramsJson: string,
-      _inviterDid: string,
-      _identityDid: string,
-      _policyJson: string | null,
-      _spendingJson: string | null,
-      _trustedDidsJson: string | null,
-    ): { decision: string } {
-      return { decision: "accept" };
-    },
-
-    // MetadataRecord inspection (§5.7.2, #615)
-    metadataRecordToJson(
-      _contextId: string,
-      _sequence: number,
-      _signerDid: string,
-      _timestamp: number,
-      _structuralJson: string,
-      _operationalJson: string,
-      _signatureHex: string,
-    ): string {
-      return JSON.stringify({ context_id: _contextId, sequence: _sequence });
-    },
-
-    metadataRecordFromJson(_jsonStr: string): string {
-      return JSON.stringify({ parsed: true });
-    },
-
-    // Context template inspection (§5.14, #615)
-    templateGetParams(_templateId: string): string {
-      return JSON.stringify({ params: {} });
-    },
-
-    validateAgainstTemplate(_paramsJson: string): string | null {
-      return null;
-    },
-
-    validateContextParams(_paramsJson: string): string | null {
-      return null;
-    },
-
-    // Economy (§19, ADR-033)
-    economyEstimateCost(_policyJson: string, _actionType: string, _metricsJson: string): number {
-      return 0;
-    },
-
-    economyPolicyRequiresPayment(_policyJson: string): boolean {
-      return false;
-    },
-
-    economyAutoAcceptBlocked(_policyJson: string): boolean {
-      return false;
-    },
-
-    economyCheckPolicyLock(_policyJson: string): boolean {
-      return false;
-    },
-
-    economyValidatePolicyChange(_currentJson: string, _proposedJson: string): boolean {
-      return true;
-    },
-
-    economyEvaluateFormula(_formulaJson: string, _metricsJson: string): number {
-      return 0;
-    },
-
-    economyBudgetRemaining(_contextId: string, _did: string): number {
-      return 0;
-    },
-
-    economyBudgetGrant(_contextId: string, _did: string, _amount: number): void {
-      // no-op
-    },
-
-    economyBudgetRecordSpend(_contextId: string, _did: string, _amount: number): void {
-      // no-op
-    },
-
-    economyAntispamRecord(_contextId: string, _senderDid: string, _timestamp: number): void {
-      // no-op
-    },
-
-    economyAntispamVelocity(_contextId: string, _senderDid: string, _now: number): number {
-      return 0;
-    },
-
-    economyAntispamEscalatedCost(
-      _contextId: string,
-      _senderDid: string,
-      _now: number,
-      baseCost: number,
-      _thresholdsJson: string,
-      _floor: number | null,
-      _cap: number | null,
-    ): number {
-      return baseCost;
-    },
-
-    // Media (ADR-024)
-    mediaCheckCapability(_ceiling: string[], _capability: string): boolean {
-      return true;
-    },
-
-    mediaInitiateSession(
-      _contextId: string,
-      _ceiling: string[],
-      _capabilities: string[],
-      _participants: string[],
-      _timestamp: number,
-    ): string {
-      return JSON.stringify({ session_id: generateId("media"), status: "initiated" });
-    },
-
-    mediaActivateSession(_sessionJson: string): string {
-      return JSON.stringify({ status: "active" });
-    },
-
-    mediaJoinSession(_sessionJson: string, _participantDid: string): string {
-      return JSON.stringify({ status: "joined" });
-    },
-
-    mediaEndSession(_sessionJson: string, _timestamp: number): string {
-      return JSON.stringify({ status: "ended" });
-    },
-
-    mediaCreateOffer(_sessionId: string, _sdp: string, _senderDid: string): string {
-      return JSON.stringify({ type: "offer", session_id: _sessionId });
-    },
-
-    mediaCreateAnswer(_sessionId: string, _sdp: string, _senderDid: string): string {
-      return JSON.stringify({ type: "answer", session_id: _sessionId });
-    },
-
-    mediaCreateIceCandidate(
-      _sessionId: string,
-      _candidate: string,
-      _senderDid: string,
-      _sdpMid?: string,
-      _sdpMlineIndex?: number,
-    ): string {
-      return JSON.stringify({ type: "ice_candidate", session_id: _sessionId });
-    },
-
-    mediaCreateSessionEnd(_sessionId: string, _senderDid: string): string {
-      return JSON.stringify({ type: "session_end", session_id: _sessionId });
-    },
-
-    mediaSendSignaling(_signalingJson: string): string {
-      return JSON.stringify({ status: "sent" });
-    },
-
-    mediaVerifySenderAttribution(_signalingJson: string, _envelopeSenderDid: string): boolean {
-      return true;
-    },
-
-    // Trust — participation verification (SCP-BA-004, §7.3.2.1)
-    verifyParticipationRequirements(_profileJson: string, _requirementsJson: string): boolean {
-      // Mock: always succeeds. Tests that need failure behavior should override.
-      return true;
-    },
-
-    // Lifecycle
-    version(): string {
-      return "0.1.0-mock";
-    },
-
-    // eslint-disable-next-line @typescript-eslint/require-await -- Signature must match the NAPI async shutdown, but the mock has no async work to drain.
-    async shutdown(_timeoutMillis: number): Promise<void> {
-      identities.clear();
-      contexts.clear();
-      transports.clear();
-    },
-
-    suspend(): void {
-      // Mock: no-op. Real bridges call BridgeInstance::suspend.
-    },
-
-    resume(): Promise<void> {
-      // Mock: no-op. Real bridges call BridgeInstance::resume, which
-      // became async after #1678 (chains transport reconnect + persisted
-      // context restoration). The mock returns an already-resolved
-      // promise to keep the Bridge interface satisfied.
-      return Promise.resolve();
-    },
-  };
-
-  return bridge;
+/**
+ * Swaps the native handle underlying an existing {@link SCP} with a
+ * mock. Use when a test has already constructed an `SCP` via the
+ * real addon path and needs to retarget it at a Proxy-backed mock
+ * (e.g. to simulate a failure mode after real initialization).
+ */
+export function replaceNativeWithMock(scp: SCP, mockNativeScp?: MockNativeScp): MockNativeScp {
+  const native = mockNativeScp ?? createMockNativeScp();
+  __setNativeForTests(scp, native);
+  return native;
 }
