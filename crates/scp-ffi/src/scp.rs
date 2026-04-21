@@ -42,11 +42,14 @@ pub struct PyScp {
 impl PyScp {
     /// Constructs a new `SCP` instance with its own `PyBridgeInstance`.
     ///
-    /// Unlike [`PyScp::default_instance`], this bypasses the process-global
-    /// `DEFAULT_BRIDGE_INSTANCE` entirely — each call produces a brand-new
-    /// instance with a fresh monotonic `instance_id`, a fresh
-    /// `CancellationToken`, and an empty `JoinSet`. Handles issued against
-    /// this instance are incompatible with any other instance.
+    /// Each call produces a brand-new instance with a fresh monotonic
+    /// `instance_id`, a fresh `CancellationToken`, and an empty
+    /// `JoinSet`. Handles issued against this instance are incompatible
+    /// with any other instance — the affinity check at every FFI entry
+    /// point surfaces a mismatch as `PermissionError` (`SCP-PERM-3030`).
+    /// Phase D (#1695, ADR-048) deleted the prior `default_instance()`
+    /// factory and `DEFAULT_BRIDGE_INSTANCE` static; there is no
+    /// process-global bridge anymore.
     #[new]
     #[must_use]
     pub fn new() -> Self {

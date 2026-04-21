@@ -2349,23 +2349,20 @@ fn spawn_suppression_scoring_task(
 }
 
 // ---------------------------------------------------------------------------
-// Free functions — identity operations
+// Identity operations — implementation helpers
 //
-// See ADR-021 acceptance criterion 2.
+// See ADR-021 acceptance criterion 2. Entry points are the `Scp` methods
+// later in this file; each method calls into a matching `_impl` helper
+// here after running the affinity check and acquiring the per-instance
+// DID resolver slot.
 // ---------------------------------------------------------------------------
 
-// Phase D (#1695): `ensure_did_resolver_initialized` free-function helper
-// deleted along with the process-wide `DEFAULT_BRIDGE_INSTANCE`. Every
-// call site now routes through the per-instance
-// [`ensure_did_resolver_initialized_on`] helper, which stores the resolver
-// on the caller's own `UniffiBridgeInstance::did_resolver` slot. The
-// companion `identity_create` free function moved earlier in the same
-// demolition to `Scp::identity_create` (PR 4 sub-slice B).
-
 // ---------------------------------------------------------------------------
-// Free functions — device attestation (#419)
+// Device attestation — implementation helpers (#419)
 //
-// See §9.3 (Sybil Resistance and Identity Uniqueness).
+// See §9.3 (Sybil Resistance and Identity Uniqueness). Dispatched from the
+// `Scp::identity_attest_device` / `identity_verify_device_attestation`
+// methods.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "allow_in_memory_custody")]
@@ -6576,32 +6573,23 @@ fn parse_observable_metrics(json: &str) -> Result<scp_core::economy::ObservableM
     })
 }
 
-// ===== UniFFI sub-slice B — identity operations (method migration) =====
+// ===== Identity operations — per-instance methods on `Scp` =====
 //
-// Migrates the 10 identity free functions
-// (`identity_create`, `identity_create_with_custody`, `identity_load`,
-// `identity_resolve`, `identity_attest_device`,
-// `identity_verify_device_attestation`, `identity_create_link_attestation`,
-// `identity_link_attestations`, `identity_remove_link_attestation`,
-// `identity_verify_link_attestation`) to `impl crate::scp::Scp` methods
-// routing through `&self.inner` (the `UniffiBridgeInstance` owned by the
-// caller).
-//
-// Free functions above are retained (they still compile and are still
-// exported via `#[uniffi::export]`) — the demolition slice at the end of
-// PR 4 removes them in one shot after every caller is migrated. Bodies
-// are preserved verbatim except for the `DEFAULT_BRIDGE_INSTANCE` →
-// `&*self.inner` swap described in the PR 4 sub-slice B plan.
-//
-// Part of #1549 Phase 4 PR 4.
+// The 10 identity operations (`identity_create`,
+// `identity_create_with_custody`, `identity_load`, `identity_resolve`,
+// `identity_attest_device`, `identity_verify_device_attestation`,
+// `identity_create_link_attestation`, `identity_link_attestations`,
+// `identity_remove_link_attestation`, `identity_verify_link_attestation`)
+// live on `impl crate::scp::Scp`, routing through `&self.inner` (the
+// caller's `UniffiBridgeInstance`). The free-function façade was deleted
+// in Phase 4 PR 4 (#1549, ADR-048).
 
-/// Per-instance equivalent of [`ensure_did_resolver_initialized`] that
-/// stores the resolver on `bi` instead of the process-wide
-/// `DEFAULT_BRIDGE_INSTANCE`.
+/// Per-instance DID-resolver initializer.
 ///
-/// Mirrors the body of the module-level helper; exists so the sub-slice B
-/// methods on [`crate::scp::Scp`] can keep the same "init on first use"
-/// behaviour without touching the default instance.
+/// Stores the resolver on the caller's [`UniffiBridgeInstance`] rather than
+/// any process-wide slot. Invoked lazily on first use by the
+/// [`crate::scp::Scp`] identity methods to keep "init on first use"
+/// semantics scoped to the owning instance.
 fn ensure_did_resolver_initialized_on(
     bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     handle: tokio::runtime::Handle,
@@ -6991,22 +6979,13 @@ impl Scp {
         identity_verify_link_attestation_impl(attestation_json, issuer_public_key_hex).await
     }
 
-    // ===== UniFFI sub-slice C — context lifecycle =====
+    // ===== Context lifecycle — per-instance methods on `Scp` =====
     //
-    // Migrates the 6 context lifecycle free functions
-    // (`context_create`, `context_join`, `context_leave`, `context_close`,
-    // `context_send`, `context_subscribe`) to `impl crate::scp::Scp`
-    // methods routing through `&self.inner` (the `UniffiBridgeInstance`
-    // owned by the caller).
-    //
-    // Free functions above are retained (they still compile and are still
-    // exported via `#[uniffi::export]`) — the demolition slice at the end
-    // of PR 4 removes them in one shot after every caller is migrated.
-    // Bodies are preserved verbatim except for the
-    // `DEFAULT_BRIDGE_INSTANCE`/module-level-helper → `&*self.inner` swap
-    // described in the PR 4 sub-slice C plan.
-    //
-    // Part of #1549 Phase 4 PR 4.
+    // The 6 context lifecycle operations (`context_create`, `context_join`,
+    // `context_leave`, `context_close`, `context_send`, `context_subscribe`)
+    // live on `impl crate::scp::Scp`, routing through `&self.inner` (the
+    // caller's `UniffiBridgeInstance`). The free-function façade was
+    // deleted in Phase 4 PR 4 (#1549, ADR-048).
 
     /// Per-instance equivalent of the free-function [`context_create`].
     ///
@@ -12217,11 +12196,10 @@ impl Scp {
         }
     }
 
-    // ===== UniFFI Phase-A gap-fill — state-touching free-fn methods =====
+    // ===== State-touching operations — per-instance methods on `Scp` =====
     //
-    // Migrates the last batch of state-touching free functions to `impl Scp`
-    // methods routing through `&self.inner` so the demolition slice can
-    // finally drop `DEFAULT_BRIDGE_INSTANCE`. Covers:
+    // The remaining state-touching operations live on `impl Scp`, routing
+    // through `&self.inner` and the inline handle-affinity check. Covers:
     //   - `identity_migrate`, `identity_create_with_agent_key`,
     //     `identity_execute_recovery`, `identity_execute_custody_migration`
     //   - `provenance_attach`
@@ -12231,11 +12209,8 @@ impl Scp {
     //   - `context_export`, `context_import`
     //   - `evaluate_invitation`
     //
-    // Bodies are preserved verbatim except for `default_bridge_instance()?`
-    // / `crate::runtime::bridge_instance()?` → `&*self.inner` and the inline
-    // handle-affinity check. Free functions are deleted in this same commit.
-    //
-    // Part of #1549 Phase 4 PR 4 demolition Phase A gap-fill.
+    // The free-function façade that forwarded to a process-wide bridge
+    // instance was deleted in Phase 4 PR 4 (#1549, ADR-048).
 
     /// Per-instance equivalent of the free-function `identity_migrate`.
     ///
