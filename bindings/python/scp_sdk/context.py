@@ -783,9 +783,6 @@ class Context:
             identity: The identity joining the context.
             spending_ucan_jwt: Optional spending UCAN JWT for
                 AND-composition with join cost (spec section 19).
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Returns:
             A :class:`Membership` representing the new participant.
@@ -818,9 +815,6 @@ class Context:
 
         Args:
             identity: The identity leaving the context.
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Raises:
             ContextError: If the context is not active.
@@ -842,9 +836,6 @@ class Context:
 
         Args:
             identity: The identity initiating the close.
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Raises:
             ContextError: If the context is not active.
@@ -875,9 +866,6 @@ class Context:
                 creator if not specified.
             spending_ucan_jwt: Optional spending UCAN JWT for
                 AND-composition with message cost (spec section 19).
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Raises:
             ContextError: If the context is not active.
@@ -906,11 +894,6 @@ class Context:
         events).  When the consumer falls behind, the oldest
         unconsumed event is dropped and a ``BufferOverflow`` warning
         is emitted.
-
-        Args:
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Returns:
             An :class:`AsyncIterator[Message]

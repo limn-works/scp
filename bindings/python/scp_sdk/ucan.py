@@ -142,13 +142,12 @@ async def validate(
     an action.
 
     Args:
+        scp: The :class:`scp_sdk.SCP` instance that owns the bridge
+            context against which the UCAN is validated.
         context: The context ID the token is being presented in.
         token: The encoded UCAN token string (JWT format).
         capability: The required capability URI
             (e.g., ``"scp:ctx:abc123/messages:write"``).
-        scp: Optional explicit :class:`_scp_core.SCP` instance. When
-            ``None`` the process-wide default instance is used for
-            back-compat (ADR-048).
 
     Raises:
         UcanPermissionError: If validation fails for any reason (malformed

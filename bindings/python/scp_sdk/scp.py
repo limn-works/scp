@@ -76,7 +76,7 @@ def _native_cls() -> Any:
 
 
 class SCP:
-    """Caller-owned SCP instance — the preferred SDK entry point.
+    """Caller-owned SCP instance — the sole public SDK entry point.
 
     Each :class:`SCP` wraps an independent native ``BridgeInstance`` (with
     its own registries, transport state, and context manager). The wrapper
@@ -84,10 +84,11 @@ class SCP:
     :meth:`shutdown`) plus the monotonic :attr:`instance_id` used by the
     FFI handle-affinity check.
 
-    For single-tenant processes that just need "the" bridge, use
-    :meth:`default` — but note that this is a process-wide shared instance
-    that the deprecated free-function façade also uses. New code should
-    construct explicit :class:`SCP` instances.
+    Phase 4 PR 4 (#1549, ADR-048) removed the process-global default
+    instance and the free-function façade that delegated to it. Every
+    caller now owns an explicit :class:`SCP` — pass it positionally to
+    :meth:`Identity.create`, :meth:`Context.create`, and every other
+    SDK entry point.
 
     :class:`SCP` is a context manager: ``with SCP() as scp: ...`` calls
     :meth:`shutdown` with a 5-second timeout on exit.

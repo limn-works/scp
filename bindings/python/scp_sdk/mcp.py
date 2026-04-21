@@ -736,9 +736,6 @@ class McpClient:
             input: The tool's input arguments.
             context: The SCP context for provenance tracking.
             identity: The SCP identity for signing / provenance.
-            scp: Optional explicit :class:`_scp_core.SCP` instance. When
-                ``None`` the process-wide default instance is used for
-                back-compat (ADR-048).
 
         Returns:
             An :class:`McpToolResult` with content and provenance.
