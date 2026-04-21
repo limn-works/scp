@@ -1,16 +1,14 @@
 /**
- * Bridge connector module for the SCP TypeScript SDK.
+ * Bridge connector types for the SCP TypeScript SDK.
  *
- * Provides functions for registering bridge connectors, evaluating bridge
- * trust levels, and creating shadow identities for external platform
- * participants.
+ * Defines bridge-connector wire types (spec §12, ADR-023). The
+ * functional entry points (`bridgeCreateShadow`) moved onto the
+ * {@link SCP} class in Phase 4 PR 4 (#1549, ADR-048); `bridgeRegister`
+ * and `bridgeEvaluateTrust` never existed on the NAPI bridge so the
+ * free-function shims were deleted outright in the same commit.
  *
  * See spec section 12 (Bridge System) and ADR-023.
  */
-
-import { mapBridgeError } from "./errors";
-import { getBridge } from "./internal/bridge";
-import type { SCP } from "./scp";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -39,105 +37,4 @@ export interface ShadowIdentity {
   readonly bridgeId: string;
   readonly attributedRole: string;
   readonly provenanceStatus: ShadowStatus;
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/**
- * Registers a bridge connector with a context.
- *
- * Routes through the supplied `SCP` instance (ADR-048). The back-compat
- * default-instance fallback was removed in Phase 4 PR 4 (#1549) demolition.
- *
- * @param scp - The `SCP` wrapper whose bridge instance should own this call.
- * @param contextId - Context to register the bridge in.
- * @param operatorDid - DID of the human operator.
- * @param governanceDid - DID of the governance authority approving the
- *   registration.  Must differ from `operatorDid` (self-approval is
- *   forbidden per ADR-023).
- * @param platform - External platform name (e.g., `"discord"`).
- * @param mode - Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
- * @returns The bridge registration result.
- * @throws {ValidationError} If mode is not recognized.
- * @throws {ContextError} If governance DID matches operator DID (self-approval).
- */
-export async function bridgeRegister(
-  scp: SCP,
-  contextId: string,
-  operatorDid: string,
-  governanceDid: string,
-  platform: string,
-  mode: BridgeMode,
-): Promise<BridgeRegistration> {
-  try {
-    const bridge = await getBridge(scp);
-    const raw = bridge.bridgeRegister(contextId, operatorDid, governanceDid, platform, mode);
-    return {
-      bridgeId: raw.bridge_id,
-      operatorDid: raw.operator_did,
-      platform: raw.platform,
-      mode: raw.mode,
-      status: raw.status,
-      contextId: raw.context_id,
-    };
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Evaluates the trust level for an action based on bridge provenance.
- *
- * @param scp - The `SCP` wrapper whose bridge instance should own this call.
- * @param isBridged - Whether the action has bridge provenance.
- * @param isNativeTransport - Whether the transport is native SCP.
- * @param shadowStatus - `"shadow"` or `"claimed"`.
- * @returns Trust tier as an integer (0-3).
- */
-export async function bridgeEvaluateTrust(
-  scp: SCP,
-  isBridged = false,
-  isNativeTransport = true,
-  shadowStatus: ShadowStatus = "shadow",
-): Promise<number> {
-  try {
-    const bridge = await getBridge(scp);
-    return bridge.bridgeEvaluateTrust(isBridged, isNativeTransport, shadowStatus);
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Creates a shadow identity for an external platform participant.
- *
- * @param scp - The `SCP` wrapper whose bridge instance should own this call.
- * @param bridgeId - The bridge connector ID.
- * @param platformHandle - External platform handle.
- * @param bridgeMode - Bridge mode: `"relay"`, `"puppet"`, `"api"`, or `"cooperative"`.
- * @param contextId - Context the shadow is being created in.
- * @returns The shadow identity result.
- */
-export async function bridgeCreateShadow(
-  scp: SCP,
-  bridgeId: string,
-  platformHandle: string,
-  bridgeMode: BridgeMode,
-  contextId?: string,
-): Promise<ShadowIdentity> {
-  try {
-    const bridge = await getBridge(scp);
-    const raw = bridge.bridgeCreateShadow(bridgeId, platformHandle, bridgeMode, contextId);
-    return {
-      shadowId: raw.shadow_id,
-      platformHandle: raw.platform_handle,
-      bridgeId: raw.bridge_id,
-      attributedRole: raw.attributed_role,
-      provenanceStatus: raw.provenance_status,
-    };
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
 }

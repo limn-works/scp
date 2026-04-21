@@ -1,139 +1,29 @@
 /**
  * UCAN module for the SCP TypeScript SDK.
  *
- * Provides functions for UCAN token lifecycle management: validation,
- * minting, revocation, and delegation. UCAN tokens are the capability
- * authorization mechanism within SCP contexts.
+ * UCAN token lifecycle (validate / mint / revoke / delegate) moved onto
+ * the {@link SCP} class in Phase 4 PR 4 (#1549, ADR-048):
+ *
+ * - `scp.ucanValidate(contextHandle, token, capability, ...)` —
+ *   full validation pipeline (signature, time bounds, delegation chain,
+ *   nonce replay, capability match).
+ * - `scp.ucanMint(contextHandle, memberDid, capabilities, proofs?)` —
+ *   mint a context-scoped token with the admin's key.
+ * - `scp.ucanRevoke(contextHandle, token, revokerDid)` — add to the
+ *   context revocation list and append a `TokenRevoked` event.
+ * - `scp.ucanDelegate(contextHandle, delegatorDid, delegateeDid,
+ *   parentToken, capabilities)` — attenuation-enforced delegation.
+ *
+ * The free-function shims that predated ADR-048 were deleted in the
+ * same commit.
  *
  * See ADR-016 (UCAN Enforcement) and ADR-022 in `.docs/adrs/phase-4.md`.
  */
 
-import type { Context } from "./context";
-import { mapBridgeError } from "./errors";
-import { getBridge } from "./internal/bridge";
-import type { UcanToken } from "./types";
+// Intentionally empty — this module used to export wrappers around the
+// above four operations. All consumers now call methods on `SCP`
+// directly. Types live in `./types::UcanToken`. The module is kept as a
+// placeholder so the barrel export in `./index` stays stable across the
+// Agent A → B → C migration. Agent B will remove this file entirely.
 
-// ---------------------------------------------------------------------------
-// UCAN operations
-// ---------------------------------------------------------------------------
-
-/**
- * Validates a UCAN token for a required capability within a context.
- *
- * Performs full validation: signature verification, time bounds checking,
- * delegation chain traversal, attenuation enforcement, nonce replay
- * detection, and capability matching.
- *
- * Routes through the context's owning `SCP` instance (ADR-048). The
- * back-compat default-instance fallback was removed in Phase 4 PR 4
- * (#1549) demolition.
- *
- * @param ctx - The context the token is presented in.
- * @param token - The encoded UCAN token string (JWT format).
- * @param capability - The required capability URI.
- * @throws {UcanPermissionError} If validation fails.
- */
-export async function validateUcan(ctx: Context, token: string, capability: string): Promise<void> {
-  try {
-    const bridge = await getBridge(ctx._scp);
-    await bridge.ucanValidate(ctx._handle, token, capability);
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Mints a new UCAN token for a context member.
- *
- * Creates a UCAN token granting the specified capabilities to the member.
- * The token is signed by the context admin's key and scoped to this context.
- *
- * Routes through the context's owning `SCP` instance (ADR-048).
- *
- * @param ctx - The context to mint the token for.
- * @param memberDid - The DID of the member receiving the token.
- * @param capabilities - Capability URIs to grant.
- * @param proofs - Optional parent UCAN tokens to chain as proofs.
- * @returns The minted UCAN token with metadata.
- * @throws {UcanPermissionError} If minting fails.
- */
-export async function mintUcan(
-  ctx: Context,
-  memberDid: string,
-  capabilities: readonly string[],
-  proofs?: readonly string[],
-): Promise<UcanToken> {
-  try {
-    const bridge = await getBridge(ctx._scp);
-    return await bridge.ucanMint(ctx._handle, memberDid, capabilities, proofs);
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Revokes a UCAN token using the full revocation pipeline.
- *
- * Performs authorization (revoker must be the token's issuer or the context
- * creator), adds the token to the context's revocation list, and appends a
- * TokenRevoked event to the context's Merkle event log.
- *
- * Routes through the context's owning `SCP` instance (ADR-048).
- *
- * @param ctx - The context the token belongs to.
- * @param token - The full encoded JWT string of the token to revoke.
- * @param revokerDid - The DID of the entity requesting the revocation.
- *   Must be the token's issuer or the context creator.
- * @throws {UcanPermissionError} If revocation fails (unauthorized, malformed, etc.).
- */
-export async function revokeUcan(ctx: Context, token: string, revokerDid: string): Promise<void> {
-  try {
-    const bridge = await getBridge(ctx._scp);
-    await bridge.ucanRevoke(ctx._handle, token, revokerDid);
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Delegates a UCAN token to another member.
- *
- * Creates a new UCAN token that delegates a subset of the original token's
- * capabilities to another member. The delegator must be the audience of the
- * original token (iss/aud chain linkage). Attenuation rules ensure the
- * delegated token cannot exceed the original's scope.
- *
- * Delegates to the real `bridge.ucanDelegate()` which performs Ed25519
- * signing via the delegator's retained `KeyCustody` and enforces
- * attenuation, iss/aud chain validation, and ceiling compliance.
- *
- * Routes through the context's owning `SCP` instance (ADR-048).
- *
- * @param ctx - The context to delegate within.
- * @param originalToken - The original token to delegate from (must include `encoded` JWT).
- * @param delegatorDid - The DID of the entity delegating (must match originalToken.audience).
- * @param targetDid - The DID of the delegation target.
- * @param capabilities - Capability URIs to delegate (must be a subset of the original).
- * @returns The delegated UCAN token.
- * @throws {UcanPermissionError} If delegation fails or capabilities exceed the original.
- */
-export async function delegateUcan(
-  ctx: Context,
-  originalToken: UcanToken,
-  delegatorDid: string,
-  targetDid: string,
-  capabilities: readonly string[],
-): Promise<UcanToken> {
-  try {
-    const bridge = await getBridge(ctx._scp);
-    return await bridge.ucanDelegate(
-      ctx._handle,
-      delegatorDid,
-      targetDid,
-      originalToken.encoded,
-      capabilities,
-    );
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
+export {};

@@ -173,7 +173,9 @@ export interface TransportConfig {
 
 export type { AddressResolution, ResolutionLayer, ResolutionPath, TrustLevel } from "./types";
 
-export declare function resolveAddress(query: string): Promise<AddressResolution[]>;
+// `resolveAddress` now takes an explicit `SCP` instance per ADR-048.
+// The authoritative declaration lives alongside the implementation in
+// `./discovery.ts`; this file no longer redeclares it.
 
 // -- Identity -----------------------------------------------------------------
 
@@ -211,36 +213,16 @@ export declare class Context {
 }
 
 // -- UCAN ---------------------------------------------------------------------
-
-export declare function mintUcan(
-  ctx: Context,
-  memberDid: string,
-  capabilities: readonly string[],
-  proofs?: readonly string[],
-): Promise<UcanToken>;
-
-export declare function validateUcan(
-  ctx: Context,
-  token: string,
-  capability: string,
-): Promise<void>;
-
-export declare function revokeUcan(ctx: Context, token: string): Promise<void>;
-
-export declare function delegateUcan(
-  ctx: Context,
-  originalToken: UcanToken,
-  delegatorDid: string,
-  targetDid: string,
-  capabilities: readonly string[],
-): Promise<UcanToken>;
+//
+// UCAN lifecycle entry points moved onto the SCP class in Phase 4 PR 4
+// (#1549, ADR-048). Call `scp.ucanValidate(...)`, `scp.ucanMint(...)`,
+// `scp.ucanRevoke(...)`, and `scp.ucanDelegate(...)` directly.
 
 // -- Trust --------------------------------------------------------------------
-
-export declare function evaluateTrust(
-  context: Context,
-  targetDid: string,
-): Promise<TrustEvaluation>;
+//
+// Trust evaluation sugar moved onto the SCP class in Phase 4 PR 4.
+// `scp.aggregateTrustInput(...)`, `scp.verifyParticipationRequirements(...)`
+// and related primitives are now available directly on the SCP instance.
 
 // -- Event Log ----------------------------------------------------------------
 
@@ -261,29 +243,12 @@ export declare class EventLog {
 export declare function connect(config: TransportConfig): Promise<void>;
 
 // -- MCP ----------------------------------------------------------------------
-
-export declare function serveMcp(
-  context: Context,
-  options?: { transport?: "stdio" | "ws"; port?: number },
-): Promise<McpServer>;
-
-export declare class McpServer {
-  stop(): Promise<void>;
-}
-
-export declare function connectMcp(config: McpClientConfig): Promise<McpClient>;
-
-export declare function connectMcpStdio(
-  command: string,
-  args?: readonly string[],
-): Promise<McpClient>;
-
-export declare class McpClient {
-  static connect(url: string): Promise<McpClient>;
-  listTools(): Promise<ToolDefinition[]>;
-  callTool(name: string, input: Record<string, unknown>): Promise<Record<string, unknown>>;
-  close(): Promise<void>;
-}
+//
+// MCP server/client entry points moved onto the SCP class in Phase 4 PR 4
+// (#1549, ADR-048). Call `scp.mcpServerCreate(...)`,
+// `scp.mcpClientConnectStdio(...)`, `scp.mcpClientConnectSse(...)` and
+// `scp.mcpClientInvoke(...)` directly. The `McpServer` and `McpClient`
+// interfaces remain in `./mcp.ts` for Agent B to collapse.
 
 // -- SCP multi-instance handle (#1549 Phase 4 PR 1, ADR-048) -----------------
 

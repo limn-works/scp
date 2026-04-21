@@ -47,6 +47,16 @@ export class Transport implements AsyncDisposable {
   }
 
   /**
+   * Constructs a `Transport` from a raw native NAPI transport handle.
+   *
+   * @internal Phase 4 PR 4 (#1549, ADR-048) — used by `SCP`
+   *   forwarders that return transport-typed results.
+   */
+  static _fromHandle(raw: unknown, scp: SCP): Transport {
+    return new Transport(raw as BridgeTransportHandle, scp);
+  }
+
+  /**
    * Connects to an SCP relay.
    *
    * The relay URL must use the `wss://` scheme. Plaintext `ws://` connections

@@ -1537,38 +1537,12 @@ export class Context implements AsyncDisposable {
 // Context restoration (#559)
 // ---------------------------------------------------------------------------
 
-/**
- * Restores a single persisted context from storage.
- *
- * @param contextId - The context ID to restore.
- * @throws {ContextError} If restoration fails (SCP-CTX-2064).
- */
-export async function restoreContext(scp: SCP, contextId: string): Promise<void> {
-  try {
-    const bridge = await getBridge(scp);
-    await bridge.contextRestore(contextId);
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Restores all persisted contexts from storage.
- *
- * Only contexts in `Active` state are restored. Contexts in `Closing`,
- * `Closed`, or `Expired` states are skipped.
- *
- * @returns JSON array of restored context ID strings.
- * @throws {ContextError} If restoration fails (SCP-CTX-2065).
- */
-export async function restoreAllContexts(scp: SCP): Promise<string> {
-  try {
-    const bridge = await getBridge(scp);
-    return await bridge.contextRestoreAll();
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
+// ---------------------------------------------------------------------------
+// Context restore / restore-all moved to `SCP.contextRestore(...)` and
+// `SCP.contextRestoreAll(...)` in Phase 4 PR 4 (#1549, ADR-048). The
+// free-function shims (`restoreContext`, `restoreAllContexts`) that
+// predated ADR-048 were deleted in the same commit.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // App Sandboxing (spec §8.4.1, §8.4.2, issue #595)
@@ -1621,26 +1595,12 @@ export class ScopedHandle {
   }
 }
 
-/**
- * Validates a capability declaration against a context ceiling and role capabilities.
- *
- * Returns a result object with validation outcome. See spec §8.4.1.
- * This is a synchronous operation -- no I/O is involved.
- */
-export function validateCapabilityDeclaration(
-  scp: SCP,
-  declarationJson: string,
-  ceilingCapabilities: string[],
-  roleCapabilities: string[],
-): DeclarationValidationResult {
-  const bridge = getBridgeSync(scp);
-  const resultJson = bridge.validateCapabilityDeclaration(
-    declarationJson,
-    ceilingCapabilities,
-    roleCapabilities,
-  );
-  return JSON.parse(resultJson) as DeclarationValidationResult;
-}
+// ---------------------------------------------------------------------------
+// `validateCapabilityDeclaration` moved to `SCP.validateCapabilityDeclaration(...)`
+// in Phase 4 PR 4 (#1549, ADR-048). Callers now use `scp.validateCapabilityDeclaration(...)`
+// and parse the JSON result themselves. The free-function shim that
+// predated ADR-048 was deleted in the same commit.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Invitation evaluation (#614)
@@ -1654,55 +1614,12 @@ export interface InvitationEvaluationResult {
   readonly decision: "auto_accept" | "prompt_agent";
 }
 
-/**
- * Evaluates a context invitation through the sequential pipeline.
- *
- * Runs the 4-step evaluation pipeline:
- * 1. **Template check** -- validates params match the claimed template.
- * 2. **Economic policy check** -- verifies spending capability for paid contexts.
- * 3. **Auto-accept check** -- evaluates trust, TTL cap, and rate limit.
- * 4. **Agent prompt** -- falls through if no auto-accept matches.
- *
- * @param paramsJson - JSON-serialized `ContextParams` from the invitation.
- * @param inviterDid - DID string of the identity sending the invitation.
- * @param identityDid - DID string of the local identity receiving the invitation.
- * @param policyJson - Optional JSON-serialized `AutoAcceptPolicy`.
- * @param spendingJson - Optional JSON-serialized `SpendingContext`.
- * @param trustedDids - Optional array of trusted DID strings.
- * @returns The evaluation result with the pipeline decision.
- * @throws {ContextError} If pipeline evaluation fails.
- * @throws {ValidationError} If input validation fails.
- */
-export async function evaluateInvitation(
-  scp: SCP,
-  paramsJson: string,
-  inviterDid: string,
-  identityDid: string,
-  policyJson?: string,
-  spendingJson?: string,
-  trustedDids?: readonly string[],
-): Promise<InvitationEvaluationResult> {
-  try {
-    const bridge = await getBridge(scp);
-    const trustedDidsJson = trustedDids ? JSON.stringify(trustedDids) : undefined;
-    const raw = bridge.evaluateInvitation(
-      paramsJson,
-      inviterDid,
-      identityDid,
-      policyJson ?? null,
-      spendingJson ?? null,
-      trustedDidsJson ?? null,
-    );
-    // Normalize: bridge may return a string, an object, or a Promise of either.
-    const resolved = await Promise.resolve(raw);
-    if (typeof resolved === "string") {
-      return JSON.parse(resolved) as InvitationEvaluationResult;
-    }
-    return resolved as unknown as InvitationEvaluationResult;
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
+// ---------------------------------------------------------------------------
+// `evaluateInvitation` moved to `SCP.evaluateInvitation(...)` in Phase 4
+// PR 4 (#1549, ADR-048). Callers now use `scp.evaluateInvitation(...)`.
+// The free-function shim that predated ADR-048 was deleted in the same
+// commit.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // MetadataRecord inspection (§5.7.2, #615)
@@ -1745,94 +1662,13 @@ export interface MetadataRecord {
   signature: number[];
 }
 
-/**
- * Serializes a MetadataRecord to a JSON string (spec §5.7.2).
- *
- * @param contextId - The context this metadata describes.
- * @param sequence - Monotonically increasing sequence number (starts at 1).
- * @param signerDid - DID of the admin who signed this record.
- * @param timestamp - Unix timestamp in milliseconds.
- * @param structural - Structural metadata object.
- * @param operational - Operational metadata object.
- * @param signatureHex - Ed25519 signature as hex string (128 hex chars).
- * @returns JSON string of the MetadataRecord.
- */
-export function metadataRecordToJson(
-  scp: SCP,
-  contextId: string,
-  sequence: number,
-  signerDid: string,
-  timestamp: number,
-  structural: StructuralMetadata,
-  operational: OperationalMetadata,
-  signatureHex: string,
-): string {
-  const bridge = getBridgeSync(scp);
-  return bridge.metadataRecordToJson(
-    contextId,
-    sequence,
-    signerDid,
-    timestamp,
-    JSON.stringify(structural),
-    JSON.stringify(operational),
-    signatureHex,
-  );
-}
-
-/**
- * Deserializes a MetadataRecord from a JSON string (spec §5.7.2).
- *
- * @param jsonStr - JSON string of a MetadataRecord.
- * @returns Parsed MetadataRecord object.
- */
-export function metadataRecordFromJson(scp: SCP, jsonStr: string): MetadataRecord {
-  const bridge = getBridgeSync(scp);
-  const validated = bridge.metadataRecordFromJson(jsonStr);
-  return JSON.parse(validated) as MetadataRecord;
-}
-
 // ---------------------------------------------------------------------------
-// Context template inspection (§5.14, #615)
+// `metadataRecordToJson`, `metadataRecordFromJson`, `templateGetParams`,
+// `validateAgainstTemplate`, and `validateContextParams` moved to
+// `SCP.metadataRecordToJson(...)`, `SCP.metadataRecordFromJson(...)`,
+// `SCP.templateGetParams(...)`, `SCP.validateAgainstTemplate(...)`, and
+// `SCP.validateContextParams(...)` in Phase 4 PR 4 (#1549, ADR-048).
+// Callers now invoke those methods on their `SCP` instance directly and
+// `JSON.parse` the returned strings as needed. The free-function shims
+// that predated ADR-048 were deleted in the same commit.
 // ---------------------------------------------------------------------------
-
-/**
- * Gets the canonical ContextParams for a well-known template (spec §5.12.1).
- *
- * @param templateId - One of: `BilateralEphemeral`, `BilateralPersistent`,
- *   `Coordination`, `GroupDiscussion`, `PublicBroadcast`, `GatedBroadcast`,
- *   `scp:template/tool-interface`, `PaidService`, `PaidBroadcast`,
- *   `HandleRegistry`.
- * @returns ContextParams object.
- */
-export function templateGetParams(scp: SCP, templateId: string): ContextParams {
-  const bridge = getBridgeSync(scp);
-  const result = bridge.templateGetParams(templateId);
-  return JSON.parse(result) as ContextParams;
-}
-
-/**
- * Validates that ContextParams match their template definition.
- *
- * When `params` contains a `template_id`, every field is compared
- * against the canonical template definition.
- *
- * @param params - ContextParams to validate.
- * @returns `null` on success, or a string error message on failure.
- */
-export function validateAgainstTemplate(scp: SCP, params: ContextParams): string | null {
-  const bridge = getBridgeSync(scp);
-  return bridge.validateAgainstTemplate(JSON.stringify(params));
-}
-
-/**
- * Validates cross-field invariants for ContextParams regardless of template.
- *
- * Currently enforces: `projection_policy` must be `null` for `Encrypted` contexts.
- *
- * @param params - ContextParams to validate.
- * @returns `null` on success, or a string error message on failure.
- */
-export function validateContextParams(scp: SCP, params: ContextParams): string | null {
-  const bridge = getBridgeSync(scp);
-  return bridge.validateContextParams(JSON.stringify(params));
-}

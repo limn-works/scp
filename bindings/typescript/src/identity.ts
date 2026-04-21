@@ -107,6 +107,21 @@ export class Identity {
   }
 
   /**
+   * Constructs an `Identity` from a raw native NAPI handle.
+   *
+   * The native addon returns an opaque class instance with at least
+   * `did` and `custodyType` fields; this helper narrows `unknown` into
+   * an `Identity` wrapper bound to the originating {@link SCP}.
+   *
+   * @internal Phase 4 PR 4 (#1549, ADR-048) — used by `SCP` method
+   *   forwarders that return identity-typed results.
+   */
+  static _fromHandle(scp: SCP, raw: unknown): Identity {
+    const handle = raw as BridgeIdentityHandle;
+    return new Identity(handle.did, handle.custodyType, handle, scp);
+  }
+
+  /**
    * Creates a new DID identity with the specified custody method.
    *
    * For `"in_memory"` custody, key material is stored in heap memory. This is

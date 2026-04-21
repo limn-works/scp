@@ -11,24 +11,16 @@
  * import { SCP, Identity } from "@limn-works/scp-ts";
  *
  * const scp = new SCP();                 // fresh in-memory instance
- * const identity = await Identity.create(scp);
+ * const identity = await scp.identityCreate("in_memory");
  * await scp.resume();                    // async — reconnects transport
  * await scp.shutdown(5);                 // graceful shutdown
- *
- * // PR 3: encrypted on-disk storage (closes #1260, #1491).
- * const persistent = new SCP({
- *   storage: { type: "sqlite", path: "/var/lib/scp", key: new Uint8Array(32) },
- * });
  * ```
  *
- * PR 3 (#1549) expanded the surface in two ways:
- * - `StorageConfig` gained the `sqlite` variant, backed by SQLCipher
- *   through `scp-platform`. Closes #1260 / #1491 (encrypted filesystem
- *   storage).
- * - `resume()` became async end-to-end (#1678) — the NAPI bridge
- *   reconnects transport from pending relay URLs and restores any
- *   persisted context snapshots before the promise settles, so
- *   transport-dependent code can run immediately after `await`.
+ * Phase 4 PR 4 (#1549, ADR-048) expanded the `SCP` surface so every NAPI
+ * bridge operation has a corresponding instance method on `SCP`. The
+ * process-wide default-instance façade and free-function shorthands were
+ * deleted — callers construct an explicit `new SCP()` and invoke methods
+ * directly (e.g. `scp.identityCreate("in_memory")`).
  *
  * NOTE: `SCP` is a NAPI-only feature. The WASM bridge
  * does not expose a multi-instance class surface; attempting to
@@ -38,7 +30,17 @@
 
 import { createRequire } from "node:module";
 
+// Deferred imports of opaque classes. The classes import `SCP` for
+// typing, so importing them eagerly here creates a module cycle at
+// evaluation time. Using type-only imports keeps the SCP module
+// standalone at runtime — the handle-wrapping helpers call
+// `_fromHandle` statics which are resolved lazily inside the SCP
+// methods via dynamic `import()` calls.
+import type { Context } from "./context";
 import { ValidationError } from "./errors";
+import type { Identity } from "./identity";
+import type { Node, Relay } from "./server";
+import type { Transport } from "./transport";
 
 /**
  * Shape of the native addon — a subset sufficient to describe the
@@ -57,34 +59,27 @@ type NativeAddon = {
  * still exists for internal use, but the SDK surface does not expose
  * it until a real `ContextPersistence` trait is wired through (see
  * #1260 and #1491).
- *
- * PR 3 extends the native factory surface with SQLite-backed storage
- * via `withStorage({ type: "sqlite", path, key })`. The NAPI layer
- * (#1678) also turned `resume()` into a real async call backed by
- * transport reconnect from pending relay URLs.
  */
 interface NativeScpCtor {
   new (): NativeScpInstance;
   withStorage: (configJson: string) => NativeScpInstance;
 }
 
+/**
+ * Raw NAPI `Scp` instance — the method surface is erased to
+ * `(...args) => unknown` because each forwarder narrows the per-call
+ * signature at its own call site, and duplicating the 178 method
+ * signatures here would drift from the Rust source of truth.
+ */
 interface NativeScpInstance {
   readonly instanceId: string;
   suspend(): void;
-  /**
-   * Resumes the underlying bridge. Real async on NAPI — the bridge
-   * reconnects transport from pending relay URLs and restores any
-   * persisted context snapshots before the returned promise settles
-   * (#1678).
-   */
   resume(): Promise<void>;
-  /**
-   * #1692: NAPI `shutdown(timeoutMillis: u64)` — `u64` maps to JS
-   * `BigInt` on the napi-rs wire, so the native method accepts a
-   * `bigint`. The SDK public wrapper (`SCP.shutdown`) keeps a
-   * `number`-valued seconds budget and converts at the boundary.
-   */
   shutdown(timeoutMillis: bigint): Promise<void>;
+  // The full Scp class surface is reached via indexed access
+  // (see `#native` usage below). Keeping the type erased matches the
+  // pattern in `internal/native.ts` and `server.ts`.
+  [method: string]: unknown;
 }
 
 /**
@@ -110,16 +105,6 @@ function resolveNapiPackage(): string {
   const pkg = platformMap[key];
 
   if (pkg === undefined) {
-    // Unsupported host platform — no per-platform NAPI package exists.
-    // Distinct message from the "package present on disk but failed to
-    // load" and "addon lacks SCP class" branches so bug reports and logs
-    // clearly identify which of the three failure modes tripped
-    // (round 2 api-design finding).
-    //
-    // `SCP-VALID-7005` — structural unavailability, not a transport-layer
-    // fault. Using a validation code matches the Rust bridge's treatment
-    // of unknown storage types and keeps transport error codes reserved
-    // for actual relay connectivity failures.
     throw new ValidationError(
       `Native addon not found — the @limn-works/scp-ts-napi-* package for ` +
         `platform ${key} is not published. Install the matching platform package ` +
@@ -131,14 +116,6 @@ function resolveNapiPackage(): string {
   return pkg;
 }
 
-/**
- * Loads the raw native addon and extracts the `SCP` class constructor.
- *
- * Cached on first successful load.
- *
- * @throws {ValidationError} If the addon cannot be loaded or lacks the
- *   `SCP` class — code `SCP-VALID-7005`.
- */
 let _nativeScp: NativeScpCtor | null = null;
 
 function nativeScp(): NativeScpCtor {
@@ -146,15 +123,6 @@ function nativeScp(): NativeScpCtor {
     return _nativeScp;
   }
 
-  // Three distinct failure modes, three distinct messages — all sharing
-  // `SCP-VALID-7005` for "structural unavailability" so a catch-by-code
-  // still groups them, but the body tells the caller exactly what to do
-  // (round 2 api-design finding).
-
-  // Failure mode 1: running in a browser with no `process` / `module`
-  // APIs. Structural incompatibility, not a transport fault — the WASM
-  // bridge does not expose a multi-instance class surface (ADR-034 /
-  // ADR-048).
   if (typeof process === "undefined" || !process.versions?.node) {
     throw new ValidationError(
       "SCP class is not available in WASM runtime — the browser build of " +
@@ -170,11 +138,6 @@ function nativeScp(): NativeScpCtor {
     const req = createRequire(import.meta.url);
     addon = req(packageName) as NativeAddon;
   } catch (cause) {
-    // Failure mode 2: platform NAPI package resolves but the addon
-    // itself fails to load at require-time. Usually a missing binary
-    // for the current libc/glibc variant, an ABI mismatch, or a
-    // partially-installed package. Preserve the underlying error so
-    // bug reports carry actionable detail.
     const underlying = (cause as Error)?.message ?? String(cause);
     throw new ValidationError(
       `Native addon failed to load: ${underlying}. Package ${packageName} ` +
@@ -186,9 +149,6 @@ function nativeScp(): NativeScpCtor {
   }
 
   if (typeof addon.SCP !== "function") {
-    // Failure mode 3: the addon loaded, but it pre-dates ADR-048 and
-    // does not export the `SCP` class surface. Callers need to rebuild
-    // or upgrade the NAPI package.
     throw new ValidationError(
       `Native addon loaded but does not export the SCP class — ` +
         `${packageName} was built before the Phase 4 PR 1 multi-instance ` +
@@ -208,34 +168,16 @@ function nativeScp(): NativeScpCtor {
 
 /**
  * Clamps a float-seconds timeout into a millisecond count suitable for
- * the NAPI `shutdown(timeoutMillis)` boundary. Exposed as an internal
- * export so the regression tests around `Infinity` / `NaN` handling
- * can exercise the clamp without needing a live native addon.
- *
- * The ceiling is pinned to `Number.MAX_SAFE_INTEGER` (2^53 − 1 ms, ≈ 285
- * million years) rather than the full `u64::MAX` — the public SDK API
- * still takes a JS `number`, so anything above `MAX_SAFE_INTEGER` cannot
- * be represented losslessly anyway. The NAPI bridge itself is `u64`
- * (#1692), so wider values are technically supported on the wire; any
- * caller that needs billion-year timeouts can hit the NAPI binding
- * directly with a `bigint` literal.
+ * the NAPI `shutdown(timeoutMillis)` boundary.
  *
  * @internal
  */
 export function __clampShutdownMillisForTests(timeoutSecs: number): number {
-  // Largest millisecond count representable losslessly as a JS `number`.
-  // The NAPI binding accepts the full `u64` range via `BigInt`, but the
-  // SDK seconds-valued input is a `number`, so `MAX_SAFE_INTEGER` is
-  // the safe upper bound for this helper.
   const MAX_MILLIS = Number.MAX_SAFE_INTEGER;
-  // Order matters: +Infinity must be caught BEFORE !isFinite, otherwise
-  // Infinity collapses to the NaN/negative abort branch (Number.isFinite
-  // is false for both Infinity and NaN).
   if (timeoutSecs === Number.POSITIVE_INFINITY) {
     return MAX_MILLIS;
   }
   if (!Number.isFinite(timeoutSecs) || timeoutSecs <= 0) {
-    // NaN, negative, negative-infinity, or zero → immediate abort.
     return 0;
   }
   if (timeoutSecs * 1000 > MAX_MILLIS) {
@@ -247,17 +189,6 @@ export function __clampShutdownMillisForTests(timeoutSecs: number): number {
 /**
  * Serializes a {@link StorageConfig} into the JSON shape accepted by
  * the NAPI `SCP.withStorage(configJson: string)` factory.
- *
- * - `in_memory` passes through unchanged.
- * - `sqlite` forwards `path` verbatim and normalizes `key`:
- *   - `Uint8Array` → JSON byte array (`number[]`) — required because
- *     `JSON.stringify` on a `Uint8Array` produces an object-with-numeric-
- *     keys, not an array, which the Rust side would reject.
- *   - `string` → passed through as a hex-encoded string; the NAPI layer
- *     accepts either shape.
- *
- * Exported for tests so the wire format can be asserted without a live
- * native addon.
  *
  * @internal
  */
@@ -278,33 +209,17 @@ function serializeStorageConfig(config: StorageConfig): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Storage configuration forwarded to the native `SCP.withStorage`
- * factory.
+ * Storage configuration forwarded to the native `SCP.withStorage` factory.
  *
- * Two variants are supported today:
  * - `{ type: "in_memory" }` — encrypted in-memory storage (ephemeral).
  * - `{ type: "sqlite"; path; key }` — SQLCipher-encrypted storage on
- *   disk at `{path}/scp.db`, backed by `scp-platform::sqlite::SqliteStorage`.
- *   `key` accepts either a raw `Uint8Array` of key material or a hex-
- *   encoded string (JSON has no native bytes type; the NAPI layer
- *   accepts either shape). The key is consumed across the FFI boundary
- *   and the Rust side zeroizes its internal copy on drop — callers
- *   should zero their own copy after construction.
- *
- * Intentionally a closed union — the open `{ type: string; ... }`
- * branch swallowed typos and drifted from the Rust-side enum.
- *
- * Closes #1260 / #1491 (encrypted filesystem storage). See also #1678
- * for the resume() reconnect wiring that complements persistent
- * storage.
+ *   disk at `{path}/scp.db`. Closes #1260 / #1491.
  */
 export type StorageConfig =
   | { type: "in_memory" }
   | { type: "sqlite"; path: string; key: Uint8Array | string };
 
-/**
- * Constructor options for `new SCP(...)`.
- */
+/** Constructor options for `new SCP(...)`. */
 export interface ScpOptions {
   /** Storage configuration. Defaults to in-memory when omitted. */
   storage?: StorageConfig;
@@ -316,37 +231,37 @@ export interface ScpOptions {
 
 /**
  * Module-private symbol for internal accessors that surface the raw
- * native handle to other SDK modules (notably
- * `internal/native.ts`, `server.ts`, `mcp.ts`, `lifecycle.ts`).
- *
- * External callers cannot reach this — the Symbol is not exported.
- * Internal callers import {@link __getNativeScp} from this module to
- * obtain the raw NAPI `SCP` handle for direct method invocation.
+ * native handle to other SDK modules. External callers cannot reach
+ * this — the Symbol is not exported.
  *
  * @internal
  */
 const NATIVE_HANDLE: unique symbol = Symbol("scp.nativeHandle");
 
 /**
- * Caller-owned SCP instance — the preferred SDK entry point.
+ * Caller-owned SCP instance — the sole SDK entry point.
  *
- * Each `SCP` wraps an independent native `BridgeInstance`. See
- * ADR-048 for the multi-instance design.
+ * Each `SCP` wraps an independent native `BridgeInstance`. Every NAPI
+ * bridge operation is exposed as an instance method; callers should
+ * invoke `scp.identityCreate(...)`, `scp.contextCreate(...)` etc.
+ * directly (ADR-048 per-instance routing).
+ *
+ * Handle-returning methods wrap the raw NAPI handle in the
+ * corresponding opaque SDK class (e.g. {@link Identity}, {@link Context},
+ * {@link Transport}, {@link Relay}, {@link Node}). Methods that return
+ * primitive values or JSON strings pass through unchanged — SDK
+ * wrappers (e.g. `Identity`, `Context`) still exist and layer their
+ * own parsing on top of these forwarders during this migration slice.
  */
 export class SCP {
-  /**
-   * The native NAPI `SCP` handle. `readonly` + private so TypeScript
-   * consumers can't reach for the raw addon surface (which is
-   * unstable across releases).
-   */
+  /** The native NAPI `SCP` handle. `readonly` + private so TS consumers can't reach the raw addon surface. */
   readonly #native: NativeScpInstance;
 
   /**
    * Constructs a fresh `SCP` instance.
    *
    * @param options Optional constructor options.
-   * @throws {ValidationError} If no NAPI addon is available (browser
-   *   runtime or missing platform package) — code `SCP-VALID-7005`.
+   * @throws {ValidationError} If no NAPI addon is available — code `SCP-VALID-7005`.
    */
   constructor(options: ScpOptions = {}) {
     const NativeScp = nativeScp();
@@ -359,44 +274,29 @@ export class SCP {
 
   /**
    * Monotonic identifier for this bridge instance, returned as a
-   * base-10 string because u64 exceeds JavaScript's safe-integer
-   * range (53-bit mantissa).
+   * base-10 string because u64 exceeds JavaScript's safe-integer range.
    */
   get instanceId(): string {
     return this.#native.instanceId;
   }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Lifecycle
+  // ───────────────────────────────────────────────────────────────────────
 
   /**
    * Suspends this bridge instance (mobile/desktop backgrounding).
    *
    * Disconnects transport and marks the instance suspended.
    * Transport-dependent operations fail until `resume()` is called.
-   *
-   * @throws {TransportError} If the transport lock is poisoned.
    */
   suspend(): void {
     this.#native.suspend();
   }
 
   /**
-   * Resumes a suspended bridge instance.
-   *
-   * Clears the suspended flag and chains the per-bridge async resume
-   * work: transport reconnect from pending relay URLs and restoration
-   * of any persisted context snapshots (#1678). The returned promise
-   * settles only after those steps complete, so callers can `await`
-   * resume and then safely issue transport-dependent operations.
-   *
-   * **Breaking change (#1549 Phase 4 PR 3)**: `resume()` is async now.
-   * Previous releases returned `void`; the method always performed a
-   * flag flip only and callers re-established the relay connection
-   * separately via `Transport.connect(...)`. The NAPI `Scp::resume`
-   * became `async` in the Rust layer, and this wrapper follows it so
-   * errors surfacing during reconnect / restoration are observable at
-   * the SDK boundary instead of fire-and-forget.
-   *
-   * @throws {ContextError} If the instance has been permanently shut
-   *   down — mapped from `SCP-CTX-2000`.
+   * Resumes a suspended bridge instance. Awaits transport reconnect
+   * and persisted context-snapshot restoration (#1678).
    */
   async resume(): Promise<void> {
     await this.#native.resume();
@@ -405,52 +305,1715 @@ export class SCP {
   /**
    * Shuts down the instance with a graceful deadline.
    *
-   * Drains in-flight tasks within `timeoutSecs` seconds. Second and
-   * subsequent calls are no-ops.
-   *
-   * Fractional seconds (e.g. `0.25`) are preserved to millisecond
-   * resolution before crossing the FFI boundary — the native side
-   * takes a `u64` millisecond count (widened from `u32` in #1692).
-   *
-   * `timeoutSecs` is clamped defensively:
-   * - `NaN` or values `<= 0` → `0` (abort in-flight tasks immediately).
-   * - `Infinity` or values that exceed `Number.MAX_SAFE_INTEGER` ms
-   *   → `Number.MAX_SAFE_INTEGER` (effectively unbounded — `u64` on the
-   *   wire comfortably holds this).
-   * - Finite values in range → rounded to the nearest millisecond.
-   *
-   * Previously used `Math.floor`, which silently lost up to 0.999 ms
-   * of caller budget; and passed `NaN` straight through to the NAPI
-   * boundary, where the earlier `u32` conversion silently yielded `0`
-   * instead of erroring (round 2 api-design + bug-catcher findings).
-   *
-   * Round 5 RED-2001 tightened the branch ordering: `Infinity` must be
-   * tested BEFORE `!Number.isFinite`, because `Number.isFinite(Infinity)`
-   * is `false` and the isFinite branch otherwise collapses Infinity to
-   * the abort path — which contradicts this docstring.
-   *
    * @param timeoutSecs Maximum seconds to wait. Defaults to 5.
-   *   Floats are honored at 1 ms granularity.
    */
   async shutdown(timeoutSecs: number = 5): Promise<void> {
     const millis = __clampShutdownMillisForTests(timeoutSecs);
-    // #1692: NAPI widened `timeoutMillis` to `u64`, exposed as JS
-    // `BigInt` on the wire. The clamp above already produces an integer
-    // number of millis inside `u64` range — coerce to `bigint` for the
-    // FFI call.
     await this.#native.shutdown(BigInt(millis));
   }
 
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Identity
+  // ───────────────────────────────────────────────────────────────────────
+
+  async identityCreate(custody: string = "in_memory"): Promise<Identity> {
+    const raw = await (this.#native.identityCreate as (c: string) => Promise<unknown>)(custody);
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  async identityCreateWithAgentKey(custody: string = "in_memory"): Promise<Identity> {
+    const raw = await (this.#native.identityCreateWithAgentKey as (c: string) => Promise<unknown>)(
+      custody,
+    );
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  async identityLoad(did: string): Promise<Identity> {
+    const raw = await (this.#native.identityLoad as (d: string) => Promise<unknown>)(did);
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  async identityResolve(did: string): Promise<unknown> {
+    return await (this.#native.identityResolve as (d: string) => Promise<unknown>)(did);
+  }
+
+  identityRemove(did: string): void {
+    (this.#native.identityRemove as (d: string) => void)(did);
+  }
+
+  identityRemoveIfPresent(did: string): boolean {
+    return (this.#native.identityRemoveIfPresent as (d: string) => boolean)(did);
+  }
+
+  async identityAttestDevice(did: string): Promise<string> {
+    return await (this.#native.identityAttestDevice as (d: string) => Promise<string>)(did);
+  }
+
+  async identityVerifyDeviceAttestation(did: string, tokenBase64: string): Promise<boolean> {
+    return await (
+      this.#native.identityVerifyDeviceAttestation as (d: string, t: string) => Promise<boolean>
+    )(did, tokenBase64);
+  }
+
+  async identityCreateLinkAttestation(
+    did: string,
+    platform: string,
+    handle: string,
+    proof: string,
+    verificationMethod: string,
+    platformId?: string | null,
+  ): Promise<string> {
+    return await (
+      this.#native.identityCreateLinkAttestation as (
+        d: string,
+        p: string,
+        h: string,
+        pr: string,
+        vm: string,
+        pid: string | null | undefined,
+      ) => Promise<string>
+    )(did, platform, handle, proof, verificationMethod, platformId ?? null);
+  }
+
+  identityLinkAttestations(did: string): string {
+    return (this.#native.identityLinkAttestations as (d: string) => string)(did);
+  }
+
+  identityRemoveLinkAttestation(did: string, attestationId: string): boolean {
+    return (this.#native.identityRemoveLinkAttestation as (d: string, a: string) => boolean)(
+      did,
+      attestationId,
+    );
+  }
+
+  async identityVerifyLinkAttestation(
+    attestationJson: string,
+    issuerPublicKeyHex: string,
+  ): Promise<boolean> {
+    return await (
+      this.#native.identityVerifyLinkAttestation as (j: string, k: string) => Promise<boolean>
+    )(attestationJson, issuerPublicKeyHex);
+  }
+
+  identityExecuteRecovery(did: string, tier: string, contextIds: readonly string[]): string {
+    return (
+      this.#native.identityExecuteRecovery as (d: string, t: string, c: readonly string[]) => string
+    )(did, tier, contextIds);
+  }
+
+  identityExecuteCustodyMigration(
+    did: string,
+    target: string,
+    contextIds: readonly string[],
+  ): string {
+    return (
+      this.#native.identityExecuteCustodyMigration as (
+        d: string,
+        t: string,
+        c: readonly string[],
+      ) => string
+    )(did, target, contextIds);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Petname
+  // ───────────────────────────────────────────────────────────────────────
+
+  petnameSet(ownerDid: string, targetDid: string, name: string): void {
+    (this.#native.petnameSet as (o: string, t: string, n: string) => void)(
+      ownerDid,
+      targetDid,
+      name,
+    );
+  }
+
+  petnameRemove(ownerDid: string, targetDid: string): void {
+    (this.#native.petnameRemove as (o: string, t: string) => void)(ownerDid, targetDid);
+  }
+
+  petnameSetContext(ownerDid: string, contextId: string, name: string): void {
+    (this.#native.petnameSetContext as (o: string, c: string, n: string) => void)(
+      ownerDid,
+      contextId,
+      name,
+    );
+  }
+
+  petnameRemoveContext(ownerDid: string, contextId: string): void {
+    (this.#native.petnameRemoveContext as (o: string, c: string) => void)(ownerDid, contextId);
+  }
+
+  petnameResolveDid(ownerDid: string, name: string): string {
+    return (this.#native.petnameResolveDid as (o: string, n: string) => string)(ownerDid, name);
+  }
+
+  petnameResolveContext(ownerDid: string, name: string): string {
+    return (this.#native.petnameResolveContext as (o: string, n: string) => string)(ownerDid, name);
+  }
+
+  petnameGetForDid(ownerDid: string, targetDid: string): string | null {
+    return (this.#native.petnameGetForDid as (o: string, t: string) => string | null)(
+      ownerDid,
+      targetDid,
+    );
+  }
+
+  petnameGetForContext(ownerDid: string, contextId: string): string | null {
+    return (this.#native.petnameGetForContext as (o: string, c: string) => string | null)(
+      ownerDid,
+      contextId,
+    );
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Handle / Scope / Address
+  // ───────────────────────────────────────────────────────────────────────
+
+  handleRegister(
+    discoveryContextId: string,
+    handle: string,
+    targetJson: string,
+    registrantDid: string,
+    description?: string,
+    tags?: readonly string[],
+  ): string {
+    return (
+      this.#native.handleRegister as (
+        d: string,
+        h: string,
+        t: string,
+        r: string,
+        desc: string | undefined,
+        tags: readonly string[] | undefined,
+      ) => string
+    )(discoveryContextId, handle, targetJson, registrantDid, description, tags);
+  }
+
+  handleLookup(discoveryContextId: string, handle: string, typeFilter?: string): string {
+    return (this.#native.handleLookup as (d: string, h: string, f: string | undefined) => string)(
+      discoveryContextId,
+      handle,
+      typeFilter,
+    );
+  }
+
+  handleDeregister(discoveryContextId: string, handle: string, did: string): string {
+    return (this.#native.handleDeregister as (d: string, h: string, did: string) => string)(
+      discoveryContextId,
+      handle,
+      did,
+    );
+  }
+
+  scopeRegister(
+    scopeContextId: string,
+    name: string,
+    targetContextId: string,
+    relayUrls: readonly string[],
+    registrantDid: string,
+    description?: string,
+    tags?: readonly string[],
+  ): string {
+    return (
+      this.#native.scopeRegister as (
+        sc: string,
+        n: string,
+        tc: string,
+        r: readonly string[],
+        rd: string,
+        d: string | undefined,
+        t: readonly string[] | undefined,
+      ) => string
+    )(scopeContextId, name, targetContextId, relayUrls, registrantDid, description, tags);
+  }
+
+  scopeLookup(scopeContextId: string, name: string): string {
+    return (this.#native.scopeLookup as (sc: string, n: string) => string)(scopeContextId, name);
+  }
+
+  scopeDeregister(scopeContextId: string, name: string, did: string): string {
+    return (this.#native.scopeDeregister as (sc: string, n: string, d: string) => string)(
+      scopeContextId,
+      name,
+      did,
+    );
+  }
+
+  async addressResolve(
+    ownerDid: string,
+    address: string,
+    knownContextsJson?: string,
+  ): Promise<string> {
+    return await (
+      this.#native.addressResolve as (
+        o: string,
+        a: string,
+        k: string | undefined,
+      ) => Promise<string>
+    )(ownerDid, address, knownContextsJson);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Context
+  // ───────────────────────────────────────────────────────────────────────
+
+  async contextCreate(identity: Identity, paramsJson: string): Promise<Context> {
+    const raw = await (this.#native.contextCreate as (id: unknown, p: string) => Promise<unknown>)(
+      identity._handle,
+      paramsJson,
+    );
+    const { Context: ContextCls } = await import("./context");
+    return ContextCls._fromHandle(raw as never, identity.did, this);
+  }
+
+  async contextJoin(
+    handle: unknown,
+    identityDid: string,
+    spendingUcanJwt?: string | null,
+  ): Promise<void> {
+    await (this.#native.contextJoin as (h: unknown, d: string, s: string | null) => Promise<void>)(
+      handle,
+      identityDid,
+      spendingUcanJwt ?? null,
+    );
+  }
+
+  async contextLeave(handle: unknown, identityDid: string): Promise<void> {
+    await (this.#native.contextLeave as (h: unknown, d: string) => Promise<void>)(
+      handle,
+      identityDid,
+    );
+  }
+
+  async contextClose(handle: unknown, identityDid: string): Promise<void> {
+    await (this.#native.contextClose as (h: unknown, d: string) => Promise<void>)(
+      handle,
+      identityDid,
+    );
+  }
+
+  async contextSend(
+    handle: unknown,
+    identityDid: string,
+    payload: Uint8Array | readonly number[],
+    spendingUcanJwt?: string | null,
+  ): Promise<void> {
+    const payloadArray = ArrayBuffer.isView(payload)
+      ? Array.from(payload as Uint8Array)
+      : (payload as readonly number[]);
+    await (
+      this.#native.contextSend as (
+        h: unknown,
+        d: string,
+        p: readonly number[],
+        s: string | null,
+      ) => Promise<void>
+    )(handle, identityDid, payloadArray, spendingUcanJwt ?? null);
+  }
+
+  async contextSubscribe(
+    handle: unknown,
+    identityDid: string,
+    onMessage: (message: unknown) => void,
+  ): Promise<void> {
+    await (
+      this.#native.contextSubscribe as (
+        h: unknown,
+        d: string,
+        cb: (m: unknown) => void,
+      ) => Promise<void>
+    )(handle, identityDid, onMessage);
+  }
+
+  contextCancelSubscription(handle: unknown): void {
+    (this.#native.contextCancelSubscription as (h: unknown) => void)(handle);
+  }
+
+  async contextMemberCount(handle: unknown): Promise<number> {
+    return await (this.#native.contextMemberCount as (h: unknown) => Promise<number>)(handle);
+  }
+
+  async contextIsMember(handle: unknown, did: string): Promise<boolean> {
+    return await (this.#native.contextIsMember as (h: unknown, d: string) => Promise<boolean>)(
+      handle,
+      did,
+    );
+  }
+
+  async contextMemberDids(handle: unknown): Promise<readonly string[]> {
+    return await (this.#native.contextMemberDids as (h: unknown) => Promise<readonly string[]>)(
+      handle,
+    );
+  }
+
+  async contextMemberRole(handle: unknown, did: string): Promise<string | null> {
+    return await (
+      this.#native.contextMemberRole as (h: unknown, d: string) => Promise<string | null>
+    )(handle, did);
+  }
+
+  async contextDrainEvents(handle: unknown): Promise<readonly string[]> {
+    return await (this.#native.contextDrainEvents as (h: unknown) => Promise<readonly string[]>)(
+      handle,
+    );
+  }
+
+  async contextRestore(contextId: string): Promise<void> {
+    await (this.#native.contextRestore as (id: string) => Promise<void>)(contextId);
+  }
+
+  async contextRestoreAll(): Promise<string> {
+    return await (this.#native.contextRestoreAll as () => Promise<string>)();
+  }
+
+  async contextTombstoneMigrated(handle: unknown): Promise<void> {
+    await (this.#native.contextTombstoneMigrated as (h: unknown) => Promise<void>)(handle);
+  }
+
+  async contextMigrationState(handle: unknown): Promise<string | null> {
+    return await (this.#native.contextMigrationState as (h: unknown) => Promise<string | null>)(
+      handle,
+    );
+  }
+
+  async contextExport(handle: unknown): Promise<Uint8Array> {
+    const raw = await (this.#native.contextExport as (h: unknown) => Promise<Uint8Array | Buffer>)(
+      handle,
+    );
+    return new Uint8Array(raw);
+  }
+
+  async contextImport(data: Uint8Array | readonly number[]): Promise<string> {
+    const dataArray = ArrayBuffer.isView(data)
+      ? Array.from(data as Uint8Array)
+      : (data as readonly number[]);
+    return await (this.#native.contextImport as (d: readonly number[]) => Promise<string>)(
+      dataArray,
+    );
+  }
+
+  contextSetEconomicPolicy(handle: unknown, policyJson: string): void {
+    (this.#native.contextSetEconomicPolicy as (h: unknown, p: string) => void)(handle, policyJson);
+  }
+
+  contextGetEconomicPolicy(handle: unknown): string | null {
+    return (this.#native.contextGetEconomicPolicy as (h: unknown) => string | null)(handle);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Broadcast / Access
+  // ───────────────────────────────────────────────────────────────────────
+
+  async accessKeyGenerate(contextId: string, memberDid: string, callerDid: string): Promise<void> {
+    await (this.#native.accessKeyGenerate as (c: string, m: string, k: string) => Promise<void>)(
+      contextId,
+      memberDid,
+      callerDid,
+    );
+  }
+
+  async accessKeyRevoke(contextId: string, memberDid: string, callerDid: string): Promise<void> {
+    await (this.#native.accessKeyRevoke as (c: string, m: string, k: string) => Promise<void>)(
+      contextId,
+      memberDid,
+      callerDid,
+    );
+  }
+
+  async accessKeyRestore(contextId: string, memberDid: string, callerDid: string): Promise<void> {
+    await (this.#native.accessKeyRestore as (c: string, m: string, k: string) => Promise<void>)(
+      contextId,
+      memberDid,
+      callerDid,
+    );
+  }
+
+  async contextBroadcastSubscriberCount(handle: unknown): Promise<number | null> {
+    return await (
+      this.#native.contextBroadcastSubscriberCount as (h: unknown) => Promise<number | null>
+    )(handle);
+  }
+
+  async contextIsBroadcastSubscriber(handle: unknown, did: string): Promise<boolean> {
+    return await (
+      this.#native.contextIsBroadcastSubscriber as (h: unknown, d: string) => Promise<boolean>
+    )(handle, did);
+  }
+
+  async contextBroadcastAdmission(handle: unknown): Promise<string | null> {
+    return await (this.#native.contextBroadcastAdmission as (h: unknown) => Promise<string | null>)(
+      handle,
+    );
+  }
+
+  async broadcastSubscribe(handle: unknown, subscriberDid: string): Promise<void> {
+    await (this.#native.broadcastSubscribe as (h: unknown, d: string) => Promise<void>)(
+      handle,
+      subscriberDid,
+    );
+  }
+
+  async broadcastUnsubscribe(
+    handle: unknown,
+    subscriberDid: string,
+    rotateKeys?: boolean,
+  ): Promise<void> {
+    await (
+      this.#native.broadcastUnsubscribe as (
+        h: unknown,
+        d: string,
+        r: boolean | undefined,
+      ) => Promise<void>
+    )(handle, subscriberDid, rotateKeys);
+  }
+
+  async broadcastPublish(
+    handle: unknown,
+    authorDid: string,
+    payload: Uint8Array | readonly number[],
+  ): Promise<void> {
+    const payloadArray = ArrayBuffer.isView(payload)
+      ? Array.from(payload as Uint8Array)
+      : (payload as readonly number[]);
+    await (
+      this.#native.broadcastPublish as (
+        h: unknown,
+        d: string,
+        p: readonly number[],
+      ) => Promise<void>
+    )(handle, authorDid, payloadArray);
+  }
+
+  async broadcastPublishAsset(
+    handle: unknown,
+    authorDid: string,
+    asset: { path: string; contentType: string; body: readonly number[] },
+    deployId?: string | null,
+  ): Promise<unknown> {
+    return await (
+      this.#native.broadcastPublishAsset as (
+        h: unknown,
+        d: string,
+        a: { path: string; contentType: string; body: readonly number[] },
+        did: string | null,
+      ) => Promise<unknown>
+    )(handle, authorDid, asset, deployId ?? null);
+  }
+
+  async broadcastPublishAssets(
+    handle: unknown,
+    authorDid: string,
+    assets: readonly { path: string; contentType: string; body: readonly number[] }[],
+    deployId?: string | null,
+  ): Promise<unknown> {
+    return await (
+      this.#native.broadcastPublishAssets as (
+        h: unknown,
+        d: string,
+        a: readonly { path: string; contentType: string; body: readonly number[] }[],
+        did: string | null,
+      ) => Promise<unknown>
+    )(handle, authorDid, assets, deployId ?? null);
+  }
+
+  async broadcastBlockSubscriber(
+    handle: unknown,
+    subscriberDid: string,
+    blockerDid: string,
+  ): Promise<void> {
+    await (
+      this.#native.broadcastBlockSubscriber as (h: unknown, s: string, b: string) => Promise<void>
+    )(handle, subscriberDid, blockerDid);
+  }
+
+  async broadcastUnblockSubscriber(
+    handle: unknown,
+    subscriberDid: string,
+    unblockerDid: string,
+  ): Promise<void> {
+    await (
+      this.#native.broadcastUnblockSubscriber as (h: unknown, s: string, u: string) => Promise<void>
+    )(handle, subscriberDid, unblockerDid);
+  }
+
+  async broadcastHandleKeyRequest(
+    handle: unknown,
+    authorDid: string,
+    requesterDid: string,
+  ): Promise<string> {
+    return await (
+      this.#native.broadcastHandleKeyRequest as (
+        h: unknown,
+        a: string,
+        r: string,
+      ) => Promise<string>
+    )(handle, authorDid, requesterDid);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Governance
+  // ───────────────────────────────────────────────────────────────────────
+
+  async contextExecuteGovernanceAction(
+    handle: unknown,
+    actionJson: string,
+    proposerDid: string,
+  ): Promise<string> {
+    return await (
+      this.#native.contextExecuteGovernanceAction as (
+        h: unknown,
+        a: string,
+        p: string,
+      ) => Promise<string>
+    )(handle, actionJson, proposerDid);
+  }
+
+  async contextGovernancePropose(
+    handle: unknown,
+    actionJson: string,
+    proposerDid: string,
+  ): Promise<string> {
+    return await (
+      this.#native.contextGovernancePropose as (h: unknown, a: string, p: string) => Promise<string>
+    )(handle, actionJson, proposerDid);
+  }
+
+  async contextGovernanceApprove(
+    handle: unknown,
+    proposalIdHex: string,
+    voterDid: string,
+  ): Promise<string> {
+    return await (
+      this.#native.contextGovernanceApprove as (h: unknown, p: string, v: string) => Promise<string>
+    )(handle, proposalIdHex, voterDid);
+  }
+
+  async contextGovernanceReject(
+    handle: unknown,
+    proposalIdHex: string,
+    voterDid: string,
+  ): Promise<string> {
+    return await (
+      this.#native.contextGovernanceReject as (h: unknown, p: string, v: string) => Promise<string>
+    )(handle, proposalIdHex, voterDid);
+  }
+
+  async contextGovernanceWithdraw(
+    handle: unknown,
+    proposalIdHex: string,
+    voterDid: string,
+  ): Promise<string> {
+    return await (
+      this.#native.contextGovernanceWithdraw as (
+        h: unknown,
+        p: string,
+        v: string,
+      ) => Promise<string>
+    )(handle, proposalIdHex, voterDid);
+  }
+
+  async contextGovernanceGetProposal(handle: unknown, proposalIdHex: string): Promise<string> {
+    return await (
+      this.#native.contextGovernanceGetProposal as (h: unknown, p: string) => Promise<string>
+    )(handle, proposalIdHex);
+  }
+
+  async contextGovernanceListProposals(handle: unknown): Promise<string> {
+    return await (this.#native.contextGovernanceListProposals as (h: unknown) => Promise<string>)(
+      handle,
+    );
+  }
+
+  async contextApplyPendingCeilingModification(
+    handle: unknown,
+    currentTimestamp: number,
+  ): Promise<boolean> {
+    return await (
+      this.#native.contextApplyPendingCeilingModification as (
+        h: unknown,
+        t: number,
+      ) => Promise<boolean>
+    )(handle, currentTimestamp);
+  }
+
+  async contextFinalizeClose(handle: unknown): Promise<void> {
+    await (this.#native.contextFinalizeClose as (h: unknown) => Promise<void>)(handle);
+  }
+
+  async contextCreateGovernanceCheckpoint(
+    handle: unknown,
+    checkpointSeq: number,
+    merkleRootHex: string,
+    eventCount: number,
+    lastEventHashHex: string,
+    stateSnapshotHashHex: string,
+    creatorDid: string,
+    creatorSignatureHex: string,
+  ): Promise<string> {
+    return await (
+      this.#native.contextCreateGovernanceCheckpoint as (
+        h: unknown,
+        seq: number,
+        root: string,
+        count: number,
+        lastHash: string,
+        stateHash: string,
+        creator: string,
+        sig: string,
+      ) => Promise<string>
+    )(
+      handle,
+      checkpointSeq,
+      merkleRootHex,
+      eventCount,
+      lastEventHashHex,
+      stateSnapshotHashHex,
+      creatorDid,
+      creatorSignatureHex,
+    );
+  }
+
+  async contextAddCheckpointCosignature(
+    handle: unknown,
+    checkpointJson: string,
+    signerDid: string,
+    signatureHex: string,
+  ): Promise<string> {
+    return await (
+      this.#native.contextAddCheckpointCosignature as (
+        h: unknown,
+        c: string,
+        s: string,
+        sig: string,
+      ) => Promise<string>
+    )(handle, checkpointJson, signerDid, signatureHex);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: TTL / Migration
+  // ───────────────────────────────────────────────────────────────────────
+
+  async contextHandleTtlExpiry(handle: unknown): Promise<void> {
+    await (this.#native.contextHandleTtlExpiry as (h: unknown) => Promise<void>)(handle);
+  }
+
+  async contextProposeTtlExtension(
+    handle: unknown,
+    proposerDid: string,
+    extensionSecs: number,
+  ): Promise<boolean> {
+    return await (
+      this.#native.contextProposeTtlExtension as (
+        h: unknown,
+        d: string,
+        s: number,
+      ) => Promise<boolean>
+    )(handle, proposerDid, extensionSecs);
+  }
+
+  async contextResetTtlTimer(handle: unknown, newDurationSecs: number): Promise<void> {
+    await (this.#native.contextResetTtlTimer as (h: unknown, s: number) => Promise<void>)(
+      handle,
+      newDurationSecs,
+    );
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Capability / Invitation / Metadata
+  // ───────────────────────────────────────────────────────────────────────
+
+  validateCapabilityDeclaration(
+    declarationJson: string,
+    ceilingCapabilities: readonly string[],
+    roleCapabilities: readonly string[],
+  ): string {
+    return (
+      this.#native.validateCapabilityDeclaration as (
+        d: string,
+        c: readonly string[],
+        r: readonly string[],
+      ) => string
+    )(declarationJson, ceilingCapabilities, roleCapabilities);
+  }
+
+  checkScopedCapability(
+    grantedCapabilities: readonly string[],
+    requiredCapability: string,
+  ): boolean {
+    return (this.#native.checkScopedCapability as (g: readonly string[], r: string) => boolean)(
+      grantedCapabilities,
+      requiredCapability,
+    );
+  }
+
+  evaluateInvitation(
+    paramsJson: string,
+    inviterDid: string,
+    identityDid: string,
+    policyJson?: string | null,
+    spendingJson?: string | null,
+    trustedDidsJson?: string | null,
+  ): unknown {
+    return (
+      this.#native.evaluateInvitation as (
+        p: string,
+        i: string,
+        id: string,
+        pol: string | null,
+        sp: string | null,
+        td: string | null,
+      ) => unknown
+    )(
+      paramsJson,
+      inviterDid,
+      identityDid,
+      policyJson ?? null,
+      spendingJson ?? null,
+      trustedDidsJson ?? null,
+    );
+  }
+
+  metadataRecordToJson(
+    contextId: string,
+    sequence: number,
+    signerDid: string,
+    timestamp: number,
+    structuralJson: string,
+    operationalJson: string,
+    signatureHex: string,
+  ): string {
+    return (
+      this.#native.metadataRecordToJson as (
+        c: string,
+        s: number,
+        sd: string,
+        t: number,
+        st: string,
+        op: string,
+        sig: string,
+      ) => string
+    )(contextId, sequence, signerDid, timestamp, structuralJson, operationalJson, signatureHex);
+  }
+
+  metadataRecordFromJson(jsonStr: string): string {
+    return (this.#native.metadataRecordFromJson as (j: string) => string)(jsonStr);
+  }
+
+  templateGetParams(templateId: string): string {
+    return (this.#native.templateGetParams as (t: string) => string)(templateId);
+  }
+
+  validateAgainstTemplate(paramsJson: string): string | null {
+    return (this.#native.validateAgainstTemplate as (p: string) => string | null)(paramsJson);
+  }
+
+  validateContextParams(paramsJson: string): string | null {
+    return (this.#native.validateContextParams as (p: string) => string | null)(paramsJson);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Tool
+  // ───────────────────────────────────────────────────────────────────────
+
+  async toolRegister(handle: unknown, definition: unknown): Promise<string> {
+    return await (this.#native.toolRegister as (h: unknown, d: unknown) => Promise<string>)(
+      handle,
+      definition,
+    );
+  }
+
+  async toolInvoke(
+    handle: unknown,
+    toolId: string,
+    inputJson: string,
+    identityDid: string,
+    ucanToken: string,
+    proofTokens?: readonly string[],
+    spendingUcanJwt?: string,
+  ): Promise<string> {
+    return await (
+      this.#native.toolInvoke as (
+        h: unknown,
+        t: string,
+        i: string,
+        d: string,
+        u: string,
+        p: readonly string[] | undefined,
+        s: string | undefined,
+      ) => Promise<string>
+    )(handle, toolId, inputJson, identityDid, ucanToken, proofTokens, spendingUcanJwt);
+  }
+
+  async toolVerify(handle: unknown, toolId: string): Promise<unknown> {
+    return await (this.#native.toolVerify as (h: unknown, t: string) => Promise<unknown>)(
+      handle,
+      toolId,
+    );
+  }
+
+  async toolInvokeCrossContext(
+    sourceHandle: unknown,
+    targetHandle: unknown,
+    toolId: string,
+    inputJson: string,
+    invokerDid: string,
+    ucanToken: string,
+    chainDepth: number,
+    proofTokens?: readonly string[],
+  ): Promise<string> {
+    return await (
+      this.#native.toolInvokeCrossContext as (
+        s: unknown,
+        t: unknown,
+        tool: string,
+        input: string,
+        did: string,
+        ucan: string,
+        depth: number,
+        proofs: readonly string[] | undefined,
+      ) => Promise<string>
+    )(
+      sourceHandle,
+      targetHandle,
+      toolId,
+      inputJson,
+      invokerDid,
+      ucanToken,
+      chainDepth,
+      proofTokens,
+    );
+  }
+
+  async toolSessionCreate(
+    handle: unknown,
+    toolId: string,
+    sourceContextId: string,
+    ttlSeconds?: number,
+  ): Promise<string> {
+    return await (
+      this.#native.toolSessionCreate as (
+        h: unknown,
+        t: string,
+        s: string,
+        ttl: number | undefined,
+      ) => Promise<string>
+    )(handle, toolId, sourceContextId, ttlSeconds);
+  }
+
+  async toolSessionInvoke(
+    handle: unknown,
+    sessionId: string,
+    inputJson: string,
+    invokerDid: string,
+    ucanToken: string,
+    proofTokens?: readonly string[],
+  ): Promise<string> {
+    return await (
+      this.#native.toolSessionInvoke as (
+        h: unknown,
+        sid: string,
+        input: string,
+        did: string,
+        ucan: string,
+        proofs: readonly string[] | undefined,
+      ) => Promise<string>
+    )(handle, sessionId, inputJson, invokerDid, ucanToken, proofTokens);
+  }
+
+  async toolSessionClose(handle: unknown, sessionId: string): Promise<void> {
+    await (this.#native.toolSessionClose as (h: unknown, sid: string) => Promise<void>)(
+      handle,
+      sessionId,
+    );
+  }
+
+  async toolInterfaceExpose(
+    handle: unknown,
+    toolId: string,
+    targetContextId: string,
+    rateLimitJson?: string,
+  ): Promise<string> {
+    return await (
+      this.#native.toolInterfaceExpose as (
+        h: unknown,
+        t: string,
+        tc: string,
+        rl: string | undefined,
+      ) => Promise<string>
+    )(handle, toolId, targetContextId, rateLimitJson);
+  }
+
+  async toolInterfaceAccept(handle: unknown, interfaceJson: string): Promise<string> {
+    return await (this.#native.toolInterfaceAccept as (h: unknown, ij: string) => Promise<string>)(
+      handle,
+      interfaceJson,
+    );
+  }
+
+  async toolInterfaceRevoke(handle: unknown, interfaceIdHex: string): Promise<string> {
+    return await (this.#native.toolInterfaceRevoke as (h: unknown, id: string) => Promise<string>)(
+      handle,
+      interfaceIdHex,
+    );
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: UCAN
+  // ───────────────────────────────────────────────────────────────────────
+
+  async ucanValidate(
+    handle: unknown,
+    token: string,
+    capability: string,
+    presentingAgentDid?: string,
+    proofTokens?: readonly string[],
+  ): Promise<void> {
+    await (
+      this.#native.ucanValidate as (
+        h: unknown,
+        t: string,
+        c: string,
+        pa: string | undefined,
+        pt: readonly string[] | undefined,
+      ) => Promise<void>
+    )(handle, token, capability, presentingAgentDid, proofTokens);
+  }
+
+  async ucanMint(
+    handle: unknown,
+    memberDid: string,
+    capabilities: readonly string[],
+    proofs?: readonly string[],
+  ): Promise<unknown> {
+    return await (
+      this.#native.ucanMint as (
+        h: unknown,
+        d: string,
+        c: readonly string[],
+        p: readonly string[] | undefined,
+      ) => Promise<unknown>
+    )(handle, memberDid, capabilities, proofs);
+  }
+
+  async ucanDelegate(
+    handle: unknown,
+    delegatorDid: string,
+    delegateeDid: string,
+    parentToken: string,
+    capabilities: readonly string[],
+  ): Promise<unknown> {
+    return await (
+      this.#native.ucanDelegate as (
+        h: unknown,
+        from: string,
+        to: string,
+        parent: string,
+        caps: readonly string[],
+      ) => Promise<unknown>
+    )(handle, delegatorDid, delegateeDid, parentToken, capabilities);
+  }
+
+  async ucanRevoke(handle: unknown, token: string, revokerDid: string): Promise<void> {
+    await (this.#native.ucanRevoke as (h: unknown, t: string, r: string) => Promise<void>)(
+      handle,
+      token,
+      revokerDid,
+    );
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Event log
+  // ───────────────────────────────────────────────────────────────────────
+
+  async eventLogQuery(handle: unknown, filterJson?: string): Promise<readonly unknown[]> {
+    return await (
+      this.#native.eventLogQuery as (
+        h: unknown,
+        f: string | undefined,
+      ) => Promise<readonly unknown[]>
+    )(handle, filterJson);
+  }
+
+  async eventLogVerify(handle: unknown, claimJson: string): Promise<unknown> {
+    return await (this.#native.eventLogVerify as (h: unknown, c: string) => Promise<unknown>)(
+      handle,
+      claimJson,
+    );
+  }
+
+  eventLogCheckpoint(handle: unknown, identity: Identity, epoch: number): unknown {
+    return (this.#native.eventLogCheckpoint as (h: unknown, i: unknown, e: number) => unknown)(
+      handle,
+      identity._handle,
+      epoch,
+    );
+  }
+
+  eventLogCheckpointByDid(handle: unknown, did: string, epoch: number): unknown {
+    return (this.#native.eventLogCheckpointByDid as (h: unknown, d: string, e: number) => unknown)(
+      handle,
+      did,
+      epoch,
+    );
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Transport
+  // ───────────────────────────────────────────────────────────────────────
+
+  async transportConnect(relayUrl: string): Promise<Transport> {
+    const raw = await (this.#native.transportConnect as (u: string) => Promise<unknown>)(relayUrl);
+    const { Transport: TransportCls } = await import("./transport");
+    return TransportCls._fromHandle(raw, this);
+  }
+
+  async transportStatus(manager: unknown): Promise<unknown> {
+    return await (this.#native.transportStatus as (m: unknown) => Promise<unknown>)(manager);
+  }
+
+  async transportDisconnect(manager: unknown): Promise<void> {
+    await (this.#native.transportDisconnect as (m: unknown) => Promise<void>)(manager);
+  }
+
+  configureLocalTransport(localDid: string): void {
+    (this.#native.configureLocalTransport as (d: string) => void)(localDid);
+  }
+
+  async configureRelayTransport(relayUrl: string, localDid: string): Promise<void> {
+    await (this.#native.configureRelayTransport as (u: string, d: string) => Promise<void>)(
+      relayUrl,
+      localDid,
+    );
+  }
+
+  async transportAddRelay(relayUrl: string): Promise<number> {
+    return await (this.#native.transportAddRelay as (u: string) => Promise<number>)(relayUrl);
+  }
+
+  transportAssignRelaySet(contextId: string): readonly number[] {
+    return (this.#native.transportAssignRelaySet as (c: string) => readonly number[])(contextId);
+  }
+
+  transportAdapterCount(): number {
+    return (this.#native.transportAdapterCount as () => number)();
+  }
+
+  transportReliability(adapterIndex: number): unknown {
+    return (this.#native.transportReliability as (i: number) => unknown)(adapterIndex);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Economy
+  // ───────────────────────────────────────────────────────────────────────
+
+  economyEstimateCost(policyJson: string, actionType: string, metricsJson: string): number {
+    return (this.#native.economyEstimateCost as (p: string, a: string, m: string) => number)(
+      policyJson,
+      actionType,
+      metricsJson,
+    );
+  }
+
+  economyPolicyRequiresPayment(policyJson: string): boolean {
+    return (this.#native.economyPolicyRequiresPayment as (p: string) => boolean)(policyJson);
+  }
+
+  economyAutoAcceptBlocked(policyJson: string): boolean {
+    return (this.#native.economyAutoAcceptBlocked as (p: string) => boolean)(policyJson);
+  }
+
+  economyCheckPolicyLock(policyJson: string): boolean {
+    return (this.#native.economyCheckPolicyLock as (p: string) => boolean)(policyJson);
+  }
+
+  economyValidatePolicyChange(currentJson: string, proposedJson: string): boolean {
+    return (this.#native.economyValidatePolicyChange as (c: string, p: string) => boolean)(
+      currentJson,
+      proposedJson,
+    );
+  }
+
+  economyEvaluateFormula(formulaJson: string, metricsJson: string): number {
+    return (this.#native.economyEvaluateFormula as (f: string, m: string) => number)(
+      formulaJson,
+      metricsJson,
+    );
+  }
+
+  economyBudgetRemaining(contextId: string, did: string): number {
+    return (this.#native.economyBudgetRemaining as (c: string, d: string) => number)(
+      contextId,
+      did,
+    );
+  }
+
+  economyBudgetGrant(contextId: string, did: string, amount: number): void {
+    (this.#native.economyBudgetGrant as (c: string, d: string, a: number) => void)(
+      contextId,
+      did,
+      amount,
+    );
+  }
+
+  economyBudgetRecordSpend(contextId: string, did: string, amount: number): void {
+    (this.#native.economyBudgetRecordSpend as (c: string, d: string, a: number) => void)(
+      contextId,
+      did,
+      amount,
+    );
+  }
+
+  economyAntispamRecord(contextId: string, senderDid: string, timestamp: number): void {
+    (this.#native.economyAntispamRecord as (c: string, s: string, t: number) => void)(
+      contextId,
+      senderDid,
+      timestamp,
+    );
+  }
+
+  economyAntispamVelocity(contextId: string, senderDid: string, now: number): number {
+    return (this.#native.economyAntispamVelocity as (c: string, s: string, n: number) => number)(
+      contextId,
+      senderDid,
+      now,
+    );
+  }
+
+  economyAntispamEscalatedCost(
+    contextId: string,
+    senderDid: string,
+    now: number,
+    baseCost: number,
+    thresholdsJson: string,
+    floor?: number | null,
+    cap?: number | null,
+  ): number {
+    return (
+      this.#native.economyAntispamEscalatedCost as (
+        c: string,
+        s: string,
+        n: number,
+        b: number,
+        t: string,
+        f: number | null,
+        cp: number | null,
+      ) => number
+    )(contextId, senderDid, now, baseCost, thresholdsJson, floor ?? null, cap ?? null);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Trust
+  // ───────────────────────────────────────────────────────────────────────
+
+  trustQueryScore(did: string, contextId: string): unknown {
+    return (this.#native.trustQueryScore as (d: string, c: string) => unknown)(did, contextId);
+  }
+
+  trustVerifyAttestation(attestationJson: string): unknown {
+    return (this.#native.trustVerifyAttestation as (j: string) => unknown)(attestationJson);
+  }
+
+  trustCreateChallenge(targetDid: string): unknown {
+    return (this.#native.trustCreateChallenge as (d: string) => unknown)(targetDid);
+  }
+
+  trustVerifyResponse(challengeJson: string, responseJson: string): boolean {
+    return (this.#native.trustVerifyResponse as (c: string, r: string) => boolean)(
+      challengeJson,
+      responseJson,
+    );
+  }
+
+  verifyParticipationRequirements(profileJson: string, requirementsJson: string): boolean {
+    return (this.#native.verifyParticipationRequirements as (p: string, r: string) => boolean)(
+      profileJson,
+      requirementsJson,
+    );
+  }
+
+  aggregateTrustInput(
+    contextId: string,
+    subjectDid: string,
+    eventsJson: string,
+    merkleRootJson: string,
+    consequenceRulesJson: string,
+    thresholdRequirementsJson: string,
+    attestorSetsJson: string,
+    cachedAttestationsJson: string,
+    challengeResultsJson: string,
+  ): string {
+    return (
+      this.#native.aggregateTrustInput as (
+        ctx: string,
+        subj: string,
+        ev: string,
+        mr: string,
+        cr: string,
+        tr: string,
+        as: string,
+        ca: string,
+        cres: string,
+      ) => string
+    )(
+      contextId,
+      subjectDid,
+      eventsJson,
+      merkleRootJson,
+      consequenceRulesJson,
+      thresholdRequirementsJson,
+      attestorSetsJson,
+      cachedAttestationsJson,
+      challengeResultsJson,
+    );
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Relay / Node
+  // ───────────────────────────────────────────────────────────────────────
+
+  async relayStartInMemory(): Promise<Relay> {
+    const raw = await (this.#native.relayStartInMemory as () => Promise<unknown>)();
+    const { Relay: RelayCls } = await import("./server");
+    return RelayCls._fromHandle(raw, this);
+  }
+
+  async relayStartLocal(dataDir: string): Promise<Relay> {
+    const raw = await (this.#native.relayStartLocal as (d: string) => Promise<unknown>)(dataDir);
+    const { Relay: RelayCls } = await import("./server");
+    return RelayCls._fromHandle(raw, this);
+  }
+
+  async nodeStartInMemory(identityDid?: string | null): Promise<Node> {
+    const raw = await (this.#native.nodeStartInMemory as (d: string | null) => Promise<unknown>)(
+      identityDid ?? null,
+    );
+    const { Node: NodeCls } = await import("./server");
+    return NodeCls._fromHandle(raw, this);
+  }
+
+  async nodeStartLocal(
+    dataDir: string,
+    identityDid?: string | null,
+    passphrase?: string | null,
+  ): Promise<Node> {
+    const raw = await (
+      this.#native.nodeStartLocal as (
+        d: string,
+        id: string | null,
+        p: string | null,
+      ) => Promise<unknown>
+    )(dataDir, identityDid ?? null, passphrase ?? null);
+    const { Node: NodeCls } = await import("./server");
+    return NodeCls._fromHandle(raw, this);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: MCP
+  // ───────────────────────────────────────────────────────────────────────
+
+  async mcpServerCreate(config: unknown): Promise<unknown> {
+    return await (this.#native.mcpServerCreate as (c: unknown) => Promise<unknown>)(config);
+  }
+
+  async mcpServerStop(handle: unknown): Promise<void> {
+    await (this.#native.mcpServerStop as (h: unknown) => Promise<void>)(handle);
+  }
+
+  async mcpClientConnectStdio(command: readonly string[]): Promise<unknown> {
+    return await (this.#native.mcpClientConnectStdio as (c: readonly string[]) => Promise<unknown>)(
+      command,
+    );
+  }
+
+  async mcpClientConnectSse(url: string): Promise<unknown> {
+    return await (this.#native.mcpClientConnectSse as (u: string) => Promise<unknown>)(url);
+  }
+
+  async mcpClientDisconnect(handle: unknown): Promise<void> {
+    await (this.#native.mcpClientDisconnect as (h: unknown) => Promise<void>)(handle);
+  }
+
+  async mcpClientListTools(handle: unknown): Promise<readonly unknown[]> {
+    return await (this.#native.mcpClientListTools as (h: unknown) => Promise<readonly unknown[]>)(
+      handle,
+    );
+  }
+
+  async mcpClientInvoke(
+    handle: unknown,
+    toolName: string,
+    inputJson: string,
+    contextId: string,
+    invokerDid: string,
+  ): Promise<unknown> {
+    return await (
+      this.#native.mcpClientInvoke as (
+        h: unknown,
+        t: string,
+        i: string,
+        c: string,
+        d: string,
+      ) => Promise<unknown>
+    )(handle, toolName, inputJson, contextId, invokerDid);
+  }
+
+  mcpConfigureStdioAllowlist(additionalBinaries: readonly string[]): void {
+    (this.#native.mcpConfigureStdioAllowlist as (b: readonly string[]) => void)(additionalBinaries);
+  }
+
+  mcpDisableStdioAllowlist(): void {
+    (this.#native.mcpDisableStdioAllowlist as () => void)();
+  }
+
+  mcpResetStdioAllowlist(): void {
+    (this.#native.mcpResetStdioAllowlist as () => void)();
+  }
+
+  mcpGetStdioAllowlist(): unknown {
+    return (this.#native.mcpGetStdioAllowlist as () => unknown)();
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Fullstack (E2E test harness)
+  // ───────────────────────────────────────────────────────────────────────
+
+  fullstackCreateNode(did: string): unknown {
+    return (this.#native.fullstackCreateNode as (d: string) => unknown)(did);
+  }
+
+  fullstackResetNetwork(): void {
+    (this.#native.fullstackResetNetwork as () => void)();
+  }
+
+  fullstackCreateContext(node: unknown, contextId: string, ceilingJson: string): string {
+    return (this.#native.fullstackCreateContext as (n: unknown, c: string, j: string) => string)(
+      node,
+      contextId,
+      ceilingJson,
+    );
+  }
+
+  fullstackAddMember(node: unknown, contextId: string, memberDid: string): void {
+    (this.#native.fullstackAddMember as (n: unknown, c: string, m: string) => void)(
+      node,
+      contextId,
+      memberDid,
+    );
+  }
+
+  fullstackJoinFromWelcome(node: unknown, contextId: string): void {
+    (this.#native.fullstackJoinFromWelcome as (n: unknown, c: string) => void)(node, contextId);
+  }
+
+  fullstackSyncSenderKeys(nodeA: unknown, nodeB: unknown, contextId: string): void {
+    (this.#native.fullstackSyncSenderKeys as (a: unknown, b: unknown, c: string) => void)(
+      nodeA,
+      nodeB,
+      contextId,
+    );
+  }
+
+  fullstackSendMessage(node: unknown, contextId: string, payload: Uint8Array | Buffer): Uint8Array {
+    const raw = (
+      this.#native.fullstackSendMessage as (
+        n: unknown,
+        c: string,
+        p: Uint8Array | Buffer,
+      ) => Uint8Array | Buffer
+    )(node, contextId, payload);
+    return new Uint8Array(raw);
+  }
+
+  fullstackDecryptMessage(
+    node: unknown,
+    contextId: string,
+    ciphertext: Uint8Array | Buffer,
+    senderDid: string,
+  ): Uint8Array {
+    const raw = (
+      this.#native.fullstackDecryptMessage as (
+        n: unknown,
+        c: string,
+        ct: Uint8Array | Buffer,
+        s: string,
+      ) => Uint8Array | Buffer
+    )(node, contextId, ciphertext, senderDid);
+    return new Uint8Array(raw);
+  }
+
+  fullstackRemoveMember(node: unknown, contextId: string, memberDid: string): void {
+    (this.#native.fullstackRemoveMember as (n: unknown, c: string, m: string) => void)(
+      node,
+      contextId,
+      memberDid,
+    );
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Media
+  // ───────────────────────────────────────────────────────────────────────
+
+  mediaCheckCapability(ceiling: readonly string[], capability: string): boolean {
+    return (this.#native.mediaCheckCapability as (c: readonly string[], cap: string) => boolean)(
+      ceiling,
+      capability,
+    );
+  }
+
+  mediaInitiateSession(
+    contextId: string,
+    ceiling: readonly string[],
+    capabilities: readonly string[],
+    participants: readonly string[],
+    timestamp: number,
+  ): string {
+    return (
+      this.#native.mediaInitiateSession as (
+        c: string,
+        cl: readonly string[],
+        caps: readonly string[],
+        p: readonly string[],
+        t: number,
+      ) => string
+    )(contextId, ceiling, capabilities, participants, timestamp);
+  }
+
+  mediaActivateSession(sessionJson: string): string {
+    return (this.#native.mediaActivateSession as (s: string) => string)(sessionJson);
+  }
+
+  mediaJoinSession(sessionJson: string, participantDid: string): string {
+    return (this.#native.mediaJoinSession as (s: string, p: string) => string)(
+      sessionJson,
+      participantDid,
+    );
+  }
+
+  mediaEndSession(sessionJson: string, timestamp: number): string {
+    return (this.#native.mediaEndSession as (s: string, t: number) => string)(
+      sessionJson,
+      timestamp,
+    );
+  }
+
+  mediaCreateOffer(sessionId: string, sdp: string, senderDid: string): string {
+    return (this.#native.mediaCreateOffer as (s: string, sdp: string, d: string) => string)(
+      sessionId,
+      sdp,
+      senderDid,
+    );
+  }
+
+  mediaCreateAnswer(sessionId: string, sdp: string, senderDid: string): string {
+    return (this.#native.mediaCreateAnswer as (s: string, sdp: string, d: string) => string)(
+      sessionId,
+      sdp,
+      senderDid,
+    );
+  }
+
+  mediaCreateIceCandidate(
+    sessionId: string,
+    candidate: string,
+    senderDid: string,
+    sdpMid?: string,
+    sdpMlineIndex?: number,
+  ): string {
+    return (
+      this.#native.mediaCreateIceCandidate as (
+        s: string,
+        c: string,
+        d: string,
+        m: string | undefined,
+        i: number | undefined,
+      ) => string
+    )(sessionId, candidate, senderDid, sdpMid, sdpMlineIndex);
+  }
+
+  mediaCreateSessionEnd(sessionId: string, senderDid: string): string {
+    return (this.#native.mediaCreateSessionEnd as (s: string, d: string) => string)(
+      sessionId,
+      senderDid,
+    );
+  }
+
+  mediaSendSignaling(signalingJson: string): string {
+    return (this.#native.mediaSendSignaling as (s: string) => string)(signalingJson);
+  }
+
+  mediaVerifySenderAttribution(signalingJson: string, envelopeSenderDid: string): boolean {
+    return (this.#native.mediaVerifySenderAttribution as (s: string, e: string) => boolean)(
+      signalingJson,
+      envelopeSenderDid,
+    );
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Provenance
+  // ───────────────────────────────────────────────────────────────────────
+
+  async evaluateProvenanceQuality(
+    sourceContext: string | undefined,
+    sourceType: string,
+    contextState: string,
+    counterparties?: readonly string[],
+  ): Promise<number> {
+    return await (
+      this.#native.evaluateProvenanceQuality as (
+        sc: string | undefined,
+        st: string,
+        cs: string,
+        cp: readonly string[] | undefined,
+      ) => Promise<number>
+    )(sourceContext, sourceType, contextState, counterparties);
+  }
+
+  provenanceAttach(
+    sourceContextId: string,
+    sourceType: string,
+    memoryScope: string,
+    members: readonly string[],
+    targetContextId: string,
+    actorDid: string,
+    existingChainDepth?: number,
+    discoveryMethod?: string,
+    purpose?: string,
+    counterpartyPolicy?: string,
+  ): string {
+    return (
+      this.#native.provenanceAttach as (
+        sc: string,
+        st: string,
+        ms: string,
+        m: readonly string[],
+        tc: string,
+        ad: string,
+        e: number | undefined,
+        dm: string | undefined,
+        p: string | undefined,
+        cp: string | undefined,
+      ) => string
+    )(
+      sourceContextId,
+      sourceType,
+      memoryScope,
+      members,
+      targetContextId,
+      actorDid,
+      existingChainDepth,
+      discoveryMethod,
+      purpose,
+      counterpartyPolicy,
+    );
+  }
+
+  provenanceCheckChainDepth(chainDepth: number, maxDepth?: number): boolean {
+    return (
+      this.#native.provenanceCheckChainDepth as (c: number, m: number | undefined) => boolean
+    )(chainDepth, maxDepth);
+  }
+
+  provenanceRedactCounterparties(provenanceJson: string): string {
+    return (this.#native.provenanceRedactCounterparties as (j: string) => string)(provenanceJson);
+  }
+
+  provenancePseudonymizeCounterparties(provenanceJson: string, pseudonymKeyHex: string): string {
+    return (this.#native.provenancePseudonymizeCounterparties as (j: string, k: string) => string)(
+      provenanceJson,
+      pseudonymKeyHex,
+    );
+  }
+
+  provenanceUpdateSourceType(provenanceJson: string, newState: string): string {
+    return (this.#native.provenanceUpdateSourceType as (j: string, s: string) => string)(
+      provenanceJson,
+      newState,
+    );
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Sync
+  // ───────────────────────────────────────────────────────────────────────
+
+  syncClassifyOffline(lastRelayContact: number, now: number): string {
+    return (this.#native.syncClassifyOffline as (l: number, n: number) => string)(
+      lastRelayContact,
+      now,
+    );
+  }
+
+  syncGetPolicy(): unknown {
+    return (this.#native.syncGetPolicy as () => unknown)();
+  }
+
+  syncClassifyOfflineCustom(
+    lastRelayContact: number,
+    now: number,
+    tier1ThresholdSecs: number,
+    tier2ThresholdSecs: number,
+  ): string {
+    return (
+      this.#native.syncClassifyOfflineCustom as (
+        l: number,
+        n: number,
+        t1: number,
+        t2: number,
+      ) => string
+    )(lastRelayContact, now, tier1ThresholdSecs, tier2ThresholdSecs);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: Bridge
+  // ───────────────────────────────────────────────────────────────────────
+
+  bridgeCreateShadow(
+    bridgeId: string,
+    platformHandle: string,
+    bridgeMode: string,
+    contextId?: string,
+  ): unknown {
+    return (
+      this.#native.bridgeCreateShadow as (
+        b: string,
+        p: string,
+        m: string,
+        c: string | undefined,
+      ) => unknown
+    )(bridgeId, platformHandle, bridgeMode, contextId);
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Domain: SCPID
+  // ───────────────────────────────────────────────────────────────────────
+
+  scpidChallenge(audience: string, ttlSeconds: number): string {
+    return (this.#native.scpidChallenge as (a: string, t: number) => string)(audience, ttlSeconds);
+  }
+
+  scpidSign(did: string, signingKeyId: string, challengeJson: string): string {
+    return (this.#native.scpidSign as (d: string, k: string, c: string) => string)(
+      did,
+      signingKeyId,
+      challengeJson,
+    );
+  }
+
+  scpidVerify(responseJson: string, challengeJson: string): string {
+    return (this.#native.scpidVerify as (r: string, c: string) => string)(
+      responseJson,
+      challengeJson,
+    );
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Internal — native handle accessor (Symbol-keyed, not exported)
+  // ───────────────────────────────────────────────────────────────────────
+
   /**
    * Internal accessor exposing the raw native NAPI `SCP` handle.
-   *
-   * The Symbol-keyed getter is used by other SDK modules
-   * (`internal/native.ts`, `server.ts`, `mcp.ts`) to dispatch SDK calls
-   * directly against this instance's class methods. The module-level
-   * free-function façade that predated ADR-048 was DELETED in PR 4
-   * (not deprecated) — no process-wide default instance exists. The
-   * Symbol is not exported, so external code cannot retrieve the
-   * native handle through this channel.
    *
    * @internal
    */
@@ -461,9 +2024,7 @@ export class SCP {
 
 /**
  * Retrieve the raw NAPI `SCP` handle from an {@link SCP} wrapper for
- * internal routing. Intended for use only by other SDK modules that
- * need to invoke class methods directly (e.g.
- * `internal/native.ts::createNativeBridge`).
+ * internal routing.
  *
  * @internal
  */

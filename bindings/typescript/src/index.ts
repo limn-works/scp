@@ -11,7 +11,7 @@
  *
  * const scp = new SCP();
  * try {
- *   const identity = await Identity.create(scp, { custody: "in_memory" });
+ *   const identity = await scp.identityCreate("in_memory");
  *
  *   await using ctx = await Context.create(identity, {
  *     ceiling: ["messages:read", "messages:write"],
@@ -29,19 +29,20 @@
  * }
  * ```
  *
- * See ADR-022 in `.docs/adrs/phase-4.md`, ADR-048
- * (`.docs/adrs/ADR-048-scp-multi-instance.md`), and
- * `.docs/scaffold/typescript.md`.
+ * Phase 4 PR 4 (#1549, ADR-048) moved every NAPI bridge operation onto
+ * the {@link SCP} class; the module-level free-function shims were
+ * deleted. Pure helpers that do not touch bridge state (e.g.
+ * {@link defineToolDefinition}, {@link parseAddress}) remain as
+ * free functions.
  *
  * @packageDocumentation
  */
 
 // ---------------------------------------------------------------------------
-// SCPID Authentication
+// SCPID Authentication — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
 export type { ScpIdAuthentication, ScpIdChallenge, ScpIdResponse } from "./auth";
-export { scpidChallenge, scpidSign, scpidVerify } from "./auth";
 
 // ---------------------------------------------------------------------------
 // Identity
@@ -61,38 +62,19 @@ export type {
   OperationalMetadata,
   StructuralMetadata,
 } from "./context";
-export {
-  Context,
-  evaluateInvitation,
-  metadataRecordFromJson,
-  metadataRecordToJson,
-  restoreAllContexts,
-  restoreContext,
-  ScopedHandle,
-  templateGetParams,
-  validateAgainstTemplate,
-  validateCapabilityDeclaration,
-  validateContextParams,
-} from "./context";
+export { Context, ScopedHandle } from "./context";
 
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
-export {
-  defineToolDefinition,
-  toolInvokeCrossContext,
-  toolSessionClose,
-  toolSessionCreate,
-  toolSessionInvoke,
-} from "./tools";
+export { defineToolDefinition } from "./tools";
 
 // ---------------------------------------------------------------------------
-// Trust
+// Trust — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
 export type { AggregatedTrustInput, AggregationInput } from "./trust";
-export { aggregateTrustInput, evaluateTrust, verifyParticipationRequirements } from "./trust";
 
 // ---------------------------------------------------------------------------
 // Event Log
@@ -107,27 +89,26 @@ export { EventLog } from "./event-log";
 export { Transport } from "./transport";
 
 // ---------------------------------------------------------------------------
-// UCAN
+// UCAN — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
-export { delegateUcan, mintUcan, revokeUcan, validateUcan } from "./ucan";
+// The `./ucan` module is empty after ADR-048 demolition; `UcanToken` is
+// re-exported from `./types` below.
 
 // ---------------------------------------------------------------------------
-// MCP
+// MCP — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
 export type { McpClient, McpServer } from "./mcp";
-export { connectMcp, connectMcpStdio, serveMcp } from "./mcp";
 
 // ---------------------------------------------------------------------------
-// Bridge Connector
+// Bridge Connector — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
 export type { BridgeMode, BridgeRegistration, ShadowIdentity, ShadowStatus } from "./bridge";
-export { bridgeCreateShadow, bridgeEvaluateTrust, bridgeRegister } from "./bridge";
 
 // ---------------------------------------------------------------------------
-// Discovery
+// Discovery — types + pure helpers (entry points for stateful ops moved to SCP)
 // ---------------------------------------------------------------------------
 
 export type {
@@ -144,30 +125,15 @@ export type {
   ScopeTarget,
 } from "./discovery";
 export {
-  addressResolve,
   createQuery,
   discoverContexts,
-  handleDeregister,
-  handleLookup,
-  handleRegister,
   normalizeAddress,
   parseAddress,
-  petnameGetForContext,
-  petnameGetForDid,
-  petnameRemove,
-  petnameRemoveContext,
-  petnameResolveContext,
-  petnameResolveDid,
-  petnameSet,
-  petnameSetContext,
   resolveAddress,
-  scopeDeregister,
-  scopeLookup,
-  scopeRegister,
 } from "./discovery";
 
 // ---------------------------------------------------------------------------
-// Media
+// Media — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
 export type {
@@ -177,71 +143,36 @@ export type {
   SessionMetadata,
   SignalingResult,
 } from "./media";
-export {
-  mediaActivateSession,
-  mediaCheckCapability,
-  mediaCreateAnswer,
-  mediaCreateIceCandidate,
-  mediaCreateOffer,
-  mediaCreateSessionEnd,
-  mediaEndSession,
-  mediaInitiateSession,
-  mediaJoinSession,
-  mediaSendSignaling,
-  mediaVerifySenderAttribution,
-} from "./media";
 
 // ---------------------------------------------------------------------------
-// Provenance
+// Provenance — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
 export type { DiscoveryMethod, ProvenanceRecord } from "./provenance";
-export {
-  evaluateProvenanceQuality,
-  provenanceAttach,
-  provenanceCheckChainDepth,
-} from "./provenance";
 
 // ---------------------------------------------------------------------------
-// Economy
+// Economy — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
 export type { ObservableMetrics, PaidActionType } from "./economy";
-export {
-  antispamEscalatedCost,
-  antispamRecord,
-  antispamVelocity,
-  autoAcceptBlocked,
-  budgetGrant,
-  budgetRecordSpend,
-  budgetRemaining,
-  checkPolicyLock,
-  estimateCost,
-  evaluateFormula,
-  policyRequiresPayment,
-  validatePolicyChange,
-} from "./economy";
 
 // ---------------------------------------------------------------------------
-// Sync
+// Sync — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
 export type { SyncPolicy } from "./sync";
-export { classifyOffline, classifyOfflineCustom, getSyncPolicy } from "./sync";
 
 // ---------------------------------------------------------------------------
 // Server (relay + node lifecycle)
 // ---------------------------------------------------------------------------
 
-export { connectLocalTransport, Node, Relay } from "./server";
+export { Node, Relay } from "./server";
 
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
 // Suspend and resume are methods on SCP itself — `scp.suspend()` / `await scp.resume()`.
-// Phase 4 PR 4 (#1549, ADR-048) deleted the free-function wrappers to
-// keep a single happy path across all SDKs.
 
 // ---------------------------------------------------------------------------
 // SCP multi-instance handle (ADR-048)

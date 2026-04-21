@@ -187,6 +187,21 @@ export class Relay implements AsyncDisposable {
     this.#handle = handle;
   }
 
+  /**
+   * Constructs a `Relay` from a raw native NAPI relay handle.
+   *
+   * @param raw The opaque NAPI relay handle returned by
+   *   `scp.relayStartInMemory()` / `scp.relayStartLocal()`.
+   * @param _scp Retained for API symmetry with the other
+   *   `_fromHandle` statics — the relay is already self-contained so
+   *   the caller-owned `SCP` does not need to be stored here.
+   *
+   * @internal Phase 4 PR 4 (#1549, ADR-048).
+   */
+  static _fromHandle(raw: unknown, _scp: SCP): Relay {
+    return new Relay(raw as NativeRelayHandle);
+  }
+
   /** The WebSocket URL clients should connect to (e.g. `ws://127.0.0.1:PORT/scp/v1`). */
   get relayUrl(): string {
     return this.#handle.relayUrl;
@@ -265,6 +280,20 @@ export class Node implements AsyncDisposable {
 
   private constructor(handle: NativeNodeHandle) {
     this.#handle = handle;
+  }
+
+  /**
+   * Constructs a `Node` from a raw native NAPI node handle.
+   *
+   * @param raw The opaque NAPI node handle returned by
+   *   `scp.nodeStartInMemory()` / `scp.nodeStartLocal()`.
+   * @param _scp Retained for API symmetry with the other
+   *   `_fromHandle` statics.
+   *
+   * @internal Phase 4 PR 4 (#1549, ADR-048).
+   */
+  static _fromHandle(raw: unknown, _scp: SCP): Node {
+    return new Node(raw as NativeNodeHandle);
   }
 
   /** The WebSocket URL for this node's relay (e.g. `ws://127.0.0.1:PORT/scp/v1`). */
@@ -487,51 +516,19 @@ export class Node implements AsyncDisposable {
 }
 
 // ---------------------------------------------------------------------------
-// Transport helper for local relays
+// Transport helpers for local relays moved to `SCP` in Phase 4 PR 4
+// (#1549, ADR-048):
+//
+// - `scp.transportConnect(relayUrl)` — plaintext `ws://` is still
+//   permitted for loopback URLs. Unlike `Transport.connect(...)` which
+//   enforces `wss://`, the raw bridge call does not, so tests that
+//   target in-process relays can construct a `Transport` via
+//   `scp.transportConnect("ws://127.0.0.1:PORT/scp/v1")` directly.
+// - `scp.configureLocalTransport(localDid)` — pre-configures the
+//   `ContextManager` with `LocalTransportProvider` so `contextSend` /
+//   `broadcastPublish` succeed locally without a running relay.
+//
+// The free-function shims (`connectLocalTransport`,
+// `configureLocalTransport`) that predated ADR-048 were deleted in the
+// same commit.
 // ---------------------------------------------------------------------------
-
-/**
- * Connects the SDK transport layer to a local relay.
- *
- * Unlike {@link Transport.connect}, this function accepts plaintext `ws://`
- * URLs because local relays (started via {@link Relay.startInMemory} or
- * {@link Node.startInMemory}) bind to `127.0.0.1` without TLS.
- *
- * @param relayUrl - The WebSocket URL of the relay (e.g. `ws://127.0.0.1:PORT/scp/v1`).
- * @param scp - The {@link SCP} wrapper whose bridge instance should
- *   own the transport. Required — the legacy process-wide default
- *   instance fallback was removed in Phase 4 PR 4 (#1549) demolition.
- */
-export async function connectLocalTransport(relayUrl: string, scp: SCP): Promise<void> {
-  const api = serverApi(scp);
-  await api.transportConnect(relayUrl);
-}
-
-// ---------------------------------------------------------------------------
-// Local transport configuration (test helper)
-// ---------------------------------------------------------------------------
-
-/**
- * Pre-configures the SDK's `ContextManager` with `LocalTransportProvider`.
- *
- * With this provider, `contextSend` and `broadcastPublish` succeed locally
- * without a running relay server. The encrypted-and-signed pipeline still
- * executes in full (MLS group encryption, sender key signing, inner envelope
- * construction); only the final relay publish step is stubbed.
- *
- * **Must be called before any `identityCreate` followed by `contextCreate`.**
- * The `ContextManager` is initialized once per process (`OnceLock`), so the
- * first initialization call wins. If `configureLocalTransport` is called
- * after a `contextCreate`, the call is a no-op and the transport provider
- * remains `NotConfiguredTransportProvider`.
- *
- * @param localDid - A valid `did:dht:` DID string used as the MLS credential
- * identity. Typically the DID of the first identity created in the test.
- * @param scp - The {@link SCP} wrapper whose bridge instance should be
- *   configured. Required — the legacy process-wide default instance
- *   fallback was removed in Phase 4 PR 4 (#1549) demolition.
- */
-export function configureLocalTransport(localDid: string, scp: SCP): void {
-  const api = serverApi(scp);
-  api.configureLocalTransport(localDid);
-}

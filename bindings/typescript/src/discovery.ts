@@ -1,9 +1,28 @@
 /**
  * Discovery module for the SCP TypeScript SDK.
  *
- * Provides functions for parsing SCP addresses, creating discovery queries,
- * normalizing addresses, discovering contexts from DIDs or `scp://` URIs,
- * and resolving addresses to typed `AddressResolution` results.
+ * Provides address parsing, query construction, address normalization,
+ * and context discovery via the addon-level free functions
+ * (`discovery_parse_address`, `discovery_create_query`,
+ * `discovery_normalize_address`, `context_discover`) which are pure
+ * helpers with no bridge-instance state — they remain free functions
+ * on the NAPI addon.
+ *
+ * Petname / handle / scope / address-resolve wrappers moved onto the
+ * {@link SCP} class in Phase 4 PR 4 (#1549, ADR-048):
+ *
+ * - `scp.petnameSet(...)`, `scp.petnameRemove(...)`,
+ *   `scp.petnameResolveDid(...)`, `scp.petnameResolveContext(...)`,
+ *   `scp.petnameGetForDid(...)`, `scp.petnameGetForContext(...)` —
+ *   plus the `*Context` variants for context petnames.
+ * - `scp.handleRegister(...)`, `scp.handleLookup(...)`,
+ *   `scp.handleDeregister(...)`.
+ * - `scp.scopeRegister(...)`, `scp.scopeLookup(...)`,
+ *   `scp.scopeDeregister(...)`.
+ * - `scp.addressResolve(...)`.
+ *
+ * The free-function shims that predated ADR-048 were deleted in the
+ * same commit. This module keeps the pure helpers.
  *
  * See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).
  */
@@ -42,6 +61,60 @@ export interface DiscoveryResult {
   readonly trustLevel: TrustLevel;
   /** Resolution path recording which layer produced this result (§22.7). */
   readonly resolutionPath: ResolutionPath;
+}
+
+/** Result of a handle registration. */
+export interface HandleRegisterResult {
+  readonly status: string;
+  readonly entry_id: string | null;
+}
+
+/** Result of a handle lookup. */
+export interface HandleLookupResult {
+  readonly results: readonly Record<string, unknown>[];
+}
+
+/** Result of a handle deregistration. */
+export interface HandleDeregisterResult {
+  readonly removed: boolean;
+}
+
+/** Target context for a scope entry (context-only by construction per ADR-043). */
+export interface ScopeTarget {
+  readonly context_id: string;
+  readonly relay_urls: readonly string[];
+}
+
+/** Optional metadata attached to a scope registration (§22.3.5). */
+export interface ScopeMetadata {
+  readonly description: string | null;
+  readonly tags: readonly string[] | null;
+}
+
+/** A single scope entry in the registry (§22.3.5). */
+export interface ScopeEntry {
+  readonly name: string;
+  readonly target: ScopeTarget;
+  readonly owner_did: string;
+  readonly registered_at: number;
+  readonly metadata: ScopeMetadata;
+  readonly entry_id: string;
+}
+
+/** Result of a scope registration. */
+export interface ScopeRegisterResult {
+  readonly status: "registered" | "conflict" | "updated";
+  readonly entry_id: string | null;
+}
+
+/** Result of a scope lookup. */
+export interface ScopeLookupResult {
+  readonly results: readonly ScopeEntry[];
+}
+
+/** Result of a scope deregistration. */
+export interface ScopeDeregisterResult {
+  readonly removed: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,13 +160,8 @@ function validateTrustLevelKind(kind: string): asserts kind is TrustLevel["kind"
 /**
  * Parses a trust level from the bridge JSON. The NAPI bridge emits trust
  * levels as `{ "kind": "..." }` objects (discriminated unions per §22.7).
- * The `MultiLayerCorroborated` variant additionally carries `sources`.
- *
- * Also handles legacy string values (e.g. `"DomainVerified"`) by wrapping
- * them into the discriminated union shape.
  *
  * @throws {ValidationError} On unrecognized variants or unexpected input types.
- * §22.7 defines exactly 6 variants.
  */
 function parseTrustLevel(raw: unknown): TrustLevel {
   if (raw != null && typeof raw === "object" && "kind" in raw) {
@@ -109,7 +177,6 @@ function parseTrustLevel(raw: unknown): TrustLevel {
     }
     return { kind };
   }
-  // Handle plain string trust levels from the bridge.
   if (typeof raw === "string") {
     validateTrustLevelKind(raw);
     if (raw === "MultiLayerCorroborated") {
@@ -142,7 +209,7 @@ function parseDiscoveryResult(item: Record<string, unknown>): DiscoveryResult {
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Pure addon helpers (no SCP-class equivalent — no bridge-instance state)
 // ---------------------------------------------------------------------------
 
 /**
@@ -155,7 +222,7 @@ function parseDiscoveryResult(item: Record<string, unknown>): DiscoveryResult {
 export async function parseAddress(scp: SCP, address: string): Promise<ParsedAddress> {
   try {
     const bridge = await getBridge(scp);
-    const result = await bridge.discoveryParseAddress(address);
+    const result = bridge.discoveryParseAddress(address);
     return safeJsonParse(result, "discoveryParseAddress") as ParsedAddress;
   } catch (error) {
     throw mapBridgeError(error);
@@ -225,13 +292,8 @@ export async function discoverContexts(scp: SCP, query: string): Promise<Discove
 /**
  * Resolves an SCP address (DID or `scp://` URI) to typed `AddressResolution` results.
  *
- * Wraps `discoverContexts()` and returns `AddressResolution[]` with the
+ * Wraps {@link discoverContexts} and returns `AddressResolution[]` with the
  * discriminated union structure matching §22.2.1.
- *
- * Currently resolves context addresses only. Identity resolution (petnames,
- * attestation handles, domain handles) requires handle tool infrastructure
- * defined in §22.3-22.6 and will be wired when those subsystems are
- * available.
  *
  * @param query - A DID string or `scp://` URI.
  * @returns Typed address resolution results.
@@ -250,455 +312,4 @@ export async function resolveAddress(scp: SCP, query: string): Promise<AddressRe
       resolutionPath: r.resolutionPath,
     }),
   );
-}
-
-// ---------------------------------------------------------------------------
-// Petname operations (§22.4)
-// ---------------------------------------------------------------------------
-
-/**
- * Assigns a petname to a DID within the owner's local namespace.
- *
- * @param ownerDid - DID of the identity that owns this petname map.
- * @param targetDid - DID to assign the petname to.
- * @param name - The petname string.
- * @throws {ValidationError} If `ownerDid` is empty.
- */
-export async function petnameSet(
-  scp: SCP,
-  ownerDid: string,
-  targetDid: string,
-  name: string,
-): Promise<void> {
-  try {
-    const bridge = await getBridge(scp);
-    bridge.petnameSet(ownerDid, targetDid, name);
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Removes a petname from a DID.
- *
- * @param ownerDid - DID of the identity that owns this petname map.
- * @param targetDid - DID to remove the petname from.
- * @throws {ValidationError} If `ownerDid` is empty.
- */
-export async function petnameRemove(scp: SCP, ownerDid: string, targetDid: string): Promise<void> {
-  try {
-    const bridge = await getBridge(scp);
-    bridge.petnameRemove(ownerDid, targetDid);
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Assigns a petname to a context within the owner's local namespace.
- *
- * @param ownerDid - DID of the identity that owns this petname map.
- * @param contextId - Context ID to assign the petname to.
- * @param name - The petname string.
- * @throws {ValidationError} If `ownerDid` is empty.
- */
-export async function petnameSetContext(
-  scp: SCP,
-  ownerDid: string,
-  contextId: string,
-  name: string,
-): Promise<void> {
-  try {
-    const bridge = await getBridge(scp);
-    bridge.petnameSetContext(ownerDid, contextId, name);
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Removes a petname from a context.
- *
- * @param ownerDid - DID of the identity that owns this petname map.
- * @param contextId - Context ID to remove the petname from.
- * @throws {ValidationError} If `ownerDid` is empty.
- */
-export async function petnameRemoveContext(
-  scp: SCP,
-  ownerDid: string,
-  contextId: string,
-): Promise<void> {
-  try {
-    const bridge = await getBridge(scp);
-    bridge.petnameRemoveContext(ownerDid, contextId);
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Resolves a petname to a list of DIDs.
- *
- * @param ownerDid - DID of the identity that owns this petname map.
- * @param name - The petname to resolve.
- * @returns Array of DID strings matching the petname.
- * @throws {ValidationError} If `ownerDid` is empty.
- */
-export async function petnameResolveDid(
-  scp: SCP,
-  ownerDid: string,
-  name: string,
-): Promise<string[]> {
-  try {
-    const bridge = await getBridge(scp);
-    const json = bridge.petnameResolveDid(ownerDid, name);
-    return safeJsonParse(json, "petnameResolveDid") as string[];
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Resolves a petname to a list of context IDs.
- *
- * @param ownerDid - DID of the identity that owns this petname map.
- * @param name - The petname to resolve.
- * @returns Array of context ID strings matching the petname.
- * @throws {ValidationError} If `ownerDid` is empty.
- */
-export async function petnameResolveContext(
-  scp: SCP,
-  ownerDid: string,
-  name: string,
-): Promise<string[]> {
-  try {
-    const bridge = await getBridge(scp);
-    const json = bridge.petnameResolveContext(ownerDid, name);
-    return safeJsonParse(json, "petnameResolveContext") as string[];
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Gets the petname assigned to a DID, if any.
- *
- * @param ownerDid - DID of the identity that owns this petname map.
- * @param targetDid - DID to look up.
- * @returns The petname string, or `null` if no petname is assigned.
- * @throws {ValidationError} If `ownerDid` is empty.
- */
-export async function petnameGetForDid(
-  scp: SCP,
-  ownerDid: string,
-  targetDid: string,
-): Promise<string | null> {
-  try {
-    const bridge = await getBridge(scp);
-    return bridge.petnameGetForDid(ownerDid, targetDid);
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Gets the petname assigned to a context, if any.
- *
- * @param ownerDid - DID of the identity that owns this petname map.
- * @param contextId - Context ID to look up.
- * @returns The petname string, or `null` if no petname is assigned.
- * @throws {ValidationError} If `ownerDid` is empty.
- */
-export async function petnameGetForContext(
-  scp: SCP,
-  ownerDid: string,
-  contextId: string,
-): Promise<string | null> {
-  try {
-    const bridge = await getBridge(scp);
-    return bridge.petnameGetForContext(ownerDid, contextId);
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Handle Registry operations (§22.3.1)
-// ---------------------------------------------------------------------------
-
-/** Result of a handle registration. */
-export interface HandleRegisterResult {
-  readonly status: string;
-  readonly entry_id: string | null;
-}
-
-/** Result of a handle lookup. */
-export interface HandleLookupResult {
-  readonly results: readonly Record<string, unknown>[];
-}
-
-/** Result of a handle deregistration. */
-export interface HandleDeregisterResult {
-  readonly removed: boolean;
-}
-
-/**
- * Registers a handle in a context with discovery tools.
- *
- * @param discoveryContextId - ID of the context.
- * @param handle - The handle string to register.
- * @param targetJson - JSON describing the target (`{ "type": "identity", "did": "..." }` or `{ "type": "context", "context_id": "...", "relay_urls": [...] }`).
- * @param registrantDid - DID of the registrant.
- * @param options - Optional description and tags.
- * @returns Registration result.
- * @throws {ValidationError} If `targetJson` is malformed.
- */
-export async function handleRegister(
-  scp: SCP,
-  discoveryContextId: string,
-  handle: string,
-  targetJson: string,
-  registrantDid: string,
-  options?: { description?: string; tags?: string[] },
-): Promise<HandleRegisterResult> {
-  try {
-    const bridge = await getBridge(scp);
-    const result = bridge.handleRegister(
-      discoveryContextId,
-      handle,
-      targetJson,
-      registrantDid,
-      options?.description,
-      options?.tags,
-    );
-    return safeJsonParse(result, "handleRegister") as HandleRegisterResult;
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Looks up a handle in a context with discovery tools.
- *
- * @param discoveryContextId - ID of the context.
- * @param handle - The handle string to look up.
- * @param typeFilter - Optional filter: `"identity"` or `"context"`.
- * @returns Lookup result with a `results` array of matching entries.
- */
-export async function handleLookup(
-  scp: SCP,
-  discoveryContextId: string,
-  handle: string,
-  typeFilter?: string,
-): Promise<HandleLookupResult> {
-  try {
-    const bridge = await getBridge(scp);
-    const result = bridge.handleLookup(discoveryContextId, handle, typeFilter);
-    return safeJsonParse(result, "handleLookup") as HandleLookupResult;
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Deregisters a handle from a context with discovery tools.
- *
- * @param discoveryContextId - ID of the context.
- * @param handle - The handle string to deregister.
- * @param did - DID of the registrant requesting deregistration.
- * @returns Deregistration result with a `removed` boolean.
- */
-export async function handleDeregister(
-  scp: SCP,
-  discoveryContextId: string,
-  handle: string,
-  did: string,
-): Promise<HandleDeregisterResult> {
-  try {
-    const bridge = await getBridge(scp);
-    const result = bridge.handleDeregister(discoveryContextId, handle, did);
-    return safeJsonParse(result, "handleDeregister") as HandleDeregisterResult;
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Scope Registry operations (§22.3.5, ADR-043)
-// ---------------------------------------------------------------------------
-
-/** Target context for a scope entry (context-only by construction per ADR-043). */
-export interface ScopeTarget {
-  readonly context_id: string;
-  readonly relay_urls: readonly string[];
-}
-
-/** Optional metadata attached to a scope registration (§22.3.5). */
-export interface ScopeMetadata {
-  readonly description: string | null;
-  readonly tags: readonly string[] | null;
-}
-
-/** A single scope entry in the registry (§22.3.5). */
-export interface ScopeEntry {
-  readonly name: string;
-  readonly target: ScopeTarget;
-  readonly owner_did: string;
-  readonly registered_at: number;
-  readonly metadata: ScopeMetadata;
-  readonly entry_id: string;
-}
-
-/** Result of a scope registration. */
-export interface ScopeRegisterResult {
-  readonly status: "registered" | "conflict" | "updated";
-  readonly entry_id: string | null;
-}
-
-/** Result of a scope lookup. */
-export interface ScopeLookupResult {
-  readonly results: readonly ScopeEntry[];
-}
-
-/** Result of a scope deregistration. */
-export interface ScopeDeregisterResult {
-  readonly removed: boolean;
-}
-
-/**
- * Registers a scope name in a scope registry.
- *
- * @param scopeContextId - ID of the context hosting the scope registry.
- * @param name - Scope name to register (`[a-z0-9-]`, max 64 chars).
- * @param targetContextId - Context ID the scope name resolves to.
- * @param relayUrls - Relay URLs for the target context.
- * @param registrantDid - DID of the registrant.
- * @param options - Optional description and tags.
- * @returns Registration result.
- * @throws {ValidationError} If the scope name or relay URLs are invalid.
- */
-export async function scopeRegister(
-  scp: SCP,
-  scopeContextId: string,
-  name: string,
-  targetContextId: string,
-  relayUrls: string[],
-  registrantDid: string,
-  options?: { description?: string; tags?: string[] },
-): Promise<ScopeRegisterResult> {
-  try {
-    const bridge = await getBridge(scp);
-    const result = bridge.scopeRegister(
-      scopeContextId,
-      name,
-      targetContextId,
-      relayUrls,
-      registrantDid,
-      options?.description,
-      options?.tags,
-    );
-    return safeJsonParse(result, "scopeRegister") as ScopeRegisterResult;
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Looks up a scope name in a scope registry.
- *
- * @param scopeContextId - ID of the context hosting the scope registry.
- * @param name - The scope name to look up.
- * @returns Lookup result with a `results` array of matching scope entries.
- */
-export async function scopeLookup(
-  scp: SCP,
-  scopeContextId: string,
-  name: string,
-): Promise<ScopeLookupResult> {
-  try {
-    const bridge = await getBridge(scp);
-    const result = bridge.scopeLookup(scopeContextId, name);
-    return safeJsonParse(result, "scopeLookup") as ScopeLookupResult;
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-/**
- * Deregisters a scope name from a scope registry.
- *
- * @param scopeContextId - ID of the context hosting the scope registry.
- * @param name - The scope name to deregister.
- * @param did - DID of the registrant requesting deregistration.
- * @returns Deregistration result with a `removed` boolean.
- */
-export async function scopeDeregister(
-  scp: SCP,
-  scopeContextId: string,
-  name: string,
-  did: string,
-): Promise<ScopeDeregisterResult> {
-  try {
-    const bridge = await getBridge(scp);
-    const result = bridge.scopeDeregister(scopeContextId, name, did);
-    return safeJsonParse(result, "scopeDeregister") as ScopeDeregisterResult;
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Multi-path address resolution (§22.8)
-// ---------------------------------------------------------------------------
-
-/**
- * Resolves a human-readable address via multi-path resolution pipeline.
- *
- * Uses the petname layer first, then handle registries, then attestation
- * and domain layers per §22.8.
- *
- * @param ownerDid - DID of the identity whose petname map to consult.
- * @param address - The address string to resolve (e.g., `"alice@cooking-community"`).
- * @param knownContextsJson - Optional JSON object mapping context IDs to names.
- *   If omitted, uses all registered contexts with discovery tools.
- * @returns Typed address resolution results.
- * @throws {ValidationError} If `ownerDid` is empty or address parsing fails.
- */
-export async function addressResolve(
-  scp: SCP,
-  ownerDid: string,
-  address: string,
-  knownContextsJson?: string,
-): Promise<AddressResolution[]> {
-  try {
-    const bridge = await getBridge(scp);
-    const raw = await bridge.addressResolve(ownerDid, address, knownContextsJson);
-    const parsed = safeJsonParse(raw, "addressResolve") as Array<Record<string, unknown>>;
-    return parsed.map((item): AddressResolution => {
-      const trustLevel = parseTrustLevel(item.trust_level ?? item.trustLevel);
-      const rawPath = (item.resolution_path ?? item.resolutionPath ?? {}) as Record<
-        string,
-        unknown
-      >;
-      const resolutionPath = parseResolutionPath(rawPath);
-      if (item.type === "Identity") {
-        return {
-          type: "Identity",
-          did: item.did as string,
-          trustLevel,
-          resolutionPath,
-        };
-      }
-      return {
-        type: "Context",
-        contextId: (item.context_id ?? item.contextId) as string,
-        relayUrls: (item.relay_urls ?? item.relayUrls ?? []) as readonly string[],
-        mode: (item.mode ?? null) as string | null,
-        trustLevel,
-        resolutionPath,
-      };
-    });
-  } catch (error) {
-    throw mapBridgeError(error);
-  }
 }
