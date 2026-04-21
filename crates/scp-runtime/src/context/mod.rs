@@ -30,6 +30,7 @@
 pub mod actor;
 pub mod app_sandbox;
 pub mod builder;
+pub(crate) mod economy_helpers;
 pub mod export_import;
 pub mod governance;
 pub(crate) mod lifecycle_helpers;
@@ -38,6 +39,7 @@ pub(crate) mod messaging_helpers;
 pub mod policy;
 pub mod providers;
 pub mod supervisor;
+pub(crate) mod trust_recovery_helpers;
 pub mod ttl;
 
 pub mod tools;

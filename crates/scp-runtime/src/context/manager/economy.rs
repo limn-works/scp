@@ -753,32 +753,16 @@ impl ContextManager {
     ///
     /// If no payment adapter is configured, all receipts return
     /// [`ReceiptVerificationError::NoVerifierForAdapter`].
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::economy_helpers::verify_payment_receipts`] free
+    /// function (ADR-049 commit 12c.3). Deleted in a later commit
+    /// alongside every other `ContextManager` economy surface.
     pub async fn verify_payment_receipts(
         &self,
         receipts: &[PaymentReceipt],
     ) -> Vec<Result<ReceiptVerification, ReceiptVerificationError>> {
-        let mut results = Vec::with_capacity(receipts.len());
-        for receipt in receipts {
-            let result = match &self.payment_adapter {
-                Some(adapter) if adapter.adapter_id() == receipt.adapter_id => adapter
-                    .verify_dyn(receipt)
-                    .await
-                    .map(|r| ReceiptVerification {
-                        receipt_id: receipt.receipt_id,
-                        result: r,
-                    })
-                    .map_err(|e| ReceiptVerificationError::VerificationFailed {
-                        receipt_id: receipt.receipt_id,
-                        error: e,
-                    }),
-                _ => Err(ReceiptVerificationError::NoVerifierForAdapter {
-                    receipt_id: receipt.receipt_id,
-                    adapter_id: receipt.adapter_id.clone(),
-                }),
-            };
-            results.push(result);
-        }
-        results
+        crate::context::economy_helpers::verify_payment_receipts(self, receipts).await
     }
 }
 

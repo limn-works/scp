@@ -3141,6 +3141,20 @@ impl ContextManager {
         self.payment_adapter.clone()
     }
 
+    /// Cheap reference to the manager's optional payment adapter. Used
+    /// by the hoisted `economy_helpers::verify_payment_receipts` free
+    /// function so it can read the adapter without cloning the `Arc`
+    /// (ADR-049 commit 12c.3). Non-feature-gated — the hoisted free
+    /// function is compiled in every build configuration. Returns
+    /// `Option<&Arc<...>>` so callers can still `Arc::clone` when they
+    /// need ownership.
+    #[must_use]
+    pub(crate) const fn payment_adapter_ref(
+        &self,
+    ) -> Option<&Arc<dyn crate::economy::adapter::PaymentAdapterDyn>> {
+        self.payment_adapter.as_ref()
+    }
+
     // -------------------------------------------------------------------
     // Commit 9 / ADR-049 — transitional lifecycle / TTL shim accessors.
     // Deleted in commit 12 with the shim itself.
