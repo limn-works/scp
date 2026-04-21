@@ -1687,6 +1687,7 @@ impl crate::scp::PyScp {
     /// parameter values are out of range, or `RuntimeError` if context creation
     /// fails.
     #[pyo3(signature = (identity_did, params))]
+    #[allow(clippy::too_many_lines)] // orchestration: validates, registers FFI state, delegates to ContextManager, returns handle
     pub fn context_create(
         &self,
         identity_did: &str,
@@ -1857,6 +1858,7 @@ impl crate::scp::PyScp {
     ///
     /// Returns `RuntimeError` if the context is not in "active" state.
     #[pyo3(signature = (handle, identity_did, spending_ucan_jwt=None))]
+    #[allow(clippy::too_many_lines)] // orchestration: validates, UCAN gate, delegates to ContextManager, syncs FFI state
     pub fn context_join(
         &self,
         handle: &PyContextHandle,

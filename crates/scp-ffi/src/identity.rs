@@ -1390,6 +1390,7 @@ impl crate::scp::PyScp {
     ///
     /// See spec §3.5.1, §3.5.2.
     #[pyo3(signature = (did, platform, handle, proof, verification_method, platform_id=None))]
+    #[allow(clippy::too_many_arguments)] // FFI surface: spec-defined signature
     pub fn create_identity_link_attestation(
         &self,
         py: Python<'_>,

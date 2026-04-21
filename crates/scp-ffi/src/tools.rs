@@ -1006,6 +1006,7 @@ fn tool_session_create_impl(
 /// Raises `ContextError` if the session is not found, has expired, or
 /// the invoker lacks capability.
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
+#[allow(clippy::too_many_arguments)] // FFI surface: spec-defined signature
 fn tool_session_invoke_impl(
     bi: &PyBridgeInstance,
     py: Python<'_>,
@@ -1538,6 +1539,7 @@ impl crate::scp::PyScp {
     #[pyo3(name = "tool_session_invoke")]
     #[pyo3(signature = (context_id, session_id, input, invoker_did, ucan_token, proof_tokens=None))]
     #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::too_many_arguments)] // FFI surface: spec-defined signature
     pub fn tool_session_invoke(
         &self,
         py: Python<'_>,

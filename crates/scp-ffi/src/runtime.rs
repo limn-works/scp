@@ -2431,28 +2431,28 @@ mod tests {
     /// still verifies that two independent instances get independent managers.
     #[test]
     fn register_context_on_non_default_bi_attaches_cm_to_bi() {
-        let bi_a = PyBridgeInstance::new_py();
-        init_context_manager_for_test(&bi_a);
-        let bi_a_cm = Arc::clone(bi_a.core.try_context_manager().unwrap());
+        let first = PyBridgeInstance::new_py();
+        init_context_manager_for_test(&first);
+        let first_manager = Arc::clone(first.core.try_context_manager().unwrap());
 
-        let bi_b = PyBridgeInstance::new_py();
+        let second = PyBridgeInstance::new_py();
         assert!(
-            !bi_b.core.has_context_manager(),
+            !second.core.has_context_manager(),
             "fresh bi must not inherit a ContextManager from another instance"
         );
 
         let ctx_id = unique_ctx_id("per-instance-cm");
         let creator = "did:dht:z6MkPerInstanceCm";
-        register_context(&bi_b, &ctx_id, creator, &[]).unwrap();
+        register_context(&second, &ctx_id, creator, &[]).unwrap();
 
         assert!(
-            bi_b.core.has_context_manager(),
-            "register_context(bi_b, ...) must attach a ContextManager to bi_b"
+            second.core.has_context_manager(),
+            "register_context(second, ...) must attach a ContextManager to it"
         );
-        let bi_b_cm = bi_b.core.try_context_manager().unwrap();
+        let second_manager = second.core.try_context_manager().unwrap();
         assert!(
-            !Arc::ptr_eq(&bi_a_cm, bi_b_cm),
-            "bi_b must hold a distinct ContextManager — not bi_a's"
+            !Arc::ptr_eq(&first_manager, second_manager),
+            "second bi must hold a distinct ContextManager — not the first's"
         );
     }
 

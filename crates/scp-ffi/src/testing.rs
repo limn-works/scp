@@ -57,7 +57,7 @@ use crate::runtime::PyBridgeInstance;
 /// All nodes created via `fullstack_create_node` on the same instance share
 /// the same `KeyExchange` so Welcome messages and sender keys can be
 /// exchanged.
-fn with_network<F, R>(bi: &PyBridgeInstance, f: F) -> PyResult<R>
+fn with_network<F, R>(bi: &PyBridgeInstance, f: F) -> R
 where
     F: FnOnce(&FullStackNetwork) -> R,
 {
@@ -66,7 +66,7 @@ where
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let network = guard.get_or_insert_with(FullStackNetwork::new);
-    Ok(f(network))
+    f(network)
 }
 
 /// Returns a permissive key resolver that always returns `None`.
@@ -104,7 +104,7 @@ impl PyFullStackNode {
 // Exported Python functions
 // ---------------------------------------------------------------------------
 
-fn fullstack_create_node_impl(bi: &PyBridgeInstance, did: String) -> PyResult<PyFullStackNode> {
+fn fullstack_create_node_impl(bi: &PyBridgeInstance, did: String) -> PyFullStackNode {
     with_network(bi, |network| {
         let node = network.create_node(&did, permissive_key_resolver());
         PyFullStackNode {
@@ -114,13 +114,12 @@ fn fullstack_create_node_impl(bi: &PyBridgeInstance, did: String) -> PyResult<Py
     })
 }
 
-fn fullstack_reset_network_impl(bi: &PyBridgeInstance) -> PyResult<()> {
+fn fullstack_reset_network_impl(bi: &PyBridgeInstance) {
     let mut guard = bi
         .network()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *guard = None;
-    Ok(())
 }
 
 fn fullstack_create_context_impl(
@@ -426,7 +425,8 @@ fn fullstack_remove_member_impl(
 impl crate::scp::PyScp {
     /// Creates a full-stack test node with real MLS crypto.
     #[pyo3(name = "fullstack_create_node")]
-    pub fn fullstack_create_node(&self, did: String) -> PyResult<PyFullStackNode> {
+    #[must_use]
+    pub fn fullstack_create_node(&self, did: String) -> PyFullStackNode {
         let bi = &*self.inner;
         fullstack_create_node_impl(bi, did)
     }
@@ -436,9 +436,9 @@ impl crate::scp::PyScp {
     ///
     /// Call between test suites to prevent cross-test state leakage.
     #[pyo3(name = "fullstack_reset_network")]
-    pub fn fullstack_reset_network(&self) -> PyResult<()> {
+    pub fn fullstack_reset_network(&self) {
         let bi = &*self.inner;
-        fullstack_reset_network_impl(bi)
+        fullstack_reset_network_impl(bi);
     }
 
     /// Creates an encrypted context owned by the given node.
