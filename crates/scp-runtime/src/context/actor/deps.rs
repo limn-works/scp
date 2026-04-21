@@ -16,8 +16,50 @@
 //! This is the mechanical contract that makes "actor A cannot send to
 //! actor B directly" a compile-time property. Cross-actor atomicity is
 //! saga-only, enforced through the `start_saga` shape.
+//!
+//! # Commit 12a.5 expansion
+//!
+//! Commit 12a.5 of ADR-049 (pre-work for handler body migration)
+//! extends the bundle with every cross-cutting collaborator the legacy
+//! `ContextManager` handler submodules reach via `self.X`:
+//!
+//! - `clock` — wall-clock source. Legacy: `ContextManager::clock`.
+//! - `event_tx` — optional fan-out channel for external `ContextEvent`
+//!   subscribers (webhook dispatcher in `scp-node`). Legacy:
+//!   `ContextManager::event_tx`. `Option` because not every embedder
+//!   wires a subscriber; legacy treats `None` as "drop silently."
+//! - `key_resolver` — DID → Ed25519 verifying-key map used by UCAN /
+//!   governance vote verification. Legacy: `ContextManager::key_resolver`.
+//! - `payment_adapter` — optional economy adapter for the 9-step paid
+//!   action flow (spec §19.2.2). Legacy:
+//!   `ContextManager::payment_adapter`. `Option` because "free context"
+//!   is a valid configuration.
+//!
+//! Fields explicitly **not** added here:
+//!
+//! - `local_dids`, `standing_contexts` — supervisor-scoped state already
+//!   reachable through `SupervisorHandle::local_dids()` /
+//!   `SupervisorHandle::standing_peer()` per ADR §2.
+//! - `contexts` / `contexts_arc` — cross-actor reads are banned by the
+//!   capability contract (ADR §2: "Never ContextActor → ContextActor
+//!   directly"). Cross-context work goes through
+//!   `SupervisorHandle::start_saga`.
+//! - `task_set` / `next_generation` — supervisor-scoped lifecycle
+//!   state that migrates with the actor run-loop in commit 12b/c.
+//! - `consequence_rules` — per-context state stored in `PerContextState`,
+//!   not a cross-cutting dep.
+//!
+//! The new fields are wired on the supervisor side at actor-spawn time
+//! (shim wiring lives behind the `testing` feature until the legacy
+//! manager is deleted in commit 12). Handler bodies do not yet read the
+//! new fields — 12b+ performs the mechanical migration from
+//! `view.manager().foo` → `deps.foo`.
 
 use std::sync::Arc;
+
+use scp_primitives::Clock;
+use scp_protocol::context::governance::KeyResolver;
+use scp_protocol::context::membership::ContextEvent;
 
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use crate::context::manager::ContextPersistence;
@@ -26,6 +68,7 @@ use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::crypto::hpke_backend::HpkeBackend;
 use crate::crypto::mls::backend::MlsBackend;
 use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
+use crate::economy::adapter::PaymentAdapterDyn;
 
 // ---------------------------------------------------------------------------
 // ActorDeps
@@ -66,6 +109,34 @@ pub struct ActorDeps {
     /// actor's `OpenMlsBackend` is per-actor but reads/writes the same
     /// underlying KV via this adapter).
     pub mls_storage: Arc<dyn OpenMlsStorageAdapter>,
+    /// Wall-clock source. Legacy: `ContextManager::clock`
+    /// (`Arc<dyn scp_primitives::Clock>`, default
+    /// [`scp_primitives::SystemClock`]). Every handler that computes
+    /// pricing windows, velocity tracking, TTL comparisons, UCAN expiry
+    /// checks, or rate-limit buckets reads the clock — concentrating it
+    /// in `ActorDeps` removes the per-handler plumbing required if each
+    /// callsite re-derived it from the supervisor.
+    pub clock: Arc<dyn Clock>,
+    /// Optional fan-out channel for `(context_id, ContextEvent)` pairs
+    /// sent to external subscribers (the webhook dispatcher in
+    /// `scp-node`, SDK event streams). Legacy:
+    /// `ContextManager::event_tx`. `None` in embedders that do not
+    /// subscribe to context events — handlers check `Option::is_some`
+    /// before sending and drop silently otherwise, matching legacy.
+    ///
+    /// Lagging receivers lose events (bounded channel) — delivery is
+    /// best-effort.
+    pub event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+    /// DID → Ed25519 verifying-key resolver used by governance vote
+    /// verification (spec §5.9, ADR-031) and UCAN proof validation.
+    /// Legacy: `ContextManager::key_resolver` (typealias
+    /// `Arc<dyn Fn(&DID) -> Option<VerifyingKey> + Send + Sync>`).
+    pub key_resolver: KeyResolver,
+    /// Optional economy adapter for the 9-step paid action flow
+    /// (spec §19.2.2). Legacy: `ContextManager::payment_adapter`.
+    /// `None` for "free context" configurations — handlers skip the
+    /// escrow path and fall through to budget-only enforcement.
+    pub payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
 }
 
 // Compile-time witness that `ActorDeps` is `Send + Sync` — the bundle

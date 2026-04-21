@@ -2869,6 +2869,74 @@ impl ContextManager {
     }
 
     // -------------------------------------------------------------------
+    // Commit 12a.5 / ADR-049 — transitional accessors feeding
+    // `ActorDeps` construction on the supervisor side. Each returns the
+    // legacy manager's field by cheap clone (every target is `Arc`,
+    // `Option<Arc>`, or a `KeyResolver` typealias that is itself an
+    // `Arc`). Deleted in commit 12 with the legacy manager.
+    //
+    // Gated on the `testing` feature because the only caller is
+    // [`Supervisor::build_actor_deps_from_attached`](crate::context::supervisor::supervisor::Supervisor::build_actor_deps_from_attached),
+    // which is itself feature-gated. CI always builds with `testing`
+    // enabled so these accessors are always compiled and linted by the
+    // ratchet; production builds omit them to keep the manager's
+    // public-ish surface area minimal during the shim window.
+    // -------------------------------------------------------------------
+
+    /// Cheap reference to the manager's shared
+    /// [`ContextTransportProvider`]. Used by the actor-deps builder on
+    /// [`Supervisor`](crate::context::supervisor::supervisor::Supervisor)
+    /// to populate [`ActorDeps::transport`](crate::context::actor::deps::ActorDeps::transport).
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub(crate) fn transport_provider_arc(&self) -> Arc<dyn ContextTransportProvider> {
+        Arc::clone(&self.transport)
+    }
+
+    /// Cheap reference to the manager's `Clock`. Used by the actor-deps
+    /// builder to populate [`ActorDeps::clock`](crate::context::actor::deps::ActorDeps::clock).
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub(crate) fn clock_arc(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.clock)
+    }
+
+    /// Cheap reference to the manager's optional event fan-out channel.
+    /// Used by the actor-deps builder to populate
+    /// [`ActorDeps::event_tx`](crate::context::actor::deps::ActorDeps::event_tx).
+    /// Legacy stores `Sender` (not `Receiver`), which is cheap to clone
+    /// (arc + atomic counter).
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub(crate) fn event_tx_opt(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>> {
+        self.event_tx.clone()
+    }
+
+    /// Cheap clone of the manager's `KeyResolver`. Used by the actor-
+    /// deps builder to populate
+    /// [`ActorDeps::key_resolver`](crate::context::actor::deps::ActorDeps::key_resolver).
+    /// `KeyResolver` is itself an `Arc<dyn Fn(...)>` typealias, so this
+    /// is a reference-count bump.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub(crate) fn key_resolver_clone(&self) -> scp_protocol::context::governance::KeyResolver {
+        Arc::clone(&self.key_resolver)
+    }
+
+    /// Cheap reference to the manager's optional payment adapter. Used
+    /// by the actor-deps builder to populate
+    /// [`ActorDeps::payment_adapter`](crate::context::actor::deps::ActorDeps::payment_adapter).
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub(crate) fn payment_adapter_opt(
+        &self,
+    ) -> Option<Arc<dyn crate::economy::adapter::PaymentAdapterDyn>> {
+        self.payment_adapter.clone()
+    }
+
+    // -------------------------------------------------------------------
     // Commit 9 / ADR-049 — transitional lifecycle / TTL shim accessors.
     // Deleted in commit 12 with the shim itself.
     // -------------------------------------------------------------------

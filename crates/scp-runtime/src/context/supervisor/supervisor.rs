@@ -357,6 +357,94 @@ impl Supervisor {
         self.context_manager_bridge.get()
     }
 
+    /// Build an [`ActorDeps`](crate::context::actor::deps::ActorDeps)
+    /// bundle from the attached legacy [`ContextManager`] (ADR-049 commit
+    /// 12a.5).
+    ///
+    /// Shim-era only. During commits 12a.5 → 12b no `ContextActor` task
+    /// is spawned — handler bodies still delegate through
+    /// [`MutationStateView`] to `ContextManager`. This method exists so
+    /// the test harness can assert every `ActorDeps` field populates
+    /// correctly from the legacy manager plus the caller-supplied
+    /// backends (split per ADR §6: `MlsBackend` + `HpkeBackend` +
+    /// `OpenMlsStorageAdapter`) and supervisor-scoped handles
+    /// (`SupervisorHandle`, this identity's `KeyPackageStoreHandle`).
+    ///
+    /// The split-backend and per-identity handles do not exist on the
+    /// legacy `ContextManager` — they're the post-refactor shape — so
+    /// they arrive as parameters here rather than being sourced from
+    /// the attached manager. In commit 12b's `spawn_actor` migration
+    /// this wiring moves inside the supervisor's own spawn path and
+    /// the caller-provided parameters collapse to supervisor-owned
+    /// fields.
+    ///
+    /// # Persistence
+    ///
+    /// [`ActorDeps::persistence`](crate::context::actor::deps::ActorDeps::persistence)
+    /// is `Arc<dyn ContextPersistence>` (non-`Option`), while legacy
+    /// `ContextManager::persistence` is `Option<Arc<...>>`. The caller
+    /// passes a concrete persistence (test harness typically supplies a
+    /// no-op impl). If the attached manager has a `Some(persistence)`,
+    /// callers should pass that `Arc` through; if `None`, callers pass
+    /// a no-op. This method does not perform the substitution itself
+    /// because constructing a no-op lives outside the runtime crate's
+    /// `context/` module (it varies by test harness).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::NotInitialized`] if no `ContextManager`
+    /// is attached.
+    ///
+    /// # Deleted in commit 12b
+    ///
+    /// This method is a scaffolding point for 12a.5's test; once the
+    /// supervisor owns the spawn path end-to-end, `build_actor_deps`
+    /// replaces this and reads the supervisor's own fields rather than
+    /// the attached manager's.
+    ///
+    /// # Method receiver
+    ///
+    /// Takes `self: &Arc<Self>` so the returned
+    /// [`SupervisorHandle`](crate::context::supervisor::handle::SupervisorHandle)
+    /// wraps a cloned `Arc` of the same supervisor instance — not a
+    /// fresh `Supervisor::for_query_shim()`. Without this the handle
+    /// would point at a dangling second supervisor and
+    /// [`SupervisorHandle::local_dids`] / [`SupervisorHandle::standing_peer`]
+    /// would read empty state.
+    #[cfg(feature = "testing")]
+    pub fn build_actor_deps_from_attached(
+        self: &Arc<Self>,
+        persistence: Arc<dyn ContextPersistence>,
+        mls: Arc<dyn crate::crypto::mls::backend::MlsBackend>,
+        hpke: Arc<dyn crate::crypto::hpke_backend::HpkeBackend>,
+        mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
+        key_package_store: crate::context::supervisor::key_package_actor::KeyPackageStoreHandle,
+    ) -> Result<crate::context::actor::deps::ActorDeps, ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::build_actor_deps_from_attached — no ContextManager attached"
+                    .to_owned(),
+            )
+        })?;
+
+        let handle = crate::context::supervisor::handle::SupervisorHandle::wrap(Arc::clone(self));
+
+        Ok(crate::context::actor::deps::ActorDeps {
+            transport: cm.transport_provider_arc(),
+            persistence,
+            event_log: cm.event_log_provider_arc(),
+            supervisor: handle,
+            key_package_store,
+            mls,
+            hpke,
+            mls_storage,
+            clock: cm.clock_arc(),
+            event_tx: cm.event_tx_opt(),
+            key_resolver: cm.key_resolver_clone(),
+            payment_adapter: cm.payment_adapter_opt(),
+        })
+    }
+
     /// Dispatch a pure-read [`QueriesCommand`] through the migration
     /// shim.
     ///
