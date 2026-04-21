@@ -940,14 +940,11 @@ impl Scp {
         let contacts = HashSet::new();
         let backend = NapiRecoveryBackend;
 
-        let handle = tokio::runtime::Handle::try_current().map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("tokio runtime not available: {e}"),
-                code: codes::IDENT_1027.to_owned(),
-            })
-        })?;
-
-        let result = handle
+        // Drive the async orchestrator on the module-local tokio runtime
+        // (crate::runtime()). The prior `Handle::try_current()` path
+        // failed on the napi-rs worker thread because libuv workers
+        // don't carry a tokio context (round-2 bug-catcher finding).
+        let result = crate::runtime()
             .block_on(orchestrator.execute_recovery(
                 compromise_tier,
                 &key_rotation,
@@ -1054,14 +1051,11 @@ impl Scp {
             CustodyMigrationOrchestrator::new(did_val, migration_target, context_ids);
         let backend = NotConfiguredMigrationBackend;
 
-        let handle = tokio::runtime::Handle::try_current().map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("tokio runtime not available: {e}"),
-                code: codes::IDENT_1028.to_owned(),
-            })
-        })?;
-
-        let result = handle
+        // Drive the async orchestrator on the module-local tokio runtime
+        // (crate::runtime()). Same rationale as identity_execute_recovery:
+        // the napi-rs worker thread has no tokio context (round-2
+        // bug-catcher finding).
+        let result = crate::runtime()
             .block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock))
             .map_err(|e| {
                 NapiError::from(ScpNapiError::Identity {
