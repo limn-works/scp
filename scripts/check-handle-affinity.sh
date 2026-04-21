@@ -109,6 +109,13 @@ HANDLE_SUFFIXES=(
     RelayHandle
     NodeHandle
     DIDDocument
+    # Feature-gated full-stack test nodes are per-instance handles too —
+    # `&bi.core.check_handle(node.instance_id())` must run at every
+    # `fullstack_*_on` entry point or a caller can hand a `NapiFullStackNode`
+    # minted by SCP A into SCP B's testing helpers. The suffix is the
+    # concrete Rust type name because the three bridges use different
+    # prefixes (`PyFullStackNode`, `NapiFullStackNode`, `FullStackNode`).
+    FullStackNode
 )
 
 # Build a regex alternation for the suffixes.
@@ -180,13 +187,20 @@ scan_bridge() {
                 sig = ""
                 sig_start_line = 0
                 brace_depth = 0
-                # body_scan: when > 0, we are inside the first N lines of a
-                # function body and looking for the macro.
-                body_scan_remaining = 0
-                body_fn_name = ""
-                body_fn_line = 0
-                body_param_type = ""
-                body_found_macro = 0
+                # Pending-scan FIFO. `pending_n` is the number of active
+                # body scans; each slot `i` (1..=pending_n) stores:
+                #   pending_fn_name[i]   — function name
+                #   pending_fn_line[i]   — signature start line
+                #   pending_param[i]     — handle-typed param type string
+                #   pending_remaining[i] — lines left in the scan window
+                #   pending_found[i]     — 1 if macro seen, else 0
+                # A FIFO (rather than a single set of globals) is required
+                # so that overlapping scans — e.g. a 1-line function body
+                # whose neighbour starts its own signature before the
+                # window closes — each get their own MISS emission. The
+                # single-global design silently dropped the earlier scan
+                # every time `finalize_sig` was re-entered.
+                pending_n = 0
             }
 
             # Track cfg(test) depth by counting braces after a `mod X {` that
@@ -196,24 +210,48 @@ scan_bridge() {
             {
                 line = $0
 
-                # If we are currently scanning a body for the macro, count
-                # this line toward the window and check for the macro name.
-                if (body_scan_remaining > 0) {
-                    if (index(line, MACRO "!") > 0) {
-                        body_found_macro = 1
-                    }
-                    body_scan_remaining--
-                    if (body_scan_remaining == 0) {
-                        if (body_found_macro == 0) {
-                            printf("MISS\t%s\t%d\t%s\t%s\n",
-                                FILE, body_fn_line, body_fn_name,
-                                body_param_type)
+                # Advance every pending scan by one line. A pending scan
+                # that hits zero without having seen the macro emits a
+                # MISS. We walk in order and compact the array in place so
+                # the remaining entries keep their FIFO ordering — new
+                # pushes always land at `pending_n + 1`.
+                if (pending_n > 0) {
+                    write_idx = 0
+                    for (read_idx = 1; read_idx <= pending_n; read_idx++) {
+                        if (index(line, MACRO "!") > 0) {
+                            pending_found[read_idx] = 1
                         }
-                        body_fn_name = ""
-                        body_fn_line = 0
-                        body_param_type = ""
-                        body_found_macro = 0
+                        pending_remaining[read_idx]--
+                        if (pending_remaining[read_idx] <= 0) {
+                            if (pending_found[read_idx] == 0) {
+                                printf("MISS\t%s\t%d\t%s\t%s\n",
+                                    FILE,
+                                    pending_fn_line[read_idx],
+                                    pending_fn_name[read_idx],
+                                    pending_param[read_idx])
+                            }
+                            # Retire this entry by not copying it forward.
+                        } else {
+                            write_idx++
+                            if (write_idx != read_idx) {
+                                pending_fn_name[write_idx]   = pending_fn_name[read_idx]
+                                pending_fn_line[write_idx]   = pending_fn_line[read_idx]
+                                pending_param[write_idx]     = pending_param[read_idx]
+                                pending_remaining[write_idx] = pending_remaining[read_idx]
+                                pending_found[write_idx]     = pending_found[read_idx]
+                            }
+                        }
                     }
+                    # Clear the tail slots so stale data does not leak if
+                    # pending_n grows later.
+                    for (clear_idx = write_idx + 1; clear_idx <= pending_n; clear_idx++) {
+                        pending_fn_name[clear_idx]   = ""
+                        pending_fn_line[clear_idx]   = 0
+                        pending_param[clear_idx]     = ""
+                        pending_remaining[clear_idx] = 0
+                        pending_found[clear_idx]     = 0
+                    }
+                    pending_n = write_idx
                 }
 
                 # Maintain cfg(test) state.
@@ -375,11 +413,17 @@ scan_bridge() {
                 # macro. Matching just the macro name covers both
                 # `pyscp_check_handle!(...)` and any future variants; we
                 # intentionally accept any call-site form.
-                body_scan_remaining = 8
-                body_fn_name = fname
-                body_fn_line = fline
-                body_param_type = param_type_found
-                body_found_macro = 0
+                #
+                # Push onto the FIFO so multiple overlapping scans can be
+                # in flight at once — a short function body whose sibling
+                # starts its own signature within the window must NOT
+                # silently overwrite the prior scan state (pre-fix bug).
+                pending_n++
+                pending_fn_name[pending_n]   = fname
+                pending_fn_line[pending_n]   = fline
+                pending_param[pending_n]     = param_type_found
+                pending_remaining[pending_n] = 8
+                pending_found[pending_n]     = 0
                 printf("CHK\t%s\t%d\t%s\n", FILE, fline, fname)
             }
 
@@ -407,18 +451,74 @@ scan_bridge() {
             }
 
             END {
-                # Flush any pending body scan.
-                if (body_scan_remaining > 0 && body_fn_name != "") {
-                    if (body_found_macro == 0) {
+                # Flush every pending body scan at EOF. A function whose
+                # window is still open at file end has not emitted a
+                # macro — treat it the same as a window that closed
+                # without finding one.
+                for (flush_idx = 1; flush_idx <= pending_n; flush_idx++) {
+                    if (pending_found[flush_idx] == 0) {
                         printf("MISS\t%s\t%d\t%s\t%s\n",
-                            FILE, body_fn_line, body_fn_name,
-                            body_param_type)
+                            FILE,
+                            pending_fn_line[flush_idx],
+                            pending_fn_name[flush_idx],
+                            pending_param[flush_idx])
                     }
                 }
             }
             ' "$file"
         done
 }
+
+# ---------------------------------------------------------------------------
+# Self-test: guards the scan-state FIFO against the single-global regression.
+# ---------------------------------------------------------------------------
+# The pre-fix version of this gate used a single global
+# (`body_scan_remaining` + `body_fn_name` + `body_found_macro`) for the
+# forward-peek window. Two consecutive handle-accepting functions whose
+# bodies fit inside the 8-line window would race: the second function's
+# `finalize_sig` would overwrite the first function's pending scan state
+# BEFORE the first function's MISS could fire, silently burying the gap.
+#
+# This self-test synthesises exactly that shape — a one-line function
+# body missing the macro, immediately followed by another handle-accepting
+# function — and asserts the queue-based implementation emits MISS for
+# BOTH. Runs before the real scan so a bad edit to the awk script fails
+# the gate loudly instead of silently reporting PASS on a broken scanner.
+# ---------------------------------------------------------------------------
+self_test_gate() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    local fixture_dir="$tmpdir/fixture"
+    mkdir -p "$fixture_dir"
+    local fixture_file="$fixture_dir/fixture.rs"
+    cat > "$fixture_file" <<'RUST'
+// Self-test fixture. Two handle-accepting fns, neither invokes the macro.
+#[pyfunction]
+fn first(h: &PyContextHandle) -> PyResult<()> { Ok(()) }
+#[pyfunction]
+fn second(h: &PyContextHandle) -> PyResult<()> { Ok(()) }
+RUST
+
+    local out
+    out=$(scan_bridge selftest "$fixture_dir" pyfunction pyscp_check_handle 2>/dev/null || true)
+    local miss_count
+    miss_count=$(printf '%s\n' "$out" | grep -c $'^MISS\t' || true)
+    miss_count=${miss_count:-0}
+
+    rm -rf "$tmpdir"
+
+    if [[ "$miss_count" -lt 2 ]]; then
+        printf '%sinternal error:%s self-test of check-handle-affinity.sh\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '  expected 2 MISS lines from the fixture, got %d\n' "$miss_count" >&2
+        printf '  the awk scan-state FIFO is broken; a neighbouring function\n' >&2
+        printf '  is overwriting an earlier pending scan before MISS can fire.\n' >&2
+        printf '  fixture output:\n%s\n' "$out" >&2
+        exit 2
+    fi
+}
+self_test_gate
 
 # ---------------------------------------------------------------------------
 # Drive the scan

@@ -125,15 +125,17 @@ pub(crate) fn fullstack_reset_network_on(bi: &NapiBridgeInstance) {
 
 /// Per-bridge-instance implementation of [`fullstack_create_context`].
 ///
-/// The operation runs entirely on the caller-supplied `NapiFullStackNode`
-/// — `bi` is carried for `_on` helper shape symmetry and will be used when
-/// the test harness moves context registration onto the bridge instance.
+/// Enforces per-instance handle affinity: the supplied `node` must have
+/// been minted by the same [`NapiBridgeInstance`] `bi` (see ADR-048).
+/// A `NapiFullStackNode` from another `SCP` instance would otherwise
+/// silently operate against the wrong bridge's shared `KeyExchange`.
 pub(crate) fn fullstack_create_context_on(
-    _bi: &NapiBridgeInstance,
+    bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,
     context_id: String,
     ceiling_json: String,
 ) -> napi::Result<String> {
+    crate::napi_check_handle!(&bi.core, node);
     let ceiling_obj: serde_json::Value = serde_json::from_str(&ceiling_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid ceiling JSON: {e}"),
@@ -193,11 +195,12 @@ pub(crate) fn fullstack_create_context_on(
 
 /// Per-bridge-instance implementation of [`fullstack_add_member`].
 pub(crate) fn fullstack_add_member_on(
-    _bi: &NapiBridgeInstance,
+    bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,
     context_id: String,
     member_did: String,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, node);
     let rt = crate::runtime();
 
     let handle = {
@@ -224,10 +227,11 @@ pub(crate) fn fullstack_add_member_on(
 
 /// Per-bridge-instance implementation of [`fullstack_join_from_welcome`].
 pub(crate) fn fullstack_join_from_welcome_on(
-    _bi: &NapiBridgeInstance,
+    bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,
     context_id: String,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, node);
     let ctx_bytes = context_id_bytes(&context_id);
     let rt = crate::runtime();
 
@@ -302,11 +306,15 @@ pub(crate) fn fullstack_join_from_welcome_on(
 
 /// Per-bridge-instance implementation of [`fullstack_sync_sender_keys`].
 pub(crate) fn fullstack_sync_sender_keys_on(
-    _bi: &NapiBridgeInstance,
+    bi: &NapiBridgeInstance,
     node_a: &NapiFullStackNode,
     node_b: &NapiFullStackNode,
     context_id: String,
 ) -> napi::Result<()> {
+    // Both nodes must have been minted by this bridge — mixing nodes
+    // from two different `SCP` instances would cross-wire the shared
+    // `KeyExchange` used for sender key distribution.
+    crate::napi_check_handle!(&bi.core, node_a, node_b);
     let ctx_bytes = context_id_bytes(&context_id);
     let did_a = node_a.inner.did.to_string();
     let did_b = node_b.inner.did.to_string();
@@ -352,11 +360,12 @@ pub(crate) fn fullstack_sync_sender_keys_on(
 
 /// Per-bridge-instance implementation of [`fullstack_send_message`].
 pub(crate) fn fullstack_send_message_on(
-    _bi: &NapiBridgeInstance,
+    bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,
     context_id: String,
     payload: Buffer,
 ) -> napi::Result<Buffer> {
+    crate::napi_check_handle!(&bi.core, node);
     let rt = crate::runtime();
 
     let handle = {
@@ -403,12 +412,13 @@ pub(crate) fn fullstack_send_message_on(
 
 /// Per-bridge-instance implementation of [`fullstack_decrypt_message`].
 pub(crate) fn fullstack_decrypt_message_on(
-    _bi: &NapiBridgeInstance,
+    bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,
     context_id: String,
     ciphertext: Buffer,
     sender_did: String,
 ) -> napi::Result<Buffer> {
+    crate::napi_check_handle!(&bi.core, node);
     let ctx_bytes = context_id_bytes(&context_id);
     let plaintext = node
         .inner
@@ -425,11 +435,12 @@ pub(crate) fn fullstack_decrypt_message_on(
 
 /// Per-bridge-instance implementation of [`fullstack_remove_member`].
 pub(crate) fn fullstack_remove_member_on(
-    _bi: &NapiBridgeInstance,
+    bi: &NapiBridgeInstance,
     node: &NapiFullStackNode,
     context_id: String,
     member_did: String,
 ) -> napi::Result<()> {
+    crate::napi_check_handle!(&bi.core, node);
     let rt = crate::runtime();
 
     let handle = {

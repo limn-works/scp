@@ -589,6 +589,58 @@ impl CoreFields {
         self.tasks.lock().await
     }
 
+    /// Emergency, non-blocking task cancellation for use from `Drop`.
+    ///
+    /// Drop must never block or `.await`, so the graceful
+    /// [`shutdown_core_async`] path is unavailable. This helper does the
+    /// minimum safe cleanup:
+    ///
+    /// 1. Fires [`CancellationToken::cancel`] so any task `select!`ing on
+    ///    `cancel_token()` exits cooperatively.
+    /// 2. Attempts `JoinSet::abort_all` via a non-blocking `try_lock`. If
+    ///    the lock is contended (some caller is mid-shutdown holding the
+    ///    `JoinSet`), the abort is skipped — that caller will abort
+    ///    anything outstanding itself, so there is nothing to do here.
+    ///
+    /// This is intentionally a best-effort emergency path. Callers that
+    /// need deterministic, awaited shutdown MUST still call
+    /// [`BridgeInstanceCore::shutdown`] with a timeout; `Drop` only catches
+    /// the case where a caller dropped the bridge without ever awaiting
+    /// `shutdown(timeout)` and would otherwise leak subscriptions, timers,
+    /// and their captured `Arc<BridgeInstance>` references forever.
+    ///
+    /// # Cancellation propagation
+    ///
+    /// Tasks that hold a cloned `Arc<BridgeInstanceCore>` (or a concrete
+    /// `Arc<NapiBridgeInstance>`, etc.) via capture will NOT be freed by
+    /// token cancellation alone — the capture itself is what keeps the
+    /// `Arc` live. They must honour the token by dropping their state
+    /// once cancellation fires. `JoinSet::abort_all` is the hard guarantee:
+    /// it cancels the task at the next `.await` point regardless of
+    /// cooperation, which drops the captured `Arc` and permits the
+    /// instance's final `Drop` to complete. Missing the lock here means
+    /// we fall back to cooperative-only cancellation, which is strictly
+    /// better than doing nothing.
+    ///
+    /// See ADR-048 (multi-instance SCP) for the full lifecycle contract.
+    pub fn emergency_cancel_tasks(&self) {
+        // Step 1: cooperative signal. Cheap, always safe.
+        self.cancel.cancel();
+        // Also cancel the reconnect-generation token so any in-flight
+        // dial drops its half-open socket instead of completing against
+        // a torn-down instance (mirrors the sync `shutdown()` path).
+        if let Ok(guard) = self.reconnect_cancel.lock() {
+            guard.cancel();
+        }
+        // Step 2: hard signal. `try_lock` is non-blocking — if another
+        // caller holds the JoinSet mid-shutdown, skip the abort rather
+        // than risk deadlocking `Drop`. `abort_all` itself is a no-op
+        // when the set is empty or every task has already finished.
+        if let Ok(mut set) = self.tasks.try_lock() {
+            set.abort_all();
+        }
+    }
+
     /// Checks that the supplied handle was issued by this instance.
     ///
     /// Handle types carry [`CoreFields::instance_id`] of the instance they

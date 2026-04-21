@@ -1754,12 +1754,14 @@ impl Scp {
         identity_did: String,
         on_message: napi::threadsafe_function::ThreadsafeFunction<Option<NapiMessage>>,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_subscribe_on(&self.inner, handle, identity_did, on_message).await
     }
 
     /// Per-instance equivalent of the free-function `context_cancel_subscription`.
     #[napi(js_name = "contextCancelSubscription")]
     pub fn context_cancel_subscription(&self, handle: &NapiContextHandle) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_cancel_subscription_on(&self.inner, handle)
     }
 
@@ -3168,6 +3170,7 @@ impl Scp {
         context_id: String,
         ceiling_json: String,
     ) -> napi::Result<String> {
+        crate::napi_check_handle!(&self.inner.core, node);
         crate::testing::fullstack_create_context_on(&self.inner, node, context_id, ceiling_json)
     }
 
@@ -3179,6 +3182,7 @@ impl Scp {
         context_id: String,
         member_did: String,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, node);
         crate::testing::fullstack_add_member_on(&self.inner, node, context_id, member_did)
     }
 
@@ -3189,6 +3193,7 @@ impl Scp {
         node: &NapiFullStackNode,
         context_id: String,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, node);
         crate::testing::fullstack_join_from_welcome_on(&self.inner, node, context_id)
     }
 
@@ -3200,6 +3205,7 @@ impl Scp {
         node_b: &NapiFullStackNode,
         context_id: String,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, node_a, node_b);
         crate::testing::fullstack_sync_sender_keys_on(&self.inner, node_a, node_b, context_id)
     }
 
@@ -3211,6 +3217,7 @@ impl Scp {
         context_id: String,
         payload: Buffer,
     ) -> napi::Result<Buffer> {
+        crate::napi_check_handle!(&self.inner.core, node);
         crate::testing::fullstack_send_message_on(&self.inner, node, context_id, payload)
     }
 
@@ -3223,6 +3230,7 @@ impl Scp {
         ciphertext: Buffer,
         sender_did: String,
     ) -> napi::Result<Buffer> {
+        crate::napi_check_handle!(&self.inner.core, node);
         crate::testing::fullstack_decrypt_message_on(
             &self.inner,
             node,
@@ -3240,6 +3248,7 @@ impl Scp {
         context_id: String,
         member_did: String,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, node);
         crate::testing::fullstack_remove_member_on(&self.inner, node, context_id, member_did)
     }
 

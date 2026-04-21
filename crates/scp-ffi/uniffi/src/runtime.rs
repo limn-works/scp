@@ -834,6 +834,25 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
     }
 }
 
+/// Emergency cancellation for `UniffiBridgeInstance` dropped without a
+/// prior `shutdown(timeout)`.
+///
+/// The graceful path is `BridgeInstanceCore::shutdown(timeout)` — Swift
+/// and Kotlin callers that want deterministic cleanup of subscriptions,
+/// timers, and relay connections must still invoke that. This `Drop` is
+/// the safety net for the case where a caller constructs a `Scp` and
+/// then lets `Arc<UniffiBridgeInstance>` go out of scope without awaiting
+/// `shutdown`. Without this impl, background tasks hold their
+/// `Arc<UniffiBridgeInstance>` captures forever — leaking a
+/// `ContextManager`, relay connection, and attached platform callbacks.
+///
+/// See ADR-048 for the multi-instance lifecycle contract.
+impl Drop for UniffiBridgeInstance {
+    fn drop(&mut self) {
+        self.core.emergency_cancel_tasks();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Phase D (#1695): `DEFAULT_BRIDGE_INSTANCE` + façade helpers deleted
 // ---------------------------------------------------------------------------

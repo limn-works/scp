@@ -451,6 +451,36 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
+        // Reset the full-stack test network slot. Best-effort: on lock
+        // poisoning we leave the slot alone — a poisoned mutex means
+        // another thread panicked while holding it, which is a larger
+        // problem than a stale `FullStackNetwork` reference.
+        #[cfg(feature = "allow_in_memory_custody")]
+        if let Ok(mut net) = self.network.lock() {
+            *net = None;
+        }
+    }
+}
+
+/// Emergency cancellation for `NapiBridgeInstance` dropped without a
+/// prior `shutdown(timeout)`.
+///
+/// The graceful path is `BridgeInstanceCore::shutdown(timeout)` — callers
+/// that want deterministic cleanup of subscriptions, timers, and relay
+/// connections must still invoke that. This `Drop` is the safety net for
+/// the case where a caller constructs a `NapiBridgeInstance` (typically
+/// via `Scp::new` on the JS/TS side), spawns background work (the
+/// `context_subscribe` task in particular captures an
+/// `Arc<NapiBridgeInstance>` for the lifetime of the subscription), and
+/// then drops the SCP without awaiting `shutdown(timeout)`. Without this
+/// impl, those tasks hold their captures forever and leak a
+/// `ContextManager`, relay connection, and attached JS threadsafe
+/// functions.
+///
+/// See ADR-048 for the multi-instance lifecycle contract.
+impl Drop for NapiBridgeInstance {
+    fn drop(&mut self) {
+        self.core.emergency_cancel_tasks();
     }
 }
 

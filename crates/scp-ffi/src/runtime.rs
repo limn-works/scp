@@ -704,6 +704,39 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // connections drop, allowing background tasks to terminate cleanly.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
+        // Reset lifecycle-owned typed slots so their held URLs / networks
+        // do not survive past shutdown. Best-effort: on lock poisoning
+        // we swallow the error and leave the slot alone — a poisoned
+        // lock means another thread panicked while holding it, and the
+        // caller already has bigger problems than a stale `None`
+        // inconsistency.
+        if let Ok(mut slot) = self.connected_relay_url.write() {
+            *slot = None;
+        }
+        #[cfg(feature = "allow_in_memory_custody")]
+        if let Ok(mut net) = self.network.lock() {
+            *net = None;
+        }
+    }
+}
+
+/// Emergency cancellation for `PyBridgeInstance` dropped without a prior
+/// `shutdown(timeout)`.
+///
+/// The graceful path is `BridgeInstanceCore::shutdown(timeout)` — callers
+/// that want deterministic cleanup of subscriptions, timers, and relay
+/// connections must still invoke that. This `Drop` is the safety net for
+/// the case where a caller constructs a `PyBridgeInstance` (typically via
+/// `PyScp`), spawns background work under its `CancellationToken` +
+/// `JoinSet`, and then drops the whole thing without awaiting shutdown.
+/// Without this impl, those tasks hold `Arc<PyBridgeInstance>` captures
+/// and live forever — leaking a `ContextManager`, relay connection, and
+/// any attached Python callbacks.
+///
+/// See ADR-048 for the multi-instance lifecycle contract.
+impl Drop for PyBridgeInstance {
+    fn drop(&mut self) {
+        self.core.emergency_cancel_tasks();
     }
 }
 
