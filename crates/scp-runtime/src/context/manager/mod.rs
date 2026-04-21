@@ -1011,7 +1011,16 @@ pub(crate) struct GovernanceState {
     /// Sender velocity tracker for anti-spam and consequence evaluation (§19.7, #1537).
     pub(crate) velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker,
     /// Per-member participation record cache for proposer eligibility (#1530).
-    participation_cache: HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
+    ///
+    /// Widened to `pub(crate)` in ADR-049 commit 12c.1b so the hoisted
+    /// [`crate::context::messaging_helpers::finalize_send`] free function
+    /// can refresh the cache after a successful send (matches the legacy
+    /// behavior — the legacy method body lived in `manager/messaging.rs`
+    /// which has submodule-descendant visibility into this field; the
+    /// hoisted free function lives outside the `manager` submodule tree
+    /// and requires explicit `pub(crate)` to access it).
+    pub(crate) participation_cache:
+        HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
     /// Cooldown tracking for consequence rules: maps `rule_index` to the Unix
     /// timestamp (seconds) until which the rule should not re-fire. Prevents
     /// repeated consequence dispatch within a rule's evaluation window.
@@ -3004,6 +3013,57 @@ impl ContextManager {
     #[must_use]
     pub(crate) const fn local_dids_ref(&self) -> &RwLock<HashSet<DID>> {
         &self.local_dids
+    }
+
+    /// Cheap reference to the manager's shared
+    /// [`ContextCryptoProvider`]. Used by the hoisted
+    /// `messaging_helpers` messaging transitives
+    /// (`encrypt_and_send`, `decrypt_and_dispatch`) so their free-function
+    /// bodies can reach the provider without cloning the `Arc`
+    /// (ADR-049 commit 12c.1b). Non-feature-gated because the hoisted
+    /// free functions are compiled in every build configuration (unlike
+    /// the `testing`-gated `transport_provider_arc` / `clock_arc`
+    /// accessors which only feed the actor-deps builder).
+    #[must_use]
+    pub(crate) const fn crypto_ref(&self) -> &Arc<dyn ContextCryptoProvider> {
+        &self.crypto
+    }
+
+    /// Cheap reference to the manager's shared
+    /// [`ContextTransportProvider`]. Used by the hoisted
+    /// `messaging_helpers::encrypt_and_send` free function so it can
+    /// fan-out send envelopes across routing IDs without cloning the
+    /// `Arc` (ADR-049 commit 12c.1b). See [`Self::crypto_ref`] for the
+    /// non-feature-gated rationale.
+    #[must_use]
+    pub(crate) const fn transport_ref(&self) -> &Arc<dyn ContextTransportProvider> {
+        &self.transport
+    }
+
+    /// Cheap reference to the manager's shared
+    /// [`ContextEventLogProvider`]. Used by the hoisted
+    /// `messaging_helpers::finalize_send` /
+    /// `validate_and_drain_timeouts` / `buffer_ahead_message` /
+    /// `deliver_message_and_drain_buffered` free functions so they can
+    /// append durable log entries and read the Merkle root without
+    /// cloning the `Arc` (ADR-049 commit 12c.1b). See
+    /// [`Self::crypto_ref`] for the non-feature-gated rationale.
+    #[must_use]
+    pub(crate) const fn event_log_ref(&self) -> &Arc<dyn ContextEventLogProvider> {
+        &self.event_log
+    }
+
+    /// Cheap reference to the manager's optional event fan-out
+    /// [`broadcast::Sender`]. Returns `Option<&Sender>` so the hoisted
+    /// `messaging_helpers` free functions can thread it into
+    /// [`PerContextState::emit_event`] without cloning the `Sender` per
+    /// call (ADR-049 commit 12c.1b). Non-feature-gated — the hoisted
+    /// free functions are compiled in every build configuration.
+    #[must_use]
+    pub(crate) const fn event_tx_ref(
+        &self,
+    ) -> Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>> {
+        self.event_tx.as_ref()
     }
 
     /// Cheap reference to the manager's optional event fan-out channel.

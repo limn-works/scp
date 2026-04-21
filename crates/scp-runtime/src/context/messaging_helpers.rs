@@ -1047,3 +1047,944 @@ pub async fn deliver_incoming(
         }
     }
 }
+
+// ===========================================================================
+// 12c.1b hoist — 8 messaging transitives previously on ContextManager.
+// ===========================================================================
+//
+// The free-function forms below mirror the legacy inherent-method bodies
+// byte-for-byte; only the `self.X` projections change to `mgr.X_ref()`
+// accessor calls or `mgr.X()` pub(crate) methods. The legacy methods
+// on `ContextManager` in `manager/messaging.rs` are now one-line
+// forwarders so existing callers (tests, hoisted top-level methods,
+// manager/tests integration) continue to compile unchanged.
+//
+// The pipeline-wiring tests (`crates/scp-testing/tests/integration/
+// pipeline_wiring.rs`) extract function bodies by first occurrence of
+// `fn <name>(` in `MANAGER_SRC`. `MANAGER_SRC` concatenates
+// `messaging_helpers.rs` BEFORE `manager/messaging.rs`, so the hoisted
+// free-function bodies here win the brace-match lookup and the literal
+// call-text assertions (`.send_message(`, `tv.validate`,
+// `create_checkpoint_if_due`, etc.) are preserved.
+
+// ---------------------------------------------------------------------------
+// 9. encrypt_and_send (hoisted in commit 12c.1b)
+// ---------------------------------------------------------------------------
+
+/// Encrypts the payload and sends it via transport (Phase 2 of
+/// [`send_message`]).
+///
+/// For pseudonym routing (§9.10.4), `routing_ids` may contain multiple
+/// targets: each member's pseudonym plus the shared context routing ID
+/// as a fallback. The encrypted blob is computed once and sent to each
+/// routing ID.
+///
+/// # Collaborators
+///
+/// - `mgr` — read access to `clock_ref()`, `crypto_ref()`,
+///   `transport_ref()`. The clock stamps the inner envelope timestamp
+///   (inside [`build_encrypted_envelope`]), the crypto provider seals
+///   the envelope, and the transport provider performs fan-out sends.
+///
+/// # Behavior preservation
+///
+/// Byte-identical to the legacy
+/// [`ContextManager::encrypt_and_send`](crate::context::manager::ContextManager::encrypt_and_send)
+/// method form. The `self.transport.send_message(rid, &encrypted)`
+/// call becomes `mgr.transport_ref().send_message(rid, &encrypted)` —
+/// the literal `.send_message(` call-text is preserved so pipeline
+/// wiring assertions continue to match.
+#[allow(clippy::too_many_arguments)] // Retains legacy method signature plus explicit `mgr` param per ADR-049 §12c.1b.
+pub fn encrypt_and_send(
+    mgr: &ContextManager,
+    broadcast_envelope: Option<BroadcastEnvelope>,
+    signing_key: Option<&ed25519_dalek::SigningKey>,
+    context_id: &str,
+    sender_did: &DID,
+    payload: &[u8],
+    recipients_data: &std::collections::HashMap<String, AccessKey>,
+    sequence: u64,
+    source_provenance: Option<&SourceContextInfo>,
+    routing_ids: &[[u8; 32]],
+) -> Result<(), ContextError> {
+    let encrypted = if let Some(envelope) = broadcast_envelope {
+        rmp_serde::to_vec_named(&envelope)
+            .map_err(|e| ContextError::CryptoFailed(format!("envelope serialization: {e}")))?
+    } else {
+        let encrypt_start = std::time::Instant::now();
+        let sk = signing_key.ok_or_else(|| {
+            ContextError::CryptoFailed("signing key required for encrypted send".into())
+        })?;
+        let result = build_encrypted_envelope(
+            mgr.clock_ref(),
+            mgr.crypto_ref(),
+            context_id,
+            sender_did,
+            payload,
+            sk,
+            recipients_data,
+            sequence,
+            source_provenance,
+        )?;
+        crate::metrics::record_encrypt_duration(encrypt_start.elapsed());
+        result
+    };
+    // §9.10.4: fan-out — seal once, send to all routing IDs.
+    // Best-effort: only fail if ALL sends fail. A partial fan-out
+    // (some routing IDs succeed, others fail) is acceptable — at least
+    // some members will receive the message. Record a metric per
+    // successful send to avoid undercounting (Bug 6).
+    let mut last_err = None;
+    let mut any_success = false;
+    for rid in routing_ids {
+        match mgr.transport_ref().send_message(rid, &encrypted) {
+            Ok(()) => {
+                any_success = true;
+                crate::metrics::record_message_sent();
+            }
+            Err(e) => {
+                tracing::warn!(routing_id = ?rid, error = %e, "fan-out send failed");
+                last_err = Some(e);
+            }
+        }
+    }
+    if !any_success {
+        return Err(last_err
+            .unwrap_or_else(|| ContextError::TransportFailed("all fan-out sends failed".into())));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 10. authorize_send_payment (hoisted in commit 12c.1b)
+// ---------------------------------------------------------------------------
+
+/// Authorizes escrow for send payment (Phase 1.5 of [`send_message`]).
+///
+/// On failure, the caller is responsible for draining the `EconomyTicket`
+/// via `rollback_economy_ticket`. This helper MUST NOT roll back any
+/// economic state itself — doing so from here would double-refund the
+/// budget when the caller subsequently drains the ticket (F4).
+/// Returns the authorization token (if payment is required) for later
+/// capture or void.
+///
+/// # Collaborators
+///
+/// - `mgr` — delegates to
+///   [`ContextManager::authorize_paid_action`](crate::context::manager::ContextManager::authorize_paid_action)
+///   (pub(crate)), which owns the economy-policy lookup and escrow
+///   reservation.
+///
+/// # Behavior preservation
+///
+/// Byte-identical to the legacy method form.
+pub async fn authorize_send_payment(
+    mgr: &ContextManager,
+    context_id: &str,
+    sender_did: &DID,
+) -> Result<Option<manager::economy::PaidActionAuthorization>, ContextError> {
+    mgr.authorize_paid_action(
+        scp_protocol::economy::types::PaidActionType::MessageSend,
+        sender_did,
+        context_id,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// 11. capture_send_payment (hoisted in commit 12c.1b)
+// ---------------------------------------------------------------------------
+
+/// Captures the escrow hold after a successful send (Phase 3 of
+/// [`send_message`]).
+///
+/// Best-effort: if capture fails, logs a warning but does NOT roll back
+/// the budget and does NOT fail the send. The message was already
+/// delivered — the service was rendered, so the budget deduction stands.
+/// Rolling back on capture failure would let senders consume the service
+/// for free whenever the payment adapter is flaky (H8).
+///
+/// On failure a `PaymentCaptureFailed` entry is appended to the event log
+/// and pushed to the receive buffer to provide a durable audit trail (H19).
+///
+/// # Collaborators
+///
+/// - `mgr` — delegates to
+///   [`ContextManager::complete_paid_action`](crate::context::manager::ContextManager::complete_paid_action)
+///   and
+///   [`ContextManager::record_payment_capture_failure`](crate::context::manager::ContextManager::record_payment_capture_failure)
+///   (both pub(crate)).
+///
+/// # Behavior preservation
+///
+/// Byte-identical to the legacy method form.
+pub async fn capture_send_payment(
+    mgr: &ContextManager,
+    auth: Option<manager::economy::PaidActionAuthorization>,
+    sender_did: &DID,
+    context_id: &str,
+    deducted_cost: Option<scp_protocol::economy::types::Amount>,
+) {
+    if let Some(a) = auth
+        && let Err(e) = mgr.complete_paid_action(a, sender_did, context_id).await
+    {
+        // H8: do NOT rollback budget — service was delivered.
+        tracing::warn!(
+            context_id,
+            "payment capture failed after successful send: {e}"
+        );
+        // H19: append durable audit record to event log + receive buffer.
+        mgr.record_payment_capture_failure(
+            context_id,
+            "send_message",
+            sender_did,
+            &e.to_string(),
+            deducted_cost,
+        )
+        .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 12. finalize_send (hoisted in commit 12c.1b)
+// ---------------------------------------------------------------------------
+
+/// Pushes a `MessageSent` event, appends to the event log, and persists.
+///
+/// Extracted from the [`send_message`] orchestration so the outer
+/// function stays within the clippy `too_many_lines` limit.
+///
+/// # Collaborators
+///
+/// - `mgr` — reaches `event_log_ref()` (append + Merkle root),
+///   `clock_ref()` (`now_secs` for consequence evaluation),
+///   `event_tx_ref()` (external fan-out channel), and the pub(crate)
+///   methods `relock_context`, `has_persistence`,
+///   `persist_context_snapshot`, and `create_checkpoint_if_due`.
+///   `ContextManager::snapshot_context` is called as an associated fn
+///   (the legacy `Self::snapshot_context(ctx)` site).
+///
+/// # Behavior preservation
+///
+/// Byte-identical to the legacy method form. Pipeline-wiring assertion
+/// `extract_fn_body(MANAGER_SRC, "finalize_send")` must contain
+/// `create_checkpoint_if_due` — the call site here preserves that
+/// literal text (`mgr.create_checkpoint_if_due(...)`).
+#[allow(clippy::too_many_arguments)] // Retains legacy method signature plus explicit `mgr` param per ADR-049 §12c.1b.
+#[allow(clippy::significant_drop_tightening)] // Legacy body held `relock_context` guard across await points deliberately — narrowing changes lock-ordering semantics.
+pub async fn finalize_send(
+    mgr: &ContextManager,
+    context_id: &str,
+    context_id_bytes: &[u8; 32],
+    sender_did: &DID,
+    sequence: u64,
+    payload: &[u8],
+    signing_key: Option<&ed25519_dalek::SigningKey>,
+    ctx_gen: &manager::ContextGeneration,
+) -> Result<(), ContextError> {
+    // M12: Append event log BEFORE consequence evaluation so that
+    // event_log_entries_for_consequences sees the current event.
+    // Periodic consequence timers only read from the event log (not
+    // the receive buffer), so the event must be persisted first.
+    mgr.event_log_ref().append_context_event(
+        context_id_bytes,
+        "MessageSent",
+        sender_did.as_ref(),
+    )?;
+    // Phase 3 reacquire with generation check — detects if the context
+    // was removed and recreated between Phase 1 and Phase 3.
+    {
+        let now = mgr.clock_ref().now_secs();
+        if let Ok(mut guard) = mgr.relock_context(ctx_gen).await {
+            let ctx = &mut *guard;
+            if manager::require_active(&ctx.handle).is_err() {
+                // Context expired during Phase 2 — rollback the sequence
+                // number to prevent a permanent gap (Fix 6).
+                ctx.membership.rollback_sequence_number(sender_did);
+                return Ok(());
+            }
+            let sent_event = ContextEvent::MessageSent {
+                sender_did: sender_did.clone(),
+                sequence_number: sequence,
+                payload: payload.to_vec(),
+            };
+            ctx.emit_event(sent_event, context_id, mgr.event_tx_ref());
+
+            // Velocity already recorded in send_message Phase 1 (M4: before
+            // economy enforcement). No duplicate record_message here.
+
+            // Consequence enforcement (#1531) — evaluate rules, then dispatch.
+            // evaluate_consequence_rules is called here so the pipeline wiring
+            // gate can detect it in messaging.rs (not hidden inside dispatch_consequences).
+            //
+            // The same event snapshot is reused for both consequence evaluation
+            // and participation record computation (finding #46 dedup).
+            let send_events = manager::governance::event_log_entries_for_consequences(
+                ctx,
+                context_id,
+                now,
+                &**mgr.event_log_ref(),
+            );
+            let consequence_rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
+            // evaluate_consequence_rules is called as an expression_statement
+            // (not a let_declaration) so the NO-DISCARD-MSG gate passes.
+            let send_triggered = evaluate_consequence_rules(
+                &consequence_rules,
+                &send_events,
+                sender_did.as_ref(),
+                now,
+            );
+            manager::governance::enforce_triggered_consequences(
+                ctx,
+                &manager::governance::EnforceConsequencesCtx {
+                    context_id,
+                    member_did: sender_did,
+                    now,
+                    triggered: &send_triggered,
+                    rules: &consequence_rules,
+                    clock: &**mgr.clock_ref(),
+                    event_log: &**mgr.event_log_ref(),
+                    event_tx: mgr.event_tx_ref(),
+                },
+            );
+
+            // Participation record update (#1530) — refresh cache after send.
+            // Reuses `send_events` from above to avoid a second
+            // event_log_entries_for_consequences call.
+            let send_merkle = mgr
+                .event_log_ref()
+                .event_log_merkle_root(context_id_bytes)
+                .unwrap_or([0u8; 32]);
+            if !send_events.is_empty()
+                && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
+                    &send_events,
+                    sender_did.as_ref(),
+                    context_id,
+                    send_merkle,
+                    now,
+                )
+                && record.participation_count > 0
+            {
+                ctx.governance
+                    .participation_cache
+                    .insert(sender_did.to_string(), record);
+            }
+
+            // Checkpoint tracking (§9.9.3): increment event counter and
+            // create a checkpoint if the event or time threshold is met.
+            ctx.checkpoint_events_since += 1;
+            if let Some(sk) = signing_key {
+                mgr.create_checkpoint_if_due(context_id, ctx, sender_did, sk);
+            }
+        } else {
+            tracing::warn!(
+                context_id,
+                "finalize_send: generation mismatch or context removed — \
+                 consequence evaluation skipped"
+            );
+        }
+    }
+    if mgr.has_persistence()
+        && let Ok(guard) = mgr.relock_context(ctx_gen).await
+    {
+        let ctx = &*guard;
+        let snapshot = ContextManager::snapshot_context(ctx);
+        mgr.persist_context_snapshot(context_id, snapshot);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 13. decrypt_and_dispatch (hoisted in commit 12c.1b)
+// ---------------------------------------------------------------------------
+
+/// Decrypts an incoming envelope and dispatches management/control
+/// messages.
+///
+/// Returns `Some(OpenedEnvelope)` for application messages that need
+/// further processing, or `None` for control/management messages that
+/// are handled internally.
+///
+/// # Collaborators
+///
+/// - `mgr` — reaches `crypto_ref()` for the open + sender-key processing
+///   calls. No other state access.
+///
+/// # Behavior preservation
+///
+/// Byte-identical to the legacy method form. Pipeline-wiring assertion
+/// `fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", ".open(")`
+/// is satisfied because `mgr.crypto_ref().open(...)` preserves the
+/// literal `.open(` text.
+pub fn decrypt_and_dispatch(
+    mgr: &ContextManager,
+    context_id: &str,
+    context_id_bytes: &[u8; 32],
+    encrypted_blob: &[u8],
+) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
+    let decrypt_start = std::time::Instant::now();
+    let open_result = mgr.crypto_ref().open(context_id_bytes, encrypted_blob)?;
+    crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
+
+    match open_result {
+        scp_protocol::context::builder::OpenResult::Application(env) => Ok(Some(*env)),
+        scp_protocol::context::builder::OpenResult::Control => Ok(None),
+        scp_protocol::context::builder::OpenResult::Management {
+            sender_did,
+            payload,
+        } => {
+            tracing::debug!(sender_did = %sender_did, context_id = %context_id, "received MLS-wrapped management message");
+            mgr.crypto_ref().process_incoming_sender_key(
+                context_id_bytes,
+                &sender_did,
+                &payload,
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 14. validate_and_drain_timeouts (hoisted in commit 12c.1b)
+// ---------------------------------------------------------------------------
+
+/// Validates timestamp and sequence, then drains timed-out gaps.
+///
+/// Returns the `SequenceCheck` result for the caller to decide whether
+/// to deliver immediately or buffer.
+///
+/// # Collaborators
+///
+/// - `mgr` — reaches `get_context_arc_pub()` (contextsmap lookup),
+///   `event_tx_ref()` (external fan-out), `clock_ref()` (no-op here
+///   but fed to `run_buffered_post_delivery`), and `event_log_ref()`
+///   (also fed to `run_buffered_post_delivery`).
+///
+/// # Behavior preservation
+///
+/// Byte-identical to the legacy method form. Pipeline-wiring assertion
+/// `fn_body_contains(MANAGER_SRC, "validate_and_drain_timeouts",
+/// "tv.validate")` is preserved by the literal `tv.validate(...)` call
+/// below.
+#[allow(clippy::significant_drop_tightening)] // Legacy body held per-context guard across await points deliberately — narrowing changes lock-ordering semantics.
+pub async fn validate_and_drain_timeouts(
+    mgr: &ContextManager,
+    context_id: &str,
+    inner: &scp_protocol::envelope::inner::InnerEnvelope,
+    now_ms: u64,
+) -> Result<SequenceCheck, ContextError> {
+    let ctx_arc = mgr
+        .get_context_arc_pub(context_id)
+        .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+    let mut guard = ctx_arc.lock().await;
+    let ctx = &mut *guard;
+
+    // Timestamp validation first — reject timestamps out of bounds.
+    let tv = scp_protocol::envelope::validation::TimestampValidator::default();
+    tv.validate(inner, now_ms)
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+    // Sequence check: replay detection + gap detection (§9.8.5).
+    let check = ctx
+        .sequence_tracker
+        .validate(inner)
+        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
+
+    // Also drain any timed-out gaps on each delivery call.
+    let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+    let timed_out = ctx
+        .reorder_buffer
+        .drain_timed_out(now_ms, &ctx.sequence_tracker);
+    for (gap_info, messages) in timed_out {
+        let gap_event = ContextEvent::SequenceGapDetected {
+            sender_did: DID(gap_info.sender_did.clone()),
+            expected_sequence: gap_info.expected_sequence,
+            first_delivered_sequence: gap_info.first_buffered_sequence,
+            reason: format!("{:?}", gap_info.reason),
+        };
+        ctx.emit_event(gap_event, context_id, mgr.event_tx_ref());
+        for msg in &messages {
+            // Re-check membership and capability — sender may have been
+            // removed or had capability revoked while the message was
+            // buffered waiting for the gap to fill.
+            if !ctx.membership.contains(&msg.sender_did)
+                || !ctx
+                    .role_state
+                    .member_has_capability(&msg.sender_did, &Capability::MessagesWrite)
+            {
+                continue;
+            }
+            ctx.sequence_tracker.advance(
+                &msg.inner.context_id,
+                &msg.sender_did,
+                msg.inner.sequence,
+                msg.inner.timestamp,
+            );
+            if let Some(event_name) = deliver_plaintext_or_announcement(
+                ctx,
+                &msg.sender_did,
+                &msg.plaintext,
+                context_id,
+                mgr.event_tx_ref(),
+            ) {
+                // Bug fix (#1534): buffered messages now receive the same
+                // post-delivery governance treatment as directly delivered
+                // messages — velocity, event log, consequence evaluation.
+                run_buffered_post_delivery(
+                    ctx,
+                    context_id,
+                    &context_id_bytes,
+                    &msg.sender_did,
+                    event_name,
+                    &**mgr.clock_ref(),
+                    &**mgr.event_log_ref(),
+                    mgr.event_tx_ref(),
+                );
+            }
+        }
+    }
+
+    Ok(check)
+}
+
+// ---------------------------------------------------------------------------
+// 15. buffer_ahead_message (hoisted in commit 12c.1b)
+// ---------------------------------------------------------------------------
+
+/// Buffers an out-of-order message that arrived ahead of expected
+/// sequence.
+///
+/// If the buffer overflows, force-closes the oldest gap and delivers
+/// all its messages.
+///
+/// # Collaborators
+///
+/// - `mgr` — reaches `get_context_arc_pub()`, `event_tx_ref()`,
+///   `clock_ref()`, `event_log_ref()` for the overflow force-delivery
+///   path.
+///
+/// # Behavior preservation
+///
+/// Byte-identical to the legacy method form.
+#[allow(clippy::significant_drop_tightening)] // Legacy body held per-context guard across await points deliberately — narrowing changes lock-ordering semantics.
+pub async fn buffer_ahead_message(
+    mgr: &ContextManager,
+    context_id: &str,
+    inner: &scp_protocol::envelope::inner::InnerEnvelope,
+    sender_did: &str,
+    plaintext: &[u8],
+    now_ms: u64,
+) -> Result<(), ContextError> {
+    let buffered_msg = scp_protocol::envelope::validation::BufferedMessage {
+        inner: inner.clone(),
+        sender_did: sender_did.to_owned(),
+        plaintext: plaintext.to_vec(),
+        received_at: now_ms,
+    };
+
+    let ctx_arc = mgr
+        .get_context_arc_pub(context_id)
+        .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+    let mut guard = ctx_arc.lock().await;
+    let ctx = &mut *guard;
+
+    if let Some((mut gap_info, messages)) = ctx.reorder_buffer.buffer(buffered_msg) {
+        let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+        let expected = ctx
+            .sequence_tracker
+            .expected_sequence(context_id, sender_did)
+            .unwrap_or(1);
+        gap_info.expected_sequence = expected;
+
+        let gap_event = ContextEvent::SequenceGapDetected {
+            sender_did: DID(gap_info.sender_did.clone()),
+            expected_sequence: gap_info.expected_sequence,
+            first_delivered_sequence: gap_info.first_buffered_sequence,
+            reason: format!("{:?}", gap_info.reason),
+        };
+        ctx.emit_event(gap_event, context_id, mgr.event_tx_ref());
+
+        for msg in &messages {
+            // Re-check membership and capability — sender may have been
+            // removed or had capability revoked while the message was
+            // buffered (buffer overflow force-delivery).
+            if !ctx.membership.contains(&msg.sender_did)
+                || !ctx
+                    .role_state
+                    .member_has_capability(&msg.sender_did, &Capability::MessagesWrite)
+            {
+                continue;
+            }
+            ctx.sequence_tracker.advance(
+                &msg.inner.context_id,
+                &msg.sender_did,
+                msg.inner.sequence,
+                msg.inner.timestamp,
+            );
+            if let Some(event_name) = deliver_plaintext_or_announcement(
+                ctx,
+                &msg.sender_did,
+                &msg.plaintext,
+                context_id,
+                mgr.event_tx_ref(),
+            ) {
+                // Bug fix (#1534): overflow-forced delivery now runs
+                // consequence evaluation, matching the direct path.
+                run_buffered_post_delivery(
+                    ctx,
+                    context_id,
+                    &context_id_bytes,
+                    &msg.sender_did,
+                    event_name,
+                    &**mgr.clock_ref(),
+                    &**mgr.event_log_ref(),
+                    mgr.event_tx_ref(),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 16. deliver_message_and_drain_buffered (hoisted in commit 12c.1b)
+// ---------------------------------------------------------------------------
+
+/// Delivers a message that is in sequence order, advances the tracker,
+/// checks membership and capability, pushes the event, and then drains
+/// any consecutive buffered messages that are now unblocked.
+///
+/// `skip_velocity` is `true` when the sender is a locally-controlled DID
+/// (i.e. the same node that sent the message). In that case velocity is
+/// already recorded on the send path and must not be counted again here,
+/// otherwise a single message would be double-counted on single-node
+/// setups.
+///
+/// # Collaborators
+///
+/// - `mgr` — reaches `get_context_arc_pub()`, `event_tx_ref()`,
+///   `event_log_ref()`, `clock_ref()`.
+///
+/// # Behavior preservation
+///
+/// Byte-identical to the legacy method form.
+#[allow(clippy::too_many_lines)] // Matches legacy method shape exactly; splitting further would fragment the shared lock scope.
+#[allow(clippy::significant_drop_tightening)] // Legacy body held per-context guard across await points deliberately — narrowing changes lock-ordering semantics.
+pub async fn deliver_message_and_drain_buffered(
+    mgr: &ContextManager,
+    context_id: &str,
+    context_id_bytes: &[u8; 32],
+    sender_did: &str,
+    inner: &scp_protocol::envelope::inner::InnerEnvelope,
+    plaintext: &[u8],
+    skip_velocity: bool,
+) -> Result<bool, ContextError> {
+    let sender_did_obj = DID(sender_did.to_owned());
+
+    let ctx_arc = mgr
+        .get_context_arc_pub(context_id)
+        .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+    let mut guard = ctx_arc.lock().await;
+    let ctx = &mut *guard;
+    manager::require_active(&ctx.handle)?;
+
+    // Membership + capability check.
+    if !ctx.membership.contains(sender_did) {
+        return Err(ContextError::MemberNotFound(format!(
+            "sender {sender_did} is not a member of this context"
+        )));
+    }
+    // Suspension-aware capability check handles both role-based and
+    // suspension-based denial via the single source of truth at
+    // `member_has_capability` (folds `suspended_capabilities` first).
+    if !ctx
+        .role_state
+        .member_has_capability(sender_did, &Capability::MessagesWrite)
+    {
+        let is_suspended = ctx
+            .role_state
+            .suspended_capabilities
+            .get(sender_did)
+            .is_some_and(|s| s.contains(&Capability::MessagesWrite));
+        let msg = if is_suspended {
+            format!("member {sender_did} write access has been revoked")
+        } else {
+            format!("member {sender_did} does not have messages:write capability")
+        };
+        return Err(ContextError::PermissionDenied(msg));
+    }
+
+    // §9.10.4: check if this is a pseudonym announcement before treating
+    // as a regular message. Announcements are internal protocol messages
+    // that update the pseudonym registry — they are NOT forwarded to the
+    // application receive buffer as regular MessageReceived events.
+    //
+    // KNOWN LIMITATION (§9.10.4 vs §9.10.4.A): Spec says receivers should verify
+    // the pseudonym-to-DID mapping, but the privacy model (pseudonym_secret from
+    // private key) makes independent verification impossible. We trust MLS-
+    // authenticated senders to honestly announce their pseudonyms. A malicious
+    // member can only misdirect their own message copies.
+    if let Ok(announcement) = rmp_serde::from_slice::<PseudonymAnnouncement>(plaintext)
+        && announcement.tag == PSEUDONYM_ANNOUNCEMENT_TAG
+    {
+        // Bug fix: verify announcement.member_did matches the MLS-authenticated
+        // sender_did. Without this check, any member could forge a pseudonym
+        // announcement for another member, redirecting their messages.
+        if announcement.member_did != sender_did {
+            tracing::warn!(
+                context_id,
+                sender_did,
+                claimed_did = %announcement.member_did,
+                "pseudonym announcement sender mismatch — rejecting forged announcement"
+            );
+            return Err(ContextError::PermissionDenied(format!(
+                "pseudonym announcement member_did ({}) does not match sender ({sender_did})",
+                announcement.member_did
+            )));
+        }
+        let announced_did = DID(announcement.member_did.clone());
+        ctx.pseudonym_registry
+            .insert(announced_did.clone(), announcement.pseudonym);
+        let announce_event = ContextEvent::PseudonymAnnounced {
+            member_did: announced_did,
+            pseudonym: announcement.pseudonym,
+        };
+        ctx.emit_event(announce_event, context_id, mgr.event_tx_ref());
+        // Advance sequence tracker for the announcement message.
+        ctx.sequence_tracker
+            .advance(context_id, sender_did, inner.sequence, inner.timestamp);
+        // Skip the normal message delivery path — announcements are
+        // consumed by the protocol, not forwarded to the application.
+        // Still drain buffered messages that may now be unblocked.
+        let next_expected = inner.sequence.saturating_add(1);
+        let consecutive =
+            ctx.reorder_buffer
+                .drain_consecutive(context_id, sender_did, next_expected);
+        for msg in &consecutive {
+            if !ctx.membership.contains(&msg.sender_did)
+                || !ctx
+                    .role_state
+                    .member_has_capability(&msg.sender_did, &Capability::MessagesWrite)
+            {
+                continue;
+            }
+            ctx.sequence_tracker.advance(
+                &msg.inner.context_id,
+                &msg.sender_did,
+                msg.inner.sequence,
+                msg.inner.timestamp,
+            );
+            if let Some(event_name) = deliver_plaintext_or_announcement(
+                ctx,
+                &msg.sender_did,
+                &msg.plaintext,
+                context_id,
+                mgr.event_tx_ref(),
+            ) {
+                // Bug fix (#1534): drain_consecutive within announcement
+                // path now runs consequence evaluation per message.
+                run_buffered_post_delivery(
+                    ctx,
+                    context_id,
+                    context_id_bytes,
+                    &msg.sender_did,
+                    event_name,
+                    &**mgr.clock_ref(),
+                    &**mgr.event_log_ref(),
+                    mgr.event_tx_ref(),
+                );
+            }
+        }
+
+        // Velocity, consequence, event log — same as normal messages.
+        // Bug fix (#1534): consequence evaluation was previously missing from
+        // the announcement path, allowing a malicious member to send
+        // announcements at high velocity without triggering rate-limiting
+        // consequences. Now both paths share identical post-delivery logic.
+        let now = mgr.clock_ref().now_secs();
+        if !skip_velocity {
+            ctx.governance
+                .velocity_tracker
+                .record_message(&DID(sender_did.to_owned()), now);
+        }
+        if let Err(e) = mgr.event_log_ref().append_context_event(
+            context_id_bytes,
+            "PseudonymAnnounced",
+            sender_did,
+        ) {
+            tracing::warn!(
+                context_id,
+                sender_did,
+                "failed to append PseudonymAnnounced to event log: {e}"
+            );
+        }
+        let consequence_rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
+        if !consequence_rules.is_empty() {
+            let recv_events = manager::governance::event_log_entries_for_consequences(
+                ctx,
+                context_id,
+                now,
+                &**mgr.event_log_ref(),
+            );
+            let recv_triggered =
+                evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
+            let recv_member_did = DID(sender_did.to_owned());
+            manager::governance::enforce_triggered_consequences(
+                ctx,
+                &manager::governance::EnforceConsequencesCtx {
+                    context_id,
+                    member_did: &recv_member_did,
+                    now,
+                    triggered: &recv_triggered,
+                    rules: &consequence_rules,
+                    clock: &**mgr.clock_ref(),
+                    event_log: &**mgr.event_log_ref(),
+                    event_tx: mgr.event_tx_ref(),
+                },
+            );
+        }
+        ctx.checkpoint_events_since += 1;
+
+        return Ok(true);
+    }
+
+    // Advance sequence tracker and deliver the in-order message.
+    ctx.sequence_tracker
+        .advance(context_id, sender_did, inner.sequence, inner.timestamp);
+    let recv_event = ContextEvent::MessageReceived {
+        sender_did: sender_did_obj,
+        payload: plaintext.to_vec(),
+    };
+    ctx.emit_event(recv_event, context_id, mgr.event_tx_ref());
+
+    // Drain consecutive buffered messages that are now unblocked (§9.8.5).
+    let next_expected = inner.sequence.saturating_add(1);
+    let consecutive = ctx
+        .reorder_buffer
+        .drain_consecutive(context_id, sender_did, next_expected);
+    for msg in &consecutive {
+        // Re-check membership and capability for buffered messages — the
+        // sender may have been removed or had capability revoked while the
+        // message was buffered.
+        if !ctx.membership.contains(&msg.sender_did)
+            || !ctx
+                .role_state
+                .member_has_capability(&msg.sender_did, &Capability::MessagesWrite)
+        {
+            continue;
+        }
+        ctx.sequence_tracker.advance(
+            &msg.inner.context_id,
+            &msg.sender_did,
+            msg.inner.sequence,
+            msg.inner.timestamp,
+        );
+        if let Some(event_name) = deliver_plaintext_or_announcement(
+            ctx,
+            &msg.sender_did,
+            &msg.plaintext,
+            context_id,
+            mgr.event_tx_ref(),
+        ) {
+            // Bug fix (#1534): drain_consecutive within normal message
+            // path now runs consequence evaluation per message.
+            run_buffered_post_delivery(
+                ctx,
+                context_id,
+                context_id_bytes,
+                &msg.sender_did,
+                event_name,
+                &**mgr.clock_ref(),
+                &**mgr.event_log_ref(),
+                mgr.event_tx_ref(),
+            );
+        }
+    }
+
+    // H5: Append the durable event log entry for `MessageReceived` BEFORE
+    // running the receive-side consequence evaluation block below. This
+    // mirrors the M12 fix on the send-side `finalize_send` and preserves
+    // the invariant that rule triggers reading
+    // `event_log_entries_for_consequences` observe the just-delivered
+    // message.
+    //
+    // The receive buffer (Source 2 of `event_log_entries_for_consequences`)
+    // does contain the just-pushed event in fresh conditions, but the
+    // dedup filter at `governance::event_log_entries_for_consequences`
+    // (`estimated_ts <= last_log_ts && last_log_ts > 0`) drops buffer
+    // entries whose estimated timestamp is at or before the latest event
+    // log entry — and the receive buffer is also bounded by both
+    // `DEFAULT_BUFFER_CAPACITY = 1000` and `MAX_BUFFER_EVENT_AGE_SECS =
+    // 3600`. Without the durable append happening first, the just-
+    // received message becomes invisible to the receive-side eval whenever
+    // any of those bounds are crossed.
+    //
+    // The append is performed while the contexts mutex is still held so
+    // that a crash between append and consequence evaluation leaves a
+    // consistent Merkle-anchored record. If the persistence layer fails
+    // we WARN and continue: the receive buffer already holds the message,
+    // and dropping the whole delivery on a log-append failure is too
+    // strict — the receiver has already validated decryption, signature,
+    // membership, capability, and sequence.
+    if let Err(e) =
+        mgr.event_log_ref()
+            .append_context_event(context_id_bytes, "MessageReceived", sender_did)
+    {
+        tracing::warn!(
+            context_id,
+            sender_did,
+            "failed to append MessageReceived to event log on receive path: {e}"
+        );
+    }
+    // H16: Defense-in-depth velocity tracking and consequence evaluation
+    // for the sender on the receive path. This ensures that even if the
+    // sender's node doesn't enforce consequences, the receiver still
+    // evaluates rules against incoming messages.
+    //
+    // Skip velocity recording when `skip_velocity` is true — this happens
+    // when the sender is a locally-controlled DID. On single-node setups
+    // the send path already recorded velocity; counting it again here would
+    // double-count the message and inflate consequence trigger counters.
+    let now = mgr.clock_ref().now_secs();
+    if !skip_velocity {
+        ctx.governance
+            .velocity_tracker
+            .record_message(&DID(sender_did.to_owned()), now);
+    }
+    let consequence_rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
+    if !consequence_rules.is_empty() {
+        let recv_events = manager::governance::event_log_entries_for_consequences(
+            ctx,
+            context_id,
+            now,
+            &**mgr.event_log_ref(),
+        );
+        let recv_triggered =
+            evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
+        let recv_member_did = DID(sender_did.to_owned());
+        manager::governance::enforce_triggered_consequences(
+            ctx,
+            &manager::governance::EnforceConsequencesCtx {
+                context_id,
+                member_did: &recv_member_did,
+                now,
+                triggered: &recv_triggered,
+                rules: &consequence_rules,
+                clock: &**mgr.clock_ref(),
+                event_log: &**mgr.event_log_ref(),
+                event_tx: mgr.event_tx_ref(),
+            },
+        );
+    }
+
+    // Checkpoint tracking (§9.9.3): increment event counter on receive.
+    // Checkpoints are only created on the send path (where a signing key
+    // is available), but the counter must reflect all event log appends
+    // including received messages to maintain accurate thresholds.
+    ctx.checkpoint_events_since += 1;
+
+    crate::metrics::record_message_received();
+
+    Ok(false)
+}
