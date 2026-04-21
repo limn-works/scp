@@ -18,10 +18,12 @@
 #   (b) be grandfathered against the ratchet baseline in
 #       `ratchet/once-lock-count.json`.
 #
-# Case (b) lets the existing `EMPTY_*` fallback registries stay put for the
-# duration of the Phase 4 remainder: each one will be deleted in a subsequent
-# PR and the ratchet count will drop with it. The gate fails if the count
-# goes **up** — i.e. a new module-level static was added.
+# Case (b) previously covered the `EMPTY_*` fallback registries that existed
+# while the default-instance façade was live. Phase 4 PR 4 (#1549) deleted
+# `DEFAULT_BRIDGE_INSTANCE` along with every `EMPTY_*` registry, so the
+# ratchet now floors at zero in every bridge (see
+# `ratchet/once-lock-count.json`). The gate fails if the count goes **up** —
+# i.e. a new module-level static was added.
 #
 # Function-local `static` declarations (e.g. `static COUNTER: AtomicU64` inside
 # a helper fn) are not module-level globals; they are naturally scoped and
