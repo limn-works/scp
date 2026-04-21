@@ -581,12 +581,28 @@ const FFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::tools::DEFAULT_TIMEOUT_MS as
 /// Bridges the MCP server's context/tool queries to the live runtime state
 /// managed by `crates/scp-ffi/src/runtime.rs`.
 struct FfiBridgeProvider {
-    /// The bridge instance whose runtime registry this provider reads.
+    /// Weak reference to the bridge instance whose runtime registry this
+    /// provider reads.
     ///
-    /// Held as `Arc` so the provider owns a strong reference — the MCP
-    /// server task can outlive the [`PyScp`] wrapper that spawned it.
-    /// Added in Phase 4 PR 4 sub-slice D (#1549).
-    bi: std::sync::Arc<crate::runtime::PyBridgeInstance>,
+    /// # Why `Weak` and not `Arc` (#1549 round-2 bug-catcher)
+    ///
+    /// The provider is installed in an [`McpServer`] that lives inside a
+    /// background task spawned on the shared tokio runtime
+    /// (`RUNTIME.spawn(...)`). That task is NOT enrolled in the per-instance
+    /// [`JoinSet`](scp_ffi_common::bridge_instance::CoreFields::task_handle)
+    /// aborted by `emergency_cancel_tasks`, so it survives
+    /// [`crate::runtime::PyBridgeInstance::drop`] unless the caller
+    /// explicitly sends a shutdown via
+    /// [`crate::scp::PyScp::py_mcp_server_stop`].
+    ///
+    /// If this field were `Arc<PyBridgeInstance>`, the server task would
+    /// keep the instance alive forever when the caller forgets to
+    /// `shutdown`. With `Weak`, callers that drop their last strong
+    /// reference release `ContextManager`, identity registry, relay
+    /// connection, and the rest of `BridgeInstance`'s state. Provider
+    /// methods upgrade per call; once `None` is returned, they emit a
+    /// stable error so the MCP server can propagate it to the peer.
+    bi: std::sync::Weak<crate::runtime::PyBridgeInstance>,
     /// The agent's DID.
     agent_did: String,
     /// The context IDs this provider serves.
@@ -614,6 +630,19 @@ struct FfiBridgeProvider {
     agent_proof_tokens: Option<Vec<String>>,
 }
 
+impl FfiBridgeProvider {
+    /// Upgrades the stored [`Weak`] to a live [`Arc<PyBridgeInstance>`].
+    ///
+    /// Returns an error string if the bridge instance has been dropped.
+    /// Callers MUST drop the returned `Arc` before the next `.await` so
+    /// they do not pin the instance alive across suspension points.
+    fn upgrade_bi(&self) -> Result<std::sync::Arc<crate::runtime::PyBridgeInstance>, String> {
+        self.bi.upgrade().ok_or_else(|| {
+            "bridge instance has been dropped — MCP provider cannot service request".to_owned()
+        })
+    }
+}
+
 impl ContextProvider for FfiBridgeProvider {
     fn active_context_ids(&self) -> Vec<String> {
         self.context_ids.clone()
@@ -621,7 +650,10 @@ impl ContextProvider for FfiBridgeProvider {
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
         // Look up the agent's role assignment in the context's role state.
-        crate::runtime::with_context(&self.bi, context_id, |rt| {
+        // Silently returns None if the bridge has been dropped — matches the
+        // "unknown context" fallback semantics of this trait method.
+        let bi = self.upgrade_bi().ok()?;
+        crate::runtime::with_context(&bi, context_id, |rt| {
             let role = rt
                 .role_state
                 .assignments
@@ -638,7 +670,12 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     fn context_tools(&self, context_id: &str) -> Vec<ContextToolInfo> {
-        crate::runtime::with_context(&self.bi, context_id, |rt| {
+        // Returns empty if the bridge has been dropped — matches the
+        // "unknown context" fallback semantics of this trait method.
+        let Ok(bi) = self.upgrade_bi() else {
+            return Vec::new();
+        };
+        crate::runtime::with_context(&bi, context_id, |rt| {
             let tools = rt
                 .tool_registry
                 .registrations()
@@ -656,6 +693,11 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), String> {
+        // Upgrade the bridge instance handle up-front so every check below
+        // sees a stable `&PyBridgeInstance`. If the instance has been
+        // dropped, fail fast with a deterministic error rather than
+        // silently accepting the capability.
+        let bi = self.upgrade_bi()?;
         // Primary check: UCAN token validation via the full 11-step ADR-016
         // pipeline. Verifies the token grants tool_invoke:{tool_name} or
         // tool_invoke:* for this context.
@@ -666,8 +708,8 @@ impl ContextProvider for FfiBridgeProvider {
                 crate::ucan::build_proof_resolver_from_tokens(self.agent_proof_tokens.as_deref())
                     .map_err(|e| format!("failed to build proof resolver: {e}"))?;
 
-            crate::runtime::with_context(&self.bi, context_id, |rt| {
-                let production_resolver = crate::runtime::did_resolver(&self.bi);
+            crate::runtime::with_context(&bi, context_id, |rt| {
+                let production_resolver = crate::runtime::did_resolver(&bi);
                 let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
                     production_resolver.map(std::convert::AsRef::as_ref),
                 );
@@ -720,7 +762,7 @@ impl ContextProvider for FfiBridgeProvider {
 
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        crate::runtime::with_context(&self.bi, context_id, |rt| {
+        crate::runtime::with_context(&bi, context_id, |rt| {
             if scp_core::context::tools::invoke::has_tool_invoke_capability(
                 &rt.role_state,
                 &self.agent_did,
@@ -801,6 +843,12 @@ impl ContextProvider for FfiBridgeProvider {
         let agent_did = self.agent_did.clone();
         let timeout = std::time::Duration::from_millis(self.tool_timeout_ms);
 
+        // Upgrade the bridge instance handle up-front. `invoke_tool` is a
+        // sync trait method, so the `Arc` we hold here has a well-defined
+        // lifetime bounded by this function's return — it cannot survive
+        // across an `await` and pin the instance alive (#1549 round-2).
+        let bi = self.upgrade_bi()?;
+
         // Consume a hard-rate-limit token BEFORE dispatching the MCP
         // tool invocation. This path — reachable from external MCP
         // clients — does not go through
@@ -823,7 +871,7 @@ impl ContextProvider for FfiBridgeProvider {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let manager = crate::runtime::context_manager(&self.bi).map_err(|e| format!("{e}"))?;
+        let manager = crate::runtime::context_manager(&bi).map_err(|e| format!("{e}"))?;
         if !manager.try_consume_hard_rate_limit_from_any_context(
             context_id,
             &invoker_did_typed,
@@ -846,7 +894,7 @@ impl ContextProvider for FfiBridgeProvider {
         // the DashMap shard lock. The lock is released when with_context
         // returns. Also compute input hash before dispatch (arguments may
         // be consumed by the handler).
-        let (dispatch, input_hash) = crate::runtime::with_context(&self.bi, context_id, |rt| {
+        let (dispatch, input_hash) = crate::runtime::with_context(&bi, context_id, |rt| {
             let registration = rt.tool_registry.get(tool_name).ok_or_else(|| {
                 ScpPyError::context(format!(
                     "tool '{tool_name}' not found in context '{context_id}'"
@@ -972,7 +1020,7 @@ impl ContextProvider for FfiBridgeProvider {
         // Re-acquire the DashMap lock briefly to append the event.
         // Returns (sequence, serialized_event_bytes) on success for
         // ProtocolRepository persistence (GitHub issue #303).
-        let append_result = crate::runtime::with_context(&self.bi, context_id, |rt| {
+        let append_result = crate::runtime::with_context(&bi, context_id, |rt| {
             let sequence = scp_event_log::tree::event_count(&rt.event_log);
             let prev_hash = if rt.event_log.leaves().is_empty() {
                 scp_event_log::tree::GENESIS_PREV_HASH
@@ -1015,7 +1063,7 @@ impl ContextProvider for FfiBridgeProvider {
                 // is Arc<EncryptingAdapter<InMemoryStorage>> and ProtocolRepository
                 // requires an owned Storage impl. The key convention matches
                 // ProtocolRepository's event_data_key format.
-                if let Ok(storage) = crate::runtime::get_storage(&self.bi)
+                if let Ok(storage) = crate::runtime::get_storage(&bi)
                     && let Ok(rt) = crate::runtime()
                 {
                     let key = format!("context/{context_id}/event_data/{sequence:020}");
@@ -1043,7 +1091,12 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     fn context_members(&self, context_id: &str) -> Vec<MemberInfo> {
-        crate::runtime::with_context(&self.bi, context_id, |rt| {
+        // Returns empty if the bridge has been dropped — matches the
+        // "unknown context" fallback semantics of this trait method.
+        let Ok(bi) = self.upgrade_bi() else {
+            return Vec::new();
+        };
+        crate::runtime::with_context(&bi, context_id, |rt| {
             let members = rt
                 .role_state
                 .members
@@ -1068,7 +1121,11 @@ impl ContextProvider for FfiBridgeProvider {
     fn context_events(&self, context_id: &str) -> serde_json::Value {
         // The EventLog stores Merkle tree hashes, not event payloads.
         // Return the event count and Merkle root as metadata.
-        crate::runtime::with_context(&self.bi, context_id, |rt| {
+        // Falls back to zero-count JSON if the bridge has been dropped.
+        let Ok(bi) = self.upgrade_bi() else {
+            return serde_json::json!({ "event_count": 0 });
+        };
+        crate::runtime::with_context(&bi, context_id, |rt| {
             let leaf_count = rt.event_log.leaves().len();
             let root = scp_event_log::tree::root(&rt.event_log);
             Ok(serde_json::json!({
@@ -1203,8 +1260,19 @@ impl crate::scp::PyScp {
         }
 
         // Create the FfiBridgeProvider and McpServer.
+        //
+        // #1549 round-2: hold the bridge instance as a `Weak`, not an
+        // `Arc`. The MCP server task is spawned on the shared tokio
+        // runtime (`rt.spawn(...)`) and is NOT enrolled in the
+        // per-instance `JoinSet`, so an `Arc` would leak the
+        // `PyBridgeInstance` (and with it `ContextManager`, identity
+        // registry, relay connection) for the remainder of the process
+        // when the caller drops `PyScp` without calling
+        // `py_mcp_server_stop`. The task body additionally selects on
+        // the instance's `cancel_token` so `emergency_cancel_tasks()`
+        // from `Drop` can wake it between requests.
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi_arc),
+            bi: Arc::downgrade(&bi_arc),
             agent_did: identity_did.to_owned(),
             context_ids: context_ids.clone(),
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -1225,17 +1293,32 @@ impl crate::scp::PyScp {
         let sse_agent_did = identity_did.to_owned();
         let sse_context_ids = context_ids.clone();
         let sse_ucan_token = ucan_token;
-        let sse_bi = Arc::clone(&bi_arc);
+        // `sse_bi` is a `Weak` reference so the SSE server task cannot
+        // pin `PyBridgeInstance` alive. Same rationale as `provider.bi`.
+        let sse_bi: std::sync::Weak<crate::runtime::PyBridgeInstance> = Arc::downgrade(&bi_arc);
+        // Capture the cancel token so the server task exits when the
+        // instance is dropped, even if the caller never calls
+        // `py_mcp_server_stop`. Cloning a `CancellationToken` does not
+        // extend the instance's lifetime.
+        let cancel_token = bi_arc.core.cancel_token();
 
         let task_handle = rt.spawn(async move {
             match transport_mode.as_str() {
                 "stdio" => {
                 // Run the MCP server over stdio. The `run_stdio` function
                 // processes stdin/stdout until EOF. We also listen for the
-                // shutdown signal.
+                // shutdown signal AND the bridge instance's cancel token
+                // so `emergency_cancel_tasks()` from the instance's
+                // `Drop` impl can terminate this task even when the
+                // caller never invoked `py_mcp_server_stop`.
                 tokio::select! {
                     _ = shutdown_rx => {
                         // Shutdown signal received -- exit cleanly.
+                    }
+                    () = cancel_token.cancelled() => {
+                        tracing::debug!(
+                            "MCP stdio server task exiting — bridge instance cancelled"
+                        );
                     }
                     () = async {
                         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -1325,14 +1408,22 @@ impl crate::scp::PyScp {
                         0,
                     )));
 
-                    // Create a ShutdownHandle for the SSE server. Wire the
-                    // oneshot shutdown_rx so that when py_mcp_server_stop sends
-                    // the signal, the SSE server also receives it via the
-                    // ShutdownHandle's CancellationToken.
+                    // Create a ShutdownHandle for the SSE server. Wire both
+                    // the oneshot shutdown_rx (py_mcp_server_stop) AND the
+                    // bridge instance's cancel_token (emergency_cancel_tasks
+                    // from Drop) so either signal tears down the SSE server.
+                    // Without the cancel_token branch, a caller that drops
+                    // `PyScp` without calling `py_mcp_server_stop` would
+                    // leave this task running indefinitely and pin
+                    // `PyBridgeInstance` state alive via the
+                    // `McpServer`-held resources (#1549 round-2).
                     let sse_shutdown = scp_mcp::sse::ShutdownHandle::new();
                     let sse_shutdown_trigger = sse_shutdown.clone();
                     tokio::spawn(async move {
-                        let _ = shutdown_rx.await;
+                        tokio::select! {
+                            _ = shutdown_rx => {}
+                            () = cancel_token.cancelled() => {}
+                        }
                         sse_shutdown_trigger.shutdown();
                     });
 
@@ -2373,8 +2464,11 @@ mod tests {
 
     #[test]
     fn ffi_bridge_provider_active_context_ids() {
+        // Hold the Arc alive for the duration of the test so the Weak
+        // inside the provider upgrades successfully (#1549 round-2).
+        let bi = __bi();
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::downgrade(&bi),
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec!["ctx-1".to_owned(), "ctx-2".to_owned()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2390,8 +2484,9 @@ mod tests {
 
     #[test]
     fn ffi_bridge_provider_agent_did() {
+        let bi = __bi();
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::downgrade(&bi),
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec![],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2404,8 +2499,9 @@ mod tests {
 
     #[test]
     fn ffi_bridge_provider_context_tools_empty_for_unknown_context() {
+        let bi = __bi();
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::downgrade(&bi),
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec!["nonexistent".to_owned()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2491,7 +2587,7 @@ mod tests {
         let ctx_id = setup_test_context(&bi, creator, true);
 
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2539,7 +2635,7 @@ mod tests {
         .unwrap();
 
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: member.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2572,7 +2668,7 @@ mod tests {
         let ctx_id = setup_test_context(&bi, creator, true);
 
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2617,7 +2713,7 @@ mod tests {
         assert_eq!(initial_count, 0, "event log should start empty");
 
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2674,7 +2770,7 @@ mod tests {
         crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", handler).unwrap();
 
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2715,7 +2811,7 @@ mod tests {
         let ctx_id = setup_test_context(&bi, creator, true);
 
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2753,7 +2849,7 @@ mod tests {
         let ctx_id = setup_test_context(&bi, creator, true);
 
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2799,7 +2895,7 @@ mod tests {
         let ctx_id = setup_test_context(&bi, creator, false);
 
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2923,8 +3019,9 @@ mod tests {
 
     #[test]
     fn ffi_bridge_provider_subscribe_resource_accepts() {
+        let bi = __bi();
         let provider = FfiBridgeProvider {
-            bi: __bi(),
+            bi: Arc::downgrade(&bi),
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec![],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2962,7 +3059,7 @@ mod tests {
         crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", handler).unwrap();
 
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -3028,7 +3125,7 @@ mod tests {
         crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", bad_handler).unwrap();
 
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -3065,7 +3162,7 @@ mod tests {
         crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", failing_handler).unwrap();
 
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -3106,7 +3203,7 @@ mod tests {
             .unwrap();
 
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: 50, // 50ms — will expire before the 5s sleep.
@@ -3154,7 +3251,7 @@ mod tests {
         crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", fast_handler).unwrap();
 
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: 5_000, // 5 seconds — plenty for an instant handler.
@@ -3242,7 +3339,7 @@ mod tests {
 
         // Create a minimal server entry directly in the registry.
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -3292,7 +3389,7 @@ mod tests {
         let ctx_id = setup_test_context(&bi, creator, false);
 
         let provider = FfiBridgeProvider {
-            bi: Arc::clone(&bi),
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -3339,5 +3436,100 @@ mod tests {
         let _ = stats.known_contexts;
         let _ = stats.identities;
         let _ = stats.relay_connected;
+    }
+
+    // -----------------------------------------------------------------------
+    // #1549 round-2 regression: FfiBridgeProvider must hold a `Weak`, not
+    // an `Arc`, so the MCP server task cannot pin `PyBridgeInstance` alive
+    // past the caller's last `Arc` drop.
+    //
+    // A direct unit assertion: the field type itself is `Weak`. When the
+    // only strong reference is dropped, the provider's methods must not
+    // panic, must return safe defaults for the "optional" methods, and
+    // must return a clear error for the "required" methods.
+    // -----------------------------------------------------------------------
+
+    /// Struct-level proof: the `bi` field is `Weak<PyBridgeInstance>`.
+    /// If someone reverts the type to `Arc`, this test stops compiling.
+    #[test]
+    fn ffi_bridge_provider_field_is_weak_not_arc() {
+        let bi = __bi();
+        let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: "did:dht:z6MkTypeProof".to_owned(),
+            context_ids: vec![],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        };
+        // Compile-time assertion: the field is a `Weak`, so upgrade()
+        // returns `Option`. If the field regresses to `Arc`, this line
+        // fails to type-check.
+        let _opt: Option<Arc<crate::runtime::PyBridgeInstance>> = provider.bi.upgrade();
+    }
+
+    /// Provider methods that degrade gracefully return safe defaults
+    /// when the bridge instance has been dropped.
+    #[test]
+    fn ffi_bridge_provider_returns_safe_defaults_when_bridge_dropped() {
+        let provider = {
+            // Construct the provider against a short-lived Arc, then drop
+            // the Arc so the provider's `Weak` can no longer upgrade.
+            let bi = __bi();
+            let p = FfiBridgeProvider {
+                bi: Arc::downgrade(&bi),
+                agent_did: "did:dht:z6MkDropped".to_owned(),
+                context_ids: vec!["ctx-dropped".to_owned()],
+                tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+                agent_ucan_token: None,
+                agent_proof_tokens: None,
+            };
+            drop(bi);
+            p
+        };
+
+        // upgrade_bi itself returns Err.
+        assert!(
+            provider.upgrade_bi().is_err(),
+            "upgrade_bi must fail when the bridge has been dropped"
+        );
+
+        // agent_role: returns None.
+        assert!(provider.agent_role("ctx-dropped").is_none());
+
+        // context_tools: returns empty.
+        assert!(provider.context_tools("ctx-dropped").is_empty());
+
+        // context_members: returns empty.
+        assert!(provider.context_members("ctx-dropped").is_empty());
+
+        // context_events: returns zero-count JSON fallback.
+        let events = provider.context_events("ctx-dropped");
+        assert_eq!(
+            events,
+            serde_json::json!({ "event_count": 0 }),
+            "context_events must emit the zero-count fallback"
+        );
+
+        // validate_capability: returns Err.
+        let vc = provider.validate_capability("ctx-dropped", "anytool");
+        assert!(
+            vc.is_err(),
+            "validate_capability must reject when bridge is dropped"
+        );
+        assert!(
+            vc.unwrap_err().contains("bridge instance has been dropped"),
+            "error must mention the dropped bridge"
+        );
+
+        // subscribe_resource is a no-op that does not touch `bi`; still Ok.
+        assert!(provider.subscribe_resource("scp://x").is_ok());
+
+        // active_context_ids & agent_did don't touch the weak at all.
+        assert_eq!(
+            provider.active_context_ids(),
+            vec!["ctx-dropped".to_owned()]
+        );
+        assert_eq!(provider.agent_did(), "did:dht:z6MkDropped");
     }
 }

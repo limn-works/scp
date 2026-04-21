@@ -32,6 +32,7 @@ server = ["scp-ffi-common/server", "dep:scp-node"]
 async-trait = { workspace = true }
 pyo3 = { version = "0.24.1", features = ["experimental-async", "multiple-pymethods"] }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 scp-core = { path = "../scp-core" }
 scp-identity = { path = "../scp-identity" }
 scp-primitives = { path = "../scp-primitives" }

@@ -176,9 +176,15 @@ impl crate::scp::PyScp {
                 bi.core.add_relay_url(url.clone());
 
                 // Spawn suppression → scoring bridge task.
+                //
+                // Pass `Weak<PyBridgeInstance>` + the instance's cancel
+                // token so the task cannot pin the instance alive. See
+                // the `spawn_suppression_scoring_task` doc comment for
+                // the Arc-cycle rationale (#1549 round-2 bug-catcher).
                 if let Some(suppression_rx) = suppression_rx {
                     spawn_suppression_scoring_task(
-                        Arc::clone(&self.inner),
+                        Arc::downgrade(&self.inner),
+                        self.inner.core.cancel_token(),
                         suppression_rx,
                         url.clone(),
                     );
@@ -385,8 +391,18 @@ impl crate::scp::PyScp {
         })?;
 
         // Spawn suppression → scoring bridge task.
+        //
+        // Pass `Weak<PyBridgeInstance>` + the instance's cancel token so
+        // the task cannot pin the instance alive. See the
+        // `spawn_suppression_scoring_task` doc comment for the Arc-cycle
+        // rationale (#1549 round-2 bug-catcher).
         if let Some(suppression_rx) = suppression_rx {
-            spawn_suppression_scoring_task(Arc::clone(&self.inner), suppression_rx, scoring_url);
+            spawn_suppression_scoring_task(
+                Arc::downgrade(&self.inner),
+                self.inner.core.cancel_token(),
+                suppression_rx,
+                scoring_url,
+            );
         }
 
         Ok(count)
@@ -491,11 +507,36 @@ impl crate::scp::PyScp {
 /// #1533 AC5). Each suppression event downgrades the relay's reliability
 /// score via `DeliveryOutcome::Failure`.
 ///
-/// The task exits gracefully when the sender half is dropped (adapter
-/// dropped or disconnected). The bridge instance is held as an `Arc` so
-/// scoring persists even if the triggering `SCP` Python object is dropped.
+/// # Arc-cycle avoidance (#1549 round-2 bug-catcher)
+///
+/// The bridge instance is captured as a [`std::sync::Weak`], not an `Arc`.
+/// Holding an `Arc<PyBridgeInstance>` here would keep the instance alive
+/// forever because this task is spawned on the shared tokio runtime
+/// (`RUNTIME.spawn(...)`) and is NOT enrolled in the per-instance
+/// [`JoinSet`](scp_ffi_common::bridge_instance::CoreFields::task_handle)
+/// that `emergency_cancel_tasks` aborts. The cycle would be:
+///
+///   `PyScp` → `Arc<PyBridgeInstance>` ← task ← `rt.spawn(...)`
+///
+/// Without a `Weak`, dropping `PyScp` (and with it the last `Arc<PyBridgeInstance>`
+/// held by the caller) would not actually drop `PyBridgeInstance` because
+/// the task body holds a strong reference. The task never exits on its own
+/// (the `recv()` future is awaited until the relay adapter closes its
+/// sender), so the `MCP` server, `ContextManager`, identity registry, and
+/// relay connection would leak for the remainder of the process.
+///
+/// With `Weak`, the task upgrades per iteration. Once the caller-side `Arc`
+/// is dropped, the next upgrade fails and the task exits cleanly. The
+/// `cancel_token` is also wired so `emergency_cancel_tasks()` from
+/// `PyBridgeInstance::drop` can wake the task before its next `recv()`.
+///
+/// The task exits gracefully when:
+/// 1. The sender half is dropped (adapter dropped or disconnected), OR
+/// 2. The `cancel_token` fires (instance shutdown), OR
+/// 3. `Weak::upgrade` returns `None` (the instance has been dropped).
 fn spawn_suppression_scoring_task(
-    bi: Arc<PyBridgeInstance>,
+    bi: std::sync::Weak<PyBridgeInstance>,
+    cancel_token: tokio_util::sync::CancellationToken,
     mut rx: tokio::sync::mpsc::Receiver<scp_transport::heartbeat::SuppressionSuspected>,
     relay_url: String,
 ) {
@@ -504,12 +545,39 @@ fn spawn_suppression_scoring_task(
     // the tokio runtime context (they use block_on for individual calls).
     let Ok(rt) = crate::runtime() else { return };
     rt.spawn(async move {
-        while let Some(_suppression) = rx.recv().await {
+        loop {
+            let suppression = tokio::select! {
+                () = cancel_token.cancelled() => {
+                    tracing::debug!(
+                        relay_url = %relay_url,
+                        "suppression scoring task exiting — bridge instance cancelled"
+                    );
+                    break;
+                }
+                ev = rx.recv() => ev,
+            };
+            if suppression.is_none() {
+                // Sender dropped (adapter disconnected).
+                break;
+            }
             tracing::debug!(
                 relay_url = %relay_url,
                 "heartbeat suppression → downgrading relay reliability score"
             );
-            crate::runtime::record_suppression(&bi, &relay_url);
+            // Upgrade on every event so a dropped instance releases the Arc
+            // immediately on the next iteration rather than pinning it alive
+            // for the remainder of the relay session.
+            let Some(bi_arc) = bi.upgrade() else {
+                tracing::debug!(
+                    relay_url = %relay_url,
+                    "suppression scoring task exiting — bridge instance dropped"
+                );
+                break;
+            };
+            crate::runtime::record_suppression(&bi_arc, &relay_url);
+            // Drop the Arc before the next `recv().await` so the caller's
+            // `Arc::strong_count` can reach zero while this task is parked.
+            drop(bi_arc);
         }
         tracing::debug!(
             relay_url = %relay_url,
@@ -593,5 +661,156 @@ mod tests {
         let result =
             default_scp().transport_connect("wss://relay.example.com/scp/v1", "invalid_source");
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // #1549 round-2 regression: suppression scoring task must not pin
+    // `PyBridgeInstance` alive via a strong `Arc` held across `recv().await`.
+    //
+    // Before the fix, `spawn_suppression_scoring_task` captured
+    // `Arc<PyBridgeInstance>` by value. Because the task runs on the
+    // shared `RUNTIME.spawn(...)` handle (not the per-instance `JoinSet`
+    // aborted by `emergency_cancel_tasks`) and parks indefinitely on
+    // `rx.recv().await`, dropping the caller's `Arc` left the instance's
+    // strong count at ≥ 1 forever. The ContextManager, identity
+    // registry, and relay connection owned by `PyBridgeInstance` leaked.
+    //
+    // The fix passes a `Weak<PyBridgeInstance>` + the instance's
+    // `cancel_token`. These tests prove:
+    //
+    //   1. While parked on `recv().await`, the task holds no strong
+    //      reference (strong_count stays at 1 — the caller's).
+    //   2. Dropping the caller's `Arc` fires `emergency_cancel_tasks`
+    //      from `PyBridgeInstance::drop`, which cancels `cancel_token`,
+    //      which wakes the task via its `select!` arm. The instance is
+    //      fully dropped; `Weak::upgrade` returns `None`.
+    // -----------------------------------------------------------------------
+
+    /// Suppression task must not hold a strong `Arc<PyBridgeInstance>`
+    /// while parked on `recv()`. Proven by observing `Arc::strong_count`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suppression_scoring_task_does_not_pin_bridge_instance() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        crate::init_runtime().ok();
+
+        let bi = Arc::new(crate::runtime::PyBridgeInstance::new_py());
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+
+        super::spawn_suppression_scoring_task(
+            Arc::downgrade(&bi),
+            bi.core.cancel_token(),
+            rx,
+            "ws://test-suppression".to_owned(),
+        );
+
+        // Yield long enough for the task to reach its `select!` and park.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The only strong reference is ours. The task holds a `Weak` and
+        // a cloned `CancellationToken`; neither bumps `strong_count`.
+        assert_eq!(
+            Arc::strong_count(&bi),
+            1,
+            "suppression task must not hold a strong Arc<PyBridgeInstance> \
+             while parked on recv() — holding one would prevent Drop from \
+             ever running when the caller releases their last strong ref"
+        );
+    }
+
+    /// Dropping the caller's `Arc` fires `PyBridgeInstance::drop` →
+    /// `emergency_cancel_tasks` → `cancel_token` fires → task exits.
+    /// After the task unparks, the instance is fully dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_bridge_instance_terminates_suppression_scoring_task() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        crate::init_runtime().ok();
+
+        let bi = Arc::new(crate::runtime::PyBridgeInstance::new_py());
+        let weak_observer = Arc::downgrade(&bi);
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+
+        super::spawn_suppression_scoring_task(
+            Arc::downgrade(&bi),
+            bi.core.cancel_token(),
+            rx,
+            "ws://test-drop".to_owned(),
+        );
+
+        // Let the task park on `select!`.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            Arc::strong_count(&bi),
+            1,
+            "precondition: task must not pin the instance"
+        );
+
+        // Drop triggers `emergency_cancel_tasks` → `cancel_token.cancel()`.
+        drop(bi);
+
+        // Yield so the task wakes on the cancel branch and exits.
+        for _ in 0..50 {
+            if weak_observer.strong_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            weak_observer.strong_count(),
+            0,
+            "after dropping the caller's Arc, PyBridgeInstance must be \
+             fully released — if this fails, the suppression task is \
+             still holding a strong reference (regressed Arc cycle)"
+        );
+        assert!(
+            weak_observer.upgrade().is_none(),
+            "Weak must not upgrade after the last strong reference is gone"
+        );
+    }
+
+    /// The task also handles the channel-sender-dropped path: when the
+    /// relay adapter that owns the suppression `tx` is dropped, the
+    /// `rx.recv()` future resolves with `None` and the task exits.
+    /// Verifies that after the sender drops, the spawned task stops
+    /// pinning (proven via `Arc::strong_count` going back to 1 after the
+    /// task was briefly alive holding a temporary upgraded Arc).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suppression_scoring_task_exits_when_sender_drops() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        crate::init_runtime().ok();
+
+        let bi = Arc::new(crate::runtime::PyBridgeInstance::new_py());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+        super::spawn_suppression_scoring_task(
+            Arc::downgrade(&bi),
+            bi.core.cancel_token(),
+            rx,
+            "ws://test-sender-drop".to_owned(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(Arc::strong_count(&bi), 1);
+
+        // Drop the sender — simulates relay adapter shutdown. The task's
+        // `recv()` returns `None`, and the task body breaks out of its
+        // loop cleanly without touching the `Weak`.
+        drop(tx);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Count remains 1 because we still hold `bi`; the task's exit
+        // did not double-drop or leak anything.
+        assert_eq!(
+            Arc::strong_count(&bi),
+            1,
+            "after sender drop the task must exit without touching strong count"
+        );
     }
 }

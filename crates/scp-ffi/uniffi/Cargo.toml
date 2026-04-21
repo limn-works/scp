@@ -30,6 +30,7 @@ server = ["scp-ffi-common/server", "dep:scp-node"]
 uniffi = { version = "0.29", features = ["tokio", "cli"] }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 thiserror = { workspace = true }
 scp-core = { path = "../../scp-core" }
 scp-media = { path = "../../scp-media" }

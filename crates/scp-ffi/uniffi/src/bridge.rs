@@ -2227,8 +2227,18 @@ impl TransportManager {
 
         // Spawn suppression → scoring bridge task against this handle's
         // owning `UniffiBridgeInstance`.
+        //
+        // Pass `Weak<UniffiBridgeInstance>` + the instance's cancel token
+        // so the task cannot pin the instance alive. See the
+        // `spawn_suppression_scoring_task` doc comment for the Arc-cycle
+        // rationale (#1549 round-2 bug-catcher).
         if let Some(rx) = suppression_rx {
-            spawn_suppression_scoring_task(Arc::clone(&self.bi), rx, relay_url);
+            spawn_suppression_scoring_task(
+                Arc::downgrade(&self.bi),
+                self.bi.core.cancel_token(),
+                rx,
+                relay_url,
+            );
         }
 
         Ok(count)
@@ -2319,17 +2329,60 @@ impl Drop for TransportManager {
 /// #1533 AC5). Each suppression event downgrades the relay's reliability
 /// score via `DeliveryOutcome::Failure`.
 ///
-/// Accesses the transport via a cloned `Arc<UniffiBridgeInstance>` — the
-/// task exits gracefully when the bridge is shut down or the transport is
-/// cleared.
+/// # Arc-cycle avoidance (#1549 round-2 bug-catcher)
+///
+/// The bridge instance is captured as a [`std::sync::Weak`], not an `Arc`.
+/// Holding an `Arc<UniffiBridgeInstance>` here would keep the instance
+/// alive forever because this task is spawned on the shared tokio runtime
+/// (`tokio::spawn(...)`) and is NOT enrolled in the per-instance
+/// [`JoinSet`](scp_ffi_common::bridge_instance::CoreFields::task_handle)
+/// that `emergency_cancel_tasks` aborts.
+///
+/// Without a `Weak`, dropping the last `Arc<UniffiBridgeInstance>` from
+/// the caller side would not actually drop the instance: the task body
+/// holds a strong reference, the task never exits on its own (the
+/// `recv()` future is awaited until the relay adapter closes its
+/// sender), and so the `ContextManager`, identity registry, relay
+/// connection, and the rest of `BridgeInstance`'s state would leak for
+/// the remainder of the process.
+///
+/// The task exits gracefully when:
+/// 1. The sender half is dropped (adapter dropped or disconnected), OR
+/// 2. The `cancel_token` fires (instance shutdown via Drop), OR
+/// 3. `Weak::upgrade` returns `None` (the instance has been dropped).
 fn spawn_suppression_scoring_task(
-    bi: Arc<crate::runtime::UniffiBridgeInstance>,
+    bi: std::sync::Weak<crate::runtime::UniffiBridgeInstance>,
+    cancel_token: tokio_util::sync::CancellationToken,
     mut rx: tokio::sync::mpsc::Receiver<scp_transport::heartbeat::SuppressionSuspected>,
     relay_url: String,
 ) {
     tokio::spawn(async move {
-        while let Some(_suppression) = rx.recv().await {
-            if bi.core.is_shutdown() {
+        loop {
+            let suppression = tokio::select! {
+                () = cancel_token.cancelled() => {
+                    tracing::debug!(
+                        relay_url = %relay_url,
+                        "suppression scoring task exiting — bridge instance cancelled"
+                    );
+                    break;
+                }
+                ev = rx.recv() => ev,
+            };
+            if suppression.is_none() {
+                // Sender dropped (adapter disconnected).
+                break;
+            }
+            // Upgrade on every event so a dropped instance releases the Arc
+            // immediately on the next iteration rather than pinning it alive
+            // for the remainder of the relay session.
+            let Some(bi_arc) = bi.upgrade() else {
+                tracing::debug!(
+                    relay_url = %relay_url,
+                    "suppression scoring task exiting — bridge instance dropped"
+                );
+                break;
+            };
+            if bi_arc.core.is_shutdown() {
                 // Bridge shut down — exit gracefully.
                 break;
             }
@@ -2337,9 +2390,12 @@ fn spawn_suppression_scoring_task(
                 relay_url = %relay_url,
                 "heartbeat suppression → downgrading relay reliability score"
             );
-            let _ = bi.core.with_transport(|inner| {
+            let _ = bi_arc.core.with_transport(|inner| {
                 inner.update_score(&relay_url, scp_transport::scoring::DeliveryOutcome::Failure);
             });
+            // Drop the Arc before the next `recv().await` so the caller's
+            // `Arc::strong_count` can reach zero while this task is parked.
+            drop(bi_arc);
         }
         tracing::debug!(
             relay_url = %relay_url,
@@ -3161,12 +3217,32 @@ const UNIFFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::tools::DEFAULT_TIMEOUT_MS
 /// - `context_members()` reads from `ContextManager::member_dids()` + `member_role()`
 /// - `context_events()` reads from the per-context event log (UCAN state)
 struct McpUniFfiBridgeProvider {
-    /// Owning `UniffiBridgeInstance` — source for the context handle
-    /// registry, `ContextManager`, and UCAN state lookups.
+    /// Weak reference to the owning `UniffiBridgeInstance` — source for the
+    /// context handle registry, `ContextManager`, and UCAN state lookups.
+    ///
+    /// # Why `Weak` and not `Arc` (#1549 round-2 bug-catcher)
+    ///
+    /// The provider is installed in an [`McpServer`] that lives inside a
+    /// background task spawned on the shared tokio runtime
+    /// (`runtime().spawn(...)`). That task is NOT enrolled in the
+    /// per-instance
+    /// [`JoinSet`](scp_ffi_common::bridge_instance::CoreFields::task_handle)
+    /// aborted by `emergency_cancel_tasks`, so it survives
+    /// [`crate::runtime::UniffiBridgeInstance::drop`] unless the caller
+    /// explicitly sends a shutdown via [`mcp_server_stop`].
+    ///
+    /// If this field were `Arc<UniffiBridgeInstance>`, the server task
+    /// would keep the instance alive forever when the caller forgets to
+    /// stop it. With `Weak`, callers that drop their last strong
+    /// reference release `ContextManager`, identity registry, relay
+    /// connection, and the rest of `BridgeInstance`'s state. Provider
+    /// methods upgrade per call; once `None` is returned, they emit a
+    /// stable error so the MCP server can propagate it to the peer.
     ///
     /// Phase D (#1695): replaces process-wide `DEFAULT_BRIDGE_INSTANCE`
-    /// lookups with per-provider `Arc` affinity.
-    bi: Arc<crate::runtime::UniffiBridgeInstance>,
+    /// lookups with per-provider affinity. Round-2 changes strong
+    /// affinity to weak.
+    bi: std::sync::Weak<crate::runtime::UniffiBridgeInstance>,
     agent_did: String,
     context_ids: Vec<String>,
     /// Maximum time (in milliseconds) to wait for a tool handler to complete.
@@ -3177,6 +3253,19 @@ struct McpUniFfiBridgeProvider {
     agent_proof_tokens: Option<Vec<String>>,
 }
 
+impl McpUniFfiBridgeProvider {
+    /// Upgrades the stored [`Weak`] to a live [`Arc<UniffiBridgeInstance>`].
+    ///
+    /// Returns an error string if the bridge instance has been dropped.
+    /// Callers MUST drop the returned `Arc` before the next `.await` so
+    /// they do not pin the instance alive across suspension points.
+    fn upgrade_bi(&self) -> Result<Arc<crate::runtime::UniffiBridgeInstance>, String> {
+        self.bi.upgrade().ok_or_else(|| {
+            "bridge instance has been dropped — MCP provider cannot service request".to_owned()
+        })
+    }
+}
+
 impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     fn active_context_ids(&self) -> Vec<scp_mcp::namespace::ContextId> {
         self.context_ids.clone()
@@ -3184,7 +3273,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
         // Read the agent's role assignment from this instance's ContextManager.
-        let manager = self.bi.context_manager_expect().ok()?;
+        // Returns None if the bridge instance has been dropped (#1549 round-2).
+        let bi = self.upgrade_bi().ok()?;
+        let manager = bi.context_manager_expect().ok()?;
         let role_state = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(manager.get_role_state(context_id))
         })?;
@@ -3201,7 +3292,11 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     fn context_tools(&self, context_id: &str) -> Vec<scp_mcp::server::ContextToolInfo> {
         // Look up the ContextHandle from this provider's instance registry
         // and read its tool_registry.
-        let registry = context_handle_registry(&self.bi);
+        // Returns empty if the bridge instance has been dropped (#1549 round-2).
+        let Ok(bi) = self.upgrade_bi() else {
+            return Vec::new();
+        };
+        let registry = context_handle_registry(&bi);
         let Some(handle) = registry.get(context_id) else {
             return Vec::new();
         };
@@ -3219,6 +3314,11 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), String> {
+        // Upgrade the bridge instance handle up-front so every check below
+        // sees a stable `&UniffiBridgeInstance`. If the instance has been
+        // dropped, fail fast rather than silently accepting the capability
+        // (#1549 round-2).
+        let bi = self.upgrade_bi()?;
         // Primary check: UCAN token validation via the full 11-step ADR-016
         // pipeline. Verifies the token grants tool_invoke:{tool_name} or
         // tool_invoke:* for this context.
@@ -3239,59 +3339,54 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             // Scope the DashMap Ref so the shard lock is released before
             // entering with_ucan_state (which uses a different DashMap).
             {
-                let handle = context_handle_registry(&self.bi)
+                let handle = context_handle_registry(&bi)
                     .get(context_id)
                     .ok_or_else(|| {
                         format!("context '{context_id}' not found in handle registry")
                     })?;
-                self.bi.ensure_ucan_registered(
-                    context_id,
-                    &handle.creator_did,
-                    &handle.ceiling_strings,
-                );
+                bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
             }
 
             let agent_did = self.agent_did.clone();
-            self.bi
-                .with_ucan_state(context_id, |ucan_state| {
-                    let production_resolver = self.bi.did_resolver();
-                    let did_resolver =
-                        scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
-                    let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
-                        revocation_list: &ucan_state.revocation_list,
-                    };
-                    let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
-                        inner: &mut ucan_state.nonce_tracker,
-                    };
+            bi.with_ucan_state(context_id, |ucan_state| {
+                let production_resolver = bi.did_resolver();
+                let did_resolver =
+                    scp_ffi_common::DispatchDidResolver::new(production_resolver.as_deref());
+                let revocation_checker = scp_ffi_common::BridgeRevocationChecker {
+                    revocation_list: &ucan_state.revocation_list,
+                };
+                let mut nonce_adapter = scp_ffi_common::BridgeNonceTracker {
+                    inner: &mut ucan_state.nonce_tracker,
+                };
 
-                    let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
-                        did_resolver: &did_resolver,
-                        nonce_tracker: &mut nonce_adapter,
-                        revocation_checker: &revocation_checker,
-                        proof_resolver: &proof_resolver,
-                        ceiling: &ucan_state.ceiling_strings,
-                        context_creator_did: &ucan_state.creator_did,
-                        presenting_agent_did: &agent_did,
-                        clock_skew_tolerance_secs:
-                            scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
-                        clock: &scp_primitives::SystemClock,
-                    };
+                let mut ctx = scp_core::crypto::ucan::validate::ValidationContext {
+                    did_resolver: &did_resolver,
+                    nonce_tracker: &mut nonce_adapter,
+                    revocation_checker: &revocation_checker,
+                    proof_resolver: &proof_resolver,
+                    ceiling: &ucan_state.ceiling_strings,
+                    context_creator_did: &ucan_state.creator_did,
+                    presenting_agent_did: &agent_did,
+                    clock_skew_tolerance_secs:
+                        scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+                    clock: &scp_primitives::SystemClock,
+                };
 
-                    scp_core::context::tools::validate_tool_invocation_ucan(
-                        token, context_id, tool_name, &mut ctx,
-                    )
-                    .map_err(|e| {
-                        tracing::warn!(
-                            agent = %agent_did,
-                            tool = %tool_name,
-                            context = %context_id,
-                            error = %e,
-                            "UCAN validation failed for tool invocation"
-                        );
-                        format!("UCAN authorization failed for tool '{tool_name}': {e}")
-                    })
+                scp_core::context::tools::validate_tool_invocation_ucan(
+                    token, context_id, tool_name, &mut ctx,
+                )
+                .map_err(|e| {
+                    tracing::warn!(
+                        agent = %agent_did,
+                        tool = %tool_name,
+                        context = %context_id,
+                        error = %e,
+                        "UCAN validation failed for tool invocation"
+                    );
+                    format!("UCAN authorization failed for tool '{tool_name}': {e}")
                 })
-                .ok_or_else(|| format!("UCAN state not found for context '{context_id}'"))??;
+            })
+            .ok_or_else(|| format!("UCAN state not found for context '{context_id}'"))??;
         } else {
             tracing::warn!(
                 agent = %self.agent_did,
@@ -3304,8 +3399,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        let manager = self
-            .bi
+        let manager = bi
             .context_manager_expect()
             .map_err(|e| format!("ContextManager not initialized: {e}"))?;
         let role_state = tokio::task::block_in_place(|| {
@@ -3343,12 +3437,17 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         let agent_did = self.agent_did.clone();
         let timeout = std::time::Duration::from_millis(self.tool_timeout_ms);
 
+        // Upgrade the bridge instance handle up-front. `invoke_tool` is a
+        // sync trait method so the Arc is bounded by this function's return
+        // and cannot survive across an `await` point (#1549 round-2).
+        let bi = self.upgrade_bi()?;
+
         // Phase 1: Validate input and extract handler + output schema under
         // the ContextHandle's tool_registry lock. The lock is released before
         // handler execution to avoid blocking concurrent context operations.
         // The DashMap Ref (shard lock) is scoped to this block.
         let (dispatch, input_hash) = {
-            let handle = context_handle_registry(&self.bi)
+            let handle = context_handle_registry(&bi)
                 .get(context_id)
                 .ok_or_else(|| format!("context '{context_id}' not found in handle registry"))?;
 
@@ -3450,15 +3549,11 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             .map_or(0, |d| d.as_secs());
 
         // Ensure UCAN state is registered before appending the event.
-        if let Some(handle) = context_handle_registry(&self.bi).get(context_id) {
-            self.bi.ensure_ucan_registered(
-                context_id,
-                &handle.creator_did,
-                &handle.ceiling_strings,
-            );
+        if let Some(handle) = context_handle_registry(&bi).get(context_id) {
+            bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
         }
 
-        let append_result = self.bi.with_ucan_state(context_id, |ucan_state| {
+        let append_result = bi.with_ucan_state(context_id, |ucan_state| {
             let sequence = scp_event_log::tree::event_count(&ucan_state.event_log);
             let prev_hash = if ucan_state.event_log.leaves().is_empty() {
                 scp_event_log::tree::GENESIS_PREV_HASH
@@ -3505,7 +3600,11 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
     fn context_members(&self, context_id: &str) -> Vec<scp_mcp::server::MemberInfo> {
         // Read member list and role assignments from this instance's ContextManager.
-        let Ok(manager) = self.bi.context_manager_expect() else {
+        // Returns empty if the bridge instance has been dropped (#1549 round-2).
+        let Ok(bi) = self.upgrade_bi() else {
+            return Vec::new();
+        };
+        let Ok(manager) = bi.context_manager_expect() else {
             return Vec::new();
         };
 
@@ -3531,24 +3630,24 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     fn context_events(&self, context_id: &str) -> serde_json::Value {
         // The EventLog stores Merkle tree hashes, not event payloads.
         // Return the event count and Merkle root as metadata (matching PyO3).
-        if let Some(handle) = context_handle_registry(&self.bi).get(context_id) {
-            self.bi.ensure_ucan_registered(
-                context_id,
-                &handle.creator_did,
-                &handle.ceiling_strings,
-            );
+        // Falls back to zero-count JSON if the bridge has been dropped
+        // (#1549 round-2).
+        let Ok(bi) = self.upgrade_bi() else {
+            return serde_json::json!({ "event_count": 0 });
+        };
+        if let Some(handle) = context_handle_registry(&bi).get(context_id) {
+            bi.ensure_ucan_registered(context_id, &handle.creator_did, &handle.ceiling_strings);
         }
 
-        self.bi
-            .with_ucan_state(context_id, |ucan_state| {
-                let leaf_count = ucan_state.event_log.leaves().len();
-                let root = scp_event_log::tree::root(&ucan_state.event_log);
-                serde_json::json!({
-                    "event_count": leaf_count,
-                    "merkle_root": hex::encode(root),
-                })
+        bi.with_ucan_state(context_id, |ucan_state| {
+            let leaf_count = ucan_state.event_log.leaves().len();
+            let root = scp_event_log::tree::root(&ucan_state.event_log);
+            serde_json::json!({
+                "event_count": leaf_count,
+                "merkle_root": hex::encode(root),
             })
-            .unwrap_or_else(|| serde_json::json!({ "event_count": 0 }))
+        })
+        .unwrap_or_else(|| serde_json::json!({ "event_count": 0 }))
     }
 
     fn subscribe_resource(&self, _uri: &str) -> Result<(), String> {
@@ -3565,11 +3664,20 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 async fn run_mcp_stdio_server_uniffi(
     server: Arc<std::sync::Mutex<scp_mcp::server::McpServer<McpUniFfiBridgeProvider>>>,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    cancel_token: tokio_util::sync::CancellationToken,
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
+    // Wire both `shutdown_rx` (mcp_server_stop) AND the bridge instance's
+    // `cancel_token` (emergency_cancel_tasks from Drop) so either signal
+    // terminates this task. Without the `cancel_token` arm, a caller that
+    // drops `SCP` without calling `mcp_server_stop` would leave this task
+    // running indefinitely (#1549 round-2).
     tokio::select! {
         _ = shutdown_rx => {}
+        () = cancel_token.cancelled() => {
+            tracing::debug!("MCP stdio server task exiting — bridge instance cancelled");
+        }
         () = async {
             let stdin = tokio::io::stdin();
             let mut stdout = tokio::io::stdout();
@@ -11146,8 +11254,18 @@ impl Scp {
 
                 // Spawn suppression → scoring bridge task bound to this
                 // instance (not the process-wide default).
+                //
+                // Pass `Weak<UniffiBridgeInstance>` + the instance's cancel
+                // token so the task cannot pin the instance alive. See the
+                // `spawn_suppression_scoring_task` doc comment for the
+                // Arc-cycle rationale (#1549 round-2 bug-catcher).
                 if let Some(rx) = suppression_rx {
-                    spawn_suppression_scoring_task(Arc::clone(&bi), rx, relay_url);
+                    spawn_suppression_scoring_task(
+                        Arc::downgrade(&bi),
+                        bi.core.cancel_token(),
+                        rx,
+                        relay_url,
+                    );
                 }
 
                 Ok(handle)
@@ -11279,8 +11397,18 @@ impl Scp {
             });
         }
 
+        // #1549 round-2: hold the bridge instance as a `Weak`, not an
+        // `Arc`. The MCP server task is spawned on the shared tokio
+        // runtime (`runtime().spawn(...)`) and is NOT enrolled in the
+        // per-instance `JoinSet`, so an `Arc` would leak the
+        // `UniffiBridgeInstance` (and with it `ContextManager`, identity
+        // registry, relay connection) for the remainder of the process
+        // when the caller drops `SCP` without calling `mcp_server_stop`.
+        // The task body additionally selects on the instance's
+        // `cancel_token` so `emergency_cancel_tasks()` from `Drop` can
+        // wake it between requests.
         let provider = McpUniFfiBridgeProvider {
-            bi: Arc::clone(&self.inner),
+            bi: Arc::downgrade(&self.inner),
             agent_did: config.identity_did.clone(),
             context_ids: config.context_ids.clone(),
             tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
@@ -11298,12 +11426,20 @@ impl Scp {
         let sse_context_ids = config.context_ids;
         let sse_ucan_token = config.ucan_token;
         let sse_proof_tokens = config.proof_tokens;
-        let sse_bi = Arc::clone(&self.inner);
+        // `sse_bi` is a `Weak` reference so the SSE server task cannot
+        // pin `UniffiBridgeInstance` alive. Same rationale as `provider.bi`.
+        let sse_bi: std::sync::Weak<crate::runtime::UniffiBridgeInstance> =
+            Arc::downgrade(&self.inner);
+        // Capture the cancel token so the server task exits when the
+        // instance is dropped, even if the caller never calls
+        // `mcp_server_stop`. Cloning a `CancellationToken` does not
+        // extend the instance's lifetime.
+        let cancel_token = self.inner.core.cancel_token();
 
         let task_handle = runtime().spawn(async move {
             match transport_mode.as_str() {
                 "stdio" => {
-                    run_mcp_stdio_server_uniffi(server_clone, shutdown_rx).await;
+                    run_mcp_stdio_server_uniffi(server_clone, shutdown_rx, cancel_token).await;
                 }
                 "sse" => {
                     let provider = McpUniFfiBridgeProvider {
@@ -11321,8 +11457,15 @@ impl Scp {
                     )));
                     let sse_shutdown = scp_mcp::sse::ShutdownHandle::new();
                     let sse_shutdown_trigger = sse_shutdown.clone();
+                    // Wire both shutdown_rx (mcp_server_stop) AND the bridge
+                    // instance's cancel_token (emergency_cancel_tasks from
+                    // Drop) so either signal tears down the SSE server
+                    // (#1549 round-2).
                     tokio::spawn(async move {
-                        let _ = shutdown_rx.await;
+                        tokio::select! {
+                            _ = shutdown_rx => {}
+                            () = cancel_token.cancelled() => {}
+                        }
                         sse_shutdown_trigger.shutdown();
                     });
                     let result = scp_mcp::sse::run_sse(sse_server, sse_config, sse_shutdown).await;
@@ -15276,5 +15419,149 @@ mod tests {
             "None spending should be accepted: {result:?}"
         );
         assert_eq!(result.unwrap(), "prompt_agent");
+    }
+
+    // -----------------------------------------------------------------------
+    // #1549 round-2 regression: UniFFI MCP provider + suppression task
+    // must hold `Weak<UniffiBridgeInstance>`, not `Arc`, so the spawned
+    // server task cannot pin the instance alive past the caller's last
+    // `Arc` drop.
+    // -----------------------------------------------------------------------
+
+    /// Struct-level proof: `McpUniFfiBridgeProvider.bi` is `Weak`.
+    /// If someone reverts the type to `Arc`, this test stops compiling.
+    #[test]
+    fn mcp_uniffi_provider_field_is_weak_not_arc() {
+        let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
+        let provider = McpUniFfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: "did:dht:z6MkTypeProof".to_owned(),
+            context_ids: vec![],
+            tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        };
+        let _opt: Option<Arc<crate::runtime::UniffiBridgeInstance>> = provider.bi.upgrade();
+    }
+
+    /// The `UniFFI` MCP provider's methods that degrade gracefully return
+    /// safe defaults when the bridge instance has been dropped.
+    #[test]
+    fn mcp_uniffi_provider_returns_safe_defaults_when_bridge_dropped() {
+        use scp_mcp::server::ContextProvider;
+
+        let provider = {
+            let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
+            let p = McpUniFfiBridgeProvider {
+                bi: Arc::downgrade(&bi),
+                agent_did: "did:dht:z6MkDropped".to_owned(),
+                context_ids: vec!["ctx-dropped".to_owned()],
+                tool_timeout_ms: UNIFFI_TOOL_TIMEOUT_MS,
+                agent_ucan_token: None,
+                agent_proof_tokens: None,
+            };
+            drop(bi);
+            p
+        };
+
+        // upgrade_bi itself returns Err.
+        assert!(
+            provider.upgrade_bi().is_err(),
+            "upgrade_bi must fail when the bridge has been dropped"
+        );
+
+        // context_tools: returns empty (no panic, no upgrade attempt leak).
+        assert!(provider.context_tools("ctx-dropped").is_empty());
+
+        // context_members: returns empty.
+        assert!(provider.context_members("ctx-dropped").is_empty());
+
+        // context_events: returns zero-count JSON fallback.
+        assert_eq!(
+            provider.context_events("ctx-dropped"),
+            serde_json::json!({ "event_count": 0 })
+        );
+
+        // validate_capability with no UCAN: returns the UCAN-required error
+        // (it short-circuits before the bridge upgrade).
+        assert!(provider.validate_capability("ctx-dropped", "t").is_err());
+
+        // subscribe_resource is a no-op — still Ok.
+        assert!(provider.subscribe_resource("scp://x").is_ok());
+
+        // active_context_ids & agent_did don't touch the Weak at all.
+        assert_eq!(
+            provider.active_context_ids(),
+            vec!["ctx-dropped".to_owned()]
+        );
+        assert_eq!(provider.agent_did(), "did:dht:z6MkDropped");
+    }
+
+    /// Suppression task must not hold a strong `Arc<UniffiBridgeInstance>`
+    /// while parked on `recv()`. Proven by observing `Arc::strong_count`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suppression_scoring_task_does_not_pin_uniffi_bridge_instance() {
+        use std::time::Duration;
+
+        let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+
+        super::spawn_suppression_scoring_task(
+            Arc::downgrade(&bi),
+            bi.core.cancel_token(),
+            rx,
+            "ws://test-uniffi-suppression".to_owned(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            Arc::strong_count(&bi),
+            1,
+            "UniFFI suppression task must not hold a strong \
+             Arc<UniffiBridgeInstance> while parked on recv() — holding \
+             one would prevent Drop from ever running when the caller \
+             releases their last strong ref (#1549 round-2)"
+        );
+    }
+
+    /// Dropping the caller's `Arc<UniffiBridgeInstance>` triggers
+    /// `emergency_cancel_tasks`, which fires `cancel_token`, which wakes
+    /// the suppression task so it exits and the instance is fully dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_uniffi_bridge_instance_terminates_suppression_scoring_task() {
+        use std::time::Duration;
+
+        let bi = Arc::new(crate::runtime::UniffiBridgeInstance::new_uniffi());
+        let weak_observer = Arc::downgrade(&bi);
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+
+        super::spawn_suppression_scoring_task(
+            Arc::downgrade(&bi),
+            bi.core.cancel_token(),
+            rx,
+            "ws://test-uniffi-drop".to_owned(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(Arc::strong_count(&bi), 1);
+
+        drop(bi);
+
+        for _ in 0..50 {
+            if weak_observer.strong_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            weak_observer.strong_count(),
+            0,
+            "after dropping the caller's Arc, UniffiBridgeInstance must \
+             be fully released — if this fails, the suppression task is \
+             still holding a strong reference (regressed Arc cycle)"
+        );
+        assert!(weak_observer.upgrade().is_none());
     }
 }
