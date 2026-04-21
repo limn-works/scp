@@ -35,28 +35,19 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { SCP } from "../src/scp";
+import { __getNativeScp, SCP } from "../src/scp";
 
 // ---------------------------------------------------------------------------
 // Guard: skip if native addon unavailable
 // ---------------------------------------------------------------------------
+//
+// Post-ADR-048 (#1549 Phase 4 PR 4): relay/transport bootstrap methods no
+// longer exist as module-level free functions on the raw addon. They are
+// instance methods on the NAPI `Scp` class, reached via `__getNativeScp`.
 
 type NativeBridge = Awaited<ReturnType<typeof import("../src/internal/bridge").getBridge>>;
-type ServerAddon = {
-  relayStartInMemory(): Promise<{
-    readonly relayUrl: string;
-    readonly relayPort: number;
-    readonly isShutdown: boolean;
-    shutdown(): void;
-  }>;
-  transportConnect(relayUrl: string): Promise<unknown>;
-  configureRelayTransport(relayUrl: string, localDid: string): Promise<void>;
-  contextSubscribe(
-    handle: unknown,
-    identityDid: string,
-    onMessage: (msg: NapiRawMessage | null) => void,
-  ): Promise<void>;
-};
+// biome-ignore lint/suspicious/noExplicitAny: the native SCP class is untyped
+type NativeScp = any;
 
 /**
  * Raw message object returned by the NAPI bridge's `contextSubscribe`.
@@ -73,51 +64,38 @@ interface NapiRawMessage {
 }
 
 let bridge: NativeBridge | null = null;
-let serverAddon: ServerAddon | null = null;
 let scp: SCP | null = null;
+let nativeScp: NativeScp | null = null;
 let skipReason = "";
 
 try {
   const { createNativeBridge } = await import("../src/internal/native.js");
   scp = new SCP();
   bridge = createNativeBridge(scp);
-
-  // Load the server addon for relay + transport operations
-  const { createRequire } = await import("node:module");
-  const req = createRequire(import.meta.url);
-  const platform = process.platform;
-  const arch = process.arch;
-  const platformMap: Record<string, string> = {
-    "linux-x64": "@limn-works/scp-ts-napi-linux-x64-gnu",
-    "linux-arm64": "@limn-works/scp-ts-napi-linux-arm64-gnu",
-    "darwin-x64": "@limn-works/scp-ts-napi-darwin-x64",
-    "darwin-arm64": "@limn-works/scp-ts-napi-darwin-arm64",
-    "win32-x64": "@limn-works/scp-ts-napi-win32-x64-msvc",
-  };
-  const pkg = platformMap[`${platform}-${arch}`];
-  if (pkg) {
-    serverAddon = req(pkg) as ServerAddon;
-  } else {
-    skipReason = `No native addon for ${platform}-${arch}`;
+  nativeScp = __getNativeScp(scp);
+  if (typeof nativeScp.relayStartInMemory !== "function") {
+    skipReason = "native SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
+    bridge = null;
+    nativeScp = null;
   }
 } catch (e: unknown) {
   const msg = e instanceof Error ? e.message : String(e);
   skipReason = `Native NAPI bridge not available: ${msg}`;
 }
 
-if (bridge === null || serverAddon === null) {
+if (bridge === null || scp === null || nativeScp === null) {
   describe("E2E relay (SKIPPED)", () => {
     test.skip(`all tests skipped: ${skipReason}`, () => {});
   });
 } else {
   const napi = bridge;
-  const addon = serverAddon;
+  const nativeHandle = nativeScp;
 
   // -------------------------------------------------------------------------
   // Relay lifecycle state
   // -------------------------------------------------------------------------
 
-  let relayHandle: Awaited<ReturnType<typeof addon.relayStartInMemory>> | null = null;
+  let relayHandle: Awaited<ReturnType<typeof nativeHandle.relayStartInMemory>> | null = null;
 
   /** Contexts with active subscriptions that need closing before relay shutdown. */
   const subscribedContexts: Array<{
@@ -127,26 +105,29 @@ if (bridge === null || serverAddon === null) {
   }> = [];
 
   beforeAll(async () => {
-    // Start an in-memory relay on an ephemeral port
-    relayHandle = await addon.relayStartInMemory();
+    // Start an in-memory relay on an ephemeral port. Post-ADR-048 this is a
+    // per-instance method on the NAPI `Scp` class (was `addon.relayStartInMemory()`).
+    const handle = await nativeHandle.relayStartInMemory();
+    relayHandle = handle;
 
     // Bootstrap identity first to get a DID for MLS credential identity.
     // This must happen BEFORE configureRelayTransport because the
-    // ContextManager OnceLock is set by whichever call wins the race.
+    // ContextManager is initialized lazily by whichever per-instance call
+    // wins the race.
     const bootstrap = await napi.identityCreate("in_memory");
 
     // Configure the ContextManager with a relay-backed transport provider.
     // configureRelayTransport creates a relay connection and wraps it in
     // RelayTransportProvider, so contextSend publishes encrypted payloads
-    // through the relay. Must be called BEFORE any contextCreate (which
-    // triggers init_context_manager via OnceLock).
-    await addon.configureRelayTransport(relayHandle.relayUrl, bootstrap.did);
+    // through the relay. Must be called BEFORE any contextCreate.
+    await nativeHandle.configureRelayTransport(handle.relayUrl, bootstrap.did);
 
     // Establish a SECOND WebSocket connection for contextSubscribe.
-    // contextSubscribe uses the global RELAY_ADAPTER (set by
-    // transportConnect) for its subscription stream, separate from the
-    // ContextManager's transport provider.
-    await addon.transportConnect(relayHandle.relayUrl);
+    // contextSubscribe uses the bridge's transport manager for its
+    // subscription stream, separate from the ContextManager's transport
+    // provider. `napi.transportConnect` dispatches through the same SCP
+    // instance (the `Bridge` wrapper routes every call through scp).
+    await napi.transportConnect(handle.relayUrl);
   });
 
   afterAll(async () => {
@@ -369,7 +350,7 @@ if (bridge === null || serverAddon === null) {
       // `async` after #1549 Phase 4 PR 1 — the returned Promise
       // resolves once the task is registered against the bridge's
       // JoinSet.
-      await addon.contextSubscribe(ctx, alice.did, (_msg: NapiRawMessage | null) => {
+      await nativeHandle.contextSubscribe(ctx, alice.did, (_msg: NapiRawMessage | null) => {
         // Callback may or may not fire depending on relay delivery.
       });
 
@@ -390,13 +371,13 @@ if (bridge === null || serverAddon === null) {
       );
 
       // First subscription succeeds.
-      await addon.contextSubscribe(ctx, alice.did, () => {});
+      await nativeHandle.contextSubscribe(ctx, alice.did, () => {});
       subscribedContexts.push({ handle: ctx, did: alice.did });
 
       // Second subscription to the same context must fail. Async
       // rejection — use `.rejects.toThrow()` rather than
       // sync `.toThrow()`.
-      await expect(addon.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow(
+      await expect(nativeHandle.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow(
         /already subscribed/,
       );
     });
@@ -418,7 +399,7 @@ if (bridge === null || serverAddon === null) {
 
       // Subscription to a closed context must fail. Promise-rejection,
       // not synchronous throw.
-      await expect(addon.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow();
+      await expect(nativeHandle.contextSubscribe(ctx, alice.did, () => {})).rejects.toThrow();
     });
   });
 
