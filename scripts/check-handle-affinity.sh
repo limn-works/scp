@@ -128,11 +128,30 @@ for suffix in "${HANDLE_SUFFIXES[@]}"; do
     fi
 done
 
-# Per-bridge: directory, attribute, expected macro.
+# Per-bridge: directory, attribute, expected macro, container attribute.
+#
+# `container_attr` is the attribute that wraps an `impl` block and exposes
+# EVERY method inside as an FFI entry point, regardless of whether the
+# inner methods carry the bridge's per-function attribute. When set, the
+# scanner treats every `fn` inside the block as attributed for as long as
+# the block's brace balance remains open.
+#
+# * PyO3 — `#[pymethods] impl T { pub fn foo() }` — `foo` has no
+#   `#[pyfunction]` but is still a Python-callable FFI entry point and
+#   therefore needs a handle-affinity check when it accepts handle-typed
+#   parameters. Without container-scope tracking, every `fullstack_*`
+#   method on `PyScp` (and every method on every other `#[pymethods]`
+#   impl) escapes the gate silently.
+# * NAPI — `#[napi] impl Scp { #[napi(...)] fn foo() }`. Inner `fn` items
+#   already carry `#[napi(...)]` so the per-function path catches them;
+#   the container attr is still recorded for defense-in-depth.
+# * UniFFI — `#[uniffi::export] impl Scp { pub fn foo() }` exports every
+#   method in the impl. Works today because coders mark each method
+#   individually; container-scope tracking catches any regression.
 BRIDGES=(
-    "pyo3|crates/scp-ffi/src|pyfunction|pyscp_check_handle"
-    "napi|crates/scp-ffi/napi/src|napi|napi_check_handle"
-    "uniffi|crates/scp-ffi/uniffi/src|uniffi::export|uniffi_check_handle"
+    "pyo3|crates/scp-ffi/src|pyfunction|pyscp_check_handle|pymethods"
+    "napi|crates/scp-ffi/napi/src|napi|napi_check_handle|napi"
+    "uniffi|crates/scp-ffi/uniffi/src|uniffi::export|uniffi_check_handle|uniffi::export"
 )
 
 TOTAL_CHECKED=0
@@ -163,6 +182,7 @@ scan_bridge() {
     local bridge_dir="$2"
     local attr="$3"
     local macro_name="$4"
+    local container_attr="${5:-}"
 
     if [[ ! -d "$bridge_dir" ]]; then
         printf '%swarning:%s bridge dir %s does not exist, skipping %s\n' \
@@ -178,6 +198,7 @@ scan_bridge() {
                 -v FILE="$file" \
                 -v ATTR="$attr" \
                 -v MACRO="$macro_name" \
+                -v CONTAINER_ATTR="$container_attr" \
                 -v HANDLE_REGEX="$HANDLE_REGEX" '
             BEGIN {
                 in_cfg_test_depth = 0
@@ -187,6 +208,13 @@ scan_bridge() {
                 sig = ""
                 sig_start_line = 0
                 brace_depth = 0
+                # Method-scope tracking for bridge container attributes.
+                # See the BRIDGES config comments below (outside the awk
+                # block) for the full rationale — kept out of this awk
+                # string because single-quoted awk source cannot contain
+                # shell-breaking apostrophes in embedded comments.
+                in_method_scope_depth = 0
+                pending_method_scope = 0
                 # Pending-scan FIFO. `pending_n` is the number of active
                 # body scans; each slot `i` (1..=pending_n) stores:
                 #   pending_fn_name[i]   — function name
@@ -217,8 +245,20 @@ scan_bridge() {
                 # pushes always land at `pending_n + 1`.
                 if (pending_n > 0) {
                     write_idx = 0
+                    # Two accepted forms in the body window:
+                    #  1. The bridge macro: `pyscp_check_handle!`,
+                    #     `napi_check_handle!`, `uniffi_check_handle!`.
+                    #  2. An inline `.check_handle(` method call on a
+                    #     `CoreFields` reference. UniFFI was migrated to
+                    #     inline calls for ergonomic reasons (no macro
+                    #     expansion in doctests); PyO3/NAPI may also
+                    #     expand inline at hot paths. Accepting both
+                    #     keeps the gate enforcing affinity at the
+                    #     behavioural level — a missing check is a bug
+                    #     regardless of its syntactic form.
                     for (read_idx = 1; read_idx <= pending_n; read_idx++) {
-                        if (index(line, MACRO "!") > 0) {
+                        if (index(line, MACRO "!") > 0 || \
+                            index(line, ".check_handle(") > 0) {
                             pending_found[read_idx] = 1
                         }
                         pending_remaining[read_idx]--
@@ -281,6 +321,90 @@ scan_bridge() {
                     next
                 }
 
+                # Maintain method-scope state for the bridge'\''s container
+                # attribute (#[pymethods], #[napi] on impl, #[uniffi::export]
+                # on impl). When we see the container attr, arm the
+                # pending_method_scope flag; the next `impl` line opens the
+                # scope. Every `fn` inside the balanced braces that follow
+                # is treated as an attributed FFI entry point — critical
+                # for `#[pymethods] impl PyScp { pub fn foo() }` where
+                # `foo` has no `#[pyfunction]` of its own.
+                if (CONTAINER_ATTR != "") {
+                    # Escape :: for regex literal match.
+                    ca = CONTAINER_ATTR
+                    gsub(/:/, "\\:", ca)
+                    container_pat = "#\\[" ca "(\\]|\\()"
+                    if (match(line, container_pat)) {
+                        pending_method_scope = 1
+                        # Do not `next` — `#[napi]` on a struct is not an
+                        # impl block; we still want the normal attr/fn
+                        # scanning to run so per-function `#[napi]` items
+                        # continue to match. For `#[pymethods]`, the line
+                        # above this `impl` is the only one where the
+                        # attr appears, so `pending_method_scope` will be
+                        # consumed on the next non-empty line.
+                    }
+                }
+
+                # Track braces for the currently-open method-scope impl.
+                # When depth drops to 0, the scope closes.
+                if (in_method_scope_depth > 0) {
+                    o2 = gsub(/\{/, "{", line)
+                    c2 = gsub(/\}/, "}", line)
+                    in_method_scope_depth += (o2 - c2)
+                    if (in_method_scope_depth < 0) {
+                        in_method_scope_depth = 0
+                    }
+                }
+
+                # If a container attr was just seen and this line opens
+                # an `impl ... {` block, activate the method scope.
+                if (pending_method_scope && match(line, /^[[:space:]]*(unsafe[[:space:]]+)?impl[[:space:]]/)) {
+                    # Count opening and closing braces on the impl line.
+                    # Most `impl T {` lines have a single `{`, but the
+                    # macro form `#[pymethods] impl T { fn ... }` may
+                    # contain both on one line in edge cases — the net
+                    # balance is what matters.
+                    o3 = gsub(/\{/, "{", line)
+                    c3 = gsub(/\}/, "}", line)
+                    if (o3 > 0) {
+                        in_method_scope_depth = o3 - c3
+                        pending_method_scope = 0
+                        # Fall through — the impl line itself does not
+                        # declare a function, so no further work here.
+                    } else {
+                        # Attribute-impl-on-separate-lines shape:
+                        #   #[pymethods]
+                        #   impl PyScp
+                        #   {
+                        #       ...
+                        # The `{` lands on a later line; activate the
+                        # scope when we see it.
+                        in_method_scope_depth = -1
+                        pending_method_scope = 0
+                    }
+                    next
+                }
+                if (in_method_scope_depth < 0 && index(line, "{") > 0) {
+                    # Brace appeared on a line after the `impl` header —
+                    # promote to an active scope starting at depth 1.
+                    o4 = gsub(/\{/, "{", line)
+                    c4 = gsub(/\}/, "}", line)
+                    in_method_scope_depth = o4 - c4
+                    if (in_method_scope_depth < 1) {
+                        in_method_scope_depth = 1
+                    }
+                    next
+                }
+
+                # If the pending flag is set but this line is neither the
+                # container attr nor an impl opener, cancel it — the attr
+                # must be followed by an `impl` to open a method scope.
+                if (pending_method_scope && match(line, /^[[:space:]]*$/) == 0 && \
+                    match(line, /^[[:space:]]*#\[/) == 0) {
+                    pending_method_scope = 0
+                }
+
                 # Look for the bridge attribute. Match either the bare
                 # attribute (`#[pyfunction]`, `#[napi]`, `#[uniffi::export]`)
                 # or with arguments (`#[napi(...)]`, `#[pyo3(...)]`).
@@ -295,6 +419,17 @@ scan_bridge() {
                 # main attribute (e.g. pyo3 signature, napi(ts_return_type)).
                 if (saw_attr && match(line, /^[[:space:]]*#\[/)) {
                     next
+                }
+
+                # Inside an open method-scope impl (#[pymethods] / #[napi] /
+                # #[uniffi::export] on impl), every `fn` is attributed.
+                # Non-function lines inside the scope (doc comments,
+                # type aliases, impl bodies) do not trigger anything —
+                # we only light up `saw_attr` when the line is a fn
+                # signature start.
+                if (in_method_scope_depth > 0 && !saw_attr && \
+                    match(line, /^[[:space:]]*(pub[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/)) {
+                    saw_attr = 1
                 }
 
                 # Start of a function signature.
@@ -501,12 +636,10 @@ fn second(h: &PyContextHandle) -> PyResult<()> { Ok(()) }
 RUST
 
     local out
-    out=$(scan_bridge selftest "$fixture_dir" pyfunction pyscp_check_handle 2>/dev/null || true)
+    out=$(scan_bridge selftest "$fixture_dir" pyfunction pyscp_check_handle pymethods 2>/dev/null || true)
     local miss_count
     miss_count=$(printf '%s\n' "$out" | grep -c $'^MISS\t' || true)
     miss_count=${miss_count:-0}
-
-    rm -rf "$tmpdir"
 
     if [[ "$miss_count" -lt 2 ]]; then
         printf '%sinternal error:%s self-test of check-handle-affinity.sh\n' \
@@ -515,6 +648,48 @@ RUST
         printf '  the awk scan-state FIFO is broken; a neighbouring function\n' >&2
         printf '  is overwriting an earlier pending scan before MISS can fire.\n' >&2
         printf '  fixture output:\n%s\n' "$out" >&2
+        rm -rf "$tmpdir"
+        exit 2
+    fi
+
+    # ---------------------------------------------------------------------
+    # Second self-test: verify that methods inside a `#[pymethods] impl T`
+    # block with no per-method `#[pyfunction]` attribute are still scanned
+    # for the handle-affinity macro. Pre-fix, every `fullstack_*` method
+    # on `PyScp` escaped the gate because only the outer `#[pymethods]`
+    # wraps the impl; individual methods only carry `#[pyo3(name = ...)]`.
+    # ---------------------------------------------------------------------
+    local fixture2_dir="$tmpdir/fixture2"
+    mkdir -p "$fixture2_dir"
+    local fixture2_file="$fixture2_dir/fixture.rs"
+    cat > "$fixture2_file" <<'RUST'
+// Self-test fixture 2. A #[pymethods] impl with a method that accepts a
+// handle but does not call the macro. The outer #[pymethods] alone should
+// be enough for the gate to scan every fn inside.
+#[pymethods]
+impl PyScp {
+    #[pyo3(name = "does_work")]
+    pub fn does_work(&self, h: &PyContextHandle) -> PyResult<()> { Ok(()) }
+}
+RUST
+
+    local out2
+    out2=$(scan_bridge selftest2 "$fixture2_dir" pyfunction pyscp_check_handle pymethods 2>/dev/null || true)
+    local miss_count2
+    miss_count2=$(printf '%s\n' "$out2" | grep -c $'^MISS\t' || true)
+    miss_count2=${miss_count2:-0}
+
+    rm -rf "$tmpdir"
+
+    if [[ "$miss_count2" -lt 1 ]]; then
+        printf '%sinternal error:%s self-test 2 of check-handle-affinity.sh\n' \
+            "$C_RED" "$C_RESET" >&2
+        printf '  expected >=1 MISS line from the #[pymethods] fixture, got %d\n' "$miss_count2" >&2
+        printf '  the scanner is not tracking container-attr scope — methods\n' >&2
+        printf '  inside `#[pymethods] impl T { ... }` are silently skipped,\n' >&2
+        printf '  which means the outer `#[pymethods] impl PyScp` fullstack\n' >&2
+        printf '  helpers (#1549) escape the gate.\n' >&2
+        printf '  fixture output:\n%s\n' "$out2" >&2
         exit 2
     fi
 }
@@ -527,16 +702,16 @@ TMPDIR_RESULT=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_RESULT"' EXIT
 
 for entry in "${BRIDGES[@]}"; do
-    IFS='|' read -r bridge_name bridge_dir attr macro_name <<< "$entry"
+    IFS='|' read -r bridge_name bridge_dir attr macro_name container_attr <<< "$entry"
     out_file="$TMPDIR_RESULT/$bridge_name.out"
-    scan_bridge "$bridge_name" "$bridge_dir" "$attr" "$macro_name" > "$out_file"
+    scan_bridge "$bridge_name" "$bridge_dir" "$attr" "$macro_name" "$container_attr" > "$out_file"
 done
 
 # ---------------------------------------------------------------------------
 # Aggregate results
 # ---------------------------------------------------------------------------
 for entry in "${BRIDGES[@]}"; do
-    IFS='|' read -r bridge_name bridge_dir attr macro_name <<< "$entry"
+    IFS='|' read -r bridge_name bridge_dir attr macro_name container_attr <<< "$entry"
     out_file="$TMPDIR_RESULT/$bridge_name.out"
     [[ -s "$out_file" ]] || continue
 
