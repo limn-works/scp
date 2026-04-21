@@ -239,6 +239,12 @@ class RunnerClient:
         the first byte — a child that writes one byte and hangs will
         still trip the budget. Caps the accumulated buffer at `max_bytes`
         so a runner that never emits the terminator cannot OOM us.
+
+        Reads one byte at a time by design: the stdio streams we consume
+        do not support unread, so any chunk read that overshoots the
+        terminator would drop body bytes on the floor. Bounded by the
+        4-KiB `max_bytes` header cap, which caps worst-case syscalls
+        per header at that level.
         """
         read1 = getattr(stream, "read", None)
         if read1 is None:

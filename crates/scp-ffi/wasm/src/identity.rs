@@ -921,12 +921,18 @@ pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
             .into());
         }
 
-        // Validate the optional 32-byte seed at the FFI boundary. The
-        // seed path is always available (spec §3.2.1 mandates the
-        // two-key model; a deterministic seed lets every bridge derive
-        // byte-identical keys under the ADR-046 parity harness).
+        // The caller-supplied `seed` parameter is a parity-harness
+        // affordance (ADR-046), not a production API — mirrors how the
+        // other three bridges gate `signed_at_override` behind
+        // `testing`. Production WASM bundles reject any non-None seed
+        // with SCP-VALID-7007; the testing build consumes the 32 bytes
+        // to drive `StdRng::from_seed` below. Note this is independent
+        // of the spec §3.2.1 two-key model, which stays unconditional:
+        // the no-seed path still derives a distinct `#active` key from
+        // `OsRng` in every build.
         let seed_bytes: Option<[u8; 32]> = match seed.as_deref() {
             None => None,
+            #[cfg(feature = "testing")]
             Some(bytes) => Some(<[u8; 32]>::try_from(bytes).map_err(|_| {
                 ScpWasmError::Validation {
                     message: format!("seed must be exactly 32 bytes, got {}", bytes.len()),
@@ -934,6 +940,17 @@ pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
                 }
                 .into_js()
             })?),
+            #[cfg(not(feature = "testing"))]
+            Some(_) => {
+                return Err(ScpWasmError::Validation {
+                    message: "`seed` parameter requires the `testing` feature — not available \
+                              in production WASM builds"
+                        .to_owned(),
+                    code: codes::VALID_7007.to_owned(),
+                }
+                .into_js()
+                .into());
+            }
         };
 
         // Per spec §3.2.1, every SCP identity has two distinct Ed25519
@@ -951,27 +968,38 @@ pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
         // * Seed path — `StdRng::from_seed(seed)` consumed twice for 32
         //   bytes each, byte-identical to the other bridges under a
         //   shared seed (ADR-046 cross-bridge parity harness).
+        let random_two_key = || -> (ed25519_dalek::SigningKey, zeroize::Zeroizing<[u8; 32]>) {
+            let identity_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+            let active_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+            (identity_key, zeroize::Zeroizing::new(active_key.to_bytes()))
+        };
+        #[cfg(feature = "testing")]
         let (signing_key, active_signing_key_bytes): (
             ed25519_dalek::SigningKey,
             zeroize::Zeroizing<[u8; 32]>,
-        ) = seed_bytes.map_or_else(
-            || {
-                let identity_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-                let active_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-                (identity_key, zeroize::Zeroizing::new(active_key.to_bytes()))
-            },
-            |s| {
-                use rand::{RngCore, SeedableRng};
-                let mut rng = rand::rngs::StdRng::from_seed(s);
-                let mut identity_key_bytes = zeroize::Zeroizing::new([0u8; 32]);
-                rng.fill_bytes(identity_key_bytes.as_mut());
-                let identity_key = ed25519_dalek::SigningKey::from_bytes(&identity_key_bytes);
-                // Consume the next 32 bytes for the distinct #active key.
-                let mut active_bytes = zeroize::Zeroizing::new([0u8; 32]);
-                rng.fill_bytes(active_bytes.as_mut());
-                (identity_key, active_bytes)
-            },
-        );
+        ) = seed_bytes.map_or_else(random_two_key, |s| {
+            use rand::{RngCore, SeedableRng};
+            let mut rng = rand::rngs::StdRng::from_seed(s);
+            let mut identity_key_bytes = zeroize::Zeroizing::new([0u8; 32]);
+            rng.fill_bytes(identity_key_bytes.as_mut());
+            let identity_key = ed25519_dalek::SigningKey::from_bytes(&identity_key_bytes);
+            // Consume the next 32 bytes for the distinct #active key.
+            let mut active_bytes = zeroize::Zeroizing::new([0u8; 32]);
+            rng.fill_bytes(active_bytes.as_mut());
+            (identity_key, active_bytes)
+        });
+        #[cfg(not(feature = "testing"))]
+        let (signing_key, active_signing_key_bytes): (
+            ed25519_dalek::SigningKey,
+            zeroize::Zeroizing<[u8; 32]>,
+        ) = {
+            // `seed_bytes` is guaranteed `None` here — the testing-gate
+            // match above returns early for any `Some(_)` on non-testing
+            // builds. Silence the unused binding without disturbing the
+            // shared control flow.
+            let _ = seed_bytes;
+            random_two_key()
+        };
         let verifying_key = signing_key.verifying_key();
         let pub_bytes = verifying_key.to_bytes();
 
@@ -3039,6 +3067,11 @@ mod tests {
     /// `entry.public_key_bytes` unconditionally, causing signatures
     /// produced with the active signing key to fail verification under
     /// the parity-harness seed path (ADR-046).
+    ///
+    /// Gated on `testing` because the seeded `StdRng` construction
+    /// depends on the `rand` crate, which is `optional = true` and only
+    /// pulled in under the `testing` feature.
+    #[cfg(feature = "testing")]
     #[test]
     fn test_sign_verify_active_roundtrip_seeded() {
         use ed25519_dalek::{Signature, Verifier};

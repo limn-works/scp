@@ -1082,11 +1082,25 @@ impl ContextPersistence for ArcContextPersistence {
 /// Constructs a persistent [`MerkleEventLogProvider`] backed by the global
 /// storage provider if initialized, or a non-persistent one otherwise.
 ///
-/// Mirrors `scp-ffi-napi`'s `build_event_log_provider` (see
-/// `crates/scp-ffi/napi/src/runtime.rs`). The persistent provider writes event
-/// entries to encrypted in-memory storage via `ProtocolRepositoryEventLogBridge`,
-/// so `ContextCreated` (appended by `builder_create_context`) survives across
-/// manager calls and is visible to `py_event_log_query`.
+/// This is NOT a direct reuse of
+/// `scp-ffi-common::bridge_runtime::build_event_log_provider` — that common
+/// fn owns its own storage (creates a fresh `BridgeInMemoryStorage` +
+/// `ProtocolRepository` and returns both) so the NAPI / `UniFFI` bridges can
+/// keep the repository handle around for later queries. The `PyO3` bridge
+/// instead reads from `DEFAULT_BRIDGE_INSTANCE.storage_provider()` so the
+/// event log shares storage with every other per-context data sink
+/// (identity state, protocol repository, blobs) — one backend per bridge
+/// instance, switchable between `InMemoryEncrypted` and `Sqlite` at init
+/// time. Collapsing the two would force the `PyO3` bridge to duplicate its
+/// storage or force the common fn to grow a storage-provider parameter,
+/// both of which cost more than the current 30-line duplication. See
+/// `.claude/memory/feedback_dedup_bridge_validators.md` for the dedup
+/// heuristic and when to break it.
+///
+/// The persistent provider writes event entries to encrypted in-memory
+/// storage via `ProtocolRepositoryEventLogBridge`, so `ContextCreated`
+/// (appended by `builder_create_context`) survives across manager calls
+/// and is visible to `py_event_log_query`.
 ///
 /// This replaced `NoOpEventLogProvider` so that the `PyO3` bridge emits the
 /// same initial `ContextCreated` event as the NAPI, WASM, and `UniFFI`

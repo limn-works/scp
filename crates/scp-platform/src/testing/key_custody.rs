@@ -74,35 +74,26 @@ impl KeyStore {
 /// See ADR-006 in `.docs/adrs/phase-1.md`.
 pub struct InMemoryKeyCustody {
     store: Mutex<KeyStore>,
-    rng: Mutex<Box<dyn RngCore + Send>>,
+    // Trait-object RNG that preserves the `CryptoRng` marker across the
+    // `Box<dyn ...>` boundary. Both constructors (`new` from `OsRng`,
+    // `from_seed_bytes` from `StdRng::from_seed`) only accept RNGs that
+    // are `CryptoRng + RngCore + Send`, so the marker is upheld at
+    // every call site.
+    rng: Mutex<Box<dyn SecureRng>>,
     next_id: AtomicU64,
 }
 
-/// A type-erased RNG that is both `RngCore` and `CryptoRng`.
+/// Composite trait combining [`RngCore`], [`CryptoRng`], and [`Send`].
 ///
-/// Needed because `rand::rngs::StdRng` implements `CryptoRng` but we store
-/// a `Box<dyn RngCore + Send>` for flexibility. This wrapper preserves the
-/// `CryptoRng` marker for the seedable path while the non-seeded path uses
-/// `rand::rngs::OsRng` (which is also `CryptoRng`).
-struct CryptoRngWrapper<R: RngCore + CryptoRng + Send>(R);
+/// The `Box<dyn SecureRng>` held by [`InMemoryKeyCustody`] is a
+/// trait-object RNG. A bare `Box<dyn RngCore + Send>` would lose the
+/// [`CryptoRng`] marker at the trait-object boundary — consumers of
+/// the boxed RNG would see only [`RngCore`]. This composite trait
+/// keeps both markers observable through erasure, and the blanket
+/// impl covers every concrete RNG that already satisfies the bound.
+trait SecureRng: RngCore + CryptoRng + Send {}
 
-impl<R: RngCore + CryptoRng + Send> RngCore for CryptoRngWrapper<R> {
-    fn next_u32(&mut self) -> u32 {
-        self.0.next_u32()
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.0.next_u64()
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        self.0.fill_bytes(dest);
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
-        self.0.try_fill_bytes(dest)
-    }
-}
+impl<R: RngCore + CryptoRng + Send + ?Sized> SecureRng for R {}
 
 impl InMemoryKeyCustody {
     /// Creates a new in-memory key custody with a cryptographically secure RNG.
@@ -110,7 +101,7 @@ impl InMemoryKeyCustody {
     pub fn new() -> Self {
         Self {
             store: Mutex::new(KeyStore::new()),
-            rng: Mutex::new(Box::new(CryptoRngWrapper(rand::rngs::OsRng))),
+            rng: Mutex::new(Box::new(rand::rngs::OsRng)),
             next_id: AtomicU64::new(1),
         }
     }
@@ -140,7 +131,7 @@ impl InMemoryKeyCustody {
         let rng = rand::rngs::StdRng::from_seed(seed);
         Self {
             store: Mutex::new(KeyStore::new()),
-            rng: Mutex::new(Box::new(CryptoRngWrapper(rng))),
+            rng: Mutex::new(Box::new(rng)),
             next_id: AtomicU64::new(1),
         }
     }

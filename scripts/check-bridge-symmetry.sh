@@ -254,59 +254,110 @@ collect_fn_names_from_file() {
         return (s ~ /fn[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*[(<]/)
     }
 
-    function is_test_gated_cfg_segment(seg) {
-        # Returns 1 iff the cfg(...) payload in `seg` is satisfied ONLY when
-        # `test` is enabled. Mirrors the Rust `meta_is_test_gated` walker:
-        #   • `cfg(test)` / `cfg(any(test, ...))` / `cfg(all(test, ...))` → 1.
-        #   • `cfg(not(test))` / `cfg(all(not(test), ...))` → 0.
-        #   • Anything with `test` appearing ONLY inside a `not(...)` → 0.
-        # Parses the nested parentheses character by character, tracking a
-        # per-depth "under_not" flag stack. Returns 1 on the first bare `test`
-        # token whose enclosing stack has no `not(...)` ancestor.
+    function is_test_gated_cfg_segment(seg,    ng, depth, ch, cur_ident, i, j, n_children, gr, any_not, limit) {
+        # Returns 1 iff the cfg(...) payload in seg is satisfied ONLY when
+        # test is enabled. Fold semantics per group (rustc-equivalent):
+        #   cfg(X)    -> test-gated iff X is test-gated.
+        #   all(A, B) compiles iff A && B; test-gated iff ANY child is
+        #             test-gated (a single test-gated predicate forces
+        #             the conjunction to require test).
+        #   any(A, B) compiles iff A || B; test-gated iff EVERY child is
+        #             test-gated (any non-test child could activate the
+        #             item in production via the disjunction).
+        #   not(X)    conservatively NOT test-gated.
+        #   bare test -> test-gated (when not inside a not(...) group).
+        # Counter-example the older any-everywhere walker misclassified:
+        #   #[cfg(all(any(feature = "x", test), not(test)))]
+        # is production-only, but the naked test inside the inner any
+        # propagates up and marks the item test-gated. Splitting the fold
+        # by group op fixes it.
+        # Implementation: iterate chars, maintain a stack of open groups
+        # keyed by depth. On "(" push a new frame; on ")" fold the frame
+        # with its op and push the result as a child of the parent frame.
+        # _cfg_op[depth], _cfg_count[depth], _cfg_res[depth SUBSEP idx].
         ng = length(seg)
         depth = 0
-        # stack[d] = 1 iff the group at depth `d` is a `not(` group.
-        # stack[0] is the top-level cfg(...) itself — never a not-group.
-        stack[0] = 0
+        _cfg_op[0] = "cfg"
+        _cfg_count[0] = 0
         cur_ident = ""
+        split("", _cfg_res)
         i = 1
-        while (i <= ng) {
-            ch = substr(seg, i, 1)
-            if (ch ~ /[A-Za-z0-9_]/) {
+        limit = ng + 1
+        while (i <= limit) {
+            if (i <= ng) {
+                ch = substr(seg, i, 1)
+            } else {
+                ch = ")"
+            }
+            if (i <= ng && ch ~ /[A-Za-z0-9_]/) {
                 cur_ident = cur_ident ch
-                i++
+                i = i + 1
                 continue
             }
-            # End of identifier: check if it opens a group.
             if (ch == "(") {
-                depth++
-                stack[depth] = (cur_ident == "not") ? 1 : 0
+                depth = depth + 1
+                _cfg_op[depth] = cur_ident
+                _cfg_count[depth] = 0
                 cur_ident = ""
-                i++
+                i = i + 1
                 continue
             }
-            # Any other delimiter: emit the identifier if present.
-            if (cur_ident == "test") {
-                # Is any ancestor group a `not(...)`?
-                any_not = 0
-                for (d = 1; d <= depth; d++) {
-                    if (stack[d]) { any_not = 1; break }
+            if (cur_ident != "") {
+                gr = 0
+                if (cur_ident == "test") {
+                    any_not = 0
+                    for (j = 1; j <= depth; j = j + 1) {
+                        if (_cfg_op[j] == "not") {
+                            any_not = 1
+                            break
+                        }
+                    }
+                    if (any_not == 0) {
+                        gr = 1
+                    }
                 }
-                if (!any_not) { return 1 }
+                _cfg_count[depth] = _cfg_count[depth] + 1
+                _cfg_res[depth SUBSEP _cfg_count[depth]] = gr
+                cur_ident = ""
             }
-            cur_ident = ""
             if (ch == ")") {
-                if (depth > 0) { depth-- }
+                if (depth == 0) {
+                    i = i + 1
+                    continue
+                }
+                n_children = _cfg_count[depth]
+                if (n_children == 0) {
+                    gr = 0
+                } else if (_cfg_op[depth] == "any") {
+                    gr = 1
+                    for (j = 1; j <= n_children; j = j + 1) {
+                        if (_cfg_res[depth SUBSEP j] == 0) {
+                            gr = 0
+                            break
+                        }
+                    }
+                } else if (_cfg_op[depth] == "not") {
+                    gr = 0
+                } else {
+                    gr = 0
+                    for (j = 1; j <= n_children; j = j + 1) {
+                        if (_cfg_res[depth SUBSEP j] == 1) {
+                            gr = 1
+                            break
+                        }
+                    }
+                }
+                for (j = 1; j <= n_children; j = j + 1) {
+                    delete _cfg_res[depth SUBSEP j]
+                }
+                depth = depth - 1
+                _cfg_count[depth] = _cfg_count[depth] + 1
+                _cfg_res[depth SUBSEP _cfg_count[depth]] = gr
             }
-            i++
+            i = i + 1
         }
-        # Trailing identifier (rare; seg ends with `)]` normally).
-        if (cur_ident == "test") {
-            any_not = 0
-            for (d = 1; d <= depth; d++) {
-                if (stack[d]) { any_not = 1; break }
-            }
-            if (!any_not) { return 1 }
+        if (_cfg_count[0] >= 1 && _cfg_res[0 SUBSEP 1] == 1) {
+            return 1
         }
         return 0
     }
@@ -366,10 +417,22 @@ collect_fn_names_from_file() {
             gsub(/fn[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*[(<]/, " ", code)
             pending_cfg_test = 0
         } else if (!blank && pending_cfg_test) {
-            # Non-empty line without matching mod/impl/fn — annotation applied
-            # to something else (e.g. a use, const, static). Clear pending
-            # unless it was itself another #[cfg(...)].
-            if (code !~ /#\[cfg\(/) {
+            # Non-empty line without matching mod/impl/fn — if the line is
+            # another attribute (#[doc = "..."], #[allow(...)], #[inline],
+            # #[must_use], #[derive(...)], #[cfg_attr(...)], etc.), keep
+            # `pending_cfg_test` alive across it: rustfmt often emits
+            #
+            #     #[cfg(test)]
+            #     #[allow(dead_code)]
+            #     fn foo() {}
+            #
+            # and the syn + tree-sitter walkers correctly collect every
+            # preceding attribute when deciding whether `foo` is test-gated.
+            # Only clear `pending_cfg_test` when we reach a non-attribute
+            # non-mod/impl/fn line — at that point the attribute landed on
+            # something else (a `use`, `const`, `static`, `struct` etc.)
+            # and must not leak onto the next fn.
+            if (code !~ /^[ \t]*#!?\[/) {
                 pending_cfg_test = 0
             }
         }

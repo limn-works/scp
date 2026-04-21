@@ -166,27 +166,30 @@ def _cfg_predicate_is_test_gated(token_tree: Node, source: bytes) -> bool:
 
     ``token_tree`` is the tree-sitter node for the parenthesised argument of
     ``cfg(...)`` — i.e. the child of an ``attribute`` whose identifier is
-    ``cfg``. Walk its children tracking ``under_not`` context:
+    ``cfg``. The predicate is "test-gated" iff it implies ``test`` (the item
+    is compiled ONLY when ``test`` is on). Semantics:
 
-    - bare ``test`` identifier NOT under ``not(...)`` -> test-gated (True).
-    - ``all(...)`` / ``any(...)`` -> recurse into inner token_tree with the
-      same ``under_not`` context; any test-positive child makes the whole
-      predicate test-gated.
+    - bare ``test`` identifier NOT under ``not(...)`` -> test-gated.
+    - ``all(A, B)`` compiles iff ``A && B`` -> test-gated iff ANY child is
+      test-gated (a single test-gated predicate forces the conjunction).
+    - ``any(A, B)`` compiles iff ``A || B`` -> test-gated iff EVERY child is
+      test-gated (any non-test child could activate the item in production).
     - ``not(...)`` -> recurse with ``under_not`` flipped. A bare ``test``
       inside ``not(...)`` means "compile when NOT under cfg(test)" — i.e.
       production-only — so do NOT report test-gated.
     - any other identifier / token is ignored (platform flags, features).
 
-    This is intentionally a strict reader of ``cfg`` semantics: naive
-    substring search treats ``#[cfg(not(test))]`` as test-gated, silently
-    skipping production-only items from call-invariant enforcement — the
-    bug MINOR-1 was filed for.
+    Conflating ``all`` and ``any`` with a single ``.any()`` fold misclassifies
+    patterns like ``cfg(all(any(feature = "x", test), not(test)))`` — which is
+    production-only — as test-gated, silently excluding production fns from
+    call-invariant enforcement. MINOR-1 filed for the old naive scanner.
     """
 
-    def walk(tt: Node, under_not: bool) -> bool:
-        # Iterate the immediate children of a token_tree, looking for
-        # identifiers and nested token_trees. Parentheses/commas are
-        # skipped as structural tokens.
+    def walk(tt: Node, under_not: bool, op: str) -> bool:
+        # Collect each child-predicate's test-gated status, then fold
+        # with the outer op (``any`` for the implicit top-level / ``all``
+        # context, ``all`` for an explicit ``any(...)``).
+        child_results: list[bool] = []
         i = 0
         children = tt.children
         while i < len(children):
@@ -211,29 +214,38 @@ def _cfg_predicate_is_test_gated(token_tree: Node, source: bytes) -> bool:
                 )
                 if nested is not None:
                     if name == "not":
-                        if walk(nested, not under_not):
-                            return True
-                    elif name in ("all", "any"):
-                        if walk(nested, under_not):
-                            return True
-                    # Unknown predicate keyword with args (e.g. cfg_attr):
-                    # skip — we're only interpreting standard cfg syntax.
+                        # `not(...)` is satisfied iff its inner is not,
+                        # so it implies `test` only if the inner is a
+                        # contradiction — we conservatively never
+                        # classify `not(...)` as test-gated.
+                        child_results.append(walk(nested, not under_not, "all"))
+                    elif name == "all":
+                        child_results.append(walk(nested, under_not, "all"))
+                    elif name == "any":
+                        child_results.append(walk(nested, under_not, "any"))
+                    else:
+                        # Unknown predicate keyword with args (e.g. cfg_attr):
+                        # skip — we're only interpreting standard cfg syntax.
+                        pass
                     i = j + 1
                     continue
-                if name == "test" and not under_not:
-                    return True
-                # Bare identifier like ``unix``, ``windows``, ``test`` under
-                # ``not(...)`` — not test-gated in this position.
+                # Bare identifier: test-gated only if it is literally
+                # `test` and we are NOT inside a `not(...)`.
+                child_results.append(name == "test" and not under_not)
             elif child.type == "token_tree":
                 # Stray nested token_tree with no leading identifier —
                 # recurse defensively so pathological trees don't hide a
-                # ``test`` identifier.
-                if walk(child, under_not):
-                    return True
+                # `test` identifier. Inherit the outer op.
+                child_results.append(walk(child, under_not, op))
             i += 1
-        return False
+        if not child_results:
+            return False
+        return all(child_results) if op == "any" else any(child_results)
 
-    return walk(token_tree, under_not=False)
+    # Top-level cfg(...) is an implicit conjunction (it carries a single
+    # predicate; if that predicate is a bare `test`, the conjunction is
+    # trivially test-gated — matching `all(...)` fold semantics).
+    return walk(token_tree, under_not=False, op="all")
 
 
 def _attribute_is_test_cfg(attr_item: Node, source: bytes) -> bool:

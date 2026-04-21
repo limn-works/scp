@@ -165,6 +165,22 @@ pub async fn scpid_sign(
     // current wall-clock time. The override must still fall within the
     // challenge window `[issued_at, expires_at]` to produce a response a
     // relying-party would accept.
+    //
+    // `signed_at_override` is a parity-harness affordance (ADR-046),
+    // gated behind `feature = "testing"` at the runtime layer so direct
+    // consumers (scp-mcp, scp-node, scp-media, scp-transport, rust-
+    // client scaffolds) cannot supply it in production builds. The FFI
+    // bridges layer their own rejection for defence-in-depth (see
+    // `scp-ffi/src/scpid.rs`, `scp-ffi/napi/src/scpid.rs`,
+    // `scp-ffi/uniffi/src/bridge.rs`, `scp-ffi/wasm/src/scpid.rs`).
+    #[cfg(not(feature = "testing"))]
+    if signed_at_override.is_some() {
+        return Err(ScpIdError::InvalidInput(
+            "signed_at_override requires the scp-runtime `testing` feature — \
+             not available in production builds"
+                .to_owned(),
+        ));
+    }
     let signed_at = if let Some(override_ms) = signed_at_override {
         if override_ms < challenge.issued_at || override_ms > challenge.expires_at {
             return Err(ScpIdError::InvalidInput(format!(

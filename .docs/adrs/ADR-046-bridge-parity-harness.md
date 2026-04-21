@@ -260,6 +260,38 @@ endpoint. Overkill for the problem.
   `expected_values` golden-value pin; any future divergence is caught
   byte-exactly.
 
+## Threat model — test-only env var forwarding
+
+The Kotlin and Swift runners need the UniFFI cdylib on the system
+library path so JNA (Kotlin) and dyld (Swift) can load it. CI
+accomplishes this by exporting `LD_LIBRARY_PATH` (Linux, Kotlin) and
+`DYLD_FALLBACK_LIBRARY_PATH` / `DYLD_LIBRARY_PATH` (macOS, Swift) to
+`${{ github.workspace }}/target/debug` (or the Swift `.build/.../debug`
+equivalent) before spawning the runner subprocess, and the harness
+propagates those values through `subprocess.Popen(env=...)`. This is a
+deliberate test-time affordance, not a production pattern:
+
+* **Scope.** The variables are set only in the parity CI jobs and in
+  the harness subprocess environment — they are never exported to
+  user-facing SDK code, to `scp-node` / `scp-relay` binaries, or to
+  any application that consumes the bridges. `bindings/swift`'s
+  production XCFramework path loads the cdylib from inside the
+  framework bundle, not via `DYLD_*`.
+* **Known risk.** `DYLD_*_LIBRARY_PATH` is the canonical dylib-hijack
+  vector on macOS: a writable directory prepended to the path can
+  cause a fake `libfoo.dylib` to load ahead of the real one. The risk
+  is bounded here because (a) the CI runner populates the path to the
+  exact `target/debug` directory the same workflow just produced, and
+  (b) no other process in the CI job writes to that directory between
+  build and runner spawn. A compromised-CI scenario could exploit
+  this — the same scenario could trivially replace `cargo` itself,
+  so the marginal risk added by the env var is zero.
+* **Why not an alternative.** `install_name_tool -rpath` or moving the
+  cdylib into `$HOME/.local/lib` would sidestep the env var but add
+  platform-specific fragility that bloats the parity matrix. The scope
+  of the risk vs. the cost of the workaround favours the current
+  design, documented here for future auditors.
+
 ## Future work
 
 - Expand the op library to cover more surface area (broadcast publish/

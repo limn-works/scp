@@ -465,6 +465,53 @@ private suspend fun opTransportStatus(args: JsonObject): JsonObject {
     }
 }
 
+// Shape-valid `did:dht:z…` DID guaranteed NOT to be in any bridge's
+// identity registry. Mirrors
+// `seed_operations.py::FAKE_UNREGISTERED_DID` and
+// `node_bridge_runner.ts::FAKE_UNREGISTERED_DID` — MUST match byte-for-byte
+// so the parity harness lines every bridge up against the same input.
+private const val FAKE_UNREGISTERED_DID =
+    "did:dht:znever1never1never1never1never1never1never1never1never1never1neva"
+
+@Suppress("UnusedParameter")
+private suspend fun opUnregisteredDidRejected(args: JsonObject): JsonObject {
+    // UniFFI `scpidSign` takes an opaque `Identity` handle, not a DID
+    // string, so it never performs the bridge-local registry lookup
+    // the PyO3/NAPI/WASM bridges use to detect an unregistered DID.
+    // Instead, we exercise the SAME error code via `identityResolve`:
+    // the fake DID's 64-char zbase32 suffix decodes to 40 bytes, which
+    // fails `DidDht::extract_public_key`'s 32-byte check locally (no
+    // DHT round-trip). That `IdentityError::InvalidDidFormat` is
+    // surfaced by the bridge's blanket `From<IdentityError>` mapping
+    // (crates/scp-ffi/uniffi/src/bridge.rs) as SCP-IDENT-1001 — the
+    // same code the other bridges emit on registry miss. See the
+    // docstring block on `OP_UNREGISTERED_DID_REJECTED` in
+    // `seed_operations.py` for the full rationale.
+    return try {
+        uniffi.scp.identityResolve(FAKE_UNREGISTERED_DID)
+        buildJsonObject {
+            put(
+                "error",
+                buildJsonObject {
+                    put("type", JsonPrimitive("none"))
+                    put("code", JsonPrimitive("NONE"))
+                }
+            )
+        }
+    } catch (e: Throwable) {
+        val message = e.message ?: e.toString()
+        buildJsonObject {
+            put(
+                "error",
+                buildJsonObject {
+                    put("type", JsonPrimitive(e::class.simpleName ?: "Exception"))
+                    put("code", JsonPrimitive(extractScpCode(message)))
+                }
+            )
+        }
+    }
+}
+
 @Suppress("UnusedParameter")
 private suspend fun opEventLogQueryFiltered(args: JsonObject): JsonObject {
     val filter = args["filter"]?.jsonObject ?: buildJsonObject {
@@ -564,6 +611,7 @@ private suspend fun dispatch(req: RawRequest): String {
             "ucan_validate_malformed" -> opUcanValidateMalformed(req.args)
             "transport_status" -> opTransportStatus(req.args)
             "event_log_query_filtered" -> opEventLogQueryFiltered(req.args)
+            "unregistered_did_rejected" -> opUnregisteredDidRejected(req.args)
             else -> return errResponse(
                 req.id,
                 type = "UnknownOp",

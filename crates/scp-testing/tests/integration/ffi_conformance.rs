@@ -321,20 +321,36 @@ fn meta_is_test_gated(meta: &syn::Meta, under_not: bool) -> bool {
                     };
                     nested.iter().any(|m| meta_is_test_gated(m, !under_not))
                 }
-                Some("all" | "any") => {
+                Some(op @ ("all" | "any")) => {
                     let Ok(nested) = list.parse_args_with(
                         syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
                     ) else {
                         return false;
                     };
-                    // For both `all(...)` and `any(...)`, if any child is
-                    // test-gated (in the non-negated sense) the item is
-                    // test-only for our scan. Rationale: if `test` ever
-                    // appears as a non-negated predicate, the item becomes
-                    // active when test is on. We treat "activates under test"
-                    // as "test-only code" — matches shell scanner intent and
-                    // avoids emitting phantom fn names from test gadgets.
-                    nested.iter().any(|m| meta_is_test_gated(m, under_not))
+                    // "test-gated" here means "the item is compiled ONLY when
+                    // test is on" — i.e., the cfg predicate implies `test`.
+                    //
+                    // * `all(A, B)` compiles iff `A && B`. The item is
+                    //   test-only iff ANY child implies test — because a
+                    //   single test-gated predicate forces the whole
+                    //   conjunction to require test.
+                    // * `any(A, B)` compiles iff `A || B`. The item is
+                    //   test-only iff EVERY child implies test — because
+                    //   any non-test predicate could activate the item in
+                    //   production via the disjunction.
+                    //
+                    // Counter-example the wrong choice misclassifies:
+                    //   `#[cfg(all(any(feature = "x", test), not(test)))]`
+                    // is production-only, but with `.any()` on `any(...)`
+                    // the inner disjunction reports test-gated, which then
+                    // propagates through the outer `all`. Splitting by op
+                    // makes the walker rustc-equivalent for these layered
+                    // patterns.
+                    if op == "all" {
+                        nested.iter().any(|m| meta_is_test_gated(m, under_not))
+                    } else {
+                        nested.iter().all(|m| meta_is_test_gated(m, under_not))
+                    }
                 }
                 _ => false,
             }
