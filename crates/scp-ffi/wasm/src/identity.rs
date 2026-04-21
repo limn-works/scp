@@ -2942,9 +2942,18 @@ pub(crate) mod test_helpers {
     ///
     /// The spec §3.2.1 two-key invariant is now type-enforced via
     /// [`IdentityRecord::Local`], so this helper generates a distinct
-    /// `#active` key alongside `#0` and `#agent`.
-    pub fn register_identity_with_agent_key()
-    -> (String, ed25519_dalek::SigningKey, ed25519_dalek::SigningKey) {
+    /// `#active` key alongside `#0` and `#agent`. Returns the four-tuple
+    /// `(did, identity_key, active_key, agent_key)` — tests that need
+    /// to sign as `#active` must use `active_key`, not `identity_key`,
+    /// because the registered record carries a distinct active key that
+    /// `sign_with_identity("#active", …)` and `verify_token_signature`
+    /// both resolve through.
+    pub fn register_identity_with_agent_key() -> (
+        String,
+        ed25519_dalek::SigningKey,
+        ed25519_dalek::SigningKey,
+        ed25519_dalek::SigningKey,
+    ) {
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
         let pub_bytes = signing_key.verifying_key().to_bytes();
         let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
@@ -2964,7 +2973,7 @@ pub(crate) mod test_helpers {
                 },
             );
         });
-        (did, signing_key, agent_key)
+        (did, signing_key, active_key, agent_key)
     }
 
     /// Clean up the identity registry (prevents cross-test pollution from

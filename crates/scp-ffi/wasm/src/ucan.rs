@@ -1132,7 +1132,7 @@ mod tests {
     fn e2e_agent_signed_category_a_rejected_after_real_signature_verification() {
         crate::identity::test_helpers::cleanup_identity_registry();
 
-        let (did, _identity_key, agent_key) =
+        let (did, _identity_key, _active_key, agent_key) =
             crate::identity::test_helpers::register_identity_with_agent_key();
 
         let context_id = "test-ctx-e2e-catA";
@@ -1180,7 +1180,7 @@ mod tests {
     fn e2e_agent_signed_category_b_passes_signature_and_category_a_check() {
         crate::identity::test_helpers::cleanup_identity_registry();
 
-        let (did, _identity_key, agent_key) =
+        let (did, _identity_key, _active_key, agent_key) =
             crate::identity::test_helpers::register_identity_with_agent_key();
 
         let context_id = "test-ctx-e2e-catB";
@@ -1233,7 +1233,7 @@ mod tests {
     fn e2e_active_key_signed_category_a_passes_category_a_check() {
         crate::identity::test_helpers::cleanup_identity_registry();
 
-        let (did, identity_key, _agent_key) =
+        let (did, _identity_key, active_key, _agent_key) =
             crate::identity::test_helpers::register_identity_with_agent_key();
 
         let context_id = "test-ctx-e2e-active";
@@ -1252,7 +1252,12 @@ mod tests {
             fct: Some(serde_json::json!({"scp_key_scope": "#active"})),
         };
 
-        let jwt = build_signed_ucan(&header, &payload, &identity_key);
+        // Sign with the distinct `#active` key (spec §3.2.1); the
+        // verifier resolves `kid: "#active"` to this key. Signing with
+        // `identity_key` (`#0`) here would produce a signature the
+        // verifier rejects — which is the whole point of the two-key
+        // model becoming a type-enforced invariant in `IdentityRecord`.
+        let jwt = build_signed_ucan(&header, &payload, &active_key);
         let parsed = parse_ucan(&jwt).expect("JWT should parse");
         verify_token_signature(&parsed).expect("real Ed25519 signature must verify");
 
@@ -1285,7 +1290,7 @@ mod tests {
     fn e2e_invalid_signature_rejected_before_category_a() {
         crate::identity::test_helpers::cleanup_identity_registry();
 
-        let (did, _identity_key, agent_key) =
+        let (did, _identity_key, _active_key, agent_key) =
             crate::identity::test_helpers::register_identity_with_agent_key();
 
         let context_id = "test-ctx-e2e-badsig";
@@ -1335,7 +1340,7 @@ mod tests {
     fn e2e_all_category_a_resources_rejected_for_agent_key() {
         crate::identity::test_helpers::cleanup_identity_registry();
 
-        let (did, _identity_key, agent_key) =
+        let (did, _identity_key, _active_key, agent_key) =
             crate::identity::test_helpers::register_identity_with_agent_key();
 
         let context_id = "test-ctx-e2e-allcatA";
