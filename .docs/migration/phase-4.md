@@ -101,11 +101,12 @@ still running at the deadline is forcibly cancelled via
 - **Kotlin** — `scp.shutdown(timeoutMillis = 5_000uL)` from inside a
   coroutine.
 
-The timeout-integer widths differ across bridges intentionally — NAPI
-used `u32` historically and is now `u64` (#1692); UniFFI and PyO3 are
-`u64`. The SDK wrappers clamp to each bridge's representable range,
-treating out-of-range or non-finite inputs as "wait forever within the
-bridge's range". See ADR-048 § "Shutdown-timeout integer width across FFI
+All three non-WASM FFI bridges carry `shutdown(timeout)` as `u64`
+milliseconds uniformly (NAPI was widened from `u32` in #1692). The SDK
+wrappers clamp non-finite or out-of-range inputs to a safe cap at the
+boundary — TypeScript uses `Number.MAX_SAFE_INTEGER`, Swift uses a
+`Double` range check, Python/Kotlin rely on their native 64-bit integer
+types. See ADR-048 § "Shutdown-timeout integer width across FFI
 bridges".
 
 ### 4. `StorageConfig::Sqlite { path, key }` (#1491, #1260)
