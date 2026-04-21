@@ -7,23 +7,31 @@
  * ## Quick start
  *
  * ```typescript
- * import { Identity, Context, Transport } from "@limn-works/scp-ts";
+ * import { SCP, Identity, Context } from "@limn-works/scp-ts";
  *
- * const identity = await Identity.create({ custody: "in_memory" });
+ * const scp = new SCP();
+ * try {
+ *   const identity = await Identity.create(scp, { custody: "in_memory" });
  *
- * await using ctx = await Context.create(identity, {
- *   ceiling: ["messages:read", "messages:write"],
- *   memoryScope: "ephemeral",
- * });
+ *   await using ctx = await Context.create(identity, {
+ *     ceiling: ["messages:read", "messages:write"],
+ *     memoryScope: "ephemeral",
+ *   });
  *
- * await ctx.send("hello world");
+ *   await ctx.send("hello world");
  *
- * for await (const msg of ctx.receive()) {
- *   console.log(msg.senderDid, msg.content);
+ *   for await (const msg of ctx.receive()) {
+ *     console.log(msg.senderDid, msg.content);
+ *     break;
+ *   }
+ * } finally {
+ *   await scp.shutdown(5);
  * }
  * ```
  *
- * See ADR-022 in `.docs/adrs/phase-4.md` and `.docs/scaffold/typescript.md`.
+ * See ADR-022 in `.docs/adrs/phase-4.md`, ADR-048
+ * (`.docs/adrs/ADR-048-scp-multi-instance.md`), and
+ * `.docs/scaffold/typescript.md`.
  *
  * @packageDocumentation
  */
