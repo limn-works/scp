@@ -197,7 +197,7 @@ fn append_consequence_event(
 /// `clippy::too_many_arguments` budget while preserving the explicit
 /// names that callers (`messaging.rs`, `tools.rs`, `governance.rs`,
 /// the periodic timer) need at construction time.
-pub(super) struct EnforceConsequencesCtx<'a> {
+pub struct EnforceConsequencesCtx<'a> {
     pub context_id: &'a str,
     pub member_did: &'a DID,
     pub now: u64,
@@ -228,7 +228,7 @@ pub(super) struct EnforceConsequencesCtx<'a> {
 /// non-repudiation gap; the durable log is the system of record). The
 /// receive buffer pushes remain because they are still useful for
 /// in-session SDK observation.
-pub(super) fn enforce_triggered_consequences(
+pub fn enforce_triggered_consequences(
     ctx: &mut PerContextState,
     args: &EnforceConsequencesCtx<'_>,
 ) {
@@ -683,7 +683,7 @@ const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
 /// not the raw `scp_event_log::Event` that consequence rules consume. The
 /// conversion is done here, bridging the gap between the two formats.
 #[allow(clippy::too_many_lines)]
-pub(super) fn event_log_entries_for_consequences(
+pub fn event_log_entries_for_consequences(
     ctx: &PerContextState,
     context_id: &str,
     now: u64,

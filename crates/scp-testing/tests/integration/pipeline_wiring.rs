@@ -26,6 +26,13 @@
 const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/manager/economy.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/messaging.rs"),
+    // Commit 12b.1 of ADR-049 hoisted six private helpers out of
+    // `manager/messaging.rs` into `context/messaging_helpers.rs`. The
+    // pipeline-wiring assertions below still need to see those helper
+    // bodies (they assert spec-required calls inside e.g.
+    // `build_encrypted_envelope`, `enforce_send_economy`), so the new
+    // free-function module is concatenated into MANAGER_SRC here.
+    include_str!("../../../../crates/scp-runtime/src/context/messaging_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/broadcast.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/governance.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/lifecycle.rs"),

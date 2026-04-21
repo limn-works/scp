@@ -66,10 +66,10 @@ use tracing::instrument;
 use zeroize::Zeroizing;
 
 mod broadcast;
-mod economy;
-mod governance;
+pub(crate) mod economy;
+pub(crate) mod governance;
 mod lifecycle;
-mod messaging;
+pub(crate) mod messaging;
 mod queries;
 pub(crate) mod standing;
 mod tools;
@@ -993,11 +993,11 @@ pub(crate) struct GovernanceState {
     /// Pruning policy override (ADR-030 §6).
     pruning_policy: Option<PruningPolicy>,
     /// Mutable economic policy (§19.3, ADR-033).
-    economic_policy: Option<EconomicPolicy>,
+    pub(crate) economic_policy: Option<EconomicPolicy>,
     /// Per-member cumulative budget tracker for governance-approved spending
     /// (§19.5, ADR-033). Grants are recorded via `ApproveSpend` governance
     /// actions and tracked here. Persisted in [`ContextSnapshot`].
-    budget_tracker: MemberBudgetTracker,
+    pub(crate) budget_tracker: MemberBudgetTracker,
     /// Last known member set for departure detection in the timeout loop.
     /// Compared each tick to the current member set to identify departures.
     last_known_members: HashSet<DID>,
@@ -1007,9 +1007,9 @@ pub(crate) struct GovernanceState {
     /// their votes on pending proposals are invalidated (ADR-031 §5).
     pending_epoch_resets: Vec<DID>,
     /// Consequence rules declared at context creation (ADR-017, #1531).
-    consequence_rules: Vec<ConsequenceRule>,
+    pub(crate) consequence_rules: Vec<ConsequenceRule>,
     /// Sender velocity tracker for anti-spam and consequence evaluation (§19.7, #1537).
-    velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker,
+    pub(crate) velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker,
     /// Per-member participation record cache for proposer eligibility (#1530).
     participation_cache: HashMap<String, scp_protocol::trust::participation::ParticipationRecord>,
     /// Cooldown tracking for consequence rules: maps `rule_index` to the Unix
@@ -1021,7 +1021,8 @@ pub(crate) struct GovernanceState {
     /// Bundles base cost, escalation tiers, and floor/cap clamps. The
     /// hard rate limit (Matrix-style token bucket, defense-in-depth)
     /// is configured separately via `hard_rate_limit` below.
-    message_pricing: Option<scp_protocol::economy::antispam::ContextMessagePricingConfig>,
+    pub(crate) message_pricing:
+        Option<scp_protocol::economy::antispam::ContextMessagePricingConfig>,
     /// Defense-in-depth Matrix-style token bucket hard rate limiter.
     ///
     /// Layered on top of the per-DID economic escalation in spec §19.7. This
@@ -1031,7 +1032,8 @@ pub(crate) struct GovernanceState {
     /// Per-context nonce tracker for spending UCAN replay prevention (ADR-016 §6).
     /// Validates that each spending UCAN nonce is used at most once, preventing
     /// replay attacks where a valid spending UCAN is resubmitted.
-    spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn Clock>>,
+    pub(crate) spending_nonce_tracker:
+        scp_protocol::crypto::ucan::nonce::NonceTracker<Arc<dyn Clock>>,
     /// Per-context revoked spending-UCAN CIDs (C1, PR #1606).
     ///
     /// Consulted by `enforce_economy` via the
@@ -1042,7 +1044,7 @@ pub(crate) struct GovernanceState {
     /// required when revocation lands is populating it (no enforcement
     /// rewrite needed). The set is part of the governance bucket because
     /// revocation actions are governance-driven (§19.5).
-    revoked_spending_ucan_cids: HashSet<String>,
+    pub(crate) revoked_spending_ucan_cids: HashSet<String>,
     /// Per-member governance proposal timestamps for earned capacity rate limiting
     /// (§9.3). Maps member DID string to a list of Unix timestamps (seconds) when
     /// the member submitted governance proposals. Used by `check_proposer_eligibility` to
@@ -1268,7 +1270,7 @@ pub(crate) struct TtlState {
 /// `MessagePack`. Recipients store the mapping in their pseudonym registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct PseudonymAnnouncement {
+pub(crate) struct PseudonymAnnouncement {
     /// Magic prefix to distinguish from regular application messages.
     pub tag: String,
     /// The announcing member's DID.
@@ -1282,7 +1284,7 @@ pub(super) struct PseudonymAnnouncement {
 /// application message stream. Prefixed with `\0` to avoid collision with
 /// user-generated content (which is always valid UTF-8 and will never start
 /// with a null byte when deserialized from `MessagePack`).
-pub(super) const PSEUDONYM_ANNOUNCEMENT_TAG: &str = "\0scp:pseudonym-announce:v1";
+pub(crate) const PSEUDONYM_ANNOUNCEMENT_TAG: &str = "\0scp:pseudonym-announce:v1";
 
 /// Internal state tracked by the manager for each context.
 ///
@@ -1298,69 +1300,69 @@ pub(crate) struct PerContextState {
     /// map. Used by Phase 3 re-checks to detect the confused-deputy scenario
     /// where a context was removed and recreated between lock release and
     /// reacquire (same `context_id`, different state).
-    generation: u64,
+    pub(crate) generation: u64,
     /// The context handle (retained for state checks and lifecycle operations).
-    handle: ContextHandle,
+    pub(crate) handle: ContextHandle,
     /// Member tracking.
-    membership: MembershipState,
+    pub(crate) membership: MembershipState,
     /// Role state (ceiling, role definitions, assignments).
-    role_state: ContextRoleState,
+    pub(crate) role_state: ContextRoleState,
     /// Receive event buffer.
-    receive_buffer: ReceiveBuffer,
+    pub(crate) receive_buffer: ReceiveBuffer,
     /// Broadcast context state (SCP-227). `Some` for `ContextMode::Broadcast`,
     /// `None` for `ContextMode::Encrypted`. Broadcast contexts do not use MLS;
     /// they use per-author AES-256-GCM keys managed by [`BroadcastContext`].
-    broadcast_context: Option<BroadcastContext>,
+    pub(crate) broadcast_context: Option<BroadcastContext>,
     /// Active migration state (§5.11A). `Some` when the context is in
     /// `MigratingOut` state. `None` otherwise.
-    migration_state: Option<MigrationState>,
+    pub(crate) migration_state: Option<MigrationState>,
     /// Governance-related state (ADR-031).
-    governance: GovernanceState,
+    pub(crate) governance: GovernanceState,
     /// MLS epoch and reconnection state.
-    epoch: EpochState,
+    pub(crate) epoch: EpochState,
     /// Write/read revocation state.
-    access: AccessControlState,
+    pub(crate) access: AccessControlState,
     /// TTL timer and extension state (SCP-021).
-    ttl: TtlState,
+    pub(crate) ttl: TtlState,
     /// This member's pseudonym-derived routing ID for this context (§9.10.4).
     /// Pre-derived by the FFI bridge via `KeyCustody::derive_pseudonym` and
     /// passed into `create_context` / `join_context`. `None` if the bridge
     /// did not supply a pseudonym (legacy callers, broadcast contexts).
-    local_pseudonym: Option<[u8; 32]>,
+    pub(crate) local_pseudonym: Option<[u8; 32]>,
     /// Known members' pseudonym routing IDs, learned via
     /// [`PseudonymAnnouncement`] MLS application messages. Keyed by member
     /// DID so `send_message` can fan-out to each member's pseudonym.
-    pseudonym_registry: HashMap<DID, [u8; 32]>,
+    pub(crate) pseudonym_registry: HashMap<DID, [u8; 32]>,
     /// Per-sender sequence tracker for anti-replay protection (§9.8.2).
     /// Validates that per-sender sequence numbers and timestamps are
     /// monotonically increasing within this context.
-    sequence_tracker: scp_protocol::envelope::SequenceTracker,
+    pub(crate) sequence_tracker: scp_protocol::envelope::SequenceTracker,
     /// Per-sender reorder buffer for out-of-order message delivery (§9.8.5).
     /// Buffers messages arriving ahead of their expected sequence number and
     /// delivers them when the gap fills or a 30-second timeout expires.
-    reorder_buffer: scp_protocol::envelope::ReorderBuffer,
+    pub(crate) reorder_buffer: scp_protocol::envelope::ReorderBuffer,
     /// Persistent retry queue for MLS Commit broadcasts that failed at the
     /// transport layer after the local state mutation already happened
     /// (PR #1606 C6). Drained by the governance timeout task.
-    pending_commits: VecDeque<PendingCommit>,
+    pub(crate) pending_commits: VecDeque<PendingCommit>,
     /// Fail-close marker set when a `PendingCommit` exhausts its retry
     /// budget. While `Some`, all context-mutating operations return
     /// [`ContextError::CommitBroadcastFault`] until cleared via
     /// [`ContextManager::acknowledge_commit_fault`].
-    commit_fault: Option<CommitFaultMarker>,
+    pub(crate) commit_fault: Option<CommitFaultMarker>,
     /// Number of event log appends since the last consistency checkpoint (§9.9.3).
-    checkpoint_events_since: u64,
+    pub(crate) checkpoint_events_since: u64,
     /// Unix timestamp (seconds) of the last consistency checkpoint (§9.9.3).
-    checkpoint_last_time_secs: u64,
+    pub(crate) checkpoint_last_time_secs: u64,
     /// Locally generated consistency checkpoints for equivocation detection (§9.9.3).
-    checkpoints: Vec<scp_event_log::checkpoint::ConsistencyCheckpoint>,
+    pub(crate) checkpoints: Vec<scp_event_log::checkpoint::ConsistencyCheckpoint>,
     /// RFC 6962 Merkle tree event log for inclusion/consistency proofs (ADR-011).
     /// Parallel to the `MerkleEventLogProvider` — both receive the same events.
     /// This log enables O(log n) Merkle proofs via `scp_event_log::proof` functions.
     ///
     /// Not persisted in `ContextSnapshot` — the tree is rebuilt from the
     /// `MerkleEventLogProvider`'s entries on `restore_context` / `import_context`.
-    merkle_tree: scp_event_log::EventLog,
+    pub(crate) merkle_tree: scp_event_log::EventLog,
 
     /// Actor-shape send-sequence tracker (ADR-049 commit 8 / plan
     /// §"`SequenceReservation`"). Seeds the RAII
@@ -1521,7 +1523,7 @@ impl PerContextState {
     /// - `MessageReceived` / `MessageSent` payloads contain decrypted plaintext
     ///   and are stripped (replaced with empty `Vec`) before broadcast to
     ///   preserve encryption-as-access-control.
-    pub(super) fn emit_event(
+    pub(crate) fn emit_event(
         &mut self,
         event: ContextEvent,
         context_id: &str,

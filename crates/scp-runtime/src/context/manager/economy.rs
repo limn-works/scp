@@ -237,7 +237,7 @@ async fn verify_and_check_receipt(
 /// (pricing, nonce tracker, per-DID escalation) are added. Constructing
 /// this struct directly at call sites is the contract; positional
 /// argument calls are compile-rejected.
-pub(super) struct EnforceEconomyRequest<'a> {
+pub struct EnforceEconomyRequest<'a> {
     /// Per-context economic policy, if any. `None` means a free context.
     pub economic_policy: Option<&'a scp_protocol::economy::types::EconomicPolicy>,
     /// Per-context budget tracker (mutable — deductions happen in-place).
@@ -297,7 +297,7 @@ pub(super) struct EnforceEconomyRequest<'a> {
 /// [`SenderVelocityTracker::compute_escalated_cost`] (spec §19.7).
 ///
 /// Returns the deducted cost for rollback on failure, or `None` if no cost.
-pub(super) fn enforce_economy(
+pub fn enforce_economy(
     req: EnforceEconomyRequest<'_>,
 ) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
     let EnforceEconomyRequest {
