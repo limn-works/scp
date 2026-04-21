@@ -9,14 +9,13 @@ See ``.docs/specs/`` section 19 (Economic Governance) and ADR-033.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import TYPE_CHECKING, Any
 
 from scp_sdk.errors import ScpError
 
 if TYPE_CHECKING:
-    from scp_sdk.scp import SCP
+    pass
 
 logger = logging.getLogger("scp_sdk")
 
@@ -159,145 +158,13 @@ def evaluate_formula(formula_json: str, metrics: dict[str, int] | None = None) -
 # ---------------------------------------------------------------------------
 
 
-def budget_remaining(
-    scp: SCP,
-    context_id: str,
-    did: str,
-) -> int:
-    """Query the remaining budget for a member in a context.
-
-    Args:
-        scp: The :class:`scp_sdk.SCP` instance that owns the budget trackers.
-        context_id: The context ID.
-        did: The member's DID.
-
-    Returns:
-        Remaining budget (smallest currency unit). Returns 0 if no budget
-        has been granted.
-    """
-    return scp._native.economy_budget_remaining(context_id, did)
-
-
-def budget_grant(
-    scp: SCP,
-    context_id: str,
-    did: str,
-    amount: int,
-) -> None:
-    """Grant spending budget to a member.
-
-    Grants are additive: granting 100 twice gives a total limit of 200.
-
-    Args:
-        scp: The :class:`scp_sdk.SCP` instance that owns the budget trackers.
-        context_id: The context ID.
-        did: The member's DID.
-        amount: Budget to grant (smallest currency unit).
-    """
-    scp._native.economy_budget_grant(context_id, did, amount)
-
-
-def budget_record_spend(
-    scp: SCP,
-    context_id: str,
-    did: str,
-    amount: int,
-) -> None:
-    """Record a spend against a member's budget.
-
-    Args:
-        scp: The :class:`scp_sdk.SCP` instance that owns the budget trackers.
-        context_id: The context ID.
-        did: The member's DID.
-        amount: Amount spent (smallest currency unit).
-
-    Raises:
-        ValueError: If no budget exists or the spend exceeds remaining budget.
-    """
-    scp._native.economy_budget_record_spend(context_id, did, amount)
-
-
 # ---------------------------------------------------------------------------
 # Antispam velocity tracking
 # ---------------------------------------------------------------------------
 
 
-def antispam_record(
-    scp: SCP,
-    context_id: str,
-    sender_did: str,
-    timestamp: int,
-) -> None:
-    """Record a message for antispam velocity tracking.
-
-    Args:
-        scp: The :class:`scp_sdk.SCP` instance that owns the antispam tracker.
-        context_id: The context ID.
-        sender_did: The sender's DID.
-        timestamp: Unix timestamp in seconds.
-    """
-    scp._native.economy_antispam_record(context_id, sender_did, timestamp)
-
-
-def antispam_velocity(
-    scp: SCP,
-    context_id: str,
-    sender_did: str,
-    now: int,
-) -> int:
-    """Query the sender's message velocity within the sliding window.
-
-    Args:
-        scp: The :class:`scp_sdk.SCP` instance that owns the antispam tracker.
-        context_id: The context ID.
-        sender_did: The sender's DID.
-        now: Current Unix timestamp in seconds.
-
-    Returns:
-        Number of messages within the sliding window.
-    """
-    return scp._native.economy_antispam_velocity(context_id, sender_did, now)
-
-
-def antispam_escalated_cost(
-    scp: SCP,
-    context_id: str,
-    sender_did: str,
-    now: int,
-    base_cost: int,
-    thresholds: list[tuple[int, int]],
-    floor: int | None = None,
-    cap: int | None = None,
-) -> int:
-    """Compute the escalated cost for a sender based on antispam velocity.
-
-    Args:
-        scp: The :class:`scp_sdk.SCP` instance that owns the antispam tracker.
-        context_id: The context ID.
-        sender_did: The sender's DID.
-        now: Current Unix timestamp in seconds.
-        base_cost: Base cost (smallest currency unit).
-        thresholds: List of ``(velocity_threshold, additional_cost)`` pairs.
-        floor: Optional minimum cost.
-        cap: Optional maximum cost.
-
-    Returns:
-        Escalated cost (smallest currency unit).
-    """
-    thresholds_json = json.dumps(thresholds)
-    return scp._native.economy_antispam_escalated_cost(
-        context_id, sender_did, now, base_cost, thresholds_json, floor, cap
-    )
-
-
 __all__ = [
-    "antispam_escalated_cost",
-    "antispam_record",
-    "antispam_velocity",
     "auto_accept_blocked",
-    "budget_grant",
-    "budget_record_spend",
-    "budget_remaining",
     "check_policy_lock",
     "estimate_cost",
     "evaluate_formula",

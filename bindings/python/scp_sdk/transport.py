@@ -121,55 +121,7 @@ class TransportConfig:
 # ---------------------------------------------------------------------------
 
 
-async def connect_relay(scp: SCP, relay_url: str) -> TransportConfig:
-    """Connect to an SCP relay and return the transport configuration.
-
-    Convenience function that creates a :class:`TransportConfig` and
-    calls :meth:`~TransportConfig.connect` in one step.
-
-    Args:
-        scp: The :class:`scp_sdk.SCP` instance whose transport is
-            being configured.
-        relay_url: The URL of the SCP relay (e.g., ``"wss://relay.example.com"``).
-
-    Returns:
-        A connected :class:`TransportConfig` instance.
-
-    Raises:
-        TransportError: If the connection fails.
-    """
-    config = TransportConfig(relay_url=relay_url)
-    await config.connect(scp)
-    return config
-
-
-async def relay_status(scp: SCP) -> TransportStatus:
-    """Query the current transport connection status.
-
-    Module-level convenience that wraps the :class:`_scp_core.SCP`
-    ``transport_status`` method.
-
-    Args:
-        scp: The :class:`scp_sdk.SCP` instance whose transport is
-            being queried.
-
-    Returns:
-        A :class:`TransportStatus` with connection state.
-
-    Raises:
-        TransportError: If querying transport status fails.
-    """
-    raw = await asyncio.to_thread(scp._native.transport_status)
-    return TransportStatus(
-        connected=raw.connected,
-        relay_url=raw.relay_url,
-        latency_ms=raw.latency_ms,
-    )
-
-
 __all__ = [
     "TransportConfig",
     "TransportStatus",
-    "connect_relay",
-    "relay_status",
 ]

@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from scp_sdk.scp import SCP
+    pass
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -174,110 +174,8 @@ class ScpIdAuthentication:
 # ---------------------------------------------------------------------------
 
 
-def scpid_challenge(
-    scp: SCP,
-    audience: str,
-    ttl_seconds: int = 300,
-) -> ScpIdChallenge:
-    """Generate an SCPID challenge for a relying party (section 3.11.8).
-
-    Args:
-        scp: The :class:`scp_sdk.SCP` instance that owns this bridge state.
-        audience: URI identifying the relying party
-            (e.g. ``"https://app.example.com"``).
-        ttl_seconds: Challenge validity window in seconds (1--300).
-            Defaults to 300.
-
-    Returns:
-        A new :class:`ScpIdChallenge`.
-
-    Raises:
-        scp_sdk.ValidationError: If *audience* is empty, exceeds 2048 bytes,
-            or *ttl_seconds* is 0 or exceeds 300.
-    """
-    native = scp._native
-    challenge_json = native.scpid_challenge(audience, ttl_seconds)
-    return ScpIdChallenge.from_json(challenge_json)
-
-
-def scpid_sign(
-    scp: SCP,
-    identity: Any,
-    signing_key_id: str,
-    challenge: ScpIdChallenge,
-) -> ScpIdResponse:
-    """Sign an SCPID challenge with a registered identity's key (section 3.11.3).
-
-    Looks up the identity by DID in the global registry, selects the
-    appropriate signing key, and produces a signed SCPID response.
-
-    Args:
-        scp: The :class:`scp_sdk.SCP` instance that owns this bridge state.
-        identity: An :class:`~scp_sdk.identity.Identity` instance whose DID
-            is registered in the bridge's identity registry.
-        signing_key_id: ``"#active"`` or ``"#agent"``.
-        challenge: The challenge to sign.
-
-    Returns:
-        A new :class:`ScpIdResponse`.
-
-    Raises:
-        scp_sdk.IdentityError: If the DID is not registered or signing fails.
-        scp_sdk.ValidationError: If *signing_key_id* is invalid or the
-            challenge is malformed.
-    """
-    native = scp._native
-    response_json = native.scpid_sign(
-        identity.did,
-        signing_key_id,
-        challenge.to_json(),
-    )
-    return ScpIdResponse.from_json(response_json)
-
-
-def scpid_verify(
-    scp: SCP,
-    response: ScpIdResponse,
-    challenge: ScpIdChallenge,
-) -> ScpIdAuthentication:
-    """Verify a signed SCPID response against the original challenge (section 3.11.4).
-
-    Resolves the signer's DID document via the global DID resolver
-    (initialized during identity creation), then runs the 11-step
-    verification pipeline.
-
-    Args:
-        scp: The :class:`scp_sdk.SCP` instance that owns this bridge state.
-        response: The signed response from the client.
-        challenge: The original challenge issued by the relying party.
-
-    Returns:
-        An :class:`ScpIdAuthentication` on success.
-
-    Raises:
-        scp_sdk.IdentityError: If the DID resolver is not initialized,
-            DID resolution fails, the signature is invalid, the challenge
-            has expired, or any other verification step fails.
-        scp_sdk.ValidationError: If either JSON structure is malformed.
-    """
-    native = scp._native
-    auth_json = native.scpid_verify(
-        response.to_json(),
-        challenge.to_json(),
-    )
-    d: dict[str, Any] = json.loads(auth_json)
-    return ScpIdAuthentication(
-        did=d["did"],
-        signing_key_id=d["signing_key_id"],
-        signed_at=d["signed_at"],
-    )
-
-
 __all__ = [
     "ScpIdAuthentication",
     "ScpIdChallenge",
     "ScpIdResponse",
-    "scpid_challenge",
-    "scpid_sign",
-    "scpid_verify",
 ]

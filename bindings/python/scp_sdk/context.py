@@ -1664,80 +1664,6 @@ def validate_capability_declaration(
     return json.loads(result_json)
 
 
-def evaluate_invitation(
-    scp: SCP,
-    params_json: str,
-    inviter_did: str,
-    identity_did: str,
-    *,
-    policy_json: str | None = None,
-    spending_json: str | None = None,
-    trusted_dids: list[str] | None = None,
-) -> str:
-    """Evaluate a context invitation through the sequential pipeline.
-
-    Runs the 4-step evaluation pipeline:
-
-    1. **Template check** -- validates params match the claimed template.
-    2. **Economic policy check** -- verifies spending capability for paid
-       contexts.
-    3. **Auto-accept check** -- evaluates trust, TTL cap, and rate limit
-       against a matching auto-accept policy.
-    4. **Agent prompt** -- falls through if no auto-accept matches.
-
-    Args:
-        params_json: JSON-serialized ``ContextParams`` from the invitation.
-        inviter_did: DID string of the identity sending the invitation.
-        identity_did: DID string of the local identity receiving the
-            invitation. Used to key the rate limit tracker.
-        policy_json: Optional JSON-serialized ``AutoAcceptPolicy``. If
-            ``None``, the pipeline always falls through to prompt-agent.
-        spending_json: Optional JSON-serialized ``SpendingContext``.
-            Required when the context has an economic policy requiring
-            payment.
-        trusted_dids: Optional list of DID strings representing identities
-            trusted by the local identity (e.g., shared-context peers).
-
-    Returns:
-        ``"auto_accept"`` if the pipeline decided to auto-accept,
-        ``"prompt_agent"`` if the agent should be prompted.
-
-    Raises:
-        ScpError: If input validation or pipeline evaluation fails.
-
-    Example::
-
-        decision = evaluate_invitation(
-            params_json=invitation.params_json,
-            inviter_did="did:dht:z6MkBob...",
-            identity_did="did:dht:z6MkAlice...",
-            policy_json=my_policy_json,
-            trusted_dids=["did:dht:z6MkBob..."],
-        )
-        if decision == "auto_accept":
-            await context.join(invitation)
-
-    See ``.docs/standards/sdk-common.md`` "Invitation evaluation" and
-    ``.docs/specs/19-economic-governance.md`` sections 19.3, 19.14.
-    """
-    import json
-
-    instance = _resolve_bridge(scp)
-    # H14: Distinguish "explicit empty trusted set" (auto-reject everyone) from
-    # "no trusted-DID policy provided" (fall through to other rules). Empty list
-    # `[]` must round-trip as `"[]"`, NOT collapse to None. Never use the falsy
-    # form on Optional collections at FFI boundaries.
-    trusted_dids_json = json.dumps(trusted_dids) if trusted_dids is not None else None
-    return instance.evaluate_invitation(
-        params_json,
-        inviter_did,
-        identity_did,
-        policy_json,
-        spending_json,
-        trusted_dids_json,
-    )
-
-
 def metadata_record_to_json(
     context_id: str,
     sequence: int,
@@ -1860,7 +1786,6 @@ __all__ = [
     "Context",
     "Membership",
     "ScopedHandle",
-    "evaluate_invitation",
     "metadata_record_from_json",
     "metadata_record_to_json",
     "template_get_params",
