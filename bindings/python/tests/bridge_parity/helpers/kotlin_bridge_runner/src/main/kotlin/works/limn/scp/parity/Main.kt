@@ -269,27 +269,15 @@ private suspend fun opIdentityCreate(args: JsonObject): JsonObject {
     return buildJsonObject {
         put("did", JsonPrimitive(identity.did()))
         put("custody", JsonPrimitive(custody))
-        // `verifyingKey()` is the hex-encoded Ed25519 `#0` identity-key.
-        // The PyO3/NAPI/WASM runners return this base64-encoded under
-        // the key name `verifying_key` — normalise here to the same
-        // base64 shape (the harness consumes raw strings — matching
-        // case-sensitively against PyO3's base64 output).
+        // `verifyingKey()` returns hex; the parity harness's
+        // `bytes_from_hex` FieldSpec canonicalises hex → base64 in the
+        // normaliser before comparison, so we emit raw hex here (same
+        // shape PyO3 / NAPI / WASM produce).
         val verifyingKeyHex = identity.verifyingKey()
         if (verifyingKeyHex != null) {
-            val keyBytes = hexToBytes(verifyingKeyHex)
-            val base64 = java.util.Base64.getEncoder().encodeToString(keyBytes)
-            put("verifying_key", JsonPrimitive(base64))
+            put("verifying_key", JsonPrimitive(verifyingKeyHex))
         }
     }
-}
-
-private fun hexToBytes(hex: String): ByteArray {
-    require(hex.length % 2 == 0) { "hex string length must be even" }
-    val out = ByteArray(hex.length / 2)
-    for (i in out.indices) {
-        out[i] = ((hex[i * 2].digitToInt(16) shl 4) or hex[i * 2 + 1].digitToInt(16)).toByte()
-    }
-    return out
 }
 
 private suspend fun opContextCreate(args: JsonObject): JsonObject {

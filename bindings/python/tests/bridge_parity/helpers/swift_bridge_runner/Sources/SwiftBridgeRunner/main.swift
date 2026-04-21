@@ -343,24 +343,10 @@ func opIdentityCreate(_ req: BridgeRequest) async throws -> [String: JSONValue] 
         "did": .string(identity.did()),
         "custody": .string(custody)
     ]
-    // Normalise `#0` verifying-key to base64 to match the PyO3/NAPI/WASM
-    // output shape. The UniFFI `verifyingKey()` getter returns hex;
-    // other bridges emit base64 from `base64::encode(&pub_bytes)`.
+    // The harness's `bytes_from_hex` FieldSpec normalises hex → base64
+    // before comparison; emit raw hex to match PyO3 / NAPI / WASM.
     if let hex = identity.verifyingKey() {
-        let bytes = hexToBytes(hex)
-        out["verifying_key"] = .string(bytes.base64EncodedString())
-    }
-    return out
-}
-
-private func hexToBytes(_ hex: String) -> Data {
-    precondition(hex.count % 2 == 0, "hex string length must be even")
-    var out = Data(capacity: hex.count / 2)
-    var idx = hex.startIndex
-    while idx < hex.endIndex {
-        let next = hex.index(idx, offsetBy: 2)
-        out.append(UInt8(hex[idx..<next], radix: 16)!)
-        idx = next
+        out["verifying_key"] = .string(hex)
     }
     return out
 }

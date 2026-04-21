@@ -7330,6 +7330,13 @@ pub async fn event_log_query(
     filter_json: Option<String>,
 ) -> Result<Vec<Event>, ScpError> {
     crate::uniffi_check_handle!(handle);
+    // Lifecycle gate — required by `uniffi_check_ready_coverage` test
+    // (see #1646). Every Category A/B export that touches
+    // `CoreFields` / `ContextManager` state must invoke one of the
+    // ready-check entry points. We resolve the default bridge instance
+    // up-front so a shut-down bridge fails fast before the manager
+    // lookup below.
+    let _bi = crate::runtime::default_bridge_instance()?;
     runtime()
         .spawn(async move {
             // Parse optional filter JSON.
