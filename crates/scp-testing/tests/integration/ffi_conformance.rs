@@ -321,20 +321,36 @@ fn meta_is_test_gated(meta: &syn::Meta, under_not: bool) -> bool {
                     };
                     nested.iter().any(|m| meta_is_test_gated(m, !under_not))
                 }
-                Some("all" | "any") => {
+                Some(op @ ("all" | "any")) => {
                     let Ok(nested) = list.parse_args_with(
                         syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
                     ) else {
                         return false;
                     };
-                    // For both `all(...)` and `any(...)`, if any child is
-                    // test-gated (in the non-negated sense) the item is
-                    // test-only for our scan. Rationale: if `test` ever
-                    // appears as a non-negated predicate, the item becomes
-                    // active when test is on. We treat "activates under test"
-                    // as "test-only code" — matches shell scanner intent and
-                    // avoids emitting phantom fn names from test gadgets.
-                    nested.iter().any(|m| meta_is_test_gated(m, under_not))
+                    // "test-gated" here means "the item is compiled ONLY when
+                    // test is on" — i.e., the cfg predicate implies `test`.
+                    //
+                    // * `all(A, B)` compiles iff `A && B`. The item is
+                    //   test-only iff ANY child implies test — because a
+                    //   single test-gated predicate forces the whole
+                    //   conjunction to require test.
+                    // * `any(A, B)` compiles iff `A || B`. The item is
+                    //   test-only iff EVERY child implies test — because
+                    //   any non-test predicate could activate the item in
+                    //   production via the disjunction.
+                    //
+                    // Counter-example the wrong choice misclassifies:
+                    //   `#[cfg(all(any(feature = "x", test), not(test)))]`
+                    // is production-only, but with `.any()` on `any(...)`
+                    // the inner disjunction reports test-gated, which then
+                    // propagates through the outer `all`. Splitting by op
+                    // makes the walker rustc-equivalent for these layered
+                    // patterns.
+                    if op == "all" {
+                        nested.iter().any(|m| meta_is_test_gated(m, under_not))
+                    } else {
+                        nested.iter().all(|m| meta_is_test_gated(m, under_not))
+                    }
                 }
                 _ => false,
             }
@@ -1695,26 +1711,91 @@ fn syn_scanner_excludes_cfg_test_fn_inside_non_test_module() {
     );
 }
 
-/// Also exercise `any(test, ...)` / `all(test, ...)` / `cfg(test)` — all three
-/// must exclude. This complements MAJOR-1 by covering the positive cases.
+/// Exercise `cfg(test)` and `all(test, ...)` — both are test-ONLY, so
+/// the scanner must exclude them. `any(test, ...)` is tested below as a
+/// production case (it has a production path via the other disjunct).
 #[test]
-fn syn_scanner_excludes_all_test_forms() {
+fn syn_scanner_excludes_test_only_cfgs() {
     const SRC: &str = r#"
         #[cfg(test)]
         fn a() {}
-
-        #[cfg(any(test, feature = "x"))]
-        fn b() {}
 
         #[cfg(all(test, feature = "x"))]
         fn c() {}
     "#;
     let fns = collect_defined_fns(SRC);
-    for name in ["a", "b", "c"] {
+    for name in ["a", "c"] {
         assert!(
             !fns.contains(name),
             "fn `{name}` gated on test should have been excluded — \
              collected: {fns:?}"
         );
     }
+}
+
+/// `#[cfg(any(test, feature = "x"))]` compiles when `test OR feature
+/// = "x"`. With `feature = "x"` enabled and `test` off, the item is
+/// reachable in production — so the scanner MUST keep it in the
+/// collected set (it is a production definition, not a test-only one).
+/// The old walker misclassified this as test-gated; ADR-046 MINOR-1
+/// rev split `all(...)` and `any(...)` folds to fix it.
+#[test]
+fn syn_scanner_includes_any_with_test_and_feature() {
+    const SRC: &str = r#"
+        #[cfg(any(test, feature = "x"))]
+        fn b() {}
+    "#;
+    let fns = collect_defined_fns(SRC);
+    assert!(
+        fns.contains("b"),
+        "fn `b` under `any(test, feature=...)` has a production path \
+         and must be collected — collected: {fns:?}"
+    );
+}
+
+/// `#[cfg_attr(test, …)]` is conditional-attribute propagation, NOT a
+/// compile-time gate on the item itself. `cfg_attr(test, deprecated)`
+/// expands to `#[deprecated]` when `test` is on and to nothing when
+/// it's off — either way, the fn is compiled in production. The
+/// walker must treat the fn as production-reachable and keep it in
+/// the collected set. Review round 12 flagged this as a coverage gap
+/// (the walker handled it correctly per ADR-046, but no fixture
+/// proved it). This test locks the behaviour.
+#[test]
+fn syn_scanner_includes_fn_with_cfg_attr_test() {
+    const SRC: &str = r#"
+        #[cfg_attr(test, deprecated = "use bar")]
+        fn foo() {}
+
+        #[cfg_attr(test, allow(dead_code), deprecated)]
+        #[cfg_attr(not(test), inline)]
+        fn bar() {}
+    "#;
+    let fns = collect_defined_fns(SRC);
+    for name in ["foo", "bar"] {
+        assert!(
+            fns.contains(name),
+            "fn `{name}` carries `cfg_attr(test, …)` which is attribute \
+             propagation, not a gate — the fn is compiled in production \
+             and must be collected; collected: {fns:?}"
+        );
+    }
+}
+
+/// Negative case: `#[cfg(test)]` stacked ABOVE `#[cfg_attr(test, …)]`
+/// is still a real test-only gate. The `cfg_attr` underneath is irrelevant
+/// because the outer `cfg(test)` already excludes the fn from production.
+#[test]
+fn syn_scanner_excludes_cfg_test_above_cfg_attr() {
+    const SRC: &str = "
+        #[cfg(test)]
+        #[cfg_attr(test, allow(dead_code))]
+        fn test_only_fn() {}
+    ";
+    let fns = collect_defined_fns(SRC);
+    assert!(
+        !fns.contains("test_only_fn"),
+        "fn `test_only_fn` under `cfg(test)` + `cfg_attr(test, …)` is \
+         test-only and must be excluded; collected: {fns:?}"
+    );
 }

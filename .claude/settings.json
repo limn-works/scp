@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'set -u; tool_json=$(cat); paths=$(printf %s \"$tool_json\" | jq -er \"[(.tool_input.file_path // empty), ((.tool_input.edits // [])[]?.file_path)] | map(select(. != null and . != \\\"\\\")) | unique | .[]\" 2>/dev/null); jq_rc=$?; if [[ $jq_rc -ne 0 ]]; then echo \"bridge-symmetry hook: jq failed to parse tool_input (exit $jq_rc); failing closed\" >&2; exit 2; fi; ffi_paths=(); while IFS= read -r p; do [[ -z \"$p\" ]] && continue; [[ \"$p\" == *\"crates/scp-ffi/\"* ]] && ffi_paths+=(\"$p\"); done <<< \"$paths\"; [[ ${#ffi_paths[@]} -eq 0 ]] && exit 0; bash \"$CLAUDE_PROJECT_DIR/scripts/check-bridge-symmetry.sh\" --hook \"${ffi_paths[@]}\"'"
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/hooks/pretooluse-bridge-symmetry.sh\""
           }
         ]
       },
@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'set -u; tool_json=$(cat); paths=$(printf %s \"$tool_json\" | jq -er \"[(.tool_input.file_path // empty), ((.tool_input.edits // [])[]?.file_path)] | map(select(. != null and . != \\\"\\\")) | unique | .[]\" 2>/dev/null); jq_rc=$?; if [[ $jq_rc -ne 0 ]]; then echo \"enforcement-file hook: jq failed to parse tool_input (exit $jq_rc); failing closed\" >&2; exit 2; fi; command -v python3.12 >/dev/null 2>&1 || { echo \"ENFORCEMENT ERROR: python3.12 required for hook realpath resolution (symlink bypass protection) — per project CLAUDE.md, system python3 is the Xcode stub and must not be used\" >&2; exit 2; }; protected_suffixes=(\".claude/settings.json\" \"scripts/check-bridge-symmetry.sh\" \"scripts/bridge-aliases.json\"); check_path() { local p=\"$1\"; for sfx in \"${protected_suffixes[@]}\"; do if [[ \"$p\" == *\"$sfx\" ]]; then echo \"enforcement file protected: $p\" >&2; echo \"CI will re-check bridge symmetry, but local edits to enforcement files should go through a separate dedicated PR.\" >&2; exit 2; fi; done; }; while IFS= read -r p; do [[ -z \"$p\" ]] && continue; check_path \"$p\"; rp=$(python3.12 -c \"import os,sys; print(os.path.realpath(sys.argv[1]))\" \"$p\" 2>/dev/null); rp_rc=$?; if [[ $rp_rc -ne 0 ]]; then echo \"ENFORCEMENT ERROR: python3.12 realpath failed for $p (exit $rp_rc); failing closed\" >&2; exit 2; fi; if [[ -n \"$rp\" && \"$rp\" != \"$p\" ]]; then check_path \"$rp\"; fi; done <<< \"$paths\"; exit 0'"
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/hooks/pretooluse-enforcement-files.sh\""
           }
         ]
       }

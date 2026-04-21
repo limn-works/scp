@@ -548,6 +548,49 @@ func opTransportStatus(_ req: BridgeRequest) async throws -> [String: JSONValue]
     ]
 }
 
+// Shape-valid `did:dht:z…` DID guaranteed NOT to be in any bridge's
+// identity registry. Mirrors
+// `seed_operations.py::FAKE_UNREGISTERED_DID` and
+// `node_bridge_runner.ts::FAKE_UNREGISTERED_DID` — MUST match byte-for-byte
+// so the parity harness lines every bridge up against the same input.
+let fakeUnregisteredDid =
+    "did:dht:znever1never1never1never1never1never1never1never1never1never1neva"
+
+func opUnregisteredDidRejected(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    _ = req
+    // UniFFI `scpidSign` takes an opaque `Identity` handle, not a DID
+    // string, so it never performs the bridge-local registry lookup
+    // the PyO3/NAPI/WASM bridges use to detect an unregistered DID.
+    // Instead, we exercise the SAME error code via `identityResolve`:
+    // the fake DID's 64-char zbase32 suffix decodes to 40 bytes, which
+    // fails `DidDht::extract_public_key`'s 32-byte check locally (no
+    // DHT round-trip). That `IdentityError::InvalidDidFormat` is
+    // surfaced by the bridge's blanket `From<IdentityError>` mapping
+    // (crates/scp-ffi/uniffi/src/bridge.rs) as SCP-IDENT-1001 — the
+    // same code the other bridges emit on registry miss. See the
+    // docstring block on `OP_UNREGISTERED_DID_REJECTED` in
+    // `seed_operations.py` for the full rationale.
+    do {
+        _ = try await identityResolve(did: fakeUnregisteredDid)
+        return [
+            "error": .object([
+                "type": .string("none"),
+                "code": .string("NONE")
+            ])
+        ]
+    } catch {
+        let message = String(describing: error)
+        let code = extractScpCode(message)
+        let errType = String(describing: type(of: error))
+        return [
+            "error": .object([
+                "type": .string(errType),
+                "code": .string(code)
+            ])
+        ]
+    }
+}
+
 func opEventLogQueryFiltered(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     let filter: [String: JSONValue]
     if let obj = req.args["filter"]?.objectValue {
@@ -678,6 +721,8 @@ func dispatch(_ req: BridgeRequest) async -> Any {
             result = try await opTransportStatus(req)
         case "event_log_query_filtered":
             result = try await opEventLogQueryFiltered(req)
+        case "unregistered_did_rejected":
+            result = try await opUnregisteredDidRejected(req)
         default:
             return ErrResponse(
                 id: req.id,

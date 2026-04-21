@@ -197,7 +197,25 @@ def _teardown_runner(
             proc.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait()
+            try:
+                # Bound the post-SIGKILL wait so a child stuck in
+                # uninterruptible native state (e.g. a JNA/JNI call into
+                # a hung Rust fn) cannot hang the whole pytest run.
+                # SIGKILL is uncatchable under Linux/macOS, so any
+                # remaining wait is the kernel reaping the process;
+                # 5 seconds is generous for that reap.
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                # Last-resort: log and abandon. The test run must not
+                # block on a stuck child — pytest can mark the fixture
+                # teardown as error and continue.
+                import warnings
+
+                warnings.warn(
+                    f"_teardown_runner: child pid {proc.pid} did not "
+                    "exit after SIGKILL; abandoning",
+                    stacklevel=2,
+                )
 
 
 # ----------------------------------------------------------------------

@@ -61,10 +61,24 @@ function findSubsequence(haystack: Uint8Array, needle: Uint8Array): number {
 
 const HEADER_TERMINATOR = new Uint8Array([13, 10, 13, 10]);
 
+// Frame-size caps. Matches `runner_client.py`'s MAX_HEADER_BYTES /
+// MAX_FRAME_BYTES, and the Kotlin + Swift runners' equivalent limits —
+// a misbehaving harness cannot OOM this process by sending a
+// pathologically large `Content-Length` or a runaway header with no
+// terminator.
+const MAX_HEADER_BYTES = 4 * 1024;
+const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+
 /** Reads one length-prefixed frame from stdin. Returns null on EOF. */
 async function readFrame(): Promise<unknown | null> {
-  // Wait for header terminator.
+  // Wait for header terminator, bounded by MAX_HEADER_BYTES so a peer
+  // that never sends \r\n\r\n can't grow `inputBuffer` unboundedly.
   while (findSubsequence(inputBuffer, HEADER_TERMINATOR) < 0) {
+    if (inputBuffer.length > MAX_HEADER_BYTES) {
+      throw new Error(
+        `header exceeded ${MAX_HEADER_BYTES} bytes without terminator`,
+      );
+    }
     const { done, value } = await stdinReader.read();
     if (done) {
       if (inputBuffer.length === 0) return null;
@@ -83,6 +97,15 @@ async function readFrame(): Promise<unknown | null> {
   }
   const lengthStr = match[1] ?? "";
   const contentLength = Number.parseInt(lengthStr, 10);
+  if (
+    !Number.isFinite(contentLength) ||
+    contentLength < 0 ||
+    contentLength > MAX_FRAME_BYTES
+  ) {
+    throw new Error(
+      `Content-Length out of range: ${lengthStr} (max ${MAX_FRAME_BYTES})`,
+    );
+  }
 
   const bodyStart = headerEnd + HEADER_TERMINATOR.length;
 
@@ -345,6 +368,12 @@ async function dispatch(req: BridgeRequest): Promise<OkResponse | ErrResponse> {
           ok: true,
           result: await opEventLogQueryFiltered(req),
         };
+      case "unregistered_did_rejected":
+        return {
+          id: req.id,
+          ok: true,
+          result: await opUnregisteredDidRejected(req),
+        };
       default:
         return {
           id: req.id,
@@ -474,6 +503,57 @@ async function opInvalidCapability(
   return {
     error: { type: "none", code: "NONE", message: "no error raised" },
   };
+}
+
+// Shape-valid `did:dht:z…` DID guaranteed NOT to be in any bridge's
+// identity registry. Mirrors
+// `seed_operations.py::FAKE_UNREGISTERED_DID` — MUST match byte-for-byte
+// so the parity harness lines every bridge up against the same input.
+const FAKE_UNREGISTERED_DID =
+  "did:dht:znever1never1never1never1never1never1never1never1never1never1neva";
+
+async function opUnregisteredDidRejected(
+  req: BridgeRequest,
+): Promise<Record<string, unknown>> {
+  // Valid SCPID challenge (passes shape validation — audience non-empty,
+  // issued_at <= now <= expires_at, nonce 32 bytes). Paired with a DID
+  // that is NOT in the bridge's identity registry, `scpid_sign` must
+  // reach the registry-lookup step and reject with SCP-IDENT-1001.
+  // Matches `seed_operations.py::_py_unregistered_did_rejected`.
+  const nowMs = Date.now();
+  const challenge = JSON.stringify({
+    protocol: "scpid/1.0",
+    nonce: "aa".repeat(32),
+    audience: "https://parity-test.example.com",
+    issued_at: nowMs,
+    expires_at: nowMs + 60_000,
+  });
+  try {
+    if (req.bridgeMode === "napi") {
+      // Use the raw addon, matching `opSignMessage`: the TS SDK wrapper
+      // drops the optional `signed_at_override` param and takes a
+      // typed handle instead of a DID string. The raw addon exposes
+      // the DID-string signature the PyO3/WASM bridges share, which
+      // is what we need to exercise the registry lookup directly.
+      const addon = await loadNapiAddon();
+      addon.scpidSign(FAKE_UNREGISTERED_DID, "#active", challenge, null);
+    } else {
+      const { raw } = await loadWasm();
+      raw.scpid_sign(FAKE_UNREGISTERED_DID, "#active", challenge);
+    }
+  } catch (err: unknown) {
+    if (err instanceof Error) {
+      const codeMatch = err.message.match(/SCP-[A-Z]+-\d+/);
+      return {
+        error: {
+          type: err.constructor.name,
+          code: codeMatch ? codeMatch[0] : "UNKNOWN",
+        },
+      };
+    }
+    return { error: { type: "unknown", code: "UNKNOWN" } };
+  }
+  return { error: { type: "none", code: "NONE" } };
 }
 
 async function opEventLogAppend(
@@ -852,6 +932,24 @@ const PARITY_CHALLENGE_EXPIRES_AT_MS = 9_999_999_999_000;
 // Main loop
 // ---------------------------------------------------------------------------
 
+// Best-effort id extraction from a partially-parsed request. Used by the
+// frame/protocol error paths so the client can correlate the error
+// response back to the offending send. Returns -1 as the "unknown"
+// sentinel — distinct from the valid request-id space (non-negative
+// integers), so a client that correlates by id can detect protocol
+// errors without risking confusion with a real id=0 request.
+function extractRequestId(value: unknown): number {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    "id" in value &&
+    typeof (value as { id: unknown }).id === "number"
+  ) {
+    return (value as { id: number }).id;
+  }
+  return -1;
+}
+
 async function main(): Promise<void> {
   await emitStartupDiagnostic();
   while (true) {
@@ -859,8 +957,13 @@ async function main(): Promise<void> {
     try {
       req = await readFrame();
     } catch (err) {
+      // `readFrame` threw — we may have parsed enough of the frame to
+      // know its id (e.g. Content-Length out of range after the header
+      // was read). We don't — `readFrame` doesn't surface a partial
+      // request. Emit -1 to signal "unknown" rather than lying with 0
+      // (which collides with the request-id space).
       await writeFrame({
-        id: 0,
+        id: -1,
         ok: false,
         error: {
           type: "FrameError",
@@ -879,8 +982,12 @@ async function main(): Promise<void> {
       !("op" in req) ||
       !("bridgeMode" in req)
     ) {
+      // The body parsed as JSON but is not a valid request — we may
+      // still have the `id` field populated. Echo it back so the
+      // client can correlate; fall back to -1 if even the id is
+      // missing or the wrong type.
       await writeFrame({
-        id: 0,
+        id: extractRequestId(req),
         ok: false,
         error: {
           type: "ProtocolError",

@@ -11,15 +11,17 @@ Each OpSpec describes:
 Adding a new op is ~20 lines: one `OpSpec`, one `py_call`, one case in
 the Bun runner's dispatch. The library is append-only.
 
-Current op library: 10 ops. The first 5 are the MVP per ADR-046;
+Current op library: 11 ops. The first 5 are the MVP per ADR-046;
 ops 6-10 cover tool registration, UCAN mint/validate-error, transport
-status, and filtered event-log query. Crypto outputs compare byte-
-exactly: `identity_create_deterministic` pins DID + identity-key
-verifying bytes under a fixed seed, and `sign_message` pins the SCPID
-signature byte-exactly under the `signed_at_override` testing
-affordance (see `scp-runtime::scpid_sign`). The latter also derives a
-distinct `#active` key from `seed[32..64]` on WASM under the `testing`
-feature, matching scp-core's two-key `DidDht::create` sequence.
+status, and filtered event-log query; op 11 pins the
+unregistered-DID rejection code (SCP-IDENT-1001) across every bridge.
+Crypto outputs compare byte-exactly: `identity_create_deterministic`
+pins DID + identity-key verifying bytes under a fixed seed, and
+`sign_message` pins the SCPID signature byte-exactly under the
+`signed_at_override` testing affordance (see `scp-runtime::scpid_sign`).
+The latter also derives a distinct `#active` key from `seed[32..64]` on
+WASM under the `testing` feature, matching scp-core's two-key
+`DidDht::create` sequence.
 
 Resolved divergences (previously xfail'd tripwires, now full parity):
   - context_id format (§18.4.1): all four bridges emit 64-char lowercase
@@ -31,9 +33,9 @@ Resolved divergences (previously xfail'd tripwires, now full parity):
     NAPI/UniFFI bridges.
   - invalid_capability_rejected unregistered-DID code: aligned on
     SCP-IDENT-1001 (identity-domain, identity-not-found) across bridges.
-    The MVP op below exercises the malformed-challenge path
-    (SCP-IDENT-1038, shared); a future `unregistered_did_rejected` op
-    will lock IDENT-1001 into the parity gate.
+    The MVP op exercises the malformed-challenge path (SCP-IDENT-1038,
+    shared); `unregistered_did_rejected` (op 11 below) locks the
+    IDENT-1001 alignment into the parity gate.
   - sign_message signature byte-exactness: previously shape-only because
     Ed25519 covers a wall-clock `signed_at`. Now byte-exact via the
     `signed_at_override` parameter on `scpid_sign`, wired across all
@@ -97,10 +99,24 @@ CONTEXT_ID_PATTERN = r"^[0-9a-f]{64}$"
 # Note: the valid-challenge + unregistered-DID path historically diverged
 # (PyO3 SCP-IDENT-1001, NAPI SCP-PERM-3023, WASM SCP-IDENT-1010). All three
 # bridges are now aligned on SCP-IDENT-1001 (identity-domain, identity-not-
-# found). The MVP op below still exercises the malformed-challenge path per
-# ADR-046; an `unregistered_did_rejected` op added in a follow-up will lock
-# the IDENT-1001 alignment into the parity gate.
+# found). The MVP op below exercises the malformed-challenge path per
+# ADR-046; the companion `unregistered_did_rejected` op locks the
+# IDENT-1001 alignment into the parity gate.
 EXPECTED_INVALID_CAPABILITY_CODE = "SCP-IDENT-1038"
+# Pinned SCP-IDENT-1001 code for the valid-challenge + unregistered-DID
+# path. Used by `OP_UNREGISTERED_DID_REJECTED` below.
+EXPECTED_UNREGISTERED_DID_CODE = "SCP-IDENT-1001"
+
+# Shape-valid `did:dht:z…` DID that is NOT registered in any bridge's
+# identity registry. zbase32 suffix is 64 chars, which decodes to 40 bytes
+# (not the 32 bytes a real did:dht key would) — so the UniFFI path (which
+# validates the DID's zbase32 suffix when it resolves the DID) also
+# surfaces the same error through `From<IdentityError>` → IDENT-1001. The
+# DID still passes the bridge-level `validate_did` shape check
+# (`did:{method}:{id}` with lowercase-alphanumeric method), so every
+# bridge enters its registry lookup path before rejecting. Pinned fixture
+# — do not change without updating every runner.
+FAKE_UNREGISTERED_DID = "did:dht:znever1never1never1never1never1never1never1never1never1never1neva"
 
 
 # ---------------------------------------------------------------------------
@@ -290,8 +306,9 @@ OP_CONTEXT_CREATE = OpSpec(
 # Real divergence caught by the harness: three bridges, three codes.
 # PyO3 returned SCP-IDENT-1001 (reference); NAPI returned SCP-PERM-3023;
 # WASM returned SCP-IDENT-1010. Aligned across all three on
-# SCP-IDENT-1001 for the unregistered-DID path; the op below now
-# exercises the malformed-challenge path (SCP-IDENT-1038, shared).
+# SCP-IDENT-1001 for the unregistered-DID path; the op below exercises
+# the malformed-challenge path (SCP-IDENT-1038, shared), and
+# `OP_UNREGISTERED_DID_REJECTED` (op 11) locks in the IDENT-1001 path.
 # ---------------------------------------------------------------------------
 
 
@@ -819,6 +836,69 @@ OP_EVENT_LOG_FILTERED = OpSpec(
 
 
 # ---------------------------------------------------------------------------
+# op 11: unregistered_did_rejected
+#
+# Companion to op 3. Op 3 exercises the malformed-challenge path
+# (SCP-IDENT-1038) — the challenge JSON fails shape validation before any
+# DID lookup happens. This op exercises the OTHER historically-divergent
+# path: a VALID challenge paired with a well-formed but unregistered
+# DID. Before alignment, PyO3 returned SCP-IDENT-1001, NAPI returned
+# SCP-PERM-3023, and WASM returned SCP-IDENT-1010. All four bridges
+# (PyO3, NAPI, WASM, UniFFI-Kotlin, UniFFI-Swift) now converge on
+# SCP-IDENT-1001 (identity-domain, identity-not-found) for this path.
+#
+# Bridge-specific dispatch:
+#   - PyO3/NAPI/WASM `scpid_sign(did_string, …)` looks the DID up in
+#     the bridge-local identity registry; an absent entry surfaces
+#     IDENT-1001 from `with_identity` / `sign_with_identity`.
+#   - UniFFI `scpid_sign(identity: Identity, …)` takes an opaque handle,
+#     not a DID string — it never performs the registry lookup the other
+#     bridges do. To exercise the same unregistered-DID code path, the
+#     Kotlin/Swift runners call the UniFFI `identityResolve` entrypoint
+#     with the fake DID instead:
+#     the fake DID's 64-char zbase32 suffix decodes to 40 bytes (not the
+#     32 required by did:dht), so `DidDht::extract_public_key` returns
+#     `IdentityError::InvalidDidFormat` locally — no DHT round-trip — and
+#     the bridge's blanket `From<IdentityError>` mapping in
+#     `crates/scp-ffi/uniffi/src/bridge.rs` surfaces it as IDENT-1001.
+#     This keeps every bridge locked to the same committed code without
+#     requiring UniFFI's `scpid_sign` to replicate the other bridges'
+#     DID-string-to-registry lookup semantics.
+# ---------------------------------------------------------------------------
+
+
+def _py_unregistered_did_rejected(ctx: OpContext) -> dict[str, Any]:
+    challenge_json = _pinned_challenge_json()
+    try:
+        ctx.scp_core.scpid_sign(FAKE_UNREGISTERED_DID, "#active", challenge_json)
+    except Exception as err:
+        err_type = type(err).__name__
+        code = getattr(err, "code", None) or _extract_code(str(err))
+        return {"error": {"type": err_type, "code": code or "UNKNOWN"}}
+    return {"error": {"type": "none", "code": "NONE"}}
+
+
+OP_UNREGISTERED_DID_REJECTED = OpSpec(
+    name="unregistered_did_rejected",
+    py_call=_py_unregistered_did_rejected,
+    node_call={"op": "unregistered_did_rejected", "args": {}},
+    schema=OpSchema(
+        fields=(
+            FieldSpec("error.type", "ignore"),
+            # `error.code` must match EXPECTED_UNREGISTERED_DID_CODE
+            # exactly across every bridge; this is the whole point of
+            # this op. Mirrors OP_UCAN_VALIDATE_MALFORMED.
+            FieldSpec("error.code", "exact"),
+        )
+    ),
+    # Pin the committed code. If all bridges silently drift (e.g. to
+    # "UNKNOWN"), exact-equality parity would still hold — this literal
+    # pin is what catches that mode.
+    expected_values=(("error.code", EXPECTED_UNREGISTERED_DID_CODE),),
+)
+
+
+# ---------------------------------------------------------------------------
 # Library
 # ---------------------------------------------------------------------------
 
@@ -834,4 +914,5 @@ SEED_OPS: tuple[OpSpec, ...] = (
     OP_UCAN_VALIDATE_MALFORMED,
     OP_TRANSPORT_STATUS,
     OP_EVENT_LOG_FILTERED,
+    OP_UNREGISTERED_DID_REJECTED,
 )
