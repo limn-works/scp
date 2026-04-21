@@ -1273,10 +1273,10 @@ public func FfiConverterTypeIdentity_lower(_ value: Identity) -> UnsafeMutableRa
 /**
  * Opaque handle to a running SCP application node.
  *
- * Created by [`node_start_in_memory`] or [`node_start_local`]. The node
- * includes a running relay server, a generated DID identity, and (optionally)
- * persistent storage. The HTTP server is **not** started automatically --
- * only the relay is bound.
+ * Created by [`node_start_in_memory_on`] or [`node_start_local_on`]. The
+ * node includes a running relay server, a generated DID identity, and
+ * (optionally) persistent storage. The HTTP server is **not** started
+ * automatically -- only the relay is bound.
  */
 public protocol NodeHandleProtocol: AnyObject, Sendable {
     
@@ -1372,10 +1372,10 @@ public protocol NodeHandleProtocol: AnyObject, Sendable {
 /**
  * Opaque handle to a running SCP application node.
  *
- * Created by [`node_start_in_memory`] or [`node_start_local`]. The node
- * includes a running relay server, a generated DID identity, and (optionally)
- * persistent storage. The HTTP server is **not** started automatically --
- * only the relay is bound.
+ * Created by [`node_start_in_memory_on`] or [`node_start_local_on`]. The
+ * node includes a running relay server, a generated DID identity, and
+ * (optionally) persistent storage. The HTTP server is **not** started
+ * automatically -- only the relay is bound.
  */
 open class NodeHandle: NodeHandleProtocol, @unchecked Sendable {
     fileprivate let pointer: UnsafeMutableRawPointer!
@@ -1983,6 +1983,15 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `instance_id` does not match this `SCP`'s.
      */
     func applyPendingCeilingModification(handle: ContextHandle, currentTimestamp: UInt64) async throws  -> Bool
+    
+    /**
+     * Per-instance equivalent of the free-function [`bridge_create_shadow`].
+     *
+     * Mutates this instance's per-context bridge state. Rejects any
+     * cross-instance caller (the method takes `&self` — the `bi` threaded
+     * into `bridge_create_shadow_on` is always this instance's).
+     */
+    func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMode: String, contextId: String) throws  -> ShadowIdentityResult
     
     /**
      * Per-instance equivalent of the free-function [`bridge_evaluate_trust`].
@@ -2640,6 +2649,23 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func migrationState(handle: ContextHandle) async throws  -> String?
     
     /**
+     * Per-instance equivalent of the free-function `node_start_in_memory`.
+     *
+     * Starts an in-memory application node. If `identity` is supplied, it
+     * must have been minted by this `Scp` (cross-instance handles are
+     * rejected via the `CoreFields::check_handle` call).
+     */
+    func nodeStartInMemory(identity: Identity?) async throws  -> NodeHandle
+    
+    /**
+     * Per-instance equivalent of the free-function `node_start_local`.
+     *
+     * Starts a file-backed application node at `data_dir`. If `identity`
+     * is supplied, it must have been minted by this `Scp`.
+     */
+    func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?) async throws  -> NodeHandle
+    
+    /**
      * Per-instance equivalent of the free-function `petname_get_for_context`.
      */
     func petnameGetForContext(ownerDid: String, contextId: String) throws  -> String?
@@ -2697,6 +2723,23 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func registerLocalDid(did: String) async throws 
     
     /**
+     * Per-instance equivalent of the free-function `relay_start_in_memory`.
+     *
+     * Starts a new in-memory relay server and returns a `RelayHandle`
+     * whose `instance_id` is stamped against this `Scp`. Phase D (#1695)
+     * replaces the old free function that looked up `DEFAULT_BRIDGE_INSTANCE`
+     * for the handle's `instance_id`.
+     */
+    func relayStartInMemory() async throws  -> RelayHandle
+    
+    /**
+     * Per-instance equivalent of the free-function `relay_start_local`.
+     *
+     * Starts a new redb-backed relay at `data_dir/blobs.redb`.
+     */
+    func relayStartLocal(dataDir: String) async throws  -> RelayHandle
+    
+    /**
      * Per-instance equivalent of the free-function [`restore_all_contexts`].
      *
      * Routes through `&*self.inner`.
@@ -2740,6 +2783,24 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Per-instance equivalent of the free-function `scope_register`.
      */
     func scopeRegister(scopeContextId: String, name: String, targetContextId: String, relayUrls: [String], registrantDid: String, description: String?, tags: [String]?) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `scpid_sign`.
+     *
+     * Signs an SCPID challenge with the identity's requested key. Rejects
+     * any `Identity` whose `instance_id` does not match this `Scp`'s.
+     */
+    func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `scpid_verify`.
+     *
+     * Uses this `Scp`'s DID resolver (populated when the caller invokes
+     * `identity_create` / `identity_create_with_custody`). Phase D (#1695)
+     * replaces the old free function that consulted the process-wide
+     * `DEFAULT_BRIDGE_INSTANCE` DID resolver slot.
+     */
+    func scpidVerify(responseJson: String, challengeJson: String) throws  -> String
     
     /**
      * Per-instance equivalent of the free-function `set_economic_policy`.
@@ -3049,11 +3110,12 @@ open class Scp: ScpProtocol, @unchecked Sendable {
     /**
      * Constructs a fresh `SCP` instance with default in-memory state.
      *
-     * Unlike [`Self::default_instance`], this bypasses the process-global
-     * `DEFAULT_BRIDGE_INSTANCE` entirely — each call produces a brand-new
-     * instance with a fresh monotonic `instance_id`, a fresh
-     * `CancellationToken`, and an empty `JoinSet`. Handles issued against
-     * this instance are incompatible with any other instance.
+     * Each call produces a brand-new instance with a fresh monotonic
+     * `instance_id`, a fresh `CancellationToken`, and an empty
+     * `JoinSet`. Handles issued against this instance are incompatible
+     * with any other instance — the `CoreFields::check_handle` path
+     * surfaces the mismatch as `ScpError::Permission` with code
+     * `SCP-PERM-3030`.
      */
 public convenience init() {
     let pointer =
@@ -3072,25 +3134,6 @@ public convenience init() {
         try! rustCall { uniffi_scp_ffi_uniffi_fn_free_scp(pointer, $0) }
     }
 
-    
-    /**
-     * Returns an `SCP` wrapping the process-wide default instance.
-     *
-     * Multiple calls return distinct `SCP` objects, but each wraps the
-     * same underlying `Arc<UniffiBridgeInstance>` — their `instance_id`s
-     * match, and changes made through one are visible to the other.
-     *
-     * # Errors
-     *
-     * Returns `ScpError::Context` if the default instance is currently
-     * suspended or permanently shut down.
-     */
-public static func defaultInstance()throws  -> Scp  {
-    return try  FfiConverterTypeScp_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_constructor_scp_default_instance($0
-    )
-})
-}
     
     /**
      * Constructs an `SCP` instance with a persistence provider placeholder.
@@ -3274,6 +3317,24 @@ open func applyPendingCeilingModification(handle: ContextHandle, currentTimestam
             liftFunc: FfiConverterBool.lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function [`bridge_create_shadow`].
+     *
+     * Mutates this instance's per-context bridge state. Rejects any
+     * cross-instance caller (the method takes `&self` — the `bi` threaded
+     * into `bridge_create_shadow_on` is always this instance's).
+     */
+open func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMode: String, contextId: String)throws  -> ShadowIdentityResult  {
+    return try  FfiConverterTypeShadowIdentityResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_create_shadow(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),
+        FfiConverterString.lower(platformHandle),
+        FfiConverterString.lower(bridgeMode),
+        FfiConverterString.lower(contextId),$0
+    )
+})
 }
     
     /**
@@ -4979,6 +5040,53 @@ open func migrationState(handle: ContextHandle)async throws  -> String?  {
 }
     
     /**
+     * Per-instance equivalent of the free-function `node_start_in_memory`.
+     *
+     * Starts an in-memory application node. If `identity` is supplied, it
+     * must have been minted by this `Scp` (cross-instance handles are
+     * rejected via the `CoreFields::check_handle` call).
+     */
+open func nodeStartInMemory(identity: Identity?)async throws  -> NodeHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_node_start_in_memory(
+                    self.uniffiClonePointer(),
+                    FfiConverterOptionTypeIdentity.lower(identity)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeNodeHandle_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `node_start_local`.
+     *
+     * Starts a file-backed application node at `data_dir`. If `identity`
+     * is supplied, it must have been minted by this `Scp`.
+     */
+open func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?)async throws  -> NodeHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_node_start_local(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(dataDir),FfiConverterOptionTypeIdentity.lower(identity),FfiConverterOptionString.lower(passphrase)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeNodeHandle_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
      * Per-instance equivalent of the free-function `petname_get_for_context`.
      */
 open func petnameGetForContext(ownerDid: String, contextId: String)throws  -> String?  {
@@ -5117,6 +5225,53 @@ open func registerLocalDid(did: String)async throws   {
 }
     
     /**
+     * Per-instance equivalent of the free-function `relay_start_in_memory`.
+     *
+     * Starts a new in-memory relay server and returns a `RelayHandle`
+     * whose `instance_id` is stamped against this `Scp`. Phase D (#1695)
+     * replaces the old free function that looked up `DEFAULT_BRIDGE_INSTANCE`
+     * for the handle's `instance_id`.
+     */
+open func relayStartInMemory()async throws  -> RelayHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_relay_start_in_memory(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeRelayHandle_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `relay_start_local`.
+     *
+     * Starts a new redb-backed relay at `data_dir/blobs.redb`.
+     */
+open func relayStartLocal(dataDir: String)async throws  -> RelayHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_relay_start_local(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(dataDir)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeRelayHandle_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
      * Per-instance equivalent of the free-function [`restore_all_contexts`].
      *
      * Routes through `&*self.inner`.
@@ -5229,6 +5384,39 @@ open func scopeRegister(scopeContextId: String, name: String, targetContextId: S
         FfiConverterString.lower(registrantDid),
         FfiConverterOptionString.lower(description),
         FfiConverterOptionSequenceString.lower(tags),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `scpid_sign`.
+     *
+     * Signs an SCPID challenge with the identity's requested key. Rejects
+     * any `Identity` whose `instance_id` does not match this `Scp`'s.
+     */
+open func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_scpid_sign(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity_lower(identity),
+        FfiConverterString.lower(signingKeyId),
+        FfiConverterString.lower(challengeJson),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `scpid_verify`.
+     *
+     * Uses this `Scp`'s DID resolver (populated when the caller invokes
+     * `identity_create` / `identity_create_with_custody`). Phase D (#1695)
+     * replaces the old free function that consulted the process-wide
+     * `DEFAULT_BRIDGE_INSTANCE` DID resolver slot.
+     */
+open func scpidVerify(responseJson: String, challengeJson: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_scpid_verify(self.uniffiClonePointer(),
+        FfiConverterString.lower(responseJson),
+        FfiConverterString.lower(challengeJson),$0
     )
 })
 }
@@ -13208,46 +13396,6 @@ public func uniffiForeignFutureHandleCountScp() -> Int {
     UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.count
 }
 /**
- * Creates a shadow identity for an external platform participant.
- *
- * Shadow identities represent non-SCP participants in a bridged context.
- * They carry provenance metadata indicating they are not native SCP
- * identities.
- *
- * Uses the persistent per-context `ShadowRegistry` and `SenderKeyStore`
- * from the process-global bridge state registry, ensuring that shadow
- * identity state and sender keys survive across function calls.
- *
- * # Arguments
- *
- * * `bridge_id` — The bridge connector ID that owns this shadow.
- * * `platform_handle` — External platform handle (e.g., `"@user#1234"`).
- * * `bridge_mode` — Bridge mode: `"relay"`, `"puppet"`, `"api"`, or
- * `"cooperative"`.
- * * `context_id` — Context the shadow is being created in.
- *
- * # Returns
- *
- * A `ShadowIdentityResult` with the shadow identity details.
- *
- * # Errors
- *
- * Returns `ScpError::Validation` if `bridge_mode` is not recognized, or
- * `ScpError::Context` if shadow creation fails.
- *
- * See spec section 12 (Bridge System) and ADR-023.
- */
-public func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMode: String, contextId: String)throws  -> ShadowIdentityResult  {
-    return try  FfiConverterTypeShadowIdentityResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_bridge_create_shadow(
-        FfiConverterString.lower(bridgeId),
-        FfiConverterString.lower(platformHandle),
-        FfiConverterString.lower(bridgeMode),
-        FfiConverterString.lower(contextId),$0
-    )
-})
-}
-/**
  * Evaluates the trust level for an action based on bridge provenance.
  *
  * Returns an integer (0-3) representing the trust tier.
@@ -13736,65 +13884,6 @@ public func metadataRecordToJson(contextId: String, sequence: UInt64, signerDid:
 })
 }
 /**
- * Starts a full application node with in-memory storage.
- *
- * When `identity` is provided, the node uses the pre-existing identity
- * instead of generating a fresh one. This enables identity portability —
- * the same DID persists across node restarts and can be shared between
- * SDK and node instances.
- *
- * Auto-wires in-memory key custody, in-memory storage, in-memory DHT client,
- * self-signed TLS, and a relay on an OS-assigned port.
- *
- * # Swift
- *
- * ```swift
- * let identity = try await identityCreate(custody: "in_memory")
- * let node = try await nodeStartInMemory(identity: identity)
- * print(node.relayUrl()) // "ws://127.0.0.1:PORT/scp/v1"
- * print(node.did())      // same DID as identity.did()
- * node.shutdown()
- * ```
- */
-public func nodeStartInMemory(identity: Identity?)async throws  -> NodeHandle  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_node_start_in_memory(FfiConverterOptionTypeIdentity.lower(identity)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeNodeHandle_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Starts a full application node with file-backed storage.
- *
- * When `identity` is provided, the node uses the pre-existing identity.
- * When `None`, the node creates or reloads a persistent identity via
- * `FileKeyCustody`. The `passphrase` parameter is required in this mode.
- *
- * Opens (or creates) persistent storage at `<data_dir>/storage/` and a redb
- * blob database at `<data_dir>/blobs.redb`.
- */
-public func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?)async throws  -> NodeHandle  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_node_start_local(FfiConverterString.lower(dataDir),FfiConverterOptionTypeIdentity.lower(identity),FfiConverterOptionString.lower(passphrase)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeNodeHandle_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
  * Checks whether the provenance chain depth is within the allowed limit.
  */
 public func provenanceCheckChainDepth(chainDepth: UInt8, maxDepth: UInt8?) -> Bool  {
@@ -13866,53 +13955,6 @@ public func provenanceUpdateSourceType(provenanceJson: String, newState: String)
 })
 }
 /**
- * Starts a relay with in-memory blob storage on an OS-assigned port.
- *
- * Returns a [`RelayHandle`] whose `relay_url()` method returns the
- * WebSocket URL for clients.
- *
- * # Swift
- *
- * ```swift
- * let relay = try await relayStartInMemory()
- * print(relay.relayUrl()) // "ws://127.0.0.1:PORT/scp/v1"
- * relay.shutdown()
- * ```
- */
-public func relayStartInMemory()async throws  -> RelayHandle  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_relay_start_in_memory(
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeRelayHandle_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Starts a relay with redb-backed blob storage on an OS-assigned port.
- *
- * Opens (or creates) a redb database at `<data_dir>/blobs.redb`.
- */
-public func relayStartLocal(dataDir: String)async throws  -> RelayHandle  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_relay_start_local(FfiConverterString.lower(dataDir)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeRelayHandle_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
  * Checks whether a given capability is allowed for an app binding.
  */
 public func sandboxCheckCapability(grantedCapabilities: [String], requiredCapability: String) -> Bool  {
@@ -13940,59 +13982,6 @@ public func sandboxValidateDeclaration(declarationJson: String, ceilingCapabilit
 })
 }
 /**
- * Waits for all outstanding FFI handles to be released, then shuts down.
- *
- * Call this from Swift/Kotlin before your process exits or before tearing
- * down the SCP library. It blocks (asynchronously) until either:
- *
- * - All opaque handle objects (`Identity`, `ContextHandle`, `UcanToken`,
- * `TransportManager`) have been garbage-collected / freed, **or**
- * - The `timeout_millis` deadline has elapsed.
- *
- * After this call returns, the tokio runtime may be dropped safely — no
- * outstanding FFI handles remain that could attempt to call into it.
- *
- * The unit is **milliseconds** — unified across all Rust bridges so the
- * Swift, Kotlin, and TypeScript SDKs can share a single conversion
- * surface (the SDK wrappers multiply by 1000 before crossing FFI). The
- * default is 5000 ms (per ADR-021 acceptance criterion 1). Pass `0` to
- * return immediately without waiting.
- *
- * # Thread safety
- *
- * This function is safe to call from any thread. It polls `HANDLE_COUNT`
- * in 10 ms intervals on the tokio runtime (via `tokio::time::sleep`) so
- * the worker is not blocked — critical for mobile apps that run this on
- * the main event loop.
- *
- * **Bug fix (PR 1 post-review):** the previous implementation polled
- * with `std::thread::sleep`, which blocks the current tokio worker.
- * Mobile apps invoking `scpShutdown` from the foreground ran the risk
- * of a frozen UI while tasks drained. The new implementation yields
- * via `tokio::time::sleep` as every other async bridge function does.
- *
- * # Example (Swift)
- *
- * ```swift
- * // Call before application exit:
- * try await scpShutdown(timeoutMillis: 5_000)
- * ```
- */
-public func scpShutdown(timeoutMillis: UInt64)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_scp_shutdown(FfiConverterUInt64.lower(timeoutMillis)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
  * Generates an SCPID challenge for the given audience (§3.11.8).
  *
  * Returns the challenge as a JSON string containing `protocol`, `nonce`,
@@ -14013,63 +14002,6 @@ public func scpidChallenge(audience: String, ttlSeconds: UInt64)throws  -> Strin
     uniffi_scp_ffi_uniffi_fn_func_scpid_challenge(
         FfiConverterString.lower(audience),
         FfiConverterUInt64.lower(ttlSeconds),$0
-    )
-})
-}
-/**
- * Signs an SCPID challenge with the identity's key (§3.11.3).
- *
- * Selects the appropriate signing key (`#active` or `#agent`) from the
- * identity handle, and produces a signed SCPID response as a JSON string.
- *
- * # Arguments
- *
- * * `identity` — The identity handle (from `identity_create`).
- * * `signing_key_id` — `"#active"` or `"#agent"`.
- * * `challenge_json` — JSON string of the challenge (from [`scpid_challenge`]).
- *
- * # Errors
- *
- * Returns `ScpError::Validation` if `signing_key_id` is invalid or the
- * challenge JSON is malformed.
- * Returns `ScpError::Identity` if the identity has no agent key when
- * `#agent` is requested, or if signing fails.
- */
-public func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_scpid_sign(
-        FfiConverterTypeIdentity_lower(identity),
-        FfiConverterString.lower(signingKeyId),
-        FfiConverterString.lower(challengeJson),$0
-    )
-})
-}
-/**
- * Verifies a signed SCPID response against the original challenge (§3.11.4).
- *
- * Resolves the signer's DID document via the global production DID resolver
- * (initialized during `identityCreate`), then runs the 11-step verification
- * pipeline from `scp-core`. Returns the `ScpIdAuthentication` result as a
- * JSON string on success.
- *
- * # Arguments
- *
- * * `response_json` — JSON string of the signed response (from `scpid_sign`).
- * * `challenge_json` — JSON string of the original challenge (from `scpid_challenge`).
- *
- * # Errors
- *
- * Returns `ScpError::Identity` if the DID resolver is not initialized
- * (no identity created yet).
- * Returns `ScpError::Validation` if either JSON string is malformed.
- * Returns `ScpError::Identity` if DID resolution fails, the signature is
- * invalid, the challenge has expired, or any other verification step fails.
- */
-public func scpidVerify(responseJson: String, challengeJson: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_scpid_verify(
-        FfiConverterString.lower(responseJson),
-        FfiConverterString.lower(challengeJson),$0
     )
 })
 }
@@ -14224,9 +14156,6 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_bridge_create_shadow() != 23486) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_bridge_evaluate_trust() != 16710) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14317,12 +14246,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_metadata_record_to_json() != 58960) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_node_start_in_memory() != 46028) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_node_start_local() != 1895) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_provenance_check_chain_depth() != 15774) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14335,28 +14258,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_provenance_update_source_type() != 33504) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_relay_start_in_memory() != 43291) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_relay_start_local() != 47076) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_sandbox_check_capability() != 25855) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_sandbox_validate_declaration() != 13375) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scp_shutdown() != 29393) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_scpid_challenge() != 19241) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scpid_sign() != 52365) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scpid_verify() != 37844) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_sync_classify_offline() != 59370) {
@@ -14498,6 +14406,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_apply_pending_ceiling_modification() != 44521) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_create_shadow() != 7288) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_evaluate_trust() != 11772) {
@@ -14740,6 +14651,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_migration_state() != 3834) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_in_memory() != 58945) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_local() != 59051) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_get_for_context() != 8149) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14770,6 +14687,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_register_local_did() != 65305) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_relay_start_in_memory() != 14458) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_relay_start_local() != 7556) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_restore_all_contexts() != 18263) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14786,6 +14709,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_scope_register() != 1713) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_scpid_sign() != 19905) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_scpid_verify() != 7728) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_set_economic_policy() != 12223) {
@@ -14920,10 +14849,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_token_id() != 51675) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_default_instance() != 7542) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_new() != 42429) {
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_new() != 52341) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_persistence() != 28565) {
