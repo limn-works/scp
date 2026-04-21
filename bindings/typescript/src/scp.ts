@@ -40,7 +40,6 @@ import type { Context } from "./context";
 import { ValidationError } from "./errors";
 import type { Identity } from "./identity";
 import type { Node, Relay } from "./server";
-import type { Transport } from "./transport";
 
 /**
  * Shape of the native addon — a subset sufficient to describe the
@@ -248,10 +247,10 @@ const NATIVE_HANDLE: unique symbol = Symbol("scp.nativeHandle");
  *
  * Handle-returning methods wrap the raw NAPI handle in the
  * corresponding opaque SDK class (e.g. {@link Identity}, {@link Context},
- * {@link Transport}, {@link Relay}, {@link Node}). Methods that return
- * primitive values or JSON strings pass through unchanged — SDK
- * wrappers (e.g. `Identity`, `Context`) still exist and layer their
- * own parsing on top of these forwarders during this migration slice.
+ * {@link Relay}, {@link Node}). Transport and MCP handles are returned
+ * as opaque `unknown` — callers pass them back to other `SCP` methods
+ * verbatim. Methods that return primitive values or JSON strings pass
+ * through unchanged.
  */
 export class SCP {
   /** The native NAPI `SCP` handle. `readonly` + private so TS consumers can't reach the raw addon surface. */
@@ -562,11 +561,11 @@ export class SCP {
 
   async contextCreate(identity: Identity, paramsJson: string): Promise<Context> {
     const raw = await (this.#native.contextCreate as (id: unknown, p: string) => Promise<unknown>)(
-      identity._handle,
+      identity._rawHandle,
       paramsJson,
     );
     const { Context: ContextCls } = await import("./context");
-    return ContextCls._fromHandle(raw as never, identity.did, this);
+    return ContextCls._fromHandle(this, raw as never, identity.did);
   }
 
   async contextJoin(
@@ -1347,7 +1346,7 @@ export class SCP {
   eventLogCheckpoint(handle: unknown, identity: Identity, epoch: number): unknown {
     return (this.#native.eventLogCheckpoint as (h: unknown, i: unknown, e: number) => unknown)(
       handle,
-      identity._handle,
+      identity._rawHandle,
       epoch,
     );
   }
@@ -1364,10 +1363,8 @@ export class SCP {
   // Domain: Transport
   // ───────────────────────────────────────────────────────────────────────
 
-  async transportConnect(relayUrl: string): Promise<Transport> {
-    const raw = await (this.#native.transportConnect as (u: string) => Promise<unknown>)(relayUrl);
-    const { Transport: TransportCls } = await import("./transport");
-    return TransportCls._fromHandle(raw, this);
+  async transportConnect(relayUrl: string): Promise<unknown> {
+    return await (this.#native.transportConnect as (u: string) => Promise<unknown>)(relayUrl);
   }
 
   async transportStatus(manager: unknown): Promise<unknown> {

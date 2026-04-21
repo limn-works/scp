@@ -7,22 +7,20 @@
  * ## Quick start
  *
  * ```typescript
- * import { SCP, Identity, Context } from "@limn-works/scp-ts";
+ * import { SCP } from "@limn-works/scp-ts";
  *
  * const scp = new SCP();
  * try {
  *   const identity = await scp.identityCreate("in_memory");
  *
- *   await using ctx = await Context.create(identity, {
+ *   const ctx = await scp.contextCreate(identity, JSON.stringify({
  *     ceiling: ["messages:read", "messages:write"],
  *     memoryScope: "ephemeral",
- *   });
- *
- *   await ctx.send("hello world");
- *
- *   for await (const msg of ctx.receive()) {
- *     console.log(msg.senderDid, msg.content);
- *     break;
+ *   }));
+ *   try {
+ *     await scp.contextSend(ctx, identity.did, new TextEncoder().encode("hello world"));
+ *   } finally {
+ *     await scp.contextLeave(ctx, identity.did);
  *   }
  * } finally {
  *   await scp.shutdown(5);
@@ -30,10 +28,12 @@
  * ```
  *
  * Phase 4 PR 4 (#1549, ADR-048) moved every NAPI bridge operation onto
- * the {@link SCP} class; the module-level free-function shims were
- * deleted. Pure helpers that do not touch bridge state (e.g.
- * {@link defineToolDefinition}, {@link parseAddress}) remain as
- * free functions.
+ * the {@link SCP} class and collapsed the namespace classes
+ * (`Identity`, `Context`, `Relay`, `Node`) to pure handle types. The
+ * module-level free-function shims and class-level instance/static
+ * method fan-out were deleted. Pure helpers that do not touch bridge
+ * state (e.g. {@link defineToolDefinition}, {@link parseAddress})
+ * remain as free functions.
  *
  * @packageDocumentation
  */
@@ -62,7 +62,7 @@ export type {
   OperationalMetadata,
   StructuralMetadata,
 } from "./context";
-export { Context, ScopedHandle } from "./context";
+export { Context } from "./context";
 
 // ---------------------------------------------------------------------------
 // Tools
@@ -77,29 +77,37 @@ export { defineToolDefinition } from "./tools";
 export type { AggregatedTrustInput, AggregationInput } from "./trust";
 
 // ---------------------------------------------------------------------------
-// Event Log
+// Event Log — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
-
-export { EventLog } from "./event-log";
+//
+// The `./event-log` module was deleted in Phase 4 PR 4 Agent B1 (#1549,
+// ADR-048). Call `scp.eventLogQuery(...)`, `scp.eventLogVerify(...)`,
+// `scp.eventLogCheckpoint(...)` / `scp.eventLogCheckpointByDid(...)`
+// directly on the SCP instance.
 
 // ---------------------------------------------------------------------------
-// Transport
+// Transport — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
-
-export { Transport } from "./transport";
+//
+// The `./transport` module was deleted in Phase 4 PR 4 Agent B1 (#1549,
+// ADR-048). Call `scp.transportConnect(...)`,
+// `scp.transportStatus(...)`, `scp.transportDisconnect(...)` directly.
+// The transport handle is returned as an opaque `unknown` and passed
+// back verbatim to subsequent `SCP` methods. `TransportStatus` lives in
+// `./types` and is re-exported below.
 
 // ---------------------------------------------------------------------------
 // UCAN — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
-
-// The `./ucan` module is empty after ADR-048 demolition; `UcanToken` is
-// re-exported from `./types` below.
+//
+// The `./ucan` module was deleted in Phase 4 PR 4 Agent B1 (#1549,
+// ADR-048). `UcanToken` lives in `./types` and is re-exported below.
 
 // ---------------------------------------------------------------------------
 // MCP — types only (entry points moved to SCP)
 // ---------------------------------------------------------------------------
 
-export type { McpClient, McpServer } from "./mcp";
+export type { McpClient, McpServer, NativeMcpClientHandle, NativeMcpServerHandle } from "./mcp";
 
 // ---------------------------------------------------------------------------
 // Bridge Connector — types only (entry points moved to SCP)

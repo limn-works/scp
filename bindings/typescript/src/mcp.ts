@@ -1,50 +1,56 @@
 /**
- * MCP (Model Context Protocol) types for the SCP TypeScript SDK.
+ * MCP (Model Context Protocol) handle types for the SCP TypeScript SDK.
  *
- * Defines handle interfaces for servers and clients. The functional
- * entry points (`serveMcp`, `connectMcp`, `connectMcpStdio`) moved
- * onto the {@link SCP} class in Phase 4 PR 4 (#1549, ADR-048) as
- * `scp.mcpServerCreate(...)`, `scp.mcpClientConnectSse(...)`,
- * `scp.mcpClientConnectStdio(...)` etc. The `McpServer` / `McpClient`
- * interfaces below survive for Agent B to collapse; the free-function
- * shims that predated ADR-048 were deleted in the same commit.
+ * After Phase 4 PR 4 (#1549, ADR-048) Agent B1, {@link McpServer} and
+ * {@link McpClient} collapse to pure handle types that wrap the raw
+ * NAPI object. All MCP operations live on the {@link SCP} class
+ * (`scp.mcpServerCreate`, `scp.mcpServerStop`,
+ * `scp.mcpClientConnectStdio`, `scp.mcpClientConnectSse`,
+ * `scp.mcpClientDisconnect`, `scp.mcpClientListTools`,
+ * `scp.mcpClientInvoke`). The free-function shims (`serveMcp`,
+ * `connectMcp`, `connectMcpStdio`) that predated ADR-048 were deleted
+ * in the same commit.
  *
  * See ADR-015 in `.docs/adrs/phase-3.md` and `crates/scp-mcp/`.
  */
 
-import type { ToolDefinition } from "./types";
+// ---------------------------------------------------------------------------
+// Opaque native handles (raw napi-rs class instances)
+// ---------------------------------------------------------------------------
+
+/** Opaque NAPI handle returned by `scp.mcpServerCreate`. */
+export type NativeMcpServerHandle = unknown;
+
+/** Opaque NAPI handle returned by `scp.mcpClientConnectStdio` / `mcpClientConnectSse`. */
+export type NativeMcpClientHandle = unknown;
 
 // ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
 
-/** Handle to a running MCP server. */
-export interface McpServer extends AsyncDisposable {
-  /** The URL the server is listening on. */
-  readonly url: string;
-  /** The tools exposed by this server. */
-  readonly tools: readonly ToolDefinition[];
-  /** Stops the MCP server. */
-  stop(): Promise<void>;
+/**
+ * Pure handle to a running MCP server — thin wrapper around the raw
+ * NAPI handle returned by {@link SCP.mcpServerCreate}. Stop the server
+ * via `scp.mcpServerStop(server._rawHandle)`.
+ */
+export interface McpServer {
+  /** @internal Raw napi-rs MCP server handle. */
+  readonly _rawHandle: NativeMcpServerHandle;
 }
 
 // ---------------------------------------------------------------------------
 // MCP Client
 // ---------------------------------------------------------------------------
 
-/** Handle to an MCP client connection. */
-export interface McpClient extends AsyncDisposable {
-  /** The server URL this client is connected to. */
-  readonly serverUrl: string;
-  /** Lists available tools on the MCP server. */
-  listTools(): Promise<readonly ToolDefinition[]>;
-  /** Invokes a tool on the MCP server. */
-  invokeTool(
-    toolName: string,
-    input: Readonly<Record<string, unknown>>,
-    contextId?: string,
-    invokerDid?: string,
-  ): Promise<unknown>;
-  /** Disconnects from the MCP server. */
-  disconnect(): Promise<void>;
+/**
+ * Pure handle to an MCP client connection — thin wrapper around the raw
+ * NAPI handle returned by {@link SCP.mcpClientConnectStdio} or
+ * {@link SCP.mcpClientConnectSse}. Disconnect via
+ * `scp.mcpClientDisconnect(client._rawHandle)`, list/invoke tools via
+ * `scp.mcpClientListTools(client._rawHandle)` and
+ * `scp.mcpClientInvoke(client._rawHandle, ...)`.
+ */
+export interface McpClient {
+  /** @internal Raw napi-rs MCP client handle. */
+  readonly _rawHandle: NativeMcpClientHandle;
 }

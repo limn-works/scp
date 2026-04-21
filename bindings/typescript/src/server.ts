@@ -1,20 +1,18 @@
 /**
  * Server-side SDK wrappers for relay and application node lifecycle.
  *
- * Provides {@link Relay} and {@link Node} classes that wrap the napi-rs
- * bridge functions `relayStartInMemory` / `relayStartLocal` and
- * `nodeStartInMemory` / `nodeStartLocal`.
+ * After Phase 4 PR 4 (#1549, ADR-048) Agent B1, {@link Relay} and
+ * {@link Node} collapse to pure handle wrappers. The static factory
+ * methods (`startInMemory` / `startLocal`) were deleted — callers
+ * construct relays and nodes via the {@link SCP} class directly
+ * (`scp.relayStartInMemory()`, `scp.relayStartLocal(dir)`,
+ * `scp.nodeStartInMemory(identity?)`, `scp.nodeStartLocal(dir, identity?, passphrase?)`),
+ * which internally calls `_fromHandle` to hydrate these wrappers.
  *
- * Both classes implement `AsyncDisposable` for `await using` automatic
- * cleanup:
- *
- * ```typescript
- * await using relay = await Relay.startInMemory();
- * console.log(relay.relayUrl);
- *
- * await using node = await Node.startInMemory();
- * console.log(node.relayUrl, node.did);
- * ```
+ * The handle-level methods remain: shutdown, serve, httpUrl,
+ * enableSiteProjection, commitDeploy, rollbackDeploy,
+ * disableSiteProjection — NAPI exposes all of those on the raw handle,
+ * so they continue to work without going back through an `SCP`.
  *
  * Server operations are native-only (Bun/Node.js). Not available for
  * WASM (ADR-034).
@@ -22,20 +20,12 @@
  * @packageDocumentation
  */
 
-import { createRequire } from "node:module";
-import { TransportError } from "./errors";
-import { __getNativeScp, type SCP } from "./scp";
+import type { SCP } from "./scp";
 import type { SiteConfig } from "./types";
 import { validateAdmission, validateBroadcastKeyHex, validateSiteConfig } from "./types";
 
 // ---------------------------------------------------------------------------
-// Native addon access — server operations bypass the Bridge interface
-//
-// Since ADR-048 (#1549 Phase 4 PR 4), relay/node factories REQUIRE an
-// `SCP` instance and dispatch through its class methods. The
-// process-wide default-instance fallback was DELETED in PR 4 (re-scoped
-// 2026-04-19) — no deprecation window. Every factory below takes `scp`
-// as its first positional argument.
+// Native handle shapes
 // ---------------------------------------------------------------------------
 
 /** Shape of the napi-rs relay handle returned by the native addon. */
@@ -72,103 +62,6 @@ interface NativeNodeHandle {
   disableSiteProjection(contextId: string): Promise<void>;
 }
 
-/** Typed subset of the native addon for server operations. */
-interface ServerAddon {
-  relayStartInMemory(): Promise<NativeRelayHandle>;
-  relayStartLocal(dataDir: string): Promise<NativeRelayHandle>;
-  nodeStartInMemory(identityDid: string | null): Promise<NativeNodeHandle>;
-  nodeStartLocal(
-    dataDir: string,
-    identityDid: string | null,
-    passphrase: string | null,
-  ): Promise<NativeNodeHandle>;
-  transportConnect(relayUrl: string): Promise<unknown>;
-  configureLocalTransport(localDid: string): void;
-}
-
-/**
- * Resolves the platform-specific napi package name.
- *
- * Uses the same hardcoded map as `internal/native.ts` to correctly handle
- * Windows (`-msvc`) and Linux (`-gnu`) suffixes.
- */
-function resolveNapiPackage(): string {
-  const platform = process.platform;
-  const arch = process.arch;
-
-  const platformMap: Record<string, string> = {
-    "linux-x64": "@limn-works/scp-ts-napi-linux-x64-gnu",
-    "linux-arm64": "@limn-works/scp-ts-napi-linux-arm64-gnu",
-    "darwin-x64": "@limn-works/scp-ts-napi-darwin-x64",
-    "darwin-arm64": "@limn-works/scp-ts-napi-darwin-arm64",
-    "win32-x64": "@limn-works/scp-ts-napi-win32-x64-msvc",
-  };
-
-  const key = `${platform}-${arch}`;
-  const pkg = platformMap[key];
-
-  if (pkg === undefined) {
-    throw new TransportError(
-      `No native addon available for platform ${key}. ` +
-        "Install the appropriate @limn-works/scp-ts-napi-* package or use the WASM bridge in a browser environment.",
-      "SCP-TRANS-5001",
-    );
-  }
-
-  return pkg;
-}
-
-/** Cached addon instance. */
-let _addon: ServerAddon | null = null;
-
-function loadServerAddon(): ServerAddon {
-  if (_addon !== null) return _addon;
-
-  if (typeof process === "undefined" || typeof process.platform !== "string") {
-    throw new TransportError("Server operations not available in browser/WASM", "SCP-TRANS-5002");
-  }
-
-  const packageName = resolveNapiPackage();
-  try {
-    const req = createRequire(import.meta.url);
-    _addon = req(packageName) as ServerAddon;
-    return _addon;
-  } catch {
-    throw new TransportError(
-      `Failed to load native addon ${packageName}. ` +
-        `Ensure the package is installed: bun add ${packageName}`,
-      "SCP-TRANS-5001",
-    );
-  }
-}
-
-/**
- * Returns a {@link ServerAddon} view backed by the given {@link SCP}
- * instance's class methods (ADR-048). Methods that have not yet been
- * ported onto the `Scp` class fall back to module-level free
- * functions.
- */
-function serverApi(scp: SCP): ServerAddon {
-  // Ensure the native addon is actually installed / loadable before we
-  // extract `Scp` class method references — `loadServerAddon` throws
-  // the same descriptive `TransportError` on failure, so the error
-  // surface remains identical to the pre-ADR-048 path.
-  loadServerAddon();
-  // Type-erased native handle — every `Scp` class method shares the
-  // `async (...args) => unknown` shape after FFI monomorphization.
-  const native = __getNativeScp(scp) as unknown as Record<string, (...args: never[]) => unknown>;
-
-  return {
-    relayStartInMemory: native.relayStartInMemory as ServerAddon["relayStartInMemory"],
-    relayStartLocal: native.relayStartLocal as ServerAddon["relayStartLocal"],
-    nodeStartInMemory: native.nodeStartInMemory as ServerAddon["nodeStartInMemory"],
-    nodeStartLocal: native.nodeStartLocal as ServerAddon["nodeStartLocal"],
-    transportConnect: native.transportConnect as ServerAddon["transportConnect"],
-    configureLocalTransport:
-      native.configureLocalTransport as ServerAddon["configureLocalTransport"],
-  };
-}
-
 // ---------------------------------------------------------------------------
 // Relay
 // ---------------------------------------------------------------------------
@@ -176,9 +69,10 @@ function serverApi(scp: SCP): ServerAddon {
 /**
  * Opaque handle to a running SCP relay server.
  *
- * Use the static factory methods {@link Relay.startInMemory} or
- * {@link Relay.startLocal} to create an instance. Call {@link Relay.shutdown}
- * to stop the relay, or use `await using` for automatic cleanup.
+ * Construct via `scp.relayStartInMemory()` or `scp.relayStartLocal(dir)`;
+ * those methods dispatch through the {@link SCP} class and call
+ * `_fromHandle` to hydrate an instance. Call {@link Relay.shutdown} to
+ * stop the relay, or use `await using` for automatic cleanup.
  */
 export class Relay implements AsyncDisposable {
   readonly #handle: NativeRelayHandle;
@@ -190,11 +84,9 @@ export class Relay implements AsyncDisposable {
   /**
    * Constructs a `Relay` from a raw native NAPI relay handle.
    *
-   * @param raw The opaque NAPI relay handle returned by
-   *   `scp.relayStartInMemory()` / `scp.relayStartLocal()`.
-   * @param _scp Retained for API symmetry with the other
-   *   `_fromHandle` statics — the relay is already self-contained so
-   *   the caller-owned `SCP` does not need to be stored here.
+   * @param _scp Retained for API symmetry with the other `_fromHandle`
+   *   statics — the relay is self-contained so the caller-owned `SCP`
+   *   does not need to be stored here.
    *
    * @internal Phase 4 PR 4 (#1549, ADR-048).
    */
@@ -215,37 +107,6 @@ export class Relay implements AsyncDisposable {
   /** `true` if {@link shutdown} has already been called. */
   get isShutdown(): boolean {
     return this.#handle.isShutdown;
-  }
-
-  /**
-   * Start a relay with in-memory blob storage on an OS-assigned port.
-   *
-   * @param scp The {@link SCP} wrapper whose bridge instance should own
-   *   the relay. Required — the legacy process-wide default instance
-   *   fallback was removed in Phase 4 PR 4 (#1549) demolition.
-   * @returns A `Relay` whose {@link relayUrl} property contains the
-   * WebSocket URL for clients.
-   */
-  static async startInMemory(scp: SCP): Promise<Relay> {
-    const api = serverApi(scp);
-    const handle = await api.relayStartInMemory();
-    return new Relay(handle);
-  }
-
-  /**
-   * Start a relay with redb-backed blob storage on an OS-assigned port.
-   *
-   * Opens (or creates) a redb database at `<dataDir>/blobs.redb`.
-   *
-   * @param dataDir - Directory for persistent blob storage.
-   * @param scp The {@link SCP} wrapper whose bridge instance should own
-   *   the relay. Required — the legacy process-wide default instance
-   *   fallback was removed in Phase 4 PR 4 (#1549) demolition.
-   */
-  static async startLocal(scp: SCP, dataDir: string): Promise<Relay> {
-    const api = serverApi(scp);
-    const handle = await api.relayStartLocal(dataDir);
-    return new Relay(handle);
   }
 
   /**
@@ -271,9 +132,11 @@ export class Relay implements AsyncDisposable {
  * Opaque handle to a running SCP application node.
  *
  * An application node includes a running relay server, a generated DID
- * identity, and (optionally) persistent storage. Use the static factory
- * methods {@link Node.startInMemory} or {@link Node.startLocal} to create
- * an instance.
+ * identity, and (optionally) persistent storage. Construct via
+ * `scp.nodeStartInMemory(identity?)` or
+ * `scp.nodeStartLocal(dir, identity?, passphrase?)`; those methods
+ * dispatch through the {@link SCP} class and call `_fromHandle` to
+ * hydrate an instance.
  */
 export class Node implements AsyncDisposable {
   readonly #handle: NativeNodeHandle;
@@ -285,10 +148,8 @@ export class Node implements AsyncDisposable {
   /**
    * Constructs a `Node` from a raw native NAPI node handle.
    *
-   * @param raw The opaque NAPI node handle returned by
-   *   `scp.nodeStartInMemory()` / `scp.nodeStartLocal()`.
-   * @param _scp Retained for API symmetry with the other
-   *   `_fromHandle` statics.
+   * @param _scp Retained for API symmetry with the other `_fromHandle`
+   *   statics.
    *
    * @internal Phase 4 PR 4 (#1549, ADR-048).
    */
@@ -314,64 +175,6 @@ export class Node implements AsyncDisposable {
   /** `true` if {@link shutdown} has already been called. */
   get isShutdown(): boolean {
     return this.#handle.isShutdown;
-  }
-
-  /**
-   * Start a full application node with in-memory storage.
-   *
-   * Auto-wires in-memory key custody, in-memory storage, in-memory DHT
-   * client, self-signed TLS, and a relay on an OS-assigned port.
-   *
-   * When `identity` is provided, the node uses the pre-existing identity
-   * (created via `identityCreate`) instead of generating a fresh one. This
-   * enables identity portability -- the same DID persists across node
-   * restarts. The `ContextManager` is also auto-initialized with the
-   * node's relay as transport.
-   *
-   * Accepts any object with a `did` property (including the `Identity`
-   * class from `identityCreate`), keeping the server module decoupled.
-   *
-   * @param scp - The {@link SCP} wrapper whose bridge instance should
-   *   own the node. Required — the legacy process-wide default instance
-   *   fallback was removed in Phase 4 PR 4 (#1549) demolition.
-   * @param identity - Optional identity object with a `.did` property.
-   */
-  static async startInMemory(scp: SCP, identity?: { did: string }): Promise<Node> {
-    const api = serverApi(scp);
-    const handle = await api.nodeStartInMemory(identity?.did ?? null);
-    return new Node(handle);
-  }
-
-  /**
-   * Start a full application node with file-backed storage.
-   *
-   * Opens (or creates) persistent storage at `<dataDir>/storage/` and a
-   * redb blob database at `<dataDir>/blobs.redb`.
-   *
-   * When `identity` is provided, the node uses the pre-existing identity
-   * instead of generating a fresh one. When omitted, the node creates or
-   * reloads a persistent identity via `FileKeyCustody`. The `passphrase`
-   * parameter is required in this mode.
-   *
-   * No passphrase is required when `identity` is provided.
-   *
-   * @param scp - The {@link SCP} wrapper whose bridge instance should
-   *   own the node. Required — the legacy process-wide default instance
-   *   fallback was removed in Phase 4 PR 4 (#1549) demolition.
-   * @param dataDir - Directory for persistent storage.
-   * @param identity - Optional identity object with a `.did` property.
-   * @param passphrase - Passphrase for Argon2id key derivation. Required when
-   *   identity is omitted.
-   */
-  static async startLocal(
-    scp: SCP,
-    dataDir: string,
-    identity?: { did: string },
-    passphrase?: string,
-  ): Promise<Node> {
-    const api = serverApi(scp);
-    const handle = await api.nodeStartLocal(dataDir, identity?.did ?? null, passphrase ?? null);
-    return new Node(handle);
   }
 
   /**
@@ -514,21 +317,3 @@ export class Node implements AsyncDisposable {
     await this.shutdown();
   }
 }
-
-// ---------------------------------------------------------------------------
-// Transport helpers for local relays moved to `SCP` in Phase 4 PR 4
-// (#1549, ADR-048):
-//
-// - `scp.transportConnect(relayUrl)` — plaintext `ws://` is still
-//   permitted for loopback URLs. Unlike `Transport.connect(...)` which
-//   enforces `wss://`, the raw bridge call does not, so tests that
-//   target in-process relays can construct a `Transport` via
-//   `scp.transportConnect("ws://127.0.0.1:PORT/scp/v1")` directly.
-// - `scp.configureLocalTransport(localDid)` — pre-configures the
-//   `ContextManager` with `LocalTransportProvider` so `contextSend` /
-//   `broadcastPublish` succeed locally without a running relay.
-//
-// The free-function shims (`connectLocalTransport`,
-// `configureLocalTransport`) that predated ADR-048 were deleted in the
-// same commit.
-// ---------------------------------------------------------------------------

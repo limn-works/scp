@@ -178,38 +178,30 @@ export type { AddressResolution, ResolutionLayer, ResolutionPath, TrustLevel } f
 // `./discovery.ts`; this file no longer redeclares it.
 
 // -- Identity -----------------------------------------------------------------
+//
+// Phase 4 PR 4 Agent B1 (#1549, ADR-048) collapsed `Identity` to a
+// pure handle type. Lifecycle operations (create, load, resolve,
+// rotateKey, agent-key CRUD, attestations, recovery, custody
+// migration) live on the `SCP` class — call `scp.identityCreate(...)`,
+// `scp.identityLoad(...)`, `scp.identityResolve(...)`,
+// `scp.identityRotateKey(identity)`, etc.
 
 export declare class Identity {
   readonly did: string;
   readonly custodyType: string;
-
-  static create(options?: { custody?: string }): Promise<Identity>;
-  static load(did: string): Promise<Identity>;
-  static resolve(did: string): Promise<DIDDocument>;
-
-  rotateKey(): Promise<Identity>;
 }
 
 // -- Context ------------------------------------------------------------------
+//
+// Phase 4 PR 4 Agent B1 collapsed `Context` to a pure handle type.
+// Lifecycle and content operations (create, import, join, send,
+// receive, leave, close, tool registration, governance, broadcast,
+// economic policy, TTL, event drain, etc.) live on the `SCP` class —
+// call `scp.contextCreate(...)`, `scp.contextSend(...)`, etc.
 
 export declare class Context {
   readonly contextId: string;
-  readonly state: string;
-
-  static create(identity: Identity, params: ContextParams): Promise<Context>;
-
-  static join(identity: Identity, contextId: string): Promise<Context>;
-
-  send(payload: Uint8Array | string): Promise<void>;
-  receive(): AsyncIterable<Message>;
-  invokeTool(
-    toolId: string,
-    input: Record<string, unknown>,
-    identity: Identity,
-    ucanToken: string,
-  ): Promise<ToolResult>;
-  leave(): Promise<void>;
-  close(): Promise<void>;
+  readonly identityDid: string;
 }
 
 // -- UCAN ---------------------------------------------------------------------
@@ -225,30 +217,27 @@ export declare class Context {
 // and related primitives are now available directly on the SCP instance.
 
 // -- Event Log ----------------------------------------------------------------
-
-export declare class EventLog {
-  query(filter?: {
-    eventType?: string;
-    actorDid?: string;
-    afterSequence?: number;
-    beforeSequence?: number;
-    limit?: number;
-  }): Promise<EventLogEvent[]>;
-
-  verify(claim: { type: string; leafIndex: number; eventHash: string }): Promise<EventLogProof>;
-}
+//
+// Phase 4 PR 4 Agent B1 deleted the `EventLog` class. Call
+// `scp.eventLogQuery(handle, filter)`,
+// `scp.eventLogVerify(handle, claimJson)`, and
+// `scp.eventLogCheckpoint(handle, identity, epoch)` /
+// `scp.eventLogCheckpointByDid(handle, did, epoch)` directly.
 
 // -- Transport ----------------------------------------------------------------
-
-export declare function connect(config: TransportConfig): Promise<void>;
+//
+// Phase 4 PR 4 Agent B1 deleted the `Transport` class and the free-
+// function `connect`. Call `scp.transportConnect(relayUrl)` directly;
+// the returned opaque handle is passed back to
+// `scp.transportStatus(handle)` and `scp.transportDisconnect(handle)`.
 
 // -- MCP ----------------------------------------------------------------------
 //
 // MCP server/client entry points moved onto the SCP class in Phase 4 PR 4
 // (#1549, ADR-048). Call `scp.mcpServerCreate(...)`,
 // `scp.mcpClientConnectStdio(...)`, `scp.mcpClientConnectSse(...)` and
-// `scp.mcpClientInvoke(...)` directly. The `McpServer` and `McpClient`
-// interfaces remain in `./mcp.ts` for Agent B to collapse.
+// `scp.mcpClientInvoke(...)` directly. `McpServer` and `McpClient` are
+// pure handle types in `./mcp.ts`.
 
 // -- SCP multi-instance handle (#1549 Phase 4 PR 1, ADR-048) -----------------
 
@@ -273,7 +262,9 @@ export interface ScpOptions {
  * transport, context manager). Phase 4 PR 4 (#1549, ADR-048) deleted
  * the process-wide default-instance façade and the free-function
  * shorthands that used it; callers construct an explicit `new SCP()`
- * and pass it positionally to every SDK entry point.
+ * and call methods on it directly. Agent B1 collapsed the namespace
+ * classes (`Identity`, `Context`, `Relay`, `Node`) to pure handle
+ * types so there is now a single API surface.
  *
  * `SCP` is a NAPI-only feature — constructing it in a WASM/browser
  * environment throws `ValidationError` (`SCP-VALID-7005`).
