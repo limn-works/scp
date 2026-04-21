@@ -1947,8 +1947,12 @@ pub fn remove_identity_if_present(bi: &PyBridgeInstance, did: &str) -> bool {
     identity_registry(bi).remove(did).is_some()
 }
 
-// Economy state is now owned by BridgeInstance. Callers access it via
-// `bridge_instance()?.with_economy_budget(...)` etc. directly.
+// Economy state is owned by `PyBridgeInstance`. Callers thread a
+// `&PyBridgeInstance` through from the enclosing `PyScp` method and
+// access it via `bi.with_economy_budget(...)` / `bi.economy_*(...)`
+// directly. The `bridge_instance()` default-lookup helper was deleted
+// in Phase D (#1549 PR 4) along with the rest of the process-wide
+// default-instance scaffolding.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

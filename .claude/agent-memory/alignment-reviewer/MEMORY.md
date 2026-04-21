@@ -1,7 +1,13 @@
 # Alignment Reviewer Memory
 
-## Phase 4 PR 4 Façade Deletion Review (2026-04-19)
-See [phase4_facade_delete_review.md](phase4_facade_delete_review.md) — branch `refactor/phase4-facade-delete` landed method-migration half of PR 4 but NOT the demolition (delete _deprecation.py/ts, SCP.default(), DEFAULT_BRIDGE_INSTANCE, opt-in-tag gate). Verdict MISALIGNED. Pattern: branch names can mislead; verify free-fn counts (`#[pyfunction]`, `#[napi]`, `#[uniffi::export]`), `SCP-DEFAULT-INSTANCE-OK` tag count (533 on branch, plan requires 0), and whether SDKs require explicit SCP instance (not `resolve_scp` fallback).
+## Phase 4 PR 4 Round-3 Review (2026-04-21) — CLEAN PASS
+See [phase4_pr4_round3_review.md](phase4_pr4_round3_review.md). Branch at `d569332d0` (16 commits ahead of c1e037772). All 3 round-2 API-design blockers fixed in `66d0a7ca3`. Round-2 bug-catcher SHIP-BLOCKER (Arc cycle via MCP/suppression) fixed in `d569332d0` via `Arc → Weak` pattern. Verdict: ALIGNMENT PASS, API-DESIGN PASS — shippable. Free-functions-taking-scp count: Python 25, TS 18 (down from ~90). No orthogonal scope in 16 commits.
+
+## Phase 4 PR 4 Façade Deletion Review (2026-04-20) — ALIGNED
+See [phase4_pr4_facade_deletion_review.md](phase4_pr4_facade_deletion_review.md) — branch advanced past 2026-04-19 state. Demolition landed: ratchet 0/0/0/0, DEFAULT_BRIDGE_INSTANCE gone, `_deprecation.*` deleted, `SCP-DEFAULT-INSTANCE-OK` count=0, `check-no-default-in-tests.sh` deleted (-410), FOLLOWUP.md deleted. All retro #1692-#1696 have real fix commits. Verdict ALIGNED with two trivial cleanups (stale docstring + stale Swift autogen checksum).
+
+## Phase 4 PR 4 Earlier Review (2026-04-19) — SUPERSEDED
+See [phase4_facade_delete_review.md](phase4_facade_delete_review.md). Was MISALIGNED at that commit (only method migration, not demolition). Branch advanced — do NOT cite as current. Pattern reminder: branch names can mislead; verify free-fn counts (`#[pyfunction]`, `#[napi]`, `#[uniffi::export]`), `SCP-DEFAULT-INSTANCE-OK` tag count, ratchet/once-lock-count.json zeros.
 
 ## SDK Standards Review Round 2 (2026-02-22)
 Second pass after ~38 findings were addressed. 6 of 7 originally tracked issues fixed.

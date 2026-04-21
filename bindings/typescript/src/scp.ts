@@ -445,10 +445,11 @@ export class SCP {
    * Internal accessor exposing the raw native NAPI `SCP` handle.
    *
    * The Symbol-keyed getter is used by other SDK modules
-   * (`internal/native.ts`, `server.ts`, `mcp.ts`, `lifecycle.ts`) to
-   * dispatch SDK calls directly against this instance's class methods
-   * rather than the deprecated module-level free functions (ADR-048).
-   * The Symbol is not exported, so external code cannot retrieve the
+   * (`internal/native.ts`, `server.ts`, `mcp.ts`) to dispatch SDK calls
+   * directly against this instance's class methods. The module-level
+   * free-function façade that predated ADR-048 was DELETED in PR 4
+   * (not deprecated) — no process-wide default instance exists. The
+   * Symbol is not exported, so external code cannot retrieve the
    * native handle through this channel.
    *
    * @internal

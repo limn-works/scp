@@ -31,10 +31,11 @@ import { validateAdmission, validateBroadcastKeyHex, validateSiteConfig } from "
 // ---------------------------------------------------------------------------
 // Native addon access — server operations bypass the Bridge interface
 //
-// Since ADR-048 (#1549 Phase 4 PR 4), relay/node factories dispatch
-// through an `SCP` instance's class methods when one is supplied.
-// Callers that omit the `scp` argument fall back to the shared
-// process-wide default instance, which preserves legacy behavior.
+// Since ADR-048 (#1549 Phase 4 PR 4), relay/node factories REQUIRE an
+// `SCP` instance and dispatch through its class methods. The
+// process-wide default-instance fallback was DELETED in PR 4 (re-scoped
+// 2026-04-19) — no deprecation window. Every factory below takes `scp`
+// as its first positional argument.
 // ---------------------------------------------------------------------------
 
 /** Shape of the napi-rs relay handle returned by the native addon. */
