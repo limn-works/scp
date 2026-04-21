@@ -1525,6 +1525,7 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-OUTLET-CREDIT-V1:"` | Outlet stream `OutletStreamCredit` invoker signature (binds context_id, outlet_id, caveats_binding) | §5.4.5 |
 | `"SCP-OUTLET-OFFER-ID-V1:"` | Outlet interface offer ID canonical hash (length-prefixed context_a_id, outlet_id, context_b_id, timestamp) | §6.2.0.1 |
 | `"SCP-OUTLET-HOP-PAD-V1:"` | HMAC domain separator for `source_chain` trail-padding pseudonyms. Each pad entry's `context_id` is `HMAC-SHA-256(pad_nonce, "SCP-OUTLET-HOP-PAD-V1:" \|\| slot_index_be)[..32]` under the fresh per-envelope `pad_nonce: [u8; 16]`. | §5.4.4 |
+| `"SCP-OUTLET-IKM-COMMITMENT-V1:"` | Ed25519 signature preimage over per-context committed `hop_salt` IKM values. Each context's admin signs `SHA-256("SCP-OUTLET-IKM-COMMITMENT-V1:" \|\| len_be32(context_a_id) \|\| context_a_id \|\| len_be32(context_b_id) \|\| context_b_id \|\| epoch_be \|\| ikm)` under its `#active` key; the signatures `ikm_a_sig` and `ikm_b_sig` are persisted verbatim alongside `ikm_a` and `ikm_b` in the `InterfaceEstablished` event. Closes the Byzantine-admin low-entropy-IKM attack (BH5-m4). | §6.2.0.1 |
 | `"SCP-CONTEXT-HOP-SALT-V1:"` | HKDF info string for per-interface `hop_salt` derivation (also used as prefix of MLS exporter label family `"scp-context-hop-salt-v1:{peer_context_id}"` — see §6.2.0.1 for per-peer suffix) | §6.2.0.1 |
 | `"SCP-KEY-DESTRUCTION-V1:"` | Key destruction proof | §9.15 |
 | `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
@@ -1574,7 +1575,7 @@ This section consolidates all HKDF labels, HPKE info prefixes, HMAC domain strin
 | Label | Used For | Spec Reference |
 |-------|----------|----------------|
 | `"scp-media-key-v1"` | DTLS-SRTP media key derivation from MLS group state | §10.9.1 |
-| `"scp-outlet-message-v1"` | Per-context HMAC key for wire-time opaque `message` field on `OutletError` — catalog key is HMAC'd under the exporter so that the same catalog key produces context-scoped wire bytes and cross-context covert signaling via catalog selection is structurally impossible. | §5.4.4 |
+| `"scp-outlet-message-v1:" \|\| BE32(len(outlet_id)) \|\| outlet_id` | Per-OUTLET HMAC key for wire-time opaque `message` field on `OutletError`. Exporter is evaluated ONCE at outlet registration acceptance (not at each error emission) and pinned for the outlet registration's lifetime. Catalog key is HMAC'd under the pinned `outlet_message_key` so that (a) the same catalog key produces outlet-scoped wire bytes defeating cross-context covert signaling via catalog selection, AND (b) the epoch-grace wire-byte-divergence covert channel is eliminated — grace windows never re-derive the key. Key rotates only at outlet re-registration (fresh `SCP-OUTLET-REGISTRATION-V2` signature). | §5.4.4 |
 
 #### 9.18.4 Key and Nonce Sizes
 

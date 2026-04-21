@@ -158,7 +158,14 @@ OutletRegistration {
   implementation_hash: [u8; 32],    // SHA-256 of the outlet's implementation artifact (see below).
   test_vectors:     Vec<TestVector>, // Known input-output pairs. Min 0, max 100.
   cost:             Option<OutletCost>, // Per-invocation cost (§19.3). Query outlets: amount == 0.
-  registered_at:    u64,             // Unix timestamp (seconds) of registration.
+  message_catalog:  Vec<MessageTemplate>, // §5.4.4 wire-time message catalog. ≤ 256 entries,
+                                     // each template ≤ 1 KiB UTF-8. Covered by the V2 signature
+                                     // preimage via `catalog_hash` (below).
+  registered_at:    u64,             // Unix timestamp (seconds) of registration. See also the
+                                     // event-log append time used for catalog-rotation dwell
+                                     // enforcement (§5.4.4 Catalog-rotation discipline —
+                                     // `registered_at` is operator-declared and therefore cannot
+                                     // be trusted for dwell-time comparisons).
   signature:        Ed25519Signature, // Operator DID signs all fields except signature.
 }
 
@@ -172,6 +179,12 @@ TestVector {
   expected_output:  Value,           // MessagePack value. Verification uses structural comparison,
                                      // not byte equality (§7.3.3).
   description:      String,          // Human-readable description of what this tests. Max 4096 UTF-8 bytes.
+}
+
+MessageTemplate {
+  key:              String,          // Catalog key. Regex `^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$`.
+                                     // Unique within a catalog.
+  template:         String,          // Pure UTF-8 string. NO interpolation slots. Max 1024 bytes.
 }
 
 OutletCost {
@@ -201,11 +214,13 @@ SHA-256(
   || BE32(len(outlet_id)) || outlet_id
   || kind_byte
   || BE32(len(name)) || name
+  || description_hash
   || BE32(len(operator_did)) || operator_did
   || schema_hash
   || implementation_hash
   || test_vectors_hash
   || cost_hash
+  || catalog_hash
   || registered_at_be
 )
 ```
@@ -214,13 +229,15 @@ where:
 
 - `kind_byte` is `0x00` for Query and `0x01` for Action (fixed 1-byte width).
 - `BE32(n)` is `n` encoded as a 4-byte big-endian unsigned integer; this length prefix precedes every variable-length field (`outlet_id`, `name`, `operator_did`) so that concatenation is unambiguous and two registrations with different field splits can never produce the same preimage.
+- `description_hash = SHA-256(description_utf8_bytes)` (32 bytes, fixed width). The `description` field is up to 4 KiB of operator-authored prose displayed to prospective invokers; like `message_catalog` it is operator-controlled text that sits outside the schema/implementation fingerprint, so it is equally a covert-channel surface if unbound. Committing `description_hash` into the V2 preimage binds the prose to the registration signature — a silent operator edit to `description` produces a new `implementation_hash`-independent registration event that members can diff.
 - `schema_hash = SHA-256(MessagePack(schema))` (32 bytes, fixed width).
 - `implementation_hash` is 32 bytes, fixed width.
 - `test_vectors_hash = SHA-256(MessagePack(test_vectors))` (32 bytes).
 - `cost_hash = SHA-256(MessagePack(cost))` (32 bytes), or `SHA-256(0x00)` (32 bytes) if absent. The sentinel preserves fixed width.
+- `catalog_hash = SHA-256(MessagePack(message_catalog))` (32 bytes, fixed width). `message_catalog` is the ordered `Vec<MessageTemplate>` defined above; MessagePack serialization of an empty vector produces a 1-byte value (`0x90`) so `catalog_hash` is always well-defined. Committing the catalog into the V2 preimage is load-bearing for the §5.4.4 `OutletError.message` HMAC rule: without this binding, an operator could silently rotate catalog entries out-of-band and receivers would have no cryptographic proof of the catalog state that corresponds to any given signed registration event. The catalog is NOT covered by `schema_hash` — the schema preimage hashes only `input`, `output`, and `aggregate_schema` (per the `schema` field body), so a separate `catalog_hash` is required to bring the catalog under the signature.
 - `registered_at_be` is `registered_at` encoded as a 8-byte big-endian unsigned integer.
 
-The `V2` suffix, the `kind_byte` inclusion, and the mandatory length prefixes on every variable-length field together constitute the break from the prior `SCP-TOOL-REGISTRATION-V1` domain; pre-migration signatures are not honored. The length-prefix requirement closes the "split-shift" preimage-collision class that the unprefixed V1 concatenation admitted (where a suffix of `outlet_id` could be reinterpreted as a prefix of `name`).
+The `V2` suffix, the `kind_byte` inclusion, the mandatory length prefixes on every variable-length field, and the explicit `description_hash` + `catalog_hash` terms together constitute the break from the prior `SCP-TOOL-REGISTRATION-V1` domain; pre-migration signatures are not honored. The length-prefix requirement closes the "split-shift" preimage-collision class that the unprefixed V1 concatenation admitted (where a suffix of `outlet_id` could be reinterpreted as a prefix of `name`). The explicit `description_hash` and `catalog_hash` close the operator-authored-prose covert-channel surface — every string field the operator controls at registration is covered by the registration signature.
 
 ### 5.4.2 Outlet Classification (Query vs Action)
 
@@ -301,7 +318,7 @@ OutletError {
 }
 ```
 
-Tags `7`, `9`, and `10` are **reserved for forward-compatible evolution** and are not used in this version of the envelope. They were drafted (`related_code`, `i18n_key`, `trace_id`) and dropped before merge — the cross-reference use case is served by `source_chain.wrapped_code`; localization is an SDK-layer concern that does not belong on the wire; and telemetry `trace_id` is not a protocol-level field (see discussion [#1698](https://github.com/limn-works/scp/discussions/1698)). Tag `11` carries the optional `pad_nonce` field introduced below to support trail-length padding verification. Any future extension MUST use tags `12+` and MUST round-trip through the `_unknown_fields` forward-compat slot so old SDKs that see the new tag preserve it without interpretation.
+Tags `7`, `9`, and `10` are **reserved for forward-compatible evolution** and are not used in this version of the envelope. They were drafted (`related_code`, `i18n_key`, `trace_id`) and dropped before merge — the cross-reference use case is served by `source_chain.wrapped_code`; localization is an SDK-layer concern that does not belong on the wire; and telemetry `trace_id` is not a protocol-level field (see discussion [#1698](https://github.com/limn-works/scp/discussions/1698)). Tag `11` carries the `pad_nonce: [u8; 16]` field introduced below for trail-length padding verification — emitted unconditionally (no Option wrapper) on every envelope to eliminate the presence-vs-absence visibility oracle. Any future extension MUST use tags `12+` and MUST round-trip through the `_unknown_fields` forward-compat slot so old SDKs that see the new tag preserve it without interpretation.
 
 ```
 OutletErrorClass {
@@ -333,31 +350,56 @@ ContextHop {
 }
 ```
 
-`OutletError` carries one additional field outside the `ContextHop` itself, used only when padding is emitted:
+`OutletError` carries one additional field outside the `ContextHop` itself, used to derive trail-padding entries and — in the un-padded case — emitted unconditionally to defeat the presence-vs-absence visibility oracle:
 
 ```
 OutletError {
   ...                                  // tags 1..8 as above
-  pad_nonce:   Option<[u8; 16]>,       // tag 11; present iff source_chain contains pad
-                                       // entries (i.e., the receiver is not a full-visibility
-                                       // observer). Fresh per error envelope; used to
-                                       // re-derive pad pseudonyms when the receiver wants
-                                       // to verify them locally. Absent when the caller has
-                                       // full visibility and source_chain is un-padded.
+  pad_nonce:   [u8; 16],               // tag 11; ALWAYS present on every error envelope (no
+                                       // Option wrapper). Fresh-per-envelope CSPRNG-sampled
+                                       // nonce that keys the HMAC used to derive pad-slot
+                                       // `context_id` values when source_chain is padded.
+                                       // For un-padded envelopes the field is emitted but
+                                       // unused on decode (the receiver's `k == max_padded_trail_depth`
+                                       // check determines whether padding is present; the
+                                       // nonce is ignored when k matches the true length).
+                                       // Emitting unconditionally closes the visibility
+                                       // oracle where "pad_nonce absent" leaked that the
+                                       // caller had full visibility into every hop.
 }
 ```
 
 **Code range.** `6100..=6199` within the `SCP-TOOL-` prefix, sub-allocated as follows. Distinct runtime conditions within a code share one code and differ by `slug` — the code set is intentionally compact (one to two codes per class, ~15 codes total) so the full taxonomy is memorable and the wire form is not a sprawling enumeration.
 
-- `6100-6109` — Protocol class (query/kind/amplification violations; schema/cache violations)
-- `6110-6119` — Authorization class (UCAN, caveat, amplification, missing outlet, adapter denial)
+- `6100-6109` — Protocol class (query/kind/amplification violations; schema/cache violations; catalog-rotation dwell-time; stream-lifecycle violations; session uniqueness)
+- `6110-6119` — Authorization class (UCAN, caveat, amplification, missing outlet, adapter denial, mid-stream revocation, credit-stream mismatch, IKM signature invalid, mask-width violation, mixed-stem/unspecified/stem-mismatch origin_kind)
 - `6120-6129` — Input class (schema, size, non-serializable)
-- `6130-6139` — Execution class (handler panic, timeout, credit exhaustion, stream gap)
+- `6130-6139` — Execution class (handler panic, timeout, credit exhaustion, stream gap, cancel-ack-timeout)
 - `6140-6149` — Output class (schema, size, non-serializable)
-- `6150-6159` — Economic class (funds, adapter, pricing, budget)
-- `6160-6169` — Transport class (relay, cross-context bridge, rate limit)
+- `6150-6159` — Economic class (funds, adapter, pricing, budget, interface-spam quadratic fee)
+- `6160-6169` — Transport class (relay, cross-context bridge, rate limit, concurrent-streams-per-invoker / per-origin-invoker / per-outlet)
 - `6170-6179` — Governance class (deregistered, suspended, ceiling, consequence active)
 - `6180-6199` — reserved
+
+**Slug allocations added in round 5.** The following slugs are registered within the existing class ranges (no new codes — slugs differentiate conditions under a shared code):
+
+| Slug | Code | Class | Source |
+|------|------|-------|--------|
+| `protocol.catalog-rotation-too-frequent` | `SCP-TOOL-6100` | Protocol | §5.4.4 Catalog-rotation discipline |
+| `protocol.stream-already-open` | `SCP-TOOL-6100` | Protocol | §6.2.1.1(b) |
+| `protocol.session-id-conflict` | `SCP-TOOL-6101` | Protocol | §6.2.1.1(a) UUIDv7 uniqueness |
+| `protocol.interface-spam-cost` | `SCP-TOOL-6150` | Economic | §6.2.0.1 quadratic fee |
+| `authorization.credit-stream-mismatch` | `SCP-TOOL-6110` | Authorization | §5.4.5 credit-grant stream identity |
+| `authorization.revoked-mid-stream` | `SCP-TOOL-6110` | Authorization | §5.4.5 revocation re-check |
+| `authorization.ikm-signature-invalid` | `SCP-TOOL-6110` | Authorization | §6.2.0.1 committed-IKM signature |
+| `attenuation.origin-kind-mixed-stem-root` | `SCP-TOOL-6114` | Authorization (attenuation sub-class) | §7.3.8 root-mint consistency |
+| `attenuation.origin-kind-stem-mismatch` | `SCP-TOOL-6114` | Authorization | §7.3.8 root-mint consistency |
+| `attenuation.origin-kind-unspecified` | `SCP-TOOL-6114` | Authorization | §7.3.8 narrow-time explicit-materialization |
+| `attenuation.mask-width-violation` | `SCP-TOOL-6114` | Authorization | §7.3.8 mask-width newtype invariant |
+| `transport.concurrent-streams-per-invoker` | `SCP-TOOL-6160` | Transport | §5.4.5 per-invoker cap |
+| `transport.concurrent-streams-per-origin-invoker` | `SCP-TOOL-6160` | Transport | §5.4.5 + §6.2.0.5 per-origin cap |
+| `transport.concurrent-streams-per-outlet` | `SCP-TOOL-6160` | Transport | §5.4.5 per-outlet cap |
+| `execution.cancel-ack-timeout` | `SCP-TOOL-6135` | Execution | §5.4.5 cancel-ack timer (round 4) |
 
 The `SCP-TOOL-` prefix is preserved (not renamed to `SCP-OUTLET-`) because the CI enforcement script `scripts/check-error-codes.sh` indexes prefixes in a closed set — adding a new top-level prefix requires coordinated changes across every language SDK's error surface. Sub-block allocation within the existing prefix is the forward-compatible path.
 
@@ -396,7 +438,9 @@ pad_entry.wrapped_code = "SCP-TOOL-6110"         // authorization.denied
 
 The `SCP-OUTLET-HOP-PAD-V1:` domain separator is registered in §9.18.2. Because `pad_nonce` is fresh per envelope, pad pseudonyms differ across every emission — two error envelopes from the same stream cannot be diffed byte-for-byte to identify which slots are real and which are pad. A receiver who wants to verify pad entries re-derives them locally from the transmitted `pad_nonce` and matches byte-equality at the claimed pad slots; real-hop entries never match the re-derived pad pseudonym at that slot (the real-hop `context_id` is an HMAC keyed by `hop_salt`, not `pad_nonce`, and the two keyings are independent per §9.5.1 domain-separation rules).
 
-**Full-visibility path.** Callers with membership on every hop AND a matching stem on every hop target see the un-padded `source_chain` (length `k`, `pad_nonce` absent). Every other caller sees the padded form (length `max_padded_trail_depth`, `pad_nonce` present). The presence of `pad_nonce` is itself not a leak: it only discloses that the caller lacks full visibility into at least one hop, which they already know from observing collapsed entries in `source_chain`.
+**Partial-visibility disclosure.** The pad + real-hop construction is honest about its scope: it hides `k` (the real chain length) from observers who cannot compute any involved `hop_salt`. A receiver who IS a member of some hop `i` holds the `hop_salt` for that hop and can therefore compute `HMAC(hop_salt, their_context_id)` and compare it against each slot's `context_id`. That member can identify exactly which slot corresponds to their hop — and, by the uniqueness of the HMAC output, can label that slot as "real"; they cannot identify other real slots (those use different hop-salt keys the observer does not hold). So a single-hop member observes a real-vs-pad distinction at their own hop only; they learn that slot `i` is real and its real `hop_index == i`, but they still do not learn whether any other slot is real or pad and therefore do not learn `k`. The pad continues to hide `k` from such an observer; it does NOT hide the existence of the member's own hop (which the member already knows). The pad fully hides `k` only from observers who hold no `hop_salt` — i.e., non-members of every hop. This is the design's target threat model (non-member chain-length inference), and the spec states the property honestly rather than claiming universal opacity. A cryptographic construction giving universal opacity would require re-HMACing every real-hop slot under `pad_nonce` too (producing `HMAC(pad_nonce, SCP-OUTLET-SLOT-V1 || slot_index || HMAC(hop_salt, raw_context_id))` on the wire), which was considered and rejected: the partial-visibility length oracle is a niche attack available only to someone who is already a hop member (and therefore already sees their hop structurally), and the extra re-HMACing imposes verifier and SDK complexity on every real-hop read without closing a practically-exploitable channel.
+
+**Full-visibility path.** Callers with membership on every hop AND a matching stem on every hop target see the un-padded `source_chain` (length `k`). Every other caller sees the padded form (length `max_padded_trail_depth`). In both cases the `pad_nonce: [u8; 16]` field is emitted on EVERY `OutletError` envelope unconditionally — for the un-padded path the field is still present and is used only as a domain-separating constant (the receiver checks the slot count against `k` and ignores the nonce), for the padded path the field keys the pad-slot derivation. Emitting `pad_nonce` unconditionally eliminates the "absence of `pad_nonce` == full visibility" visibility-oracle: an on-wire observer cannot distinguish padded vs un-padded envelopes by presence-vs-absence of the field, because the field is always present. The 16-byte fixed cost per envelope is the price paid for the visibility oracle's removal.
 
 This keeps trail length independent of the actual number of hops traversed, at the cost of `max_padded_trail_depth × entry_size + 16` bytes per error envelope — a bounded tradeoff against an otherwise-free oracle on chain depth.
 
@@ -421,28 +465,40 @@ Absent schemas: classes with `{}` detail have detail omitted entirely. An envelo
 - Internal implementation strings (SQL fragments, stack traces, file paths above the outlet source root, private-network addresses, secret fragments).
 - Raw input values (input echo in error messages is the fastest path to smuggling data out of a constrained context).
 
-**Message structural rule — registered catalog, context-HMAC'd on wire.** `message` is structurally constrained in two composed stages:
+**Message structural rule — registered catalog, per-outlet-HMAC'd on wire.** `message` is structurally constrained in two composed stages:
 
-1. **Registration-time catalog.** Every `OutletRegistration` carries a `message_catalog: Vec<MessageTemplate>` of at most 256 entries; each entry is `{ key: String, template: String }` where `template` is a pure string (no interpolation slots) bounded at 1 KiB UTF-8. Runtime substitution is explicitly forbidden so the on-wire catalog selection is a bounded discrete channel. Catalog contents are covered by the outlet registration signature (§5.4.1 `SCP_OUTLET_REGISTRATION_V2` preimage via `schema_hash`), so diffs to the catalog produce a new registration and appear in the event log.
-2. **Wire-time HMAC over catalog key.** The `message` field on the wire is NOT the catalog key in plaintext. Instead, for every `OutletError` the operator constructs:
+1. **Registration-time catalog.** Every `OutletRegistration` carries a `message_catalog: Vec<MessageTemplate>` of at most 256 entries; each entry is `{ key: String, template: String }` where `template` is a pure string (no interpolation slots) bounded at 1 KiB UTF-8. Runtime substitution is explicitly forbidden so the on-wire catalog selection is a bounded discrete channel. Catalog contents are covered explicitly by the outlet registration signature via the `catalog_hash = SHA-256(MessagePack(message_catalog))` term of the `SCP-OUTLET-REGISTRATION-V2` preimage (§5.4.1) — a dedicated term, NOT via `schema_hash` (the `schema` preimage hashes only `input`, `output`, and `aggregate_schema`). Diffs to the catalog produce a new registration event and therefore a new signed preimage.
+2. **Wire-time HMAC over catalog key, keyed per outlet.** The `message` field on the wire is NOT the catalog key in plaintext. At registration acceptance, each outlet derives and pins a 32-byte per-outlet message key from the hosting context's MLS exporter:
 
    ```
-   wire_message =
-     HMAC-SHA-256(
-       MLS_EXPORTER("scp-outlet-message-v1", b"", 32),  // per-context 32-byte key
-       catalog_key_utf8
-     )[..32]
+   outlet_message_key =
+     MLS_EXPORTER(
+       "scp-outlet-message-v1:" || BE32(len(outlet_id)) || outlet_id,
+       b"",
+       32,
+     )  // exporter taken on the hosting context's MLS epoch at the moment the
+        // OutletRegistration is accepted (i.e., committed by MLS at registration
+        // time), NOT re-evaluated at each error emission. The key is stored in
+        // the outlet's registration state alongside the accepted event.
    ```
 
-   The exporter is taken on the hosting context's current MLS epoch at error-emission time; the label `"scp-outlet-message-v1"` is registered in §9.18.3. The wire field carries this 32-byte opaque HMAC output. Members of the hosting context (who can compute the exporter) reverse-lookup the HMAC against the outlet's registered catalog keys to obtain the catalog entry; non-members see only the 32-byte opaque value.
+   For every `OutletError`, the operator constructs:
 
-   Per-context keying defeats cross-context signaling: an operator running the same outlet registration in contexts P and Q produces different HMAC outputs for the same `catalog_key`, because the exporter key material differs across MLS groups. An adversary who controls two contexts and tries to use `catalog_key` selection as a covert signal between them observes only context-scoped opaque bytes; there is no cross-context linkability.
+   ```
+   wire_message = HMAC-SHA-256(outlet_message_key, catalog_key_utf8)[..32]
+   ```
 
-   An error whose wire-time `message` does not match any catalog entry's HMAC under the current epoch (or any retained grace-window epoch per §9.7) is rejected at the receiving SDK with `OutletErrorConstructionFailed::UnregisteredMessageKey`. Epoch advancement is handled by the standard MLS grace window — a sender and receiver who drift by one epoch still agree on lookups because both sides retain the previous exporter for the grace period.
+   The wire field carries this 32-byte opaque HMAC output. Members of the hosting context, holding the pinned `outlet_message_key` derived at registration-acceptance time, reverse-lookup the HMAC against the outlet's registered catalog keys to obtain the catalog entry; non-members see only the 32-byte opaque value.
 
-The catalog-plus-HMAC approach subsumes the earlier free-text constraint: a catalog template cannot contain input-derived bytes (the operator wrote the template at registration time, before the input existed); i18n-ready future extensions can carry per-locale variants without a wire break (the HMAC keys lookups, not content); and cross-context covert signaling is structurally impossible — the wire bytes are a context-keyed MAC over a bounded input set of at most 256 catalog keys.
+   Per-outlet-and-per-context keying defeats cross-context signaling AND closes the epoch-grace covert channel. An operator running the same outlet registration in contexts P and Q produces different HMAC outputs for the same `catalog_key`, because each context's MLS exporter produces a distinct key at accept time. An operator holding two concurrent memberships during an epoch-grace window in a single context (one using epoch E's exporter, one using epoch E+1's exporter) would — under the previous per-emission-epoch rule — have produced two distinct wire-byte sequences for the same `catalog_key`, encoding one bit of covert signal per emission straddling the grace boundary; pinning the key at registration acceptance eliminates this channel entirely. There is exactly one `outlet_message_key` per outlet registration; grace-window epoch transitions do NOT re-derive it and do NOT rotate it.
 
-**Catalog-rotation discipline.** `OutletRegistration.message_catalog` edits appear in the event log (via the outlet registration event the operator must emit) and are subject to a protocol-enforced minimum dwell time of 24 hours between successive catalog edits on the same outlet. A registration update whose `message_catalog` differs from the prior registration's catalog and whose `registered_at` is within 24 hours of the prior edit is rejected with `OutletErrorClass::Protocol::CatalogRotationTooFrequent` (slug `protocol.catalog-rotation-too-frequent`). The dwell-time bound is not configurable; it removes the cooperating operator's ability to use high-frequency catalog churn as a side-channel.
+   `outlet_message_key` is pinned for the lifetime of the outlet registration (implementation_hash-locked). The key rotates ONLY when the outlet is re-registered (producing a new `registered_at`, a new `SCP-OUTLET-REGISTRATION-V2` signature, and — if MLS has advanced — a new derived key from the then-current exporter at the re-registration's acceptance epoch). A deregister-then-register sequence produces a fresh `outlet_message_key`; a silent catalog-only edit within the same outlet_id DOES trigger re-registration under the catalog-rotation discipline below, so any catalog change is paired with a fresh key.
+
+   An error whose wire-time `message` does not match any catalog entry's HMAC under the pinned `outlet_message_key` is rejected at the receiving SDK with `OutletErrorConstructionFailed::UnregisteredMessageKey`. No epoch-grace lookup window is necessary: the key is fixed at registration, not at emission, so a sender and receiver that drift one MLS epoch apart still agree on the exact same `outlet_message_key` for any outlet whose registration they both accepted.
+
+The catalog-plus-per-outlet-HMAC approach subsumes the earlier free-text constraint: a catalog template cannot contain input-derived bytes (the operator wrote the template at registration time, before the input existed); i18n-ready future extensions can carry per-locale variants without a wire break (the HMAC keys lookups, not content); cross-context covert signaling is structurally impossible — the wire bytes are an outlet-keyed MAC over a bounded input set of at most 256 catalog keys; and the epoch-grace wire-byte-divergence covert channel is closed because grace windows never touch the `outlet_message_key`.
+
+**Catalog-rotation discipline.** `OutletRegistration.message_catalog` edits appear in the event log (via the outlet registration event the operator must emit) and are subject to a protocol-enforced minimum dwell time of 24 hours between successive catalog edits on the same outlet. Dwell-time enforcement uses the **event-log append time** of the prior registration (`event_log.append_time_for(prior_registration)`), NOT the operator-declared `registered_at` field. A registration update whose `message_catalog` differs from the prior registration's catalog AND whose own event-log append time is within 24 hours of the prior registration's event-log append time is rejected with `OutletErrorClass::Protocol::CatalogRotationTooFrequent` (slug `protocol.catalog-rotation-too-frequent`). Using the event-log append time (a protocol-enforced, verifiably-ordered clock — §7.3.1) rather than `registered_at` (an operator-declared integer the operator can set arbitrarily) denies the operator the ability to back-date a registration to bypass the dwell-time floor. The dwell-time bound is not configurable; it removes the cooperating operator's ability to use high-frequency catalog churn as a side-channel.
 
 SDKs SHOULD additionally apply a lint pass to resolved catalog templates that redacts recognizable patterns (`/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/` for emails; `/did:(dht|web|key):[A-Za-z0-9._-]+/` for DIDs) before surfacing to developer-facing logs, replacing matches with `[redacted]`. Conformance fixtures include PII-redaction test cases, cross-context HMAC distinctness cases (the same `catalog_key` produces different wire bytes under two different contexts' exporters), and `CatalogRotationTooFrequent` rejection cases.
 
@@ -556,6 +612,8 @@ caveats_binding = SHA-256(
 
 where `effective_caveats` is the `InvocationCaveats` record (§7.3.8) after all delegation-chain narrowing has been applied, and `canonical_jcs_of_caveats = canonical_jcs(effective_caveats)` (the same bytes consumed as the final field). The final variable-length `canonical_jcs(effective_caveats)` term is length-prefixed per §9.5.1's uniform construction rule — without the prefix, a preimage-collision class exists where a carefully chosen suffix of one caveat-set's JCS bytes could be reinterpreted as the prefix of the following field if a later extension of the preimage added one. The binding commits to (a) the exact token (`ucan_cid`), (b) this stream instance (`request_id`), (c) the invoker identity (`invoker_did`), (d) the invoker-declared billable-chunk ceiling (`estimated_chunk_count`), and (e) the narrowed caveats. `origin_kind` (§7.3.8) is covered automatically via the `canonical_jcs(effective_caveats)` term. A later `OutletStreamOpen` received with the same `request_id` and a different `caveats_binding` is rejected as `OutletErrorClass::Authorization::AttenuationViolation`; the runtime pins `(request_id → caveats_binding)` at first open for the TTL of the stream (see "Binding-pinning invariant" below). The `SCP-OUTLET-CAVEAT-BIND-V1:` separator is registered in §9.18.2. This preimage is the first to ship — no prior `V` numbering existed outside drafts.
 
+**JCS `Option` serialization rule (cross-SDK byte-for-byte match).** Absent `Option`-typed fields in `effective_caveats` — `amount_max_per_call`, `amount_max_cumulative`, `valid_from`, `valid_until`, `hours_of_day`, `days_of_week`, `max_calls`, `rate_window`, `input_schema`, `allowed_adapters`, `allowed_target_dids`, `origin_kind` when absent — are **OMITTED** from the JCS encoding, NOT serialized as explicit `null`. Concretely, `canonical_jcs(effective_caveats)` applies standard serde-with-`skip_serializing_if = "Option::is_none"` semantics before running RFC 8785 canonicalization: a `None`-valued field produces no key-value pair in the JSON object, and RFC 8785's lexicographic sort then orders only the present keys. An SDK that serializes `None` as `"field_name": null` produces a distinct byte string and a distinct `caveats_binding` preimage, and the resulting stream-open is rejected. All four SDKs MUST use the omit-none convention. A cross-SDK conformance fixture covers this: a caveat set `{ amount_max_per_call: Some(100) }` produces the same 32-byte `caveats_binding` from Python (PyO3), TypeScript (napi-rs), Swift (UniFFI), and Kotlin (UniFFI) regardless of the other 11 fields' absence — verified by `cargo test -p scp-testing --test outlet_caveats_binding_conformance`.
+
 **Binding-pinning invariant.** At first `OutletStreamOpen`, the receiver records `(request_id → {context_id, outlet_id, caveats_binding, stream_epoch, invoker_pk, credit_counter, monotonic_seq_cursor})` in its stream table for the lifetime of the stream (bounded by `timeout_ms`, `stream_credit_stall_secs`, or terminal chunk arrival, whichever fires first). `stream_epoch` is the hosting context's MLS epoch counter at acceptance (§6.2.1.1(e)) and is the value committed into the `SCP-OUTLET-CREDIT-V1:` grant preimage — pinning it in the stream table lets the executor reject credit grants whose preimage epoch does not match the stream's accept-time epoch even if `request_id` and `caveats_binding` are colliding across a binding-eviction race. Any subsequent `OutletStreamOpen` carrying the same `request_id` but a different `caveats_binding` is rejected as `AttenuationViolation`. This closes the "two opens with the same request_id under different caveats" attack without relying on undetectable later-chunk inspection. The per-stream `CreditCounterStore` entry shares the pinning record's lifetime — the credit counter and `monotonic_seq_cursor` are stored alongside the pinned `caveats_binding` so a single eviction signal (stream terminated, timeout fired, credit-stall cancel) clears both at once. Once the stream terminates, the receiver MAY evict the pinning record and associated credit state; a fresh `request_id` is required for a new stream.
 
 **Per-context concurrent-stream bounds.** Each context enforces three independent ceilings on inbound streams, enforced at `OutletStreamOpen` acceptance:
@@ -566,7 +624,19 @@ where `effective_caveats` is the `InvocationCaveats` record (§7.3.8) after all 
 | `max_concurrent_inbound_streams_per_origin_invoker` | 16 | [1, 1024] | Maximum number of streams the *outermost caller DID in the delegation chain* may have open concurrently against any outlet hosted by this operator DID (tracked at operator scope, not per-context, so a caller cannot fan out across a cluster of interfaces hosted by the same operator to bypass the per-context limit). The outermost DID is the `iss` of the root UCAN in the delegation chain presented at open. Breach rejects with `OutletErrorClass::Transport::RateLimited` slug `transport.concurrent-streams-per-origin-invoker`. |
 | `max_concurrent_inbound_streams_per_outlet` | 128 | [1, 1024] | Maximum number of streams open concurrently against a single outlet (across all invokers). Breach rejects the open with `OutletErrorClass::Transport::RateLimited` slug `transport.concurrent-streams-per-outlet`. |
 
-All three are `ContextParams` fields, registered in §9.18.B. The immediate-invoker ceiling bounds the DoS surface a single neighbor can mount against a single context. The origin-invoker ceiling is tracked by the operator across every interface it hosts and bounds fan-out from a single origin regardless of delegation-chain rewriting: a caller who narrows a UCAN through N intermediate agents cannot open `N × per_invoker` streams against one operator because the operator groups concurrent streams by the outermost `iss`. The outlet ceiling bounds total fan-in to any one outlet regardless of how many invokers participate. A rejected open does NOT advance `credit_window` or allocate escrow — the acceptance check runs before any stream-table insertion. See also the cross-context streaming section (§6.2.0.5) which cites these parameters at cross-context acceptance.
+All three are `ContextParams` fields, registered in §9.18.B. The immediate-invoker ceiling bounds the DoS surface a single neighbor can mount against a single context. The origin-invoker ceiling is tracked by the operator across every interface it hosts and bounds fan-out from a single origin regardless of delegation-chain rewriting: a caller who narrows a UCAN through N intermediate agents cannot open `N × per_invoker` streams against one operator because the operator groups concurrent streams by the outermost `iss`. The outlet ceiling bounds total fan-in to any one outlet regardless of how many invokers participate. A rejected open does NOT advance `credit_window` or allocate escrow — the acceptance check runs before any stream-table insertion.
+
+**Concurrent-stream counter increment ordering.** The operator's concurrent-stream counter for each of the three ceilings is incremented ATOMICALLY AFTER the full UCAN delegation chain validation completes successfully (§7.2.1 steps 1 through 11) AND after the cap check itself confirms headroom — NOT speculatively at the start of `OutletStreamOpen` processing. Counter increment ordering is:
+
+1. Parse `OutletStreamOpen`; extract `invoker_did`, outermost `iss` (for the per-origin-invoker counter), outlet_id.
+2. Run the full UCAN validation pipeline (steps 1-11) to completion. A failing validation returns the corresponding `OutletErrorClass::Authorization::*` and does NOT touch any counter.
+3. Run the three cap comparisons in lexical order (per-invoker → per-origin-invoker → per-outlet). A breach at any tier returns the matching `Transport::RateLimited` slug and does NOT increment any counter. Partial increments across tiers are forbidden — a per-invoker success followed by a per-origin-invoker failure leaves all three counters unchanged.
+4. On full success (validation + all three caps clear), atomically increment all three counters under a single critical section, insert the stream into the stream table, and begin serving.
+5. On terminal chunk emission or cancel-ack, decrement all three counters atomically in the same critical section that evicts the stream-table entry.
+
+This ordering closes the slot-burn DoS where a forged-`iss` open that fails UCAN validation would nonetheless have consumed a per-origin-invoker slot against the real DID named in `iss`. Validation is paid for by the operator (CPU); slot occupancy is paid for by the real `iss` holder. Increment-before-validate would let a low-cost forged-open starve a high-value caller's concurrent-slot budget. Increment-after-validate means the real caller only pays for opens that pass validation.
+
+See also the cross-context streaming section (§6.2.0.5) which cites these parameters at cross-context acceptance.
 
 **Per-chunk operator signature.** Every `OutletStreamChunk.sig` is the operator's Ed25519 signature over
 

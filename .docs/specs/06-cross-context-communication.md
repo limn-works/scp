@@ -90,12 +90,47 @@ Outlet interface creation requires explicit consent from both the exposing conte
    ```
    This follows Context B's governance model. Acceptance creates an `InterfaceEstablished` event in both event logs. The `InterfaceEstablished` event records:
 
-   - `epoch_a` — Context A's MLS epoch counter at accept time (u64).
-   - `epoch_b` — Context B's MLS epoch counter at accept time (u64).
+   - `epoch_a` — Context A's MLS epoch counter at accept time (u64). Persisted for audit.
+   - `epoch_b` — Context B's MLS epoch counter at accept time (u64). Persisted for audit.
    - `ikm_a: [u8; 32]` — the exporter-derived IKM that Context A produced at accept time (computed as shown below), persisted verbatim in the event metadata.
    - `ikm_b: [u8; 32]` — the exporter-derived IKM that Context B produced at accept time, persisted verbatim in the event metadata.
+   - `ikm_a_sig: Ed25519Signature` — Context A's current admin's signature over `ikm_a` (preimage below), attesting that `ikm_a` was genuinely exported from Context A's MLS layer and not chosen adversarially.
+   - `ikm_b_sig: Ed25519Signature` — Context B's current admin's signature over `ikm_b`, symmetric to `ikm_a_sig`.
 
    The committed `(ikm_a, ikm_b)` pair pins the `hop_salt` derivation at accept time, so historic verifiability does not depend on retaining the underlying MLS epoch exporter keys. Verifiers rederive `hop_salt` deterministically from the committed IKMs at any later time using the HKDF step below. The MLS epoch keys MAY be rotated, destroyed, or forward-secrecy-ratcheted after acceptance without invalidating past `source_chain` pseudonym verification.
+
+   **Committed-IKM signing (Byzantine-admin mitigation).** A Byzantine admin who controls MLS exporter output (e.g., by running a hostile MLS implementation) could publish a low-entropy or attacker-chosen `ikm_a` value — shifting the `hop_salt` onto an entropy distribution the attacker can pre-image. To close this, each side's admin signs its own IKM at accept time. The preimage is deliberately short and fixed-width:
+
+   ```
+   ikm_a_sig_preimage = SHA-256(
+     "SCP-OUTLET-IKM-COMMITMENT-V1:"
+     || len_be32(context_a_id) || context_a_id
+     || len_be32(context_b_id) || context_b_id
+     || epoch_a_be                            // 8 bytes BE u64
+     || ikm_a                                  // 32 bytes
+   )
+
+   ikm_a_sig = Ed25519_sign(admin_a_active_key, ikm_a_sig_preimage)
+   ```
+
+   — and symmetrically for `ikm_b_sig` (Context B's admin signs `(context_a_id, context_b_id, epoch_b, ikm_b)` under its `#active` key). The `SCP-OUTLET-IKM-COMMITMENT-V1:` domain separator is registered in §9.18.2. The `#active` key is the human-accountable signing key per §3 — agent `#agent` keys MUST NOT sign IKM commitments, matching the metadata-signing discipline in §5.7.2.
+
+   Verifier rule: an `InterfaceEstablished` event whose `ikm_a_sig` does not verify under Context A's admin `#active` key (resolved at `epoch_a` against the context's role registry), OR whose `ikm_b_sig` does not verify under Context B's admin `#active` key (resolved at `epoch_b`), is rejected at event-log append time with `OutletErrorClass::Authorization` slug `authorization.ikm-signature-invalid` (code `SCP-TOOL-6110`). A failed signature rejects the interface establishment entirely; the event does NOT land in either event log. This ensures the published IKMs are cryptographically attributable to the signing admin — a malicious admin who later denies publishing a low-entropy IKM is disproved by the signature. Signing the context-id pair and the epoch binds each signature to this specific interface and this specific acceptance epoch, so an `ikm_a` value cannot be extracted from one interface and re-signed into another.
+
+   **Admin-removal salt rotation.** When an admin is removed from either context (via governance `RemoveMember`-with-admin-role or equivalent), every interface that context holds MUST trigger a forced `hop_salt` re-derivation. The removed admin retains their prior knowledge of the committed `(ikm_a, ikm_b)` and could therefore compute `HMAC(hop_salt, raw_context_id)` for any context id they know — continuing to reverse pseudonyms for hops they no longer have a right to observe. To close this, on any admin removal, the governance engine emits an `InterfaceSaltRotated` event to every active interface the context holds. The event structure is:
+
+   ```
+   InterfaceSaltRotated {
+     interface_id: [u8; 32],       // the prior InterfaceEstablished's offer_id
+     new_ikm_local:    [u8; 32],    // fresh exporter output at current epoch, labeled per §6.2.0.1
+     new_ikm_local_sig: Ed25519Signature, // remaining admin's signature over the new IKM
+     epoch_local:      u64,         // local context's current MLS epoch
+   }
+   ```
+
+   The peer context receives the `InterfaceSaltRotated` event via shared-member bridging and emits its own `InterfaceSaltRotated` (with its own fresh IKM, signed by its own admin) in response. Once both sides have published rotated IKMs, both contexts re-derive `hop_salt` using the HKDF step below over the NEW `(ikm_a, ikm_b)` pair. The removed admin's knowledge of the prior `hop_salt` becomes useless — any `context_id` they compute `HMAC(old_hop_salt, ...)` for does not match the new wire pseudonyms. Until both sides have rotated, the interface operates under the prior `hop_salt` (a best-effort window — typically one epoch); rotated IKMs take effect at the next `OutletError` envelope emitted by either side.
+
+   The removed admin's DID is recorded in the `InterfaceSaltRotated` event's audit metadata as `trigger_removal_did`. This makes the rotation trail verifiable against the governance event that caused it. The rotation is unconditional — governance cannot suppress it, and admins cannot opt out.
 
    **`hop_salt` derivation and lifecycle.** The `hop_salt: [u8; 32]` is used to pseudonymize `source_chain.context_id` entries for observers who are not members of each hop (§5.4.4). At accept time, each side computes its peer-labeled MLS exporter IKM and commits it into the `InterfaceEstablished` event. Thereafter, `hop_salt` is derived deterministically from the committed `(ikm_a, ikm_b)` — **not** from the live MLS exporter, so it does not degrade with MLS epoch ratcheting and does not require either context to retain obsolete MLS epoch secrets. Revocation of the interface rotates the salt on re-establishment (a fresh pair of IKMs is committed to the new `InterfaceEstablished` event).
 
@@ -147,7 +182,25 @@ Outlet interface creation requires explicit consent from both the exposing conte
 
 5. **Teardown.** Either context can revoke the interface at any time via governance action `RevokeOutletInterface { interface_id }`. Revocation is unilateral — no consent from the other side is needed. An `InterfaceRevoked` event is recorded in the revoking context's event log.
 
-**Interface-spam deterrent (quadratic cost).** Interface establishment is an economic action with an anonymity-set interaction: every additional active A↔X interface that Context A holds narrows the anonymity set under which `hop_salt` pseudonyms from A appear. To deter interface-spam as an anonymity-set-reduction attack, the cost a context pays to establish its `n`-th active interface scales **quadratically** in the count of active interfaces it already holds with the same peer over a rolling 24-hour window. Concretely, if Context A already holds `k` active interfaces with Context B (or with a cluster of contexts operated by a single DID) in the last 24 hours, the cost to establish an additional A↔B interface is `base_cost × (k + 1)^2`, where `base_cost` is set by context economic policy (§19.3) and bounded below by the `ContextParams::interface_base_cost_minimum` (registered in §9.18.B, default: smallest non-zero economic unit in the context's currency). The quadratic escalation makes repeated interface establishment with the same peer economically irrational at low counts (k=1 → 4× base; k=4 → 25× base; k=9 → 100× base), which is sufficient to prevent the attack surface without penalizing legitimate bilateral renegotiation. This rule is additive to the standard `OutletErrorClass::Economic::InsufficientFunds` path — a context without sufficient funds for the quadratic fee fails interface establishment at governance approval time, not at hop time.
+**Interface-spam deterrent (quadratic cost, cluster-aware).** Interface establishment is an economic action with an anonymity-set interaction: every additional active A↔X interface that Context A holds narrows the anonymity set under which `hop_salt` pseudonyms from A appear. To deter interface-spam as an anonymity-set-reduction attack, the cost a context pays to establish its `n`-th active interface scales **quadratically** in the count of active prior interfaces within a cluster-detection window.
+
+**Rolling window + cluster detection.** Context A maintains a 24-hour rolling interface-establishment log per peer-cluster. When Context A proposes `AcceptOutletInterface` against a candidate peer B, the governance engine computes the cluster-match count `k` by examining every prior `InterfaceEstablished` or `AcceptOutletInterface` event in the rolling window and incrementing `k` by one whenever ANY of these three predicates holds between the prior peer `P_i` and the candidate peer `B`:
+
+1. **Context-id match.** `P_i.context_id == B.context_id`. Direct re-negotiation with the same peer context.
+2. **Creator-DID match.** `P_i.creator_did == B.creator_did`, where `creator_did` is the DID captured at each peer context's creation event (the first admin who created the context per §5.4 context lifecycle). This catches the "rotate admin to spin up 100 disjoint contexts" evasion: the creator DID is fixed at context creation and cannot be rotated out.
+3. **Admin-set intersection.** `P_i.admin_set ∩ B.admin_set ≠ ∅`, comparing the admin role holders of each peer context at interface-acceptance time. This catches the "new DID creates a context and invites the same admin cluster" evasion: shared admin DIDs across the ostensibly-independent peer contexts reveal the cluster.
+
+If ANY of the three predicates holds, the prior interface contributes to `k`. The cost to establish the new A↔B interface is:
+
+```
+interface_cost = max(base_cost, interface_base_cost_minimum) × (k + 1)²
+```
+
+where `base_cost` is set by context economic policy (§19.3) and bounded below by the `ContextParams::interface_base_cost_minimum` (registered in §9.18.B, default: smallest non-zero economic unit in the context's currency — preventing `base_cost = 0` from defeating the quadratic escalator). The quadratic escalation makes repeated interface establishment with the same peer cluster economically irrational at low counts (k=1 → 4× base; k=4 → 25× base; k=9 → 100× base), which is sufficient to prevent the attack surface without penalizing legitimate bilateral renegotiation.
+
+Cluster-match data (each peer's `context_id`, `creator_did`, and `admin_set` at interface-acceptance time) is captured into the `InterfaceEstablished` event metadata at accept-time. The governance engine reads these directly from its own event log to evaluate predicates 1-3 — no external lookup is required, and the cluster calculation is therefore deterministic and replayable.
+
+This rule is additive to the standard `OutletErrorClass::Economic::InsufficientFunds` path — a context without sufficient funds for the quadratic fee fails interface establishment at governance approval time, not at hop time. The specific rejection uses code `SCP-TOOL-6150` (Economic) slug `protocol.interface-spam-cost` when the fee exceeds the proposer's balance. The cluster-aware calculation closes the "rotate creator_did AND rotate admin_set" evasion only for attackers who also invest a fresh admin DID per context (BH5-M3 residual-risk: an attacker willing to burn N distinct admin DIDs plus N distinct creator DIDs bypasses the cluster detection; the economic floor of `interface_base_cost_minimum × 1²` per interface is the lower bound and must be set at a level where N fresh DIDs is itself economically irrational).
 
 **Outbound and inbound policies:**
 
@@ -260,6 +313,10 @@ Sessions store their recorded `origin_kind` alongside the session state. A sessi
 When a streaming outlet (§5.4.5) participates in a session, the session and stream lifecycles interact through five invariants. The session owns the long-lived authorization state; each stream owns its per-invocation chunk flow.
 
 (a) **`session_id` carried on open.** `OutletStreamOpen` carries an optional `session_id: Option<String>` field. When present, the open MUST reference an existing, non-expired session whose `session_id` matches, whose TTL has not elapsed, and whose recorded `origin_kind` is compatible with the outlet's kind per §6.2.0.3. An `OutletStreamOpen` referencing an unknown, expired, or amplification-incompatible session is rejected at open with `OutletErrorClass::Protocol::UnknownSession` or `OutletErrorClass::Authorization::AmplificationViolation` respectively.
+
+**`session_id` format and uniqueness.** `session_id` is a **UUIDv7** encoded per RFC 9562 §5.7 — a 128-bit identifier whose first 48 bits encode a Unix-millisecond timestamp and whose remaining 80 bits are CSPRNG-sampled per caller. The canonical string form is the 36-character `8-4-4-4-12` hex representation with lowercase hex. Callers generate `session_id` by concatenating (a) the current `unix_ms` time as the 48-bit timestamp prefix, (b) their DID's canonical 80-bit fingerprint (first 10 bytes of `SHA-256(did_string)` XORed with a process-local monotonic 80-bit counter), to produce a `(did, process_time)`-unique identifier that is time-sortable and collision-resistant. SDKs MUST validate the UUIDv7 format on both construction (in the caller's SDK) and acceptance (in the hosting context); a malformed `session_id` is rejected with `OutletErrorClass::Protocol::MalformedSessionId` (code `SCP-TOOL-6101`, slug `protocol.malformed-session-id`).
+
+**Collision handling.** Two concurrent callers selecting the same `session_id` (possible in adversarial scenarios or under extreme process-counter collisions) is detected at session-creation time: the hosting context's session store uses `session_id` as the primary key, and a second caller opening a session with the same id is rejected with `OutletErrorClass::Protocol::SessionIdConflict` (code `SCP-TOOL-6101`, slug `protocol.session-id-conflict`). The first caller's session wins; the second caller MUST re-sample a fresh `session_id` and retry. Because UUIDv7's collision probability is ~2⁻⁴⁰ per millisecond per caller, collision-reject is an edge case, but specifying the reject rule closes the "duplicate-session-id silent takeover" surface.
 
 (b) **One concurrent stream per session.** A session supports AT MOST one concurrent stream. A second `OutletStreamOpen` referencing a `session_id` that already has a live stream is rejected with `OutletErrorClass::Protocol::StreamAlreadyOpen` (class Protocol, slug `protocol.stream-already-open`). The rule closes the "parallel billing channels through one session" surface. A stream is considered live from open until the terminal chunk is written (End or Error{terminal:true}) or the stream is cancelled and the cancel-ack chunk arrives.
 
