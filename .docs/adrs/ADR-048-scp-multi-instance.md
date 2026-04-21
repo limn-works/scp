@@ -91,6 +91,22 @@ Signature across bridges:
 
 This is a breaking change versus the Phase 4a `shutdown()` that took no arguments. Migration is mechanical: pass a sensible default (e.g. 30 seconds). Documented in the Phase 4 migration guide (PR 4).
 
+### 6. Long-lived background tasks capture `Weak<BridgeInstance>`, not `Arc`
+
+Every long-lived task spawned on the shared tokio runtime that needs access to the per-instance state captures a `std::sync::Weak<BridgeInstance>`, not a strong `Arc`. Inside the task, the reference is upgraded per event; a `None` upgrade signals that the caller dropped the `SCP` and the task exits cleanly. Each task body also selects on `bridge_instance.core.cancel_token().cancelled()` so `emergency_cancel_tasks` (invoked by `impl Drop for BridgeInstance`) terminates them promptly.
+
+Rationale: without this, a `tokio::spawn(async move { ... bi: Arc<BridgeInstance> ... })` keeps the bridge alive as long as the task is scheduled, even after the caller drops the owning `SCP`. The cycle would leak `ContextManager`, identity custody, relay connections, and MLS group state for the life of the process.
+
+Covered spawn sites (all three bridges):
+
+- `spawn_suppression_scoring_task` — transport suppression scoring (PyO3, UniFFI; NAPI already used `Weak` pre-PR).
+- `FfiBridgeProvider.bi` / `McpUniFfiBridgeProvider.bi` — MCP server providers — `Weak<BridgeInstance>` field; every `ContextProvider` trait method `upgrade()`s and returns safe defaults when the upgrade fails.
+- `py_mcp_serve` / `mcp_server_create` — stdio/SSE server loops capture `sse_bi: Weak<BridgeInstance>`, select on `cancel_token.cancelled()` alongside `read_line().await`.
+
+Short-lived tasks (single-await-then-return) are allowed to hold an `Arc` for the duration of their work; they cannot delay Drop by more than one event. Tool-invocation paths are bounded by `FFI_TOOL_TIMEOUT_MS` (30 s) at the sync `recv_timeout` barrier, so a misbehaving tool handler delays Drop by at most one invocation's timeout.
+
+Regression tests at `crates/scp-ffi/src/transport.rs::tests`, `crates/scp-ffi/src/mcp.rs::tests`, and `crates/scp-ffi/uniffi/src/bridge.rs::tests` assert (a) `Arc::strong_count(&bi) == 1` while the task is parked, and (b) `weak.upgrade().is_none()` once the caller-held `Arc` drops — proving `impl Drop for BridgeInstance` runs and `emergency_cancel_tasks` propagates.
+
 ## Consequences
 
 - **Tests parallel-safe on every bridge.** Per-test `SCP` fixtures eliminate `BRIDGE_LIFECYCLE_SERIAL`, per-test `beforeAll` in NAPI, and the module-scope poisoning on every SDK. pytest-xdist, Gradle parallel tests, and XCTest concurrency all work.

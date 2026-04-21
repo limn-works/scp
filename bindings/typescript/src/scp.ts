@@ -410,17 +410,18 @@ export class SCP {
    *
    * Fractional seconds (e.g. `0.25`) are preserved to millisecond
    * resolution before crossing the FFI boundary — the native side
-   * takes a `u32` millisecond count.
+   * takes a `u64` millisecond count (widened from `u32` in #1692).
    *
    * `timeoutSecs` is clamped defensively:
    * - `NaN` or values `<= 0` → `0` (abort in-flight tasks immediately).
-   * - `Infinity` or values that would overflow `u32` milliseconds
-   *   → `0xFFFFFFFF` (effectively unbounded).
+   * - `Infinity` or values that exceed `Number.MAX_SAFE_INTEGER` ms
+   *   → `Number.MAX_SAFE_INTEGER` (effectively unbounded — `u64` on the
+   *   wire comfortably holds this).
    * - Finite values in range → rounded to the nearest millisecond.
    *
    * Previously used `Math.floor`, which silently lost up to 0.999 ms
    * of caller budget; and passed `NaN` straight through to the NAPI
-   * boundary, where the `u32` conversion silently yielded `0`
+   * boundary, where the earlier `u32` conversion silently yielded `0`
    * instead of erroring (round 2 api-design + bug-catcher findings).
    *
    * Round 5 RED-2001 tightened the branch ordering: `Infinity` must be

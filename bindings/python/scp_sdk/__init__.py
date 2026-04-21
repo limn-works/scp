@@ -357,7 +357,6 @@ __all__ = [
     "session_close",
     "session_create",
     "session_invoke",
-    "suspend",
     "validate",
     "validate_admission",
     "validate_broadcast_key_hex",
