@@ -432,23 +432,31 @@ export class SCP {
     )(attestationJson, issuerPublicKeyHex);
   }
 
-  identityExecuteRecovery(did: string, tier: string, contextIds: readonly string[]): string {
-    return (
-      this.#native.identityExecuteRecovery as (d: string, t: string, c: readonly string[]) => string
+  async identityExecuteRecovery(
+    did: string,
+    tier: string,
+    contextIds: readonly string[],
+  ): Promise<string> {
+    return await (
+      this.#native.identityExecuteRecovery as (
+        d: string,
+        t: string,
+        c: readonly string[],
+      ) => Promise<string>
     )(did, tier, contextIds);
   }
 
-  identityExecuteCustodyMigration(
+  async identityExecuteCustodyMigration(
     did: string,
     target: string,
     contextIds: readonly string[],
-  ): string {
-    return (
+  ): Promise<string> {
+    return await (
       this.#native.identityExecuteCustodyMigration as (
         d: string,
         t: string,
         c: readonly string[],
-      ) => string
+      ) => Promise<string>
     )(did, target, contextIds);
   }
 
