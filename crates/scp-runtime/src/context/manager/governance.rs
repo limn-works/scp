@@ -5881,7 +5881,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::CommitBroadcastFault`] if the context has an
     /// active fault marker.
-    pub(super) fn check_commit_fault(ctx: &PerContextState) -> Result<(), ContextError> {
+    pub(crate) fn check_commit_fault(ctx: &PerContextState) -> Result<(), ContextError> {
         if let Some(ref marker) = ctx.commit_fault {
             return Err(ContextError::CommitBroadcastFault {
                 operation: marker.operation.label(),

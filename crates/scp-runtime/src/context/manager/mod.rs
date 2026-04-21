@@ -1028,7 +1028,7 @@ pub(crate) struct GovernanceState {
     /// Layered on top of the per-DID economic escalation in spec §19.7. This
     /// is enforced even when `economic_policy` is `None`. See ADR notes on
     /// the dormant anti-spam wiring fix.
-    hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter,
+    pub(crate) hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter,
     /// Per-context nonce tracker for spending UCAN replay prevention (ADR-016 §6).
     /// Validates that each spending UCAN nonce is used at most once, preventing
     /// replay attacks where a valid spending UCAN is resubmitted.
@@ -1143,7 +1143,7 @@ pub(crate) struct AccessControlState {
     /// Per-member access key store for content encryption key wrapping
     /// (ADR-038, §9.17). Keys are generated when members join and used
     /// by `wrap_content`/`unwrap_content` in the message pipeline.
-    access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore,
+    pub(crate) access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore,
 }
 
 impl AccessControlState {
@@ -1623,7 +1623,7 @@ pub(super) fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
 /// to verify the context was not removed and recreated between lock release
 /// and reacquire (confused-deputy detection, Phase B).
 #[must_use]
-pub(super) struct ContextGeneration {
+pub(crate) struct ContextGeneration {
     pub context_id: String,
     pub generation: u64,
 }
@@ -1879,7 +1879,7 @@ fn validate_governance_model(model: &GovernanceModel) -> Result<(), ContextCreat
 
 /// guaranteeing that no concurrent `close_context` or `handle_ttl_expiry` can
 /// interleave between the check and the mutation.
-fn require_active(handle: &ContextHandle) -> Result<(), ContextError> {
+pub(crate) fn require_active(handle: &ContextHandle) -> Result<(), ContextError> {
     let state = handle
         .try_read_state()
         .ok_or(ContextError::ContextNotActive)?;
@@ -2778,7 +2778,7 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::ContextNotRegistered`] if `context_id`
     /// is not in the map.
-    pub(super) async fn lock_context(
+    pub(crate) async fn lock_context(
         &self,
         context_id: &str,
     ) -> Result<
@@ -2806,7 +2806,7 @@ impl ContextManager {
     ///
     /// - [`ContextError::ContextNotRegistered`] if the context is gone.
     /// - [`ContextError::PermissionDenied`] if the generation changed.
-    pub(super) async fn relock_context(
+    pub(crate) async fn relock_context(
         &self,
         token: &ContextGeneration,
     ) -> Result<tokio::sync::OwnedMutexGuard<PerContextState>, ContextError> {
@@ -2975,6 +2975,37 @@ impl ContextManager {
         Arc::clone(&self.clock)
     }
 
+    /// Cheap reference to the manager's wall-clock source.
+    ///
+    /// Returns `&Arc<dyn Clock>` so callers can `Arc::clone` only when
+    /// they need ownership, and pass `&*clock` to helpers that take
+    /// `&dyn Clock`. Used by the hoisted `messaging_helpers::send_message`
+    /// / `deliver_incoming` free functions to satisfy their explicit-
+    /// collaborator signatures without re-derefing through `self.clock`
+    /// every callsite (ADR-049 commit 12c.1).
+    #[must_use]
+    pub(crate) const fn clock_ref(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+
+    /// Cheap reference to the manager's `KeyResolver`. Used by the
+    /// hoisted `messaging_helpers` free functions' explicit-collaborator
+    /// signatures (ADR-049 commit 12c.1). Returns `&KeyResolver` so
+    /// callers can pass without cloning the inner `Arc`.
+    #[must_use]
+    pub(crate) const fn key_resolver_ref(&self) -> &scp_protocol::context::governance::KeyResolver {
+        &self.key_resolver
+    }
+
+    /// Cheap reference to the manager's `local_dids` set. Used by the
+    /// hoisted `messaging_helpers::deliver_incoming` free function
+    /// (ADR-049 commit 12c.1). Commit 12c.2 migrates the handler to
+    /// read from `ActorDeps::local_dids` (`Arc<ArcSwap<...>>`) instead.
+    #[must_use]
+    pub(crate) const fn local_dids_ref(&self) -> &RwLock<HashSet<DID>> {
+        &self.local_dids
+    }
+
     /// Cheap reference to the manager's optional event fan-out channel.
     /// Used by the actor-deps builder to populate
     /// [`ActorDeps::event_tx`](crate::context::actor::deps::ActorDeps::event_tx).
@@ -3135,7 +3166,7 @@ impl ContextManager {
     /// of `PerContextState` are skipped when no persistence provider
     /// exists (the common case for most bridges).
     #[inline]
-    fn has_persistence(&self) -> bool {
+    pub(crate) fn has_persistence(&self) -> bool {
         self.persistence.is_some()
     }
 
@@ -3173,7 +3204,7 @@ impl ContextManager {
         crate::metrics::set_buffer_occupancy(total_buffered);
     }
 
-    fn persist_context_snapshot(&self, context_id: &str, mut snapshot: ContextSnapshot) {
+    pub(crate) fn persist_context_snapshot(&self, context_id: &str, mut snapshot: ContextSnapshot) {
         if let Some(ref persistence) = self.persistence {
             // Export MLS crypto state alongside the context snapshot (#645).
             // Populate `mls_crypto_state` in-place on the owned snapshot (#711).
@@ -3284,7 +3315,7 @@ impl ContextManager {
     /// Takes a `ContextSnapshot` from the current `PerContextState`.
     ///
     /// Must be called while the contexts mutex is held (snapshot under lock).
-    fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
+    pub(crate) fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
         let state = ctx.handle.try_read_state().unwrap_or(ContextState::Active);
         let ttl_remaining_secs = ctx.ttl.timer.remaining_secs();
         // Capture grace entries for transactional persistence (§23.11).

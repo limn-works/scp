@@ -166,7 +166,7 @@ pub(super) fn validate_spending_ucan_or_error(
 ///
 /// Holds the escrow authorization and evaluated cost so that
 /// `complete_paid_action` and `void_paid_action` can finalize or roll back.
-pub(super) struct PaidActionAuthorization {
+pub struct PaidActionAuthorization {
     /// The prepared action containing the authorization envelope.
     prepared: integration::PreparedAction,
     /// The payment adapter for capture/void.
@@ -473,7 +473,7 @@ pub fn enforce_economy(
 /// must-use handle prevents that class of bug from recurring when new
 /// error branches are added.
 #[must_use = "EconomyTicket must be committed or rolled back — dropping leaks budget, velocity, and hard-rate-limit state"]
-pub(super) struct EconomyTicket {
+pub struct EconomyTicket {
     /// The DID being charged — needed for every rollback operation.
     pub actor_did: DID,
     /// The budget amount deducted by [`enforce_economy`] (if any).
@@ -489,7 +489,7 @@ pub(super) struct EconomyTicket {
     /// the caller honored the contract. Visible to the `messaging` /
     /// `lifecycle` modules that construct the ticket; mutated only via
     /// the `commit`/`rollback` helpers below.
-    pub(super) consumed: bool,
+    pub(crate) consumed: bool,
 }
 
 impl Drop for EconomyTicket {
@@ -517,7 +517,7 @@ impl Drop for EconomyTicket {
 /// Call this exactly once per ticket. Dropping the returned
 /// `Option<Amount>` is safe; the budget deduction has already been
 /// recorded under the Phase 1 lock.
-pub(super) fn commit_economy_ticket(
+pub fn commit_economy_ticket(
     mut ticket: EconomyTicket,
 ) -> Option<scp_protocol::economy::types::Amount> {
     ticket.consumed = true;
@@ -529,10 +529,7 @@ pub(super) fn commit_economy_ticket(
 /// holds the per-context Mutex (Phase 1 error paths under lock).
 ///
 /// Consumes the ticket so the `Drop` guard does not fire.
-pub(super) fn rollback_economy_ticket_inline(
-    ctx: &mut super::PerContextState,
-    mut ticket: EconomyTicket,
-) {
+pub fn rollback_economy_ticket_inline(ctx: &mut super::PerContextState, mut ticket: EconomyTicket) {
     ticket.consumed = true;
     ctx.governance
         .velocity_tracker
@@ -562,7 +559,7 @@ pub(super) fn rollback_economy_ticket_inline(
 /// where the context was removed and recreated between Phase 1 and
 /// rollback (Phase B).
 #[allow(clippy::significant_drop_tightening)]
-pub(super) async fn rollback_economy_ticket(
+pub async fn rollback_economy_ticket(
     manager: &ContextManager,
     context_id: &str,
     mut ticket: EconomyTicket,
@@ -599,7 +596,7 @@ impl ContextManager {
     /// action, then calls `complete_paid_action` or `void_paid_action`.
     ///
     /// Returns `Ok(None)` when no payment adapter is configured or cost is zero.
-    pub(super) async fn authorize_paid_action(
+    pub(crate) async fn authorize_paid_action(
         &self,
         action_type: PaidActionType,
         payer_did: &DID,
@@ -682,7 +679,7 @@ impl ContextManager {
     ///
     /// Calls `adapter.capture`, verifies the receipt, stores it in the event
     /// log, and records budget spend.
-    pub(super) async fn complete_paid_action(
+    pub(crate) async fn complete_paid_action(
         &self,
         auth: PaidActionAuthorization,
         payer_did: &DID,
@@ -739,7 +736,7 @@ impl ContextManager {
     /// Used by `send_message` when `encrypt_and_send` fails after
     /// `authorize_paid_action` succeeded (escrow pattern: authorize →
     /// action → complete on success / void on failure).
-    pub(super) async fn void_paid_action(&self, auth: PaidActionAuthorization, context_id: &str) {
+    pub(crate) async fn void_paid_action(&self, auth: PaidActionAuthorization, context_id: &str) {
         if let Some(ref authorization) = auth.prepared.envelope.authorization
             && let Err(e) = auth.adapter.void_dyn(authorization).await
         {

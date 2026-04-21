@@ -640,7 +640,7 @@ impl ContextManager {
     ///
     /// Called from `finalize_send` and `deliver_message_and_drain_buffered` after
     /// each event log append.
-    pub(super) fn create_checkpoint_if_due(
+    pub(crate) fn create_checkpoint_if_due(
         &self,
         context_id: &str,
         ctx: &mut super::PerContextState,

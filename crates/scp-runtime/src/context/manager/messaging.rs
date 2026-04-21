@@ -6,10 +6,24 @@
 //! to [`crate::context::messaging_helpers`] with explicit-collaborator
 //! signatures (no more `&ContextManager` or `&self`). The outer methods
 //! [`ContextManager::send_message`] and [`ContextManager::deliver_incoming`]
-//! remain here and call the free functions with their own fields as
-//! arguments. Commit 12f deletes the outer methods once the actor handler
-//! bodies in [`crate::context::actor::handlers::messaging`] own the send /
-//! receive path.
+//! call the free-function form under that module.
+//!
+//! # Top-level hoist (commit 12c.1 of ADR-049)
+//!
+//! Commit 12c.1 extends the hoist to the two top-level methods
+//! [`ContextManager::send_message`] and
+//! [`ContextManager::deliver_incoming`]. Their bodies now live as
+//! `pub(crate) async fn`s in `messaging_helpers`; the outer methods on
+//! [`ContextManager`] have been reduced to one-line forwarders that pass
+//! `self` plus the clock and key resolver to the free function.
+//!
+//! Messaging-internal private helpers remain as inherent methods on
+//! [`ContextManager`] in commit 12c.1 and are reached via the `mgr`
+//! parameter from the hoisted bodies. They will be hoisted in a 12c.1
+//! continuation step and deleted alongside the outer shim in commit 12f
+//! once the actor handler bodies in
+//! [`crate::context::actor::handlers::messaging`] own the send / receive
+//! path.
 
 use scp_protocol::envelope::validation::{BufferedMessage, SequenceCheck, TimestampValidator};
 
@@ -18,8 +32,7 @@ use super::{
     context_id_to_bytes, evaluate_consequence_rules, instrument, require_active,
 };
 use crate::context::messaging_helpers::{
-    build_broadcast_envelope, build_encrypted_envelope, deliver_plaintext_or_announcement,
-    enforce_send_economy, run_buffered_post_delivery, verify_and_unwrap,
+    build_encrypted_envelope, deliver_plaintext_or_announcement, run_buffered_post_delivery,
 };
 
 /// Re-export of the protocol-level domain-separated routing ID derivation.
@@ -64,8 +77,11 @@ impl ContextManager {
     ///
     /// Returns [`ContextError`] if the context is not active, the sender
     /// lacks capability, or any crypto/transport step fails.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::messaging_helpers::send_message`] free function
+    /// (ADR-049 commit 12c.1). Deleted in commit 12f alongside every
+    /// other `ContextManager` messaging surface.
     #[instrument(skip_all, fields(context_id = handle.context_id()))]
-    #[allow(clippy::too_many_lines)] // H7+M4 moved capability check and velocity before economy enforcement; cannot split further without fragmenting the lock scope.
     pub async fn send_message(
         &self,
         handle: &ContextHandle,
@@ -75,259 +91,16 @@ impl ContextManager {
         source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     ) -> Result<(), ContextError> {
-        let context_id = handle.context_id().to_owned();
-        let context_id_bytes = context_id_to_bytes(&context_id);
-        // Routing ID computation is deferred to Phase 1 (under lock) where
-        // the context mode and pseudonym registry are available.
-        let (
-            broadcast_envelope,
-            recipients_data,
-            sequence,
-            is_broadcast,
-            ticket,
-            ctx_gen,
-            send_routing_ids,
-        ) = {
-            let (mut guard, ctx_gen) = self
-                .lock_context(&context_id)
-                .await
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-            let ctx = &mut *guard;
-            require_active(&ctx.handle)?;
-            // N3: Fail-close on commit fault — if a prior governance
-            // mutation's MLS Commit failed to broadcast and exhausted
-            // retries, messages encrypted under the divergent epoch may
-            // be undecryptable by members who never received the Commit.
-            Self::check_commit_fault(ctx)?;
-            // H7: check capability BEFORE budget deduction so a capability
-            // failure doesn't leak budget. The suspension-aware
-            // member_has_capability check handles both role-based and
-            // suspension-based denial.
-            if ctx.broadcast_context.is_none()
-                && !ctx
-                    .role_state
-                    .member_has_capability(sender_did.as_ref(), &Capability::MessagesWrite)
-            {
-                let is_suspended = ctx
-                    .role_state
-                    .suspended_capabilities
-                    .get(sender_did.as_ref())
-                    .is_some_and(|s| s.contains(&Capability::MessagesWrite));
-                let msg = if is_suspended {
-                    format!("member {sender_did} write access has been revoked")
-                } else {
-                    format!("member {sender_did} does not have messages:write capability")
-                };
-                return Err(ContextError::PermissionDenied(msg));
-            }
-            // Defense-in-depth (Matrix Synapse–style hard rate limit): consume
-            // a token from the per-sender bucket before any pricing logic.
-            // This bounds inbound load even when no economic policy or budget
-            // is configured. On any subsequent failure we refund the token so
-            // a rejected attempt does not consume bucket capacity.
-            let now_secs = self.clock.now_secs();
-            if !ctx
-                .governance
-                .hard_rate_limit
-                .try_consume(sender_did, now_secs)
-            {
-                return Err(ContextError::RateLimited {
-                    resource: "send".to_owned(),
-                    message: "hard rate limit exceeded for sender".to_owned(),
-                });
-            }
-            // M4: record velocity BEFORE economy enforcement so the current
-            // message is included in the velocity metric used for pricing.
-            // F5: capture the rollback token so we can refund THIS entry
-            // specifically (not race concurrent senders on "the last one").
-            let velocity_token = ctx
-                .governance
-                .velocity_tracker
-                .record_message(sender_did, now_secs);
-
-            let deducted_cost = match enforce_send_economy(
-                ctx,
-                sender_did,
-                now_secs,
-                spending_ucan,
-                &context_id,
-                &*self.clock,
-                &self.key_resolver,
-            ) {
-                Ok(cost) => cost,
-                Err(e) => {
-                    // Roll back both: the velocity increment recorded above
-                    // and the hard-rate-limit token. A rejected message must
-                    // not permanently penalize the sender on either axis.
-                    // No EconomyTicket exists yet at this point — rollback
-                    // inline under the still-held lock.
-                    ctx.governance
-                        .velocity_tracker
-                        .rollback(sender_did, velocity_token);
-                    ctx.governance.hard_rate_limit.refund(sender_did);
-                    return Err(e);
-                }
-            };
-            // F4: wrap the Phase 1 economy state in an EconomyTicket so
-            // every downstream error branch is forced to consume it.
-            // Dropping without commit/rollback is a compile-time warning
-            // (`#[must_use]`) + debug-assert at runtime.
-            let ticket = super::economy::EconomyTicket {
-                actor_did: sender_did.clone(),
-                deducted_cost,
-                velocity_token,
-                needs_hard_rate_limit_refund: true,
-                consumed: false,
-            };
-            if let Some(ref mut bc) = ctx.broadcast_context {
-                let Some(sk) = signing_key else {
-                    // Phase 1 failed after ticket creation — drain it.
-                    // Use inline variant: we already hold the per-context lock.
-                    super::economy::rollback_economy_ticket_inline(ctx, ticket);
-                    return Err(ContextError::CryptoFailed(
-                        "signing key required for broadcast publish".into(),
-                    ));
-                };
-                let env = match build_broadcast_envelope(
-                    self.clock.as_ref(),
-                    bc,
-                    sender_did,
-                    payload,
-                    sk,
-                ) {
-                    Ok(env) => env,
-                    Err(e) => {
-                        // Use inline variant: we already hold the per-context lock.
-                        super::economy::rollback_economy_ticket_inline(ctx, ticket);
-                        return Err(e);
-                    }
-                };
-                // Broadcast: use plain SHA-256(context_id) per spec §5.14.
-                let broadcast_rid = scp_protocol::context::broadcast_routing_id(&context_id);
-                (
-                    Some(env),
-                    std::collections::HashMap::new(),
-                    0,
-                    true,
-                    ticket,
-                    ctx_gen,
-                    vec![broadcast_rid],
-                )
-            } else {
-                // Capability already checked above (H7: before budget deduction).
-                // Assign sequence under lock — SequenceTracker rejects duplicates.
-                let Some(seq) = ctx.membership.next_sequence_number(sender_did) else {
-                    // Use inline variant: we already hold the per-context lock.
-                    super::economy::rollback_economy_ticket_inline(ctx, ticket);
-                    return Err(ContextError::MemberNotFound(format!(
-                        "cannot assign sequence: {sender_did} is not a member"
-                    )));
-                };
-                // §9.10.4: collect pseudonym routing IDs for fan-out.
-                // For encrypted contexts with known pseudonyms, send to each
-                // member's pseudonym. Always include the shared routing ID as
-                // fallback for members whose pseudonym is not yet known.
-                //
-                // KNOWN LIMITATION (§9.10.4): Fan-out sends the SAME MLS ciphertext to all
-                // routing IDs. A relay can correlate pseudonyms by observing identical blobs.
-                // Per-recipient re-encryption (different nonce per blob) would fix this but
-                // increases bandwidth by O(N). Acceptable until relay-blinding is implemented.
-                let mut routing_ids: Vec<[u8; 32]> =
-                    ctx.pseudonym_registry.values().copied().collect();
-                let shared_rid = scp_protocol::context::context_routing_id(&context_id);
-                // Always include the shared routing ID for backward compat /
-                // members who haven't announced a pseudonym yet. Duplicates
-                // in the fan-out are harmless (same blob to same routing ID
-                // is idempotent at the relay).
-                routing_ids.push(shared_rid);
-                (
-                    None,
-                    ctx.access.access_key_store.get_all(&context_id),
-                    seq,
-                    false,
-                    ticket,
-                    ctx_gen,
-                    routing_ids,
-                )
-            }
-        };
-        // Payment flow (#1537): escrow pattern — authorize (hold) before the
-        // action, complete (capture) after success, void + rollback on failure.
-        let auth = match self.authorize_send_payment(&context_id, sender_did).await {
-            Ok(auth) => auth,
-            Err(e) => {
-                // Authorization failure — roll back the ticket. The sequence
-                // number rollback is also needed because Phase 1 already
-                // incremented it for non-broadcast.
-                super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
-                if !is_broadcast {
-                    if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
-                        let ctx = &mut *guard;
-                        ctx.membership.rollback_sequence_number(sender_did);
-                    } else {
-                        tracing::warn!(
-                            context_id = %context_id,
-                            "send_message: generation mismatch on payment auth rollback — \
-                             sequence number rollback skipped"
-                        );
-                    }
-                }
-                return Err(e);
-            }
-        };
-
-        // Phase 2: encrypt + send (no lock held).
-        // §9.10.4: fan-out — send to all collected routing IDs.
-        let phase2_result = self.encrypt_and_send(
-            broadcast_envelope,
-            signing_key,
-            &context_id,
+        crate::context::messaging_helpers::send_message(
+            self,
+            self.clock_ref(),
+            self.key_resolver_ref(),
+            handle,
             sender_did,
             payload,
-            &recipients_data,
-            sequence,
+            signing_key,
             source_provenance,
-            &send_routing_ids,
-        );
-        if let Err(e) = phase2_result {
-            // Void the escrow hold and roll back the full ticket (budget,
-            // velocity, hard-rate-limit) on send failure. F4: before this
-            // patch the outer rollback only touched the budget, silently
-            // leaking the velocity entry and the hard-rate-limit token.
-            if let Some(a) = auth {
-                self.void_paid_action(a, &context_id).await;
-            }
-            super::economy::rollback_economy_ticket(self, &context_id, ticket, &ctx_gen).await;
-            if !is_broadcast {
-                if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
-                    let ctx = &mut *guard;
-                    ctx.membership.rollback_sequence_number(sender_did);
-                } else {
-                    tracing::warn!(
-                        context_id = %context_id,
-                        "send_message: generation mismatch on send failure rollback — \
-                         sequence number rollback skipped"
-                    );
-                }
-            }
-            return Err(e);
-        }
-
-        // Phase 3: capture the escrow hold after successful send. Consume
-        // the ticket — commit returns the deducted cost for the capture step
-        // and marks the ticket as committed so the Drop guard stays quiet.
-        let deducted_cost = super::economy::commit_economy_ticket(ticket);
-        self.capture_send_payment(auth, sender_did, &context_id, deducted_cost)
-            .await;
-
-        self.finalize_send(
-            &context_id,
-            &context_id_bytes,
-            sender_did,
-            sequence,
-            payload,
-            signing_key,
-            &ctx_gen,
+            spending_ucan,
         )
         .await
     }
@@ -341,7 +114,7 @@ impl ContextManager {
     ///
     /// Extracted to keep `send_message` within the clippy `too_many_lines` limit.
     #[allow(clippy::too_many_arguments)]
-    fn encrypt_and_send(
+    pub(crate) fn encrypt_and_send(
         &self,
         broadcast_envelope: Option<scp_protocol::crypto::sender_keys::broadcast::BroadcastEnvelope>,
         signing_key: Option<&ed25519_dalek::SigningKey>,
@@ -413,7 +186,7 @@ impl ContextManager {
     /// budget when the caller subsequently drains the ticket (F4).
     /// Returns the authorization token (if payment is required) for later
     /// capture or void.
-    async fn authorize_send_payment(
+    pub(crate) async fn authorize_send_payment(
         &self,
         context_id: &str,
         sender_did: &DID,
@@ -436,7 +209,7 @@ impl ContextManager {
     ///
     /// On failure a `PaymentCaptureFailed` entry is appended to the event log
     /// and pushed to the receive buffer to provide a durable audit trail (H19).
-    async fn capture_send_payment(
+    pub(crate) async fn capture_send_payment(
         &self,
         auth: Option<super::economy::PaidActionAuthorization>,
         sender_did: &DID,
@@ -468,7 +241,7 @@ impl ContextManager {
     /// Extracted from `send_message` Phase 3 to keep the outer function
     /// within the clippy `too_many_lines` limit.
     #[allow(clippy::too_many_arguments)]
-    async fn finalize_send(
+    pub(crate) async fn finalize_send(
         &self,
         context_id: &str,
         context_id_bytes: &[u8; 32],
@@ -597,7 +370,7 @@ impl ContextManager {
     /// Returns `Some(OpenedEnvelope)` for application messages that need further
     /// processing, or `None` for control/management messages that are handled
     /// internally.
-    fn decrypt_and_dispatch(
+    pub(crate) fn decrypt_and_dispatch(
         &self,
         context_id: &str,
         context_id_bytes: &[u8; 32],
@@ -642,154 +415,31 @@ impl ContextManager {
     /// Returns [`ContextError`] if the context is not active, decryption
     /// fails, signature verification fails, anti-replay check fails,
     /// access key unwrapping fails, or the sender lacks capability.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::messaging_helpers::deliver_incoming`] free
+    /// function (ADR-049 commit 12c.1). Deleted in commit 12f alongside
+    /// every other `ContextManager` messaging surface.
     #[instrument(skip_all, fields(context_id))]
     pub async fn deliver_incoming(
         &self,
         context_id: &str,
         encrypted_blob: &[u8],
     ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
-        let context_id_bytes = context_id_to_bytes(context_id);
-
-        // Phase 1: state check + read local member DID + access key.
-        // Read local_dids FIRST (RwLock read, low contention) to avoid
-        // nested lock ordering issues with the contexts Mutex.
-        let local_dids = self.local_dids.read().await;
-        let (local_member_did, access_key) = {
-            let ctx_arc = self
-                .get_context_arc(context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let guard = ctx_arc.lock().await;
-            let ctx = &*guard;
-            require_active(&ctx.handle)?;
-            let did = ctx
-                .membership
-                .member_dids()
-                .find(|d| local_dids.contains(*d))
-                .map(std::string::ToString::to_string)
-                .ok_or_else(|| {
-                    ContextError::CryptoFailed("no local member found in this context".into())
-                })?;
-            let key = ctx.access.access_key_store.get(context_id, &did).cloned();
-            (did, key)
-        };
-        drop(local_dids);
-
-        // Phase 2: open envelope (MLS + sender key + deserialize + integrity).
-        let Some(opened_envelope) =
-            self.decrypt_and_dispatch(context_id, &context_id_bytes, encrypted_blob)?
-        else {
-            return Ok(None);
-        };
-
-        let inner = opened_envelope.inner;
-        let sender_did = opened_envelope.sender_did;
-
-        // Cross-context injection defense: verify that the inner envelope's
-        // context_id matches the context we are delivering into. An attacker
-        // could try to deliver an envelope from context A into context B's
-        // receive path — this check prevents that.
-        if inner.context_id != context_id {
-            return Err(ContextError::CryptoFailed(format!(
-                "inner envelope context_id mismatch: expected {context_id}, got {}",
-                inner.context_id
-            )));
-        }
-
-        // Verify that the sender DID extracted from MLS credentials matches the
-        // sender DID declared in the inner envelope. A mismatch indicates a
-        // credential spoofing attack.
-        if inner.sender_did != sender_did {
-            return Err(ContextError::CryptoFailed(format!(
-                "inner envelope sender_did mismatch: MLS says {sender_did}, envelope says {}",
-                inner.sender_did
-            )));
-        }
-
-        // Verify signature + unwrap access keys BEFORE anti-replay.
-        // Signature verification must precede SequenceTracker mutation to
-        // prevent an attacker from poisoning the tracker with forged envelopes
-        // (which would cause the real message to be rejected as a replay).
-        //
-        // Recovery admin gate: check if sender has ContextClose capability
-        // (admin). Only evaluated when message_type == Recovery to avoid an
-        // extra lock acquisition on the normal path.
-        let sender_is_admin =
-            if inner.message_type == scp_protocol::envelope::inner::MessageType::Recovery {
-                if let Ok(ctx_arc) = self.get_context_arc(context_id) {
-                    let guard = ctx_arc.lock().await;
-                    let ctx = &*guard;
-                    ctx.role_state
-                        .member_has_capability(&sender_did, &Capability::ContextClose)
-                } else {
-                    false
-                }
-            } else {
-                false // irrelevant for non-Recovery messages
-            };
-
-        let ak = access_key.ok_or_else(|| {
-            ContextError::CryptoFailed(format!(
-                "no access key for {local_member_did} in context {context_id}"
-            ))
-        })?;
-        let plaintext = verify_and_unwrap(
-            &self.key_resolver,
-            &inner,
-            &sender_did,
+        crate::context::messaging_helpers::deliver_incoming(
+            self,
+            self.clock_ref(),
+            self.key_resolver_ref(),
             context_id,
-            &local_member_did,
-            &ak,
-            sender_is_admin,
-        )?;
-
-        // Anti-replay + reorder buffer (§9.8.2, §9.8.5).
-        // Now safe to inspect SequenceTracker — the envelope is authenticated.
-        let now_ms = self.clock.now_millis();
-        let sequence_check = self
-            .validate_and_drain_timeouts(context_id, &inner, now_ms)
-            .await?;
-
-        // A locally-controlled sender was already counted on the send path;
-        // skip velocity re-recording to prevent double-counting on single-node setups.
-        let is_local_sender = sender_did == local_member_did;
-
-        match sequence_check {
-            SequenceCheck::Expected => {
-                // Message is in order — deliver immediately.
-                // Bug fix (#1534): `deliver_message_and_drain_buffered` returns
-                // `true` when the message was consumed as a pseudonym announcement
-                // (internal protocol message). Announcements must NOT be forwarded
-                // to FFI callers as regular user messages.
-                let consumed_as_announcement = self
-                    .deliver_message_and_drain_buffered(
-                        context_id,
-                        &context_id_bytes,
-                        &sender_did,
-                        &inner,
-                        &plaintext,
-                        is_local_sender,
-                    )
-                    .await?;
-                if consumed_as_announcement {
-                    Ok(None)
-                } else {
-                    Ok(Some((plaintext, sender_did)))
-                }
-            }
-            SequenceCheck::Ahead { expected: _ } => {
-                // Message is ahead of expected — buffer it (§9.8.5).
-                self.buffer_ahead_message(context_id, &inner, &sender_did, &plaintext, now_ms)
-                    .await?;
-                Ok(None)
-            }
-        }
+            encrypted_blob,
+        )
+        .await
     }
 
     /// Validates timestamp and sequence, then drains timed-out gaps.
     ///
     /// Returns the `SequenceCheck` result for the caller to decide whether
     /// to deliver immediately or buffer.
-    async fn validate_and_drain_timeouts(
+    pub(crate) async fn validate_and_drain_timeouts(
         &self,
         context_id: &str,
         inner: &scp_protocol::envelope::inner::InnerEnvelope,
@@ -873,7 +523,7 @@ impl ContextManager {
     ///
     /// If the buffer overflows, force-closes the oldest gap and delivers
     /// all its messages.
-    async fn buffer_ahead_message(
+    pub(crate) async fn buffer_ahead_message(
         &self,
         context_id: &str,
         inner: &scp_protocol::envelope::inner::InnerEnvelope,
@@ -962,7 +612,7 @@ impl ContextManager {
     /// already recorded on the send path and must not be counted again here,
     /// otherwise a single message would be double-counted on single-node setups.
     #[allow(clippy::too_many_lines)]
-    pub(super) async fn deliver_message_and_drain_buffered(
+    pub(crate) async fn deliver_message_and_drain_buffered(
         &self,
         context_id: &str,
         context_id_bytes: &[u8; 32],

@@ -25,14 +25,23 @@
 // before test mocks in mod.rs (the parser returns the first match).
 const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/manager/economy.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/messaging.rs"),
     // Commit 12b.1 of ADR-049 hoisted six private helpers out of
     // `manager/messaging.rs` into `context/messaging_helpers.rs`. The
     // pipeline-wiring assertions below still need to see those helper
     // bodies (they assert spec-required calls inside e.g.
     // `build_encrypted_envelope`, `enforce_send_economy`), so the new
     // free-function module is concatenated into MANAGER_SRC here.
+    //
+    // Commit 12c.1 of ADR-049 additionally hoisted the top-level
+    // `send_message` and `deliver_incoming` method bodies into the same
+    // helper module; the outer methods in `manager/messaging.rs` are now
+    // one-line forwarders. The helpers file is concatenated BEFORE
+    // `manager/messaging.rs` so that `extract_fn_body` — which returns the
+    // FIRST occurrence — picks up the real hoisted bodies rather than
+    // the forwarders. When the forwarders are deleted in commit 12f this
+    // ordering becomes a no-op; it remains correct.
     include_str!("../../../../crates/scp-runtime/src/context/messaging_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/manager/messaging.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/broadcast.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/governance.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/lifecycle.rs"),
