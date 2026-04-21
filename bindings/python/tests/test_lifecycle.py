@@ -1,12 +1,16 @@
-"""Tests for the bridge lifecycle controls (suspend / resume).
+"""Tests for the bridge lifecycle controls (SCP.suspend / SCP.resume).
 
-Exercises scp_sdk.suspend() and scp_sdk.resume() against the PyO3 FFI
-layer.  Each test verifies:
+Exercises :meth:`scp_sdk.SCP.suspend` and :meth:`scp_sdk.SCP.resume`
+against the PyO3 FFI layer.  Each test verifies:
 
 1. suspend before any context work is a no-op (fresh instance).
 2. resume before any context work is a no-op (fresh instance).
 3. suspend after Identity.create() (which exercises bridge state) succeeds.
 4. resume after suspend succeeds.
+
+Phase 4 PR 4 (#1549) deleted the free-function ``suspend(scp)`` /
+``resume(scp)`` delegates; the class methods are now the only entry
+point (one happy path — CLAUDE.md architecture tenet).
 
 Requires the native _scp_core extension built via maturin.
 """
@@ -23,18 +27,18 @@ except (ImportError, AttributeError):
         allow_module_level=True,
     )
 
-from scp_sdk import SCP, resume, suspend
+from scp_sdk import SCP
 
 
 def test_suspend_before_init_is_noop(scp: SCP) -> None:
     """suspend() on a fresh instance must succeed (no context state)."""
-    suspend(scp)
+    scp.suspend()
 
 
 @pytest.mark.asyncio
 async def test_resume_before_init_is_noop(scp: SCP) -> None:
     """resume() on a fresh (not-suspended) instance must succeed."""
-    await resume(scp)
+    await scp.resume()
 
 
 @pytest.mark.asyncio
@@ -49,8 +53,8 @@ async def test_suspend_and_resume_roundtrip_after_init(scp: SCP) -> None:
     from scp_sdk.types import CustodyType
 
     _identity = await Identity.create(scp, custody=CustodyType.IN_MEMORY)
-    suspend(scp)
-    await resume(scp)
+    scp.suspend()
+    await scp.resume()
 
 
 @pytest.mark.asyncio
@@ -60,7 +64,7 @@ async def test_multiple_suspend_resume_cycles_are_idempotent(scp: SCP) -> None:
     from scp_sdk.types import CustodyType
 
     _identity = await Identity.create(scp, custody=CustodyType.IN_MEMORY)
-    suspend(scp)
-    suspend(scp)
-    await resume(scp)
-    await resume(scp)
+    scp.suspend()
+    scp.suspend()
+    await scp.resume()
+    await scp.resume()

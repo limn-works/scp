@@ -157,9 +157,19 @@ class SCP:
         transport-dependent operations will fail until :meth:`resume` is
         called.
 
-        :raises TransportError: If the transport lock is poisoned.
+        :raises TransportError: If transport cleanup fails
+            (code ``SCP-TRANS-5001``).
         """
-        self._native.suspend()
+        # Lazy import avoids circular dep (errors -> scp -> errors).
+        from scp_sdk.errors import TransportError
+
+        try:
+            self._native.suspend()
+        except Exception as exc:  # PyO3 raises ScpTransportError
+            raise TransportError(
+                f"suspend failed: {exc}",
+                code="SCP-TRANS-5001",
+            ) from exc
 
     async def resume(self) -> None:
         """Resume a suspended bridge instance.
@@ -183,7 +193,16 @@ class SCP:
         :raises ContextError: If the instance has been permanently shut
             down (code ``SCP-CTX-2000``).
         """
-        await asyncio.to_thread(self._native.resume)
+        # Lazy import avoids circular dep (errors -> scp -> errors).
+        from scp_sdk.errors import ContextError
+
+        try:
+            await asyncio.to_thread(self._native.resume)
+        except Exception as exc:  # PyO3 raises ScpContextError
+            raise ContextError(
+                f"resume failed: {exc}",
+                code="SCP-CTX-2000",
+            ) from exc
 
     def shutdown(self, timeout: float = 5.0) -> None:
         """Shut down this instance with a graceful deadline.

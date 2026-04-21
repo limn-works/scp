@@ -257,9 +257,29 @@ scan_bridge() {
                     #     behavioural level — a missing check is a bug
                     #     regardless of its syntactic form.
                     for (read_idx = 1; read_idx <= pending_n; read_idx++) {
-                        if (index(line, MACRO "!") > 0 || \
-                            index(line, ".check_handle(") > 0) {
+                        # Two-stage acceptance: track whether we saw a
+                        # valid-receiver preamble (`self.inner`, `.inner`,
+                        # `bi`, or `&bi.core`) in the body window, then
+                        # accept a `.check_handle(` only if the receiver
+                        # was also observed. This tolerates the UniFFI
+                        # multi-line chain
+                        # `self.inner\n .core\n .check_handle(...)` while
+                        # rejecting a bare `.check_handle(` on a foreign
+                        # core (Round-2 black-hat finding).
+                        if (index(line, MACRO "!") > 0) {
                             pending_found[read_idx] = 1
+                        } else {
+                            if (index(line, "self.inner") > 0 || \
+                                index(line, "&bi.core") > 0 || \
+                                index(line, "bi.core.") > 0 || \
+                                match(line, /[[:space:]]bi\./) > 0 || \
+                                index(line, ".inner.core") > 0) {
+                                pending_saw_recv[read_idx] = 1
+                            }
+                            if (index(line, ".check_handle(") > 0 && \
+                                pending_saw_recv[read_idx] == 1) {
+                                pending_found[read_idx] = 1
+                            }
                         }
                         pending_remaining[read_idx]--
                         if (pending_remaining[read_idx] <= 0) {
@@ -400,8 +420,16 @@ scan_bridge() {
                 # If the pending flag is set but this line is neither the
                 # container attr nor an impl opener, cancel it — the attr
                 # must be followed by an `impl` to open a method scope.
+                # Doc comments (`///`, `//!`, block `/*` and its `*`
+                # continuation) between the container attr and the `impl`
+                # line must NOT cancel the pending flag — otherwise a
+                # documented `#[pymethods] impl T` slips through the gate.
+                # (Round-2 bug-catcher finding MEDIUM #3.)
                 if (pending_method_scope && match(line, /^[[:space:]]*$/) == 0 && \
-                    match(line, /^[[:space:]]*#\[/) == 0) {
+                    match(line, /^[[:space:]]*#\[/) == 0 && \
+                    match(line, /^[[:space:]]*\/\//) == 0 && \
+                    match(line, /^[[:space:]]*\/\*/) == 0 && \
+                    match(line, /^[[:space:]]*\*/) == 0) {
                     pending_method_scope = 0
                 }
 

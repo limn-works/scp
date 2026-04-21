@@ -54,9 +54,12 @@ use crate::ucan::NapiUcanToken;
 /// import { SCP } from '@limn-works/scp-ts-napi';
 ///
 /// const scp = new SCP();                 // fresh in-memory instance
-/// const shared = SCP.default();          // shared process-wide default
 /// await scp.shutdown(5);                 // async graceful shutdown
 /// ```
+///
+/// Phase 4 PR 4 (#1549, ADR-048) removed `SCP.default()` along with the
+/// process-wide default-instance fallback; every caller must construct
+/// an `SCP` explicitly and route handles through it.
 //
 // CodeQL note (rust/access-invalid-pointer, alert #425 — false positive):
 // The `#[napi]` macro generates `FromNapiRef`/`FromNapiMutRef` impls that call
@@ -2218,6 +2221,7 @@ impl Scp {
         &self,
         handle: &NapiContextHandle,
     ) -> napi::Result<Option<String>> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_migration_state_on(&self.inner, handle).await
     }
 
@@ -2253,6 +2257,7 @@ impl Scp {
         handle: &NapiContextHandle,
         new_duration_secs: u32,
     ) -> napi::Result<()> {
+        crate::napi_check_handle!(&self.inner.core, handle);
         crate::context::context_reset_ttl_timer_on(&self.inner, handle, new_duration_secs).await
     }
 

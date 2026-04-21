@@ -226,7 +226,7 @@ export class Relay implements AsyncDisposable {
    *   the relay. Required — the legacy process-wide default instance
    *   fallback was removed in Phase 4 PR 4 (#1549) demolition.
    */
-  static async startLocal(dataDir: string, scp: SCP): Promise<Relay> {
+  static async startLocal(scp: SCP, dataDir: string): Promise<Relay> {
     const api = serverApi(scp);
     const handle = await api.relayStartLocal(dataDir);
     return new Relay(handle);

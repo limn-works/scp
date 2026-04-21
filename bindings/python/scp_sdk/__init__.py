@@ -105,7 +105,6 @@ from scp_sdk.governance import (
     withdraw_governance_vote,
 )
 from scp_sdk.identity import DIDDocument, Identity, IdentityAttestation, RevocationStatus
-from scp_sdk.lifecycle import resume, suspend
 from scp_sdk.mcp import (
     McpClient,
     McpProvenance,
@@ -349,7 +348,6 @@ __all__ = [
     "reset_ttl_timer",
     "restore_all_contexts",
     "restore_context",
-    "resume",
     "revoke",
     "run_sync",
     "scpid_challenge",

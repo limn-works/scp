@@ -128,6 +128,29 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
     await expect(scp.resume()).resolves.toBeUndefined();
   });
 
+  test("handle minted by one SCP is rejected by another (SCP-PERM-3030)", async () => {
+    // Round-2 black-hat finding: the TS parity tests must mint a handle
+    // on one SCP and call a method on a DIFFERENT SCP with it so the
+    // handle-affinity rejection path is exercised end-to-end, not only
+    // in the Rust integration tests.
+    const scpA = new addon.SCP();
+    const scpB = new addon.SCP();
+    if (typeof scpA.identityCreate !== "function" || typeof scpB.contextCreate !== "function") {
+      return; // addon predates per-instance identity/context — covered in Rust
+    }
+    expect(scpA.instanceId).not.toBe(scpB.instanceId);
+    const identity = await scpA.identityCreate("in_memory");
+    // contextCreate takes a NapiIdentity handle. Crossing it over to
+    // scpB MUST be rejected with SCP-PERM-3030 before any capability
+    // or state work runs.
+    const params = JSON.stringify({
+      ceiling: ["messages:write"],
+      governance: "single_admin",
+      memoryScope: "ephemeral",
+    });
+    await expect(scpB.contextCreate(identity, params)).rejects.toThrow(/SCP-PERM-3030/);
+  });
+
   test("SCP.withStorage accepts a sqlite config with Uint8Array key", () => {
     // PR 3 extension — SQLCipher-encrypted filesystem storage
     // (closes #1260, #1491). We only assert the factory accepts the

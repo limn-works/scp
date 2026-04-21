@@ -239,7 +239,9 @@ export { connectLocalTransport, Node, Relay } from "./server";
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-export { scpResume, scpSuspend } from "./lifecycle";
+// Suspend and resume are methods on SCP itself — `scp.suspend()` / `await scp.resume()`.
+// Phase 4 PR 4 (#1549, ADR-048) deleted the free-function wrappers to
+// keep a single happy path across all SDKs.
 
 // ---------------------------------------------------------------------------
 // SCP multi-instance handle (ADR-048)

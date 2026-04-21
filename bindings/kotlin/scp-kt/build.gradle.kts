@@ -123,7 +123,20 @@ tasks.register<Exec>("generateUniffiBindings") {
     group = "codegen"
     description = "Generate Kotlin bindings from the scp-ffi-uniffi Rust crate via UniFFI"
     workingDir = rootProject.projectDir.parentFile.parentFile
-    commandLine("./scripts/generate-uniffi-kotlin.sh")
+    commandLine("./scripts/generate-uniffi-kotlin.sh", "--features=allow_in_memory_custody")
+    // Invalidate on any Rust change under the uniffi crate so stale bindings never compile.
+    inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/uniffi/src")))
+    inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/common/src")))
+    outputs.dir(uniffiBindingsDir)
+}
+
+// Wire generation into the compile chain so `./gradlew :scp-kt:build` or `test`
+// always regenerates when Rust sources change. Without this, a developer who
+// edits the UniFFI bridge and forgets to regenerate would compile Kotlin
+// against stale bindings — every caller would silently miss any new handle-
+// affinity check or API change. (Round-2 black-hat finding.)
+tasks.matching { it.name == "compileKotlin" }.configureEach {
+    dependsOn("generateUniffiBindings")
 }
 
 publishing {
