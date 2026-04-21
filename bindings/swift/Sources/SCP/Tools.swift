@@ -64,199 +64,11 @@ public nonisolated struct ToolSessionResult: Sendable {
     }
 }
 
-// MARK: - ToolBridge
-
-/// Namespace for UniFFI bridge function references used by tool operations.
-/// Each typealias maps 1:1 to a UniFFI-generated async function. Closures are
-/// injected for testability; defaults call through to ScpBindings.
-///
-/// See ADR-026 for the flat delegation pattern and ADR-011 for tool spec.
-public enum ToolBridge {
-    /// Invoke a tool. Maps to ``toolInvoke`` in ScpBindings.
-    ///
-    /// Tool invocation flows through
-    /// `ContextManager::invoke_tool_with_economy` in the Rust runtime
-    /// (per-invocation pricing, velocity tracking, escalation, budget,
-    /// payment escrow, hard rate limit). The optional ``spendingUcan``
-    /// parameter carries a JWT-encoded ``SpendingCapability`` for paid
-    /// tool invocations under spec section 19.5 (AND-composition with
-    /// the action UCAN). See PR #1606 / C4.
-    public typealias InvokeFn = @Sendable (
-        _ handle: ContextHandle,
-        _ toolId: String,
-        _ inputJson: String,
-        _ identity: Identity,
-        _ ucanToken: String?,
-        _ proofTokens: [String]?,
-        _ spendingUcan: String?
-    ) async throws -> String
-
-    /// Register a tool. Maps to ``toolRegister`` in ScpBindings.
-    public typealias RegisterFn = @Sendable (
-        _ handle: ContextHandle,
-        _ definition: ToolDefinition
-    ) async throws -> String
-
-    /// Verify a tool. Maps to ``toolVerify`` in ScpBindings.
-    public typealias VerifyFn = @Sendable (
-        _ handle: ContextHandle,
-        _ toolId: String
-    ) async throws -> ToolVerificationResult
-
-    /// Invoke a tool across context boundaries (spec section 6.2).
-    public typealias InvokeCrossContextFn = @Sendable (
-        _ sourceHandle: ContextHandle,
-        _ targetHandle: ContextHandle,
-        _ toolId: String,
-        _ inputJson: String,
-        _ identity: Identity,
-        _ ucanToken: String,
-        _ chainDepth: UInt8,
-        _ proofTokens: [String]?
-    ) async throws -> String
-
-    /// Create a stateful tool session (spec section 6.2.1).
-    public typealias SessionCreateFn = @Sendable (
-        _ handle: ContextHandle,
-        _ toolId: String,
-        _ sourceContextId: String,
-        _ ttlSeconds: UInt64?
-    ) async throws -> String
-
-    /// Invoke a tool within an active session.
-    public typealias SessionInvokeFn = @Sendable (
-        _ handle: ContextHandle,
-        _ sessionId: String,
-        _ inputJson: String,
-        _ identity: Identity,
-        _ ucanToken: String,
-        _ proofTokens: [String]?
-    ) async throws -> String
-
-    /// Close a stateful tool session.
-    public typealias SessionCloseFn = @Sendable (
-        _ handle: ContextHandle,
-        _ sessionId: String
-    ) async throws -> Void
-
-    /// Default invoke function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/toolInvoke`` method.
-    public static let defaultInvoke: InvokeFn = { handle, toolId, inputJson, identity, ucanToken, proofTokens, spendingUcan in
-        try await Scp.defaultInstance().toolInvoke(
-            handle: handle,
-            toolId: toolId,
-            inputJson: inputJson,
-            identity: identity,
-            ucanToken: ucanToken,
-            proofTokens: proofTokens,
-            spendingUcanJwt: spendingUcan
-        )
-    }
-
-    /// Default register function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/toolRegister(handle:definition:)`` method.
-    public static let defaultRegister: RegisterFn = { handle, definition in
-        try await Scp.defaultInstance().toolRegister(handle: handle, definition: definition)
-    }
-
-    /// Default verify function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/toolVerify(handle:toolId:)`` method.
-    public static let defaultVerify: VerifyFn = { handle, toolId in
-        try await Scp.defaultInstance().toolVerify(handle: handle, toolId: toolId)
-    }
-
-    /// Default cross-context invoke function — delegates to the
-    /// process-wide default ``Scp`` instance's ``Scp/toolInvokeCrossContext``
-    /// method.
-    public static let defaultInvokeCrossContext: InvokeCrossContextFn = { sourceHandle, targetHandle, toolId, inputJson, identity, ucanToken, chainDepth, proofTokens in
-        try await Scp.defaultInstance().toolInvokeCrossContext(
-            sourceHandle: sourceHandle,
-            targetHandle: targetHandle,
-            toolId: toolId,
-            inputJson: inputJson,
-            identity: identity,
-            ucanToken: ucanToken,
-            chainDepth: chainDepth,
-            proofTokens: proofTokens
-        )
-    }
-
-    /// Default session create function — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/toolSessionCreate`` method.
-    public static let defaultSessionCreate: SessionCreateFn = { handle, toolId, sourceContextId, ttlSeconds in
-        try await Scp.defaultInstance().toolSessionCreate(
-            handle: handle,
-            toolId: toolId,
-            sourceContextId: sourceContextId,
-            ttlSeconds: ttlSeconds
-        )
-    }
-
-    /// Default session invoke function — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/toolSessionInvoke`` method.
-    public static let defaultSessionInvoke: SessionInvokeFn = { handle, sessionId, inputJson, identity, ucanToken, proofTokens in
-        try await Scp.defaultInstance().toolSessionInvoke(
-            handle: handle,
-            sessionId: sessionId,
-            inputJson: inputJson,
-            identity: identity,
-            ucanToken: ucanToken,
-            proofTokens: proofTokens
-        )
-    }
-
-    /// Default session close function — delegates to the process-wide
-    /// default ``Scp`` instance's
-    /// ``Scp/toolSessionClose(handle:sessionId:)`` method.
-    public static let defaultSessionClose: SessionCloseFn = { handle, sessionId in
-        try await Scp.defaultInstance().toolSessionClose(handle: handle, sessionId: sessionId)
-    }
-
-    /// Expose a tool interface for cross-context sharing. Maps to ``toolInterfaceExpose`` in ScpBindings.
-    public typealias InterfaceExposeFn = @Sendable (
-        _ handle: ContextHandle,
-        _ toolId: String,
-        _ targetContextId: String,
-        _ rateLimitJson: String?
-    ) async throws -> String
-
-    /// Accept a cross-context tool interface. Maps to ``toolInterfaceAccept`` in ScpBindings.
-    public typealias InterfaceAcceptFn = @Sendable (
-        _ handle: ContextHandle,
-        _ interfaceJson: String
-    ) async throws -> String
-
-    /// Revoke a cross-context tool interface. Maps to ``toolInterfaceRevoke`` in ScpBindings.
-    public typealias InterfaceRevokeFn = @Sendable (
-        _ handle: ContextHandle,
-        _ interfaceIdHex: String
-    ) async throws -> String
-
-    /// Default interface expose function — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/toolInterfaceExpose`` method.
-    public static let defaultInterfaceExpose: InterfaceExposeFn = { handle, toolId, targetContextId, rateLimitJson in
-        try await Scp.defaultInstance().toolInterfaceExpose(
-            handle: handle,
-            toolId: toolId,
-            targetContextId: targetContextId,
-            rateLimitJson: rateLimitJson
-        )
-    }
-
-    /// Default interface accept function — delegates to the process-wide
-    /// default ``Scp`` instance's
-    /// ``Scp/toolInterfaceAccept(handle:interfaceJson:)`` method.
-    public static let defaultInterfaceAccept: InterfaceAcceptFn = { handle, interfaceJson in
-        try await Scp.defaultInstance().toolInterfaceAccept(handle: handle, interfaceJson: interfaceJson)
-    }
-
-    /// Default interface revoke function — delegates to the process-wide
-    /// default ``Scp`` instance's
-    /// ``Scp/toolInterfaceRevoke(handle:interfaceIdHex:)`` method.
-    public static let defaultInterfaceRevoke: InterfaceRevokeFn = { handle, interfaceIdHex in
-        try await Scp.defaultInstance().toolInterfaceRevoke(handle: handle, interfaceIdHex: interfaceIdHex)
-    }
-}
+// Phase 4 PR 4 (ADR-048 demolition, #1549): the `ToolBridge` namespace —
+// injectable closures whose defaults called `Scp.defaultInstance()` — has
+// been deleted. Every tool operation dispatches through the ``SCP``
+// instance stored on the owning ``Context`` actor (see ``Context/scp``),
+// which matches the Kotlin SDK shape.
 
 // MARK: - Context Tool Extensions
 
@@ -291,8 +103,7 @@ public extension Context {
         ucanToken: String? = nil,
         proofTokens: [String]? = nil,
         spendingUcan: String? = nil,
-        invokerDid: String? = nil,
-        invokeFn: ToolBridge.InvokeFn = ToolBridge.defaultInvoke
+        invokerDid: String? = nil
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
             throw ScpError.Context(
@@ -306,8 +117,14 @@ public extension Context {
                 code: "SCP-TOOL-6001"
             )
         }
-        let outputJson = try await invokeFn(
-            handle, tool, inputJson, identity, ucanToken, proofTokens, spendingUcan
+        let outputJson = try await scp.toolInvoke(
+            handle: handle,
+            toolId: tool,
+            inputJson: inputJson,
+            identity: identity,
+            ucanToken: ucanToken,
+            proofTokens: proofTokens,
+            spendingUcanJwt: spendingUcan
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
@@ -333,8 +150,7 @@ public extension Context {
     /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
     /// - Story SCP-221
     func registerTool(
-        _ definition: ToolDefinition,
-        registerFn: ToolBridge.RegisterFn = ToolBridge.defaultRegister
+        _ definition: ToolDefinition
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
@@ -342,7 +158,7 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        return try await registerFn(handle, definition)
+        return try await scp.toolRegister(handle: handle, definition: definition)
     }
 
     /// Verifies a tool against its registered test vectors.
@@ -362,8 +178,7 @@ public extension Context {
     /// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
     /// - Story SCP-221
     func verifyTool(
-        _ tool: String,
-        verifyFn: ToolBridge.VerifyFn = ToolBridge.defaultVerify
+        _ tool: String
     ) async throws -> ToolVerificationResult {
         guard state == .active else {
             throw ScpError.Context(
@@ -371,7 +186,7 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        return try await verifyFn(handle, tool)
+        return try await scp.toolVerify(handle: handle, toolId: tool)
     }
 
     /// Invokes a tool registered in a different context (cross-context).
@@ -406,8 +221,7 @@ public extension Context {
         ucanToken: String,
         chainDepth: UInt8 = 0,
         proofTokens: [String]? = nil,
-        invokerDid: String? = nil,
-        invokeCrossContextFn: ToolBridge.InvokeCrossContextFn = ToolBridge.defaultInvokeCrossContext
+        invokerDid: String? = nil
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
             throw ScpError.Context(
@@ -421,9 +235,16 @@ public extension Context {
                 code: "SCP-TOOL-6001"
             )
         }
-        let targetHandle = await targetContext.handle
-        let outputJson = try await invokeCrossContextFn(
-            handle, targetHandle, tool, inputJson, identity, ucanToken, chainDepth, proofTokens
+        let targetHandle = targetContext.handle
+        let outputJson = try await scp.toolInvokeCrossContext(
+            sourceHandle: handle,
+            targetHandle: targetHandle,
+            toolId: tool,
+            inputJson: inputJson,
+            identity: identity,
+            ucanToken: ucanToken,
+            chainDepth: chainDepth,
+            proofTokens: proofTokens
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
@@ -455,8 +276,7 @@ public extension Context {
     func createToolSession(
         toolId: String,
         sourceContextId: String,
-        ttlSeconds: UInt64? = nil,
-        sessionCreateFn: ToolBridge.SessionCreateFn = ToolBridge.defaultSessionCreate
+        ttlSeconds: UInt64? = nil
     ) async throws -> ToolSessionResult {
         guard state == .active else {
             throw ScpError.Context(
@@ -464,8 +284,11 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        let sessionId = try await sessionCreateFn(
-            handle, toolId, sourceContextId, ttlSeconds
+        let sessionId = try await scp.toolSessionCreate(
+            handle: handle,
+            toolId: toolId,
+            sourceContextId: sourceContextId,
+            ttlSeconds: ttlSeconds
         )
         return ToolSessionResult(sessionId: sessionId)
     }
@@ -496,8 +319,7 @@ public extension Context {
         identity: Identity,
         ucanToken: String,
         proofTokens: [String]? = nil,
-        invokerDid: String? = nil,
-        sessionInvokeFn: ToolBridge.SessionInvokeFn = ToolBridge.defaultSessionInvoke
+        invokerDid: String? = nil
     ) async throws -> ToolInvocationResult {
         guard state == .active else {
             throw ScpError.Context(
@@ -511,8 +333,13 @@ public extension Context {
                 code: "SCP-TOOL-6001"
             )
         }
-        let outputJson = try await sessionInvokeFn(
-            handle, sessionId, inputJson, identity, ucanToken, proofTokens
+        let outputJson = try await scp.toolSessionInvoke(
+            handle: handle,
+            sessionId: sessionId,
+            inputJson: inputJson,
+            identity: identity,
+            ucanToken: ucanToken,
+            proofTokens: proofTokens
         )
         return ToolInvocationResult(
             output: Data(outputJson.utf8),
@@ -539,8 +366,7 @@ public extension Context {
     /// - Spec section 6.2.1 (Stateful Tool Sessions)
     /// - Story #322
     func closeToolSession(
-        sessionId: String,
-        sessionCloseFn: ToolBridge.SessionCloseFn = ToolBridge.defaultSessionClose
+        sessionId: String
     ) async throws {
         guard state == .active else {
             throw ScpError.Context(
@@ -548,7 +374,7 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        try await sessionCloseFn(handle, sessionId)
+        try await scp.toolSessionClose(handle: handle, sessionId: sessionId)
     }
 
     // MARK: - Bidirectional Consent Protocol (§6.2.0.1)
@@ -569,8 +395,7 @@ public extension Context {
     func exposeToolInterface(
         toolId: String,
         targetContextId: String,
-        rateLimitJson: String? = nil,
-        interfaceExposeFn: ToolBridge.InterfaceExposeFn = ToolBridge.defaultInterfaceExpose
+        rateLimitJson: String? = nil
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
@@ -578,7 +403,12 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        return try await interfaceExposeFn(handle, toolId, targetContextId, rateLimitJson)
+        return try await scp.toolInterfaceExpose(
+            handle: handle,
+            toolId: toolId,
+            targetContextId: targetContextId,
+            rateLimitJson: rateLimitJson
+        )
     }
 
     /// Accepts a cross-context tool interface (step 4).
@@ -592,8 +422,7 @@ public extension Context {
     /// - Throws: ``ScpError/Tool(msg:code:)`` if the caller is not an admin
     ///   or context mismatch.
     func acceptToolInterface(
-        interfaceJson: String,
-        interfaceAcceptFn: ToolBridge.InterfaceAcceptFn = ToolBridge.defaultInterfaceAccept
+        interfaceJson: String
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
@@ -601,7 +430,7 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        return try await interfaceAcceptFn(handle, interfaceJson)
+        return try await scp.toolInterfaceAccept(handle: handle, interfaceJson: interfaceJson)
     }
 
     /// Revokes a cross-context tool interface (step 5).
@@ -614,8 +443,7 @@ public extension Context {
     /// - Returns: The ``InterfaceRevoked`` event as a JSON string.
     /// - Throws: ``ScpError/Validation(msg:code:)`` if the hex ID is invalid.
     func revokeToolInterface(
-        interfaceIdHex: String,
-        interfaceRevokeFn: ToolBridge.InterfaceRevokeFn = ToolBridge.defaultInterfaceRevoke
+        interfaceIdHex: String
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
@@ -623,6 +451,6 @@ public extension Context {
                 code: "SCP-CTX-2001"
             )
         }
-        return try await interfaceRevokeFn(handle, interfaceIdHex)
+        return try await scp.toolInterfaceRevoke(handle: handle, interfaceIdHex: interfaceIdHex)
     }
 }

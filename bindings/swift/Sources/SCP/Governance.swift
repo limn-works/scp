@@ -66,364 +66,13 @@ public enum MemberRole: String, Sendable {
     }
 }
 
-// MARK: - ContextLifecycleBridge
-
-/// Namespace for UniFFI bridge function references used by context lifecycle
-/// operations beyond basic create/join/leave/close (drain events, TTL, export/import).
-public enum ContextLifecycleBridge {
-    /// Drain pending events from a context.
-    public typealias DrainEventsFn = @Sendable (
-        _ handle: ContextHandle
-    ) async throws -> [String]
-
-    /// Handle TTL expiry for a context.
-    public typealias HandleTtlExpiryFn = @Sendable (
-        _ handle: ContextHandle
-    ) async throws -> Void
-
-    /// Propose a TTL extension with member consent.
-    public typealias ProposeTtlExtensionFn = @Sendable (
-        _ handle: ContextHandle,
-        _ memberDid: String,
-        _ proposedSeconds: UInt64
-    ) async throws -> Bool
-
-    /// Reset the TTL timer after unanimous extension.
-    public typealias ResetTtlTimerFn = @Sendable (
-        _ handle: ContextHandle,
-        _ newSeconds: UInt64
-    ) async throws -> Void
-
-    /// Export a context's full state as serialized bytes.
-    public typealias ExportFn = @Sendable (
-        _ handle: ContextHandle
-    ) async throws -> Data
-
-    /// Import a context from serialized bytes.
-    public typealias ImportFn = @Sendable (
-        _ data: Data
-    ) async throws -> String
-
-    /// Register a DID as locally controlled.
-    public typealias RegisterLocalDidFn = @Sendable (
-        _ did: String
-    ) async throws -> Void
-
-    /// Check if a DID is registered as locally controlled.
-    public typealias IsLocalDidFn = @Sendable (
-        _ did: String
-    ) async throws -> Bool
-
-    /// Verify participation requirements via the UniFFI bridge.
-    public typealias VerifyParticipationRequirementsFn = @Sendable (
-        _ profileJson: String,
-        _ requirementsJson: String
-    ) throws -> Bool
-
-    public static let defaultDrainEvents: DrainEventsFn = { handle in
-        // Non-throwing — fall back to an empty list if the default instance
-        // cannot be resolved.
-        guard let scp = try? Scp.defaultInstance() else { return [] }
-        return await scp.contextDrainEvents(handle: handle)
-    }
-
-    public static let defaultHandleTtlExpiry: HandleTtlExpiryFn = { handle in
-        try await Scp.defaultInstance().contextHandleTtlExpiry(handle: handle)
-    }
-
-    public static let defaultProposeTtlExtension: ProposeTtlExtensionFn = { handle, memberDid, proposedSeconds in
-        try await Scp.defaultInstance().contextProposeTtlExtension(
-            handle: handle, memberDid: memberDid, proposedSeconds: proposedSeconds
-        )
-    }
-
-    public static let defaultResetTtlTimer: ResetTtlTimerFn = { handle, newSeconds in
-        // Non-throwing — silently swallow if the default instance is
-        // unavailable. Matches `contextResetTtlTimer` free-function
-        // behavior.
-        guard let scp = try? Scp.defaultInstance() else { return }
-        await scp.contextResetTtlTimer(handle: handle, newSeconds: newSeconds)
-    }
-
-    /// Default export function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/contextExport(handle:)`` method.
-    public static let defaultExport: ExportFn = { handle in
-        try await Scp.defaultInstance().contextExport(handle: handle)
-    }
-
-    /// Default import function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/contextImport(data:)`` method.
-    public static let defaultImport: ImportFn = { data in
-        try await Scp.defaultInstance().contextImport(data: data)
-    }
-
-    public static let defaultRegisterLocalDid: RegisterLocalDidFn = { did in
-        try await Scp.defaultInstance().registerLocalDid(did: did)
-    }
-
-    public static let defaultIsLocalDid: IsLocalDidFn = { did in
-        // Non-throwing — `false` on default-instance failure. Matches
-        // `isLocalDid` free-function semantics.
-        guard let scp = try? Scp.defaultInstance() else { return false }
-        return await scp.isLocalDid(did: did)
-    }
-
-    /// Default verify participation requirements function — delegates to
-    /// the process-wide default ``Scp`` instance's
-    /// ``Scp/verifyParticipationRequirements(profileJson:requirementsJson:)``
-    /// method.
-    ///
-    /// For a pure-Swift alternative using typed inputs, see
-    /// ``verifyParticipationRequirements(requirement:profile:)`` in Trust.swift.
-    public static let defaultVerifyParticipationRequirements: VerifyParticipationRequirementsFn = { profileJson, requirementsJson in
-        try Scp.defaultInstance().verifyParticipationRequirements(
-            profileJson: profileJson,
-            requirementsJson: requirementsJson
-        )
-    }
-}
-
-// MARK: - GovernanceBridge
-
-/// Namespace for UniFFI bridge function references used by governance operations.
-public enum GovernanceBridge {
-    /// Execute a governance action. Maps to ``governanceExecute`` in ScpBindings.
-    public typealias ExecuteFn = @Sendable (
-        _ handle: ContextHandle,
-        _ proposalJson: String
-    ) async throws -> String
-
-    /// Propose a governance action for voting (#621).
-    public typealias ProposeFn = @Sendable (
-        _ handle: ContextHandle,
-        _ proposerDid: String,
-        _ actionJson: String
-    ) async throws -> String
-
-    /// Approve a pending governance proposal (#621).
-    public typealias ApproveFn = @Sendable (
-        _ handle: ContextHandle,
-        _ voterDid: String,
-        _ proposalIdHex: String
-    ) async throws -> String
-
-    /// Reject a pending governance proposal (#621).
-    public typealias RejectFn = @Sendable (
-        _ handle: ContextHandle,
-        _ voterDid: String,
-        _ proposalIdHex: String
-    ) async throws -> String
-
-    /// Withdraw a vote on a pending governance proposal (#621).
-    public typealias WithdrawFn = @Sendable (
-        _ handle: ContextHandle,
-        _ voterDid: String,
-        _ proposalIdHex: String
-    ) async throws -> String
-
-    /// Default execute function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/governanceExecute`` method.
-    public static let defaultExecute: ExecuteFn = { handle, proposalJson in
-        try await Scp.defaultInstance().governanceExecute(handle: handle, proposalJson: proposalJson)
-    }
-
-    /// Default propose function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/governancePropose`` method.
-    public static let defaultPropose: ProposeFn = { handle, proposerDid, actionJson in
-        try await Scp.defaultInstance().governancePropose(
-            handle: handle, proposerDid: proposerDid, actionJson: actionJson
-        )
-    }
-
-    /// Default approve function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/governanceApprove`` method.
-    public static let defaultApprove: ApproveFn = { handle, voterDid, proposalIdHex in
-        try await Scp.defaultInstance().governanceApprove(
-            handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex
-        )
-    }
-
-    /// Default reject function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/governanceReject`` method.
-    public static let defaultReject: RejectFn = { handle, voterDid, proposalIdHex in
-        try await Scp.defaultInstance().governanceReject(
-            handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex
-        )
-    }
-
-    /// Default withdraw function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/governanceWithdraw`` method.
-    public static let defaultWithdraw: WithdrawFn = { handle, voterDid, proposalIdHex in
-        try await Scp.defaultInstance().governanceWithdraw(
-            handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex
-        )
-    }
-
-    /// Retrieve a single governance proposal by hex-encoded ID (#621).
-    public typealias GetProposalFn = @Sendable (
-        _ handle: ContextHandle,
-        _ proposalIdHex: String
-    ) async throws -> String
-
-    /// List all governance proposals for a context (#621).
-    public typealias ListProposalsFn = @Sendable (
-        _ handle: ContextHandle
-    ) async throws -> String
-
-    /// Default get proposal function — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/governanceGetProposal`` method.
-    public static let defaultGetProposal: GetProposalFn = { handle, proposalIdHex in
-        try await Scp.defaultInstance().governanceGetProposal(
-            handle: handle, proposalIdHex: proposalIdHex
-        )
-    }
-
-    /// Default list proposals function — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/governanceListProposals`` method.
-    public static let defaultListProposals: ListProposalsFn = { handle in
-        try await Scp.defaultInstance().governanceListProposals(handle: handle)
-    }
-
-    /// Apply a pending ceiling modification (#559).
-    public typealias ApplyPendingCeilingModificationFn = @Sendable (
-        _ handle: ContextHandle,
-        _ currentTimestamp: UInt64
-    ) async throws -> Bool
-
-    /// Finalize the cooperative close flow (#559).
-    public typealias FinalizeCloseFn = @Sendable (
-        _ handle: ContextHandle
-    ) async throws -> Void
-
-    /// Create a governance checkpoint (#559).
-    public typealias CreateGovernanceCheckpointFn = @Sendable (
-        _ handle: ContextHandle,
-        _ checkpointSeq: UInt64,
-        _ merkleRootHex: String,
-        _ eventCount: UInt64,
-        _ lastEventHashHex: String,
-        _ stateSnapshotHashHex: String,
-        _ creatorDid: String,
-        _ creatorSignatureHex: String
-    ) async throws -> String
-
-    /// Add a cosignature to a checkpoint (#559).
-    public typealias AddCheckpointCosignatureFn = @Sendable (
-        _ handle: ContextHandle,
-        _ checkpointJson: String,
-        _ signerDid: String,
-        _ signatureHex: String
-    ) async throws -> String
-
-    /// Restore a single persisted context (#559).
-    public typealias RestoreContextFn = @Sendable (
-        _ contextId: String
-    ) async throws -> Void
-
-    /// Restore all persisted contexts (#559).
-    public typealias RestoreAllContextsFn = @Sendable () async throws -> String
-
-    /// Default apply pending ceiling modification function — delegates to
-    /// the process-wide default ``Scp`` instance's
-    /// ``Scp/applyPendingCeilingModification`` method.
-    public static let defaultApplyPendingCeilingModification:
-        ApplyPendingCeilingModificationFn = { handle, currentTimestamp in
-            try await Scp.defaultInstance().applyPendingCeilingModification(
-                handle: handle, currentTimestamp: currentTimestamp
-            )
-        }
-
-    /// Default finalize close function — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/finalizeClose(handle:)`` method.
-    public static let defaultFinalizeClose: FinalizeCloseFn = { handle in
-        try await Scp.defaultInstance().finalizeClose(handle: handle)
-    }
-
-    /// Default create governance checkpoint function — delegates to the
-    /// process-wide default ``Scp`` instance's
-    /// ``Scp/createGovernanceCheckpoint`` method.
-    public static let defaultCreateGovernanceCheckpoint:
-        CreateGovernanceCheckpointFn = { handle, checkpointSeq, merkleRootHex, eventCount, lastEventHashHex, stateSnapshotHashHex, creatorDid, creatorSignatureHex in
-            try await Scp.defaultInstance().createGovernanceCheckpoint(
-                handle: handle,
-                checkpointSeq: checkpointSeq,
-                merkleRootHex: merkleRootHex,
-                eventCount: eventCount,
-                lastEventHashHex: lastEventHashHex,
-                stateSnapshotHashHex: stateSnapshotHashHex,
-                creatorDid: creatorDid,
-                creatorSignatureHex: creatorSignatureHex
-            )
-        }
-
-    /// Default add checkpoint cosignature function — delegates to the
-    /// process-wide default ``Scp`` instance's
-    /// ``Scp/addCheckpointCosignature`` method.
-    public static let defaultAddCheckpointCosignature:
-        AddCheckpointCosignatureFn = { handle, checkpointJson, signerDid, signatureHex in
-            try await Scp.defaultInstance().addCheckpointCosignature(
-                handle: handle,
-                checkpointJson: checkpointJson,
-                signerDid: signerDid,
-                signatureHex: signatureHex
-            )
-        }
-
-    /// Default restore context function — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/restoreContext(contextId:)`` method.
-    public static let defaultRestoreContext: RestoreContextFn = { contextId in
-        try await Scp.defaultInstance().restoreContext(contextId: contextId)
-    }
-
-    /// Default restore all contexts function — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/restoreAllContexts()`` method.
-    public static let defaultRestoreAllContexts: RestoreAllContextsFn = {
-        try await Scp.defaultInstance().restoreAllContexts()
-    }
-}
-
-// MARK: - MembershipBridge
-
-/// Namespace for UniFFI bridge function references used by membership queries.
-public enum MembershipBridge {
-    /// Return the member count for a context.
-    public typealias MemberCountFn = @Sendable (
-        _ handle: ContextHandle
-    ) async throws -> UInt64?
-
-    /// Check whether a DID is a member.
-    public typealias IsMemberFn = @Sendable (
-        _ handle: ContextHandle,
-        _ did: String
-    ) async throws -> Bool
-
-    /// Return all member DIDs.
-    public typealias MemberDidsFn = @Sendable (
-        _ handle: ContextHandle
-    ) async throws -> [String]
-
-    /// Return a member's role.
-    public typealias MemberRoleFn = @Sendable (
-        _ handle: ContextHandle,
-        _ did: String
-    ) async throws -> String?
-
-    public static let defaultMemberCount: MemberCountFn = { handle in
-        try await Scp.defaultInstance().contextMemberCount(handle: handle)
-    }
-
-    public static let defaultIsMember: IsMemberFn = { handle, did in
-        try await Scp.defaultInstance().contextIsMember(handle: handle, did: did)
-    }
-
-    public static let defaultMemberDids: MemberDidsFn = { handle in
-        try await Scp.defaultInstance().contextMemberDids(handle: handle)
-    }
-
-    public static let defaultMemberRole: MemberRoleFn = { handle, did in
-        try await Scp.defaultInstance().contextMemberRole(handle: handle, did: did)
-    }
-}
+// Phase 4 PR 4 (ADR-048 demolition, #1549): the bridge-closure namespaces
+// `ContextLifecycleBridge`, `GovernanceBridge`, `MembershipBridge`, and
+// `BroadcastBridge` — whose defaults called `Scp.defaultInstance()` — have
+// been deleted. Every governance, membership, lifecycle, and broadcast
+// operation dispatches through the ``SCP`` instance stored on the owning
+// ``Context`` actor (see ``Context/scp``). This matches the Kotlin SDK
+// shape and removes the implicit process-wide façade that ADR-048 demolishes.
 
 // MARK: - Client-side Validation (SCP-297, spec §18.11.9)
 
@@ -624,139 +273,6 @@ func validateDeployId(_ deployId: String) throws {
     }
 }
 
-// MARK: - BroadcastBridge
-
-/// Namespace for UniFFI bridge function references used by broadcast operations.
-public enum BroadcastBridge {
-    public typealias SubscribeFn = @Sendable (
-        _ handle: ContextHandle,
-        _ subscriberDid: String
-    ) async throws -> Void
-
-    public typealias UnsubscribeFn = @Sendable (
-        _ handle: ContextHandle,
-        _ subscriberDid: String,
-        _ rotateKeys: Bool
-    ) async throws -> Void
-
-    public typealias PublishFn = @Sendable (
-        _ handle: ContextHandle,
-        _ identity: Identity,
-        _ payload: Data
-    ) async throws -> Void
-
-    public typealias BlockSubscriberFn = @Sendable (
-        _ handle: ContextHandle,
-        _ subscriberDid: String,
-        _ blockerDid: String
-    ) async throws -> Void
-
-    public typealias UnblockSubscriberFn = @Sendable (
-        _ handle: ContextHandle,
-        _ subscriberDid: String,
-        _ unblockerDid: String
-    ) async throws -> Void
-
-    public typealias HandleKeyRequestFn = @Sendable (
-        _ handle: ContextHandle,
-        _ authorDid: String,
-        _ requesterDid: String
-    ) async throws -> String
-
-    public typealias SubscriberCountFn = @Sendable (
-        _ handle: ContextHandle
-    ) async throws -> UInt64?
-
-    public typealias IsSubscriberFn = @Sendable (
-        _ handle: ContextHandle,
-        _ did: String
-    ) async throws -> Bool
-
-    public typealias AdmissionFn = @Sendable (
-        _ handle: ContextHandle
-    ) async throws -> String?
-
-    /// Publish a single asset to a broadcast context (SCP-290).
-    public typealias PublishAssetFn = @Sendable (
-        _ handle: ContextHandle,
-        _ identity: Identity,
-        _ asset: AssetEntry,
-        _ deployId: String?
-    ) async throws -> PublishResult
-
-    /// Publish multiple assets to a broadcast context (SCP-290).
-    public typealias PublishAssetsFn = @Sendable (
-        _ handle: ContextHandle,
-        _ identity: Identity,
-        _ assets: [AssetEntry],
-        _ deployId: String?
-    ) async throws -> BatchPublishResult
-
-    public static let defaultSubscribe: SubscribeFn = { handle, subscriberDid in
-        try await Scp.defaultInstance().broadcastSubscribe(handle: handle, subscriberDid: subscriberDid)
-    }
-
-    public static let defaultUnsubscribe: UnsubscribeFn = { handle, subscriberDid, rotateKeys in
-        try await Scp.defaultInstance().broadcastUnsubscribe(
-            handle: handle, subscriberDid: subscriberDid, rotateKeys: rotateKeys
-        )
-    }
-
-    public static let defaultPublish: PublishFn = { handle, identity, payload in
-        try await Scp.defaultInstance().broadcastPublish(
-            handle: handle, identity: identity, payload: payload
-        )
-    }
-
-    public static let defaultBlockSubscriber: BlockSubscriberFn = { handle, subscriberDid, blockerDid in
-        try await Scp.defaultInstance().broadcastBlockSubscriber(
-            handle: handle, subscriberDid: subscriberDid, blockerDid: blockerDid
-        )
-    }
-
-    public static let defaultUnblockSubscriber: UnblockSubscriberFn = { handle, subscriberDid, unblockerDid in
-        try await Scp.defaultInstance().broadcastUnblockSubscriber(
-            handle: handle, subscriberDid: subscriberDid, unblockerDid: unblockerDid
-        )
-    }
-
-    public static let defaultHandleKeyRequest: HandleKeyRequestFn = { handle, authorDid, requesterDid in
-        try await Scp.defaultInstance().broadcastHandleKeyRequest(
-            handle: handle, authorDid: authorDid, requesterDid: requesterDid
-        )
-    }
-
-    public static let defaultSubscriberCount: SubscriberCountFn = { handle in
-        try await Scp.defaultInstance().broadcastSubscriberCount(handle: handle)
-    }
-
-    public static let defaultIsSubscriber: IsSubscriberFn = { handle, did in
-        try await Scp.defaultInstance().broadcastIsSubscriber(handle: handle, did: did)
-    }
-
-    public static let defaultAdmission: AdmissionFn = { handle in
-        try await Scp.defaultInstance().broadcastAdmission(handle: handle)
-    }
-
-    /// Default publish asset function — delegates to the process-wide
-    /// default ``Scp`` instance's
-    /// ``Scp/broadcastPublishAsset(handle:identity:asset:deployId:)`` method.
-    public static let defaultPublishAsset: PublishAssetFn = { handle, identity, asset, deployId in
-        try await Scp.defaultInstance().broadcastPublishAsset(
-            handle: handle, identity: identity, asset: asset, deployId: deployId
-        )
-    }
-
-    /// Default publish assets function — delegates to the process-wide
-    /// default ``Scp`` instance's
-    /// ``Scp/broadcastPublishAssets(handle:identity:assets:deployId:)`` method.
-    public static let defaultPublishAssets: PublishAssetsFn = { handle, identity, assets, deployId in
-        try await Scp.defaultInstance().broadcastPublishAssets(
-            handle: handle, identity: identity, assets: assets, deployId: deployId
-        )
-    }
-}
-
 // MARK: - Context Governance Extensions
 
 public extension Context {
@@ -771,8 +287,7 @@ public extension Context {
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
     ///   active or governance execution fails.
     func executeGovernanceAction(
-        proposalJson: String,
-        executeFn: GovernanceBridge.ExecuteFn = GovernanceBridge.defaultExecute
+        proposalJson: String
     ) async throws -> GovernanceActionResult {
         guard state == .active else {
             throw ScpError.Context(
@@ -781,7 +296,7 @@ public extension Context {
             )
         }
 
-        let raw = try await executeFn(handle, proposalJson)
+        let raw = try await scp.governanceExecute(handle: handle, proposalJson: proposalJson)
         return GovernanceActionResult(rawValue: raw) ?? .executed
     }
 }
@@ -804,8 +319,7 @@ public extension Context {
     ///   active or the proposal fails.
     func proposeGovernanceAction(
         actionJson: String,
-        proposerDid: String,
-        proposeFn: GovernanceBridge.ProposeFn = GovernanceBridge.defaultPropose
+        proposerDid: String
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
@@ -814,7 +328,9 @@ public extension Context {
             )
         }
 
-        return try await proposeFn(handle, proposerDid, actionJson)
+        return try await scp.governancePropose(
+            handle: handle, proposerDid: proposerDid, actionJson: actionJson
+        )
     }
 
     /// Casts an approval vote on a pending governance proposal.
@@ -829,8 +345,7 @@ public extension Context {
     /// - Throws: ``ScpError/Context(msg:code:)`` if the vote fails.
     func approveGovernanceProposal(
         proposalIdHex: String,
-        voterDid: String,
-        approveFn: GovernanceBridge.ApproveFn = GovernanceBridge.defaultApprove
+        voterDid: String
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
@@ -839,7 +354,9 @@ public extension Context {
             )
         }
 
-        return try await approveFn(handle, voterDid, proposalIdHex)
+        return try await scp.governanceApprove(
+            handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex
+        )
     }
 
     /// Casts a rejection vote on a pending governance proposal.
@@ -852,8 +369,7 @@ public extension Context {
     /// - Throws: ``ScpError/Context(msg:code:)`` if the vote fails.
     func rejectGovernanceProposal(
         proposalIdHex: String,
-        voterDid: String,
-        rejectFn: GovernanceBridge.RejectFn = GovernanceBridge.defaultReject
+        voterDid: String
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
@@ -862,7 +378,9 @@ public extension Context {
             )
         }
 
-        return try await rejectFn(handle, voterDid, proposalIdHex)
+        return try await scp.governanceReject(
+            handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex
+        )
     }
 
     /// Withdraws a previously cast vote on a pending governance proposal.
@@ -875,8 +393,7 @@ public extension Context {
     /// - Throws: ``ScpError/Context(msg:code:)`` if the withdrawal fails.
     func withdrawGovernanceVote(
         proposalIdHex: String,
-        voterDid: String,
-        withdrawFn: GovernanceBridge.WithdrawFn = GovernanceBridge.defaultWithdraw
+        voterDid: String
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
@@ -885,7 +402,9 @@ public extension Context {
             )
         }
 
-        return try await withdrawFn(handle, voterDid, proposalIdHex)
+        return try await scp.governanceWithdraw(
+            handle: handle, voterDid: voterDid, proposalIdHex: proposalIdHex
+        )
     }
 
     /// Retrieves a governance proposal by hex-encoded ID.
@@ -896,8 +415,7 @@ public extension Context {
     /// - Returns: JSON string with proposal details.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the proposal is not found.
     func getGovernanceProposal(
-        proposalIdHex: String,
-        getProposalFn: GovernanceBridge.GetProposalFn = GovernanceBridge.defaultGetProposal
+        proposalIdHex: String
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
@@ -906,7 +424,7 @@ public extension Context {
             )
         }
 
-        return try await getProposalFn(handle, proposalIdHex)
+        return try await scp.governanceGetProposal(handle: handle, proposalIdHex: proposalIdHex)
     }
 
     /// Lists all governance proposals for this context.
@@ -914,9 +432,7 @@ public extension Context {
     /// - Parameter listProposalsFn: Bridge function override for testing.
     /// - Returns: JSON array of proposals.
     /// - Throws: ``ScpError/Context(msg:code:)`` if listing fails.
-    func listGovernanceProposals(
-        listProposalsFn: GovernanceBridge.ListProposalsFn = GovernanceBridge.defaultListProposals
-    ) async throws -> String {
+    func listGovernanceProposals() async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
                 msg: "Context is not active",
@@ -924,7 +440,7 @@ public extension Context {
             )
         }
 
-        return try await listProposalsFn(handle)
+        return try await scp.governanceListProposals(handle: handle)
     }
 }
 
@@ -936,14 +452,12 @@ public extension Context {
     /// - Parameter memberCountFn: Bridge function override for testing.
     /// - Returns: The member count, or `nil` if the context is not registered.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
-    func memberCount(
-        memberCountFn: MembershipBridge.MemberCountFn = MembershipBridge.defaultMemberCount
-    ) async throws -> UInt64? {
+    func memberCount() async throws -> UInt64? {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        return try await memberCountFn(handle)
+        return await scp.contextMemberCount(handle: handle)
     }
 
     /// Checks whether a DID is a member of this context.
@@ -954,14 +468,13 @@ public extension Context {
     /// - Returns: `true` if the DID is a member.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func isMember(
-        did: String,
-        isMemberFn: MembershipBridge.IsMemberFn = MembershipBridge.defaultIsMember
+        did: String
     ) async throws -> Bool {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        return try await isMemberFn(handle, did)
+        return await scp.contextIsMember(handle: handle, did: did)
     }
 
     /// Returns all member DIDs in this context.
@@ -969,14 +482,12 @@ public extension Context {
     /// - Parameter memberDidsFn: Bridge function override for testing.
     /// - Returns: An array of DID strings.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
-    func memberDids(
-        memberDidsFn: MembershipBridge.MemberDidsFn = MembershipBridge.defaultMemberDids
-    ) async throws -> [String] {
+    func memberDids() async throws -> [String] {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        return try await memberDidsFn(handle)
+        return await scp.contextMemberDids(handle: handle)
     }
 
     /// Returns the role of a member in this context.
@@ -987,14 +498,13 @@ public extension Context {
     /// - Returns: A ``MemberRole``, or `nil` if the member is not found.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func memberRole(
-        did: String,
-        memberRoleFn: MembershipBridge.MemberRoleFn = MembershipBridge.defaultMemberRole
+        did: String
     ) async throws -> MemberRole? {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        guard let raw = try await memberRoleFn(handle, did) else {
+        guard let raw = await scp.contextMemberRole(handle: handle, did: did) else {
             return nil
         }
         return MemberRole.fromBridge(raw)
@@ -1012,14 +522,13 @@ public extension Context {
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
     ///   active or not a broadcast context.
     func broadcastSubscribe(
-        subscriberDid: String,
-        subscribeFn: BroadcastBridge.SubscribeFn = BroadcastBridge.defaultSubscribe
+        subscriberDid: String
     ) async throws {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        try await subscribeFn(handle, subscriberDid)
+        try await scp.broadcastSubscribe(handle: handle, subscriberDid: subscriberDid)
     }
 
     /// Unsubscribes a DID from this broadcast context.
@@ -1032,14 +541,15 @@ public extension Context {
     ///   active or not a broadcast context.
     func broadcastUnsubscribe(
         subscriberDid: String,
-        rotateKeys: Bool = false,
-        unsubscribeFn: BroadcastBridge.UnsubscribeFn = BroadcastBridge.defaultUnsubscribe
+        rotateKeys: Bool = false
     ) async throws {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        try await unsubscribeFn(handle, subscriberDid, rotateKeys)
+        try await scp.broadcastUnsubscribe(
+            handle: handle, subscriberDid: subscriberDid, rotateKeys: rotateKeys
+        )
     }
 
     /// Publishes a message to this broadcast context.
@@ -1052,14 +562,13 @@ public extension Context {
     ///   active or not a broadcast context.
     func broadcastPublish(
         identity: Identity,
-        payload: Data,
-        publishFn: BroadcastBridge.PublishFn = BroadcastBridge.defaultPublish
+        payload: Data
     ) async throws {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        try await publishFn(handle, identity, payload)
+        try await scp.broadcastPublish(handle: handle, identity: identity, payload: payload)
     }
 
     /// Blocks a subscriber's read access in this broadcast context.
@@ -1071,15 +580,15 @@ public extension Context {
     /// - Throws: ``ScpError/Context(msg:code:)`` if the operation fails.
     func broadcastBlockSubscriber(
         subscriberDid: String,
-        blockerDid: String,
-        blockSubscriberFn: BroadcastBridge.BlockSubscriberFn =
-            BroadcastBridge.defaultBlockSubscriber
+        blockerDid: String
     ) async throws {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        try await blockSubscriberFn(handle, subscriberDid, blockerDid)
+        try await scp.broadcastBlockSubscriber(
+            handle: handle, subscriberDid: subscriberDid, blockerDid: blockerDid
+        )
     }
 
     /// Unblocks a previously blocked subscriber in this broadcast context (§9.16.8).
@@ -1094,15 +603,15 @@ public extension Context {
     /// - Throws: ``ScpError/Context(msg:code:)`` if the operation fails.
     func broadcastUnblockSubscriber(
         subscriberDid: String,
-        unblockerDid: String,
-        unblockSubscriberFn: BroadcastBridge.UnblockSubscriberFn =
-            BroadcastBridge.defaultUnblockSubscriber
+        unblockerDid: String
     ) async throws {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        try await unblockSubscriberFn(handle, subscriberDid, unblockerDid)
+        try await scp.broadcastUnblockSubscriber(
+            handle: handle, subscriberDid: subscriberDid, unblockerDid: unblockerDid
+        )
     }
 
     /// Handles a broadcast key request from a subscriber.
@@ -1115,15 +624,15 @@ public extension Context {
     /// - Throws: ``ScpError/Context(msg:code:)`` if the operation fails.
     func broadcastHandleKeyRequest(
         authorDid: String,
-        requesterDid: String,
-        handleKeyRequestFn: BroadcastBridge.HandleKeyRequestFn =
-            BroadcastBridge.defaultHandleKeyRequest
+        requesterDid: String
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        return try await handleKeyRequestFn(handle, authorDid, requesterDid)
+        return try await scp.broadcastHandleKeyRequest(
+            handle: handle, authorDid: authorDid, requesterDid: requesterDid
+        )
     }
 
     /// Returns the number of broadcast subscribers for this context.
@@ -1131,15 +640,12 @@ public extension Context {
     /// - Parameter subscriberCountFn: Bridge function override for testing.
     /// - Returns: The subscriber count, or `nil` if not a broadcast context.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
-    func broadcastSubscriberCount(
-        subscriberCountFn: BroadcastBridge.SubscriberCountFn =
-            BroadcastBridge.defaultSubscriberCount
-    ) async throws -> UInt64? {
+    func broadcastSubscriberCount() async throws -> UInt64? {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        return try await subscriberCountFn(handle)
+        return await scp.broadcastSubscriberCount(handle: handle)
     }
 
     /// Checks whether a DID is a broadcast subscriber.
@@ -1150,14 +656,13 @@ public extension Context {
     /// - Returns: `true` if the DID is a subscriber.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func broadcastIsSubscriber(
-        did: String,
-        isSubscriberFn: BroadcastBridge.IsSubscriberFn = BroadcastBridge.defaultIsSubscriber
+        did: String
     ) async throws -> Bool {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        return try await isSubscriberFn(handle, did)
+        return await scp.broadcastIsSubscriber(handle: handle, did: did)
     }
 
     /// Returns the broadcast admission policy for this context.
@@ -1165,14 +670,12 @@ public extension Context {
     /// - Parameter admissionFn: Bridge function override for testing.
     /// - Returns: The policy (`"Open"` or `"Gated"`), or `nil` if not broadcast.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
-    func broadcastAdmission(
-        admissionFn: BroadcastBridge.AdmissionFn = BroadcastBridge.defaultAdmission
-    ) async throws -> String? {
+    func broadcastAdmission() async throws -> String? {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        return try await admissionFn(handle)
+        return await scp.broadcastAdmission(handle: handle)
     }
 
     /// Publishes a single asset to this broadcast context as structured content (SCP-290).
@@ -1192,8 +695,7 @@ public extension Context {
     func broadcastPublishAsset(
         asset: AssetEntry,
         identity: Identity? = nil,
-        deployId: String? = nil,
-        publishAssetFn: BroadcastBridge.PublishAssetFn = BroadcastBridge.defaultPublishAsset
+        deployId: String? = nil
     ) async throws -> PublishResult {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
@@ -1207,7 +709,9 @@ public extension Context {
         }
 
         let resolvedIdentity = identity ?? self.identity
-        return try await publishAssetFn(handle, resolvedIdentity, asset, deployId)
+        return try await scp.broadcastPublishAsset(
+            handle: handle, identity: resolvedIdentity, asset: asset, deployId: deployId
+        )
     }
 
     /// Publishes multiple assets to this broadcast context as structured content (SCP-290).
@@ -1228,8 +732,7 @@ public extension Context {
     func broadcastPublishAssets(
         assets: [AssetEntry],
         identity: Identity? = nil,
-        deployId: String? = nil,
-        publishAssetsFn: BroadcastBridge.PublishAssetsFn = BroadcastBridge.defaultPublishAssets
+        deployId: String? = nil
     ) async throws -> BatchPublishResult {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
@@ -1245,7 +748,9 @@ public extension Context {
         }
 
         let resolvedIdentity = identity ?? self.identity
-        return try await publishAssetsFn(handle, resolvedIdentity, assets, deployId)
+        return try await scp.broadcastPublishAssets(
+            handle: handle, identity: resolvedIdentity, assets: assets, deployId: deployId
+        )
     }
 }
 
@@ -1260,15 +765,12 @@ public extension Context {
     /// - Parameter drainEventsFn: Bridge function override for testing.
     /// - Returns: An array of event description strings.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
-    func drainEvents(
-        drainEventsFn: ContextLifecycleBridge.DrainEventsFn =
-            ContextLifecycleBridge.defaultDrainEvents
-    ) async throws -> [String] {
+    func drainEvents() async throws -> [String] {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        return try await drainEventsFn(handle)
+        return await scp.contextDrainEvents(handle: handle)
     }
 
     /// Handles TTL expiry for this context.
@@ -1278,15 +780,12 @@ public extension Context {
     ///
     /// - Parameter handleTtlExpiryFn: Bridge function override for testing.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
-    func handleTtlExpiry(
-        handleTtlExpiryFn: ContextLifecycleBridge.HandleTtlExpiryFn =
-            ContextLifecycleBridge.defaultHandleTtlExpiry
-    ) async throws {
+    func handleTtlExpiry() async throws {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        try await handleTtlExpiryFn(handle)
+        try await scp.contextHandleTtlExpiry(handle: handle)
         state = .expired
     }
 
@@ -1305,15 +804,15 @@ public extension Context {
     ///   active or the member is not found.
     func proposeTtlExtension(
         memberDid: String,
-        proposedSeconds: UInt64,
-        proposeTtlExtensionFn: ContextLifecycleBridge.ProposeTtlExtensionFn =
-            ContextLifecycleBridge.defaultProposeTtlExtension
+        proposedSeconds: UInt64
     ) async throws -> Bool {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        return try await proposeTtlExtensionFn(handle, memberDid, proposedSeconds)
+        return try await scp.contextProposeTtlExtension(
+            handle: handle, memberDid: memberDid, proposedSeconds: proposedSeconds
+        )
     }
 
     /// Resets the TTL timer after a successful unanimous extension.
@@ -1327,15 +826,13 @@ public extension Context {
     ///   - resetTtlTimerFn: Bridge function override for testing.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not active.
     func resetTtlTimer(
-        newSeconds: UInt64,
-        resetTtlTimerFn: ContextLifecycleBridge.ResetTtlTimerFn =
-            ContextLifecycleBridge.defaultResetTtlTimer
+        newSeconds: UInt64
     ) async throws {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        try await resetTtlTimerFn(handle, newSeconds)
+        await scp.contextResetTtlTimer(handle: handle, newSeconds: newSeconds)
     }
 
     /// Exports this context's full state as serialized bytes.
@@ -1347,14 +844,12 @@ public extension Context {
     /// - Parameter exportFn: Bridge function override for testing.
     /// - Returns: The serialized context state as `Data`.
     /// - Throws: ``ScpError/Context(msg:code:)`` if export fails.
-    func exportContext(
-        exportFn: ContextLifecycleBridge.ExportFn = ContextLifecycleBridge.defaultExport
-    ) async throws -> Data {
+    func exportContext() async throws -> Data {
         guard state == .active else {
             throw ScpError.Context(msg: "Context is not active", code: "SCP-CTX-2001")
         }
 
-        return try await exportFn(handle)
+        return try await scp.contextExport(handle: handle)
     }
 }
 
@@ -1373,9 +868,7 @@ public extension Context {
     /// - Returns: `true` if the modification was applied, `false` otherwise.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the operation fails.
     func applyPendingCeilingModification(
-        currentTimestamp: UInt64,
-        applyFn: GovernanceBridge.ApplyPendingCeilingModificationFn =
-            GovernanceBridge.defaultApplyPendingCeilingModification
+        currentTimestamp: UInt64
     ) async throws -> Bool {
         guard state == .active else {
             throw ScpError.Context(
@@ -1383,7 +876,9 @@ public extension Context {
                 code: "SCP-CTX-2060"
             )
         }
-        return try await applyFn(handle, currentTimestamp)
+        return try await scp.applyPendingCeilingModification(
+            handle: handle, currentTimestamp: currentTimestamp
+        )
     }
 
     /// Finalizes the cooperative close flow for a context in ``Closing`` state.
@@ -1391,11 +886,8 @@ public extension Context {
     /// - Parameters:
     ///   - finalizeFn: Bridge function override for testing.
     /// - Throws: ``ScpError/Context(msg:code:)`` if not in Closing state.
-    func finalizeClose(
-        finalizeFn: GovernanceBridge.FinalizeCloseFn =
-            GovernanceBridge.defaultFinalizeClose
-    ) async throws {
-        try await finalizeFn(handle)
+    func finalizeClose() async throws {
+        try await scp.finalizeClose(handle: handle)
     }
 
     /// Creates a governance checkpoint (ADR-031 section 9).
@@ -1418,9 +910,7 @@ public extension Context {
         lastEventHashHex: String,
         stateSnapshotHashHex: String,
         creatorDid: String,
-        creatorSignatureHex: String,
-        createFn: GovernanceBridge.CreateGovernanceCheckpointFn =
-            GovernanceBridge.defaultCreateGovernanceCheckpoint
+        creatorSignatureHex: String
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
@@ -1428,10 +918,15 @@ public extension Context {
                 code: "SCP-CTX-2062"
             )
         }
-        return try await createFn(
-            handle, checkpointSeq, merkleRootHex, eventCount,
-            lastEventHashHex, stateSnapshotHashHex, creatorDid,
-            creatorSignatureHex
+        return try await scp.createGovernanceCheckpoint(
+            handle: handle,
+            checkpointSeq: checkpointSeq,
+            merkleRootHex: merkleRootHex,
+            eventCount: eventCount,
+            lastEventHashHex: lastEventHashHex,
+            stateSnapshotHashHex: stateSnapshotHashHex,
+            creatorDid: creatorDid,
+            creatorSignatureHex: creatorSignatureHex
         )
     }
 
@@ -1447,9 +942,7 @@ public extension Context {
     func addCheckpointCosignature(
         checkpointJson: String,
         signerDid: String,
-        signatureHex: String,
-        addFn: GovernanceBridge.AddCheckpointCosignatureFn =
-            GovernanceBridge.defaultAddCheckpointCosignature
+        signatureHex: String
     ) async throws -> String {
         guard state == .active else {
             throw ScpError.Context(
@@ -1457,7 +950,12 @@ public extension Context {
                 code: "SCP-CTX-2063"
             )
         }
-        return try await addFn(handle, checkpointJson, signerDid, signatureHex)
+        return try await scp.addCheckpointCosignature(
+            handle: handle,
+            checkpointJson: checkpointJson,
+            signerDid: signerDid,
+            signatureHex: signatureHex
+        )
     }
 }
 

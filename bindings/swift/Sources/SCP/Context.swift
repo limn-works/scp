@@ -6,114 +6,12 @@ import Foundation
 // UniFFI ContextHandleProtocol: contextId() -> String, creatorDid() -> String, state() throws -> String
 // UniFFI MessageListener: onMessage(message:), onError(error:), onComplete()
 
-// MARK: - ContextBridge (UniFFI function stubs)
-
-/// Namespace for UniFFI bridge function stubs. Each function maps 1:1 to a Rust
-/// FFI export. These will be replaced by auto-generated free functions in
-/// ``ScpBindings`` when the XCFramework is built (SCP-103).
-///
-/// See ADR-021 for the bridge function surface and ADR-026 for the delegation
-/// pattern (every Swift SDK method calls exactly one bridge function).
-public enum ContextBridge {
-    /// The closure type for context creation. Injected for testability.
-    ///
-    /// Matches the UniFFI `contextCreate(identity:params:)` bridge function.
-    /// Takes the creating identity and context parameters, returns a handle.
-    public typealias CreateFn = @Sendable (
-        _ identity: Identity,
-        _ params: ContextParams
-    ) async throws -> any ContextHandleProtocol
-
-    /// Default create function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/contextCreate(identity:params:)`` method
-    /// (ADR-048 method migration).
-    public static let defaultCreate: CreateFn = { identity, params in
-        try await Scp.defaultInstance().contextCreate(identity: identity, params: params)
-    }
-
-    /// The closure type for sending a message. Injected for testability.
-    public typealias SendFn = @Sendable (
-        _ handle: ContextHandle,
-        _ identity: Identity,
-        _ payload: Data,
-        _ spendingUcanJwt: String?
-    ) async throws -> Void
-
-    /// The closure type for subscribing to messages. Injected for testability.
-    public typealias SubscribeFn = @Sendable (
-        _ handle: ContextHandle,
-        _ listener: any MessageListener
-    ) -> Void
-
-    /// The closure type for leaving a context. Injected for testability.
-    public typealias LeaveFn = @Sendable (
-        _ handle: ContextHandle,
-        _ identity: Identity
-    ) async throws -> Void
-
-    /// The closure type for closing a context. Injected for testability.
-    public typealias CloseFn = @Sendable (
-        _ handle: ContextHandle,
-        _ identity: Identity
-    ) async throws -> Void
-
-    /// The closure type for joining an existing context. Injected for testability.
-    public typealias JoinFn = @Sendable (
-        _ handle: ContextHandle,
-        _ identity: Identity,
-        _ spendingUcanJwt: String?
-    ) async throws -> Void
-
-    /// Default join function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/contextJoin`` method.
-    public static let defaultJoin: JoinFn = { handle, identity, spendingUcanJwt in
-        try await Scp.defaultInstance()
-            .contextJoin(handle: handle, identity: identity, spendingUcanJwt: spendingUcanJwt)
-    }
-
-    /// Default send function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/contextSend`` method.
-    public static let defaultSend: SendFn = { handle, identity, payload, spendingUcanJwt in
-        try await Scp.defaultInstance().contextSend(
-            handle: handle, identity: identity, payload: payload, spendingUcanJwt: spendingUcanJwt
-        )
-    }
-
-    /// Default leave function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/contextLeave`` method.
-    public static let defaultLeave: LeaveFn = { handle, identity in
-        try await Scp.defaultInstance().contextLeave(handle: handle, identity: identity)
-    }
-
-    /// Default close function — delegates to the process-wide default
-    /// ``Scp`` instance's ``Scp/contextClose`` method.
-    public static let defaultClose: CloseFn = { handle, identity in
-        try await Scp.defaultInstance().contextClose(handle: handle, identity: identity)
-    }
-
-    /// The closure type for setting economic policy. Injected for testability.
-    public typealias SetEconomicPolicyFn = @Sendable (
-        _ handle: ContextHandle,
-        _ policyJson: String
-    ) throws -> Void
-
-    /// The closure type for getting economic policy. Injected for testability.
-    public typealias GetEconomicPolicyFn = @Sendable (
-        _ handle: ContextHandle
-    ) throws -> String?
-
-    /// Default set economic policy function — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/setEconomicPolicy`` method.
-    public static let defaultSetEconomicPolicy: SetEconomicPolicyFn = { handle, policyJson in
-        try Scp.defaultInstance().setEconomicPolicy(handle: handle, policyJson: policyJson)
-    }
-
-    /// Default get economic policy function — delegates to the process-wide
-    /// default ``Scp`` instance's ``Scp/getEconomicPolicy`` method.
-    public static let defaultGetEconomicPolicy: GetEconomicPolicyFn = { handle in
-        try Scp.defaultInstance().getEconomicPolicy(handle: handle)
-    }
-}
+// Phase 4 PR 4 (ADR-048 demolition, #1549): the process-wide
+// `Scp.defaultInstance()` and the `ContextBridge` injectable-closure
+// namespace have been deleted. `Context` now stores an explicit
+// ``SCP`` reference and forwards every bridge call through it —
+// callers construct an ``SCP`` and thread it through ``Context/create``
+// or the higher-level factory on ``SCP``.
 
 // MARK: - SharedError
 
@@ -249,6 +147,16 @@ public actor Context {
 
     // MARK: - Internal state
 
+    /// The SDK-level ``SCP`` instance that minted ``handle``. Every
+    /// UniFFI call made by this actor (and its cross-file extensions)
+    /// flows through this reference — there is no process-global
+    /// façade after ADR-048 PR 4.
+    ///
+    /// Internal visibility so extensions in other files (Tools.swift,
+    /// Governance.swift, etc.) can reach it without exposing the
+    /// SDK wrapper in the public surface of the actor.
+    let scp: SCP
+
     /// The identity of the local participant in this context.
     ///
     /// Internal visibility so that extensions in other files (Tools.swift,
@@ -277,50 +185,35 @@ public actor Context {
     /// methods have finished.
     nonisolated(unsafe) var didClose = false
 
-    // MARK: - Bridge function references (injected for testability)
-
-    private let sendFn: ContextBridge.SendFn
-    private let subscribeFn: ContextBridge.SubscribeFn
-    private let leaveFn: ContextBridge.LeaveFn
-    private let closeFn: ContextBridge.CloseFn
-    private let setEconomicPolicyFn: ContextBridge.SetEconomicPolicyFn
-    private let getEconomicPolicyFn: ContextBridge.GetEconomicPolicyFn
-
     // MARK: - Initialization
 
     /// Creates a `Context` wrapping an existing UniFFI handle.
     ///
     /// This initializer is `internal` — production callers use
-    /// ``create(identity:params:)`` or `SCP.createContext(params:)`.
+    /// ``create(scp:identity:params:)``.
     ///
     /// - Parameters:
+    ///   - scp: The SDK-level ``SCP`` instance that minted the handle.
+    ///     Every per-context UniFFI call dispatches through this reference.
     ///   - handle: The opaque UniFFI context handle.
     ///   - identity: The ``Identity`` of the local participant.
     ///   - contextId: Optional override for the context ID. When `nil`,
     ///     the ID is read from the handle. Pass explicitly in tests where
     ///     the handle has no backing FFI pointer.
+    ///   - creatorDid: Optional override for the creator DID. When `nil`,
+    ///     the value is read from the handle.
     ///   - initialState: Optional override for the initial state. When
     ///     `nil`, the state is read from the handle (defaulting to
     ///     ``ContextState/active`` if the handle throws).
-    ///   - sendFn: Bridge function for sending messages.
-    ///   - subscribeFn: Bridge function for subscribing to messages.
-    ///   - leaveFn: Bridge function for leaving the context.
-    ///   - closeFn: Bridge function for closing the context.
     init(
+        scp: SCP,
         handle: ContextHandle,
         identity: Identity,
         contextId: String? = nil,
         creatorDid: String? = nil,
-        initialState: ContextState? = nil,
-        sendFn: @escaping ContextBridge.SendFn = ContextBridge.defaultSend,
-        subscribeFn: @escaping ContextBridge.SubscribeFn,
-        leaveFn: @escaping ContextBridge.LeaveFn = ContextBridge.defaultLeave,
-        closeFn: @escaping ContextBridge.CloseFn = ContextBridge.defaultClose,
-        setEconomicPolicyFn: @escaping ContextBridge.SetEconomicPolicyFn
-            = ContextBridge.defaultSetEconomicPolicy,
-        getEconomicPolicyFn: @escaping ContextBridge.GetEconomicPolicyFn
-            = ContextBridge.defaultGetEconomicPolicy
+        initialState: ContextState? = nil
     ) {
+        self.scp = scp
         self.identity = identity
         self.handle = handle
         if let contextId {
@@ -347,12 +240,6 @@ public actor Context {
             default: state = .active
             }
         }
-        self.sendFn = sendFn
-        self.subscribeFn = subscribeFn
-        self.leaveFn = leaveFn
-        self.closeFn = closeFn
-        self.setEconomicPolicyFn = setEconomicPolicyFn
-        self.getEconomicPolicyFn = getEconomicPolicyFn
     }
 
     // MARK: - deinit
@@ -360,73 +247,53 @@ public actor Context {
     deinit {
         // Safety net: schedule close if the caller forgot to call it explicitly.
         // `try?` intentionally suppresses errors in the deinit path. The detached
-        // task captures only the handle, identity, and closeFn (all Sendable) — it
+        // task captures only the handle, identity, and scp (all Sendable) — it
         // does not capture `self`, which would be invalid in deinit.
         streamContinuation?.finish()
         guard !didClose else { return }
         let capturedHandle = handle
         let capturedIdentity = identity
-        let capturedCloseFn = closeFn
+        let capturedScp = scp
         Task.detached {
-            try? await capturedCloseFn(capturedHandle, capturedIdentity)
+            try? await capturedScp.contextClose(handle: capturedHandle, identity: capturedIdentity)
         }
     }
 
     // MARK: - Factory
 
-    /// Creates a new SCP context.
+    /// Creates a new SCP context on the given ``SCP`` instance.
     ///
-    /// This is the primary factory method for creating contexts. In production,
-    /// callers typically use `SCP.createContext(params:)` which delegates to
-    /// this method after injecting the identity and bridge functions.
+    /// This is the primary factory method for creating contexts. It mints
+    /// a fresh ``ContextHandle`` on ``scp`` via ``SCP/contextCreate`` and
+    /// wraps it in an actor that stores ``scp`` so every subsequent
+    /// per-context UniFFI call routes through the same instance.
     ///
     /// - Parameters:
+    ///   - scp: The SDK-level ``SCP`` instance that will own the minted
+    ///     handle. Handles minted here are rejected by any other ``SCP``
+    ///     via the per-instance handle-affinity check.
     ///   - identity: The ``Identity`` of the context creator. Provides the DID
     ///     and key material for MLS group formation.
     ///   - params: The ``ContextParams`` governing the new context (ceiling,
     ///     governance, memory scope, TTL, promotability, min protocol version).
-    ///   - createFn: Bridge function for context creation.
-    ///   - sendFn: Bridge function for sending messages.
-    ///   - subscribeFn: Bridge function for subscribing to messages.
-    ///   - leaveFn: Bridge function for leaving the context.
-    ///   - closeFn: Bridge function for closing the context.
     /// - Returns: A new `Context` in the ``ContextState/active`` state.
     /// - Throws: ``ScpError/Context(msg:code:)`` if context creation fails.
-    static func create(
+    public static func create(
+        scp: SCP,
         identity: Identity,
         params: ContextParams,
-        createFn: ContextBridge.CreateFn = ContextBridge.defaultCreate,
-        sendFn: @escaping ContextBridge.SendFn = ContextBridge.defaultSend,
-        subscribeFn: @escaping ContextBridge.SubscribeFn,
-        leaveFn: @escaping ContextBridge.LeaveFn = ContextBridge.defaultLeave,
-        closeFn: @escaping ContextBridge.CloseFn = ContextBridge.defaultClose,
-        setEconomicPolicyFn: @escaping ContextBridge.SetEconomicPolicyFn
-            = ContextBridge.defaultSetEconomicPolicy,
-        getEconomicPolicyFn: @escaping ContextBridge.GetEconomicPolicyFn
-            = ContextBridge.defaultGetEconomicPolicy,
         contextId: String? = nil,
         creatorDid: String? = nil,
         initialState: ContextState? = nil
     ) async throws -> Context {
-        let rawHandle = try await createFn(identity, params)
-        guard let handle = rawHandle as? ContextHandle else {
-            throw ScpError.Context(
-                msg: "createFn returned a non-concrete ContextHandle",
-                code: "SCP-CTX-2002"
-            )
-        }
+        let handle = try await scp.contextCreate(identity: identity, params: params)
         return Context(
+            scp: scp,
             handle: handle,
             identity: identity,
             contextId: contextId,
             creatorDid: creatorDid,
-            initialState: initialState,
-            sendFn: sendFn,
-            subscribeFn: subscribeFn,
-            leaveFn: leaveFn,
-            closeFn: closeFn,
-            setEconomicPolicyFn: setEconomicPolicyFn,
-            getEconomicPolicyFn: getEconomicPolicyFn
+            initialState: initialState
         )
     }
 
@@ -435,8 +302,9 @@ public actor Context {
     /// Sends a message payload to this context.
     ///
     /// The payload is encrypted via MLS and delivered to all context members
-    /// through the Rust protocol engine. The bridge function handles encryption,
-    /// sequencing, and transport.
+    /// through the Rust protocol engine. Forwards to
+    /// ``SCP/contextSend(handle:identity:payload:spendingUcanJwt:)`` on the
+    /// actor's ``scp``.
     ///
     /// - Parameter payload: The raw message data to send.
     /// - Throws: ``ScpError/Context(msg:code:)`` with code `"SCP-CTX-2001"`
@@ -448,7 +316,9 @@ public actor Context {
                 code: "SCP-CTX-2001"
             )
         }
-        try await sendFn(handle, identity, payload, spendingUcanJwt)
+        try await scp.contextSend(
+            handle: handle, identity: identity, payload: payload, spendingUcanJwt: spendingUcanJwt
+        )
     }
 
     /// Sets the economic policy for this context (spec section 19).
@@ -465,7 +335,7 @@ public actor Context {
                 code: "SCP-CTX-2001"
             )
         }
-        try setEconomicPolicyFn(handle, policyJson)
+        try scp.setEconomicPolicy(handle: handle, policyJson: policyJson)
     }
 
     /// Returns the economic policy for this context as a JSON string, or `nil`.
@@ -479,7 +349,7 @@ public actor Context {
                 code: "SCP-CTX-2001"
             )
         }
-        return try getEconomicPolicyFn(handle)
+        return try scp.getEconomicPolicy(handle: handle)
     }
 
     /// An `AsyncStream` of incoming messages in this context.
@@ -546,7 +416,29 @@ public actor Context {
                 Task { await self.clearStreamContinuation() }
             }
             let listener = MessageListenerAdapter(continuation: continuation, sharedError: streamError)
-            subscribeFn(handle, listener)
+            // Bridge subscription is async throws on the UniFFI side; drive it on
+            // a detached task so the `messages` accessor itself does not need
+            // to be async. Failures are surfaced through `lastError` via the
+            // listener adapter.
+            let capturedHandle = handle
+            let capturedScp = scp
+            let capturedError = streamError
+            Task.detached {
+                do {
+                    try await capturedScp.contextSubscribe(handle: capturedHandle, listener: listener)
+                } catch let scpError as ScpError {
+                    capturedError.set(scpError)
+                    continuation.finish()
+                } catch {
+                    capturedError.set(
+                        ScpError.Context(
+                            msg: "contextSubscribe failed: \(error.localizedDescription)",
+                            code: "SCP-CTX-2004"
+                        )
+                    )
+                    continuation.finish()
+                }
+            }
             return stream
         }
     }
@@ -572,7 +464,7 @@ public actor Context {
                 code: "SCP-CTX-2001"
             )
         }
-        try await leaveFn(handle, identity)
+        try await scp.contextLeave(handle: handle, identity: identity)
         state = .closed
         didClose = true
         streamContinuation?.finish()
@@ -596,7 +488,7 @@ public actor Context {
             // Closing an already-closed context is idempotent — no error.
             return
         }
-        try await closeFn(handle, identity)
+        try await scp.contextClose(handle: handle, identity: identity)
         state = .closed
         didClose = true
         streamContinuation?.finish()
@@ -605,25 +497,20 @@ public actor Context {
 
     /// Adds another identity to this context as a member.
     ///
-    /// Convenience instance method that mirrors the free
-    /// ``joinContext(handle:identity:spendingUcanJwt:joinFn:)`` function while
-    /// keeping the call site close to the `Context` actor that owns the
-    /// handle. Delegates to the injected ``ContextBridge/JoinFn`` so tests
-    /// can stub it without requiring the live UniFFI binding.
+    /// Forwards to ``SCP/contextJoin(handle:identity:spendingUcanJwt:)`` on
+    /// the actor's ``scp``, which is the same instance that minted ``handle``
+    /// — cross-instance calls are rejected by the handle-affinity check.
     ///
     /// - Parameters:
     ///   - identity: The ``Identity`` joining the context.
     ///   - spendingUcanJwt: Optional encoded UCAN JWT authorising the join
     ///     cost (spec §19, ADR-033). Forwarded to the manager for
     ///     AND-composition with any per-join economic policy.
-    ///   - joinFn: Bridge function override for testing. Defaults to
-    ///     ``ContextBridge/defaultJoin``.
     /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not in
     ///   active state, or if the bridge join operation fails.
     public func join(
         _ identity: Identity,
-        spendingUcanJwt: String? = nil,
-        joinFn: ContextBridge.JoinFn = ContextBridge.defaultJoin
+        spendingUcanJwt: String? = nil
     ) async throws {
         guard state == .active else {
             throw ScpError.Context(
@@ -631,21 +518,27 @@ public actor Context {
                 code: "SCP-CTX-2013"
             )
         }
-        try await joinFn(handle, identity, spendingUcanJwt)
+        try await scp.contextJoin(
+            handle: handle, identity: identity, spendingUcanJwt: spendingUcanJwt
+        )
     }
 }
 
 // MARK: - Context Join (free function)
 
-/// Joins an existing SCP context.
+/// Joins an existing SCP context on the given ``SCP`` instance.
 ///
-/// Delegates to the UniFFI ``contextJoin`` bridge function. The identity
-/// provides the key package for MLS group admission.
+/// Forwards to ``SCP/contextJoin(handle:identity:spendingUcanJwt:)``. The
+/// identity provides the key package for MLS group admission. The
+/// ``ContextHandle`` must have been minted on the same ``SCP`` instance
+/// — cross-instance calls are rejected by the handle-affinity check.
 ///
 /// - Parameters:
+///   - scp: The SDK-level ``SCP`` instance that owns ``handle``.
 ///   - handle: The ``ContextHandle`` for the context to join.
 ///   - identity: The ``Identity`` joining the context.
-///   - joinFn: Bridge function override for testing.
+///   - spendingUcanJwt: Optional encoded UCAN JWT authorising the join cost
+///     (spec §19, ADR-033).
 /// - Throws: ``ScpError/Context(msg:code:)`` if the context is not
 ///   in active state or the join operation fails.
 ///
@@ -653,14 +546,15 @@ public actor Context {
 ///
 /// - ADR-021 (UniFFI Bridge)
 /// - ADR-026 (Swift SDK)
+/// - ADR-048 (Multi-instance SCP) — handle-affinity enforcement
 /// - Spec section 5 (Context Lifecycle)
 public func joinContext(
+    scp: SCP,
     handle: ContextHandle,
     identity: Identity,
-    spendingUcanJwt: String? = nil,
-    joinFn: ContextBridge.JoinFn = ContextBridge.defaultJoin
+    spendingUcanJwt: String? = nil
 ) async throws {
-    try await joinFn(handle, identity, spendingUcanJwt)
+    try await scp.contextJoin(handle: handle, identity: identity, spendingUcanJwt: spendingUcanJwt)
 }
 
 // MARK: - App Sandboxing (spec §8.4.1, §8.4.2, issue #595)
@@ -799,6 +693,7 @@ public nonisolated struct InvitationEvaluationResult: Sendable {
 /// 4. **Agent prompt** -- falls through if no auto-accept matches.
 ///
 /// - Parameters:
+///   - scp: The SDK-level ``SCP`` instance to dispatch through.
 ///   - paramsJson: JSON-serialized ``ContextParams`` from the invitation.
 ///   - inviterDid: DID string of the identity sending the invitation.
 ///   - identityDid: DID string of the local identity receiving the invitation.
@@ -808,6 +703,7 @@ public nonisolated struct InvitationEvaluationResult: Sendable {
 /// - Returns: An ``InvitationEvaluationResult`` with the pipeline decision.
 /// - Throws: ``ScpError`` if evaluation fails.
 public func evaluateContextInvitation(
+    scp: SCP,
     paramsJson: String,
     inviterDid: String,
     identityDid: String,
@@ -815,7 +711,7 @@ public func evaluateContextInvitation(
     spendingJson: String? = nil,
     trustedDids: [String] = []
 ) throws -> InvitationEvaluationResult {
-    let decision = try Scp.defaultInstance().evaluateInvitation(
+    let decision = try scp.evaluateInvitation(
         paramsJson: paramsJson,
         inviterDid: inviterDid,
         identityDid: identityDid,
