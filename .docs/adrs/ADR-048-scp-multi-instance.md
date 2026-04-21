@@ -107,6 +107,20 @@ Short-lived tasks (single-await-then-return) are allowed to hold an `Arc` for th
 
 Regression tests at `crates/scp-ffi/src/transport.rs::tests`, `crates/scp-ffi/src/mcp.rs::tests`, and `crates/scp-ffi/uniffi/src/bridge.rs::tests` assert (a) `Arc::strong_count(&bi) == 1` while the task is parked, and (b) `weak.upgrade().is_none()` once the caller-held `Arc` drops — proving `impl Drop for BridgeInstance` runs and `emergency_cancel_tasks` propagates.
 
+### 7. SDK-level Kotlin-parity: SCP methods are the sole entry point
+
+Every SDK wraps the NAPI `Scp` surface (and its PyO3/UniFFI siblings) as instance methods on its own `SCP` class. The pre-Phase-4 shape — a three-method `SCP` lifecycle object alongside a parallel collection of namespace classes (`Identity`, `Context`, `Transport`, `EventLog`, `McpServer`, `McpClient`, `Relay`, `Node`) with their own lifecycle methods plus ~140 free functions — is gone. There is one class, one surface, one entry point:
+
+- **Python:** `scp_sdk.SCP` carries 162 methods (was 3).
+- **TypeScript:** the `SCP` class in `bindings/typescript/src/scp.ts` carries 181 methods (was 3).
+- **Kotlin:** `bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt` carries 137 methods. Kotlin was the reference shape — it already expressed this surface via `CoroutineBridge` before Phase 4. Python and TypeScript now match.
+
+The namespace classes collapsed to pure handle types — `Identity { did, custodyType }`, `Context { contextId, identityDid }`, `Transport { handle }`, `EventLog { handle }`, `McpServer { handle }`, `McpClient { handle }`, `Relay { handle, relayPort }`, `Node { handle, relayPort }` — with no methods. Every lifecycle, content, governance, economy, attestation, sync, discovery, event-log, MCP, relay, and node operation is a method on `SCP` (`scp.contextCreate(...)`, `scp.ucanMint(...)`, `scp.eventLogQuery(handle, filter)`, `scp.relayStart(config)`, etc.). Handles are owned by the `SCP` that issued them and enforced by `instance_id` per §4.
+
+Swift retains per-object UniFFI-generated wrappers alongside `Scp.swift` — UniFFI does not expose a mechanism to collapse `#[uniffi::Object]` receivers into methods on an unrelated outer object without hand-written shims on both sides of the bridge. Per ADR-021, UniFFI's generator constraints govern the Swift surface. Swift callers get the same semantic surface (one `SCP` instance, handle-scoped operations) with the generator's natural shape; Python, Kotlin, and TypeScript converge on the single-class form.
+
+Commits (all on `refactor/phase4-facade-delete`, issue #1549): `dc7face6d` (Python Agent A — class scaffold), `4fb4572f8` (TS Agent A — class scaffold), `bdd2cb58a` (TS B1 — namespace class collapse), `4612e7eff` (TS B2 — Proxy mock-bridge rewrite), `ecc668bd3` (Python B+C — handle collapse + test rewrite), `cd85f3f8b` (TS B4 — large test rewrites), `5271ef84d` (TS B5 — WASM + examples).
+
 ## Consequences
 
 - **Tests parallel-safe on every bridge.** Per-test `SCP` fixtures eliminate `BRIDGE_LIFECYCLE_SERIAL`, per-test `beforeAll` in NAPI, and the module-scope poisoning on every SDK. pytest-xdist, Gradle parallel tests, and XCTest concurrency all work.
