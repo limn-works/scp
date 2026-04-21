@@ -749,6 +749,15 @@ InvocationCaveats {
   allowed_adapters:        Option<Vec<PaymentAdapterId>>,  // restrict adapters; (§19.2)
   allowed_target_dids:     Option<Vec<DID>>,         // restrict which peer DIDs may be
                                                      // invoked via cross-context outlets (§6.2)
+  origin_kind:             Option<OutletKind>,       // §6.2.0.3 amplification — MUST equal
+                                                     // the parent's origin_kind at every
+                                                     // `narrow()` step (no widening, no
+                                                     // narrowing, no reset). Absence at the
+                                                     // root of the delegation chain means
+                                                     // "inferred from the stem" (outlet_query
+                                                     // ⇒ Query, outlet_call ⇒ Action). Every
+                                                     // non-root delegation MUST carry an
+                                                     // explicit value matching its parent.
 }
 
 RateWindow {
@@ -768,6 +777,7 @@ RateWindow {
 - `rate_window.window_secs`: child MUST be `<=` parent (shorter window = stricter).
 - `allowed_adapters`, `allowed_target_dids`: child list MUST be a subset of parent's list; child MAY introduce a list where parent had none.
 - `input_schema`: conservative syntactic narrowing only (see below).
+- `origin_kind`: **equality** (`child == parent`). Unlike every other field, `origin_kind` does not narrow — Query and Action are disjoint attack-surface classes, and widening or narrowing across them is forbidden (§6.2.0.3). A non-root delegation whose `origin_kind` differs from its parent's — or is absent while the parent has one set — fails `narrow()` with `AttenuationViolation::OriginKindMismatch`. This is the caveat-layer enforcement of the signed delegation-chain invariant; it makes "origin_kind is bound to the UCAN chain" actually true (the `narrow()` verifier is the only thing that holds child≡parent — without this field, a malicious delegator could inject any `origin_kind` at the nb-reassembly boundary and each hop would accept it as the outermost origin).
 
 **Conservative JSON Schema narrowing.** The only admissible narrowing keywords are: `enum`, `const`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `required`, and `additionalProperties: false`. Any other keyword appearing newly in the child's `input_schema` triggers `OutletErrorClass::Authorization::AttenuationViolation`.
 
@@ -791,6 +801,14 @@ assert(hours_of_day & !0x00FF_FFFFu32 == 0u32)
 
 Any value with bits 24..31 set is rejected at mint with `SCP-TOOL-6114` (`caveat-mint-limit-exceeded`, slug `hours-of-day-high-bits-set`) and at narrow with `OutletErrorClass::Authorization::AttenuationViolation`. Without this assertion, a caller could set the high bits of `hours_of_day` to carry ambient data alongside the intended restriction — a covert-channel risk, and a validator-implementation-differential risk if some SDK masked the high bits while another honored them.
 
+**`days_of_week` mask width assertion.** `days_of_week` is declared `Option<u8>` and is semantically a 7-bit bitmask (bit 0 = Sunday, bit 6 = Saturday; bit 7 is unused). Both mint and narrow enforce:
+
+```
+assert(days_of_week & !0x7Fu8 == 0u8)
+```
+
+Any value with bit 7 set is rejected at mint with `SCP-TOOL-6114` (slug `days-of-week-high-bit-set`) and at narrow with `AttenuationViolation`. This closes the symmetric 1-bit covert-channel that would otherwise let a caller carry ambient data in the bit 7 slot alongside the intended day restriction.
+
 **Mint limits.** At token mint time, the issuing SDK MUST enforce the following structural bounds:
 
 | Limit | Bound |
@@ -811,6 +829,8 @@ Mints that exceed these limits are rejected at the SDK boundary with `SCP-TOOL-6
 **`CaveatCounterStore`.** A sibling of `NonceTracker` (§9.5). Keyed by `(ucan_cid, caveat_kind)`, holds `u64` counters for `max_calls`, `amount_max_cumulative`, and sliding-window rate counters. Atomic compare-and-swap semantics prevent racing invocations from double-spending a capacity. The counter store is durable (survives restarts) and is persisted under `context/{id}/caveat_counters/{ucan_cid}` per §17.3.
 
 **Interaction with other access-control layers.** Caveats are an additive deny-surface. They never widen: they compose with `SpendingCapability` (§19.5), `MemberBudgetTracker` (§19.3), `InboundPolicy`, and `OutboundPolicy` (§6.2) under logical AND. An invocation proceeds iff every layer admits it. For cross-context calls, the effective guard is `OutboundPolicy ∧ InboundPolicy ∧ caveat`. A widened caveat cannot open a capability that any other layer closes.
+
+**Orthogonality with `SpendingCapability`.** Caveats bind limits to a *delegation* — they travel with the token as it passes through delegation-chain narrowing. `SpendingCapability` (§19.5) binds limits to a *member* — it tracks a member's cumulative budget across all their tokens. The two mechanisms are orthogonal in binding (per-delegation vs. per-member) but coincident in enforcement (both are AND'd into the same guard at invocation time). A token caveat-capped at $10/call cannot be used with a member whose SpendingCapability is exhausted, and vice versa.
 
 **Revocation granularity.** Revocation is whole-token: a `UcanRevocation` event (per §7.2.1 step 10) invalidates the entire token, including all its caveats. There is NO per-caveat revocation. The rationale is simplicity — per-caveat revocation would require a second-class revocation ledger keyed by `(ucan_cid, caveat_index)` that nothing else in the protocol uses. If an operator needs to narrow a capability, they revoke and re-issue.
 

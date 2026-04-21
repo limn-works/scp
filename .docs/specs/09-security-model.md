@@ -1520,8 +1520,10 @@ All domain separators are UTF-8 strings used as prefixes in canonical hash const
 | `"SCP-EXPORT-ENTRY:"` | Context export chain hash | §5.13 |
 | `"SCP-OUTLET-REGISTRATION-V2:"` | Outlet registration integrity hash | §5.4.1 |
 | `"SCP-OUTLET-CHUNK-V1:"` | Outlet stream chunk Merkle leaf/interior tag | §5.4.5 |
-| `"SCP-OUTLET-CHUNK-SIG-V1:"` | Outlet stream per-chunk operator signature | §5.4.5 |
-| `"SCP-OUTLET-CAVEAT-BIND-V1:"` | Outlet stream `caveats_binding` preimage | §5.4.5 |
+| `"SCP-OUTLET-CHUNK-SIG-V2:"` | Outlet stream per-chunk operator signature (binds context_id, outlet_id, caveats_binding) | §5.4.5 |
+| `"SCP-OUTLET-CAVEAT-BIND-V2:"` | Outlet stream `caveats_binding` preimage (binds ucan_cid, request_id, invoker_did) | §5.4.5 |
+| `"SCP-OUTLET-CREDIT-V1:"` | Outlet stream `OutletStreamCredit` invoker signature | §5.4.5 |
+| `"SCP-CONTEXT-HOP-SALT-V1:"` | HKDF info string for per-interface `hop_salt` derivation | §6.2.0.1 |
 | `"SCP-KEY-DESTRUCTION-V1:"` | Key destruction proof | §9.15 |
 | `"SCP-CLAIM-V1:"` | Shadow identity claim validation | §12.3 |
 | `"SCP-RECEIPT-V1:"` | Payment receipt signing | §19.15.5 |
@@ -1753,6 +1755,10 @@ The following constants have protocol-defined mechanisms and acceptable ranges, 
 | Nesting depth | Unbounded (no protocol ceiling) | [1, u32 max] | `ContextParams::max_nesting_depth`. `None` = unbounded; contexts MAY set a limit. | §5.13.8 |
 | Chain depth | 8 hops | [1, 255] (u8) | `ContextParams::max_chain_depth`. `None` = use default. No protocol hard max. | §24.4 |
 | Session cap per caller | 1000 | [1, u32 max] | `ContextParams::session_cap`. `None` = use default. | §6.2.1 |
+| Outlet stream credit window default | 32 chunks | [1, u32 max] | `ContextParams::stream_window_default`. Initial credit on `OutletStreamOpen`. | §5.4.5 |
+| Outlet stream credit stall timeout | 30s | [1, 3600] | `ContextParams::stream_credit_stall_secs`. Window after credit hits 0 before runtime cancels with `execution.credit-stall`. | §5.4.5 |
+| Outlet stream cancel-ack timeout | 5s | [1, 60] | `ContextParams::stream_cancel_ack_secs`. Window for executor to emit terminal chunk after `OutletCancel`. | §5.4.5 |
+| Outlet stream UCAN revocation re-check interval | 10s | [1, 60] | `ContextParams::stream_ucan_recheck_secs`. Receiver-side re-check cadence for mid-stream revocation; bounds exposure regardless of executor checkpoint behavior. | §5.4.5 |
 | Relay blob TTL | 604,800s (7d) | [1, infinity] | Relay operator configuration. | §10.5 |
 | Relay republish interval | Derived: `max(ttl - 86400, ttl / 2, 60)` | Derived from TTL | Computed from relay blob TTL. Floor of 60s prevents spin loop at very small TTLs. | §10.5 |
 

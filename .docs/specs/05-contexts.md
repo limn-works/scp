@@ -280,11 +280,14 @@ OutletError {
                                   // SCP-TOOL- prefix registered in sdk-common.md; outlets
                                   // carve out the 6100-6199 sub-block. Bridge linters
                                   // require the prefix and the sub-block.
-  slug:          String,          // tag 2; stable kebab-case, `^[a-z][a-z0-9-]{0,63}$`.
-                                  // Finer-grained than `code`: multiple slugs may share
-                                  // the same code (e.g., code SCP-TOOL-6110 carries
-                                  // slugs authorization.expired, authorization.revoked,
-                                  // authorization.missing). Slugs are class-scoped
+  slug:          String,          // tag 2; dot-separated class-prefixed form,
+                                  // regex `^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$`.
+                                  // The class-prefix segment (before the first `.`) MUST
+                                  // match the lowercased OutletErrorClass variant name;
+                                  // subsequent segments are finer distinctions (e.g.,
+                                  // `authorization.expired`, `authorization.revoked`,
+                                  // `authorization.attenuation-violation`). Multiple slugs
+                                  // may share the same code. Slugs are class-scoped
                                   // identifiers; never surface as covert channels.
   class:         OutletErrorClass,// tag 3; one of eight root classes (below)
   message:       String,          // tag 4; human-readable, non-localized; max 1 KiB UTF-8.
@@ -342,7 +345,12 @@ The `SCP-TOOL-` prefix is preserved (not renamed to `SCP-OUTLET-`) because the C
 
 **Cross-context wrapping.** A cross-context error is not translated — the original `code` is preserved and the wrapping hop appends to `source_chain` with its own `wrapped_code`. The outermost caller sees the innermost reason and the trail of boundaries it crossed. This is the opposite of HTTP-style gateway remapping, which loses causal information.
 
-**Query oracle collapse.** Authorization errors that would reveal whether a specific `outlet_id` exists MUST be collapsed to a single indistinguishable outcome when the caller does not hold a capability that would let them disambiguate. Concretely: a caller who presents a UCAN matching neither `outlet_query:{id}` nor `outlet_call:{id}` receives `SCP-TOOL-6110` with slug `authorization.denied` regardless of whether the outlet is registered, deregistered, or has never existed. The specific sub-errors (`outlet-not-found`, `kind-mismatch`) are observable only by callers who hold at least one stem on the outlet. Without this collapse, a caller who holds no capability can enumerate the outlet registry by probing error codes — a practical oracle against private outlets.
+**Query oracle collapse.** Authorization errors that would reveal whether a specific `outlet_id` exists MUST be collapsed to a single indistinguishable outcome when the caller does not hold a capability that would let them disambiguate. Concretely: a caller who presents a UCAN matching neither `outlet_query:{id}` nor `outlet_call:{id}` receives `SCP-TOOL-6110` with slug `authorization.denied` regardless of whether the outlet is registered, deregistered, or has never existed. The specific sub-errors (`outlet.not-found`, `outlet.kind-mismatch`) are observable only by callers who hold at least one stem on the outlet. Without this collapse, a caller who holds no capability can enumerate the outlet registry by probing error codes — a practical oracle against private outlets.
+
+The collapse extends to cross-context attenuation and amplification signals carrying the same disambiguating power:
+
+- `OutletErrorClass::Authorization::AttenuationViolation` (slug `authorization.attenuation-violation`) and `OutletErrorClass::Authorization::AmplificationViolation` (slug `authorization.amplification-violation`) collapse to `SCP-TOOL-6110` slug `authorization.denied` when the caller does not hold the stem required to observe the distinction. A caller who holds neither `outlet_query:{id}` nor `outlet_call:{id}` on the hop target cannot distinguish "attenuation failed" (the token was narrowed incorrectly) from "amplification forbidden" (Query → Action is rejected) from "outlet does not exist at all" — all three produce `authorization.denied`.
+- The same collapse applies per-hop to `ContextHop.wrapped_code` entries within `source_chain`. At every hop the caller is not a member of, `wrapped_code` is collapsed to `SCP-TOOL-6110` before emission, and the accompanying slug is rewritten to `authorization.denied`. This prevents the caller from reconstructing the disambiguated error trail of hops they cannot observe — the `source_chain` still records the structural fact that a hop occurred, but not the fine-grained error type at that hop. Callers with membership (or a matching stem on the hop target) see the original `wrapped_code` and slug unchanged.
 
 **Per-class `detail` schemas.** `detail` is NOT free-form. Each class defines a typed schema; detail MUST match or be absent. This prevents operators from using `detail` as a covert channel.
 
@@ -351,7 +359,7 @@ The `SCP-TOOL-` prefix is preserved (not renamed to `SCP-OUTLET-`) because the C
 | Protocol | `{ rule: string }` — the rule name that was violated | `{ rule: "query-cost-floor" }` |
 | Authorization | `{ capability: string }` — the capability URI that was denied | `{ capability: "outlet_query:foo" }` |
 | Input | `{ field_path: string, violation: string }` — JSON Pointer + violation tag | `{ field_path: "/items/0", violation: "type" }` |
-| Execution | `{ elapsed_ms: u64 }` for timeouts; `{ panic_location: string }` for panics (file:line only, no stack text); `{}` otherwise | `{ elapsed_ms: 30000 }` |
+| Execution | `{ elapsed_ms: u64 }` for timeouts; `{ panic_location_hash: [u8; 16] }` for panics (first 16 bytes of `SHA-256("file:line")`; the operator keeps a local resolution table mapping hash → raw file:line); `{}` otherwise | `{ elapsed_ms: 30000 }` |
 | Output | `{ field_path: string, violation: string }` same as Input | |
 | Economic | `{ needed: Amount, currency: CurrencyCode }` for InsufficientFunds; `{ adapter_id: PaymentAdapterId }` for adapter errors | `{ needed: 100, currency: "USD" }` |
 | Transport | `{ retry_after_secs: u32 }` for rate limits; `{ relay_url_kind: enum }` (`wss` \| `ws-loopback` \| `unknown`) for relay errors — never a raw URL | `{ retry_after_secs: 30 }` |
@@ -365,7 +373,9 @@ Absent schemas: classes with `{}` detail have detail omitted entirely. An envelo
 - Internal implementation strings (SQL fragments, stack traces, file paths above the outlet source root, private-network addresses, secret fragments).
 - Raw input values (input echo in error messages is the fastest path to smuggling data out of a constrained context).
 
-SDKs SHOULD apply a lint pass to `message` that redacts recognizable patterns (`/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/` for emails; `/did:(dht|web|key):[A-Za-z0-9._-]+/` for DIDs) before surfacing to developer-facing logs, replacing matches with `[redacted]`. Conformance fixtures include PII-redaction test cases.
+**Message ⊄ input invariant.** At `OutletError` construction, the framework enforces `∀ window of length ≥ 8 bytes in message, window is not a substring of the canonicalized input`. Concretely: for every 8-byte (or longer) contiguous byte window `w` of `message`, `w` MUST NOT appear as a substring of `canonical_jcs(input)` (the same canonical bytes the runtime used for input validation). Violation rejects the `OutletError` at construction with `OutletErrorConstructionFailed::InputEchoDetected`; the violation is the producer's responsibility to fix. The 8-byte floor avoids false positives on tiny structural tokens (`{`, `true`, `null`, `"id"`) while catching any meaningful echo. This is a stronger defense than the regex redaction below — it structurally prevents the operator from leaking arbitrary input bytes back to the invoker through `message`, regardless of what pattern they contain.
+
+SDKs SHOULD additionally apply a lint pass to `message` that redacts recognizable patterns (`/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/` for emails; `/did:(dht|web|key):[A-Za-z0-9._-]+/` for DIDs) before surfacing to developer-facing logs, replacing matches with `[redacted]`. Conformance fixtures include PII-redaction test cases and `InputEchoDetected` rejection cases.
 
 **`source_chain` pseudonymization.** A raw `context_id` in a cross-context error trail leaks membership — a caller who sees the actual context IDs of hops they are not a member of learns the existence and identity of those contexts. Each `ContextHop.context_id` MUST be pseudonymized for hops the receiving caller does not have membership in:
 
@@ -393,16 +403,25 @@ Outlet invocations are streams by construction. A non-streaming invocation is th
 
 ```
 OutletStreamOpen {
-  request_id:       [u8; 16],      // per-stream UUIDv7; monotonic time-sortable
-  outlet_id:        String,
-  input:            Value,          // MessagePack value matching input_schema
-  invoker_did:      DID,
-  ucan:             Vec<u8>,        // UCAN JWT bytes; checked ONCE at open
-  caveats_binding:  [u8; 32],       // SHA-256 over the effective caveat set; see below
-  chain_depth:      u8,             // inherited from opening call on cross-context hops;
-                                    // matches §24.4 width [0, 255] and ADR-043
-  credit_window:    u32,            // initial credit; see backpressure below
-  timeout_ms:       u32,            // absolute stream timeout; 0 = use context default
+  request_id:             [u8; 16],      // per-stream UUIDv7; monotonic time-sortable
+  outlet_id:              String,
+  input:                  Value,          // MessagePack value matching input_schema
+  invoker_did:            DID,
+  ucan:                   Vec<u8>,        // UCAN JWT bytes; checked ONCE at open
+  caveats_binding:        [u8; 32],       // SHA-256 over (ucan_cid, request_id, invoker_did,
+                                          // caveats); see "caveats_binding preimage" below
+  chain_depth:            u8,              // inherited from opening call on cross-context hops;
+                                          // matches §24.4 width [0, 255] and ADR-043
+  credit_window:          u32,            // initial credit; see backpressure below
+  estimated_chunk_count:  u32,            // invoker-declared upper bound on billable (Data)
+                                          // chunks; used for escrow-at-open computation.
+                                          // MUST satisfy estimated_chunk_count <=
+                                          //   min(credit_window, caveats.max_calls.unwrap_or(u32::MAX))
+                                          // on Action outlets; otherwise the open is rejected
+                                          // with OutletErrorClass::Input::EstimateExceedsBound.
+                                          // For Query outlets and zero-cost Action outlets
+                                          // the value is advisory (escrow = 0 regardless).
+  timeout_ms:             u32,             // absolute stream timeout; 0 = use context default
 }
 
 OutletStreamChunk {
@@ -413,64 +432,111 @@ OutletStreamChunk {
 }
 
 ChunkPayload {
-  // Tagged union. Canonical JCS encoding MUST place `"type"` as the first field in every
-  // variant (alphabetical key order places it ahead of all other keys used here), so a
-  // canonical-hashed chunk is unambiguously classified before any field is read.
-  { "type": "data",     "value": Value },                           // matches output_schema
-  { "type": "progress", "pct": u16, "note": Option<String> },       // pct in [0, 10000] bp
-  { "type": "end",      "aggregate": Value, "provenance": Provenance,
-                        "execution_time_ms": u64 },                  // matches aggregate_schema
+  // Tagged union. The discriminator field is named `@type` (with a leading `@`) so that
+  // under RFC 8785 JCS sort order it lexicographically precedes every lowercase-letter
+  // key used by the variant bodies — ASCII `@` (0x40) sorts before `a`..`z` (0x61..0x7A).
+  // Result: the canonical-hashed serialization of every variant has `"@type"` as its
+  // first key, and the variant is unambiguously classified before any body field is read.
+  // (The earlier draft used `"type"`, which under JCS sorts AFTER `aggregate`, `code`,
+  // `execution_time_ms`, `message`, `note`, `pct`, `provenance`, and `terminal` — i.e.,
+  // last in every variant — defeating the "classify first" property.)
+  { "@type": "data",     "value": Value },                          // matches output_schema
+  { "@type": "progress", "pct": u16, "note": Option<String> },      // pct in [0, 10000] bp
+  { "@type": "end",      "aggregate": Value, "provenance": Provenance,
+                         "execution_time_ms": u64 },                 // matches aggregate_schema
                                                                      // or defaults to last Data
-  { "type": "error",    "code": String, "message": String,
-                        "terminal": bool },                          // terminal=true closes
+  { "@type": "error",    "code": String, "message": String,
+                         "terminal": bool },                         // terminal=true closes
 }
 
 OutletStreamCredit {
-  request_id: [u8; 16],
-  grant:      u32,                // additional chunks the executor may send
+  request_id:    [u8; 16],
+  grant:         u32,                     // additional chunks the executor may send
+  monotonic_seq: u64,                     // per-(request_id) monotonic grant counter,
+                                          // starting at 0. Duplicates and regressions
+                                          // are rejected as CreditReplay (§5.4.5).
+  sig:           Ed25519Signature,        // invoker's signature; preimage below
 }
 ```
 
-**`caveats_binding` preimage.** The binding commits the stream open to the exact set of caveats the UCAN was narrowed to at check time:
+**`caveats_binding` preimage.** The binding commits the stream open to the exact set of caveats the UCAN was narrowed to at check time **and** pins the open to this specific stream instance so a binding computed for one open cannot be replayed into another:
 
 ```
 caveats_binding = SHA-256(
-  "SCP-OUTLET-CAVEAT-BIND-V1:"
-  || canonical_jcs(effective_caveats)
+  "SCP-OUTLET-CAVEAT-BIND-V2:"
+  || len_be32(ucan_cid)                 // 4-byte big-endian length
+  || ucan_cid                            // CID of the opening UCAN (bytes)
+  || request_id                          // 16 bytes, the stream's request_id
+  || len_be32(invoker_did)               // 4-byte big-endian length
+  || invoker_did                         // DID string bytes, UTF-8
+  || estimated_chunk_count_be            // 4 bytes, big-endian, from OutletStreamOpen
+  || canonical_jcs(effective_caveats)    // narrowed InvocationCaveats, incl. origin_kind
 )
 ```
 
-where `effective_caveats` is the `InvocationCaveats` record (§7.3.8) after all delegation-chain narrowing has been applied. A later attempt to present a different effective caveat set against the same `request_id` is a binding mismatch and is rejected as `OutletErrorClass::Authorization::AttenuationViolation`. The `SCP-OUTLET-CAVEAT-BIND-V1:` separator is registered in §9.18.2.
+where `effective_caveats` is the `InvocationCaveats` record (§7.3.8) after all delegation-chain narrowing has been applied. The binding now commits to (a) the exact token (`ucan_cid`), (b) this stream instance (`request_id`), (c) the invoker identity (`invoker_did`), and (d) the narrowed caveats. `origin_kind` (§7.3.8) is covered automatically via the `canonical_jcs(effective_caveats)` term. A later `OutletStreamOpen` received with the same `request_id` and a different `caveats_binding` is rejected as `OutletErrorClass::Authorization::AttenuationViolation`; the runtime pins `(request_id → caveats_binding)` at first open for the TTL of the stream (see "Binding-pinning invariant" below). The `SCP-OUTLET-CAVEAT-BIND-V2:` separator is registered in §9.18.2. (V1 is deleted; the ADR-049 migration is a hard break so there is no backward-compat obligation.)
+
+**Binding-pinning invariant.** At first `OutletStreamOpen`, the receiver records `(request_id → caveats_binding)` in its stream table for the lifetime of the stream (bounded by `timeout_ms`, `stream_credit_stall_secs`, or terminal chunk arrival, whichever fires first). Any subsequent `OutletStreamOpen` carrying the same `request_id` but a different `caveats_binding` is rejected as `AttenuationViolation`. This closes the "two opens with the same request_id under different caveats" attack without relying on undetectable later-chunk inspection. Once the stream terminates, the receiver MAY evict the pinning record; a fresh `request_id` is required for a new stream.
 
 **Per-chunk operator signature.** Every `OutletStreamChunk.sig` is the operator's Ed25519 signature over
 
 ```
 SHA-256(
-  "SCP-OUTLET-CHUNK-SIG-V1:"
-  || request_id                   // 16 bytes, fixed width
-  || sequence_be                  // 8 bytes, big-endian
-  || SHA-256(canonical_jcs(payload))  // 32 bytes
+  "SCP-OUTLET-CHUNK-SIG-V2:"
+  || len_be32(context_id)             // 4-byte big-endian length
+  || context_id                        // UTF-8 bytes of the hosting context's id
+  || len_be32(outlet_id)               // 4-byte big-endian length
+  || outlet_id                         // UTF-8 bytes of the outlet id
+  || request_id                        // 16 bytes, fixed width
+  || sequence_be                       // 8 bytes, big-endian
+  || caveats_binding                   // 32 bytes, the stream's caveats_binding
+  || SHA-256(canonical_jcs(payload))   // 32 bytes
 )
 ```
 
-Per-chunk signing closes the **equivocation** gap: without per-chunk signatures, an operator could stream one sequence of chunks to one member and a different sequence to another, then commit a `stream_manifest_hash` that covers only one of the streams. With per-chunk signatures, a mismatch between what a member received and what the committed manifest covers is cryptographically detectable by that member. The `SCP-OUTLET-CHUNK-SIG-V1:` separator is registered in §9.18.2.
+Per-chunk signing closes the **equivocation** gap: without per-chunk signatures, an operator could stream one sequence of chunks to one member and a different sequence to another, then commit a `stream_manifest_hash` that covers only one of the streams. With per-chunk signatures, a mismatch between what a member received and what the committed manifest covers is cryptographically detectable by that member. Binding `context_id`, `outlet_id`, and `caveats_binding` into the preimage closes the cross-outlet and cross-stream replay surface: a chunk signed for outlet X in context A with caveats C cannot be presented as a valid chunk of a stream targeting outlet Y in context B or bearing a different caveat set, even if a `request_id` collision were contrived. The `SCP-OUTLET-CHUNK-SIG-V2:` separator is registered in §9.18.2. (V1 is deleted; hard break per ADR-049.)
 
 **Credit-based backpressure.** Each stream opens with `credit_window` chunks of headroom. The executor may emit up to that many Data/Progress chunks before it must wait for an `OutletStreamCredit` grant. End and Error are terminal and do NOT consume credit — an executor can always close a stream. The default window is `ContextParams::stream_window_default` (default 32). Consumers grant credit as they process chunks. A stream whose credit reaches zero and is not replenished within `stream_credit_stall_secs` (default 30) is cancelled with `OutletErrorClass::Execution::CreditStall`.
 
+**Credit grant signature.** Every `OutletStreamCredit` MUST carry the invoker's Ed25519 signature in `sig`, over the preimage:
+
+```
+SHA-256(
+  "SCP-OUTLET-CREDIT-V1:"
+  || request_id                   // 16 bytes, fixed width
+  || grant_be                     // 4 bytes, big-endian (u32 grant)
+  || monotonic_seq_be             // 8 bytes, big-endian (u64 monotonic_seq)
+)
+```
+
+The executor's credit accounting admits a grant only if (a) the signature verifies under the invoker's public key recorded at stream open, and (b) `monotonic_seq` strictly exceeds every previously accepted `monotonic_seq` for this `request_id`. Duplicates and regressions are rejected as `OutletErrorClass::Authorization::CreditReplay` and do NOT advance the credit counter. This closes the relay-drop/inject DoS surface: a malicious relay cannot forge grants to starve the executor, and cannot replay stale grants to bypass the invoker's intended flow control. The `SCP-OUTLET-CREDIT-V1:` separator is registered in §9.18.2.
+
+**Credit-grant escrow top-up.** Each validly accepted `OutletStreamCredit` grant on an Action outlet with `cost.amount > 0` automatically tops up the stream's escrow by `cost.amount × grant`, computed via `checked_mul` — arithmetic overflow rejects the grant with `OutletErrorClass::Economic::EscrowOverflow` and does NOT advance the credit counter. If the invoker's available balance is below the top-up amount at the moment of grant acceptance, the grant is rejected with `OutletErrorClass::Economic::InsufficientFunds` and the credit counter does not advance. The operator only bills chunks emitted while covered by topped-up escrow; a grant that fails top-up does not authorize further billable chunks. For Query outlets and zero-cost outlets no top-up is performed.
+
 **Ordering and gaps.** `sequence` values are strictly monotonic per `request_id`. A receiver that observes a gap (missing sequence) MUST cancel the stream with `OutletErrorClass::Execution::StreamGap` and SHOULD rerun. MLS has no primitive for per-message retransmit and adding one at the SCP layer would require reintroducing a per-recipient unicast channel that MLS deliberately eliminates — so the mitigation is cancel-and-rerun, not retry.
 
-**UCAN check locus.** The UCAN presented in `OutletStreamOpen` is validated exactly once, at open. Every chunk carries the `request_id`; the receiver correlates to the open and does not re-present or re-validate. This prevents UCAN revocation races mid-stream from splitting a stream into authorized and unauthorized halves — a revocation observed during the stream terminates the stream at the next executor checkpoint with `OutletErrorClass::Authorization::RevokedMidStream`, but already-emitted chunks remain authorized.
+**UCAN check locus.** The UCAN presented in `OutletStreamOpen` is validated exactly once, at open. Every chunk carries the `request_id`; the receiver correlates to the open and does not re-present or re-validate. This prevents UCAN revocation races mid-stream from splitting a stream into authorized and unauthorized halves.
+
+**Revocation re-check cadence (receiver-side).** Because an executor may never voluntarily reach a checkpoint, the stream receiver enforces its own periodic re-check of the opening UCAN's revocation status. Every `ContextParams::stream_ucan_recheck_secs` (default 10, range [1, 60]; registered in §9.18.B) the receiver consults its revocation state and, if the token has been revoked since stream open, terminates the stream with `OutletErrorClass::Authorization::RevokedMidStream` (code `SCP-TOOL-6110`, slug `authorization.revoked-mid-stream`). Already-emitted chunks remain authorized; the stream closes at or before `stream_ucan_recheck_secs` after the revocation event regardless of executor behavior. The executor also MAY re-check at its own checkpoints; the receiver-side cadence is the worst-case upper bound on exposure.
 
 **Cancellation and billing boundary.** The existing `OutletCancel` message cancels a stream by `request_id`. The executor MUST emit exactly one terminal chunk (`End` or `Error { terminal: true }`) within `stream_cancel_ack_secs` (default 5s) of observing the cancel; this terminal chunk is the **cancel-ack**. Its `sequence` is the **cancel-ack sequence**. A receiver MAY ignore chunks with sequence greater than the cancel-ack sequence, but the executor MUST NOT emit Data/Progress chunks with sequence greater than the cancel-ack sequence.
 
 **Billing semantics.** Streaming-native invocation uses an escrow-and-reconcile model so early termination does not leave the economic layer inconsistent.
 
-- **At open** (Action outlets with non-zero cost only): the runtime escrows an upper-bound estimate from the invoker's balance. The estimate is `cost.amount × estimated_chunk_count` where `estimated_chunk_count` is declared in the open, bounded by `credit_window`, bounded again by `max_calls` from the UCAN caveats. For outlets without declared cost or for Query outlets, escrow is zero.
+- **At open** (Action outlets with non-zero cost only): the runtime escrows an upper-bound estimate from the invoker's balance. The estimate is `cost.amount × estimated_chunk_count`, computed via `checked_mul` — an arithmetic overflow is rejected as `OutletErrorClass::Economic::EscrowOverflow` before any state is committed. `estimated_chunk_count` is declared in the open and is structurally bounded by `min(credit_window, caveats.max_calls.unwrap_or(u32::MAX))` — a declared estimate exceeding that bound is rejected at open with `OutletErrorClass::Input::EstimateExceedsBound` (the bound is the protocol's upper limit on how many billable chunks CAN flow regardless of executor behavior, so the escrow must not over-reserve beyond it). For outlets without declared cost or for Query outlets, escrow is zero and `estimated_chunk_count` is advisory.
 - **Per chunk**: the operator accrues `cost.amount` per billable chunk (Data chunks; Progress, End, Error are never billed). Chunks beyond the cancel-ack sequence are NOT billed even if they arrive (the operator violated cancel semantics; the invoker does not pay for the violation).
 - **At close** (`End` received or stream terminated): the runtime issues a `PaymentReceipt` (§19.15.5) for the billed amount and refunds the unspent escrow to the invoker. A stream that terminates with `Error { terminal: true }` before any Data chunk refunds the full escrow; the operator does not bill for the failed execution.
 - **Credit-stall cancel**: the stall cancel (`SCP-TOOL-6133`) releases the escrow and the chain-depth slot. The operator is billed for Data chunks already delivered within the stalled window.
 
 The event log records `chunks_billed: u32` separately from `stream_chunk_count`: the total chunk count includes Progress/End/Error, while `chunks_billed` is the count of Data chunks at or below the cancel-ack sequence that were validly delivered.
+
+**`chunks_billed` is verifiable from the manifest.** Every leaf of the chunk manifest commits to a canonical chunk whose `payload` carries the `@type` discriminator (§5.4.5 wire types). For any event whose `stream_manifest_hash` and chunk sequence are known, an auditor computes the reference count
+
+```
+chunks_billed_ref = |{ i : leaf_i.payload."@type" == "data" && i <= cancel_ack_seq }|
+```
+
+The event log's recorded `chunks_billed` MUST equal `chunks_billed_ref`. An `OutletInvokedEvent` whose recorded `chunks_billed` does not match the value derivable from the manifest root, the sealed chunk sequence, and the cancel-ack sequence is a wire-layer rejection — the event is refused at log-insert time, not accepted-and-flagged. The cancel-ack sequence is recorded alongside `stream_terminal_status` in the event (absent when the stream terminated without cancel, in which case the ceiling is `u64::MAX` and the predicate reduces to `@type == "data"`). Because leaves cover the full canonical chunk including `@type`, `sig`, and the `caveats_binding` committed at chunk-signing, `chunks_billed_ref` is a function of the signed, committed stream — operators cannot over-bill by recording a higher count than their own signed manifest supports, and cannot under-bill without making a manifest that excludes already-delivered chunks.
 
 **Cross-context streaming.** Streams span the §6.2 tool-interface boundary. A shared-member bridge re-encrypts each chunk per-recipient as it crosses. `chain_depth` is set at open and inherited by every chunk (chunks do not recompute or check it). Credit is end-to-end: the originating invoker grants credit that propagates across the bridge.
 
@@ -507,7 +573,7 @@ stream_manifest_hash = root of the resulting binary tree
 
 The `SCP-OUTLET-CHUNK-V1:` separator is registered in §9.18.2. The leaf covers the full canonical chunk including `sig`, so a later verifier holding a chunk and a manifest root can prove the operator signed that exact chunk.
 
-**Inclusion proofs.** The `stream_manifest_hash` is a commitment to the chunk sequence. A chunk is provably part of the recorded stream iff a verifier holding the chunk, the chunk's index, and the root can reconstruct a valid Merkle path. The shape of the proof (path structure, verifier algorithm) is deliberately not pinned in this revision — a per-chunk inclusion-proof API on the SDK (a reader calling `outlets.inclusion_proof(invocation_id, chunk_index)` and getting a path back) is **deferred**; the manifest root commitment is the protocol-level invariant, and auditing tools MAY reconstruct proofs off-line by replaying the event log and the retained chunk sequence. The deferral is tracked in discussion [#1698](https://github.com/limn-works/scp/discussions/1698).
+**Inclusion proofs.** The `stream_manifest_hash` is a commitment to the chunk sequence. A chunk is provably part of the recorded stream iff a verifier holding the chunk, the chunk's index, and the root can reconstruct a valid Merkle path. Inclusion and consistency proofs over this tree follow **RFC 6962 §2.1 (audit paths)** using the same leaf/interior tag-byte construction defined above — the algorithm is pinned at the protocol level even while the SDK-surface API for retrieving proofs is deferred. A per-chunk inclusion-proof API (`outlets.inclusion_proof(invocation_id, chunk_index) → path`) is the **only** deferred piece; the manifest root commitment and the audit-path algorithm are both protocol-level invariants, so auditing tools can reconstruct proofs off-line by replaying the event log and the retained chunk sequence using a standard RFC 6962 verifier. The SDK API deferral is tracked in discussion [#1698](https://github.com/limn-works/scp/discussions/1698).
 
 **Classification orthogonality.** Both Query and Action outlets stream.
 
@@ -616,7 +682,7 @@ pub struct MetadataVisibilityPolicy {
     pub name: FieldVisibility,
     pub description: FieldVisibility,
     pub economic_policy: FieldVisibility,
-    pub tool_interface_count: FieldVisibility,
+    pub outlet_interface_count: FieldVisibility,
     pub child_context_info: FieldVisibility,
 }
 
@@ -947,7 +1013,7 @@ Template: "scp:template/bilateral-ephemeral"
   memory_scope: ephemeral
   ttl:         required (creator sets duration, no default — forces intentionality)
   tools:       none
-  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
+  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/bilateral-persistent"
   ceiling:     [messages:read, messages:write, member:ban]
@@ -956,16 +1022,16 @@ Template: "scp:template/bilateral-persistent"
   memory_scope: full
   ttl:         none
   tools:       none
-  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
+  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/coordination"
-  ceiling:     [messages:read, messages:write, tool:invoke:*, member:ban]
+  ceiling:     [messages:read, messages:write, outlet:query:*, outlet:call:*, member:ban]
   roles:       [admin (creator), member (joiner)]
   governance:  single-admin
   memory_scope: summary
   ttl:         required (creator sets duration)
-  tools:       creator-defined at creation
-  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
+  outlets:     creator-defined at creation
+  metadata_visibility: { member_count: MemberOnly, context_age: MemberOnly, creator_identity: MemberOnly, name: PreJoin, description: MemberOnly, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/group-discussion"
   ceiling:     [messages:read, messages:write, member:invite, member:ban]
@@ -974,14 +1040,14 @@ Template: "scp:template/group-discussion"
   memory_scope: full
   ttl:         optional
   tools:       none
-  metadata_visibility: { member_count: PreJoin, context_age: MemberOnly, creator_identity: PreJoin, name: PreJoin, description: PreJoin, economic_policy: MemberOnly, tool_interface_count: MemberOnly, child_context_info: MemberOnly }
+  metadata_visibility: { member_count: PreJoin, context_age: MemberOnly, creator_identity: PreJoin, name: PreJoin, description: PreJoin, economic_policy: MemberOnly, outlet_interface_count: MemberOnly, child_context_info: MemberOnly }
 
 Template: "scp:template/public-broadcast"
   mode:          Broadcast
-  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*]
+  ceiling:       [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*]
   roles:
     owner:       all capabilities in ceiling + member:invite, role:assign, context:close
-    author:      messages:write, messages:read, tool:invoke:*
+    author:      messages:write, messages:read, outlet:query:*, outlet:call:*
     subscriber:  messages:read (auto-granted on DID-authenticated registration)
   governance:    single-admin
   memory_scope:  full
@@ -991,10 +1057,10 @@ Template: "scp:template/public-broadcast"
 
 Template: "scp:template/gated-broadcast"
   mode:          Broadcast
-  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*]
+  ceiling:       [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*]
   roles:
     owner:       all capabilities in ceiling + member:invite, role:assign, context:close
-    author:      messages:write, messages:read, tool:invoke:*
+    author:      messages:write, messages:read, outlet:query:*, outlet:call:*
     subscriber:  messages:read (requires admin-issued UCAN)
   governance:    single-admin
   memory_scope:  full
@@ -1002,23 +1068,23 @@ Template: "scp:template/gated-broadcast"
   metadata_visibility: { member_count: MemberOnly, all others: PreJoin }
   projection_policy: { default_rule: Gated, overrides: [] }
 
-Template: "scp:template/tool-interface"
-  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*, member:ban]
+Template: "scp:template/outlet-interface"
+  ceiling:       [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*, member:ban]
   roles:         [admin (creator), member (joiner)]
   governance:    single-admin
   memory_scope:  full
   ttl:           optional
-  tools:         creator-defined at creation
+  outlets:       creator-defined at creation
   metadata_visibility: all PreJoin
 
 Template: "scp:template/paid-service"
-  ceiling:       [messages:read, messages:write, tool:register, tool:invoke:*, member:ban]
+  ceiling:       [messages:read, messages:write, outlet:register, outlet:query:*, outlet:call:*, member:ban]
   ceiling_policy: immutable
   roles:         [admin (creator), member (joiner)]
   governance:    single-admin
   memory_scope:  full (receipts are provenance)
-  economic_policy: required — per_tool_invoke must be set at creation
-  extends:       scp:template/tool-interface
+  economic_policy: required — per_outlet_call must be set at creation
+  extends:       scp:template/outlet-interface
   ttl:           optional
   metadata_visibility: { economic_policy: PreJoin, member_count: MemberOnly, all others: PreJoin }
 
@@ -1068,12 +1134,12 @@ TrustRequirement:
 Example policy: "Auto-accept `bilateral-ephemeral` contexts from any DID I share at least one context with, if TTL ≤ 10 minutes, at most 5 per hour."
 
 **Security properties:**
-- Policies never auto-accept contexts with tool capabilities (ceiling containing `tool:invoke:*`). Tool access always requires explicit confirmation. This is non-overridable.
+- Policies never auto-accept contexts with outlet capabilities (ceiling containing `outlet:query:*` or `outlet:call:*`). Outlet access always requires explicit confirmation. This is non-overridable.
 - Rate limiting prevents a compromised contact from flooding auto-accepts.
 - The `shared_context` trust requirement means strangers can never trigger auto-accept — the existing shared context provides the trust baseline.
 - Auto-accept policies are enforced in the SDK, not the protocol. The protocol sees a normal context join. The policy just determines whether the SDK prompts the human or acts autonomously.
 
-**No auto-accept for tool-bearing contexts.** This is a hard rule, not a default. Any context whose ceiling includes `tool:invoke:*`, `tool:invoke:{tool_id}`, or any tool-related capability requires explicit human or agent confirmation regardless of auto-accept policies. The rationale: tool access is the capability that enables cross-context data flow (§6.2). Auto-accepting it would silently expand the agent's cross-context attack surface.
+**No auto-accept for outlet-bearing contexts.** This is a hard rule, not a default. Any context whose ceiling includes `outlet:query:*`, `outlet:query:{outlet_id}`, `outlet:call:*`, `outlet:call:{outlet_id}`, `outlet:register`, or any outlet-related capability requires explicit human or agent confirmation regardless of auto-accept policies. The rationale: outlet access is the capability that enables cross-context data flow (§6.2). Auto-accepting it would silently expand the agent's cross-context attack surface.
 
 **No auto-accept for paid contexts.** This is a hard rule, not a default. Any context with an `EconomicPolicy` requiring payment (non-empty `CostSchedule`) requires explicit confirmation regardless of auto-accept policies. Agents never silently incur costs. See §19.3.
 
@@ -1355,13 +1421,13 @@ Multi-parent chain:
 A child's capability ceiling is the intersection of all parent ceilings. This is enforced at creation time and is the hard security boundary that prevents capability escalation through nesting.
 
 ```
-Parent A ceiling: [messages:read, messages:write, tool:invoke:*, media]
-Parent B ceiling: [messages:read, messages:write, tool:invoke:*]
+Parent A ceiling: [messages:read, messages:write, outlet:query:*, outlet:call:*, media]
+Parent B ceiling: [messages:read, messages:write, outlet:query:*, outlet:call:*]
 
-Child ceiling ≤ intersection = [messages:read, messages:write, tool:invoke:*]
+Child ceiling ≤ intersection = [messages:read, messages:write, outlet:query:*, outlet:call:*]
 ```
 
-The child's ceiling can be equal to or narrower than the intersection — never broader. A child that only needs messaging can declare `[messages:read, messages:write]` even if the intersection would allow tools.
+The child's ceiling can be equal to or narrower than the intersection — never broader. A child that only needs messaging can declare `[messages:read, messages:write]` even if the intersection would allow outlets.
 
 If a parent has a `governed` ceiling policy (§5.3) and its ceiling is *reduced*, the child's ceiling is retrospectively reduced to maintain the intersection invariant. If this makes the child's ceiling empty (no capabilities remain), the child closes automatically. This cascade is logged in both the parent's and child's event logs. If a parent's ceiling is *expanded*, the child's ceiling does not automatically expand — the child's own ceiling policy governs.
 

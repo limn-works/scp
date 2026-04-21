@@ -76,6 +76,30 @@ Tool interface creation requires explicit consent from both the exposing context
    ```
    This follows Context B's governance model. Acceptance creates an `InterfaceEstablished` event in both event logs.
 
+   **`hop_salt` derivation.** The `InterfaceEstablished` event carries a `hop_salt: [u8; 32]` used to pseudonymize `source_chain.context_id` entries for observers who are not members of each hop (§5.4.4). The salt is deterministically derived from both contexts' MLS exporter keys so no raw random sampling is required, revocation of the interface rotates the salt automatically on re-establishment, and the salt cannot be chosen by either party alone:
+
+   ```
+   // Both contexts derive the same 32-byte salt independently at acceptance time.
+   // MLS_EXPORTER(label, context, length) is the RFC 9420 §8.5 export primitive.
+   ikm_a = MLS_EXPORTER("scp-context-hop-salt-v1", b"", 32)  // exporter on Context A's current epoch
+   ikm_b = MLS_EXPORTER("scp-context-hop-salt-v1", b"", 32)  // exporter on Context B's current epoch
+
+   // Canonical concatenation: lexicographically smaller context_id first, so both sides agree.
+   ordered = if context_a_id < context_b_id { (ikm_a, ikm_b) } else { (ikm_b, ikm_a) }
+
+   hop_salt = HKDF-SHA-256(
+     salt = b"",
+     ikm  = ordered.0 || ordered.1,
+     info = "SCP-CONTEXT-HOP-SALT-V1:" || canonical_context_pair(a_id, b_id),
+     L    = 32,
+   )
+
+   // canonical_context_pair sorts the two context_ids lexicographically, emits them as
+   //   len_be32(min_id) || min_id || len_be32(max_id) || max_id
+   ```
+
+   Because MLS exporter keys rotate on every epoch advance, `hop_salt` rotates naturally with each context's epoch progression without any interface-level bookkeeping. Revoking and re-establishing the interface also forces a fresh salt (each side re-exports on whatever epoch is current at re-acceptance). The `SCP-CONTEXT-HOP-SALT-V1:` separator is registered in §9.18.2. Both contexts store the derived salt in their interface state record; cross-context error wrapping (§5.4.4) reads the salt from this record when pseudonymizing hops.
+
 5. **Teardown.** Either context can revoke the interface at any time via governance action `RevokeToolInterface { interface_id }`. Revocation is unilateral — no consent from the other side is needed. An `InterfaceRevoked` event is recorded in the revoking context's event log.
 
 **Outbound and inbound policies:**
@@ -127,13 +151,15 @@ Cross-context outlet calls inherit an **`origin_kind`** (an `OutletKind` per §5
 
 The rule closes the "free read laundered into paid write" class of attacks: Query is the cacheable, cost-capped tier, and allowing a Query to cascade into an Action would let an adversary exercise Action semantics under Query rate limits and economics.
 
-**`origin_kind` is bound to the UCAN delegation chain, not to runtime state.** The outermost caller sets `origin_kind` equal to the stem it exercises — `Query` when it exercises `outlet_query:*`, `Action` when it exercises `outlet_call:*`. The stem lives inside a signed UCAN delegation, so the outermost `origin_kind` is not a claim any participant makes at runtime; it is a property of the token. Every cross-context hop propagates `origin_kind` by including it as part of the delegated UCAN's `nb` field (alongside the caveats from §7.3.8). Each hop target, when it validates the incoming UCAN in its full 11-step pipeline (§7.2.1), checks:
+**`origin_kind` is bound to the UCAN delegation chain, not to runtime state.** The outermost caller sets `origin_kind` equal to the stem it exercises — `Query` when it exercises `outlet_query:*`, `Action` when it exercises `outlet_call:*`. The stem lives inside a signed UCAN delegation, so the outermost `origin_kind` is not a claim any participant makes at runtime; it is a property of the token. Every cross-context hop propagates `origin_kind` inside the delegated UCAN's `nb` field as the dedicated `origin_kind` slot of `InvocationCaveats` (§7.3.8). Because `origin_kind` is a field of the signed `InvocationCaveats`, it is covered by each hop's delegation signature.
+
+The caveats-layer `narrow()` rule (§7.3.8) enforces equality between child and parent `origin_kind` at every delegation step:
 
 ```
-incoming.nb.origin_kind  ==  parent.nb.origin_kind
+child.nb.InvocationCaveats.origin_kind  ==  parent.nb.InvocationCaveats.origin_kind
 ```
 
-— that is, `origin_kind` is preserved across every delegation step; a child delegation MUST NOT reset or widen it. Narrowing is also forbidden (there is no legitimate reason to narrow `origin_kind` from `Action` to `Query`, and if there were, the amplification rule still rejects the resulting `Query → Action` hop at the target). An `origin_kind` mismatch between a child and its parent is an attenuation violation and returns `OutletErrorClass::Authorization::AttenuationViolation`.
+— that is, `origin_kind` is preserved across every delegation step; a child delegation MUST NOT reset, widen, or narrow it. An `origin_kind` mismatch between a child and its parent is an attenuation violation at Step 7b of the UCAN validation pipeline (§7.2.1) and returns `OutletErrorClass::Authorization::AttenuationViolation`. This makes the "origin_kind is signed" claim operationally true: the equality check runs on the `narrow()` verifier, which is the single chokepoint where the signed child-parent relationship is validated.
 
 Because `origin_kind` is covered by each hop's UCAN signature, the hop target cannot be tricked into treating a `Query`-originated call as `Action`-originated by a forged claim at the transport layer — forging `origin_kind` would require forging the signed delegation.
 
@@ -180,6 +206,22 @@ Sessions have an optional TTL set by the tool's context. When set, expired sessi
 **Session chain-amplification binding.** A session inherits the `origin_kind` (§6.2.0.3) of the first call that created it. Every subsequent call routed through the session (identified by `session_id` in the input) is treated by the runtime as carrying the session's recorded `origin_kind`, regardless of any new UCAN presented by the caller or any `origin_kind` claim in a later delegation. Concretely: if a session was opened by a `Query`-originated call, every call through that session is treated as `origin_kind = Query` for amplification-rule purposes, and any attempt to call an Action outlet through the session is rejected with `AmplificationViolation`. This prevents async self-triggered amplification — a `Query`-originated session cannot "mature" into an Action session by the caller later presenting an Action-rooted UCAN.
 
 Sessions store their recorded `origin_kind` alongside the session state. A session opened with `origin_kind = Action` retains Action semantics for its lifetime; a session opened with `origin_kind = Query` retains Query semantics for its lifetime. There is no session upgrade path — re-opening as Action requires a new session with a fresh `session_id`.
+
+#### 6.2.1.1 Stateful Outlet Sessions × Streaming
+
+When a streaming outlet (§5.4.5) participates in a session, the session and stream lifecycles interact through five invariants. The session owns the long-lived authorization state; each stream owns its per-invocation chunk flow.
+
+(a) **`session_id` carried on open.** `OutletStreamOpen` carries an optional `session_id: Option<String>` field. When present, the open MUST reference an existing, non-expired session whose `session_id` matches, whose TTL has not elapsed, and whose recorded `origin_kind` is compatible with the outlet's kind per §6.2.0.3. An `OutletStreamOpen` referencing an unknown, expired, or amplification-incompatible session is rejected at open with `OutletErrorClass::Protocol::UnknownSession` or `OutletErrorClass::Authorization::AmplificationViolation` respectively.
+
+(b) **One concurrent stream per session.** A session supports AT MOST one concurrent stream. A second `OutletStreamOpen` referencing a `session_id` that already has a live stream is rejected with `OutletErrorClass::Protocol::StreamAlreadyOpen` (class Protocol, slug `protocol.stream-already-open`). The rule closes the "parallel billing channels through one session" surface. A stream is considered live from open until the terminal chunk is written (End or Error{terminal:true}) or the stream is cancelled and the cancel-ack chunk arrives.
+
+(c) **Session owns `origin_kind`.** The session's recorded `origin_kind` (§6.2.1 "Session chain-amplification binding") is the authoritative value for every stream opened against the session. The opening `OutletStreamOpen`'s `effective_caveats.origin_kind` MUST equal the session's recorded `origin_kind`; a mismatch is an attenuation failure (not a silent override). This means a session opened as `Query` cannot host a stream whose narrowed caveats claim `Action` — the session's `origin_kind` shields the hop target from any later attempt to re-classify.
+
+(d) **Session owns `caveats_binding`.** The session's first stream establishes the session's pinned `caveats_binding` at session-open time (recorded from that stream's `OutletStreamOpen.caveats_binding`). Every subsequent stream opened against the same session MUST present an identical `caveats_binding`; a mismatch is rejected as `OutletErrorClass::Authorization::AttenuationViolation` under the caveats-binding-pinning invariant (§5.4.5). This extends stream-level pinning to the session lifetime — a single session cannot host multiple streams under different caveat sets, only retries of the same caveat contract.
+
+(e) **`stream_epoch` matches session's MLS epoch at open.** Each stream records `stream_epoch` equal to the hosting context's MLS epoch counter at the moment of `OutletStreamOpen` acceptance. The session independently records the MLS epoch at which it was opened (`session_epoch`). A stream whose `stream_epoch != session_epoch` is permitted (sessions persist across epoch advances), but the re-encryption bridge on cross-context streaming (§6.2.0.5) uses `stream_epoch` for chunk-level re-encryption, not `session_epoch`. Recording the two separately means a long-lived session spanning many MLS epochs still produces a per-stream chunk manifest bound to its own epoch, so a single compromised epoch exposes chunks from only the streams opened within that epoch, not the session's entire history.
+
+Together these invariants make sessions a legitimate long-lived authorization envelope without allowing them to be used as a channel that escapes stream-level billing, amplification, or caveats enforcement.
 
 ### 6.2.2 Protocol-Level Discovery
 

@@ -310,7 +310,7 @@ pub struct EconomicPolicy {
 pub struct CostSchedule {
     pub currency: CurrencyCode,                     // currency for all Amount fields in this schedule
     pub per_message: Option<Amount>,
-    pub per_tool_invoke: Option<Amount>,            // default for tools without own cost
+    pub per_outlet_call: Option<Amount>,            // default for Action outlets without own cost
     pub per_join: Option<Amount>,                   // one-time membership cost
     pub per_period: Option<SubscriptionCost>,       // recurring (carries its own currency for flexibility)
     pub per_byte_stored: Option<Amount>,            // storage costs
@@ -319,11 +319,11 @@ pub struct CostSchedule {
 
 **Outlet-level costs**: declared in outlet registration (§5.4), additive with context costs. An outlet calling an external API can pass through its cost. Outlet costs carry their own payee DID (may differ from context payee).
 
-**Query outlet cost contract (§5.4.2).** A Query outlet's registered cost MUST be absent or zero. This is a structural floor enforced at registration time. Separately, the runtime guarantees that any Query invocation incurs at most one charge per `(invoker_did, SHA-256(canonical_jcs(input)), epoch_window)` via the shared operator-signed cache (§5.4.3). When the floor is combined with the at-most-once guarantee, the practical contract is "Query outlets are free"; the at-most-once statement is stated explicitly so that future evolution cannot smuggle paid reads in without breaking the invariant. Action outlets (§5.4.2) have no such contract — each invocation may be charged independently subject to the normal cost schedule.
+**Query outlet cost contract (§5.4.2).** A Query outlet's registered cost MUST be absent or zero (`cost.is_none() || cost.amount == 0`) AND `cost.cost_formula` MUST be absent. This is a **structural floor** enforced at registration time — rejection with `OutletErrorClass::Protocol::QueryCostViolation` if violated. Action outlets (§5.4.2) have no such contract — each invocation may be charged independently subject to the normal cost schedule. Any cache-assisted "at-most-once" charge semantics are a property of future cache designs (§5.4.3 deferred per discussion [#1698](https://github.com/limn-works/scp/discussions/1698)), not of this section; the structural floor stands on its own regardless of whether a cache ever ships.
 
 **Relay-level costs**: declared in `.well-known/scp` `relay_config` (§18.3.3 extension). Separate economic relationship from in-context pricing — relay charges for transport, context charges for participation.
 
-**Economic policy is orthogonal to capability ceiling** (§5.3). Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with `tool:invoke:*` in its ceiling and `per_tool_invoke: $0.01` in its economic policy allows tool invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them.
+**Economic policy is orthogonal to capability ceiling** (§5.3). Ceiling governs what CAN happen; economic policy governs what it COSTS. Not a new ceiling category. A context with `outlet_call:*` in its ceiling and `per_outlet_call: $0.01` in its economic policy allows Action outlet invocations that cost $0.01 each. Removing the cost doesn't expand capabilities; adding a cost doesn't restrict them.
 
 **Child context independence:** Child contexts (§5.13) do NOT inherit parent economic policy — each child's pricing is independent. A free parent can have paid children and vice versa.
 
@@ -556,12 +556,12 @@ All follow the legibility principle: agents see economic terms before committing
 
 Two new well-known templates:
 
-**`scp:template/paid-service`:** Tool invocation context with per-invoke cost. `economic_policy.cost_schedule.per_tool_invoke` required at creation. Single-admin governance. Extends `scp:template/tool-interface`.
+**`scp:template/paid-service`:** Outlet invocation context with per-invoke cost. `economic_policy.cost_schedule.per_outlet_call` required at creation. Single-admin governance. Extends `scp:template/outlet-interface`.
 
 Properties:
-- Ceiling: `messages:read`, `messages:write`, `tool:register`, `tool:invoke:*`
+- Ceiling: `messages:read`, `messages:write`, `outlet:register`, `outlet:query:*`, `outlet:call:*`
 - Ceiling policy: `immutable`
-- Economic policy: required, `per_tool_invoke` must be set
+- Economic policy: required, `per_outlet_call` must be set
 - Governance: single-admin
 - Memory scope: `full` (receipts are provenance)
 
@@ -676,7 +676,7 @@ This section tabulates the wire format for all economy protocol types that cross
 |-------|------|----------|-----------|
 | `currency` | `CurrencyCode` ([u8; 4]) | Yes | Currency for all costs in this schedule. |
 | `per_message` | `Amount` (u64) | No | Cost per message sent. |
-| `per_tool_invoke` | `Amount` (u64) | No | Cost per tool invocation. |
+| `per_outlet_call` | `Amount` (u64) | No | Cost per Action outlet invocation (Query outlets MUST be absent-or-zero per §5.4.2). |
 | `per_join` | `Amount` (u64) | No | One-time cost to join the context. |
 | `per_period` | `SubscriptionCost` | No | Recurring subscription cost. |
 | `per_byte_stored` | `Amount` (u64) | No | Cost per byte of stored data. |
@@ -686,7 +686,7 @@ This section tabulates the wire format for all economy protocol types that cross
 | Variant | Serde Tag | Semantics |
 |---------|-----------|-----------|
 | `MessageSend` | `"MessageSend"` | Sending a message. |
-| `ToolInvoke` | `"ToolInvoke"` | Invoking a tool. |
+| `OutletCall` | `"OutletCall"` | Invoking an Action outlet (Query outlets are absent-or-zero cost per §5.4.2). |
 | `ContextJoin` | `"ContextJoin"` | Joining a context. |
 | `SubscriptionPeriod` | `"SubscriptionPeriod"` | Recurring subscription payment. |
 | `ByteStored` | `"ByteStored"` | Data storage. |
