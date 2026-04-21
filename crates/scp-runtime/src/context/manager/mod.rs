@@ -935,7 +935,13 @@ pub trait ContextPersistence: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Governance-related per-context state.
-struct GovernanceState {
+///
+/// **Visibility:** elevated to `pub(crate)` by commit 12a of ADR-049 so the
+/// actor's [`crate::context::actor::state::PerContextState`] can carry a
+/// field of this type while the handler-body migration is under way.
+/// Commit 12d deletes this struct along with the rest of the legacy manager
+/// module.
+pub(crate) struct GovernanceState {
     /// The governance engine for this context (ADR-031, spec §5.9).
     engine: Box<dyn GovernanceEngine>,
     /// Proposal IDs that have already been executed, mapped to the unix
@@ -1081,7 +1087,13 @@ impl GovernanceState {
 }
 
 /// MLS epoch and reconnection state.
-struct EpochState {
+///
+/// **Visibility:** elevated to `pub(crate)` by commit 12a of ADR-049 so the
+/// actor's [`crate::context::actor::state::PerContextState`] can carry a
+/// field of this type while the handler-body migration is under way.
+/// Commit 12d deletes this struct along with the rest of the legacy manager
+/// module.
+pub(crate) struct EpochState {
     /// Monotonic MLS epoch counter. Incremented each time a governance action
     /// triggers an MLS membership change (`AddMember`, `RemoveMember`,
     /// `Revoke`, `ResetMember`). Used to populate
@@ -1115,7 +1127,13 @@ struct EpochState {
 ///
 /// Capability suspension is now handled by `ContextRoleState::suspended_capabilities`.
 /// This struct retains the CEK exclusion list and per-member access key store.
-struct AccessControlState {
+///
+/// **Visibility:** elevated to `pub(crate)` by commit 12a of ADR-049 so the
+/// actor's [`crate::context::actor::state::PerContextState`] can carry a
+/// field of this type while the handler-body migration is under way.
+/// Commit 12d deletes this struct along with the rest of the legacy manager
+/// module.
+pub(crate) struct AccessControlState {
     /// Members excluded from future CEK wrapping (`Revoke { access: AccessScope::Write }`,
     /// ADR-038, §9.17). This is a cryptographic exclusion list, NOT an
     /// application-level capability suspension.
@@ -1126,8 +1144,117 @@ struct AccessControlState {
     access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore,
 }
 
+impl AccessControlState {
+    /// Construct a fresh, empty `AccessControlState`. Used by the actor's
+    /// [`crate::context::actor::state::PerContextState`] default-for-test
+    /// fixture (commit 12a of ADR-049) to populate the corresponding field
+    /// without peeking at private fields. Deleted in commit 12d alongside
+    /// the rest of the legacy manager module.
+    #[must_use]
+    pub(crate) fn new_empty_for_actor() -> Self {
+        Self {
+            read_exclusion_list: HashSet::new(),
+            access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        }
+    }
+}
+
+impl EpochState {
+    /// Construct a fresh `EpochState` with `mls_epoch = 0`, an empty
+    /// coordinator scoped to the given context, a fresh grace store, and
+    /// `needs_reconnect = false`. Used by the actor's
+    /// [`crate::context::actor::state::PerContextState`] default-for-test
+    /// fixture (commit 12a of ADR-049). Deleted in commit 12d alongside
+    /// the rest of the legacy manager module.
+    #[must_use]
+    pub(crate) fn new_fresh_for_actor(context_id: &str) -> Self {
+        Self {
+            mls_epoch: 0,
+            coordinator: EpochCoordinator::from_records(Vec::new(), context_id),
+            grace_store: crate::crypto::mls::epoch_grace::EpochGraceStore::new(),
+            needs_reconnect: false,
+        }
+    }
+}
+
+impl TtlState {
+    /// Construct a fresh `TtlState` with a clock-less `TtlTimer` and no
+    /// active extension. Used by the actor's
+    /// [`crate::context::actor::state::PerContextState`] default-for-test
+    /// fixture (commit 12a of ADR-049). Deleted in commit 12d alongside
+    /// the rest of the legacy manager module.
+    #[must_use]
+    pub(crate) fn new_fresh_for_actor() -> Self {
+        Self {
+            timer: TtlTimer::new(),
+            extension: None,
+        }
+    }
+}
+
+impl GovernanceState {
+    /// Construct a fresh, empty `GovernanceState` seeded with a
+    /// `SingleAdminEngine` for `admin_did`, a no-op key resolver, and the
+    /// given clock. Intended exclusively as the default fixture for the
+    /// actor's [`crate::context::actor::state::PerContextState`]
+    /// default-for-test helper (commit 12a of ADR-049). Production paths
+    /// continue to construct the struct inline from the lifecycle handler.
+    /// Deleted in commit 12d alongside the rest of the legacy manager
+    /// module.
+    #[must_use]
+    pub(crate) fn new_fresh_for_actor(
+        context_id: &str,
+        admin_did: DID,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        let resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_did: &DID| None);
+        let engine: Box<dyn GovernanceEngine> =
+            Box::new(SingleAdminEngine::new(admin_did, resolver));
+        Self {
+            engine,
+            executed_proposals: HashMap::new(),
+            approved_proposals: HashMap::new(),
+            next_proposal_seq: 0,
+            freeze: None,
+            timeout_task: GovernanceTimeoutTask::new(),
+            deadlock: DeadlockDetectionState::default(),
+            threshold_signers: Vec::new(),
+            threshold_value: 0,
+            pending_ceiling_modification: None,
+            pending_economic_policy_change: None,
+            registered_tools: Vec::new(),
+            tool_interfaces: Vec::new(),
+            pruning_policy: None,
+            economic_policy: None,
+            budget_tracker: MemberBudgetTracker::new(),
+            last_known_members: HashSet::new(),
+            pending_epoch_resets: Vec::new(),
+            consequence_rules: Vec::new(),
+            velocity_tracker: scp_protocol::economy::antispam::SenderVelocityTracker::new(3600),
+            participation_cache: HashMap::new(),
+            cooldown_until: HashMap::new(),
+            message_pricing: None,
+            hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::new(
+                scp_protocol::economy::antispam::HardRateLimitConfig::default(),
+            ),
+            spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::new(
+                context_id.to_owned(),
+                clock,
+            ),
+            revoked_spending_ucan_cids: HashSet::new(),
+            proposal_timestamps: HashMap::new(),
+        }
+    }
+}
+
 /// TTL timer and extension state.
-struct TtlState {
+///
+/// **Visibility:** elevated to `pub(crate)` by commit 12a of ADR-049 so the
+/// actor's [`crate::context::actor::state::PerContextState`] can carry a
+/// field of this type while the handler-body migration is under way.
+/// Commit 12d deletes this struct along with the rest of the legacy manager
+/// module.
+pub(crate) struct TtlState {
     /// TTL timer management (SCP-021).
     timer: TtlTimer,
     /// Active TTL extension proposal, if any (SCP-021).
