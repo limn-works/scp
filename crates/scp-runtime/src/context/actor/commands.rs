@@ -58,6 +58,15 @@ type BroadcastKeyReply = oneshot::Sender<Result<(zeroize::Zeroizing<[u8; 32]>, u
 /// internally. Factored out to satisfy `clippy::type_complexity`.
 pub type DeliverIncomingReply = oneshot::Sender<Result<Option<(Vec<u8>, String)>, ContextError>>;
 
+/// Reply-channel type alias for [`MessagingCommand::DrainEvents`]. The
+/// reply carries the drained `ContextEvent` vector — empty iff the
+/// context is unknown (matches the legacy
+/// [`ContextManager::drain_events`](crate::context::manager::ContextManager::drain_events)
+/// "soft-default on unknown context" contract). Factored out to satisfy
+/// `clippy::type_complexity`.
+pub type DrainEventsReply =
+    oneshot::Sender<Result<Vec<scp_protocol::context::membership::ContextEvent>, ContextError>>;
+
 // ---------------------------------------------------------------------------
 // Outer enum
 // ---------------------------------------------------------------------------
@@ -220,6 +229,69 @@ pub enum MessagingCommand {
         /// Oneshot reply channel. See [`DeliverIncomingReply`].
         reply: DeliverIncomingReply,
     },
+
+    /// Drain the per-context receive buffer.
+    ///
+    /// Mirrors the legacy
+    /// [`ContextManager::drain_events`](crate::context::manager::ContextManager::drain_events)
+    /// signature: empties the receive buffer and returns the drained
+    /// events. The legacy method returns an empty `Vec` on unknown
+    /// context; the dispatch shim preserves that contract by surfacing
+    /// `Ok(Vec::new())` rather than `Err(ContextNotRegistered)`.
+    ///
+    /// # Mutation classification
+    ///
+    /// `drain_events` mutates the per-context state by emptying the
+    /// receive buffer; it lives on the `MessagingCommand` enum because
+    /// the receive buffer is the messaging path's downstream sink (the
+    /// per-context buffer is fed by `deliver_incoming` and consumed by
+    /// FFI receive polling). Routing it through the messaging dispatch
+    /// keeps the receive-side state machine in one place.
+    DrainEvents {
+        /// Context identifier.
+        context_id: String,
+        /// Oneshot reply channel. See [`DrainEventsReply`].
+        reply: DrainEventsReply,
+    },
+
+    /// Send the local member's pseudonym announcement (§9.10.4) to the
+    /// other members of a context.
+    ///
+    /// Mirrors the legacy
+    /// [`ContextManager::send_pseudonym_announcement`](crate::context::manager::ContextManager::send_pseudonym_announcement)
+    /// signature exactly: the handler delegates to that method which
+    /// in turn wraps the announcement payload and routes it through
+    /// `send_message`. Best-effort — the legacy method returns no
+    /// error and silently swallows transport / serialization failures
+    /// (only logs them); this dispatch surface preserves the same
+    /// contract by replying `Ok(())` regardless of inner errors.
+    SendPseudonymAnnouncement {
+        /// Boxed owned payload — see [`SendPseudonymAnnouncementPayload`].
+        payload: Box<SendPseudonymAnnouncementPayload>,
+        /// Oneshot reply channel. Always replies `Ok(())` (matches the
+        /// legacy method's no-error contract).
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+}
+
+/// Payload for [`MessagingCommand::SendPseudonymAnnouncement`]. Boxed
+/// inside the variant so the enum's variant sizes stay uniform under
+/// `clippy::large_enum_variant` despite carrying
+/// [`ContextParams`](scp_protocol::context::params::ContextParams)
+/// (~1KB) and a zeroizing signing key.
+pub struct SendPseudonymAnnouncementPayload {
+    /// Context identifier (plain string, matches the legacy API).
+    pub context_id: String,
+    /// Creation-time parameters used to rebuild an ephemeral
+    /// [`ContextHandle`](crate::context::ContextHandle) on the handler
+    /// side. Cloned from the caller's handle at dispatch time.
+    pub params: scp_protocol::context::params::ContextParams,
+    /// Sender DID (the announcing member).
+    pub sender_did: scp_identity::DID,
+    /// Sender's Ed25519 signing key. Wrapped in [`SigningKeyBytes`] so
+    /// the private key zeroes on drop (mirrors the
+    /// [`SendMessagePayload`] pattern).
+    pub signing_key: SigningKeyBytes,
 }
 
 /// Owned Ed25519 signing key bytes used inside
@@ -340,6 +412,21 @@ pub struct CloseContextPayload {
     pub initiator_did: scp_identity::DID,
 }
 
+/// Payload for [`LifecycleCommand::RestoreContext`]. Boxed inside the
+/// variant for the same reason as [`CreateContextPayload`] —
+/// `ContextParams` is ~1KB.
+pub struct RestoreContextPayload {
+    /// Context identifier string.
+    pub context_id: String,
+    /// Context params — used to rebuild an ephemeral
+    /// [`ContextHandle`](crate::context::ContextHandle) on the handler
+    /// side. The legacy method takes the handle by reference; the
+    /// command carries the underlying params so the dispatch layer can
+    /// reconstruct the handle without lifetime juggling across the
+    /// mailbox.
+    pub params: scp_protocol::context::params::ContextParams,
+}
+
 /// See [`ContextCommand::Lifecycle`]. Real variants land in commit 9 of
 /// the ADR-049 commit ladder (see `handlers/lifecycle.rs`). Variants
 /// mirror the legacy
@@ -454,6 +541,76 @@ pub enum LifecycleCommand {
         export: Box<crate::context::export_import::ContextExport>,
         /// Oneshot reply channel. See [`ImportContextReply`].
         reply: ImportContextReply,
+    },
+
+    /// Restore a single previously-persisted context from storage.
+    /// Mirrors
+    /// [`ContextManager::restore_context`](crate::context::manager::ContextManager::restore_context).
+    ///
+    /// The legacy method loads a snapshot from the configured
+    /// [`ContextPersistence`](crate::context::manager::ContextPersistence)
+    /// provider, validates / sanitizes consequence rules + cooldown
+    /// state, restores the MLS crypto state, and reconstructs the
+    /// per-context governance / membership / broadcast structures.
+    /// Boxed payload — see [`RestoreContextPayload`].
+    RestoreContext {
+        /// Boxed owned payload.
+        payload: Box<RestoreContextPayload>,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Generate and store a per-member access key for explicit
+    /// lifecycle management (§9.17.2 step 1). Mirrors
+    /// [`ContextManager::generate_context_access_key`](crate::context::manager::ContextManager::generate_context_access_key).
+    ///
+    /// Requires `ContextClose` capability on the caller. Overwrites any
+    /// existing key for the same `(context_id, member_did)` pair.
+    GenerateContextAccessKey {
+        /// Context identifier string.
+        context_id: String,
+        /// Member DID receiving the key.
+        member_did: String,
+        /// Caller DID — must hold `ContextClose` capability.
+        caller_did: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Revoke (remove) a member's access key from the context's
+    /// access key store (§9.17.2 step 3, ADR-038). Mirrors
+    /// [`ContextManager::revoke_context_access_key`](crate::context::manager::ContextManager::revoke_context_access_key).
+    ///
+    /// Requires `ContextClose` capability on the caller.
+    RevokeContextAccessKey {
+        /// Context identifier string.
+        context_id: String,
+        /// Member DID losing the key.
+        member_did: String,
+        /// Caller DID — must hold `ContextClose` capability.
+        caller_did: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Restore a member's access key by generating a fresh key at
+    /// epoch 0 (§9.17.2 step 5, ADR-038 forward-only restoration).
+    /// Mirrors
+    /// [`ContextManager::restore_context_access_key`](crate::context::manager::ContextManager::restore_context_access_key).
+    ///
+    /// Requires `ContextClose` capability on the caller. Historical
+    /// content from the revocation period remains permanently
+    /// inaccessible (the old key was destroyed and is never
+    /// re-distributed).
+    RestoreContextAccessKey {
+        /// Context identifier string.
+        context_id: String,
+        /// Member DID receiving the restored key.
+        member_did: String,
+        /// Caller DID — must hold `ContextClose` capability.
+        caller_did: String,
+        /// Oneshot reply channel.
+        reply: oneshot::Sender<Result<(), ContextError>>,
     },
 }
 

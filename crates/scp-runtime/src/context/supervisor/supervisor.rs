@@ -1632,6 +1632,166 @@ impl Supervisor {
             })
     }
 
+    // ---------------------------------------------------------------
+    // Supervisor-scope direct methods (no per-context command dispatch)
+    //
+    // The methods in this block route to the attached
+    // [`ContextManager`](crate::context::manager::ContextManager)
+    // surface directly because the underlying operation has no
+    // per-context lock-and-handler shape: it operates on the
+    // supervisor-wide identity registry (`local_dids`), or it iterates
+    // every context (`flush_all_*`, `restore_all_contexts`,
+    // `shutdown_all_contexts`).
+    //
+    // Each method is a thin shim — it resolves the attached manager
+    // and forwards. Deleted in commit 12 alongside the rest of the
+    // shim when the supervisor owns these surfaces directly.
+    // ---------------------------------------------------------------
+
+    /// Register a DID as locally controlled by this node / SDK.
+    ///
+    /// Mirrors
+    /// [`ContextManager::register_local_did`](crate::context::manager::ContextManager::register_local_did)
+    /// — the registered DIDs participate in the defense-in-depth check
+    /// inside
+    /// [`ContextManager::handle_broadcast_key_request`](crate::context::manager::ContextManager::handle_broadcast_key_request).
+    /// Idempotent: registering the same DID twice is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet.
+    pub async fn register_local_did(&self, did: DID) -> Result<(), ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::register_local_did — no ContextManager attached".to_owned(),
+            )
+        })?;
+        cm.register_local_did(did).await;
+        Ok(())
+    }
+
+    /// Returns `true` iff `did` is registered as locally controlled.
+    ///
+    /// Mirrors
+    /// [`ContextManager::is_local_did`](crate::context::manager::ContextManager::is_local_did).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet.
+    pub async fn is_local_did(&self, did: &DID) -> Result<bool, ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::is_local_did — no ContextManager attached".to_owned(),
+            )
+        })?;
+        Ok(cm.is_local_did(did).await)
+    }
+
+    /// Restore every persisted context from the configured persistence
+    /// provider. Mirrors
+    /// [`ContextManager::restore_all_contexts`](crate::context::manager::ContextManager::restore_all_contexts).
+    ///
+    /// Returns the list of restored context IDs. Contexts in
+    /// `Closing` / `Closed` / `Expired` states are skipped (only
+    /// `Active` contexts are resurrected after a restart).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet.
+    /// - [`ContextError::PersistenceFailed`] if the persistence
+    ///   provider is unconfigured or `list_persisted_contexts` fails.
+    pub async fn restore_all_contexts(&self) -> Result<Vec<String>, ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::restore_all_contexts — no ContextManager attached".to_owned(),
+            )
+        })?;
+        cm.restore_all_contexts().await
+    }
+
+    /// Best-effort flush of every context's snapshot to the configured
+    /// persistence provider. Mirrors
+    /// [`ContextManager::flush_all_contexts`](crate::context::manager::ContextManager::flush_all_contexts).
+    ///
+    /// No-op if no persistence provider is configured. Per-context
+    /// lock acquisition is bounded by the manager's
+    /// `FLUSH_LOCK_BUDGET`; contexts that cannot be locked within that
+    /// budget are persisted as a degraded snapshot
+    /// (`needs_reconnect = true`) so the restore path fires the
+    /// reconnection pipeline.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet.
+    pub async fn flush_all_contexts(&self) -> Result<(), ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::flush_all_contexts — no ContextManager attached".to_owned(),
+            )
+        })?;
+        cm.flush_all_contexts().await;
+        Ok(())
+    }
+
+    /// Sync wrapper for [`Self::flush_all_contexts`]. Mirrors
+    /// [`ContextManager::flush_all_contexts_sync`](crate::context::manager::ContextManager::flush_all_contexts_sync).
+    ///
+    /// Required by `Drop` and other terminal sync callers that cannot
+    /// `.await`. Uses `tokio::runtime::Handle::current` to bridge
+    /// sync → async; **callers MUST be inside a tokio runtime**.
+    /// No-op if no persistence provider is configured.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet.
+    pub fn flush_all_contexts_sync(&self) -> Result<(), ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::flush_all_contexts_sync — no ContextManager attached".to_owned(),
+            )
+        })?;
+        cm.flush_all_contexts_sync();
+        Ok(())
+    }
+
+    /// Shut down every context the attached manager owns (best-effort,
+    /// local cleanup only). Mirrors
+    /// [`ContextManager::shutdown_all_contexts`](crate::context::manager::ContextManager::shutdown_all_contexts).
+    ///
+    /// Destroys per-context sender keys + MLS groups + event logs in
+    /// that order (zeroize secrets before tearing down structure),
+    /// removes the contexts from the manager's registry, clears the
+    /// standing-context tracking, and aborts background tasks (TTL
+    /// timers, governance timeouts). Does NOT send leave messages or
+    /// notify remote peers — used by
+    /// [`scp_ffi_common::BridgeInstance::shutdown`] for process exit /
+    /// test teardown.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if no
+    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   been attached yet.
+    pub fn shutdown_all_contexts(&self) -> Result<(), ContextError> {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::shutdown_all_contexts — no ContextManager attached".to_owned(),
+            )
+        })?;
+        cm.shutdown_all_contexts();
+        Ok(())
+    }
+
     /// Persist supervisor-level state (standing_contexts, local_dids,
     /// wrapping_keys) ahead of a shutdown or resume. Commit 6 stubs;
     /// full path lands with the `BridgeInstance` integration in commit

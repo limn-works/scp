@@ -339,6 +339,21 @@ impl ContextActor {
                     "messaging::deliver_incoming (use Supervisor::dispatch_command during commits 8-11)",
                 );
             }
+            ContextCommand::Messaging(MessagingCommand::DrainEvents { reply, .. }) => {
+                ack_not_impl(
+                    reply,
+                    "messaging::drain_events (use Supervisor::dispatch_drain_events_command during commits 8-11)",
+                );
+            }
+            ContextCommand::Messaging(MessagingCommand::SendPseudonymAnnouncement {
+                reply,
+                ..
+            }) => {
+                ack_not_impl(
+                    reply,
+                    "messaging::send_pseudonym_announcement (use Supervisor::dispatch_command during commits 8-11)",
+                );
+            }
             ContextCommand::Lifecycle(sub) => Self::skeleton_dispatch_lifecycle(sub),
             ContextCommand::Governance(sub) => Self::skeleton_dispatch_governance(sub),
             ContextCommand::Broadcast(sub) => Self::skeleton_dispatch_broadcast(sub),
@@ -506,6 +521,22 @@ impl ContextActor {
             LifecycleCommand::ImportContext { reply, .. } => ack_not_impl(
                 reply,
                 "lifecycle::import_context (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
+            ),
+            LifecycleCommand::RestoreContext { reply, .. } => ack_not_impl(
+                reply,
+                "lifecycle::restore_context (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
+            ),
+            LifecycleCommand::GenerateContextAccessKey { reply, .. } => ack_not_impl(
+                reply,
+                "lifecycle::generate_context_access_key (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
+            ),
+            LifecycleCommand::RevokeContextAccessKey { reply, .. } => ack_not_impl(
+                reply,
+                "lifecycle::revoke_context_access_key (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
+            ),
+            LifecycleCommand::RestoreContextAccessKey { reply, .. } => ack_not_impl(
+                reply,
+                "lifecycle::restore_context_access_key (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
             ),
         }
     }

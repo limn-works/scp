@@ -150,6 +150,21 @@ async fn dispatch_inner(
             envelope_bytes,
             reply,
         } => handle_deliver_incoming(mgr, &context_id, &envelope_bytes, reply).await,
+        MessagingCommand::DrainEvents { context_id, reply } => {
+            handle_drain_events(mgr, &context_id, reply).await
+        }
+        MessagingCommand::SendPseudonymAnnouncement { payload, reply } => {
+            let p = *payload;
+            handle_send_pseudonym_announcement(
+                mgr,
+                p.context_id,
+                p.params,
+                &p.sender_did,
+                &p.signing_key,
+                reply,
+            )
+            .await
+        }
     }
 }
 
@@ -329,6 +344,98 @@ async fn handle_deliver_incoming(
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "deliver_incoming exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`MessagingCommand::DrainEvents`]: delegate to the hoisted
+/// [`queries_helpers::drain_events`](crate::context::queries_helpers::drain_events)
+/// under a 30s timeout.
+///
+/// The legacy method returns an empty `Vec` on unknown context (no
+/// error). The dispatch shim preserves that contract: the reply
+/// channel always carries `Ok(events)` — never
+/// `Err(ContextNotRegistered)`. `mutated: true` because draining the
+/// receive buffer empties it.
+async fn handle_drain_events(
+    mgr: &Arc<ContextManager>,
+    context_id: &str,
+    reply: crate::context::actor::commands::DrainEventsReply,
+) -> Outcome<()> {
+    let manager: Arc<ContextManager> = Arc::clone(mgr);
+    let drain_fut = crate::context::queries_helpers::drain_events(&manager, context_id);
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, drain_fut).await {
+        Ok(events) => (Outcome::ok_mutated(()), Ok(events)),
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "drain_events exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`MessagingCommand::SendPseudonymAnnouncement`]: delegate to
+/// [`ContextManager::send_pseudonym_announcement`](crate::context::manager::ContextManager::send_pseudonym_announcement)
+/// under a 30s timeout.
+///
+/// Best-effort — the legacy method returns `()` and silently logs
+/// transport / serialization failures internally. The dispatch shim
+/// preserves that contract: the reply channel always carries `Ok(())`
+/// unless the timeout fires (in which case `TransportTimeout` is
+/// surfaced for observability). `mutated: true` because the
+/// announcement, if successfully sent, advances the wire-sequence
+/// counter on the underlying `send_message` path.
+///
+/// `send_pseudonym_announcement` has no `*_helpers` peer at this
+/// point in the ADR-049 commit ladder; it remains an inherent method
+/// on `ContextManager`. The handler calls it directly via the
+/// attached manager. When a future commit hoists the body to
+/// `messaging_helpers`, this dispatch will switch to the hoisted
+/// free function transparently.
+async fn handle_send_pseudonym_announcement(
+    mgr: &Arc<ContextManager>,
+    context_id: String,
+    params: scp_protocol::context::params::ContextParams,
+    sender_did: &scp_identity::DID,
+    signing_key: &crate::context::actor::commands::SigningKeyBytes,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let manager: Arc<ContextManager> = Arc::clone(mgr);
+
+    // Rebuild the ephemeral handle the legacy method takes by
+    // reference; transition it to `Active` so the underlying
+    // `send_message` path (called inside `send_pseudonym_announcement`)
+    // observes the same handle state every FFI bridge passes today.
+    let handle = ContextHandle::new(context_id.clone(), params);
+    if let Err(e) = handle
+        .transition_to(&scp_protocol::context::ContextState::Active)
+        .await
+    {
+        let sketch = outcome_error_sketch(&e);
+        let _ = reply.send(Err(e));
+        return Outcome::err(sketch);
+    }
+
+    let sk = signing_key.to_signing_key();
+    let send_fut = manager.send_pseudonym_announcement(&handle, sender_did, &sk);
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {
+        Ok(()) => (Outcome::ok_mutated(()), Ok(())),
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "send_pseudonym_announcement exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))

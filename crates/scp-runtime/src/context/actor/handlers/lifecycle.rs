@@ -172,6 +172,37 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: LifecycleCommand) -> Out
             // state onto the heap for this variant only.
             Box::pin(handle_import_context(mgr, export, reply)).await
         }
+        LifecycleCommand::RestoreContext { payload, reply } => {
+            let p = *payload;
+            // Box::pin — restore_context's body is large (rebuilds the
+            // full PerContextState from the persisted snapshot,
+            // including governance / membership / broadcast / MLS
+            // crypto state). The per-variant locals plus the timeout
+            // future cross clippy's 16 KB stack-future budget.
+            Box::pin(handle_restore_context(mgr, p.context_id, p.params, reply)).await
+        }
+        LifecycleCommand::GenerateContextAccessKey {
+            context_id,
+            member_did,
+            caller_did,
+            reply,
+        } => {
+            handle_generate_context_access_key(mgr, context_id, member_did, caller_did, reply).await
+        }
+        LifecycleCommand::RevokeContextAccessKey {
+            context_id,
+            member_did,
+            caller_did,
+            reply,
+        } => handle_revoke_context_access_key(mgr, context_id, member_did, caller_did, reply).await,
+        LifecycleCommand::RestoreContextAccessKey {
+            context_id,
+            member_did,
+            caller_did,
+            reply,
+        } => {
+            handle_restore_context_access_key(mgr, context_id, member_did, caller_did, reply).await
+        }
     }
 }
 
@@ -439,6 +470,170 @@ async fn handle_import_context(
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "import_context exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`LifecycleCommand::RestoreContext`]: rebuild an ephemeral
+/// handle from the supplied params and delegate to
+/// [`ContextManager::restore_context`](crate::context::manager::ContextManager::restore_context)
+/// under a 30s timeout.
+///
+/// `restore_context` has no `lifecycle_helpers` peer at this point in
+/// the ADR-049 commit ladder; it remains an inherent method on
+/// `ContextManager`. The handler calls it directly via the attached
+/// manager. When a future commit hoists the body, this dispatch will
+/// switch to the hoisted free function transparently.
+async fn handle_restore_context(
+    mgr: &Arc<ContextManager>,
+    context_id: String,
+    params: scp_protocol::context::params::ContextParams,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let manager = Arc::clone(mgr);
+
+    let handle = ContextHandle::new(context_id.clone(), params);
+    if let Err(e) = handle
+        .transition_to(&scp_protocol::context::ContextState::Active)
+        .await
+    {
+        let sketch = outcome_error_sketch(&e);
+        let _ = reply.send(Err(e));
+        return Outcome::err(sketch);
+    }
+
+    let restore_fut = manager.restore_context(&context_id, &handle);
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, restore_fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "restore_context exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`LifecycleCommand::GenerateContextAccessKey`]: delegate to
+/// the hoisted
+/// [`queries_helpers::generate_context_access_key`](crate::context::queries_helpers::generate_context_access_key)
+/// under a 30s timeout. Caller capability check (ContextClose) lives
+/// inside the helper body.
+async fn handle_generate_context_access_key(
+    mgr: &Arc<ContextManager>,
+    context_id: String,
+    member_did: String,
+    caller_did: String,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let manager = Arc::clone(mgr);
+    let fut = crate::context::queries_helpers::generate_context_access_key(
+        &manager,
+        &context_id,
+        &member_did,
+        &caller_did,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "generate_context_access_key exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`LifecycleCommand::RevokeContextAccessKey`]: delegate to
+/// the hoisted
+/// [`queries_helpers::revoke_context_access_key`](crate::context::queries_helpers::revoke_context_access_key)
+/// under a 30s timeout.
+async fn handle_revoke_context_access_key(
+    mgr: &Arc<ContextManager>,
+    context_id: String,
+    member_did: String,
+    caller_did: String,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let manager = Arc::clone(mgr);
+    let fut = crate::context::queries_helpers::revoke_context_access_key(
+        &manager,
+        &context_id,
+        &member_did,
+        &caller_did,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "revoke_context_access_key exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`LifecycleCommand::RestoreContextAccessKey`]: delegate to
+/// the hoisted
+/// [`queries_helpers::restore_context_access_key`](crate::context::queries_helpers::restore_context_access_key)
+/// under a 30s timeout.
+async fn handle_restore_context_access_key(
+    mgr: &Arc<ContextManager>,
+    context_id: String,
+    member_did: String,
+    caller_did: String,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let manager = Arc::clone(mgr);
+    let fut = crate::context::queries_helpers::restore_context_access_key(
+        &manager,
+        &context_id,
+        &member_did,
+        &caller_did,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "restore_context_access_key exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err_mutated(sketch), Err(err))
