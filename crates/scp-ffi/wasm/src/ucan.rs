@@ -420,9 +420,13 @@ pub fn ucan_validate(
 
     future_to_promise(async move {
         let parsed = parse_ucan(&token).map_err(|e| {
+            // Route UCAN error classification through the shared mapping
+            // in `scp_ffi_common::ucan_errors` so all four bridges stay
+            // in lockstep (`OP_UCAN_VALIDATE_MALFORMED` pins this code).
+            let code = scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned();
             ScpWasmError::Permission {
                 message: format!("malformed token: {e}"),
-                code: codes::PERM_3000.to_owned(),
+                code,
             }
             .into_js()
         })?;
@@ -537,21 +541,38 @@ pub fn ucan_delegate(
 ///
 /// # Errors
 ///
-/// Returns an error string if the UCAN token is malformed, the context state
-/// cannot be retrieved, or the 11-step validation pipeline rejects the token.
+/// Returns `(message, code)` where `message` is the human-readable failure
+/// reason and `code` is the canonical `SCP-…` error code. UCAN parse errors
+/// are routed through `scp_ffi_common::ucan_errors::ucan_error_code` so the
+/// classification stays in lockstep with the other three bridges
+/// (`OP_UCAN_VALIDATE_MALFORMED` parity gate). Non-parse failures (capability
+/// URI, validation-pipeline, state lookup) return the caller's fallback code
+/// as `None` — the caller decides which code envelope to wrap them in.
 pub fn validate_tool_ucan_wasm(
     context_id: &str,
     tool_id: &str,
     token: &str,
     identity_did: &str,
-) -> Result<(), String> {
-    let parsed = parse_ucan(token).map_err(|e| format!("malformed UCAN token: {e}"))?;
+) -> Result<(), (String, Option<&'static str>)> {
+    let parsed = parse_ucan(token).map_err(|e| {
+        // Route UCAN error classification through the shared mapping in
+        // `scp_ffi_common::ucan_errors` (single-point-of-change contract
+        // — today this maps to `PERM_3001`, but future refinements flow
+        // from the helper rather than each parse site hardcoding it).
+        let code = scp_ffi_common::ucan_errors::ucan_error_code(&e);
+        (format!("malformed UCAN token: {e}"), Some(code))
+    })?;
 
     // Build the required capability URI: scp:ctx:{context_id}/tool_invoke:{tool_id}
     let required_capability_str = format!("scp:ctx:{context_id}/tool_invoke:{tool_id}");
-    let required_capability: CapabilityUri = required_capability_str
-        .parse()
-        .map_err(|e: UcanError| format!("invalid capability URI: {e}"))?;
+    let required_capability: CapabilityUri =
+        required_capability_str.parse().map_err(|e: UcanError| {
+            // Capability-URI parse failures share the same `UcanError`
+            // classification surface as token parse failures, so route
+            // them through the same helper for consistency.
+            let code = scp_ffi_common::ucan_errors::ucan_error_code(&e);
+            (format!("invalid capability URI: {e}"), Some(code))
+        })?;
 
     run_validate_ucan(
         context_id,
@@ -560,6 +581,7 @@ pub fn validate_tool_ucan_wasm(
         identity_did,
         None,
     )
+    .map_err(|msg| (msg, None))
 }
 
 /// Revokes a UCAN token with authorization checking.
@@ -609,11 +631,17 @@ pub fn ucan_revoke(context: &WasmContextHandle, token: String, revoker_did: Stri
         })?;
 
         // Parse the token to extract the issuer DID for authorization.
+        // Route UCAN error classification through the shared mapping in
+        // `scp_ffi_common::ucan_errors` so all four bridges stay in
+        // lockstep (single-point-of-change contract — today this maps
+        // to `PERM_3001`, but future refinements flow from the helper
+        // rather than each parse site re-hardcoding the code).
         let parsed = parse_ucan(&token).map_err(|e| {
+            let code = scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned();
             JsValue::from(
                 ScpWasmError::Permission {
                     message: format!("malformed UCAN token: {e}"),
-                    code: codes::PERM_3001.to_owned(),
+                    code,
                 }
                 .into_js(),
             )
@@ -1104,7 +1132,7 @@ mod tests {
     fn e2e_agent_signed_category_a_rejected_after_real_signature_verification() {
         crate::identity::test_helpers::cleanup_identity_registry();
 
-        let (did, _identity_key, agent_key) =
+        let (did, _identity_key, _active_key, agent_key) =
             crate::identity::test_helpers::register_identity_with_agent_key();
 
         let context_id = "test-ctx-e2e-catA";
@@ -1152,7 +1180,7 @@ mod tests {
     fn e2e_agent_signed_category_b_passes_signature_and_category_a_check() {
         crate::identity::test_helpers::cleanup_identity_registry();
 
-        let (did, _identity_key, agent_key) =
+        let (did, _identity_key, _active_key, agent_key) =
             crate::identity::test_helpers::register_identity_with_agent_key();
 
         let context_id = "test-ctx-e2e-catB";
@@ -1205,7 +1233,7 @@ mod tests {
     fn e2e_active_key_signed_category_a_passes_category_a_check() {
         crate::identity::test_helpers::cleanup_identity_registry();
 
-        let (did, identity_key, _agent_key) =
+        let (did, _identity_key, active_key, _agent_key) =
             crate::identity::test_helpers::register_identity_with_agent_key();
 
         let context_id = "test-ctx-e2e-active";
@@ -1224,7 +1252,12 @@ mod tests {
             fct: Some(serde_json::json!({"scp_key_scope": "#active"})),
         };
 
-        let jwt = build_signed_ucan(&header, &payload, &identity_key);
+        // Sign with the distinct `#active` key (spec §3.2.1); the
+        // verifier resolves `kid: "#active"` to this key. Signing with
+        // `identity_key` (`#0`) here would produce a signature the
+        // verifier rejects — which is the whole point of the two-key
+        // model becoming a type-enforced invariant in `IdentityRecord`.
+        let jwt = build_signed_ucan(&header, &payload, &active_key);
         let parsed = parse_ucan(&jwt).expect("JWT should parse");
         verify_token_signature(&parsed).expect("real Ed25519 signature must verify");
 
@@ -1257,7 +1290,7 @@ mod tests {
     fn e2e_invalid_signature_rejected_before_category_a() {
         crate::identity::test_helpers::cleanup_identity_registry();
 
-        let (did, _identity_key, agent_key) =
+        let (did, _identity_key, _active_key, agent_key) =
             crate::identity::test_helpers::register_identity_with_agent_key();
 
         let context_id = "test-ctx-e2e-badsig";
@@ -1307,7 +1340,7 @@ mod tests {
     fn e2e_all_category_a_resources_rejected_for_agent_key() {
         crate::identity::test_helpers::cleanup_identity_registry();
 
-        let (did, _identity_key, agent_key) =
+        let (did, _identity_key, _active_key, agent_key) =
             crate::identity::test_helpers::register_identity_with_agent_key();
 
         let context_id = "test-ctx-e2e-allcatA";

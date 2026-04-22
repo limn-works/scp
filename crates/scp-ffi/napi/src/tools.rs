@@ -212,7 +212,8 @@ pub(crate) async fn tool_register_on(
     let context_id = handle.context_id();
 
     // Build a scp-core ToolRegistration from the NAPI definition.
-    let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
+    // Shared with every other bridge via `scp_ffi_common::tool_id`.
+    let tool_id = scp_ffi_common::tool_id::generate_tool_id(&definition.name);
 
     let input_schema = validate_schema_json(&definition.input_schema_json, "input_schema_json")?;
     let output_schema = validate_schema_json(&definition.output_schema_json, "output_schema_json")?;

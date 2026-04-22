@@ -33,17 +33,14 @@ use std::time::Duration;
 use dashmap::DashMap;
 use scp_core::context::builder::ContextEventLogProvider;
 use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
-use scp_core::context::providers::MerkleEventLogProvider;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::{SessionStore, ToolRegistry};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
-use scp_core::store::context::ProtocolRepositoryEventLogBridge;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
 use scp_platform::encrypting_adapter::EncryptingAdapter;
-use scp_platform::sqlite::SqliteStorage;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
@@ -82,54 +79,43 @@ pub enum StorageConfig {
     },
 }
 
-/// Protocol repository variant: an `Arc<ProtocolRepository<_>>` whose inner
-/// `Storage` matches the bridge's configured persistence backend.
+/// Bridge-internal error returned by [`NapiBridgeInstance::with_storage_napi`]
+/// when a persistence backend cannot be initialized.
 ///
-/// Before this variant existed, `NapiBridgeInstance::protocol_repository` was
-/// always `Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>`,
-/// even when the bridge was constructed with [`StorageConfig::Sqlite`]. That
-/// meant the Merkle event log — which uses the protocol repository as its
-/// backing `EventLogPersistence` — silently ran against an ephemeral
-/// in-memory store, while context snapshots correctly landed in `SQLite`. On
-/// restart the event log would be empty even though the rest of the state
-/// survived, producing a split-brain the caller had no way to detect.
-///
-/// The enum dispatches the event log bridge and the trust bridge onto the
-/// real backing store for each variant, so `SCP({storage: sqlite})` now
-/// persists *both* snapshots and Merkle event log entries to the same
-/// `SQLCipher` database.
-pub enum ProtocolRepoVariant {
-    /// Encrypted in-memory repository. Event log and trust aggregation are
-    /// backed by an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
-    /// per-instance AES-256-GCM key. Data is lost when the instance drops.
-    InMemory(Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>),
-    /// SQLCipher-backed repository. Event log and trust aggregation share the
-    /// same `Arc<SqliteStorage>` that backs `CoreFields::persistence`, so
-    /// context snapshots, trust attestations, and event log entries all
-    /// survive restart and share a single `SQLCipher` connection.
-    Sqlite(Arc<ProtocolRepository<Arc<SqliteStorage>>>),
+/// Converted to [`napi::Error`] (via [`ScpNapiError::Validation`]) at the
+/// `Scp::with_storage` factory surface. Kept as a dedicated enum so the
+/// `runtime` layer does not depend on the bridge error vocabulary and so
+/// new backends (e.g. encrypted filesystem) can extend the enum without
+/// touching every caller.
+#[derive(Debug)]
+pub enum StorageInitError {
+    /// `SqliteStorage::new` failed — directory permission denied, key
+    /// mismatch on an existing DB, `SQLCipher` init error, and so on.
+    SqliteOpen {
+        /// The directory path the caller asked for (for the error message).
+        path: String,
+        /// The underlying `scp-platform` error rendered via `Display`.
+        message: String,
+    },
 }
 
-impl ProtocolRepoVariant {
-    /// Constructs a [`ContextEventLogProvider`] backed by this repository.
-    ///
-    /// The bridge is retained by `Arc` inside [`MerkleEventLogProvider`], so
-    /// subsequent `append` calls persist entries through the backing store
-    /// that was configured at instance-construction time.
-    #[must_use]
-    pub fn event_log_provider(&self) -> Box<dyn ContextEventLogProvider> {
+impl std::fmt::Display for StorageInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InMemory(repo) => {
-                let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(repo));
-                Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
-            }
-            Self::Sqlite(repo) => {
-                let bridge = ProtocolRepositoryEventLogBridge::new(Arc::clone(repo));
-                Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+            Self::SqliteOpen { path, message } => {
+                write!(f, "failed to open SQLCipher storage at {path}: {message}")
             }
         }
     }
 }
+
+impl std::error::Error for StorageInitError {}
+
+// `ProtocolRepoVariant` lives in `scp-ffi-common::bridge_runtime`. Re-exported
+// here so existing `crate::runtime::ProtocolRepoVariant` references across
+// the NAPI bridge keep compiling without mass rename. See ADR-048 §2 for
+// the "shared-variant types for storage-backed repositories" exemption.
+pub use scp_ffi_common::bridge_runtime::ProtocolRepoVariant;
 
 /// NAPI-specific concrete bridge instance.
 ///
@@ -313,47 +299,44 @@ impl NapiBridgeInstance {
     ///   opening fails, the error is logged via `tracing::error!` and the
     ///   instance is returned without persistence (matching the `PyO3`
     ///   bridge's behaviour).
-    #[must_use]
-    pub fn with_storage_napi(config: StorageConfig) -> Self {
+    pub fn with_storage_napi(config: StorageConfig) -> Result<Self, StorageInitError> {
         match config {
-            StorageConfig::InMemory => Self::new_napi(),
+            StorageConfig::InMemory => Ok(Self::new_napi()),
             StorageConfig::Sqlite { path, key } => {
-                match scp_platform::sqlite::SqliteStorage::new(&path, &key) {
-                    Ok(storage) => {
-                        let arc_storage = Arc::new(storage);
-                        // The same `Arc<SqliteStorage>` backs BOTH the
-                        // context-snapshot persistence bridge AND the
-                        // Merkle event log + trust aggregation repository.
-                        // This is the fix for the split-brain where
-                        // `with_storage(Sqlite)` used to persist snapshots
-                        // but silently fall back to in-memory storage for
-                        // event log entries.
-                        let persistence_repo =
-                            Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
-                        let persistence: Arc<dyn ContextPersistence + Send + Sync> = Arc::new(
-                            scp_core::store::context::ProtocolRepositoryContextBridge::new(
-                                persistence_repo,
-                            ),
-                        );
-                        let event_log_repo =
-                            Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
-                        drop(arc_storage);
-                        drop(key);
-                        Self::with_persistence_napi_arc_and_repo(
-                            persistence,
-                            ProtocolRepoVariant::Sqlite(event_log_repo),
-                        )
-                    }
-                    Err(e) => {
+                let storage = scp_platform::sqlite::SqliteStorage::new(&path, &key).map_err(
+                    |e| {
                         tracing::error!(
                             error = %e,
                             path = %path.display(),
-                            "with_storage_napi: SqliteStorage::new failed — instance created without persistence"
+                            "with_storage_napi: SqliteStorage::new failed — returning error to caller"
                         );
-                        drop(key);
-                        Self::new_napi()
-                    }
-                }
+                        StorageInitError::SqliteOpen {
+                            path: path.display().to_string(),
+                            message: e.to_string(),
+                        }
+                    },
+                )?;
+                let arc_storage = Arc::new(storage);
+                // The same `Arc<SqliteStorage>` backs BOTH the
+                // context-snapshot persistence bridge AND the
+                // Merkle event log + trust aggregation repository.
+                // This is the fix for the split-brain where
+                // `with_storage(Sqlite)` used to persist snapshots
+                // but silently fall back to in-memory storage for
+                // event log entries.
+                let persistence_repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                let persistence: Arc<dyn ContextPersistence + Send + Sync> = Arc::new(
+                    scp_core::store::context::ProtocolRepositoryContextBridge::new(
+                        persistence_repo,
+                    ),
+                );
+                let event_log_repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                drop(arc_storage);
+                drop(key);
+                Ok(Self::with_persistence_napi_arc_and_repo(
+                    persistence,
+                    ProtocolRepoVariant::Sqlite(event_log_repo),
+                ))
             }
         }
     }
@@ -484,6 +467,15 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         self.ucan_registry.clear();
         #[cfg(feature = "allow_in_memory_custody")]
         self.identity_registry.clear();
+        // Release the SQLite advisory lock on `{dir}/scp.db.lock` for the
+        // `Sqlite` variant. Other `Arc<SqliteStorage>` holders
+        // (`CoreFields::persistence`, `ContextManager`) keep the storage
+        // struct alive until the `NapiBridgeInstance` drops, but the
+        // advisory lock must be released now so that a subsequent
+        // `new SCP({ storage: { type: 'sqlite', path, key } })` against
+        // the same directory does not fail with "already open by another
+        // SCP instance". The `InMemory` variant's `close()` is a no-op.
+        self.protocol_repository.close();
         // Clear MCP registries so server shutdown senders and client
         // connections drop, allowing background tasks to terminate cleanly.
         // Migrated off `crate::mcp::clear_registries` (called by a
@@ -1136,8 +1128,9 @@ pub(crate) fn remove_identity_if_present(bi: &NapiBridgeInstance, did: &str) -> 
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Permission` if the DID is not found (the identity
-/// was not created via `identity_create` on this bridge).
+/// Returns `ScpNapiError::Identity` (SCP-IDENT-1001) if the DID is not found
+/// (the identity was not created via `identity_create` on this bridge).
+/// Aligned with the `PyO3` canonical bridge for cross-bridge parity.
 #[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn with_identity<T, F>(
     bi: &NapiBridgeInstance,
@@ -1149,12 +1142,12 @@ where
 {
     let entry = identity_registry(bi)
         .get(did)
-        .ok_or_else(|| ScpNapiError::Permission {
+        .ok_or_else(|| ScpNapiError::Identity {
             message: format!(
                 "identity '{did}' not found in registry — was it created with \
                  identityCreate(\"in_memory\") in this process?"
             ),
-            code: codes::PERM_3023.to_owned(),
+            code: codes::IDENT_1001.to_owned(),
         })?;
 
     f(entry.value())
@@ -1167,7 +1160,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns `ScpNapiError::Permission` if the DID is not found.
+/// Returns `ScpNapiError::Identity` (SCP-IDENT-1001) if the DID is not found.
+/// Aligned with the `PyO3` canonical bridge for cross-bridge parity.
 #[cfg(feature = "allow_in_memory_custody")]
 pub(crate) fn with_identity_mut<T, F>(
     bi: &NapiBridgeInstance,
@@ -1179,12 +1173,12 @@ where
 {
     let mut entry = identity_registry(bi)
         .get_mut(did)
-        .ok_or_else(|| ScpNapiError::Permission {
+        .ok_or_else(|| ScpNapiError::Identity {
             message: format!(
                 "identity '{did}' not found in registry — was it created with \
                  identityCreate(\"in_memory\") in this process?"
             ),
-            code: codes::PERM_3023.to_owned(),
+            code: codes::IDENT_1001.to_owned(),
         })?;
 
     f(entry.value_mut())
@@ -1754,7 +1748,8 @@ mod tests {
         let bi = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
             path: tmp.path().to_path_buf(),
             key: zeroize::Zeroizing::new(vec![0x11u8; 32]),
-        });
+        })
+        .expect("sqlite storage must initialize in test");
         assert!(
             matches!(&bi.protocol_repository, ProtocolRepoVariant::Sqlite(_)),
             "with_storage(Sqlite) must produce ProtocolRepoVariant::Sqlite so event log \

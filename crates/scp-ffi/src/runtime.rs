@@ -64,7 +64,9 @@ use scp_core::context::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::manager::{ContextManager, ContextPersistence};
-use scp_core::context::providers::ProtocolRepositoryContextBridge;
+use scp_core::context::providers::{
+    MerkleEventLogProvider, ProtocolRepositoryContextBridge, ProtocolRepositoryEventLogBridge,
+};
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
 use scp_core::crypto::ucan::nonce::NonceTracker;
@@ -217,6 +219,37 @@ pub enum StorageConfig {
     },
 }
 
+/// Bridge-internal error returned by [`PyBridgeInstance::with_storage_py`]
+/// when a persistence backend cannot be initialized.
+///
+/// Converted to [`ScpPyError`] at the `PyScp::with_storage` factory surface.
+/// Kept as a dedicated enum so the `runtime` layer does not depend on the
+/// bridge error vocabulary and so new backends (e.g. encrypted filesystem)
+/// can extend the enum without touching every caller.
+#[derive(Debug)]
+pub enum StorageInitError {
+    /// `SqliteStorage::new` failed — directory permission denied, key
+    /// mismatch on an existing DB, `SQLCipher` init error, and so on.
+    SqliteOpen {
+        /// The directory path the caller asked for (for the error message).
+        path: String,
+        /// The underlying `scp-platform` error rendered via `Display`.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for StorageInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SqliteOpen { path, message } => {
+                write!(f, "failed to open SQLCipher storage at {path}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StorageInitError {}
+
 /// Concrete storage provider backing a [`PyBridgeInstance`].
 ///
 /// Wraps one of two encrypted storage backends. Implements
@@ -261,6 +294,24 @@ impl StorageProvider {
     pub fn new_sqlite(path: &std::path::Path, key: &[u8]) -> Result<Self, PlatformError> {
         let storage = SqliteStorage::new(path, key)?;
         Ok(Self::Sqlite(Arc::new(storage)))
+    }
+
+    /// Releases any persistent resources held by the variant.
+    ///
+    /// For [`StorageProvider::Sqlite`] this delegates to
+    /// [`SqliteStorage::close`] to release the advisory lock on
+    /// `scp.db.lock` even when outer `Arc<SqliteStorage>` references
+    /// remain alive. [`StorageProvider::InMemoryEncrypted`] has no
+    /// persistent resources and the call is a no-op.
+    ///
+    /// Called from `bridge_specific_shutdown` on the `PyO3` bridge so
+    /// that `SCP.shutdown()` on a `StorageConfig::Sqlite` instance
+    /// releases the lock at the SDK surface.
+    pub fn close(&self) {
+        match self {
+            Self::InMemoryEncrypted(_) => {}
+            Self::Sqlite(storage) => storage.close(),
+        }
     }
 }
 
@@ -462,8 +513,7 @@ impl PyBridgeInstance {
     ///
     /// For fallible construction that surfaces the `SQLite` error, use
     /// [`PyBridgeInstance::new_py`] + [`PyBridgeInstance::init_sqlite_storage`].
-    #[must_use]
-    pub fn with_storage_py(cfg: StorageConfig) -> Self {
+    pub fn with_storage_py(cfg: StorageConfig) -> Result<Self, StorageInitError> {
         match cfg {
             StorageConfig::InMemory => {
                 let instance = Self::new_py();
@@ -472,7 +522,7 @@ impl PyBridgeInstance {
                 let _ = instance
                     .storage_provider
                     .set(StorageProvider::new_in_memory_encrypted());
-                instance
+                Ok(instance)
             }
             StorageConfig::Sqlite { path, key } => {
                 // Open the database once — `SqliteStorage` owns a single
@@ -481,48 +531,46 @@ impl PyBridgeInstance {
                 // draft called `SqliteStorage::new` twice (once for the
                 // provider, once for the persistence bridge) and hit
                 // `SQLITE_BUSY` the moment both tried to write.
-                match SqliteStorage::new(&path, &key) {
-                    Ok(storage) => {
-                        let arc_storage = Arc::new(storage);
-                        // Build persistence bridge first so we can share
-                        // the same Arc across CoreFields + storage_provider.
-                        let repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
-                        let persistence: Arc<dyn ContextPersistence + Send + Sync> =
-                            Arc::new(ProtocolRepositoryContextBridge::new(repo));
-                        let instance = Self {
-                            core: CoreFields::with_persistence_arc(persistence),
-                            identity_registry: Arc::new(DashMap::new()),
-                            storage_provider: OnceLock::new(),
-                            ffi_bridge_state: Arc::new(DashMap::new()),
-                            mcp_server_registry: Arc::new(DashMap::new()),
-                            mcp_client_registry: Arc::new(DashMap::new()),
-                            credential_store: Arc::new(
-                                scp_core::bridge::credentials::InMemoryCredentialStore::new(),
-                            ),
-                            connected_relay_url: RwLock::new(None),
-                            #[cfg(feature = "allow_in_memory_custody")]
-                            network: std::sync::Mutex::new(None),
-                        };
-                        let _ = instance
-                            .storage_provider
-                            .set(StorageProvider::Sqlite(arc_storage));
-                        // `key` is `Zeroizing<Vec<u8>>`, zeroed on drop here.
-                        // SQLCipher has already retained its derived key
-                        // internally, so the caller's key material is safe
-                        // to wipe at this point.
-                        drop(key);
-                        instance
+                let storage = SqliteStorage::new(&path, &key).map_err(|e| {
+                    tracing::error!(
+                        error = %e,
+                        path = %path.display(),
+                        "with_storage_py: SqliteStorage::new failed — returning error to caller"
+                    );
+                    StorageInitError::SqliteOpen {
+                        path: path.display().to_string(),
+                        message: e.to_string(),
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            path = %path.display(),
-                            "with_storage_py: SqliteStorage::new failed — instance created without storage or persistence"
-                        );
-                        drop(key);
-                        Self::new_py()
-                    }
-                }
+                })?;
+                let arc_storage = Arc::new(storage);
+                // Build persistence bridge first so we can share
+                // the same Arc across CoreFields + storage_provider.
+                let repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                let persistence: Arc<dyn ContextPersistence + Send + Sync> =
+                    Arc::new(ProtocolRepositoryContextBridge::new(repo));
+                let instance = Self {
+                    core: CoreFields::with_persistence_arc(persistence),
+                    identity_registry: Arc::new(DashMap::new()),
+                    storage_provider: OnceLock::new(),
+                    ffi_bridge_state: Arc::new(DashMap::new()),
+                    mcp_server_registry: Arc::new(DashMap::new()),
+                    mcp_client_registry: Arc::new(DashMap::new()),
+                    credential_store: Arc::new(
+                        scp_core::bridge::credentials::InMemoryCredentialStore::new(),
+                    ),
+                    connected_relay_url: RwLock::new(None),
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    network: std::sync::Mutex::new(None),
+                };
+                let _ = instance
+                    .storage_provider
+                    .set(StorageProvider::Sqlite(arc_storage));
+                // `key` is `Zeroizing<Vec<u8>>`, zeroed on drop here.
+                // SQLCipher has already retained its derived key
+                // internally, so the caller's key material is safe
+                // to wipe at this point.
+                drop(key);
+                Ok(instance)
             }
         }
     }
@@ -693,9 +741,20 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // Clear the identity registry so held `Arc<FfiKeyCustody>` entries
         // drop, triggering `Zeroizing` on key material.
         self.identity_registry.clear();
-        // `storage_provider` is `OnceLock` — we cannot clear it. The
-        // `Arc<EncryptingAdapter>` is released when the `PyBridgeInstance`
-        // is dropped.
+        // `storage_provider` is `OnceLock` — we cannot clear the slot, but
+        // the `Sqlite` variant holds an advisory lock on
+        // `{dir}/scp.db.lock` that must be released at shutdown so
+        // `SCP(storage=...)` against the same path succeeds after a prior
+        // `SCP.shutdown()`. `StorageProvider::close()` delegates to
+        // `SqliteStorage::close()` which drops the `File` inside the
+        // lock-file mutex without dropping the `Arc<SqliteStorage>`
+        // (other Arc holders — `CoreFields::persistence`,
+        // `ContextManager::persistence` — keep the storage struct alive
+        // until the `PyBridgeInstance` itself drops). The
+        // `InMemoryEncrypted` variant's `close()` is a no-op.
+        if let Some(provider) = self.storage_provider.get() {
+            provider.close();
+        }
         // Clear the typed per-context FFI state registry so per-context
         // `ToolRegistry`, `EventLog`, receive channel senders, and
         // registered tool handlers drop.
@@ -793,7 +852,7 @@ pub fn init_context_manager(bi: &PyBridgeInstance, local_did: &str) {
     let cm_arc = build_context_manager(
         crypto,
         Box::new(NotConfiguredTransportProvider),
-        Box::new(NoOpEventLogProvider),
+        build_event_log_provider(bi),
         persistence,
     );
 
@@ -845,7 +904,7 @@ pub fn init_context_manager_for_test(bi: &PyBridgeInstance) {
     let cm_arc = build_context_manager(
         Box::new(NoOpCryptoProvider),
         Box::new(scp_core::context::LocalTransportProvider),
-        Box::new(NoOpEventLogProvider),
+        build_event_log_provider(bi),
         persistence,
     );
 
@@ -956,6 +1015,48 @@ impl ContextPersistence for ArcContextPersistence {
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         self.inner.list_persisted_contexts()
+    }
+}
+
+/// Constructs a persistent [`MerkleEventLogProvider`] backed by the global
+/// storage provider if initialized, or a non-persistent one otherwise.
+///
+/// This is NOT a direct reuse of
+/// `scp-ffi-common::bridge_runtime::build_event_log_provider` — that common
+/// fn owns its own storage (creates a fresh `BridgeInMemoryStorage` +
+/// `ProtocolRepository` and returns both) so the NAPI / `UniFFI` bridges can
+/// keep the repository handle around for later queries. The `PyO3` bridge
+/// instead reads from `DEFAULT_BRIDGE_INSTANCE.storage_provider()` so the
+/// event log shares storage with every other per-context data sink
+/// (identity state, protocol repository, blobs) — one backend per bridge
+/// instance, switchable between `InMemoryEncrypted` and `Sqlite` at init
+/// time. Collapsing the two would force the `PyO3` bridge to duplicate its
+/// storage or force the common fn to grow a storage-provider parameter,
+/// both of which cost more than the current 30-line duplication. See
+/// `.claude/memory/feedback_dedup_bridge_validators.md` for the dedup
+/// heuristic and when to break it.
+///
+/// The persistent provider writes event entries to encrypted in-memory
+/// storage via `ProtocolRepositoryEventLogBridge`, so `ContextCreated`
+/// (appended by `builder_create_context`) survives across manager calls
+/// and is visible to `py_event_log_query`.
+///
+/// This replaced `NoOpEventLogProvider` so that the `PyO3` bridge emits the
+/// same initial `ContextCreated` event as the NAPI, WASM, and `UniFFI`
+/// bridges (cross-bridge parity, ADR-046 `OP_EVENT_LOG_APPEND`).
+fn build_event_log_provider(bi: &PyBridgeInstance) -> Box<dyn ContextEventLogProvider> {
+    match bi.storage_provider() {
+        Some(StorageProvider::InMemoryEncrypted(storage)) => {
+            let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+            let bridge = ProtocolRepositoryEventLogBridge::new(protocol_repository);
+            Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+        }
+        Some(StorageProvider::Sqlite(storage)) => {
+            let protocol_repository = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+            let bridge = ProtocolRepositoryEventLogBridge::new(protocol_repository);
+            Box::new(MerkleEventLogProvider::with_persistence(Arc::new(bridge)))
+        }
+        None => Box::new(MerkleEventLogProvider::new()),
     }
 }
 
@@ -2406,7 +2507,8 @@ mod tests {
 
     #[test]
     fn test_py_bridge_instance_with_storage_py_initializes_storage() {
-        let bi = PyBridgeInstance::with_storage_py(StorageConfig::InMemory);
+        let bi = PyBridgeInstance::with_storage_py(StorageConfig::InMemory)
+            .expect("in-memory storage must always succeed");
         assert!(
             bi.storage_provider().is_some(),
             "with_storage_py(InMemory) must initialize the storage provider"

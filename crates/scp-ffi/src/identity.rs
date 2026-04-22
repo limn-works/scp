@@ -126,6 +126,22 @@ pub struct PyIdentity {
     /// a `frozen` `#[pyclass]` with no access to the owning `PyBridgeInstance`
     /// from its getter methods. Returned by [`PyIdentity::get_agent_public_key`].
     agent_public_key_multibase: Option<String>,
+    /// Hex-encoded Ed25519 verifying-key bytes for the identity key
+    /// (VM `#0`, the key that derives the DID). 64 hex chars = 32 raw
+    /// bytes. Populated for identities created via `PyScp::identity_create`;
+    /// `None` for identities loaded from storage without a live custody.
+    ///
+    /// Why `#0` (`identity_key`), not `#active`: the WASM bridge uses a
+    /// simplified single-key model in production where the DID-deriving
+    /// key *is* the signing key, while scp-core uses three distinct keys
+    /// per [`ScpIdentity`]. Exposing the identity key gives a byte-
+    /// identical value across all four bridges under a deterministic
+    /// `seed` (ADR-046). SCPID signatures use `#active`; under the
+    /// `testing` feature WASM *also* derives a distinct `#active` key
+    /// from `seed[32..64]` so `#active`-signed signatures are byte-
+    /// identical across all four bridges under the `signed_at_override`
+    /// affordance.
+    verifying_key_hex: Option<String>,
     /// Bridge instance affinity id (Phase 4 PR 1 — #1549). Consumed by
     /// [`crate::pyscp_check_handle!`] at every entry point that accepts this
     /// handle.
@@ -153,6 +169,20 @@ impl PyIdentity {
     #[getter]
     const fn has_agent_key(&self) -> bool {
         self.has_agent_key
+    }
+
+    /// Returns the hex-encoded Ed25519 verifying-key bytes for the
+    /// identity key (VM `#0`, the key that derives the DID), or `None`
+    /// if this handle was loaded without live key material (e.g. via
+    /// [`py_identity_load`]).
+    ///
+    /// Intended for cross-bridge parity assertions: under a deterministic
+    /// `seed`, this value is byte-identical across every bridge
+    /// (ADR-046). See the `verifying_key_hex` field docs for why `#0`
+    /// rather than `#active`.
+    #[getter]
+    fn verifying_key(&self) -> Option<String> {
+        self.verifying_key_hex.clone()
     }
 
     /// Returns the agent key's public key as a multibase-encoded string, or
@@ -194,6 +224,11 @@ impl PyIdentity {
     /// `None` if the identity has no agent key. Use
     /// [`PyIdentity::from_document`] when a `DidDocument` is in scope to
     /// avoid computing `has_agent_key` and the agent key multibase twice.
+    ///
+    /// `verifying_key_hex` is the hex-encoded VM `#0` public key for
+    /// deterministic cross-bridge parity assertions (ADR-046). Pass `None`
+    /// when the handle is loaded without live key material (e.g. via
+    /// `identity_load`).
     #[must_use]
     pub const fn new(
         bi: &crate::runtime::PyBridgeInstance,
@@ -201,12 +236,14 @@ impl PyIdentity {
         custody: String,
         has_agent_key: bool,
         agent_public_key_multibase: Option<String>,
+        verifying_key_hex: Option<String>,
     ) -> Self {
         Self {
             did,
             custody,
             has_agent_key,
             agent_public_key_multibase,
+            verifying_key_hex,
             instance_id: bi.core.instance_id(),
         }
     }
@@ -224,6 +261,7 @@ impl PyIdentity {
         did: String,
         custody: String,
         document: &DidDocument,
+        verifying_key_hex: Option<String>,
     ) -> Self {
         let agent_vm = document.agent_verification_method();
         let has_agent_key = agent_vm.is_some();
@@ -233,6 +271,7 @@ impl PyIdentity {
             custody,
             has_agent_key,
             agent_public_key_multibase,
+            verifying_key_hex,
             instance_id: bi.core.instance_id(),
         }
     }
@@ -412,6 +451,63 @@ impl PyDIDDocument {
 ///
 /// See issue #323, ADR-006, and SCP-294a.
 fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
+    parse_custody_with_seed(custody, None)
+}
+
+/// Validates that an optional `seed` byte slice is either `None` or exactly
+/// 32 bytes long. Keeps seed-length validation on the FFI boundary so the
+/// runtime never has to reject malformed bytes.
+fn parse_optional_seed(seed: Option<&[u8]>) -> Result<Option<[u8; 32]>, ScpPyError> {
+    seed.map_or(Ok(None), |bytes| {
+        <[u8; 32]>::try_from(bytes).map(Some).map_err(|_| {
+            ScpPyError::validation(format!(
+                "seed must be exactly 32 bytes, got {}",
+                bytes.len()
+            ))
+        })
+    })
+}
+
+/// Variant of [`parse_custody`] that optionally accepts a 32-byte seed for the
+/// `"in_memory"` custody path, used by the cross-bridge parity harness
+/// (ADR-046). The seed is fed directly into
+/// [`InMemoryKeyCustody::from_seed_bytes`], making every subsequent
+/// `generate_keypair` call deterministic.
+///
+/// A non-`None` seed on any custody type other than `"in_memory"` is a
+/// validation error — seeded determinism is only meaningful for the
+/// in-process testing custody.
+#[cfg(feature = "allow_in_memory_custody")]
+fn parse_custody_with_seed(
+    custody: &str,
+    seed: Option<[u8; 32]>,
+) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
+    match custody {
+        "in_memory" => {
+            let kc = seed.map_or_else(InMemoryKeyCustody::new, InMemoryKeyCustody::from_seed_bytes);
+            Ok((Arc::new(FfiKeyCustody::InMemory(kc)), custody.to_owned()))
+        }
+        _ if seed.is_some() => Err(ScpPyError::validation(
+            "`seed` parameter is only valid for custody=\"in_memory\"",
+        )),
+        other => parse_custody_inner(other),
+    }
+}
+
+#[cfg(not(feature = "allow_in_memory_custody"))]
+fn parse_custody_with_seed(
+    custody: &str,
+    seed: Option<[u8; 32]>,
+) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
+    if seed.is_some() {
+        return Err(ScpPyError::validation(
+            "`seed` parameter requires the allow_in_memory_custody feature",
+        ));
+    }
+    parse_custody_inner(custody)
+}
+
+fn parse_custody_inner(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
     match custody {
         #[cfg(feature = "allow_in_memory_custody")]
         "in_memory" => {
@@ -568,9 +664,16 @@ impl crate::scp::PyScp {
     /// creation (SCP-217).
     ///
     /// See ADR-013 acceptance criterion 2.
-    pub fn identity_create(&self, py: Python<'_>, custody: &str) -> PyResult<PyIdentity> {
+    #[pyo3(signature = (custody, seed=None))]
+    pub fn identity_create(
+        &self,
+        py: Python<'_>,
+        custody: &str,
+        seed: Option<&[u8]>,
+    ) -> PyResult<PyIdentity> {
         let bi_arc = Arc::clone(&self.inner);
-        let (key_custody, custody_str) = parse_custody(custody)?;
+        let seed_array = parse_optional_seed(seed)?;
+        let (key_custody, custody_str) = parse_custody_with_seed(custody, seed_array)?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -587,6 +690,20 @@ impl crate::scp::PyScp {
 
                 let did = identity.did.clone();
                 let document_for_handle = document.clone();
+
+                // Extract the verifying-key bytes for the identity (`#0`)
+                // signing key BEFORE moving the custody into the registry.
+                // Under a deterministic `seed`, this value is byte-identical
+                // across every bridge (ADR-046).
+                let pk = key_custody
+                    .public_key(&identity.identity_key)
+                    .await
+                    .map_err(|e| {
+                        ScpPyError::identity(format!(
+                            "failed to read identity key after identity create: {e}"
+                        ))
+                    })?;
+                let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
 
                 // Register the identity in this instance's registry so that
                 // subsequent bridge methods (UCAN minting, pseudonym
@@ -617,6 +734,7 @@ impl crate::scp::PyScp {
                     did,
                     custody_str,
                     &document_for_handle,
+                    verifying_key_hex,
                 ))
             })
         })
@@ -665,6 +783,19 @@ impl crate::scp::PyScp {
                 let did = identity.did.clone();
                 let document_for_handle = document.clone();
 
+                // Extract the verifying-key bytes for the identity (`#0`)
+                // signing key BEFORE moving the custody into the registry
+                // (ADR-046 parity).
+                let pk = key_custody
+                    .public_key(&identity.identity_key)
+                    .await
+                    .map_err(|e| {
+                        ScpPyError::identity(format!(
+                            "failed to read identity key after identity create: {e}"
+                        ))
+                    })?;
+                let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
+
                 crate::runtime::register_identity(
                     &bi_arc,
                     &did,
@@ -690,6 +821,7 @@ impl crate::scp::PyScp {
                     did,
                     custody_str,
                     &document_for_handle,
+                    verifying_key_hex,
                 ))
             })
         })
@@ -787,11 +919,32 @@ impl crate::scp::PyScp {
                         })
                         .ok();
                     if let Some(document) = document_snapshot {
+                        // Recover the identity (#0) verifying key from the
+                        // live registry entry so loaded identities also
+                        // populate the ADR-046 parity field. Failures are
+                        // non-fatal.
+                        let verifying_key_hex = crate::runtime::with_identity(
+                            &bi_arc,
+                            &did_owned,
+                            |entry| {
+                                Ok((
+                                    Arc::clone(&entry.custody),
+                                    entry.identity.identity_key,
+                                ))
+                            },
+                        )
+                        .ok()
+                        .and_then(|(custody, handle)| {
+                            rt.block_on(custody.public_key(&handle))
+                                .ok()
+                                .map(|pk| hex::encode(pk.as_bytes()))
+                        });
                         return Ok(PyIdentity::from_document(
                             &bi_arc,
                             stored_did,
                             custody_str,
                             &document,
+                            verifying_key_hex,
                         ));
                     }
                 }
@@ -897,11 +1050,17 @@ impl crate::scp::PyScp {
                 entry.identity = new_identity;
                 entry.document = new_document;
 
+                let verifying_key_hex = rt
+                    .block_on(entry.custody.public_key(&entry.identity.identity_key))
+                    .ok()
+                    .map(|pk| hex::encode(pk.as_bytes()));
+
                 Ok(PyIdentity::from_document(
                     &bi_arc,
                     did.clone(),
                     custody_str.clone(),
                     &entry.document,
+                    verifying_key_hex,
                 ))
             })
         });
@@ -965,11 +1124,17 @@ impl crate::scp::PyScp {
                 entry.identity = new_identity;
                 entry.document = new_document;
 
+                let verifying_key_hex = rt
+                    .block_on(entry.custody.public_key(&entry.identity.identity_key))
+                    .ok()
+                    .map(|pk| hex::encode(pk.as_bytes()));
+
                 Ok(PyIdentity::from_document(
                     &bi_arc,
                     did.clone(),
                     custody_str.clone(),
                     &entry.document,
+                    verifying_key_hex,
                 ))
             })
         });
@@ -1033,11 +1198,17 @@ impl crate::scp::PyScp {
                 entry.identity = new_identity;
                 entry.document = new_document;
 
+                let verifying_key_hex = rt
+                    .block_on(entry.custody.public_key(&entry.identity.identity_key))
+                    .ok()
+                    .map(|pk| hex::encode(pk.as_bytes()));
+
                 Ok(PyIdentity::from_document(
                     &bi_arc,
                     did.clone(),
                     custody_str.clone(),
                     &entry.document,
+                    verifying_key_hex,
                 ))
             })
         });
@@ -1100,11 +1271,17 @@ impl crate::scp::PyScp {
                 entry.identity = new_identity;
                 entry.document = new_document;
 
+                let verifying_key_hex = rt
+                    .block_on(entry.custody.public_key(&entry.identity.identity_key))
+                    .ok()
+                    .map(|pk| hex::encode(pk.as_bytes()));
+
                 Ok(PyIdentity::from_document(
                     &bi_arc,
                     did.clone(),
                     custody_str.clone(),
                     &entry.document,
+                    verifying_key_hex,
                 ))
             })
         });
@@ -1208,6 +1385,14 @@ impl crate::scp::PyScp {
                 let new_did = new_identity.did.clone();
                 let document_for_handle = new_document.clone();
 
+                // Snapshot the migrated identity's verifying-key BEFORE the
+                // identity / custody move into the registry (ADR-046 parity).
+                let verifying_key_hex = custody
+                    .public_key(&new_identity.identity_key)
+                    .await
+                    .ok()
+                    .map(|pk| hex::encode(pk.as_bytes()));
+
                 // Preserve existing attestations from the old DID across migration.
                 let existing_attestations = crate::runtime::with_identity(&bi_arc, &old_did, |e| {
                     Ok(e.identity_link_attestations.clone())
@@ -1231,6 +1416,7 @@ impl crate::scp::PyScp {
                     new_did,
                     custody_str,
                     &document_for_handle,
+                    verifying_key_hex,
                 ))
             })
         })
@@ -1905,7 +2091,7 @@ mod tests {
             let scp = default_scp();
             let bi = Arc::clone(&scp.inner);
             // Create an identity via the actual bridge method.
-            let original = scp.identity_create(py, "in_memory").unwrap();
+            let original = scp.identity_create(py, "in_memory", None).unwrap();
             let old_did = original.did.clone();
             assert!(old_did.starts_with("did:dht:"));
             assert!(crate::runtime::identity_registry_contains(&bi, &old_did));

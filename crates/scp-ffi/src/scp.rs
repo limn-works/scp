@@ -125,8 +125,10 @@ impl PyScp {
                 .into());
             }
         };
+        let bi = PyBridgeInstance::with_storage_py(cfg)
+            .map_err(|e| ScpPyError::validation(e.to_string()))?;
         Ok(Self {
-            inner: Arc::new(PyBridgeInstance::with_storage_py(cfg)),
+            inner: Arc::new(bi),
         })
     }
 

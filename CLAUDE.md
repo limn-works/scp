@@ -113,6 +113,8 @@ affinity enforcement), check-no-mutable-globals.sh,
 check-no-mutable-module-globals.py, check-no-ts-mutable-globals.sh,
 check-no-kotlin-mutable-globals.sh,
 bindings/swift/.swiftlint.yml (no_static_var / no_static_lazy_var rules),
+check-bridge-symmetry.sh, bridge-aliases.json, check-call-invariants.py,
+call-invariants-baseline.json,
 bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
 CLAUDE.md (enforcement sections).
 If a check fails, fix the code. The only legitimate modifications are:

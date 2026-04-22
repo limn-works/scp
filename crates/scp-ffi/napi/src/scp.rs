@@ -185,8 +185,14 @@ impl Scp {
                 }));
             }
         };
+        let inner = NapiBridgeInstance::with_storage_napi(storage).map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: e.to_string(),
+                code: codes::VALID_7005.to_owned(),
+            })
+        })?;
         Ok(Self {
-            inner: Arc::new(NapiBridgeInstance::with_storage_napi(storage)),
+            inner: Arc::new(inner),
         })
     }
 
@@ -293,15 +299,42 @@ impl Scp {
     /// `&*self.inner`. Key material, registry writes, and the DID
     /// resolver are all scoped to this `SCP`.
     ///
-    /// See `crate::identity::identity_create` for argument semantics.
+    /// When `seed` is supplied (32 bytes), the in-memory custody is backed
+    /// by a deterministic RNG so subsequent `generate_keypair` calls
+    /// produce byte-identical Ed25519 keys across bridges — the basis of
+    /// the cross-bridge parity test (ADR-046). `seed` is only valid for
+    /// `"in_memory"` custody; other custody types reject it with
+    /// `SCP-VALID-7007`.
     #[napi(js_name = "identityCreate")]
     pub async fn identity_create(
         &self,
         custody: String,
+        seed: Option<napi::bindgen_prelude::Buffer>,
     ) -> napi::Result<crate::identity::NapiIdentity> {
         use crate::identity::{NapiIdentityInner, ensure_did_resolver_initialized_on};
 
         validate_custody_type(&custody).map_err(NapiError::from)?;
+
+        // Validate the optional 32-byte seed at the FFI boundary so we fail
+        // early rather than panicking in `InMemoryKeyCustody::from_seed_bytes`.
+        let seed_bytes: Option<[u8; 32]> = match seed {
+            None => None,
+            Some(buf) => {
+                let slice: &[u8] = buf.as_ref();
+                if slice.len() != 32 {
+                    return Err(NapiError::from(ScpNapiError::Validation {
+                        message: format!(
+                            "`seed` must be exactly 32 bytes, got {}",
+                            slice.len()
+                        ),
+                        code: codes::VALID_7007.to_owned(),
+                    }));
+                }
+                let mut out = [0u8; 32];
+                out.copy_from_slice(slice);
+                Some(out)
+            }
+        };
 
         let bi = &*self.inner;
         ensure_did_resolver_initialized_on(bi);
@@ -312,14 +345,20 @@ impl Scp {
                 use scp_platform::testing::InMemoryKeyCustody;
                 use scp_identity::DidDht;
 
-                let key_custody = Arc::new(crate::identity::OpaqueInMemoryKeyCustody(
-                    InMemoryKeyCustody::new(),
-                ));
+                let in_memory = seed_bytes
+                    .map_or_else(InMemoryKeyCustody::new, InMemoryKeyCustody::from_seed_bytes);
+                let key_custody = Arc::new(crate::identity::OpaqueInMemoryKeyCustody(in_memory));
                 let dht = DidDht::new();
                 let (scp_identity, document) = dht
                     .create(&key_custody.0)
                     .await
                     .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+                let verifying_key_hex = crate::identity::identity_verifying_key_hex(
+                    &key_custody,
+                    &scp_identity.identity_key,
+                )
+                .await;
 
                 crate::runtime::register_identity(
                     bi,
@@ -342,7 +381,9 @@ impl Scp {
                         scp_identity: Some(scp_identity),
                         in_memory_custody: Some(key_custody),
                         document: Some(document),
-                        bi: Arc::clone(&self.inner), instance_id: bi.instance_id(),
+                        bi: Arc::clone(&self.inner),
+                        verifying_key_hex,
+                        instance_id: bi.instance_id(),
                     }),
                 };
                 crate::increment_handle_count();
@@ -356,16 +397,25 @@ impl Scp {
                 code: codes::IDENT_1008.to_owned(),
             }
             .into()),
-            "platform" | "software" => Err(ScpNapiError::Identity {
-                message: format!(
-                    "custody type {custody:?} requires a wired platform \
-                     KeyCustodyProvider — use the KeyCustodyProvider callback \
-                     interface to inject Secure Enclave (iOS) or Android \
-                     Keystore (Android) backed custody"
-                ),
-                code: codes::IDENT_1003.to_owned(),
+            "platform" | "software" => {
+                if seed_bytes.is_some() {
+                    return Err(NapiError::from(ScpNapiError::Validation {
+                        message: "`seed` parameter is only valid for custody=\"in_memory\""
+                            .to_owned(),
+                        code: codes::VALID_7007.to_owned(),
+                    }));
+                }
+                Err(ScpNapiError::Identity {
+                    message: format!(
+                        "custody type {custody:?} requires a wired platform \
+                         KeyCustodyProvider — use the KeyCustodyProvider callback \
+                         interface to inject Secure Enclave (iOS) or Android \
+                         Keystore (Android) backed custody"
+                    ),
+                    code: codes::IDENT_1003.to_owned(),
+                }
+                .into())
             }
-            .into()),
             _ => Err(ScpNapiError::Identity {
                 code: codes::IDENT_1005.to_owned(),
                 message: format!(
@@ -408,6 +458,12 @@ impl Scp {
                     .await
                     .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
+                let verifying_key_hex = crate::identity::identity_verifying_key_hex(
+                    &key_custody,
+                    &scp_identity.identity_key,
+                )
+                .await;
+
                 crate::runtime::register_identity(
                     bi,
                     &scp_identity.did,
@@ -429,7 +485,9 @@ impl Scp {
                         scp_identity: Some(scp_identity),
                         in_memory_custody: Some(key_custody),
                         document: Some(document),
-                        bi: Arc::clone(&self.inner), instance_id: bi.instance_id(),
+                        bi: Arc::clone(&self.inner),
+                        verifying_key_hex,
+                        instance_id: bi.instance_id(),
                     }),
                 };
                 crate::increment_handle_count();
@@ -494,6 +552,9 @@ impl Scp {
             });
 
             if let Ok((identity, custody, document)) = local_result {
+                let verifying_key_hex =
+                    crate::identity::identity_verifying_key_hex(&custody, &identity.identity_key)
+                        .await;
                 let handle = crate::identity::NapiIdentity {
                     inner: Arc::new(NapiIdentityInner {
                         did,
@@ -502,6 +563,7 @@ impl Scp {
                         in_memory_custody: Some(custody),
                         document: Some(document),
                         bi: Arc::clone(&self.inner),
+                        verifying_key_hex,
                         instance_id: bi.instance_id(),
                     }),
                 };
@@ -525,6 +587,7 @@ impl Scp {
                 in_memory_custody: None,
                 document: Some(document),
                 bi: Arc::clone(&self.inner),
+                verifying_key_hex: None,
                 instance_id: bi.instance_id(),
             }),
         };
@@ -2839,10 +2902,13 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `transport_status`.
+    ///
+    /// Accepts an optional transport manager handle. When `null`/`undefined`,
+    /// returns the bridge-scoped handleless probe (mirrors PyO3/WASM).
     #[napi(js_name = "transportStatus")]
     pub async fn transport_status(
         &self,
-        manager: &NapiTransportManager,
+        manager: Option<&NapiTransportManager>,
     ) -> napi::Result<NapiTransportStatus> {
         crate::transport::transport_status_on(&self.inner, manager).await
     }
@@ -3671,6 +3737,11 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `scpid_sign`.
+    ///
+    /// `signed_at_override` is a testing-only parameter for the ADR-046
+    /// cross-bridge parity harness. Only accepted when scp-core is built
+    /// with the `testing` feature; production builds reject any non-`null`
+    /// value via `SCP-VALID-7007`.
     #[cfg(feature = "allow_in_memory_custody")]
     #[napi(js_name = "scpidSign")]
     pub fn scpid_sign(
@@ -3678,8 +3749,17 @@ impl Scp {
         did: String,
         signing_key_id: String,
         challenge_json: String,
+        #[napi(ts_arg_type = "bigint | null | undefined")] signed_at_override: Option<
+            napi::bindgen_prelude::BigInt,
+        >,
     ) -> napi::Result<String> {
-        crate::scpid::scpid_sign_on(&self.inner, did, signing_key_id, challenge_json)
+        crate::scpid::scpid_sign_on(
+            &self.inner,
+            did,
+            signing_key_id,
+            challenge_json,
+            signed_at_override,
+        )
     }
 
     /// Per-instance equivalent of the free-function `scpid_verify`.

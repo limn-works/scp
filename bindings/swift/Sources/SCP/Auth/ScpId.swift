@@ -152,6 +152,53 @@ private struct AuthenticationWire: Decodable {
 /// All operations delegate to UniFFI bridge functions/methods and parse
 /// their JSON results into typed Swift structs.
 public enum ScpId {
+    /// Bridge function type for generating an SCPID challenge.
+    public typealias ChallengeFn = @Sendable (
+        _ audience: String,
+        _ ttlSeconds: UInt64
+    ) throws -> String
+
+    /// Bridge function type for signing an SCPID challenge.
+    public typealias SignFn = @Sendable (
+        _ identity: Identity,
+        _ signingKeyId: String,
+        _ challengeJson: String
+    ) throws -> String
+
+    /// Bridge function type for verifying an SCPID response.
+    public typealias VerifyFn = @Sendable (
+        _ responseJson: String,
+        _ challengeJson: String
+    ) throws -> String
+
+    /// Default challenge function — delegates to an `SCP` instance's
+    /// `scpidChallenge(audience:ttlSeconds:)` method. The free
+    /// `scpidChallenge` UniFFI export was removed in Phase 4 PR 5 (ADR-048).
+    public static let defaultChallenge: ChallengeFn = { _, _ in
+        throw ScpError.Validation(
+            message: "scpidChallenge default is not wired after façade deletion — pass an SCP-bound closure (see SCP.scpidChallenge)",
+            code: "SCP-VALID-7300"
+        )
+    }
+
+    /// Default sign function — placeholder; callers must supply an
+    /// `SCP`-bound closure via the SDK wrapper because the free
+    /// `scpidSign` UniFFI export was removed in Phase 4 PR 5 (ADR-048).
+    public static let defaultSign: SignFn = { _, _, _ in
+        throw ScpError.Validation(
+            message: "scpidSign default is not wired after façade deletion — pass an SCP-bound closure (see SCP.scpidSign)",
+            code: "SCP-VALID-7300"
+        )
+    }
+
+    /// Default verify function — delegates to UniFFI
+    /// ``scpidVerify(responseJson:challengeJson:)``. `scpidVerify` is
+    /// stateless and kept as a free function.
+    public static let defaultVerify: VerifyFn = { responseJson, challengeJson in
+        try scpidVerify(responseJson: responseJson, challengeJson: challengeJson)
+    }
+
+
     // MARK: - Public API
 
     /// Generates an SCPID challenge for the given audience (spec section 3.11.2).

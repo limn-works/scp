@@ -227,7 +227,8 @@ fn tool_register_impl(
     let cost = extract_cost(registration)?;
 
     // Generate a tool ID from the name (deterministic, human-readable).
-    let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
+    // Shared with every other bridge via `scp_ffi_common::tool_id`.
+    let tool_id = scp_ffi_common::tool_id::generate_tool_id(&name);
 
     // Build the scp-core ToolRegistration.
     let core_registration = scp_core::context::tools::ToolRegistration {

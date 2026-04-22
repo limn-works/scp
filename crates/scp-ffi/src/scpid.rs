@@ -67,30 +67,51 @@ impl crate::scp::PyScp {
 
     /// Signs an SCPID challenge with a registered identity's key (§3.11.3).
     ///
-    /// Looks up the identity by DID in the global registry, selects the
-    /// appropriate signing key (`#active` or `#agent`), and produces a signed
-    /// SCPID response as a JSON string.
+    /// Looks up the identity by DID in this bridge's registry, selects the
+    /// appropriate signing key (`#active` or `#agent`), and produces a
+    /// signed SCPID response as a JSON string.
     ///
     /// # Arguments
     ///
     /// * `did` — The signer's DID (must be registered via `identity_create`).
     /// * `signing_key_id` — `"#active"` or `"#agent"`.
     /// * `challenge_json` — JSON string of the challenge (from `PyScp::scpid_challenge`).
+    /// * `signed_at_override` — Optional Unix-millisecond timestamp used in
+    ///   place of the current wall clock. **Only accepted when scp-core is
+    ///   built with the `testing` feature**; attempts to supply a value on
+    ///   production builds are rejected. Drives the cross-bridge parity
+    ///   harness (ADR-046) so two bridges signing the same challenge under
+    ///   the same seed produce byte-identical signatures.
     ///
     /// # Errors
     ///
     /// Raises `IdentityError` if the DID is not registered.
-    /// Raises `ValidationError` if `signing_key_id` is invalid or the challenge
-    /// JSON is malformed.
+    /// Raises `ValidationError` if `signing_key_id` is invalid, the challenge
+    /// JSON is malformed, or `signed_at_override` is supplied on a
+    /// non-testing build / outside the challenge window.
     /// Raises `IdentityError` if the signing operation fails.
+    #[pyo3(signature = (did, signing_key_id, challenge_json, signed_at_override = None))]
     pub fn scpid_sign(
         &self,
         py: Python<'_>,
         did: String,
         signing_key_id: String,
         challenge_json: String,
+        signed_at_override: Option<u64>,
     ) -> PyResult<String> {
         let bi = &*self.inner;
+        // Reject `signed_at_override` on non-testing builds: the override is a
+        // parity-harness affordance, not a production API.
+        #[cfg(not(feature = "testing"))]
+        if signed_at_override.is_some() {
+            return Err(ScpPyError::ValidationError {
+                message:
+                    "signed_at_override requires the scp-core `testing` feature — not available in production builds"
+                        .to_string(),
+                code: codes::VALID_7007.to_string(),
+            }
+            .into());
+        }
         let key_id = parse_signing_key_id(&signing_key_id)?;
 
         let challenge: ScpIdChallenge =
@@ -122,6 +143,7 @@ impl crate::scp::PyScp {
                     &did,
                     key_id,
                     &challenge,
+                    signed_at_override,
                 ));
 
                 let response = response.map_err(|e| ScpPyError::IdentityError {
@@ -406,6 +428,7 @@ mod tests {
             &identity.did,
             SigningKeyId::Active,
             &challenge,
+            None,
         )
         .await
         .unwrap();

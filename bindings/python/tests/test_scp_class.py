@@ -137,7 +137,8 @@ def _make_wrapper_with_mock() -> tuple[WrapperSCP, Any]:
     return wrapper, mock_native
 
 
-def test_shutdown_infinity_maps_to_max_millis() -> None:
+@pytest.mark.asyncio
+async def test_shutdown_infinity_maps_to_max_millis() -> None:
     """`math.inf` must clamp to u64::MAX — "wait forever" — not abort.
 
     Regression test for round 5 RED-2001: the previous clamp ordering
@@ -147,11 +148,12 @@ def test_shutdown_infinity_maps_to_max_millis() -> None:
     promises the opposite.
     """
     wrapper, mock_native = _make_wrapper_with_mock()
-    wrapper.shutdown(timeout=math.inf)
+    await wrapper.shutdown(timeout=math.inf)
     mock_native.shutdown.assert_called_once_with(0xFFFFFFFF_FFFFFFFF)
 
 
-def test_shutdown_negative_infinity_maps_to_abort() -> None:
+@pytest.mark.asyncio
+async def test_shutdown_negative_infinity_maps_to_abort() -> None:
     """`-math.inf` must NOT be treated as wait-forever.
 
     The Infinity-is-wait-forever exemption is deliberately asymmetric:
@@ -159,44 +161,49 @@ def test_shutdown_negative_infinity_maps_to_abort() -> None:
     nonsensical timeout and falls through to the abort branch.
     """
     wrapper, mock_native = _make_wrapper_with_mock()
-    wrapper.shutdown(timeout=-math.inf)
+    await wrapper.shutdown(timeout=-math.inf)
     mock_native.shutdown.assert_called_once_with(0)
 
 
-def test_shutdown_nan_maps_to_abort() -> None:
+@pytest.mark.asyncio
+async def test_shutdown_nan_maps_to_abort() -> None:
     """`math.nan` must clamp to 0 (abort) — NaN is not orderable.
 
     Ordered comparisons against NaN always return False, so `nan <= 0`
     is False. `math.isfinite(nan)` is also False — that is how we trap it.
     """
     wrapper, mock_native = _make_wrapper_with_mock()
-    wrapper.shutdown(timeout=math.nan)
+    await wrapper.shutdown(timeout=math.nan)
     mock_native.shutdown.assert_called_once_with(0)
 
 
-def test_shutdown_negative_maps_to_abort() -> None:
+@pytest.mark.asyncio
+async def test_shutdown_negative_maps_to_abort() -> None:
     """Negative timeouts collapse to 0 (abort immediately)."""
     wrapper, mock_native = _make_wrapper_with_mock()
-    wrapper.shutdown(timeout=-1.5)
+    await wrapper.shutdown(timeout=-1.5)
     mock_native.shutdown.assert_called_once_with(0)
 
 
-def test_shutdown_zero_maps_to_abort() -> None:
+@pytest.mark.asyncio
+async def test_shutdown_zero_maps_to_abort() -> None:
     """A zero-second timeout maps to 0 millis — an explicit abort."""
     wrapper, mock_native = _make_wrapper_with_mock()
-    wrapper.shutdown(timeout=0.0)
+    await wrapper.shutdown(timeout=0.0)
     mock_native.shutdown.assert_called_once_with(0)
 
 
-def test_shutdown_overflow_clamps_to_max_millis() -> None:
+@pytest.mark.asyncio
+async def test_shutdown_overflow_clamps_to_max_millis() -> None:
     """Values that would overflow u64::MAX milliseconds clamp cleanly."""
     wrapper, mock_native = _make_wrapper_with_mock()
     # 1e18 seconds → 1e21 ms, well past u64::MAX (~1.8e19).
-    wrapper.shutdown(timeout=1.0e18)
+    await wrapper.shutdown(timeout=1.0e18)
     mock_native.shutdown.assert_called_once_with(0xFFFFFFFF_FFFFFFFF)
 
 
-def test_shutdown_finite_value_rounds_to_nearest_ms() -> None:
+@pytest.mark.asyncio
+async def test_shutdown_finite_value_rounds_to_nearest_ms() -> None:
     """Fractional seconds preserve ms resolution via `round()`.
 
     Regression guard for the round 2 fix (floor → round): 0.2505 s =
@@ -204,8 +211,25 @@ def test_shutdown_finite_value_rounds_to_nearest_ms() -> None:
     exact halves, but this value rounds deterministically).
     """
     wrapper, mock_native = _make_wrapper_with_mock()
-    wrapper.shutdown(timeout=0.2505)
+    await wrapper.shutdown(timeout=0.2505)
     mock_native.shutdown.assert_called_once_with(250)
+
+
+def test_shutdown_sync_exit_uses_clamping_logic() -> None:
+    """`__exit__` (synchronous `with`) must still clamp + dispatch.
+
+    The retro (PR #1690 Fix 6) made `shutdown` async, but the `with`
+    context-manager path stayed synchronous: `__exit__` calls the PyO3
+    `_native.shutdown` directly and reuses the shared `_shutdown_millis`
+    clamping helper. This guards against a regression that would either
+    (a) leave `__exit__` calling a now-coroutine `shutdown()` without
+    awaiting, or (b) duplicate the clamp logic and let the two paths
+    drift.
+    """
+    wrapper, mock_native = _make_wrapper_with_mock()
+    wrapper.__exit__(None, None, None)
+    # Default sync-exit timeout is 5.0 s → 5000 ms.
+    mock_native.shutdown.assert_called_once_with(5000)
 
 
 @pytest.mark.asyncio

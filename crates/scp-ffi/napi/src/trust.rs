@@ -303,11 +303,15 @@ pub(crate) fn aggregate_trust_input_on(
             validation_error(&format!("failed to parse challenge_results JSON: {e}"))
         })?;
 
-    // Route trust aggregation through the bridge instance's `ProtocolRepoVariant`
-    // so SQLite-backed bridges store trust attestations in the same SQLCipher
-    // database as context snapshots and event log entries. Falls back to an
-    // ephemeral in-memory store if the variant dispatch yields `None`
-    // (e.g. a test bridge with no repository). See issue #502.
+    // Route trust aggregation through this bridge instance's
+    // `ProtocolRepoVariant` so SQLite-backed bridges store trust
+    // attestations in the same SQLCipher database as context snapshots and
+    // event log entries. Per-bridge dispatch cannot be `None` — each
+    // `NapiBridgeInstance` owns a concrete variant from construction, so
+    // the split-brain failure mode main's `Option` guarded against
+    // (trust writes silently landing in an ephemeral store while
+    // context/event-log writes landed in SQLCipher) is structurally
+    // unreachable. See issue #502.
     match crate::runtime::protocol_repository(bi) {
         crate::runtime::ProtocolRepoVariant::InMemory(repo) => {
             let handle = crate::runtime().handle().clone();

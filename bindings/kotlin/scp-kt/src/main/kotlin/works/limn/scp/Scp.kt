@@ -56,6 +56,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.logging.Level
 import java.util.logging.Logger
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 import uniffi.scp.Scp as NativeScp
 
 /**
@@ -165,11 +166,18 @@ class SCP internal constructor(
      * precision is not preserved. Negative durations are clamped to
      * zero.
      *
+     * [timeout] defaults to 5 seconds — the same default the PyO3 and
+     * NAPI SDK wrappers carry. Callers that need an explicit deadline
+     * (e.g. abort immediately with `Duration.ZERO`, or wait
+     * effectively-forever with a large `Duration.ofHours(n)`) pass the
+     * argument explicitly. See PR #1690 retro api-design MODERATE.
+     *
      * @param timeout Maximum duration to wait for in-flight tasks.
+     *   Defaults to 5 seconds.
      */
     suspend fun shutdown(
         bridge: CoroutineBridge,
-        timeout: Duration,
+        timeout: Duration = 5.seconds,
     ) {
         val millis = timeout.inWholeMilliseconds.coerceAtLeast(0).toULong()
         bridge.ffiCallSuspend { inner.shutdown(timeoutMillis = millis) }

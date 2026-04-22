@@ -187,6 +187,85 @@ impl PyCheckpoint {
 /// falling back to a `LogSummary` metadata event when storage is not
 /// initialized or no event payloads have been persisted.
 ///
+/// # Arguments
+///
+/// * `context_id` -- The ID of the context whose event log to query.
+/// * `filter` -- An optional Python dict with filter parameters:
+///   - `"event_type"` (str): Filter by event type name.
+///   - `"actor_did"` (str): Filter by actor DID.
+///   - `"after_sequence"` (int): Only events after this sequence number.
+///   - `"before_sequence"` (int): Only events before this sequence number.
+///   - `"after_timestamp"` (float): Only events after this timestamp.
+///   - `"before_timestamp"` (float): Only events before this timestamp.
+///   - `"limit"` (int): Maximum number of events to return.
+///
+/// # Returns
+///
+/// A list of [`PyEvent`] objects. Returns deserialized real events when
+/// event payloads have been persisted via `ProtocolRepository`, or a single
+/// `LogSummary` event with Merkle root and event count as fallback.
+///
+/// # Errors
+///
+/// Raises `ContextError` if the context is not connected to the runtime
+/// or if the query fails.
+///
+/// See ADR-013 §7: `py_event_log_query(handle, filter) -> list[PyEvent]`.
+/// Queries the shared `ContextManager`'s event log provider and maps the
+/// resulting entries into [`PyEvent`]s using the same shape NAPI emits from
+/// its `MerkleEventLogProvider` path.
+///
+/// Returns `Ok(Some(events))` when the manager is initialized AND has
+/// entries for the context, `Ok(None)` when the caller should fall back to
+/// the bridge-local per-context `EventLog` (e.g. UCAN revocation writes,
+/// tests that bypass the manager).
+fn query_manager_entries(
+    bi: &PyBridgeInstance,
+    py: Python<'_>,
+    context_id: &str,
+    query_filter: &scp_core::store::event_log::EventQueryFilter,
+) -> PyResult<Option<Vec<PyEvent>>> {
+    let ctx_id_bytes = scp_core::context::context_id_bytes(context_id);
+    let Some(entries) = crate::runtime::context_manager(bi)
+        .ok()
+        .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten())
+    else {
+        return Ok(None);
+    };
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    let mut py_events = Vec::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        if let Some(ref et) = query_filter.event_type
+            && entry.event != *et
+        {
+            continue;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let timestamp = entry.timestamp as f64;
+        let payload_json = serde_json::json!({
+            "hash": encode_hex(&entry.hash),
+        });
+        let payload = json_to_py_dict(py, &payload_json)?;
+        py_events.push(PyEvent {
+            event_type: entry.event.clone(),
+            // `EventLogEntry` does not carry actor DID.
+            actor_did: String::new(),
+            timestamp,
+            payload,
+            sequence: idx as u64,
+        });
+        if let Some(limit) = query_filter.limit
+            && py_events.len() >= limit
+        {
+            break;
+        }
+    }
+    Ok(Some(py_events))
+}
+
 /// See GitHub issue #303.
 fn event_log_query_impl(
     bi: &PyBridgeInstance,
@@ -195,7 +274,24 @@ fn event_log_query_impl(
     filter: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Vec<PyEvent>> {
     validate::validate_context_id(context_id)?;
-    // Look up the context's event log from the runtime registry.
+
+    // Parse filter parameters from the Python dict (needed for both the
+    // ContextManager-entries path and the storage fallback).
+    let query_filter = parse_event_query_filter(filter)?;
+
+    // First, try the ContextManager's event log provider — this is the
+    // authoritative source populated by `builder_create_context`
+    // (`ContextCreated` at step 7) and subsequent manager operations.
+    // Mirrors the NAPI bridge. Aligned across PyO3/NAPI/WASM/UniFFI —
+    // pinned by the cross-bridge parity harness's `OP_EVENT_LOG_APPEND`
+    // and `OP_EVENT_LOG_FILTERED` (ADR-046).
+    if let Some(events) = query_manager_entries(bi, py, context_id, &query_filter)? {
+        return Ok(events);
+    }
+
+    // Fallback: look up this bridge's per-context event log from the runtime
+    // registry. This path is used by legacy tests and callers that write
+    // directly to the per-context `EventLog` (e.g. UCAN revocation).
     let (event_count, merkle_root_hex) = crate::runtime::with_context(bi, context_id, |rt| {
         let count = scp_event_log::tree::event_count(&rt.event_log);
         let root = scp_event_log::tree::root(&rt.event_log);
@@ -206,9 +302,6 @@ fn event_log_query_impl(
     if event_count == 0 {
         return Ok(Vec::new());
     }
-
-    // Parse filter parameters from the Python dict.
-    let query_filter = parse_event_query_filter(filter)?;
 
     // Attempt to load real events from storage if available.
     // Uses the Storage trait directly because the global storage is

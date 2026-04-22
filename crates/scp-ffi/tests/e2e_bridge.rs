@@ -479,11 +479,18 @@ fn event_log_query_empty_returns_empty() {
         let did = create_test_identity(scp.bridge_instance());
         let ctx_id = create_test_context(scp.bridge_instance(), &did);
 
-        // Event log starts empty when context is created via ContextManager
-        // (not via py_context_create which appends events). Query should
-        // succeed and return an empty list.
+        // Per commit a5b4cc8ec ("fix: emit ContextCreated on context
+        // create"), the PyO3 bridge now wires a MerkleEventLogProvider
+        // (matching NAPI/UniFFI/WASM). `ContextManager::create_context`
+        // appends exactly one `ContextCreated` event at sequence 0, so a
+        // fresh context has event_count = 1 across all four bridges.
+        // This test pins the post-alignment invariant.
         let events = scp.event_log_query(py, &ctx_id, None).unwrap();
-        assert!(events.is_empty());
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one ContextCreated event on a fresh context"
+        );
     });
 }
 

@@ -1,0 +1,15 @@
+{
+  "name": "scp-bridge-parity-runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Long-lived Bun bridge runner for cross-bridge parity tests (ADR-046)",
+  "main": "node_bridge_runner.ts",
+  "scripts": {
+    "smoke": "bun run node_bridge_runner.ts < /dev/null"
+  },
+  "dependencies": {
+    "@limn-works/scp-ts": "workspace:*",
+    "@limn-works/scp-ts-wasm": "workspace:*"
+  }
+}

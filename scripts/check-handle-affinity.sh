@@ -6,7 +6,7 @@
 # WHAT THIS CHECKS
 # ---------------------------------------------------------------------------
 # Every FFI function in one of the three non-WASM bridges
-#   crates/scp-ffi/src/        (PyO3   — #[pyfunction])
+#   crates/scp-ffi/src/        (PyO3   — #[pyfunction] / #[pymethods])
 #   crates/scp-ffi/napi/src/   (NAPI   — #[napi])
 #   crates/scp-ffi/uniffi/src/ (UniFFI — #[uniffi::export])
 # whose signature includes a parameter whose type ends in one of the handle
@@ -21,6 +21,19 @@
 # This guarantees that a handle minted by one `SCP` instance cannot be used
 # against a different `SCP` instance within the same process. Mismatches
 # return the error code SCP-PERM-3030 at runtime.
+#
+# Two shapes are covered:
+#   1. Free functions annotated with the bridge attribute directly
+#      (e.g. `#[pyfunction] fn foo(handle: &CtxHandle)`).
+#   2. Methods inside an FFI-exported `impl` block
+#      (e.g. `#[napi] impl Scp { fn foo(&self, handle: &CtxHandle) }`
+#      or `#[pymethods] impl Scp { fn foo(&self, handle: &CtxHandle) }`
+#      or `#[uniffi::export] impl Scp { fn foo(&self, handle: Arc<CtxHandle>) }`).
+#
+# Shape 2 is load-bearing for the SCP multi-instance migration (PR 4+,
+# issue #1687) — as handle-taking operations move from free functions to
+# `Scp` instance methods, the gate must catch a missing affinity check on
+# the method as it would on a free function.
 #
 # ---------------------------------------------------------------------------
 # WHEN THIS RUNS
@@ -432,6 +445,7 @@ scan_bridge() {
                     match(line, /^[[:space:]]*\*/) == 0) {
                     pending_method_scope = 0
                 }
+
 
                 # Look for the bridge attribute. Match either the bare
                 # attribute (`#[pyfunction]`, `#[napi]`, `#[uniffi::export]`)

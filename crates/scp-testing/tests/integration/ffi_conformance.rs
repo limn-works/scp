@@ -15,9 +15,17 @@
 //! apply (e.g. WASM cannot depend on scp-core per ADR-034).
 //!
 //! Implementation: reads bridge source files at compile time via `include_str!`
-//! and searches for exported function name patterns. Each bridge has naming
-//! conventions (e.g. PyO3 prefixes with `py_`, WASM uses alternate names for
-//! some operations) that are handled by per-bridge alias tables.
+//! and searches for exported function name patterns. The per-bridge alias
+//! tables live in `scripts/bridge-aliases.json` — the SAME file consumed by
+//! `scripts/check-bridge-symmetry.sh`, so the Rust test and the shell
+//! enforcement cannot silently drift apart. The test
+//! `aliases_json_is_in_sync_with_parity_operations` asserts the JSON matches
+//! the local ratchet constants (total op count and WASM-required named set).
+
+use std::collections::{BTreeSet, HashSet};
+use std::sync::OnceLock;
+
+use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
 // Source files embedded at compile time
@@ -83,272 +91,393 @@ const WASM_TRUST: &str = include_str!("../../../../crates/scp-ffi/wasm/src/trust
 const WASM_ECONOMY: &str = include_str!("../../../../crates/scp-ffi/wasm/src/economy.rs");
 
 // ---------------------------------------------------------------------------
-// Reference operation set
-//
-// Each tuple: (category, canonical_name, wasm_required)
-// `wasm_required=false` means WASM is allowed to omit it per ADR-034.
-//
-// The canonical name is the "ideal" shared name. Each bridge detection
-// function uses an alias table to map canonical names to the actual function
-// names in that bridge (e.g. PyO3 prefixes with `py_`, NAPI uses
-// `context_execute_governance_action` for `governance_execute`, etc.).
+// Shared alias table — compiled in at build time from scripts/bridge-aliases.json
 // ---------------------------------------------------------------------------
 
-const PARITY_OPERATIONS: &[(&str, &str, bool)] = &[
-    // Identity
-    ("identity", "identity_create", true),
-    ("identity", "identity_load", true),
-    ("identity", "identity_resolve", true),
-    ("identity", "identity_migrate", true),
-    ("identity", "identity_attest_device", true),
-    ("identity", "identity_verify_device_attestation", true),
-    // Context lifecycle
-    ("context", "context_create", true),
-    ("context", "context_join", true),
-    ("context", "context_leave", true),
-    ("context", "context_close", true),
-    ("context", "context_send", true),
-    ("context", "context_subscribe", true),
-    ("context", "context_export", true),
-    ("context", "context_import", true),
-    // Membership queries
-    ("membership", "context_member_count", true),
-    ("membership", "context_is_member", true),
-    ("membership", "context_member_dids", true),
-    ("membership", "context_member_role", true),
-    // Events
-    ("events", "context_drain_events", true),
-    // Governance
-    ("governance", "governance_execute", true),
-    // Tools
-    ("tools", "tool_register", true),
-    ("tools", "tool_invoke", true),
-    ("tools", "tool_verify", true),
-    ("tools", "tool_invoke_cross_context", false),
-    ("tools", "tool_session_create", false),
-    ("tools", "tool_session_invoke", false),
-    ("tools", "tool_session_close", false),
-    // UCAN
-    ("ucan", "ucan_validate", true),
-    ("ucan", "ucan_mint", true),
-    ("ucan", "ucan_revoke", true),
-    ("ucan", "ucan_delegate", true),
-    // Event Log
-    ("event_log", "event_log_query", true),
-    ("event_log", "event_log_verify", true),
-    ("event_log", "event_log_checkpoint", true),
-    // Transport -- WASM has these but they are optional per ADR-034
-    ("transport", "transport_connect", false),
-    ("transport", "transport_status", false),
-    // Broadcast
-    ("broadcast", "broadcast_subscribe", true),
-    ("broadcast", "broadcast_unsubscribe", true),
-    ("broadcast", "broadcast_publish", true),
-    ("broadcast", "broadcast_block", true),
-    // Trust
-    ("trust", "trust_query_score", true),
-    ("trust", "trust_verify_attestation", true),
-    ("trust", "trust_create_challenge", true),
-    ("trust", "trust_verify_response", true),
-    ("trust", "verify_participation_requirements", true),
-    // Sync
-    ("sync", "sync_classify_offline", true),
-    ("sync", "sync_classify_offline_custom", true),
-    ("sync", "sync_get_policy", true),
-    // Discovery
-    ("discovery", "discovery_parse_address", true),
-    ("discovery", "discovery_normalize_address", true),
-    // Provenance
-    ("provenance", "provenance_check_chain_depth", true),
-    ("provenance", "evaluate_provenance_quality", true),
-    ("provenance", "provenance_attach", true),
-    // Bridge connector -- WASM does not have these (no cross-bridge in browser)
-    ("bridge", "bridge_evaluate_trust", false),
-    ("bridge", "bridge_register", false),
-    ("bridge", "bridge_create_shadow", false),
-    // MCP -- PyO3 and NAPI only (WASM/UniFFI do not expose MCP server/client)
-    ("mcp", "mcp_server", false),
-    ("mcp", "mcp_client", false),
-    // Economy -- WASM has a subset; not required per ADR-034
-    ("economy", "economy_estimate_cost", false),
-    ("economy", "economy_policy_requires_payment", false),
-    ("economy", "economy_auto_accept_blocked", false),
-    ("economy", "economy_check_policy_lock", false),
-    ("economy", "economy_validate_policy_change", false),
-    ("economy", "economy_evaluate_formula", false),
-    ("economy", "economy_budget_remaining", false),
-    ("economy", "economy_budget_grant", false),
-    ("economy", "economy_budget_record_spend", false),
-    ("economy", "economy_antispam_record", false),
-    ("economy", "economy_antispam_velocity", false),
-    ("economy", "economy_antispam_escalated_cost", false),
-    // Media -- WASM has no media bridge; not required per ADR-034
-    ("media", "media_initiate_session", false),
-    ("media", "media_activate_session", false),
-    ("media", "media_join_session", false),
-    ("media", "media_end_session", false),
-    ("media", "media_create_offer", false),
-    ("media", "media_create_answer", false),
-    ("media", "media_create_ice_candidate", false),
-    ("media", "media_create_session_end", false),
-    ("media", "media_send_signaling", false),
-    ("media", "media_verify_sender_attribution", false),
-    ("media", "media_check_capability", false),
-    // Petname -- all bridges including WASM
-    ("petname", "petname_set", true),
-    ("petname", "petname_remove", true),
-    ("petname", "petname_set_context", true),
-    ("petname", "petname_remove_context", true),
-    ("petname", "petname_resolve_did", true),
-    ("petname", "petname_resolve_context", true),
-    ("petname", "petname_get_for_did", true),
-    ("petname", "petname_get_for_context", true),
-    // Handle/Scope -- all bridges including WASM
-    ("handle", "handle_register", true),
-    ("handle", "handle_lookup", true),
-    ("handle", "handle_deregister", true),
-    ("scope", "scope_register", true),
-    ("scope", "scope_lookup", true),
-    ("scope", "scope_deregister", true),
-    // Governance checkpoints -- all bridges including WASM
-    ("governance", "context_create_governance_checkpoint", true),
-    ("governance", "context_add_checkpoint_cosignature", true),
-];
+/// Raw JSON bytes of the shared alias table. Both this test and the shell
+/// script `scripts/check-bridge-symmetry.sh` read the same file, so drift is
+/// impossible — the test `aliases_json_is_in_sync_with_parity_operations`
+/// asserts the JSON matches the ratchet constants below.
+const BRIDGE_ALIASES_JSON: &str = include_str!("../../../../scripts/bridge-aliases.json");
 
-// ---------------------------------------------------------------------------
-// Detection: source contains `fn <name>(` or `fn <name> (`
-// ---------------------------------------------------------------------------
-
-fn source_has_fn(source: &str, name: &str) -> bool {
-    // Match `fn name(`, `fn name (`, or `fn name<` (generic lifetime params)
-    source.contains(&format!("fn {name}("))
-        || source.contains(&format!("fn {name} ("))
-        || source.contains(&format!("fn {name}<"))
+#[derive(Debug, Deserialize)]
+struct BridgeAliasesFile {
+    operations: Vec<AliasOp>,
+    #[serde(default)]
+    exemptions: BridgeExemptions,
 }
 
-fn any_source_has_fn(sources: &[&str], name: &str) -> bool {
+#[derive(Debug, Default, Deserialize)]
+struct BridgeExemptions {
+    #[serde(default)]
+    pyo3: Vec<ExemptionEntry>,
+    #[serde(default)]
+    uniffi: Vec<ExemptionEntry>,
+    #[serde(default)]
+    napi: Vec<ExemptionEntry>,
+    #[serde(default)]
+    wasm: Vec<ExemptionEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExemptionEntry {
+    canonical: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AliasOp {
+    canonical: String,
+    category: String,
+    wasm_required: bool,
+    pyo3: Vec<String>,
+    uniffi: Vec<String>,
+    napi: Vec<String>,
+    wasm: Vec<String>,
+}
+
+fn aliases() -> &'static BridgeAliasesFile {
+    static CELL: OnceLock<BridgeAliasesFile> = OnceLock::new();
+    CELL.get_or_init(|| {
+        serde_json::from_str(BRIDGE_ALIASES_JSON).expect("bridge-aliases.json is valid JSON")
+    })
+}
+
+/// Returns the list of (category, canonical, wasm_required) tuples, built
+/// dynamically from the alias JSON. Replaces the old hand-maintained
+/// `PARITY_OPERATIONS` constant. Each &'static str is a borrow into the
+/// process-lifetime `OnceLock<BridgeAliasesFile>` backing the alias data.
+fn parity_operations() -> Vec<(&'static str, &'static str, bool)> {
+    let file: &'static BridgeAliasesFile = aliases();
+    file.operations
+        .iter()
+        .map(|op| {
+            (
+                op.category.as_str(),
+                op.canonical.as_str(),
+                op.wasm_required,
+            )
+        })
+        .collect()
+}
+
+fn lookup_op(canonical: &str) -> &'static AliasOp {
+    // aliases() returns &'static BridgeAliasesFile, so every inner reference
+    // already has 'static lifetime — the compiler just needs us to name it.
+    let file: &'static BridgeAliasesFile = aliases();
+    for op in &file.operations {
+        if op.canonical == canonical {
+            return op;
+        }
+    }
+    panic!("canonical operation not found in bridge-aliases.json: {canonical}");
+}
+
+fn pyo3_names(canonical: &str) -> &'static [String] {
+    lookup_op(canonical).pyo3.as_slice()
+}
+
+fn uniffi_names(canonical: &str) -> &'static [String] {
+    lookup_op(canonical).uniffi.as_slice()
+}
+
+fn napi_names(canonical: &str) -> &'static [String] {
+    lookup_op(canonical).napi.as_slice()
+}
+
+fn wasm_names(canonical: &str) -> &'static [String] {
+    lookup_op(canonical).wasm.as_slice()
+}
+
+/// Returns the set of canonical operations explicitly exempted for the given
+/// bridge in `bridge-aliases.json`. The sole source of truth: no hand-rolled
+/// `known_exclusions` arrays anywhere in this file.
+fn exemptions_for(bridge: &str) -> BTreeSet<&'static str> {
+    let file: &'static BridgeAliasesFile = aliases();
+    let entries: &'static [ExemptionEntry] = match bridge {
+        "pyo3" => &file.exemptions.pyo3,
+        "uniffi" => &file.exemptions.uniffi,
+        "napi" => &file.exemptions.napi,
+        "wasm" => &file.exemptions.wasm,
+        other => panic!("exemptions_for: unknown bridge '{other}'"),
+    };
+    entries.iter().map(|e| e.canonical.as_str()).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Detection: parse source with `syn` and collect every function/method
+// DEFINITION at module or impl-block scope. This matches the semantics of
+// `scripts/check-bridge-symmetry.sh`'s awk-based `collect_fn_names_from_file`:
+//
+//   • Functions inside `#[cfg(test)] mod <name> { ... }` are EXCLUDED. An
+//     adversary can otherwise hide a fake alias behind a test module to
+//     satisfy a naive substring check.
+//   • Trait method DECLARATIONS (`trait Foo { fn bar(&self); }`) are EXCLUDED
+//     — they are signatures, not definitions. Implementations in impl blocks
+//     ARE included.
+//   • Doc-comments containing `/// fn name(` are EXCLUDED — `syn` only sees
+//     items.
+//   • Whitespace, generics, and line-break variants are handled uniformly.
+//
+// Parity with the shell collector matters: the Rust test and the shell script
+// read the same `bridge-aliases.json`, so if either side is weaker an attacker
+// can thread a phantom alias through the gap.
+//
+// Parsing uses `syn::parse_file` + a `syn::visit::Visit` walk that skips the
+// subtree rooted at any `#[cfg(test)]`-annotated module. We cache the per-
+// source set via `OnceLock` keyed by the pointer identity of the `&'static
+// str` — every bridge source is `include_str!`-interned, so the pointer is
+// stable and unique per file.
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use syn::visit::Visit;
+
+/// Collects every function/method name DEFINED in `source` at module or
+/// impl-block scope, skipping items under `#[cfg(test)]` modules and trait
+/// method signatures. Returns a `HashSet<String>` of unique names.
+///
+/// Fail-loud policy: if `syn::parse_file` fails, we PANIC. All bridge sources
+/// must be valid Rust (they compile with rustc upstream); a parse failure here
+/// means either (a) we embedded a file that is not a Rust source, or (b) the
+/// source contains a real lex/parse error the compiler would reject. Silently
+/// falling back to a weaker substring scanner lets an attacker smuggle a
+/// phantom alias past the test by crafting input the substring path accepts
+/// but `syn` rejects — degraded enforcement is worse than no enforcement
+/// because it looks like it is working. Mirror Layer B, which hard-fails on
+/// tree-sitter parse errors.
+fn collect_defined_fns(source: &str) -> HashSet<String> {
+    let file = match syn::parse_file(source) {
+        Ok(f) => f,
+        Err(err) => panic!(
+            "ffi_conformance: syn failed to parse bridge source: {err}. \
+             Refusing to enforce with a degraded scanner. Fix the Rust source \
+             or, if this file is known to be unparseable, add it to a Layer-A \
+             parse-error allowlist (mirror Layer B's KNOWN_PARSE_ERROR_FILES)."
+        ),
+    };
+    let mut v = FnCollector {
+        names: HashSet::new(),
+    };
+    v.visit_file(&file);
+    v.names
+}
+
+struct FnCollector {
+    names: HashSet<String>,
+}
+
+/// Returns true if `attrs` contains a `#[cfg(...)]` predicate that evaluates
+/// to test-only code — i.e. the cfg expression is satisfied ONLY when the
+/// `test` predicate is true.
+///
+/// Semantics (matches rustc cfg evaluation for the `test` predicate):
+///   • `#[cfg(test)]` → test-only.
+///   • `#[cfg(all(test, ...))]` → test-only (all must hold, so test must hold).
+///   • `#[cfg(any(test, ...))]` → test-only (it becomes active when test is on;
+///     for our scanner purposes, any item gated this way is test-only code).
+///   • `#[cfg(not(test))]` → NOT test-only (this is the inverse — active only
+///     when test is DISABLED; production code must be kept).
+///   • `#[cfg(all(not(test), ...))]` → NOT test-only (contains `not(test)` at
+///     top-level within `all`, so the predicate holds only outside tests).
+///   • Anything with `test` under a `not(...)` → NOT test-only for our purposes
+///     (the item is included when test is off).
+///
+/// We parse the cfg predicate as a `syn::Meta` tree and walk it, tracking
+/// whether we are currently under a `not(...)` context. A bare `test` ident
+/// encountered OUTSIDE a `not(...)` marks the item as test-only.
+fn attrs_contain_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    for attr in attrs {
+        if !attr.path().is_ident("cfg") {
+            continue;
+        }
+        // parse_args::<Meta>() gives us the single Meta expression inside the
+        // `cfg(...)` — e.g. `test`, `any(test, feature = "x")`, or `not(test)`.
+        let Ok(inner) = attr.parse_args::<syn::Meta>() else {
+            continue;
+        };
+        if meta_is_test_gated(&inner, false) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Walks a `syn::Meta` cfg sub-expression. Returns true iff this sub-expression
+/// evaluates to test-only code (i.e. is active only when `test` is enabled).
+///
+/// `under_not` tracks whether we are currently inside a `not(...)` wrapper.
+/// Every pass through a `not(...)` flips the sign.
+fn meta_is_test_gated(meta: &syn::Meta, under_not: bool) -> bool {
+    use syn::Meta;
+    match meta {
+        // Bare `test`. Test-only iff not negated.
+        Meta::Path(p) if p.is_ident("test") => !under_not,
+        // `any(...)`, `all(...)`, `not(...)` are list metas with nested items.
+        Meta::List(list) => {
+            let ident = list.path.get_ident().map(syn::Ident::to_string);
+            match ident.as_deref() {
+                Some("not") => {
+                    // Each nested meta inside `not(...)` has its under_not flipped.
+                    let Ok(nested) = list.parse_args_with(
+                        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                    ) else {
+                        return false;
+                    };
+                    nested.iter().any(|m| meta_is_test_gated(m, !under_not))
+                }
+                Some(op @ ("all" | "any")) => {
+                    let Ok(nested) = list.parse_args_with(
+                        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                    ) else {
+                        return false;
+                    };
+                    // "test-gated" here means "the item is compiled ONLY when
+                    // test is on" — i.e., the cfg predicate implies `test`.
+                    //
+                    // * `all(A, B)` compiles iff `A && B`. The item is
+                    //   test-only iff ANY child implies test — because a
+                    //   single test-gated predicate forces the whole
+                    //   conjunction to require test.
+                    // * `any(A, B)` compiles iff `A || B`. The item is
+                    //   test-only iff EVERY child implies test — because
+                    //   any non-test predicate could activate the item in
+                    //   production via the disjunction.
+                    //
+                    // Counter-example the wrong choice misclassifies:
+                    //   `#[cfg(all(any(feature = "x", test), not(test)))]`
+                    // is production-only, but with `.any()` on `any(...)`
+                    // the inner disjunction reports test-gated, which then
+                    // propagates through the outer `all`. Splitting by op
+                    // makes the walker rustc-equivalent for these layered
+                    // patterns.
+                    if op == "all" {
+                        nested.iter().any(|m| meta_is_test_gated(m, under_not))
+                    } else {
+                        nested.iter().all(|m| meta_is_test_gated(m, under_not))
+                    }
+                }
+                _ => false,
+            }
+        }
+        // Any other Meta (NameValue, a Path that is not `test`, etc.) is not
+        // a test gate by itself.
+        _ => false,
+    }
+}
+
+impl<'ast> Visit<'ast> for FnCollector {
+    // Free-standing `fn`. Always a definition — UNLESS the fn itself carries a
+    // `#[cfg(test)]` (or equivalent) attribute. A non-test module may still
+    // contain a test-only fn: `mod foo { #[cfg(test)] fn bar() {} }`. Without
+    // this guard, `bar` would be collected and could satisfy a phantom alias.
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if attrs_contain_cfg_test(&node.attrs) {
+            return;
+        }
+        self.names.insert(node.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, node);
+    }
+
+    // Methods inside `impl` blocks are definitions. Same fn-level cfg(test)
+    // guard as free-standing fns.
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if attrs_contain_cfg_test(&node.attrs) {
+            return;
+        }
+        self.names.insert(node.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, node);
+    }
+
+    // Trait method SIGNATURES are declarations, not definitions — skip.
+    // A default body (`fn foo(&self) { ... }`) inside a trait is still a
+    // declaration in terms of the exported surface: callers don't call the
+    // trait method through that name, they call the impl. Not descending into
+    // trait items keeps us aligned with the shell script, which never matches
+    // inside `trait { ... }` blocks either (no impl body is required there).
+    fn visit_item_trait(&mut self, _node: &'ast syn::ItemTrait) {
+        // Intentionally do not recurse.
+    }
+
+    // Descend into modules UNLESS they are `#[cfg(test)]`.
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if attrs_contain_cfg_test(&node.attrs) {
+            return;
+        }
+        syn::visit::visit_item_mod(self, node);
+    }
+
+    // Descend into `impl` blocks UNLESS they are `#[cfg(test)]`. Without this
+    // guard, a non-test module could still host a test-only impl block whose
+    // methods would be collected — a real instance exists at
+    // `crates/scp-ffi/napi/src/context.rs:296` and `runtime.rs:347`. An
+    // adversary can otherwise declare a canonical alias as a method inside
+    // `#[cfg(test)] impl Foo { fn alias() {} }` and satisfy the scanner with
+    // code that never ships. Mirrors `visit_item_mod`'s cfg(test) guard.
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if attrs_contain_cfg_test(&node.attrs) {
+            return;
+        }
+        syn::visit::visit_item_impl(self, node);
+    }
+}
+
+/// Cache key for `FnSetCache`. `(ptr, len)` keys the parsed set against the
+/// identity of a `&'static str` — see `fns_of_source` for rationale.
+type FnSetCacheKey = (usize, usize);
+
+/// Process-wide cache of parsed fn-name sets, keyed by `FnSetCacheKey`.
+type FnSetCache = Mutex<HashMap<FnSetCacheKey, &'static HashSet<String>>>;
+
+/// Returns a cached `HashSet<String>` of function-definition names for the
+/// given source. Keyed by `(ptr, len)` of the `&'static str` so each
+/// `include_str!`-ed bridge file is parsed exactly once per test process.
+///
+/// Invariant note: every `include_str!(...)` produces a distinct static byte
+/// slice with a unique pointer — but in theory a rustc string-constant-merging
+/// pass could fold two byte-identical `include_str!` results to the same
+/// pointer. That is unlikely to happen in practice (bridge source files are
+/// many KB and include surrounding context that makes them textually unique),
+/// but keying on `(ptr, len)` rather than `ptr` alone is robust even in the
+/// degenerate case: two distinct sources with identical bytes share a cache
+/// entry (correct: they parse to the same fn set), and the rare case of two
+/// DIFFERENT sources sharing a pointer is impossible when lengths differ.
+fn fns_of_source(source: &'static str) -> &'static HashSet<String> {
+    static CACHE: OnceLock<FnSetCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key: FnSetCacheKey = (source.as_ptr() as usize, source.len());
+    // Fast path: already cached.
+    {
+        let guard = cache.lock().expect("fns_of_source cache mutex");
+        if let Some(set) = guard.get(&key) {
+            return set;
+        }
+    }
+    // Slow path: parse, leak to get a 'static reference, insert.
+    let parsed: &'static HashSet<String> = Box::leak(Box::new(collect_defined_fns(source)));
+    let mut guard = cache.lock().expect("fns_of_source cache mutex");
+    // Another thread may have inserted between the two lock acquisitions.
+    guard.entry(key).or_insert(parsed)
+}
+
+fn source_has_fn(source: &'static str, name: &str) -> bool {
+    fns_of_source(source).contains(name)
+}
+
+fn any_source_has_fn(sources: &[&'static str], name: &str) -> bool {
     sources.iter().any(|s| source_has_fn(s, name))
 }
 
-// ---------------------------------------------------------------------------
-// Per-bridge alias tables
-//
-// Maps canonical operation name -> actual function names to search for.
-// Bridges with no alias entry use the canonical name directly, plus
-// any bridge-specific prefix (py_ for PyO3).
-// ---------------------------------------------------------------------------
-
-/// Returns the function names to search for in PyO3 sources.
-///
-/// Historically PyO3 prefixed every free function with `py_`. Phase 4 PR 4
-/// (#1549 façade deletion) migrated those free functions to
-/// `#[pymethods] impl PyScp { pub fn foo(&self, ...) }` methods. The method
-/// form uses the canonical name directly, so both the legacy `py_{canonical}`
-/// and the method form `{canonical}` are accepted. Pre-existing renamings
-/// (`context_subscribe` → `context_receive`, `broadcast_block` →
-/// `broadcast_block_subscriber`, governance checkpoints losing the
-/// `context_` prefix) are also checked under both the legacy `py_*` form
-/// and the new method form.
-fn pyo3_names(canonical: &str) -> Vec<String> {
-    // Accept the canonical method name and the legacy `py_` prefix.
-    let mut names = vec![canonical.to_string(), format!("py_{canonical}")];
-    match canonical {
-        // PyO3 uses "context_receive" for the subscribe/receive pattern
-        "context_subscribe" => {
-            names.push("context_receive".to_string());
-            names.push("py_context_receive".to_string());
-        }
-        // PyO3 uses "broadcast_block_subscriber" not "broadcast_block"
-        "broadcast_block" => {
-            names.push("broadcast_block_subscriber".to_string());
-            names.push("py_broadcast_block_subscriber".to_string());
-        }
-        // `governance_execute` + legacy `py_governance_execute` already
-        // match via the default `{canonical}` and `py_{canonical}` entries,
-        // so no additional alias is needed. Drop-through handled by `_`.
-        // MCP: check for specific sub-functions
-        "mcp_server" => {
-            names.push("mcp_serve".to_string());
-            names.push("py_mcp_serve".to_string());
-        }
-        "mcp_client" => {
-            names.push("mcp_client_connect_stdio".to_string());
-            names.push("py_mcp_client_connect_stdio".to_string());
-        }
-        // Governance checkpoints: PyO3 drops the `context_` prefix.
-        "context_create_governance_checkpoint" => {
-            names.push("create_governance_checkpoint".to_string());
-            names.push("py_create_governance_checkpoint".to_string());
-        }
-        "context_add_checkpoint_cosignature" => {
-            names.push("add_checkpoint_cosignature".to_string());
-            names.push("py_add_checkpoint_cosignature".to_string());
-        }
-        _ => {}
-    }
-    names
-}
-
-/// Returns the function names to search for in UniFFI source.
-fn uniffi_names(canonical: &str) -> Vec<String> {
-    let mut names = vec![canonical.to_string()];
-    match canonical {
-        "broadcast_block" => {
-            names.push("broadcast_block_subscriber".to_string());
-        }
-        // UniFFI uses create_governance_checkpoint (no context_ prefix)
-        "context_create_governance_checkpoint" => {
-            names.push("create_governance_checkpoint".to_string());
-        }
-        "context_add_checkpoint_cosignature" => {
-            names.push("add_checkpoint_cosignature".to_string());
-        }
-        _ => {}
-    }
-    names
-}
-
-/// Returns the function names to search for in NAPI sources.
-fn napi_names(canonical: &str) -> Vec<String> {
-    let mut names = vec![canonical.to_string()];
-    match canonical {
-        "governance_execute" => {
-            names.push("context_execute_governance_action".to_string());
-        }
-        "broadcast_block" => {
-            names.push("broadcast_block_subscriber".to_string());
-        }
-        "mcp_server" => {
-            names.push("mcp_server_create".to_string());
-        }
-        "mcp_client" => {
-            names.push("mcp_client_connect_stdio".to_string());
-        }
-        _ => {}
-    }
-    names
-}
-
-/// Returns the function names to search for in WASM sources.
-fn wasm_names(canonical: &str) -> Vec<String> {
-    let mut names = vec![canonical.to_string()];
-    match canonical {
-        "governance_execute" => {
-            names.push("context_execute_governance".to_string());
-        }
-        "broadcast_block_subscriber" => {
-            names.push("broadcast_block".to_string());
-        }
-        _ => {}
-    }
-    names
-}
 
 // ---------------------------------------------------------------------------
 // Per-bridge detection
 // ---------------------------------------------------------------------------
 
-fn pyo3_has_operation(sources: &[&str], canonical: &str) -> bool {
+fn pyo3_has_operation(sources: &[&'static str], canonical: &str) -> bool {
     pyo3_names(canonical)
         .iter()
         .any(|name| any_source_has_fn(sources, name))
@@ -360,13 +489,13 @@ fn uniffi_has_operation(canonical: &str) -> bool {
         .any(|name| source_has_fn(UNIFFI_BRIDGE, name))
 }
 
-fn napi_has_operation(sources: &[&str], canonical: &str) -> bool {
+fn napi_has_operation(sources: &[&'static str], canonical: &str) -> bool {
     napi_names(canonical)
         .iter()
         .any(|name| any_source_has_fn(sources, name))
 }
 
-fn wasm_has_operation(sources: &[&str], canonical: &str) -> bool {
+fn wasm_has_operation(sources: &[&'static str], canonical: &str) -> bool {
     wasm_names(canonical)
         .iter()
         .any(|name| any_source_has_fn(sources, name))
@@ -460,7 +589,7 @@ where
     let mut present = Vec::new();
     let mut missing = Vec::new();
 
-    for &(category, op, _) in PARITY_OPERATIONS {
+    for (category, op, _) in parity_operations() {
         if detect(op) {
             present.push((category, op));
         } else {
@@ -468,7 +597,7 @@ where
         }
     }
 
-    let total = PARITY_OPERATIONS.len();
+    let total = parity_operations().len();
     BridgeCoverage {
         name,
         present,
@@ -540,66 +669,84 @@ fn pyo3_bridge_covers_all_operations() {
     }
 }
 
-/// UniFFI bridge should cover all core operations except MCP (which UniFFI
-/// does not expose) and bridge_register/bridge_create_shadow (not yet
-/// implemented). Fails on any gap outside the documented exclusion set.
+/// UniFFI bridge should cover all core operations except those explicitly
+/// exempted in `scripts/bridge-aliases.json`. The JSON is the single source
+/// of truth for exemptions — no hand-maintained lists in this file.
 #[test]
 fn uniffi_bridge_covers_core_operations() {
     let coverage = compute_uniffi_coverage();
     print_coverage(&coverage);
 
-    // Known intentional exclusions for UniFFI:
-    // - mcp_server / mcp_client: UniFFI targets mobile; MCP is PyO3/NAPI only
-    let known_exclusions: &[&str] = &["mcp_server", "mcp_client"];
+    let exempt = exemptions_for("uniffi");
 
     let unexpected_missing: Vec<_> = coverage
         .missing
         .iter()
-        .filter(|(_, op)| !known_exclusions.contains(op))
+        .filter(|(_, op)| !exempt.contains(*op))
         .collect();
 
     assert!(
         unexpected_missing.is_empty(),
-        "UniFFI has {} unexpected missing operations: {:?}",
+        "UniFFI has {} unexpected missing operations: {:?}. \
+         If any of these are intentional, add them to \
+         scripts/bridge-aliases.json:exemptions.uniffi with a reason.",
         unexpected_missing.len(),
         unexpected_missing
     );
 
-    // Also assert the known exclusion count hasn't grown
-    let known_missing_count = coverage
-        .missing
+    // Also assert the exempt entries actually correspond to missing ops —
+    // an exemption for an operation that IS implemented is stale and should
+    // be removed from the JSON.
+    let missing_ops: BTreeSet<&str> = coverage.missing.iter().map(|(_, op)| *op).collect();
+    let stale_exemptions: Vec<&str> = exempt
         .iter()
-        .filter(|(_, op)| known_exclusions.contains(op))
-        .count();
-    assert_eq!(
-        known_missing_count,
-        known_exclusions.len(),
-        "Known exclusion count mismatch -- an excluded operation may have been added"
+        .copied()
+        .filter(|e| !missing_ops.contains(e))
+        .collect();
+    assert!(
+        stale_exemptions.is_empty(),
+        "UniFFI has stale exemption(s) in bridge-aliases.json (operation is \
+         implemented but still listed as exempt): {stale_exemptions:?}. \
+         Remove them from exemptions.uniffi."
     );
 }
 
-/// NAPI bridge should cover all operations except identity_migrate
-/// (not yet implemented in NAPI).
+/// NAPI bridge should cover all core operations except those explicitly
+/// exempted in `scripts/bridge-aliases.json`. The JSON is the single source
+/// of truth for exemptions.
 #[test]
 fn napi_bridge_covers_core_operations() {
     let coverage = compute_napi_coverage();
     print_coverage(&coverage);
 
-    // Known intentional exclusions for NAPI:
-    // - identity_migrate: not yet in NAPI bridge
-    let known_exclusions: &[&str] = &["identity_migrate"];
+    let exempt = exemptions_for("napi");
 
     let unexpected_missing: Vec<_> = coverage
         .missing
         .iter()
-        .filter(|(_, op)| !known_exclusions.contains(op))
+        .filter(|(_, op)| !exempt.contains(*op))
         .collect();
 
     assert!(
         unexpected_missing.is_empty(),
-        "NAPI has {} unexpected missing operations: {:?}",
+        "NAPI has {} unexpected missing operations: {:?}. \
+         If any of these are intentional, add them to \
+         scripts/bridge-aliases.json:exemptions.napi with a reason.",
         unexpected_missing.len(),
         unexpected_missing
+    );
+
+    let missing_ops: BTreeSet<&str> = coverage.missing.iter().map(|(_, op)| *op).collect();
+    let stale_exemptions: Vec<&str> = exempt
+        .iter()
+        .copied()
+        .filter(|e| !missing_ops.contains(e))
+        .collect();
+    assert!(
+        stale_exemptions.is_empty(),
+        "NAPI has stale exemption(s) in bridge-aliases.json (operation is \
+         implemented but still listed as exempt): {stale_exemptions:?}. \
+         Remove them from exemptions.napi."
     );
 }
 
@@ -611,25 +758,19 @@ fn wasm_bridge_covers_core_operations() {
     let coverage = compute_wasm_coverage();
     print_coverage(&coverage);
 
+    let ops = parity_operations();
+
     // Separate required vs optional gaps
     let required_missing: Vec<_> = coverage
         .missing
         .iter()
-        .filter(|(cat, op)| {
-            PARITY_OPERATIONS
-                .iter()
-                .any(|(c, o, req)| c == cat && o == op && *req)
-        })
+        .filter(|(cat, op)| ops.iter().any(|(c, o, req)| c == cat && o == op && *req))
         .collect();
 
     let optional_missing: Vec<_> = coverage
         .missing
         .iter()
-        .filter(|(cat, op)| {
-            PARITY_OPERATIONS
-                .iter()
-                .any(|(c, o, req)| c == cat && o == op && !*req)
-        })
+        .filter(|(cat, op)| ops.iter().any(|(c, o, req)| c == cat && o == op && !*req))
         .collect();
 
     if !optional_missing.is_empty() {
@@ -669,7 +810,7 @@ fn cross_bridge_parity_matrix() {
     );
     eprintln!("{}", "-".repeat(82));
 
-    for &(category, op, _wasm_required) in PARITY_OPERATIONS {
+    for (category, op, _wasm_required) in parity_operations() {
         let p = pyo3.present.iter().any(|(_, o)| *o == op);
         let u = uniffi.present.iter().any(|(_, o)| *o == op);
         let n = napi.present.iter().any(|(_, o)| *o == op);
@@ -810,11 +951,14 @@ fn wasm_sources_contain_wasm_bindgen_markers() {
 // Per-category coverage depth tests
 // ---------------------------------------------------------------------------
 
-/// Verifies identity operations are present across all bridges.
-/// identity_migrate is excluded from UniFFI/NAPI (known gap).
+/// Verifies identity operations are present across all bridges. Per-bridge
+/// exemptions are sourced from `scripts/bridge-aliases.json` — the same
+/// single source of truth used by the per-bridge coverage tests and the
+/// shell symmetry script. No hand-maintained skip lists here.
 #[test]
 fn identity_category_coverage() {
-    let identity_ops: Vec<_> = PARITY_OPERATIONS
+    let ops = parity_operations();
+    let identity_ops: Vec<_> = ops
         .iter()
         .filter(|(cat, _, _)| *cat == "identity")
         .collect();
@@ -823,19 +967,28 @@ fn identity_category_coverage() {
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
-    for &(_, op, _) in &identity_ops {
-        assert!(
-            pyo3_has_operation(&pyo3_srcs, op),
-            "PyO3 missing identity op: {op}"
-        );
-        assert!(
-            wasm_has_operation(&wasm_srcs, op),
-            "WASM missing identity op: {op}"
-        );
+    let uniffi_exempt = exemptions_for("uniffi");
+    let napi_exempt = exemptions_for("napi");
+    let pyo3_exempt = exemptions_for("pyo3");
+    let wasm_exempt = exemptions_for("wasm");
 
-        // identity_migrate is a known gap in UniFFI and NAPI
-        if *op != "identity_migrate" {
+    for (_, op, _) in &identity_ops {
+        if !pyo3_exempt.contains(*op) {
+            assert!(
+                pyo3_has_operation(&pyo3_srcs, op),
+                "PyO3 missing identity op: {op}"
+            );
+        }
+        if !wasm_exempt.contains(*op) {
+            assert!(
+                wasm_has_operation(&wasm_srcs, op),
+                "WASM missing identity op: {op}"
+            );
+        }
+        if !uniffi_exempt.contains(*op) {
             assert!(uniffi_has_operation(op), "UniFFI missing identity op: {op}");
+        }
+        if !napi_exempt.contains(*op) {
             assert!(
                 napi_has_operation(&napi_srcs, op),
                 "NAPI missing identity op: {op}"
@@ -848,16 +1001,14 @@ fn identity_category_coverage() {
 /// Handles naming variance: PyO3 uses `context_receive` for `context_subscribe`.
 #[test]
 fn context_category_coverage() {
-    let context_ops: Vec<_> = PARITY_OPERATIONS
-        .iter()
-        .filter(|(cat, _, _)| *cat == "context")
-        .collect();
+    let ops = parity_operations();
+    let context_ops: Vec<_> = ops.iter().filter(|(cat, _, _)| *cat == "context").collect();
 
     let pyo3_srcs = pyo3_sources();
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
-    for &(_, op, _) in &context_ops {
+    for (_, op, _) in &context_ops {
         assert!(
             pyo3_has_operation(&pyo3_srcs, op),
             "PyO3 missing context op: {op}"
@@ -877,16 +1028,14 @@ fn context_category_coverage() {
 /// Verifies UCAN operations are present across all bridges.
 #[test]
 fn ucan_category_coverage() {
-    let ucan_ops: Vec<_> = PARITY_OPERATIONS
-        .iter()
-        .filter(|(cat, _, _)| *cat == "ucan")
-        .collect();
+    let ops = parity_operations();
+    let ucan_ops: Vec<_> = ops.iter().filter(|(cat, _, _)| *cat == "ucan").collect();
 
     let pyo3_srcs = pyo3_sources();
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
-    for &(_, op, _) in &ucan_ops {
+    for (_, op, _) in &ucan_ops {
         assert!(
             pyo3_has_operation(&pyo3_srcs, op),
             "PyO3 missing UCAN op: {op}"
@@ -906,16 +1055,14 @@ fn ucan_category_coverage() {
 /// Verifies tool operations are present across all bridges.
 #[test]
 fn tools_category_coverage() {
-    let tool_ops: Vec<_> = PARITY_OPERATIONS
-        .iter()
-        .filter(|(cat, _, _)| *cat == "tools")
-        .collect();
+    let ops = parity_operations();
+    let tool_ops: Vec<_> = ops.iter().filter(|(cat, _, _)| *cat == "tools").collect();
 
     let pyo3_srcs = pyo3_sources();
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
-    for &(_, op, _) in &tool_ops {
+    for (_, op, _) in &tool_ops {
         assert!(
             pyo3_has_operation(&pyo3_srcs, op),
             "PyO3 missing tool op: {op}"
@@ -936,7 +1083,8 @@ fn tools_category_coverage() {
 /// Accounts for naming variance: `broadcast_block` vs `broadcast_block_subscriber`.
 #[test]
 fn broadcast_category_coverage() {
-    let broadcast_ops: Vec<_> = PARITY_OPERATIONS
+    let ops = parity_operations();
+    let broadcast_ops: Vec<_> = ops
         .iter()
         .filter(|(cat, _, _)| *cat == "broadcast")
         .collect();
@@ -945,7 +1093,7 @@ fn broadcast_category_coverage() {
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
-    for &(_, op, _) in &broadcast_ops {
+    for (_, op, _) in &broadcast_ops {
         assert!(
             pyo3_has_operation(&pyo3_srcs, op),
             "PyO3 missing broadcast op: {op}"
@@ -968,16 +1116,14 @@ fn broadcast_category_coverage() {
 /// Verifies trust operations are present across all bridges.
 #[test]
 fn trust_category_coverage() {
-    let trust_ops: Vec<_> = PARITY_OPERATIONS
-        .iter()
-        .filter(|(cat, _, _)| *cat == "trust")
-        .collect();
+    let ops = parity_operations();
+    let trust_ops: Vec<_> = ops.iter().filter(|(cat, _, _)| *cat == "trust").collect();
 
     let pyo3_srcs = pyo3_sources();
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
-    for &(_, op, _) in &trust_ops {
+    for (_, op, _) in &trust_ops {
         assert!(
             pyo3_has_operation(&pyo3_srcs, op),
             "PyO3 missing trust op: {op}"
@@ -997,7 +1143,8 @@ fn trust_category_coverage() {
 /// Verifies event_log operations are present across all bridges.
 #[test]
 fn event_log_category_coverage() {
-    let event_log_ops: Vec<_> = PARITY_OPERATIONS
+    let ops = parity_operations();
+    let event_log_ops: Vec<_> = ops
         .iter()
         .filter(|(cat, _, _)| *cat == "event_log")
         .collect();
@@ -1006,7 +1153,7 @@ fn event_log_category_coverage() {
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
-    for &(_, op, _) in &event_log_ops {
+    for (_, op, _) in &event_log_ops {
         assert!(
             pyo3_has_operation(&pyo3_srcs, op),
             "PyO3 missing event_log op: {op}"
@@ -1029,7 +1176,8 @@ fn event_log_category_coverage() {
 /// Verifies discovery and provenance operations are present across all bridges.
 #[test]
 fn discovery_and_provenance_coverage() {
-    let ops: Vec<_> = PARITY_OPERATIONS
+    let ops = parity_operations();
+    let selected: Vec<_> = ops
         .iter()
         .filter(|(cat, _, _)| *cat == "discovery" || *cat == "provenance")
         .collect();
@@ -1038,7 +1186,7 @@ fn discovery_and_provenance_coverage() {
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
-    for &(cat, op, _) in &ops {
+    for (cat, op, _) in &selected {
         assert!(
             pyo3_has_operation(&pyo3_srcs, op),
             "PyO3 missing {cat} op: {op}"
@@ -1167,25 +1315,25 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
 /// added; existing operations must not be removed without human approval.
 #[test]
 fn parity_operation_count_never_decreases() {
+    let ops = parity_operations();
     assert!(
-        PARITY_OPERATIONS.len() >= MIN_PARITY_OPERATIONS,
-        "PARITY_OPERATIONS has {} entries, minimum is {}. \
+        ops.len() >= MIN_PARITY_OPERATIONS,
+        "parity operations has {} entries, minimum is {}. \
          Operations were removed without updating the ratchet.",
-        PARITY_OPERATIONS.len(),
+        ops.len(),
         MIN_PARITY_OPERATIONS
     );
 }
 
 /// Every operation in `WASM_REQUIRED_OPERATIONS` must remain in
-/// `PARITY_OPERATIONS` with `wasm_required=true`. Changing an operation
+/// parity operations with `wasm_required=true`. Changing an operation
 /// from required to optional (or removing it) is caught.
 #[test]
 fn wasm_required_set_not_weakened() {
+    let ops = parity_operations();
     for op_name in WASM_REQUIRED_OPERATIONS {
-        let entry = PARITY_OPERATIONS
-            .iter()
-            .find(|(_, name, _)| name == op_name);
-        assert!(entry.is_some(), "{op_name} removed from PARITY_OPERATIONS");
+        let entry = ops.iter().find(|(_, name, _)| name == op_name);
+        assert!(entry.is_some(), "{op_name} removed from parity operations");
         assert!(
             entry.unwrap().2,
             "{op_name} changed from wasm_required=true to false"
@@ -1193,12 +1341,12 @@ fn wasm_required_set_not_weakened() {
     }
 }
 
-/// Verify that WASM_REQUIRED_OPERATIONS is consistent with PARITY_OPERATIONS.
-/// Every operation marked `wasm_required=true` in PARITY_OPERATIONS must
+/// Verify that WASM_REQUIRED_OPERATIONS is consistent with the parity table.
+/// Every operation marked `wasm_required=true` in the table must
 /// appear in the named set.
 #[test]
 fn wasm_required_set_is_complete() {
-    for &(_, op, required) in PARITY_OPERATIONS {
+    for (_, op, required) in parity_operations() {
         if required {
             assert!(
                 WASM_REQUIRED_OPERATIONS.contains(&op),
@@ -1234,5 +1382,438 @@ fn min_parity_operations_comment_references_real_deletion() {
         !comment.contains("economy_evaluate_relay_cost"),
         "ratchet comment must not cite the fabricated op name \
          'economy_evaluate_relay_cost'"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-validation: scripts/bridge-aliases.json must match the ratchet
+// ---------------------------------------------------------------------------
+
+/// Ensures the shell-side enforcement source of truth (bridge-aliases.json)
+/// and the Rust-side ratchet constants stay in lockstep. Without this test,
+/// someone could add a canonical operation to the JSON without surfacing it
+/// in the named WASM_REQUIRED_OPERATIONS set (and vice versa).
+#[test]
+fn aliases_json_is_in_sync_with_parity_operations() {
+    let file = aliases();
+
+    // 1. Count: must meet or exceed the ratchet floor.
+    assert!(
+        file.operations.len() >= MIN_PARITY_OPERATIONS,
+        "bridge-aliases.json has {} operations, ratchet requires at least {}",
+        file.operations.len(),
+        MIN_PARITY_OPERATIONS
+    );
+
+    // 2. No duplicate canonical names.
+    let mut canon_set: BTreeSet<&str> = BTreeSet::new();
+    for op in &file.operations {
+        assert!(
+            canon_set.insert(op.canonical.as_str()),
+            "bridge-aliases.json contains duplicate canonical name: {}",
+            op.canonical
+        );
+    }
+
+    // 3. No empty or duplicate aliases within a bridge's list.
+    for op in &file.operations {
+        for (bridge_name, aliases) in [
+            ("pyo3", &op.pyo3),
+            ("uniffi", &op.uniffi),
+            ("napi", &op.napi),
+            ("wasm", &op.wasm),
+        ] {
+            let mut seen = HashSet::new();
+            for alias in aliases {
+                assert!(
+                    !alias.is_empty(),
+                    "empty alias in {bridge_name} list for canonical {}",
+                    op.canonical
+                );
+                assert!(
+                    seen.insert(alias.as_str()),
+                    "duplicate alias {alias} in {bridge_name} list for canonical {}",
+                    op.canonical
+                );
+            }
+        }
+    }
+
+    // 4. wasm_required=true set must equal the named WASM_REQUIRED_OPERATIONS
+    //    set (catches drift in either direction).
+    let json_wasm_required: BTreeSet<&str> = file
+        .operations
+        .iter()
+        .filter(|op| op.wasm_required)
+        .map(|op| op.canonical.as_str())
+        .collect();
+    let rust_wasm_required: BTreeSet<&str> = WASM_REQUIRED_OPERATIONS.iter().copied().collect();
+    assert_eq!(
+        json_wasm_required,
+        rust_wasm_required,
+        "bridge-aliases.json wasm_required set diverges from Rust \
+         WASM_REQUIRED_OPERATIONS: json_only={:?} rust_only={:?}",
+        json_wasm_required
+            .difference(&rust_wasm_required)
+            .collect::<Vec<_>>(),
+        rust_wasm_required
+            .difference(&json_wasm_required)
+            .collect::<Vec<_>>()
+    );
+
+    // 5. Every canonical op must have at least one alias per bridge
+    //    (even if the bridge is exempt in the JSON's exemption list — the
+    //    alias the script would search for must still be documented).
+    for op in &file.operations {
+        for (bridge_name, aliases) in [
+            ("pyo3", &op.pyo3),
+            ("uniffi", &op.uniffi),
+            ("napi", &op.napi),
+            ("wasm", &op.wasm),
+        ] {
+            assert!(
+                !aliases.is_empty(),
+                "canonical {} has no aliases for bridge {bridge_name}",
+                op.canonical
+            );
+        }
+    }
+}
+
+/// Every alias declared in `bridge-aliases.json` must EITHER resolve to a
+/// real `fn <alias>(` definition in the corresponding bridge's source tree,
+/// OR the canonical operation must be listed in that bridge's `exemptions`
+/// array.
+///
+/// This blocks the adversarial pattern where an agent adds a fake alias like
+/// `"napi": ["fake_symbol"]` to the JSON to pretend an op is implemented.
+/// The existing count/duplicate/empty checks do not catch that.
+#[test]
+fn every_alias_resolves_to_a_real_fn_or_exemption() {
+    let file = aliases();
+    let pyo3_srcs = pyo3_sources();
+    let napi_srcs = napi_sources();
+    let wasm_srcs = wasm_sources();
+
+    let pyo3_exempt = exemptions_for("pyo3");
+    let uniffi_exempt = exemptions_for("uniffi");
+    let napi_exempt = exemptions_for("napi");
+    let wasm_exempt = exemptions_for("wasm");
+
+    let mut phantom: Vec<String> = Vec::new();
+
+    for op in &file.operations {
+        // --- pyo3 ---
+        if !pyo3_exempt.contains(op.canonical.as_str()) {
+            let any_resolves = op
+                .pyo3
+                .iter()
+                .any(|name| any_source_has_fn(&pyo3_srcs, name));
+            if !any_resolves {
+                phantom.push(format!(
+                    "pyo3:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/src/",
+                    op.canonical, op.pyo3
+                ));
+            }
+        }
+        // --- uniffi ---
+        if !uniffi_exempt.contains(op.canonical.as_str()) {
+            let any_resolves = op
+                .uniffi
+                .iter()
+                .any(|name| source_has_fn(UNIFFI_BRIDGE, name));
+            if !any_resolves {
+                phantom.push(format!(
+                    "uniffi:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/uniffi/src/bridge.rs",
+                    op.canonical, op.uniffi
+                ));
+            }
+        }
+        // --- napi ---
+        if !napi_exempt.contains(op.canonical.as_str()) {
+            let any_resolves = op
+                .napi
+                .iter()
+                .any(|name| any_source_has_fn(&napi_srcs, name));
+            if !any_resolves {
+                phantom.push(format!(
+                    "napi:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/napi/src/",
+                    op.canonical, op.napi
+                ));
+            }
+        }
+        // --- wasm --- (only when required, mirroring CI script behavior)
+        if op.wasm_required && !wasm_exempt.contains(op.canonical.as_str()) {
+            let any_resolves = op
+                .wasm
+                .iter()
+                .any(|name| any_source_has_fn(&wasm_srcs, name));
+            if !any_resolves {
+                phantom.push(format!(
+                    "wasm:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/wasm/src/",
+                    op.canonical, op.wasm
+                ));
+            }
+        }
+    }
+
+    assert!(
+        phantom.is_empty(),
+        "bridge-aliases.json contains {} phantom alias declaration(s) — an alias was \
+         listed but no matching `fn <alias>(` exists in the bridge's source tree and \
+         the canonical is not exempted:\n  {}",
+        phantom.len(),
+        phantom.join("\n  ")
+    );
+}
+
+/// Guards against reintroduction of hand-maintained exclusion lists inside
+/// this file that duplicate the `exemptions` section of
+/// `scripts/bridge-aliases.json`. The JSON is the single source of truth —
+/// any drift is a footgun. Fails loudly if a hand-rolled skip-list
+/// identifier reappears as an assignment target (a previous regression
+/// lived here: `mcp_server` / `identity_migrate` were duplicated in both
+/// places).
+#[test]
+fn no_hardcoded_exclusion_arrays_in_this_file() {
+    let src = include_str!("ffi_conformance.rs");
+    // Banned tokens are encoded with a string-concat so the test body itself
+    // does not trigger the match. The assertion hunts for `let <token>` which
+    // is how the old hand-rolled arrays were declared — harmless occurrences
+    // of the same substring in comments or messages do not trip it.
+    let banned_names: Vec<String> = vec![
+        format!("{}_{}", "known", "exclusions"),
+        format!("{}_missing_{}", "known", "count"),
+    ];
+    for name in &banned_names {
+        let needle = format!("let {name}");
+        assert!(
+            !src.contains(&needle),
+            "ffi_conformance.rs reintroduced hand-maintained `{name}` list. \
+             Exemptions live in scripts/bridge-aliases.json only — read them via \
+             exemptions_for(bridge) instead."
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Syn scanner adversarial tests — guard against drift between the shell and
+// Rust scanners. The bash fixture under
+// `scripts/tests/bridge-symmetry/fixtures/bad-alias-in-test-module-only/`
+// exercises the bash path only. These tests exercise the Rust `syn` path over
+// the same fixture source, so if either side weakens its cfg(test) exclusion
+// the matrix catches it.
+// ---------------------------------------------------------------------------
+
+/// Adversarial fn-hidden-in-test-module fixture: asserts the Rust `syn`
+/// scanner EXCLUDES a fn defined inside `#[cfg(test)] mod tests { ... }` the
+/// same way the bash scanner does. Without this test, the two scanners could
+/// silently drift and let a phantom alias through.
+#[test]
+fn syn_scanner_excludes_cfg_test_module() {
+    // Embed the fixture source at compile time so it moves with the file and
+    // we do not depend on runtime cwd. The fixture's intent: `widget_create`
+    // is defined ONLY inside `#[cfg(test)] mod tests { ... }` — the scanner
+    // must not report it.
+    const FIXTURE: &str = include_str!(
+        "../../../../scripts/tests/bridge-symmetry/fixtures/\
+         bad-alias-in-test-module-only/crates/scp-ffi/napi/src/widgets.rs"
+    );
+    let fns = collect_defined_fns(FIXTURE);
+    assert!(
+        !fns.contains("widget_create"),
+        "syn scanner leaked a fn defined inside #[cfg(test)] mod tests — \
+         names collected: {fns:?}"
+    );
+    // Sanity: the non-test fn is still visible.
+    assert!(
+        fns.contains("widget_create_not_real"),
+        "syn scanner failed to collect the non-test fn widget_create_not_real \
+         — names collected: {fns:?}"
+    );
+}
+
+/// Adversarial fn-hidden-in-test-impl fixture: asserts the Rust `syn` scanner
+/// EXCLUDES a method defined inside `#[cfg(test)] impl Foo { ... }`. Real
+/// instances of this pattern live at `crates/scp-ffi/napi/src/context.rs:296`
+/// and `runtime.rs:347` — an adversary can declare a canonical alias as a
+/// method name inside a test-only impl to satisfy a naive scanner. The guard
+/// is `visit_item_impl` skipping the subtree when
+/// `attrs_contain_cfg_test(&node.attrs)` is true.
+///
+/// Pair of the `bad-alias-in-test-impl` bash fixture — both scanners must
+/// fail on the same source to prevent silent drift.
+#[test]
+fn syn_scanner_excludes_cfg_test_impl() {
+    const FIXTURE: &str = include_str!(
+        "../../../../scripts/tests/bridge-symmetry/fixtures/\
+         bad-alias-in-test-impl/crates/scp-ffi/napi/src/widgets.rs"
+    );
+    let fns = collect_defined_fns(FIXTURE);
+    assert!(
+        !fns.contains("widget_create"),
+        "syn scanner leaked a method defined inside #[cfg(test)] impl Context \
+         — names collected: {fns:?}"
+    );
+    // Sanity: the non-test fn OUTSIDE the impl is still visible.
+    assert!(
+        fns.contains("widget_create_not_real"),
+        "syn scanner failed to collect the non-test fn widget_create_not_real \
+         — names collected: {fns:?}"
+    );
+}
+
+/// Guards MAJOR-1 (cfg predicate semantics): a fn marked `#[cfg(not(test))]`
+/// is production-only code and MUST be collected. A bare `test` token scan
+/// that reported any mention of `test` as test-only would wrongly drop it.
+#[test]
+fn syn_scanner_keeps_cfg_not_test_fn() {
+    const SRC: &str = r#"
+        #[cfg(not(test))]
+        pub fn should_be_kept() {}
+
+        #[cfg(all(not(test), feature = "x"))]
+        pub fn should_also_be_kept() {}
+    "#;
+    let fns = collect_defined_fns(SRC);
+    assert!(
+        fns.contains("should_be_kept"),
+        "#[cfg(not(test))] fn was incorrectly excluded — collected: {fns:?}"
+    );
+    assert!(
+        fns.contains("should_also_be_kept"),
+        "#[cfg(all(not(test), ...))] fn was incorrectly excluded — \
+         collected: {fns:?}"
+    );
+}
+
+/// Guards MAJOR-2 (fn-level cfg(test)): a fn marked `#[cfg(test)]` inside a
+/// non-test module must NOT be collected. Both `visit_item_fn` and
+/// `visit_impl_item_fn` must consult the fn's own attrs.
+#[test]
+fn syn_scanner_excludes_cfg_test_fn_inside_non_test_module() {
+    const SRC: &str = r"
+        mod foo {
+            #[cfg(test)]
+            fn fake_canonical() {}
+
+            pub fn production_fn() {}
+        }
+
+        struct Widget;
+        impl Widget {
+            #[cfg(test)]
+            fn fake_method() {}
+
+            pub fn real_method(&self) {}
+        }
+    ";
+    let fns = collect_defined_fns(SRC);
+    assert!(
+        !fns.contains("fake_canonical"),
+        "fn-level #[cfg(test)] in non-test module was not excluded — \
+         collected: {fns:?}"
+    );
+    assert!(
+        !fns.contains("fake_method"),
+        "fn-level #[cfg(test)] on impl method was not excluded — \
+         collected: {fns:?}"
+    );
+    assert!(
+        fns.contains("production_fn"),
+        "production fn was dropped — collected: {fns:?}"
+    );
+    assert!(
+        fns.contains("real_method"),
+        "impl method was dropped — collected: {fns:?}"
+    );
+}
+
+/// Exercise `cfg(test)` and `all(test, ...)` — both are test-ONLY, so
+/// the scanner must exclude them. `any(test, ...)` is tested below as a
+/// production case (it has a production path via the other disjunct).
+#[test]
+fn syn_scanner_excludes_test_only_cfgs() {
+    const SRC: &str = r#"
+        #[cfg(test)]
+        fn a() {}
+
+        #[cfg(all(test, feature = "x"))]
+        fn c() {}
+    "#;
+    let fns = collect_defined_fns(SRC);
+    for name in ["a", "c"] {
+        assert!(
+            !fns.contains(name),
+            "fn `{name}` gated on test should have been excluded — \
+             collected: {fns:?}"
+        );
+    }
+}
+
+/// `#[cfg(any(test, feature = "x"))]` compiles when `test OR feature
+/// = "x"`. With `feature = "x"` enabled and `test` off, the item is
+/// reachable in production — so the scanner MUST keep it in the
+/// collected set (it is a production definition, not a test-only one).
+/// The old walker misclassified this as test-gated; ADR-046 MINOR-1
+/// rev split `all(...)` and `any(...)` folds to fix it.
+#[test]
+fn syn_scanner_includes_any_with_test_and_feature() {
+    const SRC: &str = r#"
+        #[cfg(any(test, feature = "x"))]
+        fn b() {}
+    "#;
+    let fns = collect_defined_fns(SRC);
+    assert!(
+        fns.contains("b"),
+        "fn `b` under `any(test, feature=...)` has a production path \
+         and must be collected — collected: {fns:?}"
+    );
+}
+
+/// `#[cfg_attr(test, …)]` is conditional-attribute propagation, NOT a
+/// compile-time gate on the item itself. `cfg_attr(test, deprecated)`
+/// expands to `#[deprecated]` when `test` is on and to nothing when
+/// it's off — either way, the fn is compiled in production. The
+/// walker must treat the fn as production-reachable and keep it in
+/// the collected set. Review round 12 flagged this as a coverage gap
+/// (the walker handled it correctly per ADR-046, but no fixture
+/// proved it). This test locks the behaviour.
+#[test]
+fn syn_scanner_includes_fn_with_cfg_attr_test() {
+    const SRC: &str = r#"
+        #[cfg_attr(test, deprecated = "use bar")]
+        fn foo() {}
+
+        #[cfg_attr(test, allow(dead_code), deprecated)]
+        #[cfg_attr(not(test), inline)]
+        fn bar() {}
+    "#;
+    let fns = collect_defined_fns(SRC);
+    for name in ["foo", "bar"] {
+        assert!(
+            fns.contains(name),
+            "fn `{name}` carries `cfg_attr(test, …)` which is attribute \
+             propagation, not a gate — the fn is compiled in production \
+             and must be collected; collected: {fns:?}"
+        );
+    }
+}
+
+/// Negative case: `#[cfg(test)]` stacked ABOVE `#[cfg_attr(test, …)]`
+/// is still a real test-only gate. The `cfg_attr` underneath is irrelevant
+/// because the outer `cfg(test)` already excludes the fn from production.
+#[test]
+fn syn_scanner_excludes_cfg_test_above_cfg_attr() {
+    const SRC: &str = "
+        #[cfg(test)]
+        #[cfg_attr(test, allow(dead_code))]
+        fn test_only_fn() {}
+    ";
+    let fns = collect_defined_fns(SRC);
+    assert!(
+        !fns.contains("test_only_fn"),
+        "fn `test_only_fn` under `cfg(test)` + `cfg_attr(test, …)` is \
+         test-only and must be excluded; collected: {fns:?}"
     );
 }

@@ -697,9 +697,13 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpError {
 
 impl From<scp_core::crypto::ucan::UcanError> for ScpError {
     fn from(e: scp_core::crypto::ucan::UcanError) -> Self {
+        // Canonical UCAN→error-code mapping — see `scp-ffi/src/error.rs`
+        // for the full rationale. All bridges route through the shared
+        // `scp_ffi_common::ucan_errors` module.
+        let code = scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned();
         Self::Permission {
             msg: format!("{e} — check token format, signatures, time bounds, and capability chain"),
-            code: codes::PERM_3001.to_owned(),
+            code,
         }
     }
 }
@@ -1400,6 +1404,16 @@ pub struct Identity {
     /// `None` for in-memory and external custody.
     #[allow(dead_code)]
     pub(crate) callback_custody: Option<Arc<CallbackKeyCustody>>,
+    /// Hex-encoded Ed25519 verifying-key bytes for the identity key
+    /// (VM `#0`, the key that derives the DID). 64 hex chars = 32 raw
+    /// bytes. `None` for externally loaded identities without live key
+    /// material.
+    ///
+    /// Uses `identity_key` (not `#active`) because the WASM bridge has a
+    /// simplified single-key model; exposing the identity key gives
+    /// byte-exact cross-bridge parity under a deterministic `seed`
+    /// (ADR-046).
+    pub(crate) verifying_key_hex: Option<String>,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
     /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
@@ -1435,6 +1449,18 @@ impl Identity {
             CustodyMethod::Software => "software".to_owned(),
             CustodyMethod::External => "external".to_owned(),
         }
+    }
+
+    /// Returns the hex-encoded Ed25519 verifying-key bytes for the
+    /// identity key (VM `#0`, the DID-deriving key), or `null` if this
+    /// handle was loaded without live key material.
+    ///
+    /// Under a deterministic `seed`, this value is byte-identical across
+    /// every bridge (ADR-046). See the `verifying_key_hex` field docs
+    /// for why `#0` rather than `#active`.
+    #[must_use]
+    pub fn verifying_key(&self) -> Option<String> {
+        self.verifying_key_hex.clone()
     }
 
     /// Rotates the active signing key for this identity (async).
@@ -1474,6 +1500,12 @@ impl Identity {
                 .await
                 .map_err(ScpError::from)?;
 
+            let verifying_key_hex = callback
+                .public_key(&new_identity.identity_key)
+                .await
+                .ok()
+                .map(|pk| hex::encode(pk.as_bytes()));
+
             let handle = Arc::new(Self {
                 did: new_identity.did.clone(),
                 custody_type: self.custody_type.clone(),
@@ -1482,6 +1514,7 @@ impl Identity {
                 #[cfg(feature = "allow_in_memory_custody")]
                 in_memory_custody: None,
                 callback_custody: self.callback_custody.clone(),
+                verifying_key_hex,
                 instance_id: self.instance_id,
             });
             increment_handle_count();
@@ -1496,6 +1529,13 @@ impl Identity {
                 .await
                 .map_err(ScpError::from)?;
 
+            let verifying_key_hex = custody
+                .0
+                .public_key(&new_identity.identity_key)
+                .await
+                .ok()
+                .map(|pk| hex::encode(pk.as_bytes()));
+
             let handle = Arc::new(Self {
                 did: new_identity.did.clone(),
                 custody_type: CustodyMethod::InMemory,
@@ -1503,6 +1543,7 @@ impl Identity {
                 core_document: Some(new_document),
                 in_memory_custody: self.in_memory_custody.clone(),
                 callback_custody: None,
+                verifying_key_hex,
                 instance_id: self.instance_id,
             });
             increment_handle_count();
@@ -1632,6 +1673,13 @@ impl Identity {
                         .await
                         .map_err(ScpError::from)?;
 
+                    let verifying_key_hex = custody
+                        .0
+                        .public_key(&updated_identity.identity_key)
+                        .await
+                        .ok()
+                        .map(|pk| hex::encode(pk.as_bytes()));
+
                     let handle = Arc::new(Self {
                         did,
                         custody_type,
@@ -1639,6 +1687,7 @@ impl Identity {
                         core_document: Some(updated_doc),
                         in_memory_custody,
                         callback_custody: None,
+                        verifying_key_hex,
                         instance_id,
                     });
                     increment_handle_count();
@@ -1717,12 +1766,20 @@ impl Identity {
             let instance_id = self.instance_id;
             let dht = make_dht_with_signer(custody)?;
 
+            let custody_for_key = custody.clone();
             runtime()
                 .spawn(async move {
                     let (updated_identity, updated_doc) = dht
                         .remove_agent_key(&identity_clone, &doc_clone)
                         .await
                         .map_err(ScpError::from)?;
+
+                    let verifying_key_hex = custody_for_key
+                        .0
+                        .public_key(&updated_identity.identity_key)
+                        .await
+                        .ok()
+                        .map(|pk| hex::encode(pk.as_bytes()));
 
                     let handle = Arc::new(Self {
                         did,
@@ -1731,6 +1788,7 @@ impl Identity {
                         core_document: Some(updated_doc),
                         in_memory_custody,
                         callback_custody: None,
+                        verifying_key_hex,
                         instance_id,
                     });
                     increment_handle_count();
@@ -1814,6 +1872,13 @@ impl Identity {
                         .await
                         .map_err(ScpError::from)?;
 
+                    let verifying_key_hex = custody
+                        .0
+                        .public_key(&updated_identity.identity_key)
+                        .await
+                        .ok()
+                        .map(|pk| hex::encode(pk.as_bytes()));
+
                     let handle = Arc::new(Self {
                         did,
                         custody_type,
@@ -1821,6 +1886,7 @@ impl Identity {
                         core_document: Some(updated_doc),
                         in_memory_custody,
                         callback_custody: None,
+                        verifying_key_hex,
                         instance_id,
                     });
                     increment_handle_count();
@@ -6146,8 +6212,21 @@ pub(crate) fn scpid_sign_impl(
     identity: Arc<Identity>,
     signing_key_id: String,
     challenge_json: String,
+    signed_at_override: Option<u64>,
 ) -> Result<String, ScpError> {
     use scp_core::identity::scpid_sign as core_sign;
+
+    // Reject `signed_at_override` on non-testing builds: the override is a
+    // parity-harness affordance (ADR-046), not a production API.
+    #[cfg(not(feature = "testing"))]
+    if signed_at_override.is_some() {
+        return Err(ScpError::Validation {
+            msg:
+                "signed_at_override requires the scp-core `testing` feature — not available in production builds"
+                    .to_owned(),
+            code: codes::VALID_7007.to_owned(),
+        });
+    }
 
     let key_id = parse_scpid_signing_key_id(&signing_key_id)?;
 
@@ -6199,6 +6278,7 @@ pub(crate) fn scpid_sign_impl(
         &identity.did,
         key_id,
         &challenge,
+        signed_at_override,
     ));
 
     let response = response.map_err(|e| ScpError::Identity {
@@ -6735,12 +6815,36 @@ impl Scp {
     /// initialization, handle `instance_id` stamping) is scoped to this
     /// `SCP`.
     ///
-    /// See the documentation on the free `identity_create` function for
-    /// argument semantics and the `"in_memory"` / `"platform"` custody
-    /// distinction (ADR-006, #88).
-    pub async fn identity_create(&self, custody: String) -> Result<Arc<Identity>, ScpError> {
+    /// When `seed` is supplied (32 bytes), the in-memory custody is backed
+    /// by a deterministic RNG so subsequent `generate_keypair` calls produce
+    /// byte-identical Ed25519 keys across bridges — the basis of the
+    /// cross-bridge parity test (ADR-046). `seed` is only valid for
+    /// `"in_memory"` custody; other custody types reject it with
+    /// `SCP-VALID-7007`.
+    pub async fn identity_create(
+        &self,
+        custody: String,
+        seed: Option<Vec<u8>>,
+    ) -> Result<Arc<Identity>, ScpError> {
         let custody_method = parse_custody_method(&custody)?;
         let bi = Arc::clone(&self.inner);
+
+        // Validate the optional 32-byte seed at the FFI boundary so we fail
+        // early rather than panicking in `InMemoryKeyCustody::from_seed_bytes`.
+        let seed_bytes: Option<[u8; 32]> = match seed {
+            None => None,
+            Some(bytes) => {
+                if bytes.len() != 32 {
+                    return Err(ScpError::Validation {
+                        msg: format!("seed must be exactly 32 bytes, got {}", bytes.len()),
+                        code: codes::VALID_7007.to_owned(),
+                    });
+                }
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&bytes);
+                Some(out)
+            }
+        };
 
         runtime()
             .spawn(async move {
@@ -6752,6 +6856,7 @@ impl Scp {
                         #[cfg(not(feature = "allow_in_memory_custody"))]
                         {
                             let _ = &bi;
+                            let _ = seed_bytes;
                             Err(ScpError::Identity {
                                 msg: "\"in_memory\" custody is not available in this build \
                                       — enable the \"allow_in_memory_custody\" feature for \
@@ -6774,11 +6879,25 @@ impl Scp {
                             // that are indices into `key_custody`'s internal store.
                             // Dropping `key_custody` destroys all private key material
                             // and renders those handles dangling.
-                            let key_custody =
-                                Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+                            //
+                            // When `seed` is supplied, the custody is backed by a
+                            // deterministic RNG (ADR-046 parity).
+                            let in_memory = seed_bytes.map_or_else(
+                                InMemoryKeyCustody::new,
+                                InMemoryKeyCustody::from_seed_bytes,
+                            );
+                            let key_custody = Arc::new(OpaqueInMemoryKeyCustody(in_memory));
                             let dht = DidDht::new();
                             let (identity, document) =
                                 dht.create(&key_custody.0).await.map_err(ScpError::from)?;
+
+                            // Snapshot the #0 (identity) verifying key for ADR-046 parity.
+                            let verifying_key_hex = key_custody
+                                .0
+                                .public_key(&identity.identity_key)
+                                .await
+                                .ok()
+                                .map(|pk| hex::encode(pk.as_bytes()));
 
                             // Initialize the production DID resolver for UCAN
                             // validation on this instance (H4 — matching
@@ -6795,6 +6914,7 @@ impl Scp {
                                 core_document: Some(document),
                                 in_memory_custody: Some(key_custody),
                                 callback_custody: None,
+                                verifying_key_hex,
                                 instance_id: bi.core.instance_id(),
                             });
                             increment_handle_count();
@@ -6802,6 +6922,13 @@ impl Scp {
                         }
                     }
                     CustodyMethod::Platform | CustodyMethod::Software => {
+                        if seed_bytes.is_some() {
+                            return Err(ScpError::Validation {
+                                msg: "`seed` parameter is only valid for custody=\"in_memory\""
+                                    .to_owned(),
+                                code: codes::VALID_7007.to_owned(),
+                            });
+                        }
                         // Platform and software custody require a wired
                         // KeyCustodyProvider (ADR-006 platform abstraction).
                         // Use `identity_create_with_custody` to inject a
@@ -6862,6 +6989,13 @@ impl Scp {
                     .await
                     .map_err(ScpError::from)?;
 
+                // Snapshot the #0 (identity) verifying key for ADR-046 parity.
+                let verifying_key_hex = callback_custody
+                    .public_key(&identity.identity_key)
+                    .await
+                    .ok()
+                    .map(|pk| hex::encode(pk.as_bytes()));
+
                 // Initialize the production DID resolver for UCAN validation
                 // on this instance.
                 ensure_did_resolver_initialized_on(&bi, tokio::runtime::Handle::current())?;
@@ -6874,6 +7008,7 @@ impl Scp {
                     #[cfg(feature = "allow_in_memory_custody")]
                     in_memory_custody: None,
                     callback_custody: Some(callback_custody),
+                    verifying_key_hex,
                     instance_id: bi.core.instance_id(),
                 });
                 increment_handle_count();
@@ -6906,6 +7041,7 @@ impl Scp {
 
                 // identity_load returns a DID-string-only handle. Key operations
                 // require the KeyCustodyProvider callback interface to be wired.
+                // No live key material, so `verifying_key_hex` is `None`.
                 let handle = Arc::new(Identity {
                     did,
                     custody_type: CustodyMethod::External,
@@ -6914,6 +7050,7 @@ impl Scp {
                     #[cfg(feature = "allow_in_memory_custody")]
                     in_memory_custody: None,
                     callback_custody: None,
+                    verifying_key_hex: None,
                     instance_id: bi.core.instance_id(),
                 });
                 increment_handle_count();
@@ -11794,18 +11931,24 @@ impl Scp {
     ///
     /// Signs an SCPID challenge with the identity's requested key. Rejects
     /// any `Identity` whose `instance_id` does not match this `Scp`'s.
+    ///
+    /// `signed_at_override` is a testing-only parameter for the ADR-046
+    /// cross-bridge parity harness. Only accepted when scp-core is built
+    /// with the `testing` feature; production builds reject any non-`None`
+    /// value via `SCP-VALID-7007`.
     #[cfg(feature = "allow_in_memory_custody")]
     pub fn scpid_sign(
         &self,
         identity: Arc<Identity>,
         signing_key_id: String,
         challenge_json: String,
+        signed_at_override: Option<u64>,
     ) -> Result<String, ScpError> {
         self.inner
             .core
             .check_handle(identity.instance_id())
             .map_err(ScpError::from)?;
-        scpid_sign_impl(identity, signing_key_id, challenge_json)
+        scpid_sign_impl(identity, signing_key_id, challenge_json, signed_at_override)
     }
 
     /// Per-instance equivalent of the free-function `scpid_verify`.
@@ -12430,6 +12573,11 @@ impl Scp {
 
                     let new_did = new_identity.did.clone();
                     let has_agent = new_document.has_agent_key();
+                    let verifying_key_hex =
+                        kc.0.public_key(&new_identity.identity_key)
+                            .await
+                            .ok()
+                            .map(|pk| hex::encode(pk.as_bytes()));
                     let handle = Arc::new(Identity {
                         did: new_identity.did.clone(),
                         custody_type,
@@ -12438,6 +12586,7 @@ impl Scp {
                         #[cfg(feature = "allow_in_memory_custody")]
                         in_memory_custody: custody_arc,
                         callback_custody,
+                        verifying_key_hex,
                         instance_id,
                     });
                     increment_handle_count();
@@ -12493,6 +12642,11 @@ impl Scp {
                         .map_err(ScpError::from)?;
 
                     let new_did = new_identity.did.clone();
+                    let verifying_key_hex = cc
+                        .public_key(&new_identity.identity_key)
+                        .await
+                        .ok()
+                        .map(|pk| hex::encode(pk.as_bytes()));
                     let handle = Arc::new(Identity {
                         did: new_identity.did.clone(),
                         custody_type,
@@ -12501,6 +12655,7 @@ impl Scp {
                         #[cfg(feature = "allow_in_memory_custody")]
                         in_memory_custody: None,
                         callback_custody: Some(Arc::clone(cc)),
+                        verifying_key_hex,
                         instance_id,
                     });
                     increment_handle_count();
@@ -12584,6 +12739,14 @@ impl Scp {
                                 .await
                                 .map_err(ScpError::from)?;
 
+                            // Snapshot the #0 verifying key for ADR-046 parity.
+                            let verifying_key_hex = key_custody
+                                .0
+                                .public_key(&identity.identity_key)
+                                .await
+                                .ok()
+                                .map(|pk| hex::encode(pk.as_bytes()));
+
                             // Initialize the production DID resolver for UCAN
                             // validation on this instance.
                             ensure_did_resolver_initialized_on(
@@ -12598,6 +12761,7 @@ impl Scp {
                                 core_document: Some(document),
                                 in_memory_custody: Some(key_custody),
                                 callback_custody: None,
+                                verifying_key_hex,
                                 instance_id: bi.core.instance_id(),
                             });
                             increment_handle_count();
@@ -13935,6 +14099,7 @@ mod tests {
             #[cfg(feature = "allow_in_memory_custody")]
             in_memory_custody: None,
             callback_custody: None,
+            verifying_key_hex: None,
             instance_id,
         })
     }
@@ -14827,6 +14992,7 @@ mod tests {
             &identity.did,
             scp_identity::SigningKeyId::Active,
             &challenge,
+            None,
         )
         .await
         .unwrap();

@@ -35,7 +35,6 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use scp_ffi_common::trust_store::InMemoryFfiTrustStore;
 
 use crate::runtime::PyBridgeInstance;
 use crate::validate;
@@ -422,21 +421,19 @@ fn aggregate_with_storage(
     >,
 ) -> PyResult<String> {
     use crate::runtime::StorageProvider;
-    let Ok(provider) = crate::runtime::get_storage(bi) else {
-        return scp_ffi_common::trust_store::populate_and_aggregate(
-            InMemoryFfiTrustStore::new(),
-            context_id,
-            subject_did,
-            cached_attestations,
-            challenge_results,
-            events,
-            merkle_root,
-            consequence_rules,
-            threshold_requirements,
-            attestor_sets,
-        )
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()));
-    };
+    // Surface storage-not-initialized as an init bug, not a silent fallback.
+    // The former path swapped in an ephemeral `InMemoryFfiTrustStore` so
+    // aggregations against a `SCP({storage: sqlite})` caller's configured
+    // SQLCipher store invisibly landed in an empty ephemeral store. See
+    // `with_storage_py` / PR #1690 review.
+    let provider = crate::runtime::get_storage(bi).map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "{}: bridge storage not initialized — trust aggregation is \
+             unreachable until this PyBridgeInstance has allocated its \
+             storage provider (bridge init bug)",
+            scp_ffi_common::error_codes::VALID_7005
+        ))
+    })?;
     let handle = crate::runtime()?.handle().clone();
     match provider {
         StorageProvider::InMemoryEncrypted(storage) => {

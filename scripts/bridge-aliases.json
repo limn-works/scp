@@ -1,0 +1,1690 @@
+{
+  "schema_version": "1.0",
+  "_generated_from": "crates/scp-testing/tests/integration/ffi_conformance.rs \u2014 PARITY_OPERATIONS + per-bridge alias match arms",
+  "operations": [
+    {
+      "canonical": "identity_create",
+      "category": "identity",
+      "wasm_required": true,
+      "pyo3": [
+        "py_identity_create"
+      ],
+      "uniffi": [
+        "identity_create"
+      ],
+      "napi": [
+        "identity_create"
+      ],
+      "wasm": [
+        "identity_create"
+      ]
+    },
+    {
+      "canonical": "identity_load",
+      "category": "identity",
+      "wasm_required": true,
+      "pyo3": [
+        "py_identity_load"
+      ],
+      "uniffi": [
+        "identity_load"
+      ],
+      "napi": [
+        "identity_load"
+      ],
+      "wasm": [
+        "identity_load"
+      ]
+    },
+    {
+      "canonical": "identity_resolve",
+      "category": "identity",
+      "wasm_required": true,
+      "pyo3": [
+        "py_identity_resolve"
+      ],
+      "uniffi": [
+        "identity_resolve"
+      ],
+      "napi": [
+        "identity_resolve"
+      ],
+      "wasm": [
+        "identity_resolve"
+      ]
+    },
+    {
+      "canonical": "identity_migrate",
+      "category": "identity",
+      "wasm_required": true,
+      "pyo3": [
+        "py_identity_migrate"
+      ],
+      "uniffi": [
+        "identity_migrate"
+      ],
+      "napi": [
+        "identity_migrate"
+      ],
+      "wasm": [
+        "identity_migrate"
+      ]
+    },
+    {
+      "canonical": "identity_attest_device",
+      "category": "identity",
+      "wasm_required": true,
+      "pyo3": [
+        "py_identity_attest_device"
+      ],
+      "uniffi": [
+        "identity_attest_device"
+      ],
+      "napi": [
+        "identity_attest_device"
+      ],
+      "wasm": [
+        "identity_attest_device"
+      ]
+    },
+    {
+      "canonical": "identity_verify_device_attestation",
+      "category": "identity",
+      "wasm_required": true,
+      "pyo3": [
+        "py_identity_verify_device_attestation"
+      ],
+      "uniffi": [
+        "identity_verify_device_attestation"
+      ],
+      "napi": [
+        "identity_verify_device_attestation"
+      ],
+      "wasm": [
+        "identity_verify_device_attestation"
+      ]
+    },
+    {
+      "canonical": "context_create",
+      "category": "context",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_create"
+      ],
+      "uniffi": [
+        "context_create"
+      ],
+      "napi": [
+        "context_create"
+      ],
+      "wasm": [
+        "context_create"
+      ]
+    },
+    {
+      "canonical": "context_join",
+      "category": "context",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_join"
+      ],
+      "uniffi": [
+        "context_join"
+      ],
+      "napi": [
+        "context_join"
+      ],
+      "wasm": [
+        "context_join"
+      ]
+    },
+    {
+      "canonical": "context_leave",
+      "category": "context",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_leave"
+      ],
+      "uniffi": [
+        "context_leave"
+      ],
+      "napi": [
+        "context_leave"
+      ],
+      "wasm": [
+        "context_leave"
+      ]
+    },
+    {
+      "canonical": "context_close",
+      "category": "context",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_close"
+      ],
+      "uniffi": [
+        "context_close"
+      ],
+      "napi": [
+        "context_close"
+      ],
+      "wasm": [
+        "context_close"
+      ]
+    },
+    {
+      "canonical": "context_send",
+      "category": "context",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_send"
+      ],
+      "uniffi": [
+        "context_send"
+      ],
+      "napi": [
+        "context_send"
+      ],
+      "wasm": [
+        "context_send"
+      ]
+    },
+    {
+      "canonical": "context_subscribe",
+      "category": "context",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_subscribe",
+        "py_context_receive"
+      ],
+      "uniffi": [
+        "context_subscribe"
+      ],
+      "napi": [
+        "context_subscribe"
+      ],
+      "wasm": [
+        "context_subscribe"
+      ]
+    },
+    {
+      "canonical": "context_export",
+      "category": "context",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_export"
+      ],
+      "uniffi": [
+        "context_export"
+      ],
+      "napi": [
+        "context_export"
+      ],
+      "wasm": [
+        "context_export"
+      ]
+    },
+    {
+      "canonical": "context_import",
+      "category": "context",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_import"
+      ],
+      "uniffi": [
+        "context_import"
+      ],
+      "napi": [
+        "context_import"
+      ],
+      "wasm": [
+        "context_import"
+      ]
+    },
+    {
+      "canonical": "context_member_count",
+      "category": "membership",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_member_count"
+      ],
+      "uniffi": [
+        "context_member_count"
+      ],
+      "napi": [
+        "context_member_count"
+      ],
+      "wasm": [
+        "context_member_count"
+      ]
+    },
+    {
+      "canonical": "context_is_member",
+      "category": "membership",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_is_member"
+      ],
+      "uniffi": [
+        "context_is_member"
+      ],
+      "napi": [
+        "context_is_member"
+      ],
+      "wasm": [
+        "context_is_member"
+      ]
+    },
+    {
+      "canonical": "context_member_dids",
+      "category": "membership",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_member_dids"
+      ],
+      "uniffi": [
+        "context_member_dids"
+      ],
+      "napi": [
+        "context_member_dids"
+      ],
+      "wasm": [
+        "context_member_dids"
+      ]
+    },
+    {
+      "canonical": "context_member_role",
+      "category": "membership",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_member_role"
+      ],
+      "uniffi": [
+        "context_member_role"
+      ],
+      "napi": [
+        "context_member_role"
+      ],
+      "wasm": [
+        "context_member_role"
+      ]
+    },
+    {
+      "canonical": "context_drain_events",
+      "category": "events",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_drain_events"
+      ],
+      "uniffi": [
+        "context_drain_events"
+      ],
+      "napi": [
+        "context_drain_events"
+      ],
+      "wasm": [
+        "context_drain_events"
+      ]
+    },
+    {
+      "canonical": "governance_execute",
+      "category": "governance",
+      "wasm_required": true,
+      "pyo3": [
+        "py_governance_execute"
+      ],
+      "uniffi": [
+        "governance_execute"
+      ],
+      "napi": [
+        "governance_execute",
+        "context_execute_governance_action"
+      ],
+      "wasm": [
+        "governance_execute",
+        "context_execute_governance"
+      ]
+    },
+    {
+      "canonical": "tool_register",
+      "category": "tools",
+      "wasm_required": true,
+      "pyo3": [
+        "py_tool_register"
+      ],
+      "uniffi": [
+        "tool_register"
+      ],
+      "napi": [
+        "tool_register"
+      ],
+      "wasm": [
+        "tool_register"
+      ]
+    },
+    {
+      "canonical": "tool_invoke",
+      "category": "tools",
+      "wasm_required": true,
+      "pyo3": [
+        "py_tool_invoke"
+      ],
+      "uniffi": [
+        "tool_invoke"
+      ],
+      "napi": [
+        "tool_invoke"
+      ],
+      "wasm": [
+        "tool_invoke"
+      ]
+    },
+    {
+      "canonical": "tool_verify",
+      "category": "tools",
+      "wasm_required": true,
+      "pyo3": [
+        "py_tool_verify"
+      ],
+      "uniffi": [
+        "tool_verify"
+      ],
+      "napi": [
+        "tool_verify"
+      ],
+      "wasm": [
+        "tool_verify"
+      ]
+    },
+    {
+      "canonical": "tool_invoke_cross_context",
+      "category": "tools",
+      "wasm_required": false,
+      "pyo3": [
+        "py_tool_invoke_cross_context"
+      ],
+      "uniffi": [
+        "tool_invoke_cross_context"
+      ],
+      "napi": [
+        "tool_invoke_cross_context"
+      ],
+      "wasm": [
+        "tool_invoke_cross_context"
+      ]
+    },
+    {
+      "canonical": "tool_session_create",
+      "category": "tools",
+      "wasm_required": false,
+      "pyo3": [
+        "py_tool_session_create"
+      ],
+      "uniffi": [
+        "tool_session_create"
+      ],
+      "napi": [
+        "tool_session_create"
+      ],
+      "wasm": [
+        "tool_session_create"
+      ]
+    },
+    {
+      "canonical": "tool_session_invoke",
+      "category": "tools",
+      "wasm_required": false,
+      "pyo3": [
+        "py_tool_session_invoke"
+      ],
+      "uniffi": [
+        "tool_session_invoke"
+      ],
+      "napi": [
+        "tool_session_invoke"
+      ],
+      "wasm": [
+        "tool_session_invoke"
+      ]
+    },
+    {
+      "canonical": "tool_session_close",
+      "category": "tools",
+      "wasm_required": false,
+      "pyo3": [
+        "py_tool_session_close"
+      ],
+      "uniffi": [
+        "tool_session_close"
+      ],
+      "napi": [
+        "tool_session_close"
+      ],
+      "wasm": [
+        "tool_session_close"
+      ]
+    },
+    {
+      "canonical": "ucan_validate",
+      "category": "ucan",
+      "wasm_required": true,
+      "pyo3": [
+        "py_ucan_validate"
+      ],
+      "uniffi": [
+        "ucan_validate"
+      ],
+      "napi": [
+        "ucan_validate"
+      ],
+      "wasm": [
+        "ucan_validate"
+      ]
+    },
+    {
+      "canonical": "ucan_mint",
+      "category": "ucan",
+      "wasm_required": true,
+      "pyo3": [
+        "py_ucan_mint"
+      ],
+      "uniffi": [
+        "ucan_mint"
+      ],
+      "napi": [
+        "ucan_mint"
+      ],
+      "wasm": [
+        "ucan_mint"
+      ]
+    },
+    {
+      "canonical": "ucan_revoke",
+      "category": "ucan",
+      "wasm_required": true,
+      "pyo3": [
+        "py_ucan_revoke"
+      ],
+      "uniffi": [
+        "ucan_revoke"
+      ],
+      "napi": [
+        "ucan_revoke"
+      ],
+      "wasm": [
+        "ucan_revoke"
+      ]
+    },
+    {
+      "canonical": "ucan_delegate",
+      "category": "ucan",
+      "wasm_required": true,
+      "pyo3": [
+        "py_ucan_delegate"
+      ],
+      "uniffi": [
+        "ucan_delegate"
+      ],
+      "napi": [
+        "ucan_delegate"
+      ],
+      "wasm": [
+        "ucan_delegate"
+      ]
+    },
+    {
+      "canonical": "event_log_query",
+      "category": "event_log",
+      "wasm_required": true,
+      "pyo3": [
+        "py_event_log_query"
+      ],
+      "uniffi": [
+        "event_log_query"
+      ],
+      "napi": [
+        "event_log_query"
+      ],
+      "wasm": [
+        "event_log_query"
+      ]
+    },
+    {
+      "canonical": "event_log_verify",
+      "category": "event_log",
+      "wasm_required": true,
+      "pyo3": [
+        "py_event_log_verify"
+      ],
+      "uniffi": [
+        "event_log_verify"
+      ],
+      "napi": [
+        "event_log_verify"
+      ],
+      "wasm": [
+        "event_log_verify"
+      ]
+    },
+    {
+      "canonical": "event_log_checkpoint",
+      "category": "event_log",
+      "wasm_required": true,
+      "pyo3": [
+        "py_event_log_checkpoint"
+      ],
+      "uniffi": [
+        "event_log_checkpoint"
+      ],
+      "napi": [
+        "event_log_checkpoint"
+      ],
+      "wasm": [
+        "event_log_checkpoint"
+      ]
+    },
+    {
+      "canonical": "transport_connect",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "py_transport_connect"
+      ],
+      "uniffi": [
+        "transport_connect"
+      ],
+      "napi": [
+        "transport_connect"
+      ],
+      "wasm": [
+        "transport_connect"
+      ]
+    },
+    {
+      "canonical": "transport_status",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "py_transport_status"
+      ],
+      "uniffi": [
+        "transport_status"
+      ],
+      "napi": [
+        "transport_status"
+      ],
+      "wasm": [
+        "transport_status"
+      ]
+    },
+    {
+      "canonical": "broadcast_subscribe",
+      "category": "broadcast",
+      "wasm_required": true,
+      "pyo3": [
+        "py_broadcast_subscribe"
+      ],
+      "uniffi": [
+        "broadcast_subscribe"
+      ],
+      "napi": [
+        "broadcast_subscribe"
+      ],
+      "wasm": [
+        "broadcast_subscribe"
+      ]
+    },
+    {
+      "canonical": "broadcast_unsubscribe",
+      "category": "broadcast",
+      "wasm_required": true,
+      "pyo3": [
+        "py_broadcast_unsubscribe"
+      ],
+      "uniffi": [
+        "broadcast_unsubscribe"
+      ],
+      "napi": [
+        "broadcast_unsubscribe"
+      ],
+      "wasm": [
+        "broadcast_unsubscribe"
+      ]
+    },
+    {
+      "canonical": "broadcast_publish",
+      "category": "broadcast",
+      "wasm_required": true,
+      "pyo3": [
+        "py_broadcast_publish"
+      ],
+      "uniffi": [
+        "broadcast_publish"
+      ],
+      "napi": [
+        "broadcast_publish"
+      ],
+      "wasm": [
+        "broadcast_publish"
+      ]
+    },
+    {
+      "canonical": "broadcast_block",
+      "category": "broadcast",
+      "wasm_required": true,
+      "pyo3": [
+        "py_broadcast_block",
+        "py_broadcast_block_subscriber"
+      ],
+      "uniffi": [
+        "broadcast_block",
+        "broadcast_block_subscriber"
+      ],
+      "napi": [
+        "broadcast_block",
+        "broadcast_block_subscriber"
+      ],
+      "wasm": [
+        "broadcast_block"
+      ]
+    },
+    {
+      "canonical": "trust_query_score",
+      "category": "trust",
+      "wasm_required": true,
+      "pyo3": [
+        "py_trust_query_score"
+      ],
+      "uniffi": [
+        "trust_query_score"
+      ],
+      "napi": [
+        "trust_query_score"
+      ],
+      "wasm": [
+        "trust_query_score"
+      ]
+    },
+    {
+      "canonical": "trust_verify_attestation",
+      "category": "trust",
+      "wasm_required": true,
+      "pyo3": [
+        "py_trust_verify_attestation"
+      ],
+      "uniffi": [
+        "trust_verify_attestation"
+      ],
+      "napi": [
+        "trust_verify_attestation"
+      ],
+      "wasm": [
+        "trust_verify_attestation"
+      ]
+    },
+    {
+      "canonical": "trust_create_challenge",
+      "category": "trust",
+      "wasm_required": true,
+      "pyo3": [
+        "py_trust_create_challenge"
+      ],
+      "uniffi": [
+        "trust_create_challenge"
+      ],
+      "napi": [
+        "trust_create_challenge"
+      ],
+      "wasm": [
+        "trust_create_challenge"
+      ]
+    },
+    {
+      "canonical": "trust_verify_response",
+      "category": "trust",
+      "wasm_required": true,
+      "pyo3": [
+        "py_trust_verify_response"
+      ],
+      "uniffi": [
+        "trust_verify_response"
+      ],
+      "napi": [
+        "trust_verify_response"
+      ],
+      "wasm": [
+        "trust_verify_response"
+      ]
+    },
+    {
+      "canonical": "verify_participation_requirements",
+      "category": "trust",
+      "wasm_required": true,
+      "pyo3": [
+        "py_verify_participation_requirements"
+      ],
+      "uniffi": [
+        "verify_participation_requirements"
+      ],
+      "napi": [
+        "verify_participation_requirements"
+      ],
+      "wasm": [
+        "verify_participation_requirements"
+      ]
+    },
+    {
+      "canonical": "sync_classify_offline",
+      "category": "sync",
+      "wasm_required": true,
+      "pyo3": [
+        "py_sync_classify_offline"
+      ],
+      "uniffi": [
+        "sync_classify_offline"
+      ],
+      "napi": [
+        "sync_classify_offline"
+      ],
+      "wasm": [
+        "sync_classify_offline"
+      ]
+    },
+    {
+      "canonical": "sync_classify_offline_custom",
+      "category": "sync",
+      "wasm_required": true,
+      "pyo3": [
+        "py_sync_classify_offline_custom"
+      ],
+      "uniffi": [
+        "sync_classify_offline_custom"
+      ],
+      "napi": [
+        "sync_classify_offline_custom"
+      ],
+      "wasm": [
+        "sync_classify_offline_custom"
+      ]
+    },
+    {
+      "canonical": "sync_get_policy",
+      "category": "sync",
+      "wasm_required": true,
+      "pyo3": [
+        "py_sync_get_policy"
+      ],
+      "uniffi": [
+        "sync_get_policy"
+      ],
+      "napi": [
+        "sync_get_policy"
+      ],
+      "wasm": [
+        "sync_get_policy"
+      ]
+    },
+    {
+      "canonical": "discovery_parse_address",
+      "category": "discovery",
+      "wasm_required": true,
+      "pyo3": [
+        "py_discovery_parse_address"
+      ],
+      "uniffi": [
+        "discovery_parse_address"
+      ],
+      "napi": [
+        "discovery_parse_address"
+      ],
+      "wasm": [
+        "discovery_parse_address"
+      ]
+    },
+    {
+      "canonical": "discovery_normalize_address",
+      "category": "discovery",
+      "wasm_required": true,
+      "pyo3": [
+        "py_discovery_normalize_address"
+      ],
+      "uniffi": [
+        "discovery_normalize_address"
+      ],
+      "napi": [
+        "discovery_normalize_address"
+      ],
+      "wasm": [
+        "discovery_normalize_address"
+      ]
+    },
+    {
+      "canonical": "provenance_check_chain_depth",
+      "category": "provenance",
+      "wasm_required": true,
+      "pyo3": [
+        "py_provenance_check_chain_depth"
+      ],
+      "uniffi": [
+        "provenance_check_chain_depth"
+      ],
+      "napi": [
+        "provenance_check_chain_depth"
+      ],
+      "wasm": [
+        "provenance_check_chain_depth"
+      ]
+    },
+    {
+      "canonical": "evaluate_provenance_quality",
+      "category": "provenance",
+      "wasm_required": true,
+      "pyo3": [
+        "py_evaluate_provenance_quality"
+      ],
+      "uniffi": [
+        "evaluate_provenance_quality"
+      ],
+      "napi": [
+        "evaluate_provenance_quality"
+      ],
+      "wasm": [
+        "evaluate_provenance_quality"
+      ]
+    },
+    {
+      "canonical": "provenance_attach",
+      "category": "provenance",
+      "wasm_required": true,
+      "pyo3": [
+        "py_provenance_attach"
+      ],
+      "uniffi": [
+        "provenance_attach"
+      ],
+      "napi": [
+        "provenance_attach"
+      ],
+      "wasm": [
+        "provenance_attach"
+      ]
+    },
+    {
+      "canonical": "bridge_evaluate_trust",
+      "category": "bridge",
+      "wasm_required": false,
+      "pyo3": [
+        "py_bridge_evaluate_trust"
+      ],
+      "uniffi": [
+        "bridge_evaluate_trust"
+      ],
+      "napi": [
+        "bridge_evaluate_trust"
+      ],
+      "wasm": [
+        "bridge_evaluate_trust"
+      ]
+    },
+    {
+      "canonical": "bridge_register",
+      "category": "bridge",
+      "wasm_required": false,
+      "pyo3": [
+        "py_bridge_register"
+      ],
+      "uniffi": [
+        "bridge_register"
+      ],
+      "napi": [
+        "bridge_register"
+      ],
+      "wasm": [
+        "bridge_register"
+      ]
+    },
+    {
+      "canonical": "bridge_create_shadow",
+      "category": "bridge",
+      "wasm_required": false,
+      "pyo3": [
+        "py_bridge_create_shadow"
+      ],
+      "uniffi": [
+        "bridge_create_shadow"
+      ],
+      "napi": [
+        "bridge_create_shadow"
+      ],
+      "wasm": [
+        "bridge_create_shadow"
+      ]
+    },
+    {
+      "canonical": "mcp_server",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_server",
+        "py_mcp_serve"
+      ],
+      "uniffi": [
+        "mcp_server"
+      ],
+      "napi": [
+        "mcp_server",
+        "mcp_server_create"
+      ],
+      "wasm": [
+        "mcp_server"
+      ]
+    },
+    {
+      "canonical": "mcp_client",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_client",
+        "py_mcp_client_connect_stdio"
+      ],
+      "uniffi": [
+        "mcp_client"
+      ],
+      "napi": [
+        "mcp_client",
+        "mcp_client_connect_stdio"
+      ],
+      "wasm": [
+        "mcp_client"
+      ]
+    },
+    {
+      "canonical": "economy_estimate_cost",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "py_economy_estimate_cost"
+      ],
+      "uniffi": [
+        "economy_estimate_cost"
+      ],
+      "napi": [
+        "economy_estimate_cost"
+      ],
+      "wasm": [
+        "economy_estimate_cost"
+      ]
+    },
+    {
+      "canonical": "economy_policy_requires_payment",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "py_economy_policy_requires_payment"
+      ],
+      "uniffi": [
+        "economy_policy_requires_payment"
+      ],
+      "napi": [
+        "economy_policy_requires_payment"
+      ],
+      "wasm": [
+        "economy_policy_requires_payment"
+      ]
+    },
+    {
+      "canonical": "economy_auto_accept_blocked",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "py_economy_auto_accept_blocked"
+      ],
+      "uniffi": [
+        "economy_auto_accept_blocked"
+      ],
+      "napi": [
+        "economy_auto_accept_blocked"
+      ],
+      "wasm": [
+        "economy_auto_accept_blocked"
+      ]
+    },
+    {
+      "canonical": "economy_check_policy_lock",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "py_economy_check_policy_lock"
+      ],
+      "uniffi": [
+        "economy_check_policy_lock"
+      ],
+      "napi": [
+        "economy_check_policy_lock"
+      ],
+      "wasm": [
+        "economy_check_policy_lock"
+      ]
+    },
+    {
+      "canonical": "economy_validate_policy_change",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "py_economy_validate_policy_change"
+      ],
+      "uniffi": [
+        "economy_validate_policy_change"
+      ],
+      "napi": [
+        "economy_validate_policy_change"
+      ],
+      "wasm": [
+        "economy_validate_policy_change"
+      ]
+    },
+    {
+      "canonical": "economy_evaluate_formula",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "py_economy_evaluate_formula"
+      ],
+      "uniffi": [
+        "economy_evaluate_formula"
+      ],
+      "napi": [
+        "economy_evaluate_formula"
+      ],
+      "wasm": [
+        "economy_evaluate_formula"
+      ]
+    },
+    {
+      "canonical": "economy_budget_remaining",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "py_economy_budget_remaining"
+      ],
+      "uniffi": [
+        "economy_budget_remaining"
+      ],
+      "napi": [
+        "economy_budget_remaining"
+      ],
+      "wasm": [
+        "economy_budget_remaining"
+      ]
+    },
+    {
+      "canonical": "economy_budget_grant",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "py_economy_budget_grant"
+      ],
+      "uniffi": [
+        "economy_budget_grant"
+      ],
+      "napi": [
+        "economy_budget_grant"
+      ],
+      "wasm": [
+        "economy_budget_grant"
+      ]
+    },
+    {
+      "canonical": "economy_budget_record_spend",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "py_economy_budget_record_spend"
+      ],
+      "uniffi": [
+        "economy_budget_record_spend"
+      ],
+      "napi": [
+        "economy_budget_record_spend"
+      ],
+      "wasm": [
+        "economy_budget_record_spend"
+      ]
+    },
+    {
+      "canonical": "economy_antispam_record",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "py_economy_antispam_record"
+      ],
+      "uniffi": [
+        "economy_antispam_record"
+      ],
+      "napi": [
+        "economy_antispam_record"
+      ],
+      "wasm": [
+        "economy_antispam_record"
+      ]
+    },
+    {
+      "canonical": "economy_antispam_velocity",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "py_economy_antispam_velocity"
+      ],
+      "uniffi": [
+        "economy_antispam_velocity"
+      ],
+      "napi": [
+        "economy_antispam_velocity"
+      ],
+      "wasm": [
+        "economy_antispam_velocity"
+      ]
+    },
+    {
+      "canonical": "economy_antispam_escalated_cost",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "py_economy_antispam_escalated_cost"
+      ],
+      "uniffi": [
+        "economy_antispam_escalated_cost"
+      ],
+      "napi": [
+        "economy_antispam_escalated_cost"
+      ],
+      "wasm": [
+        "economy_antispam_escalated_cost"
+      ]
+    },
+    {
+      "canonical": "media_initiate_session",
+      "category": "media",
+      "wasm_required": false,
+      "pyo3": [
+        "py_media_initiate_session"
+      ],
+      "uniffi": [
+        "media_initiate_session"
+      ],
+      "napi": [
+        "media_initiate_session"
+      ],
+      "wasm": [
+        "media_initiate_session"
+      ]
+    },
+    {
+      "canonical": "media_activate_session",
+      "category": "media",
+      "wasm_required": false,
+      "pyo3": [
+        "py_media_activate_session"
+      ],
+      "uniffi": [
+        "media_activate_session"
+      ],
+      "napi": [
+        "media_activate_session"
+      ],
+      "wasm": [
+        "media_activate_session"
+      ]
+    },
+    {
+      "canonical": "media_join_session",
+      "category": "media",
+      "wasm_required": false,
+      "pyo3": [
+        "py_media_join_session"
+      ],
+      "uniffi": [
+        "media_join_session"
+      ],
+      "napi": [
+        "media_join_session"
+      ],
+      "wasm": [
+        "media_join_session"
+      ]
+    },
+    {
+      "canonical": "media_end_session",
+      "category": "media",
+      "wasm_required": false,
+      "pyo3": [
+        "py_media_end_session"
+      ],
+      "uniffi": [
+        "media_end_session"
+      ],
+      "napi": [
+        "media_end_session"
+      ],
+      "wasm": [
+        "media_end_session"
+      ]
+    },
+    {
+      "canonical": "media_create_offer",
+      "category": "media",
+      "wasm_required": false,
+      "pyo3": [
+        "py_media_create_offer"
+      ],
+      "uniffi": [
+        "media_create_offer"
+      ],
+      "napi": [
+        "media_create_offer"
+      ],
+      "wasm": [
+        "media_create_offer"
+      ]
+    },
+    {
+      "canonical": "media_create_answer",
+      "category": "media",
+      "wasm_required": false,
+      "pyo3": [
+        "py_media_create_answer"
+      ],
+      "uniffi": [
+        "media_create_answer"
+      ],
+      "napi": [
+        "media_create_answer"
+      ],
+      "wasm": [
+        "media_create_answer"
+      ]
+    },
+    {
+      "canonical": "media_create_ice_candidate",
+      "category": "media",
+      "wasm_required": false,
+      "pyo3": [
+        "py_media_create_ice_candidate"
+      ],
+      "uniffi": [
+        "media_create_ice_candidate"
+      ],
+      "napi": [
+        "media_create_ice_candidate"
+      ],
+      "wasm": [
+        "media_create_ice_candidate"
+      ]
+    },
+    {
+      "canonical": "media_create_session_end",
+      "category": "media",
+      "wasm_required": false,
+      "pyo3": [
+        "py_media_create_session_end"
+      ],
+      "uniffi": [
+        "media_create_session_end"
+      ],
+      "napi": [
+        "media_create_session_end"
+      ],
+      "wasm": [
+        "media_create_session_end"
+      ]
+    },
+    {
+      "canonical": "media_send_signaling",
+      "category": "media",
+      "wasm_required": false,
+      "pyo3": [
+        "py_media_send_signaling"
+      ],
+      "uniffi": [
+        "media_send_signaling"
+      ],
+      "napi": [
+        "media_send_signaling"
+      ],
+      "wasm": [
+        "media_send_signaling"
+      ]
+    },
+    {
+      "canonical": "media_verify_sender_attribution",
+      "category": "media",
+      "wasm_required": false,
+      "pyo3": [
+        "py_media_verify_sender_attribution"
+      ],
+      "uniffi": [
+        "media_verify_sender_attribution"
+      ],
+      "napi": [
+        "media_verify_sender_attribution"
+      ],
+      "wasm": [
+        "media_verify_sender_attribution"
+      ]
+    },
+    {
+      "canonical": "media_check_capability",
+      "category": "media",
+      "wasm_required": false,
+      "pyo3": [
+        "py_media_check_capability"
+      ],
+      "uniffi": [
+        "media_check_capability"
+      ],
+      "napi": [
+        "media_check_capability"
+      ],
+      "wasm": [
+        "media_check_capability"
+      ]
+    },
+    {
+      "canonical": "petname_set",
+      "category": "petname",
+      "wasm_required": true,
+      "pyo3": [
+        "py_petname_set"
+      ],
+      "uniffi": [
+        "petname_set"
+      ],
+      "napi": [
+        "petname_set"
+      ],
+      "wasm": [
+        "petname_set"
+      ]
+    },
+    {
+      "canonical": "petname_remove",
+      "category": "petname",
+      "wasm_required": true,
+      "pyo3": [
+        "py_petname_remove"
+      ],
+      "uniffi": [
+        "petname_remove"
+      ],
+      "napi": [
+        "petname_remove"
+      ],
+      "wasm": [
+        "petname_remove"
+      ]
+    },
+    {
+      "canonical": "petname_set_context",
+      "category": "petname",
+      "wasm_required": true,
+      "pyo3": [
+        "py_petname_set_context"
+      ],
+      "uniffi": [
+        "petname_set_context"
+      ],
+      "napi": [
+        "petname_set_context"
+      ],
+      "wasm": [
+        "petname_set_context"
+      ]
+    },
+    {
+      "canonical": "petname_remove_context",
+      "category": "petname",
+      "wasm_required": true,
+      "pyo3": [
+        "py_petname_remove_context"
+      ],
+      "uniffi": [
+        "petname_remove_context"
+      ],
+      "napi": [
+        "petname_remove_context"
+      ],
+      "wasm": [
+        "petname_remove_context"
+      ]
+    },
+    {
+      "canonical": "petname_resolve_did",
+      "category": "petname",
+      "wasm_required": true,
+      "pyo3": [
+        "py_petname_resolve_did"
+      ],
+      "uniffi": [
+        "petname_resolve_did"
+      ],
+      "napi": [
+        "petname_resolve_did"
+      ],
+      "wasm": [
+        "petname_resolve_did"
+      ]
+    },
+    {
+      "canonical": "petname_resolve_context",
+      "category": "petname",
+      "wasm_required": true,
+      "pyo3": [
+        "py_petname_resolve_context"
+      ],
+      "uniffi": [
+        "petname_resolve_context"
+      ],
+      "napi": [
+        "petname_resolve_context"
+      ],
+      "wasm": [
+        "petname_resolve_context"
+      ]
+    },
+    {
+      "canonical": "petname_get_for_did",
+      "category": "petname",
+      "wasm_required": true,
+      "pyo3": [
+        "py_petname_get_for_did"
+      ],
+      "uniffi": [
+        "petname_get_for_did"
+      ],
+      "napi": [
+        "petname_get_for_did"
+      ],
+      "wasm": [
+        "petname_get_for_did"
+      ]
+    },
+    {
+      "canonical": "petname_get_for_context",
+      "category": "petname",
+      "wasm_required": true,
+      "pyo3": [
+        "py_petname_get_for_context"
+      ],
+      "uniffi": [
+        "petname_get_for_context"
+      ],
+      "napi": [
+        "petname_get_for_context"
+      ],
+      "wasm": [
+        "petname_get_for_context"
+      ]
+    },
+    {
+      "canonical": "handle_register",
+      "category": "handle",
+      "wasm_required": true,
+      "pyo3": [
+        "py_handle_register"
+      ],
+      "uniffi": [
+        "handle_register"
+      ],
+      "napi": [
+        "handle_register"
+      ],
+      "wasm": [
+        "handle_register"
+      ]
+    },
+    {
+      "canonical": "handle_lookup",
+      "category": "handle",
+      "wasm_required": true,
+      "pyo3": [
+        "py_handle_lookup"
+      ],
+      "uniffi": [
+        "handle_lookup"
+      ],
+      "napi": [
+        "handle_lookup"
+      ],
+      "wasm": [
+        "handle_lookup"
+      ]
+    },
+    {
+      "canonical": "handle_deregister",
+      "category": "handle",
+      "wasm_required": true,
+      "pyo3": [
+        "py_handle_deregister"
+      ],
+      "uniffi": [
+        "handle_deregister"
+      ],
+      "napi": [
+        "handle_deregister"
+      ],
+      "wasm": [
+        "handle_deregister"
+      ]
+    },
+    {
+      "canonical": "scope_register",
+      "category": "scope",
+      "wasm_required": true,
+      "pyo3": [
+        "py_scope_register"
+      ],
+      "uniffi": [
+        "scope_register"
+      ],
+      "napi": [
+        "scope_register"
+      ],
+      "wasm": [
+        "scope_register"
+      ]
+    },
+    {
+      "canonical": "scope_lookup",
+      "category": "scope",
+      "wasm_required": true,
+      "pyo3": [
+        "py_scope_lookup"
+      ],
+      "uniffi": [
+        "scope_lookup"
+      ],
+      "napi": [
+        "scope_lookup"
+      ],
+      "wasm": [
+        "scope_lookup"
+      ]
+    },
+    {
+      "canonical": "scope_deregister",
+      "category": "scope",
+      "wasm_required": true,
+      "pyo3": [
+        "py_scope_deregister"
+      ],
+      "uniffi": [
+        "scope_deregister"
+      ],
+      "napi": [
+        "scope_deregister"
+      ],
+      "wasm": [
+        "scope_deregister"
+      ]
+    },
+    {
+      "canonical": "context_create_governance_checkpoint",
+      "category": "governance",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_create_governance_checkpoint",
+        "py_create_governance_checkpoint"
+      ],
+      "uniffi": [
+        "context_create_governance_checkpoint",
+        "create_governance_checkpoint"
+      ],
+      "napi": [
+        "context_create_governance_checkpoint"
+      ],
+      "wasm": [
+        "context_create_governance_checkpoint"
+      ]
+    },
+    {
+      "canonical": "context_add_checkpoint_cosignature",
+      "category": "governance",
+      "wasm_required": true,
+      "pyo3": [
+        "py_context_add_checkpoint_cosignature",
+        "py_add_checkpoint_cosignature"
+      ],
+      "uniffi": [
+        "context_add_checkpoint_cosignature",
+        "add_checkpoint_cosignature"
+      ],
+      "napi": [
+        "context_add_checkpoint_cosignature"
+      ],
+      "wasm": [
+        "context_add_checkpoint_cosignature"
+      ]
+    }
+  ],
+  "exemptions": {
+    "_comment": "Per-bridge exemptions for operations that are intentionally not implemented in that bridge. This is a MIRROR of the language-level exemptions in .docs/standards/sdk-capability-matrix.json, keyed by bridge name (pyo3 / uniffi / napi / wasm) rather than SDK language. The symmetry script consults this map in addition to the wasm_required flag before emitting a finding.",
+    "pyo3": [],
+    "uniffi": [
+      {
+        "canonical": "mcp_server",
+        "reason": "UniFFI targets mobile; MCP is PyO3/NAPI only"
+      },
+      {
+        "canonical": "mcp_client",
+        "reason": "UniFFI targets mobile; MCP is PyO3/NAPI only"
+      }
+    ],
+    "napi": [
+      {
+        "canonical": "identity_migrate",
+        "reason": "not yet exported in NAPI bridge (known gap)"
+      }
+    ],
+    "wasm": []
+  }
+}

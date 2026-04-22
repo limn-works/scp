@@ -49,6 +49,8 @@ The class is named after the protocol, not after internal plumbing. This matches
 
 Every shared helper in `scp-ffi-common` operates on `&dyn BridgeInstanceCore`. Per-bridge callers pass their concrete instance. The four `Box<dyn Any>` slots introduced in Phase 4a are removed. Type safety is compile-time; there are no runtime downcasts. This satisfies the CLAUDE.md rule "enforce mechanically — type system over documentation."
 
+**Approved exemption — shared-variant types for storage-backed repositories.** The rule "per-bridge concrete structs, no shared type-erased slots" has one deliberate carve-out: types that enumerate a **closed, protocol-level** set of storage backends. `ProtocolRepoVariant { InMemory(…), Sqlite(…) }` is the canonical case. It is not bridge plumbing — the variants are dictated by `StorageConfig` (itself protocol-shaped: in-memory vs. persistent SQLCipher), the `Storage` trait is `scp_platform`-level, and every non-WASM bridge dispatches identically over the same arms. Duplicating the enum into `NapiProtocolRepoVariant` + `UniffiProtocolRepoVariant` + `PyProtocolRepoVariant` produces three identical match statements with no extra type safety — each bridge already owns its own concrete instance type, so the enum lives on a per-bridge field without ambiguity. The exemption is **narrow**: it applies only to closed-set enums whose variants trace to a protocol-level configuration type (today: `StorageConfig`). It does not re-admit `Box<dyn Any>`, runtime downcasts, or open-ended trait objects — those remain rejected per Phase 4a. `ProtocolRepoVariant` has been promoted into `scp-ffi-common` so the three bridges share the single definition; the carve-out is documented here so future maintainers do not re-litigate the decision.
+
 ### 3. Default-instance façade is DELETED in PR 4 (no deprecation window)
 
 **Re-scoped 2026-04-19 per builder tenet "no deferral" and pre-release posture (no external consumers).** The earlier draft of this ADR called for `DEFAULT_BRIDGE_INSTANCE` and every free-function façade to remain in place for a two-release-cycle sunset window. That plan is abandoned.
@@ -315,3 +317,25 @@ PR 3 closes the following issues:
 - **#1260** — UniFFI `ContextManager` persistence threading.
 - **#1678** — Async `resume` + multi-relay reconnect.
 - **#1342** — UniFFI real crypto; `FfiBridgeCrypto` deleted.
+
+### Non-SCP handle `instanceId` getters — known low-risk enumeration surface
+
+Every NAPI handle type (`NapiContextHandle`, `NapiIdentity`, `NapiUcanToken`, `NapiMcpServerHandle`, `NapiMcpClientHandle`, `NapiTestingHandle`, …) exposes a JS-visible `instanceId` getter via `#[napi(getter, js_name = "instanceId")]`. The getter returns the u64 as a JS string (u64 exceeds `Number.MAX_SAFE_INTEGER`) so the handle-affinity macro on the Rust side can read the value via `handle.instance_id()` — a separate inherent method used by `napi_check_handle!`.
+
+The getter is **redundant with the Rust-side method for affinity enforcement** — the macro calls the inherent `instance_id()` method on the Rust type, not the JS property. The getter exists so JS-side test harnesses and diagnostic code can correlate handles to the `Scp` instance that minted them.
+
+A defence-in-depth hardening would either:
+- mark the getters `#[napi(getter, skip)]` so the JS property is invisible at runtime (the Rust-side affinity check still sees the u64), or
+- gate the getter behind an authorisation check that verifies the caller holds the `Scp` instance that minted the handle.
+
+Both impose friction on legitimate tooling (e.g. `handle.instanceId === scp.instanceId` assertions in SDK tests) without reducing the risk surface meaningfully: an attacker who can execute JS in-process already has FFI reach, so enumerating `instanceId` across handles yields no capability they do not already have.
+
+Documented here so future security reviewers don't re-litigate: the getter stays. Any migration must coordinate with the SDK test harnesses and the handle-affinity macro. PR #1690 retro LOW.
+
+### `check-no-bridge-globals.sh` widened to function-local sharing primitives (PR #1699 review follow-up)
+
+The original ratchet walker ignored any `static` declaration at brace depth > 0 — the rationale was that function-local statics are "naturally scoped." A PR #1699 review correctly rejected that framing for the sharing primitives: a `static NETWORK: OnceLock<Mutex<…>>` inside a helper fn has the same `'static` lifetime, same single-init semantics, and same cross-invocation process-global behavior as a module-level one. Function scope changes only the namespace, not the sharing semantics.
+
+The walker now scans function-local `static` declarations too, but only when their type starts with or contains one of the process-global sharing primitives — `OnceLock<…>`, `LazyLock<…>`, `Mutex<…>`, `RwLock<…>`, `parking_lot::Mutex<…>`, or `parking_lot::RwLock<…>`. These get a `COUNT_FN_LOCAL` tag (still counted against the same per-bridge ratchet total as module-level globals) or `ALLOW` if their name is on the allowlist. Function-local statics of naturally function-scoped types — atomics (`AtomicU64`, `AtomicBool`, …), `Cell`, `RefCell`, `std::sync::Once` init guards, thread-local macros — remain ignored.
+
+The `NETWORK` slot in `crates/scp-ffi/napi/src/testing.rs` — a function-local `OnceLock<Mutex<Option<FullStackNetwork>>>` used by the cross-test-file full-stack harness — is allowlisted by name because the `testing` module is feature-gated behind `allow_in_memory_custody` and is never compiled into production builds. The doc-comment on the declaration carries the full rationale. Any future function-local sharing static in a bridge must either move onto the per-bridge instance struct or extend the allowlist with the same kind of justification; bumping the ratchet count alone is not a valid fix.

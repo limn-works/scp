@@ -263,6 +263,17 @@ pub fn scp_version() -> String {
 mod tests {
     use super::*;
 
+    // Force-link the weak napi stubs from the scp-ffi-napi-test-stubs
+    // dev-dependency. Without this reference, cargo would strip the
+    // (otherwise-unused) rlib from the test-binary link graph and the
+    // `cargo:rustc-link-lib=static=napi_test_stubs` directive emitted
+    // by its build.rs would never take effect — the test binary would
+    // fail to link with undefined `napi_*` symbols. The cdylib never
+    // sees this reference (it's inside `#[cfg(test)]`), so at runtime
+    // Node's real napi_* symbols bind via dynamic linking as normal.
+    #[allow(dead_code)]
+    const _FORCE_NAPI_STUB_LINK: u8 = scp_ffi_napi_test_stubs::FORCE_LINK;
+
     #[test]
     fn scp_version_is_non_empty() {
         let v = scp_version();

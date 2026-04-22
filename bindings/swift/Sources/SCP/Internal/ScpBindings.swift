@@ -928,6 +928,17 @@ public protocol IdentityProtocol: AnyObject, Sendable {
      */
     func rotateKey() async throws  -> Identity
     
+    /**
+     * Returns the hex-encoded Ed25519 verifying-key bytes for the
+     * identity key (VM `#0`, the DID-deriving key), or `null` if this
+     * handle was loaded without live key material.
+     *
+     * Under a deterministic `seed`, this value is byte-identical across
+     * every bridge (ADR-046). See the `verifying_key_hex` field docs
+     * for why `#0` rather than `#active`.
+     */
+    func verifyingKey()  -> String?
+    
 }
 /**
  * Opaque handle to an SCP identity.
@@ -1212,6 +1223,22 @@ open func rotateKey()async throws  -> Identity  {
         )
 }
     
+    /**
+     * Returns the hex-encoded Ed25519 verifying-key bytes for the
+     * identity key (VM `#0`, the DID-deriving key), or `null` if this
+     * handle was loaded without live key material.
+     *
+     * Under a deterministic `seed`, this value is byte-identical across
+     * every bridge (ADR-046). See the `verifying_key_hex` field docs
+     * for why `#0` rather than `#active`.
+     */
+open func verifyingKey() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_identity_verifying_key(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 
 }
 
@@ -1273,7 +1300,8 @@ public func FfiConverterTypeIdentity_lower(_ value: Identity) -> UnsafeMutableRa
 /**
  * Opaque handle to a running SCP application node.
  *
- * Created by [`node_start_in_memory_on`] or [`node_start_local_on`]. The
+ * Created by [`Scp::node_start_in_memory`](crate::scp::Scp::node_start_in_memory)
+ * or [`Scp::node_start_local`](crate::scp::Scp::node_start_local). The
  * node includes a running relay server, a generated DID identity, and
  * (optionally) persistent storage. The HTTP server is **not** started
  * automatically -- only the relay is bound.
@@ -1372,7 +1400,8 @@ public protocol NodeHandleProtocol: AnyObject, Sendable {
 /**
  * Opaque handle to a running SCP application node.
  *
- * Created by [`node_start_in_memory_on`] or [`node_start_local_on`]. The
+ * Created by [`Scp::node_start_in_memory`](crate::scp::Scp::node_start_in_memory)
+ * or [`Scp::node_start_local`](crate::scp::Scp::node_start_local). The
  * node includes a running relay server, a generated DID identity, and
  * (optionally) persistent storage. The HTTP server is **not** started
  * automatically -- only the relay is bound.
@@ -1698,7 +1727,7 @@ public func FfiConverterTypeNodeHandle_lower(_ value: NodeHandle) -> UnsafeMutab
 /**
  * Opaque handle to a running SCP relay server.
  *
- * Created by [`relay_start_in_memory`] or [`relay_start_local`]. The relay
+ * Created by `relay_start_in_memory` or `relay_start_local`. The relay
  * accepts WebSocket connections at [`relay_url`](Self::relay_url)
  * and can be gracefully stopped via [`shutdown`](Self::shutdown).
  */
@@ -1738,7 +1767,7 @@ public protocol RelayHandleProtocol: AnyObject, Sendable {
 /**
  * Opaque handle to a running SCP relay server.
  *
- * Created by [`relay_start_in_memory`] or [`relay_start_local`]. The relay
+ * Created by `relay_start_in_memory` or `relay_start_local`. The relay
  * accepts WebSocket connections at [`relay_url`](Self::relay_url)
  * and can be gracefully stopped via [`shutdown`](Self::shutdown).
  */
@@ -1939,21 +1968,21 @@ public func FfiConverterTypeRelayHandle_lower(_ value: RelayHandle) -> UnsafeMut
 public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
-     * Per-instance equivalent of the free-function [`access_key_generate`].
+     * Per-instance equivalent of the free-function `access_key_generate`.
      *
      * Routes through `&*self.inner`.
      */
     func accessKeyGenerate(contextId: String, memberDid: String, callerDid: String) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`access_key_restore`].
+     * Per-instance equivalent of the free-function `access_key_restore`.
      *
      * Routes through `&*self.inner`.
      */
     func accessKeyRestore(contextId: String, memberDid: String, callerDid: String) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`access_key_revoke`].
+     * Per-instance equivalent of the free-function `access_key_revoke`.
      *
      * Routes through `&*self.inner`.
      */
@@ -1961,7 +1990,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`add_checkpoint_cosignature`].
+     * `add_checkpoint_cosignature`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -1974,7 +2003,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func addressResolve(ownerDid: String, address: String, knownContextsJson: String?) throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`aggregate_trust_input`].
+     * Per-instance equivalent of the free-function `aggregate_trust_input`.
      *
      * Routes through `&*self.inner` — trust data is populated against
      * THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`),
@@ -1985,7 +2014,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`apply_pending_ceiling_modification`].
+     * `apply_pending_ceiling_modification`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -1993,7 +2022,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func applyPendingCeilingModification(handle: ContextHandle, currentTimestamp: UInt64) async throws  -> Bool
     
     /**
-     * Per-instance equivalent of the free-function [`bridge_create_shadow`].
+     * Per-instance equivalent of the free-function `bridge_create_shadow`.
      *
      * Mutates this instance's per-context bridge state. Rejects any
      * cross-instance caller (the method takes `&self` — the `bi` threaded
@@ -2010,7 +2039,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadowStatus: String) throws  -> UInt8
     
     /**
-     * Per-instance equivalent of the free-function [`broadcast_admission`].
+     * Per-instance equivalent of the free-function `broadcast_admission`.
      *
      * Routes through `&*self.inner`. Returns `None` when the handle's
      * `instance_id` does not match this `SCP`'s.
@@ -2019,7 +2048,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`broadcast_block_subscriber`].
+     * `broadcast_block_subscriber`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2028,7 +2057,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`broadcast_handle_key_request`].
+     * `broadcast_handle_key_request`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2037,7 +2066,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`broadcast_is_subscriber`].
+     * `broadcast_is_subscriber`.
      *
      * Routes through `&*self.inner`. Returns `false` when the handle's
      * `instance_id` does not match this `SCP`'s.
@@ -2045,7 +2074,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func broadcastIsSubscriber(handle: ContextHandle, did: String) async  -> Bool
     
     /**
-     * Per-instance equivalent of the free-function [`broadcast_publish`].
+     * Per-instance equivalent of the free-function `broadcast_publish`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -2054,7 +2083,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`broadcast_publish_asset`].
+     * `broadcast_publish_asset`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -2063,7 +2092,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`broadcast_publish_assets`].
+     * `broadcast_publish_assets`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -2071,7 +2100,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func broadcastPublishAssets(handle: ContextHandle, identity: Identity, assets: [AssetEntry], deployId: String?) async throws  -> BatchPublishResult
     
     /**
-     * Per-instance equivalent of the free-function [`broadcast_subscribe`].
+     * Per-instance equivalent of the free-function `broadcast_subscribe`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2080,7 +2109,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`broadcast_subscriber_count`].
+     * `broadcast_subscriber_count`.
      *
      * Routes through `&*self.inner`. Returns `None` when the handle's
      * `instance_id` does not match this `SCP`'s.
@@ -2089,7 +2118,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`broadcast_unblock_subscriber`].
+     * `broadcast_unblock_subscriber`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2097,7 +2126,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func broadcastUnblockSubscriber(handle: ContextHandle, subscriberDid: String, unblockerDid: String) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`broadcast_unsubscribe`].
+     * Per-instance equivalent of the free-function `broadcast_unsubscribe`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2105,7 +2134,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rotateKeys: Bool) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`configure_relay_transport`].
+     * Per-instance equivalent of the free-function `configure_relay_transport`.
      *
      * Routes through `&*self.inner`. Installs a real `MlsCryptoProvider`
      * and `RelayTransportProvider` on this instance's `ContextManager`.
@@ -2113,7 +2142,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func configureRelayTransport(relayUrl: String, localDid: String) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`context_close`].
+     * Per-instance equivalent of the free-function `context_close`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -2125,7 +2154,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func contextClose(handle: ContextHandle, identity: Identity) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`context_create`].
+     * Per-instance equivalent of the free-function `context_create`.
      *
      * Creates a new SCP context under this instance. Routes through
      * `&*self.inner` instead of the process-wide
@@ -2134,14 +2163,14 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * and the returned handle's `instance_id` stamping are all scoped to
      * this `SCP`. The context handle is rejected on any other `SCP`.
      *
-     * See the documentation on the free [`context_create`] function for
+     * See the documentation on the free `context_create` function for
      * argument semantics and MLS group / event-log initialization
      * details.
      */
     func contextCreate(identity: Identity, params: ContextParams) async throws  -> ContextHandle
     
     /**
-     * Per-instance equivalent of the free-function [`context_drain_events`].
+     * Per-instance equivalent of the free-function `context_drain_events`.
      *
      * Routes through `&*self.inner`. Returns an empty `Vec` when the
      * handle's `instance_id` does not match this `SCP`'s.
@@ -2155,7 +2184,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`context_handle_ttl_expiry`].
+     * `context_handle_ttl_expiry`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2168,7 +2197,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func contextImport(data: Data) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`context_is_member`].
+     * Per-instance equivalent of the free-function `context_is_member`.
      *
      * Routes through `&*self.inner`. Returns `false` when the handle's
      * `instance_id` does not match this `SCP`'s.
@@ -2176,18 +2205,18 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func contextIsMember(handle: ContextHandle, did: String) async  -> Bool
     
     /**
-     * Per-instance equivalent of the free-function [`context_join`].
+     * Per-instance equivalent of the free-function `context_join`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
      * `Identity` whose `instance_id` does not match this `SCP`'s.
      *
-     * See the documentation on the free [`context_join`] function for
+     * See the documentation on the free `context_join` function for
      * argument semantics and the spending-UCAN AND-composition path.
      */
     func contextJoin(handle: ContextHandle, identity: Identity, spendingUcanJwt: String?) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`context_leave`].
+     * Per-instance equivalent of the free-function `context_leave`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -2195,7 +2224,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func contextLeave(handle: ContextHandle, identity: Identity) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`context_member_count`].
+     * Per-instance equivalent of the free-function `context_member_count`.
      *
      * Routes through `&*self.inner`. Returns `None` when the handle's
      * `instance_id` does not match this `SCP`'s.
@@ -2203,7 +2232,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func contextMemberCount(handle: ContextHandle) async  -> UInt64?
     
     /**
-     * Per-instance equivalent of the free-function [`context_member_dids`].
+     * Per-instance equivalent of the free-function `context_member_dids`.
      *
      * Routes through `&*self.inner`. Returns an empty `Vec` when the
      * handle's `instance_id` does not match this `SCP`'s.
@@ -2211,7 +2240,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func contextMemberDids(handle: ContextHandle) async  -> [String]
     
     /**
-     * Per-instance equivalent of the free-function [`context_member_role`].
+     * Per-instance equivalent of the free-function `context_member_role`.
      *
      * Routes through `&*self.inner`. Returns `None` when the handle's
      * `instance_id` does not match this `SCP`'s.
@@ -2220,7 +2249,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`context_propose_ttl_extension`].
+     * `context_propose_ttl_extension`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2229,7 +2258,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`context_reset_ttl_timer`].
+     * `context_reset_ttl_timer`.
      *
      * Routes through `&*self.inner`. Silently returns when the handle's
      * `instance_id` does not match this `SCP`'s (matches the free-function
@@ -2238,7 +2267,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64) async 
     
     /**
-     * Per-instance equivalent of the free-function [`context_send`].
+     * Per-instance equivalent of the free-function `context_send`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -2246,7 +2275,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func contextSend(handle: ContextHandle, identity: Identity, payload: Data, spendingUcanJwt: String?) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`context_subscribe`].
+     * Per-instance equivalent of the free-function `context_subscribe`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2261,7 +2290,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`create_governance_checkpoint`].
+     * `create_governance_checkpoint`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2304,7 +2333,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func evaluateInvitation(paramsJson: String, inviterDid: String, identityDid: String, policyJson: String?, spendingJson: String?, trustedDids: [String]) throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`event_log_checkpoint`].
+     * Per-instance equivalent of the free-function `event_log_checkpoint`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -2312,7 +2341,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func eventLogCheckpoint(handle: ContextHandle, identity: Identity, epoch: UInt64) async throws  -> Checkpoint
     
     /**
-     * Per-instance equivalent of the free-function [`event_log_query`].
+     * Per-instance equivalent of the free-function `event_log_query`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2320,7 +2349,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func eventLogQuery(handle: ContextHandle, filterJson: String?) async throws  -> [Event]
     
     /**
-     * Per-instance equivalent of the free-function [`event_log_verify`].
+     * Per-instance equivalent of the free-function `event_log_verify`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2328,7 +2357,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func eventLogVerify(handle: ContextHandle, claimJson: String) async throws  -> Proof
     
     /**
-     * Per-instance equivalent of the free-function [`finalize_close`].
+     * Per-instance equivalent of the free-function `finalize_close`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2341,7 +2370,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func getEconomicPolicy(handle: ContextHandle) throws  -> String?
     
     /**
-     * Per-instance equivalent of the free-function [`governance_approve`].
+     * Per-instance equivalent of the free-function `governance_approve`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2349,7 +2378,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func governanceApprove(handle: ContextHandle, voterDid: String, proposalIdHex: String) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`governance_execute`].
+     * Per-instance equivalent of the free-function `governance_execute`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2357,7 +2386,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func governanceExecute(handle: ContextHandle, proposalJson: String) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`governance_get_proposal`].
+     * Per-instance equivalent of the free-function `governance_get_proposal`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2365,7 +2394,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func governanceGetProposal(handle: ContextHandle, proposalIdHex: String) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`governance_list_proposals`].
+     * Per-instance equivalent of the free-function `governance_list_proposals`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2373,7 +2402,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func governanceListProposals(handle: ContextHandle) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`governance_propose`].
+     * Per-instance equivalent of the free-function `governance_propose`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2381,7 +2410,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func governancePropose(handle: ContextHandle, proposerDid: String, actionJson: String) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`governance_reject`].
+     * Per-instance equivalent of the free-function `governance_reject`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2389,7 +2418,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func governanceReject(handle: ContextHandle, voterDid: String, proposalIdHex: String) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`governance_withdraw`].
+     * Per-instance equivalent of the free-function `governance_withdraw`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2413,7 +2442,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`identity_attest_device`].
+     * `identity_attest_device`.
      *
      * Rejects any `Identity` whose `instance_id` does not match this
      * `SCP`'s — cross-instance handle misuse surfaces as
@@ -2422,7 +2451,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func identityAttestDevice(identity: Identity) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`identity_create`].
+     * Per-instance equivalent of the free-function `identity_create`.
      *
      * Creates a new SCP identity under this instance. Routes through
      * `&*self.inner` instead of the process-wide
@@ -2430,15 +2459,18 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * initialization, handle `instance_id` stamping) is scoped to this
      * `SCP`.
      *
-     * See the documentation on the free [`identity_create`] function for
-     * argument semantics and the `"in_memory"` / `"platform"` custody
-     * distinction (ADR-006, #88).
+     * When `seed` is supplied (32 bytes), the in-memory custody is backed
+     * by a deterministic RNG so subsequent `generate_keypair` calls produce
+     * byte-identical Ed25519 keys across bridges — the basis of the
+     * cross-bridge parity test (ADR-046). `seed` is only valid for
+     * `"in_memory"` custody; other custody types reject it with
+     * `SCP-VALID-7007`.
      */
-    func identityCreate(custody: String) async throws  -> Identity
+    func identityCreate(custody: String, seed: Data?) async throws  -> Identity
     
     /**
      * Per-instance equivalent of the free-function
-     * [`identity_create_link_attestation`].
+     * `identity_create_link_attestation`.
      *
      * Signs the link attestation with the identity's active signing key
      * and stores the entry in the per-instance link-attestation and
@@ -2460,7 +2492,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`identity_create_with_custody`].
+     * `identity_create_with_custody`.
      *
      * Creates a new SCP identity under this instance using an injected
      * [`KeyCustodyProvider`](crate::KeyCustodyProvider). Routes through
@@ -2487,7 +2519,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`identity_link_attestations`].
+     * `identity_link_attestations`.
      *
      * Reads the link-attestation registry on `&*self.inner`.
      *
@@ -2496,7 +2528,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func identityLinkAttestations(did: String) throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`identity_load`].
+     * Per-instance equivalent of the free-function `identity_load`.
      *
      * Loads an external identity handle under this instance. Routes through
      * `&*self.inner` — the returned handle's `instance_id` is stamped
@@ -2515,7 +2547,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`identity_remove_link_attestation`].
+     * `identity_remove_link_attestation`.
      *
      * Mutates the link-attestation registry on `&*self.inner`.
      *
@@ -2524,7 +2556,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func identityRemoveLinkAttestation(did: String, attestationId: String)  -> Bool
     
     /**
-     * Per-instance equivalent of the free-function [`identity_resolve`].
+     * Per-instance equivalent of the free-function `identity_resolve`.
      *
      * Resolves a DID to its document. DID resolution itself doesn't touch
      * the instance — the method variant exists for API symmetry with the
@@ -2534,7 +2566,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`identity_verify_device_attestation`].
+     * `identity_verify_device_attestation`.
      *
      * Verification itself is a pure function — taking `&self` keeps the
      * method surface uniform.
@@ -2543,7 +2575,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`identity_verify_link_attestation`].
+     * `identity_verify_link_attestation`.
      *
      * Signature verification is a pure function — taking `&self` keeps
      * the method surface uniform.
@@ -2558,7 +2590,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func instanceId()  -> UInt64
     
     /**
-     * Per-instance equivalent of the free-function [`is_local_did`].
+     * Per-instance equivalent of the free-function `is_local_did`.
      *
      * Routes through `&*self.inner`. Returns `false` if the DID fails
      * validation or the instance's `ContextManager` cannot be
@@ -2567,35 +2599,35 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func isLocalDid(did: String) async  -> Bool
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_client_connect_sse`].
+     * Per-instance equivalent of the free-function `mcp_client_connect_sse`.
      *
      * Routes through the module-level MCP client registry.
      */
     func mcpClientConnectSse(url: String) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_client_connect_stdio`].
+     * Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
      *
      * Routes through the module-level MCP client registry.
      */
     func mcpClientConnectStdio(command: [String]) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_client_disconnect`].
+     * Per-instance equivalent of the free-function `mcp_client_disconnect`.
      *
      * Routes through the module-level MCP client registry.
      */
     func mcpClientDisconnect(handle: String) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_client_invoke`].
+     * Per-instance equivalent of the free-function `mcp_client_invoke`.
      *
      * Routes through the module-level MCP client registry.
      */
     func mcpClientInvoke(handle: String, toolName: String, inputJson: String, contextId: String, invokerDid: String) async throws  -> McpInvokeResult
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_client_list_tools`].
+     * Per-instance equivalent of the free-function `mcp_client_list_tools`.
      *
      * Routes through the module-level MCP client registry.
      */
@@ -2632,7 +2664,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func mcpResetStdioAllowlist() throws 
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_server_create`].
+     * Per-instance equivalent of the free-function `mcp_server_create`.
      *
      * Routes through `&*self.inner`. The MCP server registry is
      * module-level (not per-instance) so the returned opaque handle
@@ -2641,7 +2673,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func mcpServerCreate(config: McpServerConfig) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_server_stop`].
+     * Per-instance equivalent of the free-function `mcp_server_stop`.
      *
      * Routes through the module-level MCP server registry (the registry
      * is not per-instance; the opaque handle string is globally unique).
@@ -2649,7 +2681,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func mcpServerStop(handle: String) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`migration_state`].
+     * Per-instance equivalent of the free-function `migration_state`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2722,7 +2754,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func provenanceAttach(sourceContextId: String, sourceType: String, memoryScopeStr: String, members: [String], targetContextId: String, actorDid: String, existingChainDepth: UInt8?) throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`register_local_did`].
+     * Per-instance equivalent of the free-function `register_local_did`.
      *
      * Routes through `&*self.inner`. Initializes this instance's
      * `ContextManager` if not yet attached (idempotent) and registers
@@ -2748,14 +2780,14 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func relayStartLocal(dataDir: String) async throws  -> RelayHandle
     
     /**
-     * Per-instance equivalent of the free-function [`restore_all_contexts`].
+     * Per-instance equivalent of the free-function `restore_all_contexts`.
      *
      * Routes through `&*self.inner`.
      */
     func restoreAllContexts() async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`restore_context`].
+     * Per-instance equivalent of the free-function `restore_context`.
      *
      * Routes through `&*self.inner`.
      */
@@ -2765,7 +2797,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Resumes a suspended bridge instance.
      *
      * Clears the suspended flag, then runs any per-bridge async work chained
-     * by the [`BridgeInstanceCore::resume`] override (transport reconnect
+     * by the `BridgeInstanceCore::resume` override (transport reconnect
      * from pending relay URLs, persisted-context restoration).
      *
      * `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin.
@@ -2797,8 +2829,13 @@ public protocol ScpProtocol: AnyObject, Sendable {
      *
      * Signs an SCPID challenge with the identity's requested key. Rejects
      * any `Identity` whose `instance_id` does not match this `Scp`'s.
+     *
+     * `signed_at_override` is a testing-only parameter for the ADR-046
+     * cross-bridge parity harness. Only accepted when scp-core is built
+     * with the `testing` feature; production builds reject any non-`None`
+     * value via `SCP-VALID-7007`.
      */
-    func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String) throws  -> String
+    func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String, signedAtOverride: UInt64?) throws  -> String
     
     /**
      * Per-instance equivalent of the free-function `scpid_verify`.
@@ -2868,7 +2905,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`tombstone_migrated_context`].
+     * `tombstone_migrated_context`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2876,7 +2913,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func tombstoneMigratedContext(handle: ContextHandle) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`tool_interface_accept`].
+     * Per-instance equivalent of the free-function `tool_interface_accept`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2884,7 +2921,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func toolInterfaceAccept(handle: ContextHandle, interfaceJson: String) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`tool_interface_expose`].
+     * Per-instance equivalent of the free-function `tool_interface_expose`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2892,7 +2929,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func toolInterfaceExpose(handle: ContextHandle, toolId: String, targetContextId: String, rateLimitJson: String?) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`tool_interface_revoke`].
+     * Per-instance equivalent of the free-function `tool_interface_revoke`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2900,7 +2937,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func toolInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`tool_invoke`].
+     * Per-instance equivalent of the free-function `tool_invoke`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -2909,7 +2946,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`tool_invoke_cross_context`].
+     * `tool_invoke_cross_context`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -2917,7 +2954,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`tool_register`].
+     * Per-instance equivalent of the free-function `tool_register`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2925,7 +2962,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func toolRegister(handle: ContextHandle, definition: ToolDefinition) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`tool_session_close`].
+     * Per-instance equivalent of the free-function `tool_session_close`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2933,7 +2970,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func toolSessionClose(handle: ContextHandle, sessionId: String) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`tool_session_create`].
+     * Per-instance equivalent of the free-function `tool_session_create`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2941,7 +2978,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func toolSessionCreate(handle: ContextHandle, toolId: String, sourceContextId: String, ttlSeconds: UInt64?) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`tool_session_invoke`].
+     * Per-instance equivalent of the free-function `tool_session_invoke`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -2949,7 +2986,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func toolSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?) async throws  -> String
     
     /**
-     * Per-instance equivalent of the free-function [`tool_verify`].
+     * Per-instance equivalent of the free-function `tool_verify`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -2957,7 +2994,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func toolVerify(handle: ContextHandle, toolId: String) async throws  -> ToolVerificationResult
     
     /**
-     * Per-instance equivalent of the free-function [`transport_connect`].
+     * Per-instance equivalent of the free-function `transport_connect`.
      *
      * Routes through `&*self.inner`. The returned `TransportManager`
      * handle's `instance_id` is stamped against this `SCP`'s
@@ -2967,7 +3004,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func transportConnect(relayUrl: String) async throws  -> TransportManager
     
     /**
-     * Per-instance equivalent of the free-function [`transport_disconnect`].
+     * Per-instance equivalent of the free-function `transport_disconnect`.
      *
      * Routes through `&*self.inner`. Rejects any `TransportManager`
      * whose `instance_id` does not match this `SCP`'s.
@@ -2975,7 +3012,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func transportDisconnect(manager: TransportManager) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`transport_status`].
+     * Per-instance equivalent of the free-function `transport_status`.
      *
      * Routes through `&*self.inner`. Rejects any `TransportManager`
      * whose `instance_id` does not match this `SCP`'s.
@@ -2990,7 +3027,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func trustCreateChallenge(targetDid: String) throws  -> ChallengeResult
     
     /**
-     * Per-instance equivalent of the free-function [`trust_query_score`].
+     * Per-instance equivalent of the free-function `trust_query_score`.
      *
      * Trust event counts are queried from the module-level helper (a
      * stateless `(0, 0)` stub today — see `runtime::query_trust_event_counts`).
@@ -3014,7 +3051,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func trustVerifyResponse(challengeJson: String, responseJson: String) throws  -> Bool
     
     /**
-     * Per-instance equivalent of the free-function [`ucan_delegate`].
+     * Per-instance equivalent of the free-function `ucan_delegate`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -3022,7 +3059,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String]) async throws  -> UcanToken
     
     /**
-     * Per-instance equivalent of the free-function [`ucan_mint`].
+     * Per-instance equivalent of the free-function `ucan_mint`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -3030,7 +3067,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func ucanMint(handle: ContextHandle, memberDid: String, capabilities: [String], proofs: [String]?) async throws  -> UcanToken
     
     /**
-     * Per-instance equivalent of the free-function [`ucan_revoke`].
+     * Per-instance equivalent of the free-function `ucan_revoke`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -3038,7 +3075,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func ucanRevoke(handle: ContextHandle, token: String, revokerDid: String) async throws 
     
     /**
-     * Per-instance equivalent of the free-function [`ucan_validate`].
+     * Per-instance equivalent of the free-function `ucan_validate`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -3169,13 +3206,19 @@ public static func withPersistence() -> Scp  {
     /**
      * Constructs an `SCP` instance with a storage configuration.
      *
-     * PR 1 accepts the default (in-memory) configuration only. PR 3 adds
-     * filesystem-backed storage via an additional variant on
-     * [`StorageConfig`]. The `config` parameter is forwarded to the inner
-     * constructor; the current match honours only `InMemory`.
+     * `StorageConfig::Sqlite` opens a `SQLCipher`-encrypted database at
+     * `{path}/scp.db` via [`scp_platform::sqlite::SqliteStorage`].
+     *
+     * # Errors
+     *
+     * Returns [`ScpError::Validation`] with code `SCP-VALID-7005` if the
+     * `SQLite` database cannot be opened (bad key, permission denied,
+     * corrupt file). Previously this condition logged an error and
+     * silently fell back to an in-memory instance — a split-brain that
+     * produced a working-looking `Scp` whose writes vanished on drop.
      */
-public static func withStorage(config: StorageConfig) -> Scp  {
-    return try!  FfiConverterTypeScp_lift(try! rustCall() {
+public static func withStorage(config: StorageConfig)throws  -> Scp  {
+    return try  FfiConverterTypeScp_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_constructor_scp_with_storage(
         FfiConverterTypeStorageConfig_lower(config),$0
     )
@@ -3185,7 +3228,7 @@ public static func withStorage(config: StorageConfig) -> Scp  {
 
     
     /**
-     * Per-instance equivalent of the free-function [`access_key_generate`].
+     * Per-instance equivalent of the free-function `access_key_generate`.
      *
      * Routes through `&*self.inner`.
      */
@@ -3207,7 +3250,7 @@ open func accessKeyGenerate(contextId: String, memberDid: String, callerDid: Str
 }
     
     /**
-     * Per-instance equivalent of the free-function [`access_key_restore`].
+     * Per-instance equivalent of the free-function `access_key_restore`.
      *
      * Routes through `&*self.inner`.
      */
@@ -3229,7 +3272,7 @@ open func accessKeyRestore(contextId: String, memberDid: String, callerDid: Stri
 }
     
     /**
-     * Per-instance equivalent of the free-function [`access_key_revoke`].
+     * Per-instance equivalent of the free-function `access_key_revoke`.
      *
      * Routes through `&*self.inner`.
      */
@@ -3252,7 +3295,7 @@ open func accessKeyRevoke(contextId: String, memberDid: String, callerDid: Strin
     
     /**
      * Per-instance equivalent of the free-function
-     * [`add_checkpoint_cosignature`].
+     * `add_checkpoint_cosignature`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -3288,7 +3331,7 @@ open func addressResolve(ownerDid: String, address: String, knownContextsJson: S
 }
     
     /**
-     * Per-instance equivalent of the free-function [`aggregate_trust_input`].
+     * Per-instance equivalent of the free-function `aggregate_trust_input`.
      *
      * Routes through `&*self.inner` — trust data is populated against
      * THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`),
@@ -3313,7 +3356,7 @@ open func aggregateTrustInput(contextId: String, subjectDid: String, eventsJson:
     
     /**
      * Per-instance equivalent of the free-function
-     * [`apply_pending_ceiling_modification`].
+     * `apply_pending_ceiling_modification`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -3336,7 +3379,7 @@ open func applyPendingCeilingModification(handle: ContextHandle, currentTimestam
 }
     
     /**
-     * Per-instance equivalent of the free-function [`bridge_create_shadow`].
+     * Per-instance equivalent of the free-function `bridge_create_shadow`.
      *
      * Mutates this instance's per-context bridge state. Rejects any
      * cross-instance caller (the method takes `&self` — the `bi` threaded
@@ -3370,7 +3413,7 @@ open func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadowSt
 }
     
     /**
-     * Per-instance equivalent of the free-function [`broadcast_admission`].
+     * Per-instance equivalent of the free-function `broadcast_admission`.
      *
      * Routes through `&*self.inner`. Returns `None` when the handle's
      * `instance_id` does not match this `SCP`'s.
@@ -3395,7 +3438,7 @@ open func broadcastAdmission(handle: ContextHandle)async  -> String?  {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`broadcast_block_subscriber`].
+     * `broadcast_block_subscriber`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -3419,7 +3462,7 @@ open func broadcastBlockSubscriber(handle: ContextHandle, subscriberDid: String,
     
     /**
      * Per-instance equivalent of the free-function
-     * [`broadcast_handle_key_request`].
+     * `broadcast_handle_key_request`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -3443,7 +3486,7 @@ open func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, re
     
     /**
      * Per-instance equivalent of the free-function
-     * [`broadcast_is_subscriber`].
+     * `broadcast_is_subscriber`.
      *
      * Routes through `&*self.inner`. Returns `false` when the handle's
      * `instance_id` does not match this `SCP`'s.
@@ -3467,7 +3510,7 @@ open func broadcastIsSubscriber(handle: ContextHandle, did: String)async  -> Boo
 }
     
     /**
-     * Per-instance equivalent of the free-function [`broadcast_publish`].
+     * Per-instance equivalent of the free-function `broadcast_publish`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -3491,7 +3534,7 @@ open func broadcastPublish(handle: ContextHandle, identity: Identity, payload: D
     
     /**
      * Per-instance equivalent of the free-function
-     * [`broadcast_publish_asset`].
+     * `broadcast_publish_asset`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -3515,7 +3558,7 @@ open func broadcastPublishAsset(handle: ContextHandle, identity: Identity, asset
     
     /**
      * Per-instance equivalent of the free-function
-     * [`broadcast_publish_assets`].
+     * `broadcast_publish_assets`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -3538,7 +3581,7 @@ open func broadcastPublishAssets(handle: ContextHandle, identity: Identity, asse
 }
     
     /**
-     * Per-instance equivalent of the free-function [`broadcast_subscribe`].
+     * Per-instance equivalent of the free-function `broadcast_subscribe`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -3562,7 +3605,7 @@ open func broadcastSubscribe(handle: ContextHandle, subscriberDid: String)async 
     
     /**
      * Per-instance equivalent of the free-function
-     * [`broadcast_subscriber_count`].
+     * `broadcast_subscriber_count`.
      *
      * Routes through `&*self.inner`. Returns `None` when the handle's
      * `instance_id` does not match this `SCP`'s.
@@ -3587,7 +3630,7 @@ open func broadcastSubscriberCount(handle: ContextHandle)async  -> UInt64?  {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`broadcast_unblock_subscriber`].
+     * `broadcast_unblock_subscriber`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -3610,7 +3653,7 @@ open func broadcastUnblockSubscriber(handle: ContextHandle, subscriberDid: Strin
 }
     
     /**
-     * Per-instance equivalent of the free-function [`broadcast_unsubscribe`].
+     * Per-instance equivalent of the free-function `broadcast_unsubscribe`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -3633,7 +3676,7 @@ open func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rot
 }
     
     /**
-     * Per-instance equivalent of the free-function [`configure_relay_transport`].
+     * Per-instance equivalent of the free-function `configure_relay_transport`.
      *
      * Routes through `&*self.inner`. Installs a real `MlsCryptoProvider`
      * and `RelayTransportProvider` on this instance's `ContextManager`.
@@ -3656,7 +3699,7 @@ open func configureRelayTransport(relayUrl: String, localDid: String)async throw
 }
     
     /**
-     * Per-instance equivalent of the free-function [`context_close`].
+     * Per-instance equivalent of the free-function `context_close`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -3683,7 +3726,7 @@ open func contextClose(handle: ContextHandle, identity: Identity)async throws   
 }
     
     /**
-     * Per-instance equivalent of the free-function [`context_create`].
+     * Per-instance equivalent of the free-function `context_create`.
      *
      * Creates a new SCP context under this instance. Routes through
      * `&*self.inner` instead of the process-wide
@@ -3692,7 +3735,7 @@ open func contextClose(handle: ContextHandle, identity: Identity)async throws   
      * and the returned handle's `instance_id` stamping are all scoped to
      * this `SCP`. The context handle is rejected on any other `SCP`.
      *
-     * See the documentation on the free [`context_create`] function for
+     * See the documentation on the free `context_create` function for
      * argument semantics and MLS group / event-log initialization
      * details.
      */
@@ -3714,7 +3757,7 @@ open func contextCreate(identity: Identity, params: ContextParams)async throws  
 }
     
     /**
-     * Per-instance equivalent of the free-function [`context_drain_events`].
+     * Per-instance equivalent of the free-function `context_drain_events`.
      *
      * Routes through `&*self.inner`. Returns an empty `Vec` when the
      * handle's `instance_id` does not match this `SCP`'s.
@@ -3759,7 +3802,7 @@ open func contextExport(handle: ContextHandle)async throws  -> Data  {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`context_handle_ttl_expiry`].
+     * `context_handle_ttl_expiry`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -3802,7 +3845,7 @@ open func contextImport(data: Data)async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`context_is_member`].
+     * Per-instance equivalent of the free-function `context_is_member`.
      *
      * Routes through `&*self.inner`. Returns `false` when the handle's
      * `instance_id` does not match this `SCP`'s.
@@ -3826,12 +3869,12 @@ open func contextIsMember(handle: ContextHandle, did: String)async  -> Bool  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`context_join`].
+     * Per-instance equivalent of the free-function `context_join`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
      * `Identity` whose `instance_id` does not match this `SCP`'s.
      *
-     * See the documentation on the free [`context_join`] function for
+     * See the documentation on the free `context_join` function for
      * argument semantics and the spending-UCAN AND-composition path.
      */
 open func contextJoin(handle: ContextHandle, identity: Identity, spendingUcanJwt: String?)async throws   {
@@ -3852,7 +3895,7 @@ open func contextJoin(handle: ContextHandle, identity: Identity, spendingUcanJwt
 }
     
     /**
-     * Per-instance equivalent of the free-function [`context_leave`].
+     * Per-instance equivalent of the free-function `context_leave`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -3875,7 +3918,7 @@ open func contextLeave(handle: ContextHandle, identity: Identity)async throws   
 }
     
     /**
-     * Per-instance equivalent of the free-function [`context_member_count`].
+     * Per-instance equivalent of the free-function `context_member_count`.
      *
      * Routes through `&*self.inner`. Returns `None` when the handle's
      * `instance_id` does not match this `SCP`'s.
@@ -3899,7 +3942,7 @@ open func contextMemberCount(handle: ContextHandle)async  -> UInt64?  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`context_member_dids`].
+     * Per-instance equivalent of the free-function `context_member_dids`.
      *
      * Routes through `&*self.inner`. Returns an empty `Vec` when the
      * handle's `instance_id` does not match this `SCP`'s.
@@ -3923,7 +3966,7 @@ open func contextMemberDids(handle: ContextHandle)async  -> [String]  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`context_member_role`].
+     * Per-instance equivalent of the free-function `context_member_role`.
      *
      * Routes through `&*self.inner`. Returns `None` when the handle's
      * `instance_id` does not match this `SCP`'s.
@@ -3948,7 +3991,7 @@ open func contextMemberRole(handle: ContextHandle, did: String)async  -> String?
     
     /**
      * Per-instance equivalent of the free-function
-     * [`context_propose_ttl_extension`].
+     * `context_propose_ttl_extension`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -3972,7 +4015,7 @@ open func contextProposeTtlExtension(handle: ContextHandle, memberDid: String, p
     
     /**
      * Per-instance equivalent of the free-function
-     * [`context_reset_ttl_timer`].
+     * `context_reset_ttl_timer`.
      *
      * Routes through `&*self.inner`. Silently returns when the handle's
      * `instance_id` does not match this `SCP`'s (matches the free-function
@@ -3997,7 +4040,7 @@ open func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64)async  
 }
     
     /**
-     * Per-instance equivalent of the free-function [`context_send`].
+     * Per-instance equivalent of the free-function `context_send`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` /
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -4020,7 +4063,7 @@ open func contextSend(handle: ContextHandle, identity: Identity, payload: Data, 
 }
     
     /**
-     * Per-instance equivalent of the free-function [`context_subscribe`].
+     * Per-instance equivalent of the free-function `context_subscribe`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -4050,7 +4093,7 @@ open func contextSubscribe(handle: ContextHandle, listener: MessageListener)asyn
     
     /**
      * Per-instance equivalent of the free-function
-     * [`create_governance_checkpoint`].
+     * `create_governance_checkpoint`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -4167,7 +4210,7 @@ open func evaluateInvitation(paramsJson: String, inviterDid: String, identityDid
 }
     
     /**
-     * Per-instance equivalent of the free-function [`event_log_checkpoint`].
+     * Per-instance equivalent of the free-function `event_log_checkpoint`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -4190,7 +4233,7 @@ open func eventLogCheckpoint(handle: ContextHandle, identity: Identity, epoch: U
 }
     
     /**
-     * Per-instance equivalent of the free-function [`event_log_query`].
+     * Per-instance equivalent of the free-function `event_log_query`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -4213,7 +4256,7 @@ open func eventLogQuery(handle: ContextHandle, filterJson: String?)async throws 
 }
     
     /**
-     * Per-instance equivalent of the free-function [`event_log_verify`].
+     * Per-instance equivalent of the free-function `event_log_verify`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -4236,7 +4279,7 @@ open func eventLogVerify(handle: ContextHandle, claimJson: String)async throws  
 }
     
     /**
-     * Per-instance equivalent of the free-function [`finalize_close`].
+     * Per-instance equivalent of the free-function `finalize_close`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -4270,7 +4313,7 @@ open func getEconomicPolicy(handle: ContextHandle)throws  -> String?  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`governance_approve`].
+     * Per-instance equivalent of the free-function `governance_approve`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -4293,7 +4336,7 @@ open func governanceApprove(handle: ContextHandle, voterDid: String, proposalIdH
 }
     
     /**
-     * Per-instance equivalent of the free-function [`governance_execute`].
+     * Per-instance equivalent of the free-function `governance_execute`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -4316,7 +4359,7 @@ open func governanceExecute(handle: ContextHandle, proposalJson: String)async th
 }
     
     /**
-     * Per-instance equivalent of the free-function [`governance_get_proposal`].
+     * Per-instance equivalent of the free-function `governance_get_proposal`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -4339,7 +4382,7 @@ open func governanceGetProposal(handle: ContextHandle, proposalIdHex: String)asy
 }
     
     /**
-     * Per-instance equivalent of the free-function [`governance_list_proposals`].
+     * Per-instance equivalent of the free-function `governance_list_proposals`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -4362,7 +4405,7 @@ open func governanceListProposals(handle: ContextHandle)async throws  -> String 
 }
     
     /**
-     * Per-instance equivalent of the free-function [`governance_propose`].
+     * Per-instance equivalent of the free-function `governance_propose`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -4385,7 +4428,7 @@ open func governancePropose(handle: ContextHandle, proposerDid: String, actionJs
 }
     
     /**
-     * Per-instance equivalent of the free-function [`governance_reject`].
+     * Per-instance equivalent of the free-function `governance_reject`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -4408,7 +4451,7 @@ open func governanceReject(handle: ContextHandle, voterDid: String, proposalIdHe
 }
     
     /**
-     * Per-instance equivalent of the free-function [`governance_withdraw`].
+     * Per-instance equivalent of the free-function `governance_withdraw`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -4474,7 +4517,7 @@ open func handleRegister(discoveryContextId: String, handle: String, targetJson:
     
     /**
      * Per-instance equivalent of the free-function
-     * [`identity_attest_device`].
+     * `identity_attest_device`.
      *
      * Rejects any `Identity` whose `instance_id` does not match this
      * `SCP`'s — cross-instance handle misuse surfaces as
@@ -4498,7 +4541,7 @@ open func identityAttestDevice(identity: Identity)async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`identity_create`].
+     * Per-instance equivalent of the free-function `identity_create`.
      *
      * Creates a new SCP identity under this instance. Routes through
      * `&*self.inner` instead of the process-wide
@@ -4506,17 +4549,20 @@ open func identityAttestDevice(identity: Identity)async throws  -> String  {
      * initialization, handle `instance_id` stamping) is scoped to this
      * `SCP`.
      *
-     * See the documentation on the free [`identity_create`] function for
-     * argument semantics and the `"in_memory"` / `"platform"` custody
-     * distinction (ADR-006, #88).
+     * When `seed` is supplied (32 bytes), the in-memory custody is backed
+     * by a deterministic RNG so subsequent `generate_keypair` calls produce
+     * byte-identical Ed25519 keys across bridges — the basis of the
+     * cross-bridge parity test (ADR-046). `seed` is only valid for
+     * `"in_memory"` custody; other custody types reject it with
+     * `SCP-VALID-7007`.
      */
-open func identityCreate(custody: String)async throws  -> Identity  {
+open func identityCreate(custody: String, seed: Data?)async throws  -> Identity  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_identity_create(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(custody)
+                    FfiConverterString.lower(custody),FfiConverterOptionData.lower(seed)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
@@ -4529,7 +4575,7 @@ open func identityCreate(custody: String)async throws  -> Identity  {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`identity_create_link_attestation`].
+     * `identity_create_link_attestation`.
      *
      * Signs the link attestation with the identity's active signing key
      * and stores the entry in the per-instance link-attestation and
@@ -4581,7 +4627,7 @@ open func identityCreateWithAgentKey(custody: String)async throws  -> Identity  
     
     /**
      * Per-instance equivalent of the free-function
-     * [`identity_create_with_custody`].
+     * `identity_create_with_custody`.
      *
      * Creates a new SCP identity under this instance using an injected
      * [`KeyCustodyProvider`](crate::KeyCustodyProvider). Routes through
@@ -4639,7 +4685,7 @@ open func identityExecuteRecovery(did: String, tier: String, contextIds: [String
     
     /**
      * Per-instance equivalent of the free-function
-     * [`identity_link_attestations`].
+     * `identity_link_attestations`.
      *
      * Reads the link-attestation registry on `&*self.inner`.
      *
@@ -4654,7 +4700,7 @@ open func identityLinkAttestations(did: String)throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`identity_load`].
+     * Per-instance equivalent of the free-function `identity_load`.
      *
      * Loads an external identity handle under this instance. Routes through
      * `&*self.inner` — the returned handle's `instance_id` is stamped
@@ -4703,7 +4749,7 @@ open func identityMigrate(identity: Identity)async throws  -> Identity  {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`identity_remove_link_attestation`].
+     * `identity_remove_link_attestation`.
      *
      * Mutates the link-attestation registry on `&*self.inner`.
      *
@@ -4719,7 +4765,7 @@ open func identityRemoveLinkAttestation(did: String, attestationId: String) -> B
 }
     
     /**
-     * Per-instance equivalent of the free-function [`identity_resolve`].
+     * Per-instance equivalent of the free-function `identity_resolve`.
      *
      * Resolves a DID to its document. DID resolution itself doesn't touch
      * the instance — the method variant exists for API symmetry with the
@@ -4744,7 +4790,7 @@ open func identityResolve(did: String)async throws  -> DidDocument  {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`identity_verify_device_attestation`].
+     * `identity_verify_device_attestation`.
      *
      * Verification itself is a pure function — taking `&self` keeps the
      * method surface uniform.
@@ -4768,7 +4814,7 @@ open func identityVerifyDeviceAttestation(did: String, tokenBase64: String)async
     
     /**
      * Per-instance equivalent of the free-function
-     * [`identity_verify_link_attestation`].
+     * `identity_verify_link_attestation`.
      *
      * Signature verification is a pure function — taking `&self` keeps
      * the method surface uniform.
@@ -4803,7 +4849,7 @@ open func instanceId() -> UInt64  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`is_local_did`].
+     * Per-instance equivalent of the free-function `is_local_did`.
      *
      * Routes through `&*self.inner`. Returns `false` if the DID fails
      * validation or the instance's `ContextManager` cannot be
@@ -4828,7 +4874,7 @@ open func isLocalDid(did: String)async  -> Bool  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_client_connect_sse`].
+     * Per-instance equivalent of the free-function `mcp_client_connect_sse`.
      *
      * Routes through the module-level MCP client registry.
      */
@@ -4850,7 +4896,7 @@ open func mcpClientConnectSse(url: String)async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_client_connect_stdio`].
+     * Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
      *
      * Routes through the module-level MCP client registry.
      */
@@ -4872,7 +4918,7 @@ open func mcpClientConnectStdio(command: [String])async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_client_disconnect`].
+     * Per-instance equivalent of the free-function `mcp_client_disconnect`.
      *
      * Routes through the module-level MCP client registry.
      */
@@ -4894,7 +4940,7 @@ open func mcpClientDisconnect(handle: String)async throws   {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_client_invoke`].
+     * Per-instance equivalent of the free-function `mcp_client_invoke`.
      *
      * Routes through the module-level MCP client registry.
      */
@@ -4916,7 +4962,7 @@ open func mcpClientInvoke(handle: String, toolName: String, inputJson: String, c
 }
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_client_list_tools`].
+     * Per-instance equivalent of the free-function `mcp_client_list_tools`.
      *
      * Routes through the module-level MCP client registry.
      */
@@ -4986,7 +5032,7 @@ open func mcpResetStdioAllowlist()throws   {try rustCallWithError(FfiConverterTy
 }
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_server_create`].
+     * Per-instance equivalent of the free-function `mcp_server_create`.
      *
      * Routes through `&*self.inner`. The MCP server registry is
      * module-level (not per-instance) so the returned opaque handle
@@ -5010,7 +5056,7 @@ open func mcpServerCreate(config: McpServerConfig)async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_server_stop`].
+     * Per-instance equivalent of the free-function `mcp_server_stop`.
      *
      * Routes through the module-level MCP server registry (the registry
      * is not per-instance; the opaque handle string is globally unique).
@@ -5033,7 +5079,7 @@ open func mcpServerStop(handle: String)async throws   {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`migration_state`].
+     * Per-instance equivalent of the free-function `migration_state`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -5217,7 +5263,7 @@ open func provenanceAttach(sourceContextId: String, sourceType: String, memorySc
 }
     
     /**
-     * Per-instance equivalent of the free-function [`register_local_did`].
+     * Per-instance equivalent of the free-function `register_local_did`.
      *
      * Routes through `&*self.inner`. Initializes this instance's
      * `ContextManager` if not yet attached (idempotent) and registers
@@ -5288,7 +5334,7 @@ open func relayStartLocal(dataDir: String)async throws  -> RelayHandle  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`restore_all_contexts`].
+     * Per-instance equivalent of the free-function `restore_all_contexts`.
      *
      * Routes through `&*self.inner`.
      */
@@ -5310,7 +5356,7 @@ open func restoreAllContexts()async throws  -> String  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`restore_context`].
+     * Per-instance equivalent of the free-function `restore_context`.
      *
      * Routes through `&*self.inner`.
      */
@@ -5335,7 +5381,7 @@ open func restoreContext(contextId: String)async throws   {
      * Resumes a suspended bridge instance.
      *
      * Clears the suspended flag, then runs any per-bridge async work chained
-     * by the [`BridgeInstanceCore::resume`] override (transport reconnect
+     * by the `BridgeInstanceCore::resume` override (transport reconnect
      * from pending relay URLs, persisted-context restoration).
      *
      * `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin.
@@ -5409,13 +5455,19 @@ open func scopeRegister(scopeContextId: String, name: String, targetContextId: S
      *
      * Signs an SCPID challenge with the identity's requested key. Rejects
      * any `Identity` whose `instance_id` does not match this `Scp`'s.
+     *
+     * `signed_at_override` is a testing-only parameter for the ADR-046
+     * cross-bridge parity harness. Only accepted when scp-core is built
+     * with the `testing` feature; production builds reject any non-`None`
+     * value via `SCP-VALID-7007`.
      */
-open func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String)throws  -> String  {
+open func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String, signedAtOverride: UInt64?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_method_scp_scpid_sign(self.uniffiClonePointer(),
         FfiConverterTypeIdentity_lower(identity),
         FfiConverterString.lower(signingKeyId),
-        FfiConverterString.lower(challengeJson),$0
+        FfiConverterString.lower(challengeJson),
+        FfiConverterOptionUInt64.lower(signedAtOverride),$0
     )
 })
 }
@@ -5541,7 +5593,7 @@ open func syncGetPolicy() -> SyncPolicyResult  {
     
     /**
      * Per-instance equivalent of the free-function
-     * [`tombstone_migrated_context`].
+     * `tombstone_migrated_context`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -5564,7 +5616,7 @@ open func tombstoneMigratedContext(handle: ContextHandle)async throws   {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`tool_interface_accept`].
+     * Per-instance equivalent of the free-function `tool_interface_accept`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -5587,7 +5639,7 @@ open func toolInterfaceAccept(handle: ContextHandle, interfaceJson: String)async
 }
     
     /**
-     * Per-instance equivalent of the free-function [`tool_interface_expose`].
+     * Per-instance equivalent of the free-function `tool_interface_expose`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -5610,7 +5662,7 @@ open func toolInterfaceExpose(handle: ContextHandle, toolId: String, targetConte
 }
     
     /**
-     * Per-instance equivalent of the free-function [`tool_interface_revoke`].
+     * Per-instance equivalent of the free-function `tool_interface_revoke`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -5633,7 +5685,7 @@ open func toolInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String)asyn
 }
     
     /**
-     * Per-instance equivalent of the free-function [`tool_invoke`].
+     * Per-instance equivalent of the free-function `tool_invoke`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -5657,7 +5709,7 @@ open func toolInvoke(handle: ContextHandle, toolId: String, inputJson: String, i
     
     /**
      * Per-instance equivalent of the free-function
-     * [`tool_invoke_cross_context`].
+     * `tool_invoke_cross_context`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -5680,7 +5732,7 @@ open func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: Cont
 }
     
     /**
-     * Per-instance equivalent of the free-function [`tool_register`].
+     * Per-instance equivalent of the free-function `tool_register`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -5703,7 +5755,7 @@ open func toolRegister(handle: ContextHandle, definition: ToolDefinition)async t
 }
     
     /**
-     * Per-instance equivalent of the free-function [`tool_session_close`].
+     * Per-instance equivalent of the free-function `tool_session_close`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -5726,7 +5778,7 @@ open func toolSessionClose(handle: ContextHandle, sessionId: String)async throws
 }
     
     /**
-     * Per-instance equivalent of the free-function [`tool_session_create`].
+     * Per-instance equivalent of the free-function `tool_session_create`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -5749,7 +5801,7 @@ open func toolSessionCreate(handle: ContextHandle, toolId: String, sourceContext
 }
     
     /**
-     * Per-instance equivalent of the free-function [`tool_session_invoke`].
+     * Per-instance equivalent of the free-function `tool_session_invoke`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` or
      * `Identity` whose `instance_id` does not match this `SCP`'s.
@@ -5772,7 +5824,7 @@ open func toolSessionInvoke(handle: ContextHandle, sessionId: String, inputJson:
 }
     
     /**
-     * Per-instance equivalent of the free-function [`tool_verify`].
+     * Per-instance equivalent of the free-function `tool_verify`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -5795,7 +5847,7 @@ open func toolVerify(handle: ContextHandle, toolId: String)async throws  -> Tool
 }
     
     /**
-     * Per-instance equivalent of the free-function [`transport_connect`].
+     * Per-instance equivalent of the free-function `transport_connect`.
      *
      * Routes through `&*self.inner`. The returned `TransportManager`
      * handle's `instance_id` is stamped against this `SCP`'s
@@ -5820,7 +5872,7 @@ open func transportConnect(relayUrl: String)async throws  -> TransportManager  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`transport_disconnect`].
+     * Per-instance equivalent of the free-function `transport_disconnect`.
      *
      * Routes through `&*self.inner`. Rejects any `TransportManager`
      * whose `instance_id` does not match this `SCP`'s.
@@ -5843,7 +5895,7 @@ open func transportDisconnect(manager: TransportManager)async throws   {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`transport_status`].
+     * Per-instance equivalent of the free-function `transport_status`.
      *
      * Routes through `&*self.inner`. Rejects any `TransportManager`
      * whose `instance_id` does not match this `SCP`'s.
@@ -5879,7 +5931,7 @@ open func trustCreateChallenge(targetDid: String)throws  -> ChallengeResult  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`trust_query_score`].
+     * Per-instance equivalent of the free-function `trust_query_score`.
      *
      * Trust event counts are queried from the module-level helper (a
      * stateless `(0, 0)` stub today — see `runtime::query_trust_event_counts`).
@@ -5923,7 +5975,7 @@ open func trustVerifyResponse(challengeJson: String, responseJson: String)throws
 }
     
     /**
-     * Per-instance equivalent of the free-function [`ucan_delegate`].
+     * Per-instance equivalent of the free-function `ucan_delegate`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -5946,7 +5998,7 @@ open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid
 }
     
     /**
-     * Per-instance equivalent of the free-function [`ucan_mint`].
+     * Per-instance equivalent of the free-function `ucan_mint`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -5969,7 +6021,7 @@ open func ucanMint(handle: ContextHandle, memberDid: String, capabilities: [Stri
 }
     
     /**
-     * Per-instance equivalent of the free-function [`ucan_revoke`].
+     * Per-instance equivalent of the free-function `ucan_revoke`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -5992,7 +6044,7 @@ open func ucanRevoke(handle: ContextHandle, token: String, revokerDid: String)as
 }
     
     /**
-     * Per-instance equivalent of the free-function [`ucan_validate`].
+     * Per-instance equivalent of the free-function `ucan_validate`.
      *
      * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
      * `instance_id` does not match this `SCP`'s.
@@ -10570,7 +10622,7 @@ public enum CustodyMethod {
     /**
      * Identity loaded by DID string without local key material.
      *
-     * Used by [`identity_load`] to represent an identity whose keys are
+     * Used by `identity_load` to represent an identity whose keys are
      * managed externally (e.g., via an injected `KeyCustodyProvider`).
      */
     case external
@@ -12052,7 +12104,7 @@ public func FfiConverterCallbackInterfaceKeyCustodyProvider_lower(_ v: KeyCustod
  * The Swift SDK wraps this in `AsyncStream<Message>` via
  * `AsyncStream.Continuation`. The Kotlin SDK wraps it in `Flow<Message>`
  * via `callbackFlow`. Implemented by Swift/Kotlin code and passed to
- * [`context_subscribe`].
+ * `context_subscribe`.
  *
  * # SAFETY: Thread execution context
  *
@@ -14352,6 +14404,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_key() != 21897) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_verifying_key() != 19807) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_commit_deploy() != 10847) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14403,118 +14458,118 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_relayhandle_shutdown() != 3484) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_access_key_generate() != 27140) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_access_key_generate() != 37675) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_access_key_restore() != 37070) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_access_key_restore() != 26636) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_access_key_revoke() != 56161) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_access_key_revoke() != 26727) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_add_checkpoint_cosignature() != 62931) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_add_checkpoint_cosignature() != 48565) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_address_resolve() != 64098) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_aggregate_trust_input() != 26913) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_aggregate_trust_input() != 37504) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_apply_pending_ceiling_modification() != 44521) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_apply_pending_ceiling_modification() != 41792) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_create_shadow() != 7288) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_create_shadow() != 8590) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_evaluate_trust() != 11772) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_admission() != 60115) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_admission() != 47745) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_block_subscriber() != 12982) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_block_subscriber() != 22466) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_handle_key_request() != 29572) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_handle_key_request() != 345) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_is_subscriber() != 12071) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_is_subscriber() != 4444) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_publish() != 59556) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_publish() != 24392) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_publish_asset() != 30456) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_publish_asset() != 47050) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_publish_assets() != 35816) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_publish_assets() != 39568) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_subscribe() != 56186) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_subscribe() != 57536) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_subscriber_count() != 52435) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_subscriber_count() != 53302) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_unblock_subscriber() != 57917) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_unblock_subscriber() != 50779) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_unsubscribe() != 41981) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_unsubscribe() != 16701) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_relay_transport() != 22269) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_relay_transport() != 42668) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_close() != 18254) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_close() != 41503) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_create() != 26667) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_create() != 337) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_drain_events() != 52985) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_drain_events() != 50890) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_export() != 18548) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_handle_ttl_expiry() != 52028) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_handle_ttl_expiry() != 26613) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_import() != 9378) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_is_member() != 16707) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_is_member() != 22393) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_join() != 32005) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_join() != 13120) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_leave() != 22714) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_leave() != 21568) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_member_count() != 54890) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_member_count() != 64151) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_member_dids() != 62304) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_member_dids() != 36615) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_member_role() != 45315) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_member_role() != 16382) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_propose_ttl_extension() != 1399) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_propose_ttl_extension() != 10308) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reset_ttl_timer() != 14137) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reset_ttl_timer() != 12217) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_send() != 34088) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_send() != 57249) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_subscribe() != 41405) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_subscribe() != 23938) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_create_governance_checkpoint() != 5744) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_create_governance_checkpoint() != 55112) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_antispam_escalated_cost() != 52575) {
@@ -14538,40 +14593,40 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_evaluate_invitation() != 59132) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint() != 61883) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint() != 31004) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_query() != 56222) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_query() != 26119) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_verify() != 11804) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_verify() != 36287) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_finalize_close() != 26496) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_finalize_close() != 12188) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_get_economic_policy() != 8617) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_approve() != 23537) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_approve() != 14937) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_execute() != 22998) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_execute() != 38425) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_get_proposal() != 29263) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_get_proposal() != 65469) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_list_proposals() != 33699) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_list_proposals() != 5473) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_propose() != 48279) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_propose() != 46255) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_reject() != 50152) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_reject() != 58576) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_withdraw() != 12532) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_withdraw() != 31863) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_handle_deregister() != 11124) {
@@ -14583,19 +14638,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_handle_register() != 61984) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_attest_device() != 49498) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_attest_device() != 36607) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 48826) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 47563) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_link_attestation() != 21310) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_link_attestation() != 29874) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_with_agent_key() != 20413) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_with_custody() != 49143) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_with_custody() != 35310) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_execute_custody_migration() != 23068) {
@@ -14604,46 +14659,46 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_execute_recovery() != 41947) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_link_attestations() != 28500) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_link_attestations() != 36734) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_load() != 13281) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_load() != 9295) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_migrate() != 35072) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_link_attestation() != 5819) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_link_attestation() != 51771) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_resolve() != 40412) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_resolve() != 31124) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_verify_device_attestation() != 53270) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_verify_device_attestation() != 26963) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_verify_link_attestation() != 64001) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_verify_link_attestation() != 21755) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_instance_id() != 43175) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_is_local_did() != 13791) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_is_local_did() != 10856) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_sse() != 46218) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_sse() != 44028) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_stdio() != 43915) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_stdio() != 2953) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 60275) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 63976) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_invoke() != 18767) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_invoke() != 30137) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_list_tools() != 54318) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_list_tools() != 53196) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_configure_stdio_allowlist() != 12983) {
@@ -14658,13 +14713,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_reset_stdio_allowlist() != 41096) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_create() != 40479) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_create() != 11371) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_stop() != 61549) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_stop() != 46867) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_migration_state() != 3834) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_migration_state() != 34622) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_in_memory() != 58945) {
@@ -14700,7 +14755,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_provenance_attach() != 3158) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_register_local_did() != 65305) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_register_local_did() != 49984) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_relay_start_in_memory() != 14458) {
@@ -14709,13 +14764,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_relay_start_local() != 7556) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_restore_all_contexts() != 18263) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_restore_all_contexts() != 43499) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_restore_context() != 23404) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_restore_context() != 6223) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_resume() != 62509) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_resume() != 24128) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_scope_deregister() != 49133) {
@@ -14727,7 +14782,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_scope_register() != 1713) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_scpid_sign() != 19905) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_scpid_sign() != 48262) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_scpid_verify() != 7728) {
@@ -14751,52 +14806,52 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_sync_get_policy() != 7910) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tombstone_migrated_context() != 23646) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tombstone_migrated_context() != 15228) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_interface_accept() != 18829) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_interface_accept() != 29084) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_interface_expose() != 7515) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_interface_expose() != 35947) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_interface_revoke() != 4998) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_interface_revoke() != 43274) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke() != 27038) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke() != 31430) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke_cross_context() != 14033) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke_cross_context() != 47346) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_register() != 45946) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_register() != 65327) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_session_close() != 39761) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_session_close() != 64711) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_session_create() != 7544) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_session_create() != 1081) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_session_invoke() != 14060) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_session_invoke() != 26287) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_verify() != 18395) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_verify() != 10586) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_connect() != 37340) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_connect() != 45064) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_disconnect() != 13286) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_disconnect() != 45973) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_status() != 23261) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_status() != 20055) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_create_challenge() != 25481) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_query_score() != 24245) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_query_score() != 20746) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_attestation() != 36949) {
@@ -14805,16 +14860,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 16753) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 36266) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 51192) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_mint() != 41218) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_mint() != 2465) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_revoke() != 9574) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_revoke() != 34885) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_validate() != 12388) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_validate() != 38327) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_verify_participation_requirements() != 3735) {
@@ -14871,7 +14926,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_persistence() != 28565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 21004) {
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 21217) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 4506) {

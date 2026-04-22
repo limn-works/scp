@@ -42,3 +42,6 @@ bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/*.kt
 .mcp.json
 .mcp_data
 bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/internal/
+bindings/python/tests/bridge_parity/helpers/kotlin_bridge_runner/.gradle/
+bindings/python/tests/bridge_parity/helpers/kotlin_bridge_runner/build/
+bindings/python/tests/bridge_parity/helpers/swift_bridge_runner/.build/

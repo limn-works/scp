@@ -641,7 +641,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     fn identity_create_in_memory_produces_did_dht_prefix() {
         let rt = runtime();
-        let result = rt.block_on(scp_test().identity_create("in_memory".to_owned()));
+        let result = rt.block_on(scp_test().identity_create("in_memory".to_owned(), None));
         let identity = result.expect("identity_create should succeed for in_memory custody");
         assert!(
             identity.did().starts_with("did:dht:"),
@@ -659,7 +659,7 @@ mod tests {
     #[cfg(not(feature = "allow_in_memory_custody"))]
     fn identity_create_in_memory_rejected_without_feature() {
         let rt = runtime();
-        let result = rt.block_on(scp_test().identity_create("in_memory".to_owned()));
+        let result = rt.block_on(scp_test().identity_create("in_memory".to_owned(), None));
         match result {
             Err(ScpError::Identity { code, .. }) => {
                 assert_eq!(
@@ -692,7 +692,7 @@ mod tests {
 
         // First create an identity to pass as the context creator.
         let identity = rt
-            .block_on(scp.identity_create("in_memory".to_owned()))
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
             .expect("identity_create failed");
 
         let params = bridge::ContextParams {
@@ -755,7 +755,7 @@ mod tests {
         let scp = scp_test();
 
         let identity = rt
-            .block_on(scp.identity_create("in_memory".to_owned()))
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
             .expect("identity_create failed");
 
         let params = bridge::ContextParams {
@@ -811,7 +811,7 @@ mod tests {
         // create/drop is guaranteed regardless of concurrent test activity.
         let before_create = HANDLE_COUNT.load(Ordering::SeqCst);
         let id = rt
-            .block_on(scp_test().identity_create("in_memory".to_owned()))
+            .block_on(scp_test().identity_create("in_memory".to_owned(), None))
             .expect("identity_create failed");
         let after_create = HANDLE_COUNT.load(Ordering::SeqCst);
 

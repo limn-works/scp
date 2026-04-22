@@ -25,17 +25,21 @@ use crate::runtime::NapiBridgeInstance;
 // Shared network
 // ---------------------------------------------------------------------------
 //
-// The shared `FullStackNetwork` lives as a typed field on
-// `NapiBridgeInstance` (see `crate::runtime::NapiBridgeInstance::network`).
-// Using the per-bridge slot (instead of a process-global singleton)
-// preserves the previous behaviour — all `fullstack_create_node` calls on
-// the same instance share a `KeyExchange` — while still allowing a
-// caller-owned `SCP` to keep its test network isolated from other
-// instances in the same process.
+// The shared `FullStackNetwork` lives in a process-global slot owned by
+// THIS module, NOT on `NapiBridgeInstance`. The test harness needs the
+// network to survive across the default bridge's lifecycle: individual
+// TypeScript test files exercise `scpShutdown`, which transitions the
+// default `NapiBridgeInstance` into a permanent-shutdown state. If the
+// test network lived on the default bridge, any test file that ran
+// after a shutdown-exercising file would see
+// `"default bridge instance has been permanently shut down"` and fail.
 //
-// `Mutex<Option<...>>` (rather than `OnceLock`) is used so tests can reset
-// the network between runs, preventing cross-test state leakage via the
-// `fullstack_reset_network` entry point.
+// A module-local `OnceLock<Mutex<Option<FullStackNetwork>>>` is simpler
+// AND sufficient: fullstack nodes are feature-gated behind
+// `allow_in_memory_custody`, only ever reached from the test harness,
+// and the `KeyExchange` they share is unrelated to bridge-instance
+// lifecycle (no handle-affinity, no shutdown hooks). Resetting the
+// network between runs still works via `fullstack_reset_network`.
 // ---------------------------------------------------------------------------
 
 /// Per-bridge-instance implementation of `with_network`.
@@ -101,7 +105,12 @@ impl NapiFullStackNode {
 // Exported NAPI functions
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of [`fullstack_create_node`].
+/// Per-bridge-instance implementation of `fullstack_create_node`.
+///
+/// All nodes created via this helper on the same `NapiBridgeInstance`
+/// share a single `FullStackNetwork` (and therefore a single
+/// `KeyExchange`), enabling Welcome message and sender key exchange
+/// between them.
 pub(crate) fn fullstack_create_node_on(bi: &NapiBridgeInstance, did: String) -> NapiFullStackNode {
     let instance_id = bi.instance_id();
     with_network_on(bi, |network| {
@@ -114,7 +123,10 @@ pub(crate) fn fullstack_create_node_on(bi: &NapiBridgeInstance, did: String) -> 
     })
 }
 
-/// Per-bridge-instance implementation of [`fullstack_reset_network`].
+/// Per-bridge-instance implementation of `fullstack_reset_network`.
+///
+/// Drops this instance's `FullStackNetwork` (and all nodes / state it
+/// owns). Call between test suites to prevent cross-test state leakage.
 pub(crate) fn fullstack_reset_network_on(bi: &NapiBridgeInstance) {
     let mut guard = bi
         .network()

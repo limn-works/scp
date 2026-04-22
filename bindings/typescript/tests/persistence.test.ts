@@ -136,18 +136,23 @@ describeNapi("SCP with SQLite storage (#1549 PR 3)", () => {
       });
       await scp1.shutdown(1);
 
-      // Second open with a wrong key. The NAPI layer currently logs
-      // and falls back to an in-memory-only instance (matching the
-      // PyO3 bridge's `with_storage_py` behaviour). The construction
-      // therefore succeeds; what we guard against is corruption of
-      // the original encrypted DB file.
+      // Second open with a wrong key must RAISE — after commit
+      // `9fa80e13c` (`fix(ffi): propagate SqliteStorage::new failure
+      // from with_storage`) the bridge surfaces the SQLCipher
+      // key-mismatch as a `SCP-VALID-7005` validation error rather
+      // than silently returning an in-memory instance. The original
+      // encrypted DB must survive the failed attempt so the next
+      // correct-key open still works.
       const wrongKey = new Uint8Array(32).fill(0x11);
-      const scp2 = new SCP({
-        storage: { type: "sqlite", path: dir, key: wrongKey },
-      });
-      await scp2.shutdown(1);
+      expect(() => {
+        new SCP({
+          storage: { type: "sqlite", path: dir, key: wrongKey },
+        });
+      }).toThrow(/SCP-VALID-7005/);
 
-      // Third open with the correct key — must still succeed.
+      // Third open with the correct key — must still succeed, proving
+      // the failed mismatched-key attempt did not corrupt or truncate
+      // the encrypted database file.
       const scp3 = new SCP({
         storage: { type: "sqlite", path: dir, key: SQLITE_KEY },
       });

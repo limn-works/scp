@@ -475,11 +475,17 @@ impl From<scp_core::crypto::sender_keys::SenderKeyError> for ScpPyError {
 
 impl From<scp_core::crypto::ucan::UcanError> for ScpPyError {
     fn from(e: scp_core::crypto::ucan::UcanError) -> Self {
+        // Canonical UCAN→error-code mapping lives in `scp_ffi_common::ucan_errors`
+        // so all four bridges (PyO3/NAPI/UniFFI/WASM) stay in lockstep.
+        // The cross-bridge parity harness (`OP_UCAN_VALIDATE_MALFORMED`)
+        // pins this code; changing it here requires updating the shared
+        // mapping and the harness golden-code in the same PR.
+        let code = scp_ffi_common::ucan_errors::ucan_error_code(&e).to_owned();
         Self::UcanError {
             message: format!(
                 "{e} — check token format, signatures, time bounds, and capability chain"
             ),
-            code: codes::PERM_3001.to_owned(),
+            code,
         }
     }
 }

@@ -305,22 +305,45 @@ pub(crate) async fn transport_connect_on(
     }
 }
 
-/// Per-bridge-instance implementation of [`transport_status`].
+/// Per-bridge-instance implementation of `transport_status`.
+///
+/// When `manager` is provided, reflects the status of that handle with a
+/// defense-in-depth check against this bridge's transport state: if the
+/// underlying `TransportManager` has been cleared (e.g., by
+/// `transportDisconnect` without touching the handle), the status is
+/// downgraded to disconnected.
+///
+/// When `manager` is `None`, returns a stateless snapshot drawn from the
+/// bridge's transport state. Mirrors the `PyO3` / WASM handleless probe
+/// so callers can observe the disconnected shape before ever calling
+/// `transportConnect`, without needing to construct a
+/// `NapiTransportManager` handle.
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub(crate) async fn transport_status_on(
     bi: &NapiBridgeInstance,
-    manager: &NapiTransportManager,
+    manager: Option<&NapiTransportManager>,
 ) -> napi::Result<NapiTransportStatus> {
-    crate::napi_check_handle!(&bi.core, manager);
-    let mut status = manager.status();
-    // Defense-in-depth: verify the transport manager is actually alive,
-    // not just what the manager's local status believes. If the transport
-    // manager has been dropped (e.g., disconnect was called without
-    // updating the manager), report disconnected.
-    if status.connected && !has_transport_manager_on(bi) {
-        status.connected = false;
+    if let Some(mgr) = manager {
+        crate::napi_check_handle!(&bi.core, mgr);
+        let mut status = mgr.status();
+        // Defense-in-depth: verify the transport manager is actually alive,
+        // not just what the manager's local status believes. If the transport
+        // manager has been dropped (e.g., disconnect was called without
+        // updating the manager), report disconnected.
+        if status.connected && !has_transport_manager_on(bi) {
+            status.connected = false;
+        }
+        return Ok(status);
     }
-    Ok(status)
+    // Handleless probe — mirrors PyO3/WASM `transport_status()`. Reports
+    // whether a `TransportManager` is wired on this bridge; the relay URL /
+    // latency fields are null because those live on the handle, not in
+    // the bridge instance.
+    Ok(NapiTransportStatus {
+        connected: has_transport_manager_on(bi),
+        relay_url: None,
+        latency_ms: None,
+    })
 }
 
 /// Per-bridge-instance implementation of [`transport_disconnect`].

@@ -129,7 +129,7 @@ from scp_sdk.media import (
 from scp_sdk.media import (
     verify_sender_attribution as media_verify_sender_attribution,
 )
-from scp_sdk.scp import SCP
+from scp_sdk.scp import SCP, InMemoryStorage, SqliteStorage, StorageConfig
 from scp_sdk.server import Node, Relay
 from scp_sdk.sync import classify_offline, get_policy, run_sync
 from scp_sdk.tools import (
@@ -201,6 +201,7 @@ __all__ = [
     "Identity",
     "IdentityAttestation",
     "IdentityError",
+    "InMemoryStorage",
     "McpClient",
     "McpProvenance",
     "McpServer",
@@ -230,6 +231,8 @@ __all__ = [
     "SignedCheckpoint",
     "SiteConfig",
     "SourceType",
+    "SqliteStorage",
+    "StorageConfig",
     "TestVector",
     "ToolCost",
     "ToolDefinition",

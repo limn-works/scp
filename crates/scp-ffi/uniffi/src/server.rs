@@ -855,7 +855,7 @@ mod tests {
     fn node_in_memory_with_identity_uses_provided_did() {
         let scp = crate::scp::Scp::new();
         let identity = rt()
-            .block_on(scp.identity_create("in_memory".to_owned()))
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
             .unwrap();
         let expected_did = identity.did();
 
@@ -883,7 +883,7 @@ mod tests {
     fn node_local_with_identity_uses_provided_did() {
         let scp = crate::scp::Scp::new();
         let identity = rt()
-            .block_on(scp.identity_create("in_memory".to_owned()))
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
             .unwrap();
         let expected_did = identity.did();
 
