@@ -266,7 +266,12 @@ impl ContextManager {
     /// Async variant of [`Self::try_consume_hard_rate_limit_blocking`]
     /// for callers already inside a tokio executor where
     /// `blocking_lock` would panic. Same unknown-context pass-through.
-    #[allow(clippy::significant_drop_tightening)] // two-step borrow on the contexts map
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::tools_helpers::try_consume_hard_rate_limit`]
+    /// free function (ADR-049 commit 12c.4). Deleted in a later commit
+    /// alongside every other actor-reachable `ContextManager` tools
+    /// surface.
     #[must_use]
     pub async fn try_consume_hard_rate_limit(
         &self,
@@ -274,22 +279,17 @@ impl ContextManager {
         did: &DID,
         now_secs: u64,
     ) -> bool {
-        let Ok(arc) = self.get_context_arc(context_id) else {
-            return true;
-        };
-        let mut guard = arc.lock().await;
-        let ctx = &mut *guard;
-        ctx.governance.hard_rate_limit.try_consume(did, now_secs)
+        crate::context::tools_helpers::try_consume_hard_rate_limit(self, context_id, did, now_secs)
+            .await
     }
 
     /// Async refund. No-op if the context is unknown.
-    #[allow(clippy::significant_drop_tightening)]
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::tools_helpers::refund_hard_rate_limit`] free
+    /// function (ADR-049 commit 12c.4).
     pub async fn refund_hard_rate_limit(&self, context_id: &str, did: &DID) {
-        if let Ok(ctx_arc) = self.get_context_arc(context_id) {
-            let guard = ctx_arc.lock().await;
-            let ctx = &*guard;
-            ctx.governance.hard_rate_limit.refund(did);
-        }
+        crate::context::tools_helpers::refund_hard_rate_limit(self, context_id, did).await;
     }
 
     /// Runtime-agnostic hard-rate-limit consume for sync bridge trait

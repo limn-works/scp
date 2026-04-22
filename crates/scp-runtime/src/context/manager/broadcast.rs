@@ -1,14 +1,35 @@
 //! Broadcast context operations (subscribe, publish, block).
+//!
+//! # Hoist (ADR-049 commit 12c.4)
+//!
+//! The ten `ContextManager` methods reached by the broadcast actor handler
+//! (`subscribe_broadcast`, `unsubscribe_broadcast`, `publish_broadcast`,
+//! `publish_broadcast_content`, `block_broadcast_subscriber`,
+//! `unblock_broadcast_subscriber`, `handle_broadcast_key_request`,
+//! `broadcast_subscriber_count`, `is_broadcast_subscriber`,
+//! `broadcast_admission`) now forward to hoisted `pub async fn` free
+//! functions in [`crate::context::broadcast_helpers`]. See the helper
+//! module for the authoritative bodies; the methods here are one-line
+//! forwarders that preserve the legacy `mgr.X(...)` call shape during
+//! the commits-10-to-12 shim window.
 
-use super::{
-    BlockResult, BroadcastAdmission, BroadcastContent, BroadcastContext, BroadcastEnvelope,
-    BuildHasher, Capability, ContextError, ContextEvent, ContextManager, DID, DidResolver,
-    KeyRequestDecision, NonceTracker, ProofResolver, RevocationChecker, SubscriptionResult,
-    UcanToken, UnsubscribeResult, ValidationContext, context_id_to_bytes, instrument,
-    require_active, serialize_broadcast_content,
+use std::hash::BuildHasher;
+
+use scp_identity::DID;
+use scp_protocol::context::ContextError;
+use scp_protocol::context::broadcast::{
+    BlockResult, BroadcastAdmission, KeyRequestDecision, SubscriptionResult, UnsubscribeResult,
 };
+use scp_protocol::context::broadcast_content::BroadcastContent;
+use scp_protocol::crypto::sender_keys::BroadcastEnvelope;
+use scp_protocol::crypto::ucan::UcanToken;
+use scp_protocol::crypto::ucan::validate::{
+    DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext,
+};
+use tracing::instrument;
 
-#[allow(clippy::significant_drop_tightening)]
+use super::ContextManager;
+
 impl ContextManager {
     /// Subscribes a DID to a broadcast context.
     ///
@@ -19,12 +40,17 @@ impl ContextManager {
     /// Returns the current author key epochs so the subscriber knows which
     /// epochs to request keys for.
     ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::broadcast_helpers::subscribe_broadcast`] free
+    /// function (ADR-049 commit 12c.4).
+    ///
     /// # Errors
     ///
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
     /// - [`ContextError::MembershipFailed`] if the context is not a broadcast
     ///   context or the subscriber is already registered.
     /// - [`ContextError::PermissionDenied`] if the context is gated and no
+    ///   valid `messagesRead` UCAN is supplied.
     #[instrument(skip_all, fields(context_id))]
     pub async fn subscribe_broadcast<D, N, R, P, S>(
         &self,
@@ -41,80 +67,15 @@ impl ContextManager {
         P: ProofResolver + Send + Sync,
         S: BuildHasher + Send + Sync,
     {
-        let context_id_bytes = context_id_to_bytes(context_id);
-
-        let (result, snapshot) = {
-            let ctx_arc = self
-                .get_context_arc(context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut guard = ctx_arc.lock().await;
-            let ctx = &mut *guard;
-
-            require_active(&ctx.handle)?;
-
-            // Version compatibility check (spec §13.4): reject subscribe if the
-            // context requires a protocol version higher than this SDK supports.
-            // Applies to ALL context modes including broadcast.
-            ctx.handle
-                .params()
-                .check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
-
-            let bc = ctx
-                .broadcast_context
-                .as_mut()
-                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
-
-            let result = bc.subscribe(subscriber_did, ucan, timestamp, validation_ctx)?;
-
-            // Take snapshot for persistence before dropping lock (skip if
-            // no persistence provider is configured).
-            let snapshot = if self.has_persistence() {
-                Some(bc.to_snapshot())
-            } else {
-                None
-            };
-
-            // Add subscriber to membership tracking (role = "subscriber").
-            ctx.membership
-                .add_member(subscriber_did.clone(), "subscriber".into(), vec![]);
-
-            // Push event to receive buffer.
-            ctx.emit_event(result.event.clone(), context_id, self.event_tx.as_ref());
-
-            (result, snapshot)
-        };
-        // Lock dropped.
-
-        // Persist broadcast state for crash recovery.
-        if let Some(ref snapshot) = snapshot {
-            self.persist_broadcast_snapshot(context_id, snapshot);
-        }
-
-        // Persist context state after subscribe (best-effort).
-        if self.has_persistence()
-            && let Ok(ctx_arc) = self.get_context_arc(context_id)
-        {
-            let guard = ctx_arc.lock().await;
-            let ctx = &*guard;
-            let ctx_snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(context_id, ctx_snapshot);
-        }
-
-        // Append event to persistent event log.
-        self.event_log.append_context_event(
-            &context_id_bytes,
-            "MemberJoined",
-            subscriber_did.as_ref(),
-        )?;
-        {
-            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
-                let mut guard = ctx_arc.lock().await;
-                let ctx = &mut *guard;
-                ctx.checkpoint_events_since += 1;
-            }
-        }
-
-        Ok(result)
+        crate::context::broadcast_helpers::subscribe_broadcast(
+            self,
+            context_id,
+            subscriber_did,
+            ucan,
+            timestamp,
+            validation_ctx,
+        )
+        .await
     }
 
     /// Unsubscribes a DID from a broadcast context.
@@ -122,6 +83,10 @@ impl ContextManager {
     /// When `rotate_keys` is `true`, all authors rotate their broadcast keys
     /// to ensure forward secrecy (the departed subscriber cannot decrypt
     /// future content).
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::broadcast_helpers::unsubscribe_broadcast`] free
+    /// function (ADR-049 commit 12c.4).
     ///
     /// # Errors
     ///
@@ -135,74 +100,13 @@ impl ContextManager {
         subscriber_did: &DID,
         rotate_keys: bool,
     ) -> Result<UnsubscribeResult, ContextError> {
-        let context_id_bytes = context_id_to_bytes(context_id);
-
-        let (result, snapshot) = {
-            let ctx_arc = self
-                .get_context_arc(context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut guard = ctx_arc.lock().await;
-            let ctx = &mut *guard;
-
-            require_active(&ctx.handle)?;
-
-            let bc = ctx
-                .broadcast_context
-                .as_mut()
-                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
-
-            let result = bc.unsubscribe(subscriber_did, rotate_keys)?;
-
-            // Take snapshot for persistence before dropping lock (skip if
-            // no persistence provider is configured).
-            let snapshot = if self.has_persistence() {
-                Some(bc.to_snapshot())
-            } else {
-                None
-            };
-
-            // Remove from membership tracking.
-            ctx.membership.remove_member(subscriber_did);
-
-            // Emit MemberLeft event to receive buffer.
-            let left_event = ContextEvent::MemberLeft {
-                member_did: subscriber_did.clone(),
-            };
-            ctx.emit_event(left_event, context_id, self.event_tx.as_ref());
-
-            (result, snapshot)
-        };
-        // Lock dropped.
-
-        // Persist broadcast state for crash recovery.
-        if let Some(ref snapshot) = snapshot {
-            self.persist_broadcast_snapshot(context_id, snapshot);
-        }
-
-        // Persist context state after unsubscribe (best-effort).
-        if self.has_persistence()
-            && let Ok(ctx_arc) = self.get_context_arc(context_id)
-        {
-            let guard = ctx_arc.lock().await;
-            let ctx = &*guard;
-            let ctx_snapshot = Self::snapshot_context(ctx);
-            self.persist_context_snapshot(context_id, ctx_snapshot);
-        }
-
-        self.event_log.append_context_event(
-            &context_id_bytes,
-            "MemberLeft",
-            subscriber_did.as_ref(),
-        )?;
-        {
-            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
-                let mut guard = ctx_arc.lock().await;
-                let ctx = &mut *guard;
-                ctx.checkpoint_events_since += 1;
-            }
-        }
-
-        Ok(result)
+        crate::context::broadcast_helpers::unsubscribe_broadcast(
+            self,
+            context_id,
+            subscriber_did,
+            rotate_keys,
+        )
+        .await
     }
 
     /// Publishes a message to a broadcast context.
@@ -214,6 +118,10 @@ impl ContextManager {
     /// This is the broadcast-specific publish path. For a unified API, use
     /// [`send_message`](Self::send_message) which routes to this path
     /// automatically for broadcast contexts.
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::broadcast_helpers::publish_broadcast`] free
+    /// function (ADR-049 commit 12c.4).
     ///
     /// # Errors
     ///
@@ -229,121 +137,15 @@ impl ContextManager {
         custody: &impl scp_platform::KeyCustody,
         signing_key_handle: &scp_platform::KeyHandle,
     ) -> Result<BroadcastEnvelope, ContextError> {
-        let context_id_bytes = context_id_to_bytes(context_id);
-
-        let envelope = {
-            let ctx_arc = self
-                .get_context_arc(context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut guard = ctx_arc.lock().await;
-            let ctx = &mut *guard;
-
-            require_active(&ctx.handle)?;
-
-            // Suspension-aware capability check (§9.17, ADR-038). In
-            // broadcast contexts, authors may be registered with the
-            // BroadcastContext without being members of the role_state, so
-            // we check the suspension overlay directly: only members whose
-            // MessagesWrite capability has been explicitly suspended via
-            // governance Revoke are blocked here. The downstream
-            // `bc.publish` enforces author registration.
-            if ctx
-                .role_state
-                .suspended_capabilities
-                .get(author_did.as_ref())
-                .is_some_and(|s| s.contains(&Capability::MessagesWrite))
-            {
-                return Err(ContextError::PermissionDenied(format!(
-                    "write access has been suspended for {author_did}"
-                )));
-            }
-
-            let bc = ctx
-                .broadcast_context
-                .as_mut()
-                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
-
-            let timestamp = self.clock.now_millis();
-
-            // Compute the signing payload externally so we can sign via
-            // key custody (async) while keeping seal_broadcast synchronous.
-            let meta = bc.publish_metadata(author_did)?;
-            let nonce = scp_protocol::crypto::sender_keys::generate_broadcast_nonce();
-            let provenance_hash = scp_protocol::crypto::sender_keys::compute_provenance_hash(None)
-                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-            let signing_payload =
-                scp_protocol::crypto::sender_keys::build_broadcast_signing_payload(
-                    &scp_protocol::crypto::sender_keys::SigningPayloadFields {
-                        version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
-                        context_id: meta.context_id,
-                        author_did: meta.author_did,
-                        sequence: meta.next_sequence,
-                        key_epoch: meta.key_epoch,
-                        timestamp,
-                        nonce: &nonce,
-                        provenance_hash: &provenance_hash,
-                    },
-                )
-                .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-            // Sign via key custody (async).
-            let platform_sig = custody
-                .sign(signing_key_handle, &signing_payload)
-                .await
-                .map_err(|e| ContextError::CryptoFailed(format!("custody signing failed: {e}")))?;
-            let sig_bytes: [u8; 64] = platform_sig.as_bytes().try_into().map_err(|_| {
-                ContextError::CryptoFailed(format!(
-                    "custody signature has wrong length: expected 64, got {}",
-                    platform_sig.as_bytes().len()
-                ))
-            })?;
-            let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-
-            let envelope = bc.publish(author_did, payload, timestamp, signature, &nonce, None)?;
-
-            // Assign per-sender monotonic sequence number.
-            let seq = ctx
-                .membership
-                .next_sequence_number(author_did)
-                .ok_or_else(|| ContextError::MemberNotFound(author_did.to_string()))?;
-
-            let sent_event = ContextEvent::MessageSent {
-                sender_did: author_did.clone(),
-                sequence_number: seq,
-                payload: payload.to_vec(),
-            };
-            ctx.emit_event(sent_event, context_id, self.event_tx.as_ref());
-
-            envelope
-        };
-        // Lock dropped.
-
-        // Serialize the full BroadcastEnvelope for transport. The relay stores
-        // the entire envelope (not just encrypted_content) so that the node's
-        // projection layer can reconstruct metadata (author_did, key_epoch, etc.)
-        // without decrypting.
-        let envelope_bytes = rmp_serde::to_vec_named(&envelope)
-            .map_err(|e| ContextError::CryptoFailed(format!("envelope serialization: {e}")))?;
-
-        // Send via transport.
-        self.transport
-            .send_message(&context_id_bytes, &envelope_bytes)?;
-
-        // Append event to persistent event log.
-        self.event_log.append_context_event(
-            &context_id_bytes,
-            "MessageSent",
-            author_did.as_ref(),
-        )?;
-        {
-            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
-                let mut guard = ctx_arc.lock().await;
-                let ctx = &mut *guard;
-                ctx.checkpoint_events_since += 1;
-            }
-        }
-
-        Ok(envelope)
+        crate::context::broadcast_helpers::publish_broadcast(
+            self,
+            context_id,
+            author_did,
+            payload,
+            custody,
+            signing_key_handle,
+        )
+        .await
     }
 
     /// Publishes a [`BroadcastContent`] to a broadcast context.
@@ -351,6 +153,10 @@ impl ContextManager {
     /// This is the structured-content publish path. It serializes the
     /// `BroadcastContent` with the magic prefix and delegates to
     /// [`publish_broadcast`](Self::publish_broadcast).
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::broadcast_helpers::publish_broadcast_content`]
+    /// free function (ADR-049 commit 12c.4).
     ///
     /// # Errors
     ///
@@ -367,13 +173,11 @@ impl ContextManager {
         custody: &impl scp_platform::KeyCustody,
         signing_key_handle: &scp_platform::KeyHandle,
     ) -> Result<BroadcastEnvelope, ContextError> {
-        let payload = serialize_broadcast_content(&content).map_err(|e| {
-            ContextError::CryptoFailed(format!("content serialization failed: {e}"))
-        })?;
-        self.publish_broadcast(
+        crate::context::broadcast_helpers::publish_broadcast_content(
+            self,
             context_id,
             author_did,
-            &payload,
+            content,
             custody,
             signing_key_handle,
         )
@@ -388,6 +192,10 @@ impl ContextManager {
     /// to future key requests and cannot decrypt content encrypted with the
     /// new key.
     ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::broadcast_helpers::block_broadcast_subscriber`]
+    /// free function (ADR-049 commit 12c.4).
+    ///
     /// # Errors
     ///
     /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
@@ -400,62 +208,13 @@ impl ContextManager {
         author_did: &DID,
         subscriber_did: &DID,
     ) -> Result<BlockResult, ContextError> {
-        let context_id_bytes = context_id_to_bytes(context_id);
-
-        let (result, snapshot) = {
-            let ctx_arc = self
-                .get_context_arc(context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut guard = ctx_arc.lock().await;
-            let ctx = &mut *guard;
-
-            require_active(&ctx.handle)?;
-
-            let bc = ctx
-                .broadcast_context
-                .as_mut()
-                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
-
-            let result = bc.block_subscriber(author_did, subscriber_did)?;
-
-            // Take snapshot for persistence before dropping lock (skip if
-            // no persistence provider is configured).
-            let snapshot = if self.has_persistence() {
-                Some(bc.to_snapshot())
-            } else {
-                None
-            };
-
-            // Emit block event to receive buffer.
-            let block_event = ContextEvent::MemberBlocked {
-                blocked_did: subscriber_did.clone(),
-                author_did: author_did.clone(),
-            };
-            ctx.emit_event(block_event, context_id, self.event_tx.as_ref());
-
-            (result, snapshot)
-        };
-        // Lock dropped.
-
-        // Persist broadcast state for crash recovery.
-        if let Some(ref snapshot) = snapshot {
-            self.persist_broadcast_snapshot(context_id, snapshot);
-        }
-
-        self.event_log.append_context_event(
-            &context_id_bytes,
-            "MemberBlocked",
-            author_did.as_ref(),
-        )?;
-        {
-            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
-                let mut guard = ctx_arc.lock().await;
-                let ctx = &mut *guard;
-                ctx.checkpoint_events_since += 1;
-            }
-        }
-
-        Ok(result)
+        crate::context::broadcast_helpers::block_broadcast_subscriber(
+            self,
+            context_id,
+            author_did,
+            subscriber_did,
+        )
+        .await
     }
 
     /// Unblocks a previously blocked subscriber in a broadcast context
@@ -465,6 +224,10 @@ impl ContextManager {
     /// Per §9.16.8, the author does NOT rotate their sender key. The
     /// unblocked subscriber can request the current key on next pull but
     /// cannot decrypt content from the block period.
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::broadcast_helpers::unblock_broadcast_subscriber`]
+    /// free function (ADR-049 commit 12c.4).
     ///
     /// # Errors
     ///
@@ -480,61 +243,13 @@ impl ContextManager {
         author_did: &DID,
         subscriber_did: &DID,
     ) -> Result<(), ContextError> {
-        let context_id_bytes = context_id_to_bytes(context_id);
-
-        let snapshot = {
-            let ctx_arc = self
-                .get_context_arc(context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-            let mut guard = ctx_arc.lock().await;
-            let ctx = &mut *guard;
-
-            require_active(&ctx.handle)?;
-
-            let bc = ctx
-                .broadcast_context
-                .as_mut()
-                .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
-
-            let _result = bc.unblock_subscriber(author_did, subscriber_did)?;
-
-            // Take snapshot for persistence before dropping lock.
-            let snapshot = if self.has_persistence() {
-                Some(bc.to_snapshot())
-            } else {
-                None
-            };
-
-            // Emit unblock event to receive buffer.
-            let unblock_event = ContextEvent::MemberUnblocked {
-                unblocked_did: subscriber_did.clone(),
-                author_did: author_did.clone(),
-            };
-            ctx.emit_event(unblock_event, context_id, self.event_tx.as_ref());
-
-            snapshot
-        };
-        // Lock dropped.
-
-        // Persist broadcast state for crash recovery.
-        if let Some(ref snapshot) = snapshot {
-            self.persist_broadcast_snapshot(context_id, snapshot);
-        }
-
-        self.event_log.append_context_event(
-            &context_id_bytes,
-            "MemberUnblocked",
-            author_did.as_ref(),
-        )?;
-        {
-            if let Ok(ctx_arc) = self.get_context_arc(context_id) {
-                let mut guard = ctx_arc.lock().await;
-                let ctx = &mut *guard;
-                ctx.checkpoint_events_since += 1;
-            }
-        }
-
-        Ok(())
+        crate::context::broadcast_helpers::unblock_broadcast_subscriber(
+            self,
+            context_id,
+            author_did,
+            subscriber_did,
+        )
+        .await
     }
 
     /// Evaluates whether a subscriber's broadcast key request should be
@@ -552,12 +267,17 @@ impl ContextManager {
     /// context. Transport-layer auth (spec section 9.16.6) remains the
     /// primary enforcement mechanism; this check is an additional layer.
     ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::broadcast_helpers::handle_broadcast_key_request`]
+    /// free function (ADR-049 commit 12c.4).
+    ///
     /// # Errors
     ///
     /// Returns [`ContextError::PermissionDenied`] if `author_did` is not
     /// registered as a locally controlled DID.
     ///
     /// Returns [`ContextError::MembershipFailed`] if the context is not
+    /// a broadcast context.
     #[instrument(skip_all, fields(context_id))]
     pub async fn handle_broadcast_key_request(
         &self,
@@ -565,62 +285,46 @@ impl ContextManager {
         author_did: &DID,
         requester_did: &DID,
     ) -> Result<KeyRequestDecision, ContextError> {
-        // Defense-in-depth: verify the local SDK controls the author DID.
-        // Transport-layer auth (section 9.16.6) is the primary gate; this prevents
-        // misuse if the method is ever called from a different context.
-        if !self.local_dids.read().await.contains(author_did) {
-            return Err(ContextError::PermissionDenied(format!(
-                "author DID is not controlled by the local node: {author_did}"
-            )));
-        }
-
-        let ctx_arc = self
-            .get_context_arc(context_id)
-            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let guard = ctx_arc.lock().await;
-        let ctx = &*guard;
-
-        let bc = ctx
-            .broadcast_context
-            .as_ref()
-            .ok_or_else(|| ContextError::MembershipFailed("not a broadcast context".into()))?;
-
-        Ok(bc.handle_key_request(author_did, requester_did))
+        crate::context::broadcast_helpers::handle_broadcast_key_request(
+            self,
+            context_id,
+            author_did,
+            requester_did,
+        )
+        .await
     }
 
     /// Returns the number of subscribers in a broadcast context.
     ///
     /// Returns `None` if the context is not registered or not broadcast.
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::broadcast_helpers::broadcast_subscriber_count`]
+    /// free function (ADR-049 commit 12c.4).
     #[instrument(skip_all, fields(context_id))]
     pub async fn broadcast_subscriber_count(&self, context_id: &str) -> Option<usize> {
-        let arc = self.get_context_arc(context_id).ok()?;
-        let ctx = arc.lock().await;
-        ctx.broadcast_context
-            .as_ref()
-            .map(BroadcastContext::subscriber_count)
+        crate::context::broadcast_helpers::broadcast_subscriber_count(self, context_id).await
     }
 
     /// Returns `true` if the given DID is a subscriber in a broadcast context.
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::broadcast_helpers::is_broadcast_subscriber`] free
+    /// function (ADR-049 commit 12c.4).
     #[instrument(skip_all, fields(context_id))]
     pub async fn is_broadcast_subscriber(&self, context_id: &str, did: &str) -> bool {
-        let Ok(arc) = self.get_context_arc(context_id) else {
-            return false;
-        };
-        let ctx = arc.lock().await;
-        ctx.broadcast_context
-            .as_ref()
-            .is_some_and(|bc| bc.is_subscriber(did))
+        crate::context::broadcast_helpers::is_broadcast_subscriber(self, context_id, did).await
     }
 
     /// Returns the admission policy for a broadcast context.
     ///
     /// Returns `None` if the context is not registered or not broadcast.
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::broadcast_helpers::broadcast_admission`] free
+    /// function (ADR-049 commit 12c.4).
     #[instrument(skip_all, fields(context_id))]
     pub async fn broadcast_admission(&self, context_id: &str) -> Option<BroadcastAdmission> {
-        let arc = self.get_context_arc(context_id).ok()?;
-        let ctx = arc.lock().await;
-        ctx.broadcast_context
-            .as_ref()
-            .map(BroadcastContext::admission)
+        crate::context::broadcast_helpers::broadcast_admission(self, context_id).await
     }
 }

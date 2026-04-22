@@ -72,9 +72,29 @@ const MANAGER_SRC: &str = concat!(
     // `check_and_resolve_expired_freezes`, `try_broadcast_commit_or_enqueue`,
     // `build_governance_context`). `governance_helpers.rs` is concatenated
     // BEFORE `manager/governance.rs` for the same first-match reason.
+    //
+    // Commit 12c.4 of ADR-049 extends the hoist pattern to the
+    // standing-pair, tools, and broadcast domains: standing
+    // (`standing_context`, `standing_context_count`,
+    // `has_standing_context`, `register_standing_context`,
+    // `reconnect_all_standing`); tools (`try_consume_hard_rate_limit`,
+    // `refund_hard_rate_limit`); broadcast (`subscribe_broadcast`,
+    // `unsubscribe_broadcast`, `publish_broadcast`,
+    // `publish_broadcast_content`, `block_broadcast_subscriber`,
+    // `unblock_broadcast_subscriber`, `handle_broadcast_key_request`,
+    // `broadcast_subscriber_count`, `is_broadcast_subscriber`,
+    // `broadcast_admission`). The three new helper modules
+    // (`standing_helpers.rs`, `tools_helpers.rs`, `broadcast_helpers.rs`)
+    // are concatenated BEFORE their `manager/{standing,tools,broadcast}.rs`
+    // counterparts for the same first-match reason — any pipeline-wiring
+    // assertion that names one of these methods must witness the
+    // hoisted body, not the forwarder.
     include_str!("../../../../crates/scp-runtime/src/context/messaging_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/standing_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/tools_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/broadcast_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/messaging.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/broadcast.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/governance.rs"),

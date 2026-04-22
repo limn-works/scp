@@ -9,7 +9,6 @@
 //! `.docs/adrs/phase-2.md` for the full context lifecycle specification.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::BuildHasher;
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -28,10 +27,15 @@ use super::ttl::{CloseResult, TtlExtension, TtlTimer};
 use scp_identity::DID;
 use scp_primitives::Clock;
 use scp_protocol::context::broadcast::{
-    BlockResult, BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot,
-    GovernanceBanResult, KeyRequestDecision, SubscriptionResult, UnsubscribeResult,
+    BroadcastAdmission, BroadcastContext, BroadcastContextSnapshot, GovernanceBanResult,
 };
-use scp_protocol::context::broadcast_content::{BroadcastContent, serialize_broadcast_content};
+// Re-exported for `manager/tests/{broadcast,queries,trust_recovery}.rs` test
+// modules which reach `super::KeyRequestDecision`. After the broadcast hoist
+// in commit 12c.4 the `manager/mod.rs` `use` for this type went away (the
+// hoisted helpers import directly from `scp_protocol::context::broadcast`),
+// so the test re-export is the only remaining consumer in this module.
+#[cfg(test)]
+pub(crate) use scp_protocol::context::broadcast::KeyRequestDecision;
 use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
 use scp_protocol::context::governance::{
     AccessScope, CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint,
@@ -50,11 +54,6 @@ use scp_protocol::context::roles::{
 };
 use scp_protocol::context::tools::interface::ToolInterface;
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
-use scp_protocol::crypto::sender_keys::BroadcastEnvelope;
-use scp_protocol::crypto::ucan::UcanToken;
-use scp_protocol::crypto::ucan::validate::{
-    DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext,
-};
 use scp_protocol::economy::budget::MemberBudgetTracker;
 use scp_protocol::economy::types::EconomicPolicy;
 use scp_protocol::trust::consequence::{
@@ -3151,6 +3150,20 @@ impl ContextManager {
         &self,
     ) -> Option<&Arc<dyn crate::economy::adapter::PaymentAdapterDyn>> {
         self.payment_adapter.as_ref()
+    }
+
+    /// Cheap reference to the manager's `standing_contexts` map. Used by
+    /// the hoisted `standing_helpers::{standing_context,
+    /// standing_context_count, has_standing_context,
+    /// register_standing_context, reconnect_all_standing}` free functions
+    /// so they can read/mutate the standing-pair tracking map without
+    /// reaching through a private field (ADR-049 commit 12c.4).
+    /// Non-feature-gated — the hoisted free functions are compiled in
+    /// every build configuration. Returns `&Mutex<HashMap<...>>` so
+    /// callers can `lock().await` directly.
+    #[must_use]
+    pub(crate) const fn standing_contexts_ref(&self) -> &Mutex<HashMap<String, DID>> {
+        &self.standing_contexts
     }
 
     // -------------------------------------------------------------------
