@@ -37,7 +37,7 @@
  * See ADR-022 in `.docs/adrs/phase-4.md` and ADR-048.
  */
 
-import { afterAll, beforeAll, describe, expect, it, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -616,8 +616,7 @@ describe("createMockNativeScp / mountMockScp (harness contract)", () => {
 // ---------------------------------------------------------------------------
 
 let napiSkipReason = "";
-let sharedScp: SCP | null = null;
-let sharedRelay: Relay | null = null;
+let napiAvailable = false;
 
 try {
   const probe = new SCP();
@@ -626,47 +625,64 @@ try {
   // bridge is usable.
   if (typeof (probe as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
     napiSkipReason = "SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
-    probe.shutdown(1).catch(() => {});
   } else {
-    sharedScp = probe;
+    napiAvailable = true;
   }
+  // Always shut the probe down — it is disposable and never used by tests.
+  // Fresh `new SCP()` instances are minted per-test in the `beforeEach`
+  // below, so there is no shared NAPI state between tests.
+  probe.shutdown(1).catch(() => {});
 } catch (e: unknown) {
   napiSkipReason = e instanceof Error ? e.message : String(e);
 }
 
 // Only stateful contexts — everything stateless (mock/harness) is unaffected.
-const describeNapi = sharedScp ? describe : describe.skip;
+const describeNapi = napiAvailable ? describe : describe.skip;
 
 describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
-  const scp = sharedScp as SCP;
+  // Per-test isolation (security-reviewer round-1 LOW #3 / #1549):
+  // every test gets a fresh `SCP` + in-memory relay. Tests never share
+  // bridge state, so a stale subscription, residual UCAN nonce, blocked
+  // subscriber, or in-flight relay message cannot influence the
+  // assertions of a subsequent test. The per-test bootstrap measured at
+  // ~1 ms/cycle on the target hardware — negligible next to the ~0.5 s
+  // total suite runtime.
+  //
+  // `scp` is reassigned in `beforeEach`; every nested `it` captures the
+  // current value through the closure `let` binding, so there is no
+  // stale reference even though the block structure still looks shared.
+  let scp: SCP = null as unknown as SCP;
+  let relay: Relay | null = null;
 
-  beforeAll(async () => {
-    // Start an in-memory relay on an ephemeral port and bootstrap
-    // identity + relay-transport so every contextSend / broadcastPublish
-    // publishes encrypted payloads through the relay. Mirrors the
-    // pattern used in `tests/real-napi.test.ts`.
-    sharedRelay = await scp.relayStartInMemory();
+  beforeEach(async () => {
+    // Construct a fresh SCP and in-memory relay. Bootstrap identity +
+    // relay transport so every contextSend / broadcastPublish publishes
+    // encrypted payloads through the relay. Mirrors the pattern used
+    // in `tests/real-napi.test.ts`.
+    scp = new SCP();
+    relay = await scp.relayStartInMemory();
     const bootstrap = await scp.identityCreate("in_memory");
-    await scp.configureRelayTransport(sharedRelay.relayUrl, bootstrap.did);
+    await scp.configureRelayTransport(relay.relayUrl, bootstrap.did);
     // Establish the second relay adapter used by contextSubscribe.
-    await scp.transportConnect(sharedRelay.relayUrl);
+    await scp.transportConnect(relay.relayUrl);
   });
 
-  afterAll(async () => {
-    // Drain pending tasks and release the relay; idempotent if a test
-    // already invoked `shutdown`.
+  afterEach(async () => {
+    // Drain pending tasks and release the relay. Idempotent if a test
+    // already invoked `shutdown` or closed the relay directly.
     try {
-      await scp.shutdown(1);
+      await scp.shutdown(1000);
     } catch {
       // best effort — may already be shut down
     }
-    if (sharedRelay && !sharedRelay.isShutdown) {
+    if (relay && !relay.isShutdown) {
       try {
-        sharedRelay.shutdown();
+        relay.shutdown();
       } catch {
         // best effort
       }
     }
+    relay = null;
   });
 
   // -------------------------------------------------------------------
@@ -740,13 +756,16 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       expect(ok).toBe(false);
     });
 
-    it("scp.identityExecuteCustodyMigration rejects an unknown target", () => {
+    it("scp.identityExecuteCustodyMigration rejects an unknown target", async () => {
       // Target must be one of the documented custody kinds (hardware,
       // platform, software, etc.). Synchronous surface — the bridge
-      // validates before any async work.
-      expect(() =>
-        scp.identityExecuteCustodyMigration("did:dht:z6Nope", "nonexistent", []),
-      ).toThrow(/invalid|unsupported|nonexistent/);
+      // validates before any async work. Use a real identity that this
+      // SCP owns so the DID-ownership gate lets us reach the target
+      // validation branch (post per-test isolation).
+      const identity = await scp.identityCreate("in_memory");
+      expect(() => scp.identityExecuteCustodyMigration(identity.did, "nonexistent", [])).toThrow(
+        /invalid|unsupported|nonexistent/,
+      );
     });
 
     // NAPI `identity_execute_recovery` / `identity_execute_custody_migration`
@@ -754,11 +773,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
     // napi-rs worker thread (no tokio context). Phase 4 PR 5 fix
     // (commit 78102c871) switched both to `crate::runtime().block_on(...)`
     // using the module-local tokio runtime; happy-path calls now succeed.
-    it("scp.identityExecuteRecovery rejects an unknown tier synchronously", () => {
+    it("scp.identityExecuteRecovery rejects an unknown tier synchronously", async () => {
       // Target tier must be one of the spec tiers (agent / active_signing /
       // identity_key). An unknown tier fails at the validation branch
-      // before any async work is driven.
-      expect(() => scp.identityExecuteRecovery("did:dht:z6Nope", "nonexistent-tier", [])).toThrow();
+      // before any async work is driven. Use a real identity so the
+      // DID-ownership gate lets us reach the tier validation branch.
+      const identity = await scp.identityCreate("in_memory");
+      expect(() => scp.identityExecuteRecovery(identity.did, "nonexistent-tier", [])).toThrow();
     });
 
     it("scp.identityExecuteRecovery returns a JSON result on the happy path", async () => {

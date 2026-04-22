@@ -16,7 +16,7 @@
  * If the native addon is not available, all tests are skipped gracefully.
  */
 
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createRequire } from "node:module";
 import type { BridgeMode } from "../src/bridge";
 import { SCP } from "../src/scp";
@@ -42,21 +42,30 @@ type NativeBridge = Awaited<ReturnType<typeof import("../src/internal/bridge").g
 // biome-ignore lint/suspicious/noExplicitAny: the native addon module is untyped
 type NativeAddon = any;
 
-let bridge: NativeBridge | null = null;
-let scp: SCP | null = null;
+// `createNativeBridge` is resolved once at module load so `beforeEach` can
+// mint a fresh bridge/SCP pair per test without the async-import penalty.
+let createNativeBridge:
+  | ((scp: SCP) => ReturnType<typeof import("../src/internal/native").createNativeBridge>)
+  | null = null;
 let rawAddon: NativeAddon = null;
 let skipReason = "";
+let napiAvailable = false;
 
 try {
-  // Attempt to load the native bridge synchronously to detect availability.
-  const { createNativeBridge } = await import("../src/internal/native.js");
-  scp = new SCP();
-  bridge = createNativeBridge(scp);
-  if (typeof (scp as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
+  // Resolve the SDK bridge factory and probe the SCP class for the
+  // Phase 4 surface. The probe SCP is discarded immediately — each test
+  // will mint its own.
+  ({ createNativeBridge } = await import("../src/internal/native.js"));
+  const probe = new SCP();
+  if (typeof (probe as unknown as Record<string, unknown>).relayStartInMemory !== "function") {
     skipReason = "SCP missing relayStartInMemory — rebuild with the Phase 4 changes";
-    bridge = null;
-    scp = null;
+    createNativeBridge = null;
+  } else {
+    napiAvailable = true;
   }
+  // Dispose of the probe so it never leaks state into the per-test
+  // instances bootstrapped in `beforeEach` below.
+  probe.shutdown(1).catch(() => {});
 
   // Also load the raw addon — it still exports the stateless module-level
   // helpers (discovery, bridge_evaluate_trust, bridge_register).
@@ -80,27 +89,41 @@ try {
 }
 
 // When the bridge is unavailable, define a single test that reports the skip.
-if (bridge === null || scp === null || rawAddon === null) {
+if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
   describe("Real NAPI bridge E2E (SKIPPED)", () => {
     test.skip(`all tests skipped: ${skipReason}`, () => {});
   });
 } else {
-  // Capture bridge and SCP in consts for type narrowing.
-  const napi = bridge;
-  const scpInstance = scp;
+  // Capture the add-on and the bridge factory in consts for type narrowing.
   const addon = rawAddon;
+  const makeBridge = createNativeBridge;
 
   // ---------------------------------------------------------------------------
-  // Relay lifecycle state
+  // Per-test isolation state (security-reviewer round-1 LOW #3 / #1549)
   // ---------------------------------------------------------------------------
-
-  // The relay handle is wrapped in the SDK's `Relay` class — minted by
-  // the SCP that owns it — so handle affinity (#1549 Phase 4) rejects
-  // cross-instance use with `SCP-PERM-3030` and everything below
-  // operates against `scpInstance` exclusively.
+  //
+  // Every test gets its own fresh `SCP` + bridge + in-memory relay so no
+  // per-test state (UCAN nonces, blocked subscribers, registered tools,
+  // relay messages, event-log entries) leaks into any subsequent test. The
+  // per-test bootstrap measured at ~1 ms/cycle on the target hardware —
+  // negligible next to the suite's overall runtime.
+  //
+  // `scp`, `napi`, and `relayHandle` are reassigned in `beforeEach`; every
+  // nested `test` captures the current values through the closure `let`
+  // bindings, so there is no stale reference even though the block
+  // structure still looks shared.
+  let scpInstance: SCP = null as unknown as SCP;
+  let napi: NativeBridge = null as unknown as NativeBridge;
   let relayHandle: Relay | null = null;
 
-  beforeAll(async () => {
+  beforeEach(async () => {
+    // Construct a fresh SCP + bridge per test. The bridge handle
+    // affinity guard (#1549 Phase 4) ensures the new bridge only
+    // accepts handles minted by this SCP — cross-instance reuse
+    // from an earlier test would be rejected with SCP-PERM-3030.
+    scpInstance = new SCP();
+    napi = makeBridge(scpInstance);
+
     // Start an in-memory relay on an ephemeral port. Post-ADR-048 this
     // is a first-class method on the SDK's `SCP` class that returns a
     // `Relay` wrapper around the raw native handle.
@@ -130,11 +153,7 @@ if (bridge === null || scp === null || rawAddon === null) {
     await napi.transportConnect(handle.relayUrl);
   });
 
-  // ---------------------------------------------------------------------------
-  // Lifecycle hooks
-  // ---------------------------------------------------------------------------
-
-  afterAll(async () => {
+  afterEach(async () => {
     // Shutdown timeout is in milliseconds after #1549 Phase 4 unit
     // unification — 1000 ms (1 second) gives pending tasks time to
     // drain without stalling the suite. `napi.shutdown` is the `Bridge`
@@ -145,10 +164,19 @@ if (bridge === null || scp === null || rawAddon === null) {
     // The shutdown call goes through the single `SCP` instance that
     // owns every handle minted above, so the suite never risks
     // cross-instance affinity rejections (`SCP-PERM-3030`).
-    await napi.shutdown(1000);
-    if (relayHandle && !relayHandle.isShutdown) {
-      await relayHandle.shutdown();
+    try {
+      await napi.shutdown(1000);
+    } catch {
+      // best effort — tests may have already invoked shutdown
     }
+    if (relayHandle && !relayHandle.isShutdown) {
+      try {
+        await relayHandle.shutdown();
+      } catch {
+        // best effort
+      }
+    }
+    relayHandle = null;
   });
 
   // ---------------------------------------------------------------------------
