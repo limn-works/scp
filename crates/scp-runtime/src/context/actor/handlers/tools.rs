@@ -112,7 +112,9 @@ async fn handle_try_consume_hard_rate_limit(
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let consume_fut = manager.try_consume_hard_rate_limit(context_id, did, now_secs);
+    let consume_fut = crate::context::tools_helpers::try_consume_hard_rate_limit(
+        &manager, context_id, did, now_secs,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, consume_fut).await {
         Ok(consumed) => {
@@ -151,7 +153,8 @@ async fn handle_refund_hard_rate_limit(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let refund_fut = manager.refund_hard_rate_limit(context_id, did);
+    let refund_fut =
+        crate::context::tools_helpers::refund_hard_rate_limit(&manager, context_id, did);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, refund_fut).await {
         Ok(()) => (Outcome::ok_mutated(()), Ok(())),

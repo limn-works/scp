@@ -212,21 +212,21 @@ async fn handle_subscribe_broadcast(
         // mailbox. The no-op turbofish types satisfy the legacy
         // method's generic bounds; passing `None` for the optional
         // `validation_ctx` argument short-circuits the full pipeline.
-        manager
-            .subscribe_broadcast::<
-                NoopDidResolver,
-                NoopNonceTracker,
-                NoopRevocationChecker,
-                NoopProofResolver,
-                std::collections::hash_map::RandomState,
-            >(
-                &p.context_id,
-                &p.subscriber_did,
-                p.ucan.as_ref(),
-                p.timestamp,
-                None,
-            )
-            .await
+        crate::context::broadcast_helpers::subscribe_broadcast::<
+            NoopDidResolver,
+            NoopNonceTracker,
+            NoopRevocationChecker,
+            NoopProofResolver,
+            std::collections::hash_map::RandomState,
+        >(
+            &manager,
+            &p.context_id,
+            &p.subscriber_did,
+            p.ucan.as_ref(),
+            p.timestamp,
+            None,
+        )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, subscribe_fut).await {
@@ -257,9 +257,13 @@ async fn handle_unsubscribe_broadcast(
     let context_id = p.context_id.clone();
 
     let unsub_fut = async move {
-        manager
-            .unsubscribe_broadcast(&p.context_id, &p.subscriber_did, p.rotate_keys)
-            .await
+        crate::context::broadcast_helpers::unsubscribe_broadcast(
+            &manager,
+            &p.context_id,
+            &p.subscriber_did,
+            p.rotate_keys,
+        )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, unsub_fut).await {
@@ -290,7 +294,8 @@ async fn handle_publish_broadcast<C: KeyCustody>(
     let manager = std::sync::Arc::clone(view.manager());
     let context_id = p.context_id.clone();
 
-    let publish_fut = manager.publish_broadcast(
+    let publish_fut = crate::context::broadcast_helpers::publish_broadcast(
+        &manager,
         &p.context_id,
         &p.author_did,
         &p.payload,
@@ -326,7 +331,8 @@ async fn handle_publish_broadcast_content<C: KeyCustody>(
     let manager = std::sync::Arc::clone(view.manager());
     let context_id = p.context_id.clone();
 
-    let publish_fut = manager.publish_broadcast_content(
+    let publish_fut = crate::context::broadcast_helpers::publish_broadcast_content(
+        &manager,
         &p.context_id,
         &p.author_did,
         p.content,
@@ -362,9 +368,13 @@ async fn handle_block_broadcast_subscriber(
     let context_id = p.context_id.clone();
 
     let block_fut = async move {
-        manager
-            .block_broadcast_subscriber(&p.context_id, &p.author_did, &p.subscriber_did)
-            .await
+        crate::context::broadcast_helpers::block_broadcast_subscriber(
+            &manager,
+            &p.context_id,
+            &p.author_did,
+            &p.subscriber_did,
+        )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, block_fut).await {
@@ -395,9 +405,13 @@ async fn handle_unblock_broadcast_subscriber(
     let context_id = p.context_id.clone();
 
     let unblock_fut = async move {
-        manager
-            .unblock_broadcast_subscriber(&p.context_id, &p.author_did, &p.subscriber_did)
-            .await
+        crate::context::broadcast_helpers::unblock_broadcast_subscriber(
+            &manager,
+            &p.context_id,
+            &p.author_did,
+            &p.subscriber_did,
+        )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, unblock_fut).await {
@@ -427,7 +441,12 @@ async fn handle_handle_broadcast_key_request(
     reply: HandleBroadcastKeyRequestReply,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let key_req_fut = manager.handle_broadcast_key_request(context_id, author_did, requester_did);
+    let key_req_fut = crate::context::broadcast_helpers::handle_broadcast_key_request(
+        &manager,
+        context_id,
+        author_did,
+        requester_did,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, key_req_fut).await {
         Ok(Ok(decision)) => (Outcome::ok(()), Ok(decision)),
@@ -454,7 +473,8 @@ async fn handle_broadcast_subscriber_count(
     reply: oneshot::Sender<Result<Option<usize>, ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let count_fut = manager.broadcast_subscriber_count(context_id);
+    let count_fut =
+        crate::context::broadcast_helpers::broadcast_subscriber_count(&manager, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, count_fut).await {
         Ok(count) => (Outcome::ok(()), Ok(count)),
@@ -478,7 +498,8 @@ async fn handle_is_broadcast_subscriber(
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let is_fut = manager.is_broadcast_subscriber(context_id, did);
+    let is_fut =
+        crate::context::broadcast_helpers::is_broadcast_subscriber(&manager, context_id, did);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, is_fut).await {
         Ok(is) => (Outcome::ok(()), Ok(is)),
@@ -501,7 +522,8 @@ async fn handle_broadcast_admission(
     reply: BroadcastAdmissionReply,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let admission_fut = manager.broadcast_admission(context_id);
+    let admission_fut =
+        crate::context::broadcast_helpers::broadcast_admission(&manager, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, admission_fut).await {
         Ok(admission) => (Outcome::ok(()), Ok(admission)),

@@ -199,8 +199,13 @@ async fn handle_create_context(
     reply: CreateContextReply,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let create_fut =
-        manager.create_context(context_id.clone(), params, creator_did, local_pseudonym);
+    let create_fut = crate::context::lifecycle_helpers::create_context(
+        &manager,
+        context_id.clone(),
+        params,
+        creator_did,
+        local_pseudonym,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, create_fut).await {
         Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),
@@ -255,7 +260,13 @@ async fn handle_join_context(
         return Outcome::err(sketch);
     }
 
-    let join_fut = manager.join_context(&handle, key_package, spending_ucan, local_pseudonym);
+    let join_fut = crate::context::lifecycle_helpers::join_context(
+        &manager,
+        &handle,
+        key_package,
+        spending_ucan,
+        local_pseudonym,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, join_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
@@ -299,7 +310,12 @@ async fn handle_leave_context(
         return Outcome::err(sketch);
     }
 
-    let leave_fut = manager.leave_context(&handle, &caller_did, &member_did);
+    let leave_fut = crate::context::lifecycle_helpers::leave_context(
+        &manager,
+        &handle,
+        &caller_did,
+        &member_did,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, leave_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
@@ -345,7 +361,8 @@ async fn handle_close_context(
         return Outcome::err(sketch);
     }
 
-    let close_fut = manager.close_context(&handle, &initiator_did);
+    let close_fut =
+        crate::context::lifecycle_helpers::close_context(&manager, &handle, &initiator_did);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, close_fut).await {
         Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
@@ -377,7 +394,8 @@ async fn handle_export_context(
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
 
-    let export_fut = manager.export_context(&context_id, exporter_did);
+    let export_fut =
+        crate::context::lifecycle_helpers::export_context(&manager, &context_id, exporter_did);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, export_fut).await {
         Ok(Ok(export)) => (Outcome::ok(()), Ok(export)),
@@ -416,7 +434,9 @@ async fn handle_import_context(
     // hoisted `lifecycle_helpers::import_context` body's 12 KB+ locals
     // do not inflate `handle_import_context`'s own future past clippy's
     // 16 KB stack budget (ADR-049 commit 12c.2).
-    let import_fut = Box::pin(manager.import_context(*export));
+    let import_fut = Box::pin(crate::context::lifecycle_helpers::import_context(
+        &manager, *export,
+    ));
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, import_fut).await {
         Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),

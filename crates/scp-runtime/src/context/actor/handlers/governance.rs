@@ -219,12 +219,15 @@ async fn handle_propose_governance_action(
     // hoist tightened some call-graph futures adjacent to the governance
     // path). Boxing moves the state onto the heap.
     let propose_fut = async move {
-        Box::pin(manager.propose_governance_action(
-            &p.context_id,
-            &p.proposer_did,
-            p.action,
-            &signing_key,
-        ))
+        Box::pin(
+            crate::context::governance_helpers::propose_governance_action(
+                &manager,
+                &p.context_id,
+                &p.proposer_did,
+                p.action,
+                &signing_key,
+            ),
+        )
         .await
     };
 
@@ -265,12 +268,15 @@ async fn handle_propose_governance_action_checked(
     // Box::pin — see the rationale on the sibling
     // `handle_propose_governance_action`.
     let propose_fut = async move {
-        Box::pin(manager.propose_governance_action_checked(
-            &p.context_id,
-            &p.proposer_did,
-            p.action,
-            &signing_key,
-        ))
+        Box::pin(
+            crate::context::governance_helpers::propose_governance_action_checked(
+                &manager,
+                &p.context_id,
+                &p.proposer_did,
+                p.action,
+                &signing_key,
+            ),
+        )
         .await
     };
 
@@ -313,7 +319,8 @@ async fn handle_vote_on_proposal(
     // the 12c.3b hoist; boxing inside the `async move` keeps the
     // heap allocation per-call rather than per-handler.
     let vote_fut = async move {
-        Box::pin(manager.vote_on_proposal(
+        Box::pin(crate::context::governance_helpers::vote_on_proposal(
+            &manager,
             &p.context_id,
             &p.proposal_id,
             &p.voter_did,
@@ -360,12 +367,15 @@ async fn handle_approve_governance_proposal(
 
     // Box::pin — see sibling `handle_propose_governance_action`.
     let approve_fut = async move {
-        Box::pin(manager.approve_governance_proposal(
-            &p.context_id,
-            &p.proposal_id,
-            &p.voter_did,
-            &signing_key,
-        ))
+        Box::pin(
+            crate::context::governance_helpers::approve_governance_proposal(
+                &manager,
+                &p.context_id,
+                &p.proposal_id,
+                &p.voter_did,
+                &signing_key,
+            ),
+        )
         .await
     };
 
@@ -406,12 +416,15 @@ async fn handle_reject_governance_proposal(
 
     // Box::pin — see sibling `handle_propose_governance_action`.
     let reject_fut = async move {
-        Box::pin(manager.reject_governance_proposal(
-            &p.context_id,
-            &p.proposal_id,
-            &p.voter_did,
-            &signing_key,
-        ))
+        Box::pin(
+            crate::context::governance_helpers::reject_governance_proposal(
+                &manager,
+                &p.context_id,
+                &p.proposal_id,
+                &p.voter_did,
+                &signing_key,
+            ),
+        )
         .await
     };
 
@@ -448,7 +461,12 @@ async fn handle_withdraw_governance_vote(
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let withdraw_fut = manager.withdraw_governance_vote(context_id, proposal_id, voter_did);
+    let withdraw_fut = crate::context::governance_helpers::withdraw_governance_vote(
+        &manager,
+        context_id,
+        proposal_id,
+        voter_did,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, withdraw_fut).await {
         Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok(status)),
@@ -482,9 +500,12 @@ async fn handle_execute_governance_action(
     let proposal = p.proposal;
 
     let execute_fut = async move {
-        manager
-            .execute_governance_action(&p.context_id, &proposal)
-            .await
+        crate::context::governance_helpers::execute_governance_action(
+            &manager,
+            &p.context_id,
+            &proposal,
+        )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, execute_fut).await {
@@ -518,7 +539,8 @@ async fn handle_get_proposal(
     >,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let get_fut = manager.get_proposal(context_id, proposal_id);
+    let get_fut =
+        crate::context::governance_helpers::get_proposal(&manager, context_id, proposal_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, get_fut).await {
         Ok(Ok(proposal)) => (Outcome::ok(()), Ok(proposal)),
@@ -551,7 +573,7 @@ async fn handle_list_proposals(
     >,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let list_fut = manager.list_proposals(context_id);
+    let list_fut = crate::context::governance_helpers::list_proposals(&manager, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, list_fut).await {
         Ok(Ok(proposals)) => (Outcome::ok(()), Ok(proposals)),
@@ -583,7 +605,11 @@ async fn handle_apply_pending_ceiling_modification(
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let apply_fut = manager.apply_pending_ceiling_modification(context_id, current_timestamp);
+    let apply_fut = crate::context::governance_helpers::apply_pending_ceiling_modification(
+        &manager,
+        context_id,
+        current_timestamp,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, apply_fut).await {
         Ok(Ok(applied)) => {
@@ -623,7 +649,11 @@ async fn handle_apply_pending_economic_policy_change(
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let apply_fut = manager.apply_pending_economic_policy_change(context_id, current_timestamp);
+    let apply_fut = crate::context::governance_helpers::apply_pending_economic_policy_change(
+        &manager,
+        context_id,
+        current_timestamp,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, apply_fut).await {
         Ok(Ok(applied)) => {
@@ -661,7 +691,8 @@ async fn handle_tombstone_migrated_context(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let tombstone_fut = manager.tombstone_migrated_context(context_id);
+    let tombstone_fut =
+        crate::context::governance_helpers::tombstone_migrated_context(&manager, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, tombstone_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
@@ -694,7 +725,7 @@ async fn handle_migration_state(
     reply: oneshot::Sender<Result<Option<crate::context::manager::MigrationState>, ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let migration_fut = manager.migration_state(context_id);
+    let migration_fut = crate::context::governance_helpers::migration_state(&manager, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, migration_fut).await {
         Ok(state) => (Outcome::ok(()), Ok(state)),
@@ -720,7 +751,8 @@ async fn handle_acknowledge_commit_fault(
     reply: oneshot::Sender<Result<crate::context::manager::CommitFaultMarker, ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let ack_fut = manager.acknowledge_commit_fault(context_id);
+    let ack_fut =
+        crate::context::governance_helpers::acknowledge_commit_fault(&manager, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, ack_fut).await {
         Ok(Ok(marker)) => (Outcome::ok_mutated(()), Ok(marker)),

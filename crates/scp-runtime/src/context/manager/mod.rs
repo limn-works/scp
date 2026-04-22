@@ -3173,8 +3173,10 @@ impl ContextManager {
 
     /// Legacy one-line forwarder to the hoisted
     /// [`crate::context::lifecycle_helpers::start_ttl_timer`] free
-    /// function (ADR-049 commit 12c.2). Deleted in a later commit
-    /// alongside every other `ContextManager` lifecycle surface.
+    /// function (ADR-049 commit 12c.2). Retained for signature
+    /// stability during the migration window; deleted in a later
+    /// commit alongside every other `ContextManager` lifecycle surface.
+    #[allow(dead_code)] // Forwarder preserved for symmetry; see doc comment.
     pub(crate) async fn start_ttl_timer(
         &self,
         context_id: &str,

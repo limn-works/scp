@@ -121,7 +121,9 @@ async fn handle_standing_context(
     reply: oneshot::Sender<Result<String, ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let standing_fut = async move { manager.standing_context(&local_did, &peer_did).await };
+    let standing_fut = async move {
+        crate::context::standing_helpers::standing_context(&manager, &local_did, &peer_did).await
+    };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, standing_fut).await {
         Ok(Ok(ctx_id)) => (Outcome::ok_mutated(()), Ok(ctx_id)),
@@ -148,7 +150,7 @@ async fn handle_standing_context_count(
     reply: oneshot::Sender<Result<usize, ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let count_fut = manager.standing_context_count();
+    let count_fut = crate::context::standing_helpers::standing_context_count(&manager);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, count_fut).await {
         Ok(count) => (Outcome::ok(()), Ok(count)),
@@ -172,7 +174,9 @@ async fn handle_has_standing_context(
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let has_fut = async move { manager.has_standing_context(&peer_did).await };
+    let has_fut = async move {
+        crate::context::standing_helpers::has_standing_context(&manager, &peer_did).await
+    };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, has_fut).await {
         Ok(has) => (Outcome::ok(()), Ok(has)),
@@ -198,7 +202,9 @@ async fn handle_register_standing_context(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let register_fut = async move { manager.register_standing_context(peer_did).await };
+    let register_fut = async move {
+        crate::context::standing_helpers::register_standing_context(&manager, peer_did).await;
+    };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, register_fut).await {
         Ok(()) => (Outcome::ok_mutated(()), Ok(())),
@@ -223,7 +229,8 @@ async fn handle_reconnect_all_standing(
     reply: oneshot::Sender<Result<usize, ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let reconnect_fut = async move { manager.reconnect_all_standing().await };
+    let reconnect_fut =
+        async move { crate::context::standing_helpers::reconnect_all_standing(&manager).await };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reconnect_fut).await {
         Ok(Ok(count)) => (Outcome::ok_mutated(()), Ok(count)),

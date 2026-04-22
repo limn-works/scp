@@ -149,7 +149,8 @@ async fn handle_start_ttl_timer(
         return Outcome::err(sketch);
     }
 
-    let spawn_fut = manager.start_ttl_timer(&context_id, duration, handle);
+    let spawn_fut =
+        crate::context::lifecycle_helpers::start_ttl_timer(&manager, &context_id, duration, handle);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, spawn_fut).await {
         Ok(()) => (Outcome::ok_mutated(()), Ok(())),
@@ -177,7 +178,12 @@ async fn handle_extend_ttl(
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let extend_fut = manager.propose_ttl_extension(&context_id, &member_did, proposed_duration);
+    let extend_fut = crate::context::lifecycle_helpers::propose_ttl_extension(
+        &manager,
+        &context_id,
+        &member_did,
+        proposed_duration,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, extend_fut).await {
         Ok(Ok(unanimous)) => (Outcome::ok_mutated(()), Ok(unanimous)),
@@ -220,7 +226,12 @@ async fn handle_reset_ttl_timer(
         return Outcome::err(sketch);
     }
 
-    let reset_fut = manager.reset_ttl_timer(&context_id, new_duration, handle);
+    let reset_fut = crate::context::lifecycle_helpers::reset_ttl_timer(
+        &manager,
+        &context_id,
+        new_duration,
+        handle,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reset_fut).await {
         Ok(()) => (Outcome::ok_mutated(()), Ok(())),
@@ -258,7 +269,7 @@ async fn handle_execute_ttl_close(
         return Outcome::err(sketch);
     }
 
-    let expiry_fut = manager.handle_ttl_expiry(&handle);
+    let expiry_fut = crate::context::lifecycle_helpers::handle_ttl_expiry(&manager, &handle);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, expiry_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
@@ -300,7 +311,7 @@ async fn handle_finalize_close(
         return Outcome::err(sketch);
     }
 
-    let finalize_fut = manager.finalize_close(&handle);
+    let finalize_fut = crate::context::lifecycle_helpers::finalize_close(&manager, &handle);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, finalize_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),

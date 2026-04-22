@@ -122,18 +122,18 @@ async fn handle_create_governance_checkpoint(
     let context_id = p.context_id.clone();
 
     let create_fut = async move {
-        manager
-            .create_governance_checkpoint(
-                &p.context_id,
-                p.checkpoint_seq,
-                p.merkle_root,
-                p.event_count,
-                p.last_event_hash,
-                p.state_snapshot_hash,
-                &p.creator_did,
-                p.creator_signature,
-            )
-            .await
+        crate::context::trust_recovery_helpers::create_governance_checkpoint(
+            &manager,
+            &p.context_id,
+            p.checkpoint_seq,
+            p.merkle_root,
+            p.event_count,
+            p.last_event_hash,
+            p.state_snapshot_hash,
+            &p.creator_did,
+            p.creator_signature,
+        )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, create_fut).await {
@@ -177,7 +177,12 @@ async fn handle_add_checkpoint_cosignature(
     >,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let add_fut = manager.add_checkpoint_cosignature(context_id, &mut checkpoint, cosignature);
+    let add_fut = crate::context::trust_recovery_helpers::add_checkpoint_cosignature(
+        &manager,
+        context_id,
+        &mut checkpoint,
+        cosignature,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, add_fut).await {
         Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok((checkpoint, status))),
@@ -213,7 +218,8 @@ async fn handle_recovery_advance_epoch(
     reply: oneshot::Sender<Result<u64, ContextError>>,
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
-    let advance_fut = manager.recovery_advance_epoch(context_id);
+    let advance_fut =
+        crate::context::trust_recovery_helpers::recovery_advance_epoch(&manager, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, advance_fut).await {
         Ok(Ok(epoch)) => (Outcome::ok_mutated(()), Ok(epoch)),
@@ -254,15 +260,15 @@ async fn handle_recovery_send_notification(
     let signing_key = p.signing_key.to_signing_key();
 
     let send_fut = async move {
-        manager
-            .recovery_send_notification(
-                &p.context_id,
-                &p.sender_did,
-                &p.payload,
-                p.sequence,
-                &signing_key,
-            )
-            .await
+        crate::context::trust_recovery_helpers::recovery_send_notification(
+            &manager,
+            &p.context_id,
+            &p.sender_did,
+            &p.payload,
+            p.sequence,
+            &signing_key,
+        )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {
@@ -300,9 +306,14 @@ async fn handle_recovery_notify_contact(
     let signing_key = p.signing_key.to_signing_key();
 
     let notify_fut = async move {
-        manager
-            .recovery_notify_contact(&p.recovering_did, &p.contact_did, &p.payload, &signing_key)
-            .await
+        crate::context::trust_recovery_helpers::recovery_notify_contact(
+            &manager,
+            &p.recovering_did,
+            &p.contact_did,
+            &p.payload,
+            &signing_key,
+        )
+        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, notify_fut).await {

@@ -193,7 +193,10 @@ async fn handle_send_message(
     // command.
     let sk = signing_key.map(crate::context::actor::commands::SigningKeyBytes::to_signing_key);
     let sk_ref = sk.as_ref();
-    let send_fut = manager.send_message(
+    let send_fut = crate::context::messaging_helpers::send_message(
+        &manager,
+        manager.clock_ref(),
+        manager.key_resolver_ref(),
         &handle,
         sender_did,
         payload,
@@ -292,7 +295,13 @@ async fn handle_deliver_incoming(
 ) -> Outcome<()> {
     let manager: std::sync::Arc<crate::context::manager::ContextManager> =
         std::sync::Arc::clone(view.manager());
-    let deliver_fut = manager.deliver_incoming(context_id, envelope_bytes);
+    let deliver_fut = crate::context::messaging_helpers::deliver_incoming(
+        &manager,
+        manager.clock_ref(),
+        manager.key_resolver_ref(),
+        context_id,
+        envelope_bytes,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, deliver_fut).await {
         Ok(Ok(opt)) => (Outcome::ok_mutated(()), Ok(opt)),

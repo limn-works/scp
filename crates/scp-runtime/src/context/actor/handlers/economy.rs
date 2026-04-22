@@ -92,7 +92,7 @@ async fn handle_verify_payment_receipts(
 ) -> Outcome<()> {
     let manager = std::sync::Arc::clone(view.manager());
 
-    let verify_fut = manager.verify_payment_receipts(&receipts);
+    let verify_fut = crate::context::economy_helpers::verify_payment_receipts(&manager, &receipts);
 
     let results = match tokio::time::timeout(HANDLER_TIMEOUT, verify_fut).await {
         Ok(vec) => vec,
