@@ -40,6 +40,7 @@ pub mod manager;
 pub(crate) mod messaging_helpers;
 pub mod policy;
 pub mod providers;
+pub(crate) mod queries_helpers;
 pub(crate) mod standing_helpers;
 pub mod supervisor;
 pub(crate) mod tools_helpers;

@@ -89,12 +89,42 @@ const MANAGER_SRC: &str = concat!(
     // counterparts for the same first-match reason — any pipeline-wiring
     // assertion that names one of these methods must witness the
     // hoisted body, not the forwarder.
+    //
+    // Commit 12c.5 of ADR-049 completes the hoist pattern on the queries
+    // domain — the last hoist before shim deletion + legacy deletion.
+    // `queries_helpers.rs` hoists: local DID management
+    // (`register_local_did`, `is_local_did`); per-context read queries
+    // (`local_pseudonym`, `get_broadcast_key_for_local_author`,
+    // `member_count`, `is_member`, `member_dids`, `member_role`,
+    // `context_params`, `get_role_state`, `pending_commits`,
+    // `commit_fault`); receive buffer + degraded mode
+    // (`drain_events`, `report_degraded_mode`); event log passthrough
+    // (`event_log_entries`); access-key management
+    // (`generate_context_access_key`, `revoke_context_access_key`,
+    // `restore_context_access_key`, `set_access_key`,
+    // `remove_access_key`); test-only accessors (`inject_access_key`,
+    // `get_access_key`, `get_all_access_keys`,
+    // `grant_budget_for_test`, `remaining_budget_for_test`,
+    // `velocity_for_test`); checkpoint operations
+    // (`create_checkpoint_if_due`, `force_create_checkpoint`,
+    // `compare_remote_checkpoint`, and the private `build_checkpoint`
+    // helper); Merkle proof operations (`prove_event_inclusion`,
+    // `prove_event_consistency`, `verify_event_inclusion`,
+    // `verify_event_consistency`, and the private `sync_merkle_tree`
+    // helper). `queries_helpers.rs` is concatenated BEFORE
+    // `manager/queries.rs` for the same first-match reason as the
+    // earlier `*_helpers.rs` additions. `set_payment_adapter` and
+    // `event_log_provider` remain as inherent methods on
+    // `ContextManager` (the former is a `&mut self` one-time setter;
+    // the latter is a pure accessor returning a `&dyn` trait
+    // reference).
     include_str!("../../../../crates/scp-runtime/src/context/messaging_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/standing_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/tools_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/broadcast_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/queries_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/messaging.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/broadcast.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/governance.rs"),
