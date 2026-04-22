@@ -71,7 +71,7 @@ use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
 /// This is idempotent: subsequent calls are no-ops.
 ///
 /// See #311 for the DID resolver unification design.
-fn ensure_did_resolver_initialized(bi: &PyBridgeInstance, handle: tokio::runtime::Handle) {
+fn ensure_did_resolver_initialized_on(bi: &PyBridgeInstance, handle: tokio::runtime::Handle) {
     if crate::runtime::did_resolver(bi).is_some() {
         return;
     }
@@ -678,7 +678,7 @@ impl crate::scp::PyScp {
 
         // Ensure the production DID resolver is initialized on this bridge
         // (idempotent). #311.
-        ensure_did_resolver_initialized(&bi_arc, rt.handle().clone());
+        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone());
 
         py.allow_threads(|| {
             rt.block_on(async {
@@ -770,7 +770,7 @@ impl crate::scp::PyScp {
 
         // Ensure the production DID resolver is initialized on this bridge
         // (idempotent). #311.
-        ensure_did_resolver_initialized(&bi_arc, rt.handle().clone());
+        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone());
 
         py.allow_threads(|| {
             rt.block_on(async {

@@ -1787,7 +1787,7 @@
     },
     {
       "rule_id": "did-resolver-init-on-identity-create",
-      "description": "Every non-WASM bridge's `identity_create` entrypoint must call `ensure_did_resolver_initialized` before returning. The resolver is a global singleton used by UCAN validation (#311); skipping initialization degrades UCAN verification to string-only lookups. WASM is exempt per ADR-034 (BridgeDidResolver stays in-process).",
+      "description": "Every non-WASM bridge's `identity_create` entrypoint must call `ensure_did_resolver_initialized_on` before returning. The resolver is a per-bridge-instance slot used by UCAN validation (#311, ADR-048 renamed the helper from `ensure_did_resolver_initialized` to the `_on` suffix convention for per-instance helpers in Phase 4 PR 5); skipping initialization degrades UCAN verification to string-only lookups. WASM is exempt per ADR-034 (BridgeDidResolver stays in-process).",
       "applies_to": [
         "pyo3",
         "napi",
@@ -1795,19 +1795,19 @@
       ],
       "pattern": {
         "caller_matches": "^(py_)?identity_create$",
-        "required_callee": "ensure_did_resolver_initialized",
+        "required_callee": "ensure_did_resolver_initialized_on",
         "scope": "same-function",
         "min_occurrences": 1
       },
       "evidence": {
         "code_sites": [
-          "crates/scp-ffi/src/identity.rs:577 py_identity_create \u2192 ensure_did_resolver_initialized",
-          "crates/scp-ffi/napi/src/identity.rs:979 identity_create \u2192 ensure_did_resolver_initialized",
-          "crates/scp-ffi/uniffi/src/bridge.rs:2419 identity_create (in-memory arm) \u2192 ensure_did_resolver_initialized"
+          "crates/scp-ffi/src/identity.rs PyScp::identity_create \u2192 ensure_did_resolver_initialized_on",
+          "crates/scp-ffi/napi/src/scp.rs Scp::identity_create \u2192 ensure_did_resolver_initialized_on",
+          "crates/scp-ffi/uniffi/src/bridge.rs Scp::identity_create (in-memory arm) \u2192 ensure_did_resolver_initialized_on"
         ]
       },
       "exemptions": {
-        "wasm": "ADR-034: WASM bridge uses BridgeDidResolver directly (string-only resolver, no tokio runtime) \u2014 no ensure_did_resolver_initialized to precede."
+        "wasm": "ADR-034: WASM bridge uses BridgeDidResolver directly (string-only resolver, no tokio runtime) \u2014 no ensure_did_resolver_initialized_on to precede."
       }
     }
   ]

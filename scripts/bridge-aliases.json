@@ -7,7 +7,8 @@
       "category": "identity",
       "wasm_required": true,
       "pyo3": [
-        "py_identity_create"
+        "py_identity_create",
+        "identity_create"
       ],
       "uniffi": [
         "identity_create"
@@ -24,7 +25,8 @@
       "category": "identity",
       "wasm_required": true,
       "pyo3": [
-        "py_identity_load"
+        "py_identity_load",
+        "identity_load"
       ],
       "uniffi": [
         "identity_load"
@@ -41,7 +43,8 @@
       "category": "identity",
       "wasm_required": true,
       "pyo3": [
-        "py_identity_resolve"
+        "py_identity_resolve",
+        "identity_resolve"
       ],
       "uniffi": [
         "identity_resolve"
@@ -58,7 +61,8 @@
       "category": "identity",
       "wasm_required": true,
       "pyo3": [
-        "py_identity_migrate"
+        "py_identity_migrate",
+        "identity_migrate"
       ],
       "uniffi": [
         "identity_migrate"
@@ -75,7 +79,8 @@
       "category": "identity",
       "wasm_required": true,
       "pyo3": [
-        "py_identity_attest_device"
+        "py_identity_attest_device",
+        "identity_attest_device"
       ],
       "uniffi": [
         "identity_attest_device"
@@ -92,7 +97,8 @@
       "category": "identity",
       "wasm_required": true,
       "pyo3": [
-        "py_identity_verify_device_attestation"
+        "py_identity_verify_device_attestation",
+        "identity_verify_device_attestation"
       ],
       "uniffi": [
         "identity_verify_device_attestation"
@@ -109,7 +115,8 @@
       "category": "context",
       "wasm_required": true,
       "pyo3": [
-        "py_context_create"
+        "py_context_create",
+        "context_create"
       ],
       "uniffi": [
         "context_create"
@@ -126,7 +133,8 @@
       "category": "context",
       "wasm_required": true,
       "pyo3": [
-        "py_context_join"
+        "py_context_join",
+        "context_join"
       ],
       "uniffi": [
         "context_join"
@@ -143,7 +151,8 @@
       "category": "context",
       "wasm_required": true,
       "pyo3": [
-        "py_context_leave"
+        "py_context_leave",
+        "context_leave"
       ],
       "uniffi": [
         "context_leave"
@@ -160,7 +169,8 @@
       "category": "context",
       "wasm_required": true,
       "pyo3": [
-        "py_context_close"
+        "py_context_close",
+        "context_close"
       ],
       "uniffi": [
         "context_close"
@@ -177,7 +187,8 @@
       "category": "context",
       "wasm_required": true,
       "pyo3": [
-        "py_context_send"
+        "py_context_send",
+        "context_send"
       ],
       "uniffi": [
         "context_send"
@@ -195,7 +206,9 @@
       "wasm_required": true,
       "pyo3": [
         "py_context_subscribe",
-        "py_context_receive"
+        "context_subscribe",
+        "py_context_receive",
+        "context_receive"
       ],
       "uniffi": [
         "context_subscribe"
@@ -212,7 +225,8 @@
       "category": "context",
       "wasm_required": true,
       "pyo3": [
-        "py_context_export"
+        "py_context_export",
+        "context_export"
       ],
       "uniffi": [
         "context_export"
@@ -229,7 +243,8 @@
       "category": "context",
       "wasm_required": true,
       "pyo3": [
-        "py_context_import"
+        "py_context_import",
+        "context_import"
       ],
       "uniffi": [
         "context_import"
@@ -246,7 +261,8 @@
       "category": "membership",
       "wasm_required": true,
       "pyo3": [
-        "py_context_member_count"
+        "py_context_member_count",
+        "context_member_count"
       ],
       "uniffi": [
         "context_member_count"
@@ -263,7 +279,8 @@
       "category": "membership",
       "wasm_required": true,
       "pyo3": [
-        "py_context_is_member"
+        "py_context_is_member",
+        "context_is_member"
       ],
       "uniffi": [
         "context_is_member"
@@ -280,7 +297,8 @@
       "category": "membership",
       "wasm_required": true,
       "pyo3": [
-        "py_context_member_dids"
+        "py_context_member_dids",
+        "context_member_dids"
       ],
       "uniffi": [
         "context_member_dids"
@@ -297,7 +315,8 @@
       "category": "membership",
       "wasm_required": true,
       "pyo3": [
-        "py_context_member_role"
+        "py_context_member_role",
+        "context_member_role"
       ],
       "uniffi": [
         "context_member_role"
@@ -314,7 +333,8 @@
       "category": "events",
       "wasm_required": true,
       "pyo3": [
-        "py_context_drain_events"
+        "py_context_drain_events",
+        "context_drain_events"
       ],
       "uniffi": [
         "context_drain_events"
@@ -331,7 +351,8 @@
       "category": "governance",
       "wasm_required": true,
       "pyo3": [
-        "py_governance_execute"
+        "py_governance_execute",
+        "governance_execute"
       ],
       "uniffi": [
         "governance_execute"
@@ -350,7 +371,8 @@
       "category": "tools",
       "wasm_required": true,
       "pyo3": [
-        "py_tool_register"
+        "py_tool_register",
+        "tool_register"
       ],
       "uniffi": [
         "tool_register"
@@ -367,7 +389,8 @@
       "category": "tools",
       "wasm_required": true,
       "pyo3": [
-        "py_tool_invoke"
+        "py_tool_invoke",
+        "tool_invoke"
       ],
       "uniffi": [
         "tool_invoke"
@@ -384,7 +407,8 @@
       "category": "tools",
       "wasm_required": true,
       "pyo3": [
-        "py_tool_verify"
+        "py_tool_verify",
+        "tool_verify"
       ],
       "uniffi": [
         "tool_verify"
@@ -401,7 +425,8 @@
       "category": "tools",
       "wasm_required": false,
       "pyo3": [
-        "py_tool_invoke_cross_context"
+        "py_tool_invoke_cross_context",
+        "tool_invoke_cross_context"
       ],
       "uniffi": [
         "tool_invoke_cross_context"
@@ -418,7 +443,8 @@
       "category": "tools",
       "wasm_required": false,
       "pyo3": [
-        "py_tool_session_create"
+        "py_tool_session_create",
+        "tool_session_create"
       ],
       "uniffi": [
         "tool_session_create"
@@ -435,7 +461,8 @@
       "category": "tools",
       "wasm_required": false,
       "pyo3": [
-        "py_tool_session_invoke"
+        "py_tool_session_invoke",
+        "tool_session_invoke"
       ],
       "uniffi": [
         "tool_session_invoke"
@@ -452,7 +479,8 @@
       "category": "tools",
       "wasm_required": false,
       "pyo3": [
-        "py_tool_session_close"
+        "py_tool_session_close",
+        "tool_session_close"
       ],
       "uniffi": [
         "tool_session_close"
@@ -469,7 +497,8 @@
       "category": "ucan",
       "wasm_required": true,
       "pyo3": [
-        "py_ucan_validate"
+        "py_ucan_validate",
+        "ucan_validate"
       ],
       "uniffi": [
         "ucan_validate"
@@ -486,7 +515,8 @@
       "category": "ucan",
       "wasm_required": true,
       "pyo3": [
-        "py_ucan_mint"
+        "py_ucan_mint",
+        "ucan_mint"
       ],
       "uniffi": [
         "ucan_mint"
@@ -503,7 +533,8 @@
       "category": "ucan",
       "wasm_required": true,
       "pyo3": [
-        "py_ucan_revoke"
+        "py_ucan_revoke",
+        "ucan_revoke"
       ],
       "uniffi": [
         "ucan_revoke"
@@ -520,7 +551,8 @@
       "category": "ucan",
       "wasm_required": true,
       "pyo3": [
-        "py_ucan_delegate"
+        "py_ucan_delegate",
+        "ucan_delegate"
       ],
       "uniffi": [
         "ucan_delegate"
@@ -537,7 +569,8 @@
       "category": "event_log",
       "wasm_required": true,
       "pyo3": [
-        "py_event_log_query"
+        "py_event_log_query",
+        "event_log_query"
       ],
       "uniffi": [
         "event_log_query"
@@ -554,7 +587,8 @@
       "category": "event_log",
       "wasm_required": true,
       "pyo3": [
-        "py_event_log_verify"
+        "py_event_log_verify",
+        "event_log_verify"
       ],
       "uniffi": [
         "event_log_verify"
@@ -571,7 +605,8 @@
       "category": "event_log",
       "wasm_required": true,
       "pyo3": [
-        "py_event_log_checkpoint"
+        "py_event_log_checkpoint",
+        "event_log_checkpoint"
       ],
       "uniffi": [
         "event_log_checkpoint"
@@ -588,7 +623,8 @@
       "category": "transport",
       "wasm_required": false,
       "pyo3": [
-        "py_transport_connect"
+        "py_transport_connect",
+        "transport_connect"
       ],
       "uniffi": [
         "transport_connect"
@@ -605,7 +641,8 @@
       "category": "transport",
       "wasm_required": false,
       "pyo3": [
-        "py_transport_status"
+        "py_transport_status",
+        "transport_status"
       ],
       "uniffi": [
         "transport_status"
@@ -622,7 +659,8 @@
       "category": "broadcast",
       "wasm_required": true,
       "pyo3": [
-        "py_broadcast_subscribe"
+        "py_broadcast_subscribe",
+        "broadcast_subscribe"
       ],
       "uniffi": [
         "broadcast_subscribe"
@@ -639,7 +677,8 @@
       "category": "broadcast",
       "wasm_required": true,
       "pyo3": [
-        "py_broadcast_unsubscribe"
+        "py_broadcast_unsubscribe",
+        "broadcast_unsubscribe"
       ],
       "uniffi": [
         "broadcast_unsubscribe"
@@ -656,7 +695,8 @@
       "category": "broadcast",
       "wasm_required": true,
       "pyo3": [
-        "py_broadcast_publish"
+        "py_broadcast_publish",
+        "broadcast_publish"
       ],
       "uniffi": [
         "broadcast_publish"
@@ -674,7 +714,9 @@
       "wasm_required": true,
       "pyo3": [
         "py_broadcast_block",
-        "py_broadcast_block_subscriber"
+        "broadcast_block",
+        "py_broadcast_block_subscriber",
+        "broadcast_block_subscriber"
       ],
       "uniffi": [
         "broadcast_block",
@@ -693,7 +735,8 @@
       "category": "trust",
       "wasm_required": true,
       "pyo3": [
-        "py_trust_query_score"
+        "py_trust_query_score",
+        "trust_query_score"
       ],
       "uniffi": [
         "trust_query_score"
@@ -710,7 +753,8 @@
       "category": "trust",
       "wasm_required": true,
       "pyo3": [
-        "py_trust_verify_attestation"
+        "py_trust_verify_attestation",
+        "trust_verify_attestation"
       ],
       "uniffi": [
         "trust_verify_attestation"
@@ -727,7 +771,8 @@
       "category": "trust",
       "wasm_required": true,
       "pyo3": [
-        "py_trust_create_challenge"
+        "py_trust_create_challenge",
+        "trust_create_challenge"
       ],
       "uniffi": [
         "trust_create_challenge"
@@ -744,7 +789,8 @@
       "category": "trust",
       "wasm_required": true,
       "pyo3": [
-        "py_trust_verify_response"
+        "py_trust_verify_response",
+        "trust_verify_response"
       ],
       "uniffi": [
         "trust_verify_response"
@@ -761,7 +807,8 @@
       "category": "trust",
       "wasm_required": true,
       "pyo3": [
-        "py_verify_participation_requirements"
+        "py_verify_participation_requirements",
+        "verify_participation_requirements"
       ],
       "uniffi": [
         "verify_participation_requirements"
@@ -778,7 +825,8 @@
       "category": "sync",
       "wasm_required": true,
       "pyo3": [
-        "py_sync_classify_offline"
+        "py_sync_classify_offline",
+        "sync_classify_offline"
       ],
       "uniffi": [
         "sync_classify_offline"
@@ -795,7 +843,8 @@
       "category": "sync",
       "wasm_required": true,
       "pyo3": [
-        "py_sync_classify_offline_custom"
+        "py_sync_classify_offline_custom",
+        "sync_classify_offline_custom"
       ],
       "uniffi": [
         "sync_classify_offline_custom"
@@ -812,7 +861,8 @@
       "category": "sync",
       "wasm_required": true,
       "pyo3": [
-        "py_sync_get_policy"
+        "py_sync_get_policy",
+        "sync_get_policy"
       ],
       "uniffi": [
         "sync_get_policy"
@@ -829,7 +879,8 @@
       "category": "discovery",
       "wasm_required": true,
       "pyo3": [
-        "py_discovery_parse_address"
+        "py_discovery_parse_address",
+        "discovery_parse_address"
       ],
       "uniffi": [
         "discovery_parse_address"
@@ -846,7 +897,8 @@
       "category": "discovery",
       "wasm_required": true,
       "pyo3": [
-        "py_discovery_normalize_address"
+        "py_discovery_normalize_address",
+        "discovery_normalize_address"
       ],
       "uniffi": [
         "discovery_normalize_address"
@@ -863,7 +915,8 @@
       "category": "provenance",
       "wasm_required": true,
       "pyo3": [
-        "py_provenance_check_chain_depth"
+        "py_provenance_check_chain_depth",
+        "provenance_check_chain_depth"
       ],
       "uniffi": [
         "provenance_check_chain_depth"
@@ -880,7 +933,8 @@
       "category": "provenance",
       "wasm_required": true,
       "pyo3": [
-        "py_evaluate_provenance_quality"
+        "py_evaluate_provenance_quality",
+        "evaluate_provenance_quality"
       ],
       "uniffi": [
         "evaluate_provenance_quality"
@@ -897,7 +951,8 @@
       "category": "provenance",
       "wasm_required": true,
       "pyo3": [
-        "py_provenance_attach"
+        "py_provenance_attach",
+        "provenance_attach"
       ],
       "uniffi": [
         "provenance_attach"
@@ -914,7 +969,8 @@
       "category": "bridge",
       "wasm_required": false,
       "pyo3": [
-        "py_bridge_evaluate_trust"
+        "py_bridge_evaluate_trust",
+        "bridge_evaluate_trust"
       ],
       "uniffi": [
         "bridge_evaluate_trust"
@@ -931,7 +987,8 @@
       "category": "bridge",
       "wasm_required": false,
       "pyo3": [
-        "py_bridge_register"
+        "py_bridge_register",
+        "bridge_register"
       ],
       "uniffi": [
         "bridge_register"
@@ -948,7 +1005,8 @@
       "category": "bridge",
       "wasm_required": false,
       "pyo3": [
-        "py_bridge_create_shadow"
+        "py_bridge_create_shadow",
+        "bridge_create_shadow"
       ],
       "uniffi": [
         "bridge_create_shadow"
@@ -966,7 +1024,9 @@
       "wasm_required": false,
       "pyo3": [
         "py_mcp_server",
-        "py_mcp_serve"
+        "mcp_server",
+        "py_mcp_serve",
+        "mcp_serve"
       ],
       "uniffi": [
         "mcp_server"
@@ -985,7 +1045,9 @@
       "wasm_required": false,
       "pyo3": [
         "py_mcp_client",
-        "py_mcp_client_connect_stdio"
+        "mcp_client",
+        "py_mcp_client_connect_stdio",
+        "mcp_client_connect_stdio"
       ],
       "uniffi": [
         "mcp_client"
@@ -1003,7 +1065,8 @@
       "category": "economy",
       "wasm_required": false,
       "pyo3": [
-        "py_economy_estimate_cost"
+        "py_economy_estimate_cost",
+        "economy_estimate_cost"
       ],
       "uniffi": [
         "economy_estimate_cost"
@@ -1020,7 +1083,8 @@
       "category": "economy",
       "wasm_required": false,
       "pyo3": [
-        "py_economy_policy_requires_payment"
+        "py_economy_policy_requires_payment",
+        "economy_policy_requires_payment"
       ],
       "uniffi": [
         "economy_policy_requires_payment"
@@ -1037,7 +1101,8 @@
       "category": "economy",
       "wasm_required": false,
       "pyo3": [
-        "py_economy_auto_accept_blocked"
+        "py_economy_auto_accept_blocked",
+        "economy_auto_accept_blocked"
       ],
       "uniffi": [
         "economy_auto_accept_blocked"
@@ -1054,7 +1119,8 @@
       "category": "economy",
       "wasm_required": false,
       "pyo3": [
-        "py_economy_check_policy_lock"
+        "py_economy_check_policy_lock",
+        "economy_check_policy_lock"
       ],
       "uniffi": [
         "economy_check_policy_lock"
@@ -1071,7 +1137,8 @@
       "category": "economy",
       "wasm_required": false,
       "pyo3": [
-        "py_economy_validate_policy_change"
+        "py_economy_validate_policy_change",
+        "economy_validate_policy_change"
       ],
       "uniffi": [
         "economy_validate_policy_change"
@@ -1088,7 +1155,8 @@
       "category": "economy",
       "wasm_required": false,
       "pyo3": [
-        "py_economy_evaluate_formula"
+        "py_economy_evaluate_formula",
+        "economy_evaluate_formula"
       ],
       "uniffi": [
         "economy_evaluate_formula"
@@ -1105,7 +1173,8 @@
       "category": "economy",
       "wasm_required": false,
       "pyo3": [
-        "py_economy_budget_remaining"
+        "py_economy_budget_remaining",
+        "economy_budget_remaining"
       ],
       "uniffi": [
         "economy_budget_remaining"
@@ -1122,7 +1191,8 @@
       "category": "economy",
       "wasm_required": false,
       "pyo3": [
-        "py_economy_budget_grant"
+        "py_economy_budget_grant",
+        "economy_budget_grant"
       ],
       "uniffi": [
         "economy_budget_grant"
@@ -1139,7 +1209,8 @@
       "category": "economy",
       "wasm_required": false,
       "pyo3": [
-        "py_economy_budget_record_spend"
+        "py_economy_budget_record_spend",
+        "economy_budget_record_spend"
       ],
       "uniffi": [
         "economy_budget_record_spend"
@@ -1156,7 +1227,8 @@
       "category": "economy",
       "wasm_required": false,
       "pyo3": [
-        "py_economy_antispam_record"
+        "py_economy_antispam_record",
+        "economy_antispam_record"
       ],
       "uniffi": [
         "economy_antispam_record"
@@ -1173,7 +1245,8 @@
       "category": "economy",
       "wasm_required": false,
       "pyo3": [
-        "py_economy_antispam_velocity"
+        "py_economy_antispam_velocity",
+        "economy_antispam_velocity"
       ],
       "uniffi": [
         "economy_antispam_velocity"
@@ -1190,7 +1263,8 @@
       "category": "economy",
       "wasm_required": false,
       "pyo3": [
-        "py_economy_antispam_escalated_cost"
+        "py_economy_antispam_escalated_cost",
+        "economy_antispam_escalated_cost"
       ],
       "uniffi": [
         "economy_antispam_escalated_cost"
@@ -1207,7 +1281,8 @@
       "category": "media",
       "wasm_required": false,
       "pyo3": [
-        "py_media_initiate_session"
+        "py_media_initiate_session",
+        "media_initiate_session"
       ],
       "uniffi": [
         "media_initiate_session"
@@ -1224,7 +1299,8 @@
       "category": "media",
       "wasm_required": false,
       "pyo3": [
-        "py_media_activate_session"
+        "py_media_activate_session",
+        "media_activate_session"
       ],
       "uniffi": [
         "media_activate_session"
@@ -1241,7 +1317,8 @@
       "category": "media",
       "wasm_required": false,
       "pyo3": [
-        "py_media_join_session"
+        "py_media_join_session",
+        "media_join_session"
       ],
       "uniffi": [
         "media_join_session"
@@ -1258,7 +1335,8 @@
       "category": "media",
       "wasm_required": false,
       "pyo3": [
-        "py_media_end_session"
+        "py_media_end_session",
+        "media_end_session"
       ],
       "uniffi": [
         "media_end_session"
@@ -1275,7 +1353,8 @@
       "category": "media",
       "wasm_required": false,
       "pyo3": [
-        "py_media_create_offer"
+        "py_media_create_offer",
+        "media_create_offer"
       ],
       "uniffi": [
         "media_create_offer"
@@ -1292,7 +1371,8 @@
       "category": "media",
       "wasm_required": false,
       "pyo3": [
-        "py_media_create_answer"
+        "py_media_create_answer",
+        "media_create_answer"
       ],
       "uniffi": [
         "media_create_answer"
@@ -1309,7 +1389,8 @@
       "category": "media",
       "wasm_required": false,
       "pyo3": [
-        "py_media_create_ice_candidate"
+        "py_media_create_ice_candidate",
+        "media_create_ice_candidate"
       ],
       "uniffi": [
         "media_create_ice_candidate"
@@ -1326,7 +1407,8 @@
       "category": "media",
       "wasm_required": false,
       "pyo3": [
-        "py_media_create_session_end"
+        "py_media_create_session_end",
+        "media_create_session_end"
       ],
       "uniffi": [
         "media_create_session_end"
@@ -1343,7 +1425,8 @@
       "category": "media",
       "wasm_required": false,
       "pyo3": [
-        "py_media_send_signaling"
+        "py_media_send_signaling",
+        "media_send_signaling"
       ],
       "uniffi": [
         "media_send_signaling"
@@ -1360,7 +1443,8 @@
       "category": "media",
       "wasm_required": false,
       "pyo3": [
-        "py_media_verify_sender_attribution"
+        "py_media_verify_sender_attribution",
+        "media_verify_sender_attribution"
       ],
       "uniffi": [
         "media_verify_sender_attribution"
@@ -1377,7 +1461,8 @@
       "category": "media",
       "wasm_required": false,
       "pyo3": [
-        "py_media_check_capability"
+        "py_media_check_capability",
+        "media_check_capability"
       ],
       "uniffi": [
         "media_check_capability"
@@ -1394,7 +1479,8 @@
       "category": "petname",
       "wasm_required": true,
       "pyo3": [
-        "py_petname_set"
+        "py_petname_set",
+        "petname_set"
       ],
       "uniffi": [
         "petname_set"
@@ -1411,7 +1497,8 @@
       "category": "petname",
       "wasm_required": true,
       "pyo3": [
-        "py_petname_remove"
+        "py_petname_remove",
+        "petname_remove"
       ],
       "uniffi": [
         "petname_remove"
@@ -1428,7 +1515,8 @@
       "category": "petname",
       "wasm_required": true,
       "pyo3": [
-        "py_petname_set_context"
+        "py_petname_set_context",
+        "petname_set_context"
       ],
       "uniffi": [
         "petname_set_context"
@@ -1445,7 +1533,8 @@
       "category": "petname",
       "wasm_required": true,
       "pyo3": [
-        "py_petname_remove_context"
+        "py_petname_remove_context",
+        "petname_remove_context"
       ],
       "uniffi": [
         "petname_remove_context"
@@ -1462,7 +1551,8 @@
       "category": "petname",
       "wasm_required": true,
       "pyo3": [
-        "py_petname_resolve_did"
+        "py_petname_resolve_did",
+        "petname_resolve_did"
       ],
       "uniffi": [
         "petname_resolve_did"
@@ -1479,7 +1569,8 @@
       "category": "petname",
       "wasm_required": true,
       "pyo3": [
-        "py_petname_resolve_context"
+        "py_petname_resolve_context",
+        "petname_resolve_context"
       ],
       "uniffi": [
         "petname_resolve_context"
@@ -1496,7 +1587,8 @@
       "category": "petname",
       "wasm_required": true,
       "pyo3": [
-        "py_petname_get_for_did"
+        "py_petname_get_for_did",
+        "petname_get_for_did"
       ],
       "uniffi": [
         "petname_get_for_did"
@@ -1513,7 +1605,8 @@
       "category": "petname",
       "wasm_required": true,
       "pyo3": [
-        "py_petname_get_for_context"
+        "py_petname_get_for_context",
+        "petname_get_for_context"
       ],
       "uniffi": [
         "petname_get_for_context"
@@ -1530,7 +1623,8 @@
       "category": "handle",
       "wasm_required": true,
       "pyo3": [
-        "py_handle_register"
+        "py_handle_register",
+        "handle_register"
       ],
       "uniffi": [
         "handle_register"
@@ -1547,7 +1641,8 @@
       "category": "handle",
       "wasm_required": true,
       "pyo3": [
-        "py_handle_lookup"
+        "py_handle_lookup",
+        "handle_lookup"
       ],
       "uniffi": [
         "handle_lookup"
@@ -1564,7 +1659,8 @@
       "category": "handle",
       "wasm_required": true,
       "pyo3": [
-        "py_handle_deregister"
+        "py_handle_deregister",
+        "handle_deregister"
       ],
       "uniffi": [
         "handle_deregister"
@@ -1581,7 +1677,8 @@
       "category": "scope",
       "wasm_required": true,
       "pyo3": [
-        "py_scope_register"
+        "py_scope_register",
+        "scope_register"
       ],
       "uniffi": [
         "scope_register"
@@ -1598,7 +1695,8 @@
       "category": "scope",
       "wasm_required": true,
       "pyo3": [
-        "py_scope_lookup"
+        "py_scope_lookup",
+        "scope_lookup"
       ],
       "uniffi": [
         "scope_lookup"
@@ -1615,7 +1713,8 @@
       "category": "scope",
       "wasm_required": true,
       "pyo3": [
-        "py_scope_deregister"
+        "py_scope_deregister",
+        "scope_deregister"
       ],
       "uniffi": [
         "scope_deregister"
@@ -1633,7 +1732,9 @@
       "wasm_required": true,
       "pyo3": [
         "py_context_create_governance_checkpoint",
-        "py_create_governance_checkpoint"
+        "context_create_governance_checkpoint",
+        "py_create_governance_checkpoint",
+        "create_governance_checkpoint"
       ],
       "uniffi": [
         "context_create_governance_checkpoint",
@@ -1652,7 +1753,9 @@
       "wasm_required": true,
       "pyo3": [
         "py_context_add_checkpoint_cosignature",
-        "py_add_checkpoint_cosignature"
+        "context_add_checkpoint_cosignature",
+        "py_add_checkpoint_cosignature",
+        "add_checkpoint_cosignature"
       ],
       "uniffi": [
         "context_add_checkpoint_cosignature",
