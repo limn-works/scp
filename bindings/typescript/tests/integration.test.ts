@@ -2213,10 +2213,10 @@ describe("Error hierarchy (SDK-level)", () => {
   });
 
   it("AttestationError extends ScpError and carries the code", () => {
-    const err = new AttestationError("revoked", "SCP-ATT-9010");
+    const err = new AttestationError("revoked", "SCP-ATTEST-9010");
     expect(err).toBeInstanceOf(AttestationError);
     expect(err).toBeInstanceOf(ScpError);
-    expect(err.code).toBe("SCP-ATT-9010");
+    expect(err.code).toBe("SCP-ATTEST-9010");
   });
 
   it("ScpError.code field is read-only via the JS property accessor (no reassignment path)", () => {
