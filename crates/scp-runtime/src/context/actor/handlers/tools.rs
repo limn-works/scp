@@ -14,6 +14,15 @@
 //! The shim wraps the delegated call in [`tokio::time::timeout`] with a
 //! 30s budget per ADR-049 §7.
 //!
+//! # ADR-049 commit 12c.7 — direct dispatch
+//!
+//! Prior to 12c.7 the handler took a `MutationStateView<'_>` borrow
+//! adapter that bundled an `Arc<ContextManager>` reference plus a
+//! mutable scratch send-sequence tracker (the tools path never read
+//! the tracker, but the adapter was uniform across handlers). 12c.7
+//! deletes the adapter: the supervisor passes the
+//! `&Arc<ContextManager>` directly and no scratch tracker is allocated.
+//!
 //! # SAGA WIRING DEFERRED — see
 //! `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
 //!
@@ -37,6 +46,7 @@
 //! mailbox; it is not migrated to a command variant and continues to
 //! run on the direct manager surface (FFI bridges invoke it inline).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use scp_protocol::context::ContextError;
@@ -44,38 +54,33 @@ use tokio::sync::oneshot;
 
 use crate::context::actor::commands::ToolsCommand;
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::mutation_state_view::MutationStateView;
 use crate::context::actor::outcome::Outcome;
+use crate::context::manager::ContextManager;
 
 /// Per-call transport budget for tools handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch a [`ToolsCommand`] against a mutation state view + deps
+/// Dispatch a [`ToolsCommand`] against an attached manager + deps
 /// bundle.
-// `needless_pass_by_ref_mut` allow — matches the `&mut` contract used
-// by every migrated handler dispatch.
-#[allow(clippy::needless_pass_by_ref_mut)]
 pub async fn dispatch(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     _deps: &ActorDeps,
     cmd: ToolsCommand,
 ) -> Outcome<()> {
-    dispatch_inner(view, cmd).await
+    dispatch_inner(mgr, cmd).await
 }
 
 /// Shim-callable dispatch. Used by
 /// [`Supervisor::dispatch_tools_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_tools_command).
-// `needless_pass_by_ref_mut` allow — see the comment on [`dispatch`].
-#[allow(clippy::needless_pass_by_ref_mut)]
 pub(crate) async fn dispatch_from_shim(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     cmd: ToolsCommand,
 ) -> Outcome<()> {
-    dispatch_inner(view, cmd).await
+    dispatch_inner(mgr, cmd).await
 }
 
-async fn dispatch_inner(view: &MutationStateView<'_>, cmd: ToolsCommand) -> Outcome<()> {
+async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: ToolsCommand) -> Outcome<()> {
     match cmd {
         ToolsCommand::Placeholder { reply } => reply_not_implemented(reply),
         ToolsCommand::TryConsumeHardRateLimit {
@@ -83,12 +88,12 @@ async fn dispatch_inner(view: &MutationStateView<'_>, cmd: ToolsCommand) -> Outc
             did,
             now_secs,
             reply,
-        } => handle_try_consume_hard_rate_limit(view, &context_id, &did, now_secs, reply).await,
+        } => handle_try_consume_hard_rate_limit(mgr, &context_id, &did, now_secs, reply).await,
         ToolsCommand::RefundHardRateLimit {
             context_id,
             did,
             reply,
-        } => handle_refund_hard_rate_limit(view, &context_id, &did, reply).await,
+        } => handle_refund_hard_rate_limit(mgr, &context_id, &did, reply).await,
         ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => {
             reply_saga_deferred(reply)
         }
@@ -105,13 +110,13 @@ async fn dispatch_inner(view: &MutationStateView<'_>, cmd: ToolsCommand) -> Outc
 /// refund attempt on a timed-out consume is unsafe. Surfacing the
 /// timeout is the correct defensive move.
 async fn handle_try_consume_hard_rate_limit(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: &str,
     did: &scp_identity::DID,
     now_secs: u64,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let consume_fut = crate::context::tools_helpers::try_consume_hard_rate_limit(
         &manager, context_id, did, now_secs,
     );
@@ -147,12 +152,12 @@ async fn handle_try_consume_hard_rate_limit(
 /// [`ContextManager::refund_hard_rate_limit`](crate::context::manager::ContextManager::refund_hard_rate_limit)
 /// under a 30s timeout.
 async fn handle_refund_hard_rate_limit(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: &str,
     did: &scp_identity::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let refund_fut =
         crate::context::tools_helpers::refund_hard_rate_limit(&manager, context_id, did);
 

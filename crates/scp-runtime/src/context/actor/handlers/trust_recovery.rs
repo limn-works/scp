@@ -5,8 +5,8 @@
 //! # Commit 10 scope
 //!
 //! Migrates the dispatch shape: the handler takes
-//! [`MutationStateView`](crate::context::actor::mutation_state_view::MutationStateView)
-//! + [`ActorDeps`] + [`TrustRecoveryCommand`], returns `Outcome<()>`.
+//! `&Arc<ContextManager>` + [`ActorDeps`] + [`TrustRecoveryCommand`],
+//! returns `Outcome<()>`.
 //!
 //! The underlying byte-identical implementation still lives on
 //! [`ContextManager`](crate::context::manager::ContextManager): each
@@ -20,6 +20,15 @@
 //! The shim wraps each delegated call in [`tokio::time::timeout`] with
 //! a 30s budget per ADR-049 §7.
 //!
+//! # ADR-049 commit 12c.7 — direct dispatch
+//!
+//! Prior to 12c.7 the handler took a `MutationStateView<'_>` borrow
+//! adapter that bundled an `Arc<ContextManager>` reference plus a
+//! mutable scratch send-sequence tracker (the trust-recovery path never
+//! read the tracker, but the adapter was uniform across handlers).
+//! 12c.7 deletes the adapter: the supervisor passes the
+//! `&Arc<ContextManager>` directly and no scratch tracker is allocated.
+//!
 //! Trust-recovery's synchronous methods on `ContextManager`
 //! (`verify_attestation`, `create_challenge`, `verify_challenge_response`)
 //! are pure-CPU operations with no state mutation; they are not
@@ -28,6 +37,7 @@
 //! resolver + clock). Migration paths to non-actor helper types land
 //! in commit 12 alongside the manager deletion.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use scp_protocol::context::ContextError;
@@ -38,51 +48,46 @@ use crate::context::actor::commands::{
     RecoverySendNotificationPayload, TrustRecoveryCommand,
 };
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::mutation_state_view::MutationStateView;
 use crate::context::actor::outcome::Outcome;
+use crate::context::manager::ContextManager;
 
 /// Per-call transport budget for trust-recovery handlers. Plan
 /// §"Transport timeouts inside actor handlers": 30 seconds.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch a [`TrustRecoveryCommand`] against a mutation state view
+/// Dispatch a [`TrustRecoveryCommand`] against an attached manager
 /// + deps bundle.
 ///
 /// Plan-conforming dispatch signature: matches the post-refactor actor
 /// `run()` loop's call shape
-/// (`handlers::trust_recovery::dispatch(&mut self.state, &self.deps, cmd).await`).
+/// (`handlers::trust_recovery::dispatch(&mgr, &self.deps, cmd).await`).
 /// `deps` is accepted for symmetry — the trust-recovery handler does
 /// not yet touch deps during the shim period. Commit 12 rewires these
 /// paths.
-// `needless_pass_by_ref_mut` allow — matches the `&mut` contract used
-// by every migrated handler dispatch for signature stability.
-#[allow(clippy::needless_pass_by_ref_mut)]
 pub async fn dispatch(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     _deps: &ActorDeps,
     cmd: TrustRecoveryCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner(view, cmd)).await
+    Box::pin(dispatch_inner(mgr, cmd)).await
 }
 
 /// Shim-callable dispatch. Used by
 /// [`Supervisor::dispatch_trust_recovery_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_trust_recovery_command)
 /// during the commits-10-to-11 migration window — deleted in commit 12
 /// when the shim dissolves.
-// `needless_pass_by_ref_mut` allow — see the comment on [`dispatch`].
-#[allow(clippy::needless_pass_by_ref_mut)]
 pub(crate) async fn dispatch_from_shim(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     cmd: TrustRecoveryCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner(view, cmd)).await
+    Box::pin(dispatch_inner(mgr, cmd)).await
 }
 
-async fn dispatch_inner(view: &MutationStateView<'_>, cmd: TrustRecoveryCommand) -> Outcome<()> {
+async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: TrustRecoveryCommand) -> Outcome<()> {
     match cmd {
         TrustRecoveryCommand::Placeholder { reply } => reply_not_implemented(reply),
         TrustRecoveryCommand::CreateGovernanceCheckpoint { payload, reply } => {
-            handle_create_governance_checkpoint(view, *payload, reply).await
+            handle_create_governance_checkpoint(mgr, *payload, reply).await
         }
         TrustRecoveryCommand::AddCheckpointCosignature {
             context_id,
@@ -90,17 +95,17 @@ async fn dispatch_inner(view: &MutationStateView<'_>, cmd: TrustRecoveryCommand)
             cosignature,
             reply,
         } => {
-            handle_add_checkpoint_cosignature(view, &context_id, *checkpoint, *cosignature, reply)
+            handle_add_checkpoint_cosignature(mgr, &context_id, *checkpoint, *cosignature, reply)
                 .await
         }
         TrustRecoveryCommand::RecoveryAdvanceEpoch { context_id, reply } => {
-            handle_recovery_advance_epoch(view, &context_id, reply).await
+            handle_recovery_advance_epoch(mgr, &context_id, reply).await
         }
         TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
-            handle_recovery_send_notification(view, *payload, reply).await
+            handle_recovery_send_notification(mgr, *payload, reply).await
         }
         TrustRecoveryCommand::RecoveryNotifyContact { payload, reply } => {
-            handle_recovery_notify_contact(view, *payload, reply).await
+            handle_recovery_notify_contact(mgr, *payload, reply).await
         }
     }
 }
@@ -112,13 +117,13 @@ async fn dispatch_inner(view: &MutationStateView<'_>, cmd: TrustRecoveryCommand)
 /// side effect when a pruning policy is configured — that is a
 /// mutation, so the handler reports `mutated: true` on success.
 async fn handle_create_governance_checkpoint(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     p: CreateGovernanceCheckpointPayload,
     reply: oneshot::Sender<
         Result<scp_protocol::context::governance::ContextCheckpoint, ContextError>,
     >,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
 
     let create_fut = async move {
@@ -162,7 +167,7 @@ async fn handle_create_governance_checkpoint(
 /// the handler owns the checkpoint by value and returns the mutated
 /// copy alongside the attestation status.
 async fn handle_add_checkpoint_cosignature(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: &str,
     mut checkpoint: scp_protocol::context::governance::ContextCheckpoint,
     cosignature: scp_protocol::context::governance::CosignedCheckpoint,
@@ -176,7 +181,7 @@ async fn handle_add_checkpoint_cosignature(
         >,
     >,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let add_fut = crate::context::trust_recovery_helpers::add_checkpoint_cosignature(
         &manager,
         context_id,
@@ -213,11 +218,11 @@ async fn handle_add_checkpoint_cosignature(
 /// [`ContextManager::recovery_advance_epoch`](crate::context::manager::ContextManager::recovery_advance_epoch)
 /// under a 30s timeout.
 async fn handle_recovery_advance_epoch(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: &str,
     reply: oneshot::Sender<Result<u64, ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let advance_fut =
         crate::context::trust_recovery_helpers::recovery_advance_epoch(&manager, context_id);
 
@@ -251,11 +256,11 @@ async fn handle_recovery_advance_epoch(
 /// recovery envelope but does not persist per-context state
 /// modifications — `Outcome::ok(())` on the success path.
 async fn handle_recovery_send_notification(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     p: RecoverySendNotificationPayload,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
     let signing_key = p.signing_key.to_signing_key();
 
@@ -297,11 +302,11 @@ async fn handle_recovery_send_notification(
 /// the legacy method only transmits an envelope through the first
 /// shared context it finds.
 async fn handle_recovery_notify_contact(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     p: RecoveryNotifyContactPayload,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let recovering_did = p.recovering_did.clone();
     let signing_key = p.signing_key.to_signing_key();
 

@@ -5,8 +5,8 @@
 //! # Commit 11 scope
 //!
 //! Migrates the dispatch shape: the handler takes
-//! [`MutationStateView`](crate::context::actor::mutation_state_view::MutationStateView)
-//! + [`ActorDeps`] + [`StandingCommand`], returns `Outcome<()>`.
+//! `&Arc<ContextManager>` + [`ActorDeps`] + [`StandingCommand`], returns
+//! `Outcome<()>`.
 //!
 //! The underlying byte-identical implementation still lives on
 //! [`ContextManager`](crate::context::manager::ContextManager): each
@@ -19,6 +19,15 @@
 //! [`ContextManager::reconnect_all_standing`](crate::context::manager::ContextManager::reconnect_all_standing).
 //! The shim wraps the delegated call in [`tokio::time::timeout`] with a
 //! 30s budget per ADR-049 §7.
+//!
+//! # ADR-049 commit 12c.7 — direct dispatch
+//!
+//! Prior to 12c.7 the handler took a `MutationStateView<'_>` borrow
+//! adapter that bundled an `Arc<ContextManager>` reference plus a
+//! mutable scratch send-sequence tracker (the standing path never read
+//! the tracker, but the adapter was uniform across handlers). 12c.7
+//! deletes the adapter: the supervisor passes the
+//! `&Arc<ContextManager>` directly and no scratch tracker is allocated.
 //!
 //! # SAGA WIRING DEFERRED — see
 //! `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
@@ -41,6 +50,7 @@
 //! `StandingContext` get-or-create variant still routes through the
 //! legacy path, which is idempotent by construction.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use scp_protocol::context::ContextError;
@@ -48,64 +58,56 @@ use tokio::sync::oneshot;
 
 use crate::context::actor::commands::StandingCommand;
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::mutation_state_view::MutationStateView;
 use crate::context::actor::outcome::Outcome;
+use crate::context::manager::ContextManager;
 
 /// Per-call transport budget for standing handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch a [`StandingCommand`] against a mutation state view + deps
+/// Dispatch a [`StandingCommand`] against an attached manager + deps
 /// bundle.
 ///
 /// Plan-conforming dispatch signature: matches the post-refactor actor
 /// `run()` loop's call shape
-/// (`handlers::standing::dispatch(&mut self.state, &self.deps, cmd).await`).
-// `needless_pass_by_ref_mut` allow — matches the `&mut` contract used
-// by every migrated handler dispatch for signature stability. Commit
-// 11's standing handlers delegate to
-// [`ContextManager`](crate::context::manager::ContextManager) and do
-// not mutate the view directly.
-#[allow(clippy::needless_pass_by_ref_mut)]
+/// (`handlers::standing::dispatch(&mgr, &self.deps, cmd).await`).
 pub async fn dispatch(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     _deps: &ActorDeps,
     cmd: StandingCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner(view, cmd)).await
+    Box::pin(dispatch_inner(mgr, cmd)).await
 }
 
 /// Shim-callable dispatch. Used by
 /// [`Supervisor::dispatch_standing_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_standing_command)
 /// during the commits-11-to-11.5 migration window.
-// `needless_pass_by_ref_mut` allow — see the comment on [`dispatch`].
-#[allow(clippy::needless_pass_by_ref_mut)]
 pub(crate) async fn dispatch_from_shim(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     cmd: StandingCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner(view, cmd)).await
+    Box::pin(dispatch_inner(mgr, cmd)).await
 }
 
-async fn dispatch_inner(view: &MutationStateView<'_>, cmd: StandingCommand) -> Outcome<()> {
+async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: StandingCommand) -> Outcome<()> {
     match cmd {
         StandingCommand::Placeholder { reply } => reply_not_implemented(reply),
         StandingCommand::StandingContext {
             local_did,
             peer_did,
             reply,
-        } => handle_standing_context(view, local_did, peer_did, reply).await,
+        } => handle_standing_context(mgr, local_did, peer_did, reply).await,
         StandingCommand::StandingContextCount { reply } => {
-            handle_standing_context_count(view, reply).await
+            handle_standing_context_count(mgr, reply).await
         }
         StandingCommand::HasStandingContext { peer_did, reply } => {
-            handle_has_standing_context(view, peer_did, reply).await
+            handle_has_standing_context(mgr, peer_did, reply).await
         }
         StandingCommand::RegisterStandingContext { peer_did, reply } => {
-            handle_register_standing_context(view, peer_did, reply).await
+            handle_register_standing_context(mgr, peer_did, reply).await
         }
         StandingCommand::ReconnectAllStanding { reply } => {
-            handle_reconnect_all_standing(view, reply).await
+            handle_reconnect_all_standing(mgr, reply).await
         }
         StandingCommand::InitiateStandingPairCreate { reply, .. } => reply_saga_deferred(reply),
     }
@@ -115,12 +117,12 @@ async fn dispatch_inner(view: &MutationStateView<'_>, cmd: StandingCommand) -> O
 /// [`ContextManager::standing_context`](crate::context::manager::ContextManager::standing_context)
 /// under a 30s timeout.
 async fn handle_standing_context(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     local_did: scp_identity::DID,
     peer_did: scp_identity::DID,
     reply: oneshot::Sender<Result<String, ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let standing_fut = async move {
         crate::context::standing_helpers::standing_context(&manager, &local_did, &peer_did).await
     };
@@ -146,10 +148,10 @@ async fn handle_standing_context(
 
 /// Handle [`StandingCommand::StandingContextCount`] — read-only.
 async fn handle_standing_context_count(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     reply: oneshot::Sender<Result<usize, ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let count_fut = crate::context::standing_helpers::standing_context_count(&manager);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, count_fut).await {
@@ -169,11 +171,11 @@ async fn handle_standing_context_count(
 
 /// Handle [`StandingCommand::HasStandingContext`] — read-only.
 async fn handle_has_standing_context(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     peer_did: scp_identity::DID,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let has_fut = async move {
         crate::context::standing_helpers::has_standing_context(&manager, &peer_did).await
     };
@@ -197,11 +199,11 @@ async fn handle_has_standing_context(
 /// [`ContextManager::register_standing_context`](crate::context::manager::ContextManager::register_standing_context)
 /// under a 30s timeout. Always mutating.
 async fn handle_register_standing_context(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     peer_did: scp_identity::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let register_fut = async move {
         crate::context::standing_helpers::register_standing_context(&manager, peer_did).await;
     };
@@ -225,10 +227,10 @@ async fn handle_register_standing_context(
 /// [`ContextManager::reconnect_all_standing`](crate::context::manager::ContextManager::reconnect_all_standing)
 /// under a 30s timeout. Always mutating.
 async fn handle_reconnect_all_standing(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     reply: oneshot::Sender<Result<usize, ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let reconnect_fut =
         async move { crate::context::standing_helpers::reconnect_all_standing(&manager).await };
 

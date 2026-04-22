@@ -2,7 +2,7 @@
 //!
 //! Exercises the path
 //! [`Supervisor::dispatch_query`](scp_runtime::context::supervisor::Supervisor::dispatch_query)
-//! → [`QueryStateView`](scp_runtime::context::actor::query_state_view)
+//! → `QueryStateView` (deleted in commit 12c.7 of ADR-049)
 //! → migrated [`queries`](scp_runtime::context::actor::handlers::queries)
 //! handler
 //! against the legacy [`ContextManager`](scp_runtime::context::manager::ContextManager)

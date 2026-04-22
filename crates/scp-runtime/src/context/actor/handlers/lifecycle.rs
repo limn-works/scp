@@ -5,8 +5,8 @@
 //! # Commit 9 scope
 //!
 //! Migrates the dispatch shape: the handler takes
-//! [`MutationStateView`](crate::context::actor::mutation_state_view::MutationStateView)
-//! + [`ActorDeps`] + [`LifecycleCommand`], returns `Outcome<()>`.
+//! `&Arc<ContextManager>` + [`ActorDeps`] + [`LifecycleCommand`], returns
+//! `Outcome<()>`.
 //!
 //! The underlying byte-identical implementation still lives on
 //! [`ContextManager`](crate::context::manager::ContextManager): each
@@ -34,6 +34,15 @@
 //! `ContextManager::create_context` / `join_context` directly — saga
 //! wiring lands with `handlers/standing.rs` in commit 11.
 //!
+//! # ADR-049 commit 12c.7 — direct dispatch
+//!
+//! Prior to 12c.7 the handler took a `MutationStateView<'_>` borrow
+//! adapter that bundled an `Arc<ContextManager>` reference plus a
+//! mutable scratch send-sequence tracker (the lifecycle path never read
+//! the tracker, but the adapter was uniform across handlers). 12c.7
+//! deletes the adapter: the supervisor passes the
+//! `&Arc<ContextManager>` directly and no scratch tracker is allocated.
+//!
 //! # Transport-timeout budget
 //!
 //! [`HANDLER_TIMEOUT`] is the handler-level budget. The legacy
@@ -42,6 +51,7 @@
 //! plan's "every transport and storage call inside a handler wraps
 //! `tokio::time::timeout(30s, ...)`" contract.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use scp_protocol::context::ContextError;
@@ -52,39 +62,27 @@ use crate::context::actor::commands::{
     CloseContextReply, CreateContextReply, ExportContextReply, ImportContextReply, LifecycleCommand,
 };
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::mutation_state_view::MutationStateView;
 use crate::context::actor::outcome::Outcome;
+use crate::context::manager::ContextManager;
 
 /// Per-call transport budget for lifecycle handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch a [`LifecycleCommand`] against a mutation state view + deps
+/// Dispatch a [`LifecycleCommand`] against an attached manager + deps
 /// bundle.
 ///
 /// Plan-conforming dispatch signature: matches the post-refactor actor
 /// `run()` loop's call shape
-/// (`handlers::lifecycle::dispatch(&mut self.state, &self.deps, cmd).await`).
+/// (`handlers::lifecycle::dispatch(&mgr, &self.deps, cmd).await`).
 /// `deps` is accepted for symmetry — the lifecycle handler does not yet
 /// touch deps during the shim period (the transport, event log, crypto
 /// providers, and persistence live on the legacy
-/// [`ContextManager`](crate::context::manager::ContextManager) the view
-/// borrows). Commit 12 rewires these paths to use `deps` directly once
-/// the manager surface is deleted.
-// `needless_pass_by_ref_mut` allow — the handler's dispatch shape
-// takes `&mut MutationStateView` by contract to match the
-// post-refactor actor `run()` loop's call signature
-// (`handlers::lifecycle::dispatch(&mut self.state, &self.deps, cmd).await`).
-// Commit 9's shim body only delegates to
-// [`ContextManager`](crate::context::manager::ContextManager) and
-// never reads the tracker — the legacy method still owns the per-
-// context mutation paths — but switching the parameter to `&` would
-// force a signature change at the shim's callers that we would have
-// to revert when commit 12 lands the real state mutations on the
-// actor's owned [`PerContextState`](crate::context::actor::state::PerContextState).
-#[allow(clippy::needless_pass_by_ref_mut)]
+/// [`ContextManager`](crate::context::manager::ContextManager)). Commit
+/// 12 rewires these paths to use `deps` directly once the manager
+/// surface is deleted.
 pub async fn dispatch(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     _deps: &ActorDeps,
     cmd: LifecycleCommand,
 ) -> Outcome<()> {
@@ -94,7 +92,7 @@ pub async fn dispatch(
     // inside each handler) crosses clippy's 16-KB stack budget for
     // async futures. Boxing here moves the per-variant state onto the
     // heap once per dispatch.
-    Box::pin(dispatch_inner(view, cmd)).await
+    Box::pin(dispatch_inner(mgr, cmd)).await
 }
 
 /// Shim-callable dispatch. Used by
@@ -105,31 +103,25 @@ pub async fn dispatch(
 ///
 /// Lifecycle commands do not yet touch [`ActorDeps`] during the shim
 /// period (every resource the legacy lifecycle methods need lives on
-/// the [`ContextManager`](crate::context::manager::ContextManager) the
-/// view borrows). This entry point exists so callers can route
-/// lifecycle operations through the shim without synthesizing an
-/// [`ActorDeps`] — matching the pattern established for queries (commit
-/// 7) and messaging (commit 8).
-// `needless_pass_by_ref_mut` allow — see the comment on
-// [`dispatch`] above. `dispatch_from_shim` shares the `&mut`
-// contract with the actor-side entry point for signature stability
-// across the commit ladder.
-#[allow(clippy::needless_pass_by_ref_mut)]
+/// the [`ContextManager`](crate::context::manager::ContextManager)). This
+/// entry point exists so callers can route lifecycle operations through
+/// the shim without synthesizing an [`ActorDeps`] — matching the pattern
+/// established for queries (commit 7) and messaging (commit 8).
 pub(crate) async fn dispatch_from_shim(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     cmd: LifecycleCommand,
 ) -> Outcome<()> {
     // See the comment on [`dispatch`] for the `Box::pin` rationale.
-    Box::pin(dispatch_inner(view, cmd)).await
+    Box::pin(dispatch_inner(mgr, cmd)).await
 }
 
-async fn dispatch_inner(view: &MutationStateView<'_>, cmd: LifecycleCommand) -> Outcome<()> {
+async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: LifecycleCommand) -> Outcome<()> {
     match cmd {
         LifecycleCommand::Placeholder { reply } => reply_not_implemented(reply),
         LifecycleCommand::CreateContext { payload, reply } => {
             let p = *payload;
             handle_create_context(
-                view,
+                mgr,
                 p.context_id,
                 p.params,
                 p.creator_did,
@@ -141,7 +133,7 @@ async fn dispatch_inner(view: &MutationStateView<'_>, cmd: LifecycleCommand) -> 
         LifecycleCommand::JoinContext { payload, reply } => {
             let p = *payload;
             handle_join_context(
-                view,
+                mgr,
                 p.context_id,
                 p.params,
                 p.key_package,
@@ -154,7 +146,7 @@ async fn dispatch_inner(view: &MutationStateView<'_>, cmd: LifecycleCommand) -> 
         LifecycleCommand::LeaveContext { payload, reply } => {
             let p = *payload;
             handle_leave_context(
-                view,
+                mgr,
                 p.context_id,
                 p.params,
                 p.caller_did,
@@ -165,20 +157,20 @@ async fn dispatch_inner(view: &MutationStateView<'_>, cmd: LifecycleCommand) -> 
         }
         LifecycleCommand::CloseContext { payload, reply } => {
             let p = *payload;
-            handle_close_context(view, p.context_id, p.params, p.initiator_did, reply).await
+            handle_close_context(mgr, p.context_id, p.params, p.initiator_did, reply).await
         }
         LifecycleCommand::ExportContext {
             context_id,
             exporter_did,
             reply,
-        } => handle_export_context(view, context_id, exporter_did, reply).await,
+        } => handle_export_context(mgr, context_id, exporter_did, reply).await,
         LifecycleCommand::ImportContext { export, reply } => {
             // Box::pin — the per-variant import future crosses clippy's
             // 16 KB stack budget (ContextExport ~2 KB + the full
             // PerContextState-construction locals inside the hoisted
             // `lifecycle_helpers::import_context` body). Boxing moves the
             // state onto the heap for this variant only.
-            Box::pin(handle_import_context(view, export, reply)).await
+            Box::pin(handle_import_context(mgr, export, reply)).await
         }
     }
 }
@@ -191,14 +183,14 @@ async fn dispatch_inner(view: &MutationStateView<'_>, cmd: LifecycleCommand) -> 
 /// `handlers/standing.rs` in commit 11; commit 9's shim routes the
 /// command through the legacy method directly.
 async fn handle_create_context(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     creator_did: scp_identity::DID,
     local_pseudonym: Option<[u8; 32]>,
     reply: CreateContextReply,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let create_fut = crate::context::lifecycle_helpers::create_context(
         &manager,
         context_id.clone(),
@@ -239,7 +231,7 @@ async fn handle_create_context(
 /// under a 30s timeout.
 #[allow(clippy::too_many_arguments)] // mirrors the legacy method's signature surface
 async fn handle_join_context(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     key_package: scp_protocol::context::membership::KeyPackage,
@@ -247,7 +239,7 @@ async fn handle_join_context(
     local_pseudonym: Option<[u8; 32]>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
 
     // Rebuild an ephemeral handle for the legacy method's signature.
     let handle = ContextHandle::new(context_id.clone(), params);
@@ -291,14 +283,14 @@ async fn handle_join_context(
 /// [`ContextManager::leave_context`](crate::context::manager::ContextManager::leave_context)
 /// under a 30s timeout.
 async fn handle_leave_context(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     caller_did: scp_identity::DID,
     member_did: scp_identity::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
 
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
@@ -343,13 +335,13 @@ async fn handle_leave_context(
 /// (`GovernanceAction::CloseContext`) — the legacy method enforces
 /// that gate, we just delegate.
 async fn handle_close_context(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     initiator_did: scp_identity::DID,
     reply: CloseContextReply,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
 
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
@@ -387,12 +379,12 @@ async fn handle_close_context(
 /// [`ContextManager::export_context`](crate::context::manager::ContextManager::export_context)
 /// under a 30s timeout.
 async fn handle_export_context(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: String,
     exporter_did: scp_identity::DID,
     reply: ExportContextReply,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
 
     let export_fut =
         crate::context::lifecycle_helpers::export_context(&manager, &context_id, exporter_did);
@@ -422,11 +414,11 @@ async fn handle_export_context(
 /// by the legacy method; the handler passes the parsed export through
 /// verbatim.
 async fn handle_import_context(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     export: Box<crate::context::export_import::ContextExport>,
     reply: ImportContextReply,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let context_id = export.snapshot.context_id.clone();
 
     // Unbox at the last possible moment to minimize stack-held size

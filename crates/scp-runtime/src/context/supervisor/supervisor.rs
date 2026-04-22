@@ -46,9 +46,7 @@ use crate::context::actor::commands::{
 };
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::handlers;
-use crate::context::actor::mutation_state_view::MutationStateView;
 use crate::context::actor::outcome::Outcome;
-use crate::context::actor::query_state_view::QueryStateView;
 use crate::context::actor::sequence::SendSequenceTracker;
 use crate::context::actor::state::WrappingKeyPair;
 use crate::context::manager::{ContextManager, ContextPersistence};
@@ -362,9 +360,10 @@ impl Supervisor {
     /// 12a.5).
     ///
     /// Shim-era only. During commits 12a.5 → 12b no `ContextActor` task
-    /// is spawned — handler bodies still delegate through
-    /// [`MutationStateView`] to `ContextManager`. This method exists so
-    /// the test harness can assert every `ActorDeps` field populates
+    /// is spawned — handler bodies still delegate to `ContextManager`
+    /// through the supervisor's `dispatch_*` methods. This method
+    /// exists so the test harness can assert every `ActorDeps` field
+    /// populates
     /// correctly from the legacy manager plus the caller-supplied
     /// backends (split per ADR §6: `MlsBackend` + `HpkeBackend` +
     /// `OpenMlsStorageAdapter`) and supervisor-scoped handles
@@ -465,13 +464,12 @@ impl Supervisor {
     /// Behaviour (byte-identical to the legacy `ContextManager::foo()`
     /// it replaces):
     ///
-    /// - Takes the per-context mutex under
-    ///   [`ContextManager::with_query_state`].
-    /// - Builds a [`QueryStateView`] over the locked state and the
-    ///   manager's shared event-log provider.
-    /// - Invokes [`handlers::queries::dispatch_from_shim`], which
-    ///   matches on the command variant, sends the typed oneshot
-    ///   reply, and returns `Outcome::ok(())` with `mutated: false`.
+    /// - Takes the per-context mutex via the manager's `get_context_arc_pub`.
+    /// - Calls [`handlers::queries::dispatch_from_shim`] with the
+    ///   locked `&PerContextState` and the manager's shared event-log
+    ///   provider. The handler matches on the command variant, sends
+    ///   the typed oneshot reply, and returns `Outcome::ok(())` with
+    ///   `mutated: false`.
     /// - On missing context, the shim emits the variant's legacy
     ///   default (e.g. `MemberCount::Ok(None)`, `IsMember::Ok(false)`)
     ///   without entering the handler — this preserves the
@@ -568,13 +566,12 @@ impl Supervisor {
     /// 2. Drops the lock so the delegated
     ///    [`ContextManager`](crate::context::manager::ContextManager)
     ///    call can re-acquire it internally without deadlock.
-    /// 3. Builds a [`MutationStateView`] over the taken tracker + a
-    ///    reference to the attached manager, and invokes
-    ///    [`handlers::messaging::dispatch`](crate::context::actor::handlers::messaging::dispatch).
-    ///    The handler exercises
+    /// 3. Invokes
+    ///    [`handlers::messaging::dispatch_from_shim`](crate::context::actor::handlers::messaging::dispatch_from_shim)
+    ///    with the attached manager Arc and a `&mut` borrow of the
+    ///    taken tracker. The handler exercises
     ///    [`SequenceReservation`](crate::context::actor::SequenceReservation)
-    ///    on the view's `send_tracker` (the taken tracker), wraps the
-    ///    delegated
+    ///    on that tracker, wraps the delegated
     ///    [`ContextManager::send_message`](crate::context::manager::ContextManager::send_message)
     ///    / [`ContextManager::deliver_incoming`](crate::context::manager::ContextManager::deliver_incoming)
     ///    call in `tokio::time::timeout` with a 30s budget, and maps
@@ -587,19 +584,18 @@ impl Supervisor {
     ///
     /// # Why the take-and-swap pattern
     ///
-    /// `MutationStateView` holds `&mut SendSequenceTracker`. If the
-    /// view held a `tokio::sync::OwnedMutexGuard<PerContextState>` the
+    /// The handler takes `&mut SendSequenceTracker`. If the dispatcher
+    /// held a `tokio::sync::OwnedMutexGuard<PerContextState>` the
     /// borrow would live across the delegated `cm.send_message(...).await`
     /// and deadlock the re-entrant per-context mutex acquisition inside
     /// `ContextManager::send_message`. The take-and-swap workaround
     /// makes the tracker reservation lock-free: the dispatcher owns
     /// the tracker for the handler's await points, and the per-context
     /// lock is held for zero duration during the delegated call. This
-    /// mirrors the plan's "handler takes `&mut` sibling of the query
-    /// view" contract while preserving deadlock safety during the shim
-    /// period. Commit 12 replaces this with a direct `&mut PerContextState`
-    /// on the actor's owned state (no lock involved, the actor
-    /// serializes by construction).
+    /// preserves deadlock safety during the shim period. Commit 12
+    /// replaces this with a direct `&mut PerContextState` on the
+    /// actor's owned state (no lock involved, the actor serializes by
+    /// construction).
     ///
     /// # Missing ActorDeps during the shim
     ///
@@ -668,18 +664,12 @@ impl Supervisor {
             std::mem::take(guard.send_tracker_mut())
         };
 
-        // Phase B: invoke the handler with a view over the taken
-        // tracker + a borrow of the attached manager. No per-context
-        // lock is held during this await so the delegated
+        // Phase B: invoke the handler with the attached manager + a
+        // mutable borrow of the taken tracker. No per-context lock is
+        // held during this await so the delegated
         // `cm.send_message(...)` call inside the handler acquires the
         // same mutex without contention.
-        let outcome = {
-            let mut view = MutationStateView {
-                send_tracker: &mut taken_tracker,
-                manager: cm,
-            };
-            handlers::messaging::dispatch_from_shim(&mut view, cmd).await
-        };
+        let outcome = handlers::messaging::dispatch_from_shim(cm, &mut taken_tracker, cmd).await;
 
         // Phase C: swap the (committed or rolled-back) tracker back
         // in. If another task concurrently reserved a number on the
@@ -711,15 +701,13 @@ impl Supervisor {
     /// [`ContextManager`](crate::context::manager::ContextManager)
     /// lifecycle methods it replaces):
     ///
-    /// Step 1 builds a [`MutationStateView`] over a scratch
-    /// [`SendSequenceTracker`](crate::context::actor::SendSequenceTracker)
-    /// plus a reference to the attached manager. Lifecycle handlers never
-    /// read or mutate `send_tracker` (only the messaging path touches it),
-    /// so we do not need the messaging shim's per-context take-and-swap.
-    /// The scratch tracker preserves the post-refactor handler signature.
+    /// Step 1 invokes
+    /// [`handlers::lifecycle::dispatch_from_shim`](crate::context::actor::handlers::lifecycle::dispatch_from_shim)
+    /// with a reference to the attached manager. Lifecycle handlers
+    /// never read or mutate `send_tracker` (only the messaging path
+    /// touches it), so no per-context take-and-swap or scratch tracker
+    /// is required.
     ///
-    /// Step 2 invokes
-    /// [`handlers::lifecycle::dispatch_from_shim`](crate::context::actor::handlers::lifecycle::dispatch_from_shim).
     /// Each variant wraps the delegated
     /// [`ContextManager`](crate::context::manager::ContextManager) method
     /// in `tokio::time::timeout` with a 30s budget, maps a timeout to
@@ -758,30 +746,21 @@ impl Supervisor {
             )
         })?;
 
-        // Scratch tracker — see method docs. The view needs a
-        // `&mut SendSequenceTracker` to construct; lifecycle handlers
-        // never touch it, so we allocate a fresh one on each call.
-        let mut scratch_tracker = SendSequenceTracker::new();
-        let mut view = MutationStateView {
-            send_tracker: &mut scratch_tracker,
-            manager: cm,
-        };
         // `Box::pin` — the combined size of the rebuilt handle,
         // context params, and the per-variant 30s-timeout future
         // crosses clippy's 16-KB stack budget for async futures. See
         // the matching comment on `handlers::lifecycle::dispatch`.
-        Ok(Box::pin(handlers::lifecycle::dispatch_from_shim(&mut view, cmd)).await)
+        Ok(Box::pin(handlers::lifecycle::dispatch_from_shim(cm, cmd)).await)
     }
 
     /// Dispatch a mutating [`TtlCloseCommand`] through the migration
     /// shim (ADR-049 commit 9 / plan row 9).
     ///
-    /// Same shape as [`Self::dispatch_lifecycle_command`] — a scratch
-    /// [`SendSequenceTracker`](crate::context::actor::SendSequenceTracker)
-    /// backs the [`MutationStateView`], handlers wrap delegated
+    /// Same shape as [`Self::dispatch_lifecycle_command`] — handlers
+    /// take the attached manager directly, wrap delegated
     /// [`ContextManager`](crate::context::manager::ContextManager) calls
-    /// in [`tokio::time::timeout`] with a 30s budget, and the typed
-    /// result is relayed through the variant's oneshot.
+    /// in [`tokio::time::timeout`] with a 30s budget, and relay the
+    /// typed result through the variant's oneshot.
     ///
     /// # TTL-timer ownership
     ///
@@ -807,12 +786,7 @@ impl Supervisor {
             )
         })?;
 
-        let mut scratch_tracker = SendSequenceTracker::new();
-        let mut view = MutationStateView {
-            send_tracker: &mut scratch_tracker,
-            manager: cm,
-        };
-        Ok(handlers::ttl_close::dispatch_from_shim(&mut view, cmd).await)
+        Ok(handlers::ttl_close::dispatch_from_shim(cm, cmd).await)
     }
 
     /// Dispatch a [`GovernanceCommand`] through the migration shim
@@ -822,15 +796,13 @@ impl Supervisor {
     /// [`ContextManager`](crate::context::manager::ContextManager)
     /// governance methods it replaces):
     ///
-    /// Step 1 builds a [`MutationStateView`] over a scratch
-    /// [`SendSequenceTracker`](crate::context::actor::SendSequenceTracker)
-    /// plus a reference to the attached manager. Governance handlers
+    /// Step 1 invokes
+    /// [`handlers::governance::dispatch_from_shim`](crate::context::actor::handlers::governance::dispatch_from_shim)
+    /// with a reference to the attached manager. Governance handlers
     /// never read or mutate `send_tracker` (only the messaging path
-    /// touches it), so no per-context take-and-swap is required —
-    /// same shape as the lifecycle shim.
+    /// touches it), so no per-context take-and-swap or scratch tracker
+    /// is required — same shape as the lifecycle shim.
     ///
-    /// Step 2 invokes
-    /// [`handlers::governance::dispatch_from_shim`](crate::context::actor::handlers::governance::dispatch_from_shim).
     /// Each variant wraps the delegated
     /// [`ContextManager`](crate::context::manager::ContextManager) method
     /// in `tokio::time::timeout` with a 30s budget, maps a timeout to
@@ -857,15 +829,10 @@ impl Supervisor {
             )
         })?;
 
-        let mut scratch_tracker = SendSequenceTracker::new();
-        let mut view = MutationStateView {
-            send_tracker: &mut scratch_tracker,
-            manager: cm,
-        };
         // `Box::pin` — see the matching comment on
         // `handlers::governance::dispatch` for the 16-KB stack-future
         // rationale.
-        Ok(Box::pin(handlers::governance::dispatch_from_shim(&mut view, cmd)).await)
+        Ok(Box::pin(handlers::governance::dispatch_from_shim(cm, cmd)).await)
     }
 
     /// Dispatch an [`EconomyCommand`] through the migration shim
@@ -894,12 +861,7 @@ impl Supervisor {
             )
         })?;
 
-        let mut scratch_tracker = SendSequenceTracker::new();
-        let mut view = MutationStateView {
-            send_tracker: &mut scratch_tracker,
-            manager: cm,
-        };
-        Ok(handlers::economy::dispatch_from_shim(&mut view, cmd).await)
+        Ok(handlers::economy::dispatch_from_shim(cm, cmd).await)
     }
 
     /// Dispatch a [`TrustRecoveryCommand`] through the migration shim
@@ -926,23 +888,18 @@ impl Supervisor {
             )
         })?;
 
-        let mut scratch_tracker = SendSequenceTracker::new();
-        let mut view = MutationStateView {
-            send_tracker: &mut scratch_tracker,
-            manager: cm,
-        };
         // `Box::pin` — CreateGovernanceCheckpoint's payload carries
         // multiple 32-byte hashes + a variable-length Ed25519 signature
         // vector; the per-variant locals cross clippy's 16-KB stack-
         // future budget.
-        Ok(Box::pin(handlers::trust_recovery::dispatch_from_shim(&mut view, cmd)).await)
+        Ok(Box::pin(handlers::trust_recovery::dispatch_from_shim(cm, cmd)).await)
     }
 
-    /// Helper: acquire the per-context lock, build the view, run the
-    /// query handler inline (sync — the handler awaits nothing), and
-    /// send the typed reply. On soft-fallback + missing context,
-    /// synthesize the variant's legacy default via the view-less
-    /// fallback.
+    /// Helper: acquire the per-context lock, run the query handler
+    /// inline (sync — the handler awaits nothing) against the locked
+    /// state borrow + shared event-log provider, and send the typed
+    /// reply. On soft-fallback + missing context, synthesize the
+    /// variant's legacy default via the view-less fallback.
     async fn dispatch_with_view(
         cm: &Arc<ContextManager>,
         context_id: &str,
@@ -960,8 +917,7 @@ impl Supervisor {
         match cm.get_context_arc_pub(context_id) {
             Ok(arc) => {
                 let guard = arc.lock().await;
-                let view = QueryStateView::from_manager_state(&guard, &elp);
-                handlers::queries::dispatch_from_shim(&view, cmd);
+                handlers::queries::dispatch_from_shim(&guard, &elp, cmd);
                 // Drop the guard explicitly so the per-context mutex is
                 // released before we return — the outer `Ok(...)` does
                 // not use the guard, and clippy's
@@ -1161,12 +1117,7 @@ impl Supervisor {
             )
         })?;
 
-        let mut scratch_tracker = SendSequenceTracker::new();
-        let mut view = MutationStateView {
-            send_tracker: &mut scratch_tracker,
-            manager: cm,
-        };
-        Ok(Box::pin(handlers::standing::dispatch_from_shim(&mut view, cmd)).await)
+        Ok(Box::pin(handlers::standing::dispatch_from_shim(cm, cmd)).await)
     }
 
     /// Dispatch a [`ToolsCommand`] through the migration shim
@@ -1196,12 +1147,7 @@ impl Supervisor {
             )
         })?;
 
-        let mut scratch_tracker = SendSequenceTracker::new();
-        let mut view = MutationStateView {
-            send_tracker: &mut scratch_tracker,
-            manager: cm,
-        };
-        Ok(handlers::tools::dispatch_from_shim(&mut view, cmd).await)
+        Ok(handlers::tools::dispatch_from_shim(cm, cmd).await)
     }
 
     /// Dispatch a [`BroadcastCommand`] through the migration shim
@@ -1231,12 +1177,7 @@ impl Supervisor {
             )
         })?;
 
-        let mut scratch_tracker = SendSequenceTracker::new();
-        let mut view = MutationStateView {
-            send_tracker: &mut scratch_tracker,
-            manager: cm,
-        };
-        Ok(Box::pin(handlers::broadcast::dispatch_from_shim(&mut view, cmd)).await)
+        Ok(Box::pin(handlers::broadcast::dispatch_from_shim(cm, cmd)).await)
     }
 
     /// Dispatch a [`BroadcastCommand`] through the migration shim with
@@ -1262,14 +1203,9 @@ impl Supervisor {
             )
         })?;
 
-        let mut scratch_tracker = SendSequenceTracker::new();
-        let mut view = MutationStateView {
-            send_tracker: &mut scratch_tracker,
-            manager: cm,
-        };
         Ok(
             Box::pin(handlers::broadcast::dispatch_from_shim_with_custody(
-                &mut view, cmd, custody,
+                cm, cmd, custody,
             ))
             .await,
         )

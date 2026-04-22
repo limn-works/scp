@@ -5,8 +5,8 @@
 //! # Commit 9 scope
 //!
 //! Migrates the dispatch shape: the handler takes
-//! [`MutationStateView`](crate::context::actor::mutation_state_view::MutationStateView)
-//! + [`ActorDeps`] + [`TtlCloseCommand`], returns `Outcome<()>`.
+//! `&Arc<ContextManager>` + [`ActorDeps`] + [`TtlCloseCommand`], returns
+//! `Outcome<()>`.
 //!
 //! The underlying byte-identical implementation still lives on
 //! [`ContextManager`](crate::context::manager::ContextManager): each
@@ -29,6 +29,15 @@
 //! synchronously. Full timer-owning actor logic migrates with plan row
 //! 11.
 //!
+//! # ADR-049 commit 12c.7 — direct dispatch
+//!
+//! Prior to 12c.7 the handler took a `MutationStateView<'_>` borrow
+//! adapter that bundled an `Arc<ContextManager>` reference plus a
+//! mutable scratch send-sequence tracker (the TTL path never read
+//! the tracker, but the adapter was uniform across handlers). 12c.7
+//! deletes the adapter: the supervisor passes the
+//! `&Arc<ContextManager>` directly and no scratch tracker is allocated.
+//!
 //! # Transport-timeout budget
 //!
 //! [`HANDLER_TIMEOUT`] is the handler-level budget. The legacy
@@ -37,6 +46,7 @@
 //! plan's "every transport and storage call inside a handler wraps
 //! `tokio::time::timeout(30s, ...)`" contract.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use scp_protocol::context::ContextError;
@@ -45,37 +55,27 @@ use tokio::sync::oneshot;
 use crate::context::ContextHandle;
 use crate::context::actor::commands::TtlCloseCommand;
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::mutation_state_view::MutationStateView;
 use crate::context::actor::outcome::Outcome;
+use crate::context::manager::ContextManager;
 
 /// Per-call transport budget for TTL-close handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch a [`TtlCloseCommand`] against a mutation state view + deps
+/// Dispatch a [`TtlCloseCommand`] against an attached manager + deps
 /// bundle.
 ///
 /// Plan-conforming dispatch signature: matches the post-refactor actor
 /// `run()` loop's call shape
-/// (`handlers::ttl_close::dispatch(&mut self.state, &self.deps, cmd).await`).
+/// (`handlers::ttl_close::dispatch(&mgr, &self.deps, cmd).await`).
 /// `deps` is accepted for symmetry — the ttl-close handler does not yet
 /// touch deps during the shim period. Commit 12 rewires these paths.
-// `needless_pass_by_ref_mut` allow — matches the `&mut` contract
-// used by every migrated handler dispatch
-// (`handlers::{messaging,lifecycle,ttl_close}::dispatch`) so the
-// post-refactor actor `run()` loop can call each one uniformly.
-// Commit 9's TTL handlers delegate to
-// [`ContextManager`](crate::context::manager::ContextManager) and
-// do not mutate the view; commit 12 replaces those delegations with
-// direct state mutations on the actor's owned
-// [`PerContextState`](crate::context::actor::state::PerContextState).
-#[allow(clippy::needless_pass_by_ref_mut)]
 pub async fn dispatch(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     _deps: &ActorDeps,
     cmd: TtlCloseCommand,
 ) -> Outcome<()> {
-    dispatch_inner(view, cmd).await
+    dispatch_inner(mgr, cmd).await
 }
 
 /// Shim-callable dispatch. Used by
@@ -83,40 +83,37 @@ pub async fn dispatch(
 /// during the commits-9-to-11 migration window — deleted in commit 12
 /// when the shim dissolves and the actor's `run()` loop is the only
 /// caller of [`dispatch`].
-///
-/// `needless_pass_by_ref_mut` allow — see the comment on [`dispatch`].
-#[allow(clippy::needless_pass_by_ref_mut)]
 pub(crate) async fn dispatch_from_shim(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     cmd: TtlCloseCommand,
 ) -> Outcome<()> {
-    dispatch_inner(view, cmd).await
+    dispatch_inner(mgr, cmd).await
 }
 
-async fn dispatch_inner(view: &MutationStateView<'_>, cmd: TtlCloseCommand) -> Outcome<()> {
+async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: TtlCloseCommand) -> Outcome<()> {
     match cmd {
         TtlCloseCommand::Placeholder { reply } => reply_not_implemented(reply),
         TtlCloseCommand::StartTtlTimer { payload, reply } => {
             let p = *payload;
-            handle_start_ttl_timer(view, p.context_id, p.params, p.duration, reply).await
+            handle_start_ttl_timer(mgr, p.context_id, p.params, p.duration, reply).await
         }
         TtlCloseCommand::ExtendTtl {
             context_id,
             member_did,
             proposed_duration,
             reply,
-        } => handle_extend_ttl(view, context_id, member_did, proposed_duration, reply).await,
+        } => handle_extend_ttl(mgr, context_id, member_did, proposed_duration, reply).await,
         TtlCloseCommand::ResetTtlTimer { payload, reply } => {
             let p = *payload;
-            handle_reset_ttl_timer(view, p.context_id, p.params, p.duration, reply).await
+            handle_reset_ttl_timer(mgr, p.context_id, p.params, p.duration, reply).await
         }
         TtlCloseCommand::ExecuteTtlClose { payload, reply } => {
             let p = *payload;
-            handle_execute_ttl_close(view, p.context_id, p.params, reply).await
+            handle_execute_ttl_close(mgr, p.context_id, p.params, reply).await
         }
         TtlCloseCommand::FinalizeClose { payload, reply } => {
             let p = *payload;
-            handle_finalize_close(view, p.context_id, p.params, reply).await
+            handle_finalize_close(mgr, p.context_id, p.params, reply).await
         }
     }
 }
@@ -131,13 +128,13 @@ async fn dispatch_inner(view: &MutationStateView<'_>, cmd: TtlCloseCommand) -> O
 /// the task is spawned), but we still wrap it so a pathological mutex
 /// contention storm cannot block the dispatcher indefinitely.
 async fn handle_start_ttl_timer(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     duration: std::time::Duration,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
 
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
@@ -171,13 +168,13 @@ async fn handle_start_ttl_timer(
 /// [`ContextManager::propose_ttl_extension`](crate::context::manager::ContextManager::propose_ttl_extension)
 /// under a 30s timeout.
 async fn handle_extend_ttl(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: String,
     member_did: scp_identity::DID,
     proposed_duration: std::time::Duration,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let extend_fut = crate::context::lifecycle_helpers::propose_ttl_extension(
         &manager,
         &context_id,
@@ -208,13 +205,13 @@ async fn handle_extend_ttl(
 /// [`ContextManager::reset_ttl_timer`](crate::context::manager::ContextManager::reset_ttl_timer)
 /// under a 30s timeout.
 async fn handle_reset_ttl_timer(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     new_duration: std::time::Duration,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
 
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
@@ -252,12 +249,12 @@ async fn handle_reset_ttl_timer(
 /// [`ContextManager::handle_ttl_expiry`](crate::context::manager::ContextManager::handle_ttl_expiry)
 /// under a 30s timeout.
 async fn handle_execute_ttl_close(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
 
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
@@ -294,12 +291,12 @@ async fn handle_execute_ttl_close(
 /// [`ContextManager::finalize_close`](crate::context::manager::ContextManager::finalize_close)
 /// under a 30s timeout.
 async fn handle_finalize_close(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
 
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle

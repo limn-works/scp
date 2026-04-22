@@ -1535,10 +1535,10 @@ pub enum ToolsCommand {
 /// the dispatch function sends the reply and returns
 /// `Outcome { mutated: false }`.
 ///
-/// Commit 7 lands the real read variants that route through the
-/// transitional
-/// [`QueryStateView`](crate::context::actor::query_state_view::QueryStateView)
-/// borrow adapter. Variants that mutate state (even if they live in
+/// Commit 7 lands the real read variants. Commit 12c.7 deletes the
+/// transitional `QueryStateView` borrow adapter and routes the
+/// `&PerContextState` + shared event-log provider directly into the
+/// query handler. Variants that mutate state (even if they live in
 /// `manager/queries.rs` today — `drain_events`, access-key management,
 /// `compare_remote_checkpoint`, `prove_event_*`, etc.) are NOT migrated
 /// here and continue to route through the legacy `ContextManager` until

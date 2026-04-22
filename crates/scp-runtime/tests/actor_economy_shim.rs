@@ -2,7 +2,7 @@
 //!
 //! Exercises the path
 //! [`Supervisor::dispatch_economy_command`](scp_runtime::context::supervisor::Supervisor::dispatch_economy_command)
-//! → [`MutationStateView`](scp_runtime::context::actor::mutation_state_view)
+//! → `MutationStateView` (deleted in commit 12c.7 of ADR-049)
 //! → migrated
 //! [`economy`](scp_runtime::context::actor::handlers::economy)
 //! handler → delegated

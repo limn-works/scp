@@ -7,7 +7,7 @@
 //! attached legacy [`ContextManager`](scp_runtime::context::manager::ContextManager).
 //!
 //! No handler body migration happens in commit 12a.5 — the deps bundle
-//! is wired but not yet consumed by `MutationStateView`-based handlers.
+//! is wired but not yet consumed by `MutationStateView`-based handlers (the adapter was deleted in commit 12c.7).
 //! This test is the mechanical check that the wiring is correct so
 //! commit 12b can move call sites onto `deps.X` one submodule at a
 //! time without discovering missing fields mid-migration.

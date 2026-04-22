@@ -2,7 +2,7 @@
 //!
 //! Exercises the path
 //! [`Supervisor::dispatch_trust_recovery_command`](scp_runtime::context::supervisor::Supervisor::dispatch_trust_recovery_command)
-//! → [`MutationStateView`](scp_runtime::context::actor::mutation_state_view)
+//! → `MutationStateView` (deleted in commit 12c.7 of ADR-049)
 //! → migrated
 //! [`trust_recovery`](scp_runtime::context::actor::handlers::trust_recovery)
 //! handler → delegated

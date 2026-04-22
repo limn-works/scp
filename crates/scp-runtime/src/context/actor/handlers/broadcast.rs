@@ -47,6 +47,7 @@
 //! land, the saga-initiator path returns
 //! `ContextError::NotImplemented`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use scp_platform::KeyCustody;
@@ -60,39 +61,34 @@ use crate::context::actor::commands::{
     SubscribeBroadcastReply, UnsubscribeBroadcastPayload, UnsubscribeBroadcastReply,
 };
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::mutation_state_view::MutationStateView;
 use crate::context::actor::outcome::Outcome;
+use crate::context::manager::ContextManager;
 
 /// Per-call transport budget for broadcast handlers.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch a [`BroadcastCommand`] against a mutation state view + deps
+/// Dispatch a [`BroadcastCommand`] against an attached manager + deps
 /// bundle.
 ///
 /// Publish variants require a key custody reference which cannot cross
 /// the actor mailbox; this entry point rejects them with a typed error
 /// directing the caller to the generic
-/// [`dispatch_with_custody`] path instead.
-// `needless_pass_by_ref_mut` allow — matches the `&mut` contract used
-// by every migrated handler dispatch.
-#[allow(clippy::needless_pass_by_ref_mut)]
+/// [`dispatch_from_shim_with_custody`] path instead.
 pub async fn dispatch(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     _deps: &ActorDeps,
     cmd: BroadcastCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner_no_custody(view, cmd)).await
+    Box::pin(dispatch_inner_no_custody(mgr, cmd)).await
 }
 
 /// Shim-callable dispatch for NON-publish broadcast variants. See the
 /// publish-specific entry points below.
-// `needless_pass_by_ref_mut` allow — see the comment on [`dispatch`].
-#[allow(clippy::needless_pass_by_ref_mut)]
 pub(crate) async fn dispatch_from_shim(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     cmd: BroadcastCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner_no_custody(view, cmd)).await
+    Box::pin(dispatch_inner_no_custody(mgr, cmd)).await
 }
 
 /// Shim-callable dispatch for publish variants that need a key custody
@@ -101,33 +97,31 @@ pub(crate) async fn dispatch_from_shim(
 /// [`ContextManager::publish_broadcast`](crate::context::manager::ContextManager::publish_broadcast)
 /// / [`ContextManager::publish_broadcast_content`](crate::context::manager::ContextManager::publish_broadcast_content)
 /// methods.
-// `needless_pass_by_ref_mut` allow — see the comment on [`dispatch`].
-#[allow(clippy::needless_pass_by_ref_mut)]
 pub(crate) async fn dispatch_from_shim_with_custody<C: KeyCustody>(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     cmd: BroadcastCommand,
     custody: &C,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner_with_custody(view, cmd, custody)).await
+    Box::pin(dispatch_inner_with_custody(mgr, cmd, custody)).await
 }
 
 async fn dispatch_inner_no_custody(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     cmd: BroadcastCommand,
 ) -> Outcome<()> {
     match cmd {
         BroadcastCommand::Placeholder { reply } => reply_not_implemented(reply),
         BroadcastCommand::SubscribeBroadcast { payload, reply } => {
-            handle_subscribe_broadcast(view, *payload, reply).await
+            handle_subscribe_broadcast(mgr, *payload, reply).await
         }
         BroadcastCommand::UnsubscribeBroadcast { payload, reply } => {
-            handle_unsubscribe_broadcast(view, *payload, reply).await
+            handle_unsubscribe_broadcast(mgr, *payload, reply).await
         }
         BroadcastCommand::BlockBroadcastSubscriber { payload, reply } => {
-            handle_block_broadcast_subscriber(view, *payload, reply).await
+            handle_block_broadcast_subscriber(mgr, *payload, reply).await
         }
         BroadcastCommand::UnblockBroadcastSubscriber { payload, reply } => {
-            handle_unblock_broadcast_subscriber(view, *payload, reply).await
+            handle_unblock_broadcast_subscriber(mgr, *payload, reply).await
         }
         BroadcastCommand::HandleBroadcastKeyRequest {
             context_id,
@@ -136,7 +130,7 @@ async fn dispatch_inner_no_custody(
             reply,
         } => {
             handle_handle_broadcast_key_request(
-                view,
+                mgr,
                 &context_id,
                 &author_did,
                 &requester_did,
@@ -145,15 +139,15 @@ async fn dispatch_inner_no_custody(
             .await
         }
         BroadcastCommand::BroadcastSubscriberCount { context_id, reply } => {
-            handle_broadcast_subscriber_count(view, &context_id, reply).await
+            handle_broadcast_subscriber_count(mgr, &context_id, reply).await
         }
         BroadcastCommand::IsBroadcastSubscriber {
             context_id,
             did,
             reply,
-        } => handle_is_broadcast_subscriber(view, &context_id, &did, reply).await,
+        } => handle_is_broadcast_subscriber(mgr, &context_id, &did, reply).await,
         BroadcastCommand::BroadcastAdmission { context_id, reply } => {
-            handle_broadcast_admission(view, &context_id, reply).await
+            handle_broadcast_admission(mgr, &context_id, reply).await
         }
         BroadcastCommand::PublishBroadcast { reply, .. } => {
             // Publish variants require a custody reference that cannot
@@ -178,30 +172,30 @@ async fn dispatch_inner_no_custody(
 }
 
 async fn dispatch_inner_with_custody<C: KeyCustody>(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     cmd: BroadcastCommand,
     custody: &C,
 ) -> Outcome<()> {
     match cmd {
         BroadcastCommand::PublishBroadcast { payload, reply } => {
-            handle_publish_broadcast(view, *payload, custody, reply).await
+            handle_publish_broadcast(mgr, *payload, custody, reply).await
         }
         BroadcastCommand::PublishBroadcastContent { payload, reply } => {
-            handle_publish_broadcast_content(view, *payload, custody, reply).await
+            handle_publish_broadcast_content(mgr, *payload, custody, reply).await
         }
         // Non-publish variants do not need a custody reference. Fall
         // through to the no-custody dispatch so the custody-generic
         // shim method can carry every variant (not just publish).
-        other => dispatch_inner_no_custody(view, other).await,
+        other => dispatch_inner_no_custody(mgr, other).await,
     }
 }
 
 async fn handle_subscribe_broadcast(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     p: SubscribeBroadcastPayload,
     reply: SubscribeBroadcastReply,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
 
     let subscribe_fut = async move {
@@ -249,11 +243,11 @@ async fn handle_subscribe_broadcast(
 }
 
 async fn handle_unsubscribe_broadcast(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     p: UnsubscribeBroadcastPayload,
     reply: UnsubscribeBroadcastReply,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
 
     let unsub_fut = async move {
@@ -286,12 +280,12 @@ async fn handle_unsubscribe_broadcast(
 }
 
 async fn handle_publish_broadcast<C: KeyCustody>(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     p: PublishBroadcastPayload,
     custody: &C,
     reply: PublishBroadcastReply,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
 
     let publish_fut = crate::context::broadcast_helpers::publish_broadcast(
@@ -323,12 +317,12 @@ async fn handle_publish_broadcast<C: KeyCustody>(
 }
 
 async fn handle_publish_broadcast_content<C: KeyCustody>(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     p: PublishBroadcastContentPayload,
     custody: &C,
     reply: PublishBroadcastReply,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
 
     let publish_fut = crate::context::broadcast_helpers::publish_broadcast_content(
@@ -360,11 +354,11 @@ async fn handle_publish_broadcast_content<C: KeyCustody>(
 }
 
 async fn handle_block_broadcast_subscriber(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     p: BroadcastBlockPayload,
     reply: BlockBroadcastSubscriberReply,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
 
     let block_fut = async move {
@@ -397,11 +391,11 @@ async fn handle_block_broadcast_subscriber(
 }
 
 async fn handle_unblock_broadcast_subscriber(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     p: BroadcastBlockPayload,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
 
     let unblock_fut = async move {
@@ -434,13 +428,13 @@ async fn handle_unblock_broadcast_subscriber(
 }
 
 async fn handle_handle_broadcast_key_request(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: &str,
     author_did: &scp_identity::DID,
     requester_did: &scp_identity::DID,
     reply: HandleBroadcastKeyRequestReply,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let key_req_fut = crate::context::broadcast_helpers::handle_broadcast_key_request(
         &manager,
         context_id,
@@ -468,11 +462,11 @@ async fn handle_handle_broadcast_key_request(
 }
 
 async fn handle_broadcast_subscriber_count(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: &str,
     reply: oneshot::Sender<Result<Option<usize>, ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let count_fut =
         crate::context::broadcast_helpers::broadcast_subscriber_count(&manager, context_id);
 
@@ -492,12 +486,12 @@ async fn handle_broadcast_subscriber_count(
 }
 
 async fn handle_is_broadcast_subscriber(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: &str,
     did: &str,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let is_fut =
         crate::context::broadcast_helpers::is_broadcast_subscriber(&manager, context_id, did);
 
@@ -517,11 +511,11 @@ async fn handle_is_broadcast_subscriber(
 }
 
 async fn handle_broadcast_admission(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: &str,
     reply: BroadcastAdmissionReply,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
     let admission_fut =
         crate::context::broadcast_helpers::broadcast_admission(&manager, context_id);
 

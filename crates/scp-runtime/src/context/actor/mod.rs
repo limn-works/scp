@@ -39,9 +39,7 @@ pub mod commands;
 pub mod deps;
 pub mod handle;
 pub mod handlers;
-pub(crate) mod mutation_state_view;
 pub mod outcome;
-pub(crate) mod query_state_view;
 pub mod sequence;
 pub mod state;
 

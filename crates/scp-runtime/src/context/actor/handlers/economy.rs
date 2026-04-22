@@ -5,8 +5,8 @@
 //! # Commit 10 scope
 //!
 //! Migrates the dispatch shape: the handler takes
-//! [`MutationStateView`](crate::context::actor::mutation_state_view::MutationStateView)
-//! + [`ActorDeps`] + [`EconomyCommand`], returns `Outcome<()>`.
+//! `&Arc<ContextManager>` + [`ActorDeps`] + [`EconomyCommand`], returns
+//! `Outcome<()>`.
 //!
 //! The underlying byte-identical implementation still lives on
 //! [`ContextManager::verify_payment_receipts`](crate::context::manager::ContextManager::verify_payment_receipts).
@@ -24,13 +24,23 @@
 //! invoked by the messaging path, not by FFI bridges. They migrate
 //! implicitly with the messaging / lifecycle handlers, not as
 //! dedicated commands.
+//!
+//! # ADR-049 commit 12c.7 — direct dispatch
+//!
+//! Prior to 12c.7 the handler took a `MutationStateView<'_>` borrow
+//! adapter that bundled an `Arc<ContextManager>` reference plus a
+//! mutable scratch send-sequence tracker (the economy path never read
+//! the tracker, but the adapter was uniform across handlers). 12c.7
+//! deletes the adapter: the supervisor passes the
+//! `&Arc<ContextManager>` directly and no scratch tracker is allocated.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::context::actor::commands::EconomyCommand;
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::mutation_state_view::MutationStateView;
 use crate::context::actor::outcome::Outcome;
+use crate::context::manager::ContextManager;
 use crate::economy::receipt::ReceiptVerificationError;
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
@@ -39,43 +49,38 @@ use tokio::sync::oneshot;
 /// timeouts inside actor handlers": 30 seconds.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch an [`EconomyCommand`] against a mutation state view + deps
+/// Dispatch an [`EconomyCommand`] against an attached manager + deps
 /// bundle.
 ///
 /// Plan-conforming dispatch signature: matches the post-refactor actor
 /// `run()` loop's call shape
-/// (`handlers::economy::dispatch(&mut self.state, &self.deps, cmd).await`).
+/// (`handlers::economy::dispatch(&mgr, &self.deps, cmd).await`).
 /// `deps` is accepted for symmetry — the economy handler does not yet
 /// touch deps during the shim period. Commit 12 rewires these paths.
-// `needless_pass_by_ref_mut` allow — matches the `&mut` contract
-// used by every migrated handler dispatch for signature stability.
-#[allow(clippy::needless_pass_by_ref_mut)]
 pub async fn dispatch(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     _deps: &ActorDeps,
     cmd: EconomyCommand,
 ) -> Outcome<()> {
-    dispatch_inner(view, cmd).await
+    dispatch_inner(mgr, cmd).await
 }
 
 /// Shim-callable dispatch. Used by
 /// [`Supervisor::dispatch_economy_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_economy_command)
 /// during the commits-10-to-11 migration window — deleted in commit 12
 /// when the shim dissolves.
-// `needless_pass_by_ref_mut` allow — see the comment on [`dispatch`].
-#[allow(clippy::needless_pass_by_ref_mut)]
 pub(crate) async fn dispatch_from_shim(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     cmd: EconomyCommand,
 ) -> Outcome<()> {
-    dispatch_inner(view, cmd).await
+    dispatch_inner(mgr, cmd).await
 }
 
-async fn dispatch_inner(view: &MutationStateView<'_>, cmd: EconomyCommand) -> Outcome<()> {
+async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: EconomyCommand) -> Outcome<()> {
     match cmd {
         EconomyCommand::Placeholder { reply } => reply_not_implemented(reply),
         EconomyCommand::VerifyPaymentReceipts { receipts, reply } => {
-            handle_verify_payment_receipts(view, *receipts, reply).await
+            handle_verify_payment_receipts(mgr, *receipts, reply).await
         }
     }
 }
@@ -86,11 +91,11 @@ async fn dispatch_inner(view: &MutationStateView<'_>, cmd: EconomyCommand) -> Ou
 /// per-context state; it calls the configured payment adapter's
 /// `verify_dyn` method per receipt and collates results.
 async fn handle_verify_payment_receipts(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     receipts: Vec<crate::economy::adapter::PaymentReceipt>,
     reply: crate::context::actor::commands::VerifyPaymentReceiptsReply,
 ) -> Outcome<()> {
-    let manager = std::sync::Arc::clone(view.manager());
+    let manager = Arc::clone(mgr);
 
     let verify_fut = crate::context::economy_helpers::verify_payment_receipts(&manager, &receipts);
 

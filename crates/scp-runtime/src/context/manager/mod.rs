@@ -1295,10 +1295,13 @@ pub(crate) const PSEUDONYM_ANNOUNCEMENT_TAG: &str = "\0scp:pseudonym-announce:v1
 /// Internal state tracked by the manager for each context.
 ///
 /// **Visibility:** elevated to `pub(crate)` by commit 7 of ADR-049 so the
-/// transitional [`crate::context::actor::query_state_view::QueryStateView`]
-/// adapter can borrow into this struct while the query-handler migration is
-/// under way. The struct (and this elevation) is deleted in commit 12
-/// alongside `ContextManager`. Do not add new public users outside the
+/// transitional query-handler shim could borrow into this struct while the
+/// query-handler migration was under way. Commit 12c.7 deleted the
+/// `QueryStateView` adapter; the supervisor now passes the locked
+/// `&PerContextState` directly into
+/// [`crate::context::actor::handlers::queries::dispatch_from_shim`] so the
+/// `pub(crate)` elevation is still required. The struct is deleted in commit
+/// 12 alongside `ContextManager`. Do not add new public users outside the
 /// shim — everything that reads this type today either lives inside
 /// `manager/` or passes through the shim's typed accessor methods.
 pub(crate) struct PerContextState {
@@ -1398,11 +1401,14 @@ impl PerContextState {
     // Commit 7 / ADR-049 read-only accessors
     //
     // These accessors expose borrowed views into the legacy
-    // `PerContextState` for the transitional
-    // [`crate::context::actor::query_state_view::QueryStateView`] shim.
-    // They return shared references only; every mutating path continues
-    // to touch fields directly inside the manager module. The set is
-    // deleted in commit 12 together with `manager::PerContextState`.
+    // `PerContextState` for the query-handler shim
+    // ([`crate::context::actor::handlers::queries::dispatch_from_shim`])
+    // — commit 12c.7 deleted the `QueryStateView` adapter and now
+    // routes the `&PerContextState` directly, but the handler still
+    // calls these accessors. They return shared references only;
+    // every mutating path continues to touch fields directly inside
+    // the manager module. The set is deleted in commit 12 together
+    // with `manager::PerContextState`.
     // -------------------------------------------------------------------
 
     /// Membership state — the live `MembershipState` the manager uses to
@@ -1481,13 +1487,16 @@ impl PerContextState {
     }
 
     // -------------------------------------------------------------------
-    // Commit 8 / ADR-049 mutable accessors for the transitional
-    // [`crate::context::actor::mutation_state_view::MutationStateView`]
-    // shim. Mutable siblings of the read-only accessors above. Every
-    // entry here is deleted in commit 12 along with the manager struct.
-    // The only reason these are not simple `pub(super)` field accesses
-    // is that the shim lives in `context::actor`, a sibling module, and
-    // the fields are private to `manager`.
+    // Commit 8 / ADR-049 mutable accessors for the messaging shim.
+    // Commit 12c.7 deleted the `MutationStateView` adapter; the
+    // supervisor's `dispatch_command` (messaging) still uses
+    // `send_tracker_mut()` directly under the take-and-swap protocol
+    // before handing a `&mut SendSequenceTracker` to
+    // [`crate::context::actor::handlers::messaging::dispatch_from_shim`].
+    // Every entry here is deleted in commit 12 along with the manager
+    // struct. The only reason these are not simple `pub(super)` field
+    // accesses is that the shim lives in `context::actor`, a sibling
+    // module, and the fields are private to `manager`.
     // -------------------------------------------------------------------
 
     /// Mutable send-sequence tracker (ADR-049 commit 8). Caller passes

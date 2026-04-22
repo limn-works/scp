@@ -215,9 +215,10 @@ pub struct CoreFields {
     /// Every bridge instance owns one supervisor. Queries dispatched
     /// through the supervisor's
     /// [`dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)
-    /// path are answered by migrated handler code reading through the
-    /// transitional `QueryStateView` borrow adapter; writes continue to
-    /// run on the legacy `ContextManager`. See ADR-049 row 7 of the
+    /// path are answered by migrated handler code reading the locked
+    /// `&PerContextState` directly (commit 12c.7 deleted the
+    /// transitional `QueryStateView` borrow adapter); writes continue
+    /// to run on the legacy `ContextManager`. See ADR-049 row 7 of the
     /// commit ladder. Deleted in commit 12 with the shim itself.
     ///
     /// Constructed eagerly by every `CoreFields` constructor via

@@ -6,8 +6,8 @@
 //! # Commit 8 scope
 //!
 //! Migrates the dispatch shape: the handler takes
-//! [`MutationStateView`](crate::context::actor::mutation_state_view::MutationStateView)
-//! + [`ActorDeps`] + [`MessagingCommand`], returns `Outcome<()>`.
+//! `&Arc<ContextManager>` + `&mut SendSequenceTracker` + [`ActorDeps`] +
+//! [`MessagingCommand`], returns `Outcome<()>`.
 //!
 //! The underlying byte-identical implementation still lives on
 //! [`ContextManager::send_message`](crate::context::manager::ContextManager::send_message)
@@ -22,13 +22,24 @@
 //!    handlers". Timeout maps to
 //!    [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout).
 //! 2. Use [`SequenceReservation::reserve`](crate::context::actor::SequenceReservation)
-//!    on the view's `send_tracker` for the send path so the RAII
+//!    on the caller-supplied `send_tracker` for the send path so the RAII
 //!    rollback mechanism is exercised on every failure mode (early `?`
 //!    return, transport timeout, crypto error). The legacy
 //!    `MembershipState::next_sequence_number` tracker remains
 //!    authoritative for wire sequence numbers during the shim period;
 //!    commit 12 rewires the send path so this tracker alone drives the
 //!    wire sequence.
+//!
+//! # ADR-049 commit 12c.7 — direct dispatch
+//!
+//! Prior to 12c.7 the handler took a `MutationStateView<'_>` borrow
+//! adapter that bundled an `Arc<ContextManager>` reference plus a
+//! mutable borrow of the per-context `SendSequenceTracker`. 12c.7
+//! deletes the adapter: the supervisor passes the
+//! `&Arc<ContextManager>` plus a `&mut SendSequenceTracker` directly.
+//! Both remain required — the send path needs the tracker for RAII
+//! reservation; the deliver path only reads the manager, so the
+//! tracker is threaded through but not consumed on that arm.
 //!
 //! # Transport-timeout budget
 //!
@@ -38,47 +49,51 @@
 //! plan's "every transport and storage call inside a handler wraps
 //! `tokio::time::timeout(30s, ...)`" contract.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
 use crate::context::ContextHandle;
+use crate::context::actor::SendSequenceTracker;
 use crate::context::actor::commands::MessagingCommand;
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::mutation_state_view::MutationStateView;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::sequence::SequenceReservation;
+use crate::context::manager::ContextManager;
 
 /// Per-call transport budget for mutation handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch a [`MessagingCommand`] against a mutation state view + deps
-/// bundle. Each real variant wraps the delegated
+/// Dispatch a [`MessagingCommand`] against the attached manager + the
+/// per-context send-sequence tracker + a deps bundle. Each real variant
+/// wraps the delegated
 /// [`ContextManager`](crate::context::manager::ContextManager) call in
-/// [`tokio::time::timeout`] with the per-call
-/// [`HANDLER_TIMEOUT`] budget.
+/// [`tokio::time::timeout`] with the per-call [`HANDLER_TIMEOUT`]
+/// budget.
 ///
 /// Plan-conforming dispatch signature: matches the post-refactor actor
 /// `run()` loop's call shape
-/// (`handlers::messaging::dispatch(&mut self.state, &self.deps, cmd).await`).
+/// (`handlers::messaging::dispatch(&mgr, &self.deps, &mut state.send_tracker, cmd).await`).
 /// `deps` is accepted for symmetry — the messaging handler does not yet
 /// touch deps during the shim period (the transport, event log, etc.
-/// live on the legacy [`ContextManager`](crate::context::manager::ContextManager)
-/// the view borrows). Commit 12 rewires these paths to use `deps`
-/// directly once the manager surface is deleted.
+/// live on the legacy [`ContextManager`](crate::context::manager::ContextManager)).
+/// Commit 12 rewires these paths to use `deps` directly once the
+/// manager surface is deleted.
 ///
 /// Deleted / heavily refactored in commit 12 (the shim-driven
 /// delegation pattern goes away with `ContextManager`; the handler
 /// body reads state and encrypts in-place against the actor's owned
 /// backends).
 pub async fn dispatch(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     _deps: &ActorDeps,
+    send_tracker: &mut SendSequenceTracker,
     cmd: MessagingCommand,
 ) -> Outcome<()> {
-    dispatch_inner(view, cmd).await
+    dispatch_inner(mgr, send_tracker, cmd).await
 }
 
 /// Shim-callable dispatch. Used by
@@ -89,20 +104,25 @@ pub async fn dispatch(
 ///
 /// Messaging commands do not yet touch [`ActorDeps`] during the shim
 /// period (the transport, MLS/HPKE backends, and key-package store
-/// live on the legacy [`ContextManager`](crate::context::manager::ContextManager)
-/// the view borrows). Requiring callers to synthesize an `ActorDeps`
-/// instance just to route a send / deliver through the shim would
-/// force every bridge into a placeholder-deps dance before commits
-/// 9-11 land the real dep wiring. This entry point exists to avoid
-/// that churn — it takes only the view and the command.
+/// live on the legacy [`ContextManager`](crate::context::manager::ContextManager)).
+/// Requiring callers to synthesize an `ActorDeps` instance just to route
+/// a send / deliver through the shim would force every bridge into a
+/// placeholder-deps dance before commits 9-11 land the real dep wiring.
+/// This entry point exists to avoid that churn — it takes only the
+/// manager, the send tracker, and the command.
 pub(crate) async fn dispatch_from_shim(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
+    send_tracker: &mut SendSequenceTracker,
     cmd: MessagingCommand,
 ) -> Outcome<()> {
-    dispatch_inner(view, cmd).await
+    dispatch_inner(mgr, send_tracker, cmd).await
 }
 
-async fn dispatch_inner(view: &mut MutationStateView<'_>, cmd: MessagingCommand) -> Outcome<()> {
+async fn dispatch_inner(
+    mgr: &Arc<ContextManager>,
+    send_tracker: &mut SendSequenceTracker,
+    cmd: MessagingCommand,
+) -> Outcome<()> {
     match cmd {
         MessagingCommand::Placeholder { reply } => reply_not_implemented(reply),
         MessagingCommand::SendMessage { payload, reply } => {
@@ -112,7 +132,8 @@ async fn dispatch_inner(view: &mut MutationStateView<'_>, cmd: MessagingCommand)
             // not need to preserve the Box.
             let p = *payload;
             handle_send_message(
-                view,
+                mgr,
+                send_tracker,
                 &p.context_id,
                 p.params,
                 &p.sender_did,
@@ -128,7 +149,7 @@ async fn dispatch_inner(view: &mut MutationStateView<'_>, cmd: MessagingCommand)
             context_id,
             envelope_bytes,
             reply,
-        } => handle_deliver_incoming(view, &context_id, &envelope_bytes, reply).await,
+        } => handle_deliver_incoming(mgr, &context_id, &envelope_bytes, reply).await,
     }
 }
 
@@ -139,7 +160,8 @@ async fn dispatch_inner(view: &mut MutationStateView<'_>, cmd: MessagingCommand)
 /// drop (RAII rollback) on any failure path.
 #[allow(clippy::too_many_arguments)] // unavoidable — matches ContextManager::send_message signature
 async fn handle_send_message(
-    view: &mut MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
+    send_tracker: &mut SendSequenceTracker,
     context_id: &str,
     params: scp_protocol::context::params::ContextParams,
     sender_did: &scp_identity::DID,
@@ -149,22 +171,19 @@ async fn handle_send_message(
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    // Capture the manager reference FIRST (immutable borrow) before
-    // acquiring the mutable borrow for the `SequenceReservation`. Once
-    // the reservation holds `&mut view.send_tracker`, Rust's borrow
-    // checker refuses a simultaneous `&view.manager` — so we clone
-    // the `Arc<ContextManager>` up-front. Cloning the Arc is a cheap
-    // refcount bump; the handler needs it alive across the delegated
-    // await regardless.
-    let manager: std::sync::Arc<crate::context::manager::ContextManager> =
-        std::sync::Arc::clone(view.manager());
+    // Clone the `Arc<ContextManager>` up-front so the
+    // `SequenceReservation`'s mutable borrow of `send_tracker` and the
+    // subsequent use of the manager do not conflict. Cloning the Arc is
+    // a cheap refcount bump; the handler needs it alive across the
+    // delegated await regardless.
+    let manager: Arc<ContextManager> = Arc::clone(mgr);
 
     // Step 1: reserve the next actor-shape sequence number. The RAII
     // guard rolls back on any early `?` return below, on transport
     // timeout, or on crypto failure. Legacy `MembershipState` wire
     // sequence numbers are assigned inside `ContextManager::send_message`
     // during the shim period.
-    let reservation = SequenceReservation::reserve(view.send_tracker);
+    let reservation = SequenceReservation::reserve(send_tracker);
     let _reserved = reservation.number();
 
     // Step 2: rebuild an ephemeral `ContextHandle` on the receive side
@@ -281,20 +300,18 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
 /// [`ContextManager::deliver_incoming`](crate::context::manager::ContextManager::deliver_incoming)
 /// under the same 30s timeout contract.
 ///
-/// Takes the view by shared reference — deliver does not reserve a
-/// send-sequence, so no mutable access to the view's `send_tracker` is
-/// needed during the shim period. The handler signature will flip to
-/// `&mut MutationStateView` (matching the send path) in commit 12 when
-/// the receive-sequence tracker moves onto the actor state's
-/// `recv_tracker` field.
+/// Takes the manager by shared reference — deliver does not reserve a
+/// send-sequence, so no access to the `send_tracker` is needed during
+/// the shim period. The handler signature will flip to take the full
+/// actor state (including the `recv_tracker`) in commit 12 when the
+/// receive-sequence tracker moves onto the actor state.
 async fn handle_deliver_incoming(
-    view: &MutationStateView<'_>,
+    mgr: &Arc<ContextManager>,
     context_id: &str,
     envelope_bytes: &[u8],
     reply: crate::context::actor::commands::DeliverIncomingReply,
 ) -> Outcome<()> {
-    let manager: std::sync::Arc<crate::context::manager::ContextManager> =
-        std::sync::Arc::clone(view.manager());
+    let manager: Arc<ContextManager> = Arc::clone(mgr);
     let deliver_fut = crate::context::messaging_helpers::deliver_incoming(
         &manager,
         manager.clock_ref(),

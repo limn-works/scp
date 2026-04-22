@@ -2,7 +2,7 @@
 //!
 //! Exercises the path
 //! [`Supervisor::dispatch_lifecycle_command`](scp_runtime::context::supervisor::Supervisor::dispatch_lifecycle_command)
-//! → [`MutationStateView`](scp_runtime::context::actor::mutation_state_view)
+//! → `MutationStateView` (deleted in commit 12c.7 of ADR-049)
 //! → migrated
 //! [`lifecycle`](scp_runtime::context::actor::handlers::lifecycle)
 //! handler → delegated
