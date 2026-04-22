@@ -38,9 +38,7 @@ use scp_protocol::context::governance::{
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
     GovernanceProposal, KeyResolver, ProposalId, ProposalStatus, PruningPolicy, SingleAdminEngine,
     majority::MajorityVoteEngine,
-    mls_integration::{
-        CoordinationRecord, EpochCoordinator, MlsImpact, classify_action, generate_mls_operations,
-    },
+    mls_integration::{CoordinationRecord, EpochCoordinator},
     multisig::ThresholdEngine,
     unanimity::UnanimityEngine,
 };
@@ -81,13 +79,13 @@ pub(crate) mod ttl_close;
 // ---------------------------------------------------------------------------
 
 /// Maximum number of registered tools per context.
-const MAX_REGISTERED_TOOLS: usize = 256;
+pub(crate) const MAX_REGISTERED_TOOLS: usize = 256;
 
 /// Maximum number of cross-context tool interfaces per context.
-const MAX_TOOL_INTERFACES: usize = 256;
+pub(crate) const MAX_TOOL_INTERFACES: usize = 256;
 
 /// Maximum number of governance threshold signers per context.
-const MAX_THRESHOLD_SIGNERS: usize = 64;
+pub(crate) const MAX_THRESHOLD_SIGNERS: usize = 64;
 
 /// Default ceiling change notification period in seconds (M7, §5.3.2).
 ///
@@ -96,14 +94,14 @@ const MAX_THRESHOLD_SIGNERS: usize = 64;
 /// ceiling are notified and may leave before the expansion applies.
 ///
 /// Spec §5.3.2: "A mandatory notification period of 72 hours begins."
-const CEILING_CHANGE_NOTIFICATION_PERIOD_SECS: u64 = 259_200; // 72 hours
+pub(crate) const CEILING_CHANGE_NOTIFICATION_PERIOD_SECS: u64 = 259_200; // 72 hours
 
 /// TTL for `executed_proposals` entries in seconds (14 days).
 ///
 /// Entries older than this are evicted on each insert to prevent unbounded
 /// growth. 14 days is generous — governance proposals are typically resolved
 /// within hours, so a 14-day window provides ample replay protection.
-const EXECUTED_PROPOSALS_TTL_SECS: u64 = 14 * 24 * 60 * 60; // 14 days
+pub(crate) const EXECUTED_PROPOSALS_TTL_SECS: u64 = 14 * 24 * 60 * 60; // 14 days
 
 // ---------------------------------------------------------------------------
 // MLS commit broadcast retry queue (PR #1606 C6)
@@ -332,7 +330,7 @@ impl PendingCeilingModification {
 ///
 /// Spec §19.3: "economic policy changes MUST NOT take effect sooner than
 /// 24 hours after the `EconomicPolicyChanged` event."
-const ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS: u64 = 86_400; // 24 hours
+pub(crate) const ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS: u64 = 86_400; // 24 hours
 
 // ---------------------------------------------------------------------------
 // PendingEconomicPolicyChange (§19.3)
@@ -1564,7 +1562,7 @@ impl PerContextState {
 /// The match is exhaustive (no wildcard catch-all) so that adding a new
 /// `ContextEvent` variant with sensitive data causes a compile error,
 /// forcing the developer to decide whether the variant needs stripping.
-pub(super) fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
+pub(crate) fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
     match event {
         ContextEvent::MessageReceived { sender_did, .. } => ContextEvent::MessageReceived {
             sender_did: sender_did.clone(),
@@ -1902,7 +1900,7 @@ pub(crate) fn require_active(handle: &ContextHandle) -> Result<(), ContextError>
 
 /// Requires the context to be in `MigratingOut` state (§5.11A).
 /// Used for `CancelContextMigration` which is only valid during migration.
-fn require_migrating_out(handle: &ContextHandle) -> Result<(), ContextError> {
+pub(crate) fn require_migrating_out(handle: &ContextHandle) -> Result<(), ContextError> {
     let state = handle
         .try_read_state()
         .ok_or(ContextError::ContextNotActive)?;

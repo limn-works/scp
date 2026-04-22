@@ -8073,10 +8073,16 @@ pub async fn governance_approve(
         .spawn(async move {
             let did = scp_identity::DID(voter_did);
             let manager = crate::runtime::context_manager()?;
-            let status = manager
-                .approve_governance_proposal(&context_id, &proposal_id, &did, &signing_key)
-                .await
-                .map_err(ScpError::from)?;
+            // Box::pin — ADR-049 commit 12c.3b hoist pushed the governance
+            // path's future size past clippy's 16 KB stack budget.
+            let status = Box::pin(manager.approve_governance_proposal(
+                &context_id,
+                &proposal_id,
+                &did,
+                &signing_key,
+            ))
+            .await
+            .map_err(ScpError::from)?;
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })
@@ -8119,10 +8125,16 @@ pub async fn governance_reject(
         .spawn(async move {
             let did = scp_identity::DID(voter_did);
             let manager = crate::runtime::context_manager()?;
-            let status = manager
-                .reject_governance_proposal(&context_id, &proposal_id, &did, &signing_key)
-                .await
-                .map_err(ScpError::from)?;
+            // Box::pin — ADR-049 commit 12c.3b hoist pushed the governance
+            // path's future size past clippy's 16 KB stack budget.
+            let status = Box::pin(manager.reject_governance_proposal(
+                &context_id,
+                &proposal_id,
+                &did,
+                &signing_key,
+            ))
+            .await
+            .map_err(ScpError::from)?;
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })

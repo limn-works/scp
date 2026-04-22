@@ -2818,15 +2818,21 @@ pub async fn context_governance_reject(
         let manager = context_manager()?;
         let context_id = handle.context_id.clone();
 
-        let status = manager
-            .reject_governance_proposal(&context_id, &proposal_id, &did, &signing_key)
-            .await
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Context {
-                    message: format!("governance rejection failed: {e}"),
-                    code: codes::CTX_2043.to_owned(),
-                })
-            })?;
+        // Box::pin — ADR-049 commit 12c.3b hoist pushed the governance
+        // path's future size past clippy's 16 KB stack budget.
+        let status = Box::pin(manager.reject_governance_proposal(
+            &context_id,
+            &proposal_id,
+            &did,
+            &signing_key,
+        ))
+        .await
+        .map_err(|e| {
+            NapiError::from(ScpNapiError::Context {
+                message: format!("governance rejection failed: {e}"),
+                code: codes::CTX_2043.to_owned(),
+            })
+        })?;
 
         if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id).await {
             tracing::warn!(

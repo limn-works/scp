@@ -2528,12 +2528,18 @@ fn py_governance_reject(
     let proposal_id = parse_proposal_id(proposal_id_hex)?;
 
     rt.block_on(async move {
-        let status = mgr
-            .reject_governance_proposal(&context_id, &proposal_id, &voter_did, &signing_key)
-            .await
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("SCP-CTX-2043: governance rejection failed: {e}"))
-            })?;
+        // Box::pin — ADR-049 commit 12c.3b hoist pushed the governance
+        // path's future size past clippy's 16 KB stack budget.
+        let status = Box::pin(mgr.reject_governance_proposal(
+            &context_id,
+            &proposal_id,
+            &voter_did,
+            &signing_key,
+        ))
+        .await
+        .map_err(|e| {
+            PyRuntimeError::new_err(format!("SCP-CTX-2043: governance rejection failed: {e}"))
+        })?;
 
         if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id) {
             tracing::warn!(

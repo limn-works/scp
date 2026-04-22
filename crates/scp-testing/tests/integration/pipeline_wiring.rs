@@ -54,8 +54,27 @@ const MANAGER_SRC: &str = concat!(
     // `manager/ttl_close.rs` for the same first-match reason — any
     // pipeline-wiring assertion that names one of these methods must
     // witness the hoisted body, not the forwarder.
+    //
+    // Commit 12c.3b of ADR-049 extends the hoist pattern to the
+    // governance domain: `propose_governance_action`,
+    // `propose_governance_action_checked`, `vote_on_proposal`,
+    // `approve_governance_proposal`, `reject_governance_proposal`,
+    // `withdraw_governance_vote`, `execute_governance_action`,
+    // `get_proposal`, `list_proposals`,
+    // `apply_pending_ceiling_modification`,
+    // `apply_pending_economic_policy_change`,
+    // `tombstone_migrated_context`, `migration_state`,
+    // `acknowledge_commit_fault`, and their 25+ domain-internal
+    // transitives (the `execute_*` bodies, `finalize_governance_action`,
+    // `dispatch_governance_action`, `dispatch_context_governance_action`,
+    // `dispatch_content_governance_action`, `propose_governance_action_inner`,
+    // `vote_on_proposal_inner`, `detect_and_handle_conflicts`,
+    // `check_and_resolve_expired_freezes`, `try_broadcast_commit_or_enqueue`,
+    // `build_governance_context`). `governance_helpers.rs` is concatenated
+    // BEFORE `manager/governance.rs` for the same first-match reason.
     include_str!("../../../../crates/scp-runtime/src/context/messaging_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/messaging.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/broadcast.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/governance.rs"),

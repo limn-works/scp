@@ -308,16 +308,19 @@ async fn handle_vote_on_proposal(
     let context_id = p.context_id.clone();
     let signing_key = p.signing_key.to_signing_key();
 
+    // Box::pin — see sibling `handle_propose_governance_action`. The
+    // governance-path future crosses clippy's 16 KB stack budget after
+    // the 12c.3b hoist; boxing inside the `async move` keeps the
+    // heap allocation per-call rather than per-handler.
     let vote_fut = async move {
-        manager
-            .vote_on_proposal(
-                &p.context_id,
-                &p.proposal_id,
-                &p.voter_did,
-                approve,
-                &signing_key,
-            )
-            .await
+        Box::pin(manager.vote_on_proposal(
+            &p.context_id,
+            &p.proposal_id,
+            &p.voter_did,
+            approve,
+            &signing_key,
+        ))
+        .await
     };
 
     // Box::pin — governance futures cross clippy's 16 KB stack budget
@@ -355,10 +358,15 @@ async fn handle_approve_governance_proposal(
     let context_id = p.context_id.clone();
     let signing_key = p.signing_key.to_signing_key();
 
+    // Box::pin — see sibling `handle_propose_governance_action`.
     let approve_fut = async move {
-        manager
-            .approve_governance_proposal(&p.context_id, &p.proposal_id, &p.voter_did, &signing_key)
-            .await
+        Box::pin(manager.approve_governance_proposal(
+            &p.context_id,
+            &p.proposal_id,
+            &p.voter_did,
+            &signing_key,
+        ))
+        .await
     };
 
     // Box::pin — see sibling `handle_propose_governance_action`.
@@ -396,10 +404,15 @@ async fn handle_reject_governance_proposal(
     let context_id = p.context_id.clone();
     let signing_key = p.signing_key.to_signing_key();
 
+    // Box::pin — see sibling `handle_propose_governance_action`.
     let reject_fut = async move {
-        manager
-            .reject_governance_proposal(&p.context_id, &p.proposal_id, &p.voter_did, &signing_key)
-            .await
+        Box::pin(manager.reject_governance_proposal(
+            &p.context_id,
+            &p.proposal_id,
+            &p.voter_did,
+            &signing_key,
+        ))
+        .await
     };
 
     // Box::pin — see sibling `handle_propose_governance_action`.

@@ -3305,7 +3305,11 @@ async fn scp274_conflict_detection_change_role() {
         ctx.governance
             .approved_proposals
             .insert(proposal_a.proposal_id, (proposal_a.clone(), now, now));
-        let events = manager.detect_and_handle_conflicts(ctx, &proposal_b);
+        let events = crate::context::governance_helpers::detect_and_handle_conflicts(
+            &manager,
+            ctx,
+            &proposal_b,
+        );
         assert!(
             events.iter().any(|e| matches!(
                 e,
@@ -16738,8 +16742,10 @@ async fn h10_governance_freeze_not_triggered_by_timestamp_collision() {
     let mut g = arc.lock().await;
     let ctx = &mut *g;
 
-    let events_a = manager.detect_and_handle_conflicts(ctx, &proposal_a);
-    let events_b = manager.detect_and_handle_conflicts(ctx, &proposal_b);
+    let events_a =
+        crate::context::governance_helpers::detect_and_handle_conflicts(&manager, ctx, &proposal_a);
+    let events_b =
+        crate::context::governance_helpers::detect_and_handle_conflicts(&manager, ctx, &proposal_b);
 
     // Wall clock did NOT advance.
     assert_eq!(
@@ -16832,7 +16838,8 @@ async fn h10_approved_proposals_stores_monotonic_seq() {
         );
 
         for p in &proposals {
-            let _ = manager.detect_and_handle_conflicts(ctx, p);
+            let _ =
+                crate::context::governance_helpers::detect_and_handle_conflicts(&manager, ctx, p);
         }
 
         // Counter must have advanced exactly 3 times.
@@ -16900,8 +16907,10 @@ async fn h10_next_proposal_seq_persists_across_snapshot() {
             .clone();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
-        let _ = manager.detect_and_handle_conflicts(ctx, &p_a);
-        let _ = manager.detect_and_handle_conflicts(ctx, &p_b);
+        let _ =
+            crate::context::governance_helpers::detect_and_handle_conflicts(&manager, ctx, &p_a);
+        let _ =
+            crate::context::governance_helpers::detect_and_handle_conflicts(&manager, ctx, &p_b);
         assert_eq!(ctx.governance.next_proposal_seq, 2);
         super::ContextManager::snapshot_context(ctx)
     };
@@ -16987,8 +16996,10 @@ async fn h10_import_context_resets_next_proposal_seq() {
             .clone();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
-        let _ = manager.detect_and_handle_conflicts(ctx, &p_a);
-        let _ = manager.detect_and_handle_conflicts(ctx, &p_b);
+        let _ =
+            crate::context::governance_helpers::detect_and_handle_conflicts(&manager, ctx, &p_a);
+        let _ =
+            crate::context::governance_helpers::detect_and_handle_conflicts(&manager, ctx, &p_b);
         super::ContextManager::snapshot_context(ctx)
     };
 
@@ -17109,14 +17120,22 @@ async fn h10_conflict_resolution_uses_seq_not_timestamp() {
             .clone();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
-        let _events_a = manager.detect_and_handle_conflicts(ctx, &proposal_a);
+        let _events_a = crate::context::governance_helpers::detect_and_handle_conflicts(
+            &manager,
+            ctx,
+            &proposal_a,
+        );
 
         // Rewind the wall clock — simulates clock skew, NTP step-back,
         // or the attacker's most aggressive forgery.
         clock.set(1_500_000);
         assert_eq!(clock.now_secs(), 1_500_000, "TestClock rewound");
 
-        let events_b = manager.detect_and_handle_conflicts(ctx, &proposal_b);
+        let events_b = crate::context::governance_helpers::detect_and_handle_conflicts(
+            &manager,
+            ctx,
+            &proposal_b,
+        );
 
         // Proposal A must still hold the approved slot.
         assert!(
