@@ -867,9 +867,37 @@ impl Scp {
         use scp_ffi_common::validate::validate_did;
         use scp_identity::DID;
 
-        let _ = &self.inner;
-
         validate_did(&did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+        // Ownership check: reject recovery for DIDs not registered in
+        // this bridge instance's identity registry (round-3 red-hat
+        // RED-PR5-003). Without this, any realm-local caller could
+        // drive unbounded recovery work on `crate::runtime()` against
+        // arbitrary DIDs.
+        if !crate::runtime::identity_registry(&self.inner).contains_key(&did) {
+            return Err(NapiError::from(ScpNapiError::Identity {
+                message: format!(
+                    "identity_execute_recovery: DID '{did}' is not owned by this SCP instance — \
+                     recovery is restricted to identities created or loaded via this SCP"
+                ),
+                code: codes::IDENT_1020.to_owned(),
+            }));
+        }
+
+        // Length cap: prevent DoS by unbounded context_ids list
+        // (round-3 red-hat RED-PR5-003 amplifier).
+        const MAX_CONTEXT_IDS_PER_RECOVERY: usize = 1024;
+        if context_ids.len() > MAX_CONTEXT_IDS_PER_RECOVERY {
+            return Err(NapiError::from(ScpNapiError::Validation {
+                message: format!(
+                    "identity_execute_recovery: context_ids length {} exceeds cap of {}",
+                    context_ids.len(),
+                    MAX_CONTEXT_IDS_PER_RECOVERY
+                ),
+                code: codes::VALID_7120.to_owned(),
+            }));
+        }
+
         let did_val = DID::from(did.as_str());
 
         let compromise_tier = match tier.as_str() {
@@ -984,9 +1012,36 @@ impl Scp {
         use scp_ffi_common::validate::validate_did;
         use scp_identity::DID;
 
-        let _ = &self.inner;
-
         validate_did(&did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+        // Ownership check: reject custody migration for DIDs not
+        // registered in this bridge instance's identity registry
+        // (round-3 red-hat RED-PR5-004). Same rationale as
+        // identity_execute_recovery above.
+        if !crate::runtime::identity_registry(&self.inner).contains_key(&did) {
+            return Err(NapiError::from(ScpNapiError::Identity {
+                message: format!(
+                    "identity_execute_custody_migration: DID '{did}' is not owned by this SCP \
+                     instance — custody migration is restricted to identities created or loaded \
+                     via this SCP"
+                ),
+                code: codes::IDENT_1024.to_owned(),
+            }));
+        }
+
+        // Length cap: prevent DoS by unbounded context_ids list.
+        const MAX_CONTEXT_IDS_PER_MIGRATION: usize = 1024;
+        if context_ids.len() > MAX_CONTEXT_IDS_PER_MIGRATION {
+            return Err(NapiError::from(ScpNapiError::Validation {
+                message: format!(
+                    "identity_execute_custody_migration: context_ids length {} exceeds cap of {}",
+                    context_ids.len(),
+                    MAX_CONTEXT_IDS_PER_MIGRATION
+                ),
+                code: codes::VALID_7120.to_owned(),
+            }));
+        }
+
         let did_val = DID::from(did.as_str());
 
         let migration_target = match target.as_str() {

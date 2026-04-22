@@ -48,7 +48,7 @@
  * See ADR-048, and the Phase 4 PR 4 (#1549) B-track plan.
  */
 
-import { __constructScpWithNativeForTests, __setNativeForTests, type SCP } from "../src/scp";
+import { __constructScpWithNativeForTests, type SCP } from "../src/scp";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -294,14 +294,11 @@ export function mountMockScp(mockNativeScp?: MockNativeScp): {
   return { scp, native };
 }
 
-/**
- * Swaps the native handle underlying an existing {@link SCP} with a
- * mock. Use when a test has already constructed an `SCP` via the
- * real addon path and needs to retarget it at a Proxy-backed mock
- * (e.g. to simulate a failure mode after real initialization).
- */
-export function replaceNativeWithMock(scp: SCP, mockNativeScp?: MockNativeScp): MockNativeScp {
-  const native = mockNativeScp ?? createMockNativeScp();
-  __setNativeForTests(scp, native);
-  return native;
-}
+// `replaceNativeWithMock` removed in round-3 cleanup (BLACK-PR5-003). The
+// post-construction swap via `__setNativeForTests` + a WeakMap was only
+// visible to `__getNativeScp` consumers; the ~180 SCP class methods
+// dispatched through `this.#native` directly and bypassed the override,
+// producing silent-half-mocked state. No test used this helper; the only
+// supported mock path is `mountMockScp` which mounts the mock via
+// `__constructScpWithNativeForTests` at construction time so every class
+// method sees it.

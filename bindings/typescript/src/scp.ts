@@ -249,17 +249,11 @@ export interface ScpOptions {
  */
 const nativeHandles = new WeakMap<SCP, NativeScpInstance>();
 
-/**
- * Module-private WeakMap of test-only handle overrides. Populated by
- * {@link __setNativeForTests}; read by {@link __getNativeScp}. When an
- * override is present it takes precedence over `nativeHandles`. No
- * SCP-class method dispatches through the override — only consumers of
- * `__getNativeScp` (mock-bridge-bound tests) do. Production code paths
- * (the ~180 methods on `SCP`) still hit the real `#native`.
- *
- * @internal
- */
-const nativeTestOverrides = new WeakMap<SCP, NativeScpInstance>();
+// Post-construction native swaps were removed in round-3 cleanup. The only
+// way to mount a mock is via `__constructScpWithNativeForTests` which
+// populates `#native` at construction time so every class method sees the
+// mock. `__getNativeScp` reads from `nativeHandles` directly (no override
+// path). See BLACK-PR5-003 finding.
 
 /**
  * Module-private symbol used to smuggle a pre-constructed native handle
@@ -2078,10 +2072,6 @@ export class SCP {
  * @internal
  */
 export function __getNativeScp(scp: SCP): NativeScpInstance {
-  // Test override takes precedence so `mountMockScp` / `__setNativeForTests`
-  // can redirect SDK dispatch paths that route through this helper.
-  const override = nativeTestOverrides.get(scp);
-  if (override !== undefined) return override;
   const native = nativeHandles.get(scp);
   if (native === undefined) {
     throw new Error("SCP instance has no native handle — was it constructed with `new SCP()`?");
@@ -2090,17 +2080,43 @@ export function __getNativeScp(scp: SCP): NativeScpInstance {
 }
 
 /**
- * Swap the native handle underlying an existing {@link SCP} with a
- * caller-supplied mock. Intended only for the test harness in
- * `tests/mock-bridge.ts`. External code would have to import this
- * function by name AND have a reference to an `SCP` instance — both
- * are things a legitimate consumer would never do.
+ * Production guard for the two test-only native-handle mutators.
+ * Throws when the current runtime looks like a production build so
+ * that even if a supply-chain attacker deep-imports `dist/scp.js` and
+ * reaches these helpers they cannot swap the native bridge behind a
+ * user's back (round-3 red-hat RED-PR5-001/007).
  *
- * @internal
+ * The gate uses `process.env.NODE_ENV === "production"` — the widely-
+ * honoured React/Node build-flag. Apps that ship with
+ * `NODE_ENV=production` get the guard; tests run with `NODE_ENV=test`
+ * or unset, which passes through. `process` may be undefined in
+ * browser/Deno contexts — we treat that as "not production" since the
+ * WASM bridge has no `SCP` class at all.
  */
-export function __setNativeForTests(scp: SCP, native: unknown): void {
-  nativeTestOverrides.set(scp, native as NativeScpInstance);
+function assertTestHookAllowed(hookName: string): void {
+  const env: string | undefined = (() => {
+    try {
+      return (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env?.NODE_ENV;
+    } catch {
+      return undefined;
+    }
+  })();
+  if (env === "production") {
+    throw new Error(
+      `${hookName} is a test-only hook and must not be called in a production build ` +
+        `(NODE_ENV=production). If you're seeing this in legitimate code, your build is ` +
+        `mis-configured or a dependency is attempting to swap the SCP native bridge.`,
+    );
+  }
 }
+
+// `__setNativeForTests` + `replaceNativeWithMock` removed in round-3 cleanup:
+// black-hat finding BLACK-PR5-003 noted that post-construction swaps via the
+// `nativeTestOverrides` WeakMap were invisible to the ~180 class methods
+// (which dispatch through `this.#native` directly). Only the construction-
+// time path via `__constructScpWithNativeForTests` mounts a mock that
+// intercepts every method call. No test currently needs post-construction
+// swap; removing the partial API closes the footgun.
 
 /**
  * Construct a fresh {@link SCP} whose `#native` slot is seeded with the
@@ -2109,9 +2125,14 @@ export function __setNativeForTests(scp: SCP, native: unknown): void {
  * Proxy-backed mock without requiring `@limn-works/scp-ts-napi-*` to
  * be installed for the host platform.
  *
+ * Guarded by `NODE_ENV === "production"` throw to close the
+ * round-3 red-hat RED-PR5-007 attack chain (smuggled-native SCP
+ * injection into a downstream library).
+ *
  * @internal
  */
 export function __constructScpWithNativeForTests(native: unknown): SCP {
+  assertTestHookAllowed("__constructScpWithNativeForTests");
   return new SCP({
     [NATIVE_OVERRIDE]: native as NativeScpInstance,
   } as unknown as ScpOptions);
