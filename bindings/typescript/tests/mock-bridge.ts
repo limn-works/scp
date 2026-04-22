@@ -24,19 +24,23 @@
  * 1. Intercepts every `get` on the fake handle.
  * 2. If the caller has configured a stub for that method name via
  *    `stub(name, fn)`, routes the call to the stub.
- * 3. Otherwise returns a safe default:
- *    - For lifecycle methods (`suspend`, `resume`, `shutdown`), a noop.
- *    - For `instanceId`, a deterministic string.
- *    - For any other property access, a function that returns
- *      `Promise.resolve(undefined)` (async default) or `undefined`
- *      (sync default). We cannot statically know whether a caller
- *      intends sync/async, so the Proxy returns a value that works
- *      under both `await handle.foo()` and `handle.foo()`: a promise
- *      that also behaves like `undefined` is not possible, so the
- *      default is `Promise.resolve(undefined)`. Tests that call a
- *      synchronous method and inspect the return value must configure
- *      a stub; everything else passes trivially.
- * 4. Records every invocation for test assertions (method name, args,
+ * 3. Otherwise applies a strict-by-default policy:
+ *    - For `instanceId`, returns a deterministic string.
+ *    - For lifecycle methods in {@link SAFE_DEFAULT_METHODS}
+ *      (`suspend`, `resume`, `shutdown`), returns a safe no-op — sync
+ *      `undefined` for `suspend`, `Promise.resolve(undefined)` otherwise.
+ *    - For every other unstubbed method, **throws** an explanatory
+ *      `Error`. This prevents the silent-success failure mode flagged
+ *      by cryptographer finding M-1 (a "verify succeeds" test passing
+ *      trivially on `Promise.resolve(undefined)` when the method was
+ *      never stubbed).
+ * 4. Tests that genuinely want lenient "every method resolves to
+ *    undefined" behaviour (e.g. forwarder-plumbing assertions that only
+ *    inspect arguments) opt in explicitly with
+ *    `createMockNativeScp({ strict: false })`. Strict remains the
+ *    default so assertions that check *results* cannot silently pass
+ *    on `undefined`.
+ * 5. Records every invocation for test assertions (method name, args,
  *    result). Helpers `calls(name?)`, `lastCall(name)`, and `reset()`
  *    expose the recording.
  *
@@ -45,7 +49,8 @@
  * load so tests run even when no platform `@limn-works/scp-ts-napi-*`
  * package is installed.
  *
- * See ADR-048, and the Phase 4 PR 4 (#1549) B-track plan.
+ * See ADR-048, the Phase 4 PR 4 (#1549) B-track plan, and cryptographer
+ * finding M-1 for the strict-by-default rationale.
  */
 
 import { __constructScpWithNativeForTests, type SCP } from "../src/scp";
@@ -147,20 +152,81 @@ const RUNTIME_HOOKS: ReadonlySet<string | symbol> = new Set<string | symbol>([
 const SYNC_METHODS: ReadonlySet<string> = new Set<string>(["suspend"]);
 
 /**
- * Default return value for an unstubbed invocation. We return a resolved
- * promise so `await handle.foo()` succeeds; callers that need a
- * specific value configure a stub.
+ * Methods where an unstubbed call is safe to treat as a no-op even in
+ * strict mode. These are lifecycle operations whose void return is
+ * semantically `undefined` — tests that invoke `await scp.shutdown()`
+ * in an `afterEach` should not have to configure a stub just to let
+ * teardown complete. Every method in this set either returns `void`
+ * or `Promise<void>` on the real NAPI bridge, so a mock that resolves
+ * to `undefined` cannot accidentally hide a result-dependent assertion.
+ *
+ * Extend with care: the whole point of strict mode is that an unstubbed
+ * call with an inspectable return value throws rather than masquerading
+ * as success. A method belongs here only if:
+ *   - It has no meaningful return value (`void` / `Promise<void>`), and
+ *   - Tests routinely invoke it for teardown / lifecycle purposes
+ *     without caring about the outcome.
  */
-function defaultReturn(method: string): unknown {
+export const SAFE_DEFAULT_METHODS: readonly string[] = Object.freeze([
+  "suspend",
+  "resume",
+  "shutdown",
+]);
+
+const SAFE_DEFAULT_METHOD_SET: ReadonlySet<string> = new Set<string>(SAFE_DEFAULT_METHODS);
+
+/**
+ * Safe default return value for an unstubbed invocation of a
+ * lifecycle method. Returns `undefined` synchronously for methods
+ * whose real signatures are sync (`suspend`), and `Promise.resolve(undefined)`
+ * for the async lifecycle methods.
+ */
+function safeDefaultReturn(method: string): unknown {
   if (SYNC_METHODS.has(method)) {
     return undefined;
   }
   return Promise.resolve(undefined);
 }
 
+/**
+ * Builds the strict-mode error raised when a test invokes a method
+ * on the mock handle that has no stub and is not in
+ * {@link SAFE_DEFAULT_METHODS}.
+ */
+function unstubbedMethodError(method: string): Error {
+  return new Error(
+    `MockNativeScp: method \`${method}\` was called without a stub. ` +
+      `Strict mode (default) rejects silent "resolved to undefined" ` +
+      `returns that would let result-dependent assertions pass ` +
+      `trivially (cryptographer finding M-1). Either configure a stub ` +
+      `with \`handle.__stub("${method}", fn)\`, or opt out of strict ` +
+      `mode for this handle with \`createMockNativeScp({ strict: false })\`.`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
+
+/**
+ * Options accepted by {@link createMockNativeScp}.
+ */
+export interface CreateMockNativeScpOptions {
+  /**
+   * Explicit instance id for this handle. Omit to auto-generate a
+   * monotonic numeric id (matches the real NAPI class's behaviour).
+   */
+  readonly instanceId?: string;
+  /**
+   * Whether unstubbed calls throw. Defaults to `true` — the
+   * strict-by-default policy introduced in response to cryptographer
+   * finding M-1. Pass `false` to restore the historical "every
+   * unstubbed method resolves to undefined" behaviour; useful only
+   * for tests that intentionally exercise control flow through the
+   * SDK without caring about any return value.
+   */
+  readonly strict?: boolean;
+}
 
 /**
  * Monotonic counter so each `createMockNativeScp()` returns a handle
@@ -172,16 +238,25 @@ let _nextMockInstanceId = 1;
 /**
  * Builds a Proxy-backed mock native `Scp` handle.
  *
- * By default every method returns `Promise.resolve(undefined)` (async
- * shape) or `undefined` (`suspend` only). Tests that care configure
- * stubs with `handle.__stub(methodName, fn)`. Tests that only exercise
- * control flow through the SDK don't need any stubs — the defaults
- * make every method call a successful no-op.
+ * Strict mode (default): unstubbed method calls throw, except for the
+ * lifecycle methods in {@link SAFE_DEFAULT_METHODS}
+ * (`suspend` / `resume` / `shutdown`) which keep their historical
+ * safe-no-op defaults because tests frequently call them for teardown.
+ * Tests that assert on method *results* must configure explicit stubs;
+ * this prevents "verify-succeeds" assertions from passing trivially on
+ * `Promise.resolve(undefined)` when the method was never stubbed
+ * (cryptographer finding M-1).
+ *
+ * Lenient mode (`{ strict: false }`): every unstubbed method returns
+ * `Promise.resolve(undefined)` (async default) or `undefined` (sync
+ * default). Provided as an explicit opt-out for tests that exercise
+ * SDK control flow without inspecting return values.
  */
-export function createMockNativeScp(options: { instanceId?: string } = {}): MockNativeScp {
+export function createMockNativeScp(options: CreateMockNativeScpOptions = {}): MockNativeScp {
   const stubs = new Map<string, MockStub>();
   const calls: MockCall[] = [];
   const instanceId = options.instanceId ?? String(_nextMockInstanceId++);
+  const strict = options.strict ?? true;
 
   // The Proxy target is a plain object; we never use it directly — the
   // `get` trap owns the whole lookup path.
@@ -245,7 +320,23 @@ export function createMockNativeScp(options: { instanceId?: string } = {}): Mock
       const method = prop;
       return (...args: readonly unknown[]): unknown => {
         const stub = stubs.get(method);
-        const result = stub !== undefined ? stub(...args) : defaultReturn(method);
+        if (stub !== undefined) {
+          const result = stub(...args);
+          calls.push({ method, args: args.slice(), result });
+          return result;
+        }
+
+        // Unstubbed dispatch — apply the strict-vs-lenient policy.
+        if (strict && !SAFE_DEFAULT_METHOD_SET.has(method)) {
+          // Record the call before throwing so tests that assert on
+          // "method foo was called (and then threw)" can still inspect
+          // the call log after catching the error.
+          const err = unstubbedMethodError(method);
+          calls.push({ method, args: args.slice(), result: err });
+          throw err;
+        }
+
+        const result = safeDefaultReturn(method);
         calls.push({ method, args: args.slice(), result });
         return result;
       };
@@ -282,8 +373,9 @@ export function createMockNativeScp(options: { instanceId?: string } = {}): Mock
  * configure stubs and inspect the call log.
  *
  * @param mockNativeScp Optional pre-built mock. If omitted a fresh
- *   mock is created. Passing a caller-built mock lets tests share
- *   setup across multiple SCP instances.
+ *   strict-mode mock is created. Passing a caller-built mock lets tests
+ *   share setup across multiple SCP instances or opt into lenient mode
+ *   via `createMockNativeScp({ strict: false })`.
  */
 export function mountMockScp(mockNativeScp?: MockNativeScp): {
   scp: SCP;

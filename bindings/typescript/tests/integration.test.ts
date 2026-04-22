@@ -536,24 +536,69 @@ describe("SCP forwarder dispatch (mountMockScp)", () => {
 // ---------------------------------------------------------------------------
 
 describe("createMockNativeScp / mountMockScp (harness contract)", () => {
-  it("default unstubbed methods resolve to undefined without throwing", async () => {
+  // Strict-by-default (cryptographer finding M-1): unstubbed calls on a
+  // result-returning method must throw so that tests asserting
+  // "verify / check / lookup succeeds" cannot pass trivially on a
+  // silently-resolved `undefined`.
+  it("strict mode (default) throws when an unstubbed method is called", () => {
     const mock = createMockNativeScp();
-    // Method that isn't stubbed — should return a promise resolving to undefined.
+    expect(() =>
+      (mock as unknown as { someUnstubbedMethod: () => unknown }).someUnstubbedMethod(),
+    ).toThrow(/without a stub/);
+  });
+
+  it("strict mode records the attempted call before throwing", () => {
+    const mock = createMockNativeScp();
+    try {
+      (mock as unknown as { identityVerify: (p: string) => unknown }).identityVerify("proof");
+    } catch {
+      /* expected — strict mode rejects unstubbed result-returning calls */
+    }
+    const last = mock.__lastCall("identityVerify");
+    expect(last).toBeDefined();
+    expect(last?.args).toEqual(["proof"]);
+    expect(last?.result).toBeInstanceOf(Error);
+  });
+
+  it("strict mode leaves SAFE_DEFAULT_METHODS (suspend/resume/shutdown) as safe no-ops", async () => {
+    const mock = createMockNativeScp();
+    // `suspend` is in SYNC_METHODS — returns undefined synchronously.
+    const sus = (mock as unknown as { suspend: () => unknown }).suspend();
+    expect(sus).toBeUndefined();
+    // `resume` and `shutdown` return Promise<undefined> so `afterEach`
+    // teardown paths that `await scp.shutdown(...)` don't force every
+    // test to set up a stub for a semantically-void operation.
+    await expect(
+      (mock as unknown as { resume: () => Promise<unknown> }).resume(),
+    ).resolves.toBeUndefined();
+    await expect(
+      (mock as unknown as { shutdown: (t: bigint) => Promise<unknown> }).shutdown(0n),
+    ).resolves.toBeUndefined();
+  });
+
+  it("lenient mode (`strict: false`) resolves unstubbed methods to undefined", async () => {
+    // Opt-out path for tests that exercise SDK control flow without
+    // caring about return values. Explicit acknowledgement that the
+    // lenient default applies to this handle; result-dependent tests
+    // should never use this mode.
+    const mock = createMockNativeScp({ strict: false });
     const result = await (
       mock as unknown as { someUnstubbedMethod: () => Promise<unknown> }
     ).someUnstubbedMethod();
     expect(result).toBeUndefined();
   });
 
-  it("suspend is a synchronous no-op by default", () => {
-    const mock = createMockNativeScp();
-    // `suspend` is in the SYNC_METHODS set — returns undefined synchronously.
+  it("lenient mode preserves the sync-method surface (suspend)", () => {
+    const mock = createMockNativeScp({ strict: false });
     const result = (mock as unknown as { suspend: () => unknown }).suspend();
     expect(result).toBeUndefined();
   });
 
   it("__calls with no argument returns every recorded invocation in order", () => {
-    const mock = createMockNativeScp();
+    // Use lenient mode so we can invoke arbitrary method names without
+    // also needing to stub each one; the test is about call-log order,
+    // not about any specific method's behaviour.
+    const mock = createMockNativeScp({ strict: false });
     (mock as unknown as { a: () => unknown }).a();
     (mock as unknown as { b: () => unknown }).b();
     (mock as unknown as { a: (x: number) => unknown }).a(42);
@@ -564,7 +609,9 @@ describe("createMockNativeScp / mountMockScp (harness contract)", () => {
   });
 
   it("__calls(name) filters to a single method", () => {
-    const mock = createMockNativeScp();
+    // Lenient mode for the same reason as above — we're asserting on
+    // the filter, not on any method's return shape.
+    const mock = createMockNativeScp({ strict: false });
     (mock as unknown as { a: () => unknown }).a();
     (mock as unknown as { b: () => unknown }).b();
     (mock as unknown as { a: (x: number) => unknown }).a(42);
@@ -575,6 +622,9 @@ describe("createMockNativeScp / mountMockScp (harness contract)", () => {
   });
 
   it("__reset clears stubs and call log", () => {
+    // Strict mode is fine here: the first call is behind an explicit
+    // stub, and after `__reset` we assert that a further unstubbed
+    // call *throws* — the strict-by-default contract.
     const mock = createMockNativeScp();
     mock.__stub("foo", () => "stubbed");
     (mock as unknown as { foo: () => unknown }).foo();
@@ -582,9 +632,9 @@ describe("createMockNativeScp / mountMockScp (harness contract)", () => {
 
     mock.__reset();
     expect(mock.__calls()).toHaveLength(0);
-    // Stub is cleared — a further call returns the default promise.
-    const after = (mock as unknown as { foo: () => Promise<unknown> }).foo();
-    expect(after).toBeInstanceOf(Promise);
+    // Stub is cleared — under strict mode, a further call throws
+    // rather than silently resolving to undefined.
+    expect(() => (mock as unknown as { foo: () => unknown }).foo()).toThrow(/without a stub/);
   });
 
   it("__stub(name, null) removes a previously configured stub", () => {
@@ -592,7 +642,8 @@ describe("createMockNativeScp / mountMockScp (harness contract)", () => {
     mock.__stub("bar", () => "first");
     expect((mock as unknown as { bar: () => unknown }).bar()).toBe("first");
     mock.__stub("bar", null);
-    expect((mock as unknown as { bar: () => Promise<unknown> }).bar()).toBeInstanceOf(Promise);
+    // After the stub is cleared, strict mode rejects the unstubbed call.
+    expect(() => (mock as unknown as { bar: () => unknown }).bar()).toThrow(/without a stub/);
   });
 });
 
