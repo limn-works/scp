@@ -647,6 +647,12 @@ pub const VALID_7133: &str = "SCP-VALID-7133";
 pub const VALID_7134: &str = "SCP-VALID-7134";
 /// Address resolution ambiguous error.
 pub const VALID_7135: &str = "SCP-VALID-7135";
+/// Recovery or custody-migration concurrency cap reached.
+///
+/// The NAPI bridge bounds concurrent `block_on` invocations to prevent libuv
+/// worker-pool exhaustion (RED-PR5-002 / BLACK-PR5-002). Caller should back
+/// off and retry.
+pub const VALID_7140: &str = "SCP-VALID-7140";
 /// Governance vote validation error.
 pub const VALID_7216: &str = "SCP-VALID-7216";
 /// Media validation error.

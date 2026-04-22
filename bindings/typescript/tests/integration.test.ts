@@ -1952,7 +1952,10 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
 // 6. Storage persistence — ephemeral vs SQLite resume-after-suspend
 //
 // Separate describe so the SQLite-only tests can spin up / tear down their
-// own SCP with a temp directory, independent of the shared instance above.
+// own SCP with a temp directory. Every test above uses the per-test
+// `beforeEach` fresh-`SCP` pattern (d8ffcdadf, #1549) — there is no shared
+// instance. These storage tests likewise construct and tear down their own
+// `SCP` inside each test body.
 // ---------------------------------------------------------------------------
 
 function napiIsUsable(): boolean {

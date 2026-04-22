@@ -209,7 +209,43 @@ pub struct NapiBridgeInstance {
     /// Feature-gated behind `allow_in_memory_custody` to mirror `testing.rs`.
     #[cfg(feature = "allow_in_memory_custody")]
     pub(crate) network: std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>>,
+
+    /// Bounds concurrent compromise-recovery and custody-migration calls.
+    ///
+    /// `Scp::identity_execute_recovery` and
+    /// `Scp::identity_execute_custody_migration` drive an async orchestrator
+    /// via `crate::runtime().block_on(...)` on the napi-rs worker thread.
+    /// Each in-flight call pins one libuv worker for the duration of the
+    /// `block_on` — the default libuv pool has 4 threads, so a realm-local
+    /// attacker (or a buggy app) issuing concurrent recovery requests against
+    /// valid DIDs could saturate the pool and starve every other NAPI async
+    /// callback.
+    ///
+    /// The permit cap is enforced via `try_acquire_owned` (non-blocking): if
+    /// no permit is available the call returns `SCP-VALID-7140` immediately
+    /// rather than queueing on the semaphore, which would itself pin a libuv
+    /// worker on the permit wait. The cap is deliberately small
+    /// (see [`RECOVERY_CONCURRENCY_CAP`]) so that an attacker flooding
+    /// recovery calls burns negligible work per rejected request.
+    ///
+    /// Shared between recovery and migration because both issue the same
+    /// shape of work (async orchestrator on the module runtime) and a
+    /// single cap is simpler to reason about than two separate ones.
+    ///
+    /// Closes RED-PR5-002 / BLACK-PR5-002 (#1549).
+    pub(crate) recovery_semaphore: Arc<tokio::sync::Semaphore>,
 }
+
+/// Permit cap for [`NapiBridgeInstance::recovery_semaphore`].
+///
+/// Bounds the number of concurrent `block_on`-driven
+/// `identityExecuteRecovery` + `identityExecuteCustodyMigration` calls on a
+/// single NAPI bridge instance. Chosen to allow at most one recovery plus
+/// one migration (or two of one) to run simultaneously while leaving the
+/// remaining libuv workers free for other NAPI async callbacks. The
+/// happy-path caller sees no throttling; a misbehaving or hostile caller
+/// gets `SCP-VALID-7140` on the N+1 concurrent invocation.
+pub(crate) const RECOVERY_CONCURRENCY_CAP: usize = 2;
 
 impl NapiBridgeInstance {
     /// Constructs a new `NapiBridgeInstance` with default in-memory state.
@@ -232,6 +268,7 @@ impl NapiBridgeInstance {
             mcp_client_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
+            recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
         }
     }
 
@@ -255,6 +292,7 @@ impl NapiBridgeInstance {
             mcp_client_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
+            recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
         }
     }
 
@@ -350,6 +388,7 @@ impl NapiBridgeInstance {
             mcp_client_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
+            recovery_semaphore: Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY_CAP)),
         }
     }
 

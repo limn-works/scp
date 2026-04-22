@@ -86,10 +86,14 @@ class SCP:
     FFI handle-affinity check.
 
     Phase 4 PR 4 (#1549, ADR-048) removed the process-global default
-    instance and the free-function façade that delegated to it. Every
-    caller now owns an explicit :class:`SCP` — pass it positionally to
-    :meth:`Identity.create`, :meth:`Context.create`, and every other
-    SDK entry point.
+    instance and the free-function façade that delegated to it. Phase 4
+    PR 5 (ADR-048 §7) completed the Kotlin-parity collapse: the
+    per-domain namespace classes (``Identity``, ``Context``, ``Relay``,
+    ``Node``, etc.) are pure handle types with no methods — every
+    stateful operation is now a method on :class:`SCP` itself
+    (:meth:`identity_create`, :meth:`context_create`,
+    :meth:`ucan_mint`, and ~160 more). Pure protocol helpers that touch
+    no registry state remain module-level free functions.
 
     :class:`SCP` is a context manager: ``with SCP() as scp: ...`` calls
     :meth:`shutdown` with a 5-second timeout on exit.
@@ -359,6 +363,24 @@ class SCP:
 
         Returns the migration outcome dict parsed from the bridge's JSON
         payload (§3.2.1).
+
+        :param did: The DID whose custody is migrating. **Must be owned
+            by this :class:`SCP` instance** — created or loaded via
+            :meth:`identity_create` / :meth:`identity_load`. DIDs
+            absent from the instance's identity registry are rejected
+            with ``SCP-IDENT-1024`` (round-3 red-hat fix against
+            realm-local callers driving unmetered orchestrator work on
+            arbitrary DIDs).
+        :param context_ids: The contexts to migrate. Capped at **1024**
+            entries per call; over-cap requests return
+            ``SCP-VALID-7120`` before the orchestrator runs. The
+            recovery / migration orchestrator runs on ``crate::runtime``
+            via ``block_on`` — the cap bounds per-call amplification.
+            A per-bridge semaphore
+            (``NapiBridgeInstance::recovery_semaphore``) composes with
+            the cap to bound concurrent invocations; exhausted permits
+            return ``SCP-VALID-7140`` non-blockingly (see ADR-048 §7
+            round-2/3 hardening).
         """
         import json
 
@@ -374,6 +396,17 @@ class SCP:
 
         Returns the recovery outcome dict parsed from the bridge's JSON
         payload (§9.12).
+
+        :param did: The compromised DID. **Must be owned by this**
+            :class:`SCP` **instance** — created or loaded via
+            :meth:`identity_create` / :meth:`identity_load`. DIDs
+            absent from the instance's identity registry are rejected
+            with ``SCP-IDENT-1020``.
+        :param context_ids: Contexts to run the recovery protocol
+            against. Capped at **1024** entries per call; over-cap
+            requests return ``SCP-VALID-7120`` before the orchestrator
+            runs. See :meth:`identity_execute_custody_migration` for
+            the shared rate-limiting rationale.
         """
         import json
 

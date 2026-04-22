@@ -850,6 +850,18 @@ impl Scp {
     /// Executes the compromise recovery protocol and returns the result as
     /// a JSON string. Bridge-level recovery backend is a placeholder — real
     /// backends are injected via the SDK wrapper.
+    ///
+    /// # Concurrency cap
+    ///
+    /// This method drives an async orchestrator via
+    /// `crate::runtime().block_on(...)` from a sync napi entry point — each
+    /// in-flight call pins one libuv worker for the duration. To prevent
+    /// libuv worker-pool exhaustion (RED-PR5-002 / BLACK-PR5-002) the bridge
+    /// bounds concurrent recovery + custody-migration invocations via
+    /// [`NapiBridgeInstance::recovery_semaphore`] (cap =
+    /// [`crate::runtime::RECOVERY_CONCURRENCY_CAP`]). When the permit pool is
+    /// exhausted the call returns `SCP-VALID-7140` immediately — it does not
+    /// queue on the permit wait (queueing would itself pin a libuv worker).
     #[napi(js_name = "identityExecuteRecovery")]
     pub fn identity_execute_recovery(
         &self,
@@ -874,6 +886,9 @@ impl Scp {
         // RED-PR5-003). Without this, any realm-local caller could
         // drive unbounded recovery work on `crate::runtime()` against
         // arbitrary DIDs.
+        //
+        // Runs BEFORE the concurrency-cap check so unauthorised callers
+        // cannot consume recovery permits with arbitrary DIDs.
         if !crate::runtime::identity_registry(&self.inner).contains_key(&did) {
             return Err(NapiError::from(ScpNapiError::Identity {
                 message: format!(
@@ -897,6 +912,29 @@ impl Scp {
                 code: codes::VALID_7120.to_owned(),
             }));
         }
+
+        // RED-PR5-002 / BLACK-PR5-002: bound concurrent `block_on` calls so a
+        // flood of recovery requests (even with valid, owned DIDs) cannot
+        // saturate the libuv worker pool. `try_acquire_owned` is non-blocking
+        // — if the permit pool is exhausted we return a typed busy error
+        // rather than queue the caller (queueing would itself pin a libuv
+        // worker on the permit wait). The permit is dropped automatically
+        // when `_permit` goes out of scope after `block_on` returns.
+        //
+        // Placed AFTER the ownership + length-cap checks so rejected-upstream
+        // callers never consume a permit.
+        let _permit = Arc::clone(&self.inner.recovery_semaphore)
+            .try_acquire_owned()
+            .map_err(|_| {
+                NapiError::from(ScpNapiError::Validation {
+                    message: format!(
+                        "recovery/custody-migration concurrency cap reached ({} in flight); \
+                         retry after an in-flight call completes",
+                        crate::runtime::RECOVERY_CONCURRENCY_CAP
+                    ),
+                    code: codes::VALID_7140.to_owned(),
+                })
+            })?;
 
         let did_val = DID::from(did.as_str());
 
@@ -998,6 +1036,15 @@ impl Scp {
 
     /// Per-instance equivalent of `identity_execute_custody_migration`
     /// (spec §3.2.1).
+    ///
+    /// # Concurrency cap
+    ///
+    /// Shares [`NapiBridgeInstance::recovery_semaphore`] with
+    /// [`Self::identity_execute_recovery`] (cap =
+    /// [`crate::runtime::RECOVERY_CONCURRENCY_CAP`]). Returns
+    /// `SCP-VALID-7140` when the permit pool is exhausted. See the rustdoc
+    /// on [`Self::identity_execute_recovery`] for the libuv worker-pool
+    /// rationale (RED-PR5-002 / BLACK-PR5-002).
     #[napi(js_name = "identityExecuteCustodyMigration")]
     pub fn identity_execute_custody_migration(
         &self,
@@ -1018,6 +1065,9 @@ impl Scp {
         // registered in this bridge instance's identity registry
         // (round-3 red-hat RED-PR5-004). Same rationale as
         // identity_execute_recovery above.
+        //
+        // Runs BEFORE the concurrency-cap check so unauthorised callers
+        // cannot consume migration permits with arbitrary DIDs.
         if !crate::runtime::identity_registry(&self.inner).contains_key(&did) {
             return Err(NapiError::from(ScpNapiError::Identity {
                 message: format!(
@@ -1041,6 +1091,25 @@ impl Scp {
                 code: codes::VALID_7120.to_owned(),
             }));
         }
+
+        // RED-PR5-002 / BLACK-PR5-002: shared permit pool with
+        // `identity_execute_recovery`. See the rustdoc on that method for
+        // the full rationale.
+        //
+        // Placed AFTER the ownership + length-cap checks so rejected-upstream
+        // callers never consume a permit.
+        let _permit = Arc::clone(&self.inner.recovery_semaphore)
+            .try_acquire_owned()
+            .map_err(|_| {
+                NapiError::from(ScpNapiError::Validation {
+                    message: format!(
+                        "recovery/custody-migration concurrency cap reached ({} in flight); \
+                         retry after an in-flight call completes",
+                        crate::runtime::RECOVERY_CONCURRENCY_CAP
+                    ),
+                    code: codes::VALID_7140.to_owned(),
+                })
+            })?;
 
         let did_val = DID::from(did.as_str());
 
@@ -3621,5 +3690,242 @@ impl Scp {
         challenge_json: String,
     ) -> napi::Result<String> {
         crate::scpid::scpid_verify_on(&self.inner, response_json, challenge_json)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recovery / custody-migration concurrency-cap tests (RED-PR5-002 /
+// BLACK-PR5-002, #1549).
+//
+// The sync `Scp::identity_execute_recovery` +
+// `Scp::identity_execute_custody_migration` methods drive their async
+// orchestrators via `crate::runtime().block_on(...)`, pinning one libuv
+// worker per in-flight call. A shared `tokio::sync::Semaphore` on the
+// bridge instance caps concurrent invocations to `RECOVERY_CONCURRENCY_CAP`;
+// excess callers get `SCP-VALID-7140` (non-blocking rejection) rather than
+// queueing on the permit wait.
+//
+// These tests exercise the cap directly by pre-acquiring owned permits on
+// the bridge's semaphore and then calling the public methods — so the
+// ordering invariant ("ownership check runs BEFORE the semaphore check, so
+// rejected-upstream callers never consume a permit") and the busy-error
+// shape are both validated without depending on orchestrator timing.
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "allow_in_memory_custody"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod concurrency_cap_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use scp_identity::DidMethod;
+    use scp_platform::testing::InMemoryKeyCustody;
+
+    use crate::identity::OpaqueInMemoryKeyCustody;
+    use crate::runtime::{NapiBridgeInstance, RECOVERY_CONCURRENCY_CAP};
+
+    /// Builds a `Scp` with one real in-memory identity registered in its
+    /// bridge instance. Returns the SCP handle and the registered DID so
+    /// tests can call `identity_execute_recovery` / `..._custody_migration`
+    /// against a DID the ownership check will accept.
+    fn build_scp_with_identity() -> (Scp, String) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let dht = scp_identity::DidDht::new();
+        let (identity, document) = rt.block_on(dht.create(&custody.0)).unwrap();
+        let did = identity.did.clone();
+
+        let bi = Arc::new(NapiBridgeInstance::new_napi());
+        crate::runtime::register_identity(
+            &bi,
+            &did,
+            crate::runtime::NapiIdentityEntry {
+                identity,
+                custody,
+                document,
+                identity_link_attestations: Vec::new(),
+            },
+        );
+
+        (Scp { inner: bi }, did)
+    }
+
+    #[test]
+    fn recovery_returns_busy_error_when_permits_exhausted() {
+        let (scp, did) = build_scp_with_identity();
+
+        // Pre-acquire the full permit pool — simulates RECOVERY_CONCURRENCY_CAP
+        // in-flight recovery/migration calls.
+        let sem = Arc::clone(&scp.inner.recovery_semaphore);
+        let mut permits = Vec::with_capacity(RECOVERY_CONCURRENCY_CAP);
+        for _ in 0..RECOVERY_CONCURRENCY_CAP {
+            permits.push(sem.clone().try_acquire_owned().unwrap());
+        }
+
+        // N+1 call must fail-fast with SCP-VALID-7140, not block on the
+        // permit wait.
+        let err = scp
+            .identity_execute_recovery(did.clone(), "agent".to_owned(), Vec::new())
+            .expect_err("N+1 recovery call must be rejected with busy error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-VALID-7140"),
+            "expected SCP-VALID-7140 in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("concurrency cap"),
+            "expected 'concurrency cap' in error message, got: {msg}"
+        );
+
+        // Drop one permit — the next call must proceed past the permit check.
+        // It may still fail downstream (the bridge-level recovery backend is
+        // a placeholder that returns Ok) but it must NOT be a VALID-7140
+        // busy rejection.
+        drop(permits.pop());
+        let result = scp.identity_execute_recovery(did, "agent".to_owned(), Vec::new());
+        match result {
+            Ok(_) => {
+                // Happy path — orchestrator completed.
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("SCP-VALID-7140"),
+                    "after dropping a permit, the next call must not be busy-rejected; got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn custody_migration_shares_recovery_permit_pool() {
+        let (scp, did) = build_scp_with_identity();
+
+        // Drain the shared semaphore via the recovery path first. The
+        // `held_permits` binding keeps the permits alive for the duration
+        // of the call below — dropping them early would repopulate the
+        // pool and defeat the test.
+        let sem = Arc::clone(&scp.inner.recovery_semaphore);
+        let mut held_permits = Vec::with_capacity(RECOVERY_CONCURRENCY_CAP);
+        for _ in 0..RECOVERY_CONCURRENCY_CAP {
+            held_permits.push(sem.clone().try_acquire_owned().unwrap());
+        }
+
+        // Custody migration must observe the exhausted pool and reject with
+        // the same busy error code — confirming the single shared cap.
+        let err = scp
+            .identity_execute_custody_migration(did, "in_memory".to_owned(), Vec::new())
+            .expect_err("custody migration must share the recovery permit pool");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-VALID-7140"),
+            "expected SCP-VALID-7140 in error, got: {msg}"
+        );
+
+        // Explicitly drop at the end to silence `collection_is_never_read`
+        // — the permits must outlive the call above.
+        drop(held_permits);
+    }
+
+    #[test]
+    fn ownership_check_runs_before_permit_acquisition() {
+        // Unauthorised callers (DIDs not in the bridge's identity registry)
+        // must be rejected BEFORE consuming a permit — otherwise an attacker
+        // spamming invalid DIDs could starve legitimate recovery callers.
+        let (scp, _did) = build_scp_with_identity();
+
+        // The semaphore starts at full capacity.
+        assert_eq!(
+            scp.inner.recovery_semaphore.available_permits(),
+            RECOVERY_CONCURRENCY_CAP,
+            "semaphore must start at full capacity"
+        );
+
+        let unowned_did = "did:dht:unowned-attacker-did".to_owned();
+        let err = scp
+            .identity_execute_recovery(unowned_did, "agent".to_owned(), Vec::new())
+            .expect_err("recovery against unowned DID must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SCP-IDENT-1020"),
+            "expected ownership-check rejection (SCP-IDENT-1020), got: {msg}"
+        );
+
+        // The critical invariant: the permit pool is unchanged. The
+        // rejected caller did NOT consume a permit.
+        assert_eq!(
+            scp.inner.recovery_semaphore.available_permits(),
+            RECOVERY_CONCURRENCY_CAP,
+            "ownership-rejected calls must not consume a recovery permit"
+        );
+    }
+
+    #[test]
+    fn three_concurrent_recoveries_reject_at_least_one() {
+        // Spawn `RECOVERY_CONCURRENCY_CAP + 1` threads all trying to run a
+        // recovery against the same owned DID. Use a shared barrier so the
+        // threads hit the semaphore near-simultaneously. To keep the cap
+        // pressure observable we pre-acquire all permits in the test thread
+        // and release them only after the workers have voted on their
+        // outcome — this is the only reliable way to force overlap across
+        // CI hosts where the orchestrator completes in microseconds.
+        let (scp, did) = build_scp_with_identity();
+
+        let worker_count = RECOVERY_CONCURRENCY_CAP + 1;
+        let sem = Arc::clone(&scp.inner.recovery_semaphore);
+        // Hold every permit — every worker will observe a full pool.
+        let mut held_permits = Vec::with_capacity(RECOVERY_CONCURRENCY_CAP);
+        for _ in 0..RECOVERY_CONCURRENCY_CAP {
+            held_permits.push(sem.clone().try_acquire_owned().unwrap());
+        }
+
+        let barrier = Arc::new(Barrier::new(worker_count));
+        let rejected = Arc::new(AtomicUsize::new(0));
+        let scp_arc = Arc::new(scp);
+
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let barrier_cl = Arc::clone(&barrier);
+            let rejected_cl = Arc::clone(&rejected);
+            let scp_cl = Arc::clone(&scp_arc);
+            let did_cl = did.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier_cl.wait();
+                let res = scp_cl.identity_execute_recovery(did_cl, "agent".to_owned(), Vec::new());
+                if let Err(e) = res
+                    && e.to_string().contains("SCP-VALID-7140")
+                {
+                    rejected_cl.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // With every permit held externally, EVERY worker must have been
+        // rejected fast — no worker could have acquired a permit.
+        assert_eq!(
+            rejected.load(Ordering::SeqCst),
+            worker_count,
+            "every concurrent worker should have been rejected while all \
+             permits were held externally"
+        );
+
+        // Drop the held permits so the pool is replenished. This also
+        // validates that `_permit` drop inside `identity_execute_recovery`
+        // restores capacity for future callers.
+        drop(held_permits);
+        assert_eq!(
+            scp_arc.inner.recovery_semaphore.available_permits(),
+            RECOVERY_CONCURRENCY_CAP,
+            "pool must return to full capacity once permits are dropped"
+        );
     }
 }

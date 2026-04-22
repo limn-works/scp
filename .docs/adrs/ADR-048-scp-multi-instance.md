@@ -121,6 +121,27 @@ Swift retains per-object UniFFI-generated wrappers alongside `Scp.swift` — Uni
 
 Commits (all on `refactor/phase4-facade-delete`, issue #1549): `dc7face6d` (Python Agent A — class scaffold), `4fb4572f8` (TS Agent A — class scaffold), `bdd2cb58a` (TS B1 — namespace class collapse), `4612e7eff` (TS B2 — Proxy mock-bridge rewrite), `ecc668bd3` (Python B+C — handle collapse + test rewrite), `cd85f3f8b` (TS B4 — large test rewrites), `5271ef84d` (TS B5 — WASM + examples).
 
+**Round-2 and round-3 hardening (post-§7 review loop, 2026-04-21).** After the §7 migration landed the full review roster surfaced three classes of finding that were addressed in `3de6cbe30`, `78102c871`, `d8ffcdadf`, and `d489f6610`. The decisions baked into those commits supersede naïve readings of the earlier §7 framing:
+
+- **Test-hook realm hardening (red-hat RED-PR5-001/007, black-hat BLACK-PR5-003).** The initial B-track landed `[NATIVE_HANDLE]` / `[NATIVE_SET]` Symbol-keyed accessors on the `SCP` prototype so `createMockNativeScp` could swap the native handle post-construction. `Object.getOwnPropertySymbols(SCP.prototype)` surfaced both — any in-realm import could overwrite the native handle. Round-2 replaced the Symbol accessors with two **module-local WeakMaps** (`nativeHandles` for the real handle, `nativeTestOverrides` for test-only swaps); neither is exported. The only reach-in helpers (`__getNativeScp`, `__constructScpWithNativeForTests`) hold WeakMap references by closure. Round-3 additionally gates `__constructScpWithNativeForTests` behind a runtime `NODE_ENV === "production"` guard so a deep import of `dist/scp.js` from a compromised transitive dep cannot swap the native bridge in a production deployment. `__setNativeForTests` and its companion `replaceNativeWithMock` were deleted outright — the post-construction swap was invisible to the ~180 SCP class methods that dispatch through the private `#native` field, so any test using it would have seen half-mocked state. The sole supported mock path is `mountMockScp` (constructs via `__constructScpWithNativeForTests` at `new SCP()` time).
+- **DID ownership + DoS cap on recovery / custody migration (red-hat RED-PR5-003/004).** `identity_execute_recovery` and `identity_execute_custody_migration` on `NapiScp` now reject DIDs absent from the bridge instance's identity registry with `SCP-IDENT-1020` / `SCP-IDENT-1024`. Without this gate any realm-local caller could drive unmetered recovery work on `crate::runtime()` against arbitrary DIDs. Both methods also enforce `MAX_CONTEXT_IDS_PER_{RECOVERY,MIGRATION} = 1024` at the FFI boundary; over-cap requests return `SCP-VALID-7120` before the orchestrator runs. The equivalent PyO3 and UniFFI surfaces inherit the same ownership gate through the shared identity registry.
+- **NAPI crypto methods stay sync (bug-catcher HIGH).** Commit `3de6cbe30` flipped the TS wrappers for `identityExecuteRecovery` / `identityExecuteCustodyMigration` to `async` under the misreading that the Rust methods were async. They are not — the Rust side runs on `crate::runtime()` via `block_on`, matching every other sync bridge function. Round-2 (`78102c871`) reverted the TS wrappers back to sync; the SDK surface is `string` (not `Promise<string>`). The JSON payload remains the return type; callers parse it as needed.
+- **Per-test `SCP` isolation in the TS integration suite.** The restored real-NAPI integration suite initially shared a single `new SCP()` + in-memory relay across every test in each `describe` via `beforeAll`/`afterAll`. Two tests (`identityExecuteCustodyMigration rejects an unknown target`, `identityExecuteRecovery rejects an unknown tier synchronously`) were only passing because fabricated `did:dht:z6Nope` DIDs happened to round-trip through the DID registry populated by earlier tests. Round-3 (`d8ffcdadf`) switched to `beforeEach`/`afterEach` with a fresh `SCP` + bridge + relay per test; the two affected tests now create real identities via `scp.identityCreate` so the validation branch they claim to exercise is actually reached. This is the canonical pattern documented in `.docs/migration/phase-4.md` — post-PR-5 the suite enforces it, not just recommends it.
+
+Concurrency cap on recovery / migration: a per-instance **semaphore**
+(`NapiBridgeInstance::recovery_semaphore`, cap =
+`RECOVERY_CONCURRENCY_CAP`) bounds concurrent `block_on`-backed
+orchestrator dispatches so a flood of valid-DID recovery or migration
+requests cannot saturate the libuv worker pool
+(RED-PR5-002 / BLACK-PR5-002). `try_acquire_owned` is non-blocking —
+exhausted permits return `SCP-VALID-7140` immediately rather than
+queue on the wait (a queued caller would still pin a libuv worker).
+The 1024-entry `context_ids` cap and the semaphore compose: the first
+bounds per-call amplification, the second bounds invocation
+concurrency.
+
+No round-3 findings remain open against §7.
+
 ## Consequences
 
 - **Tests parallel-safe on every bridge.** Per-test `SCP` fixtures eliminate `BRIDGE_LIFECYCLE_SERIAL`, per-test `beforeAll` in NAPI, and the module-scope poisoning on every SDK. pytest-xdist, Gradle parallel tests, and XCTest concurrency all work.
