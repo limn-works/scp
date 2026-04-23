@@ -88,8 +88,14 @@
       "status": "pending",
       "stories": [
         "SCP-OUT-040",
-        "SCP-OUT-041",
-        "SCP-OUT-042"
+        "SCP-OUT-041a",
+        "SCP-OUT-041b",
+        "SCP-OUT-041c",
+        "SCP-OUT-041d",
+        "SCP-OUT-042a",
+        "SCP-OUT-042b",
+        "SCP-OUT-042c",
+        "SCP-OUT-042d"
       ]
     }
   ],
@@ -545,7 +551,7 @@
         "Developer-docs note: `ctx.outlets.sessions.invoke` and `ctx.outlets.invoke` are distinct namespaces (API MAJOR 26): `ctx.outlets.invoke(id, input)` opens a non-session stream; `ctx.outlets.sessions.invoke(session_id, input)` routes through an existing session (§6.2.1.1). Quickstart documents both and grep -c 'ctx\\.outlets\\.sessions\\.invoke' README returns >= 1 per SDK.",
         "SessionId newtype (API MAJOR 28 — cold-read disambiguation for ctx.outlets.sessions.invoke vs ctx.outlets.invoke which have identical positional shapes `(str, Value)`): every SDK defines a typed SessionId distinct from OutletId/str so the compiler/type-checker rejects a caller who accidentally passes a session id to ctx.outlets.invoke or an outlet id to ctx.outlets.sessions.invoke. Python: `SessionId = NewType('SessionId', str)` (exported from scp_sdk); `ctx.outlets.sessions.invoke(session_id: SessionId, input: Value)` signature. TypeScript: `export type SessionId = string & { readonly __brand: 'SessionId' }`; `ctx.outlets.sessions.invoke(sessionId: SessionId, input: Value)` signature. Swift: `struct SessionId: Sendable, Hashable { public let raw: String }`; `ctx.outlets.sessions.invoke(sessionId: SessionId, input: Value)` signature. Kotlin: `@JvmInline value class SessionId(val raw: String)`; `ctx.outlets.sessions.invoke(sessionId: SessionId, input: Value)` signature. Per-language test asserts passing a raw String/str where a SessionId is required fails at type-check/compile time (mypy --strict for Python; tsc for TypeScript; the Swift and Kotlin compilers reject natively).",
         "SessionId uniform usage across sessions.open / sessions.close (API MINOR, round 5): sessions.open returns SessionId (not raw str), and sessions.close takes SessionId as its sole argument. Python: `def open(self, ...) -> SessionId`; `def close(self, session_id: SessionId) -> None`. TypeScript: `open(...): Promise<SessionId>`; `close(sessionId: SessionId): Promise<void>`. Swift: `func open(...) async throws -> SessionId`; `func close(sessionId: SessionId) async throws`. Kotlin: `suspend fun open(...): SessionId`; `suspend fun close(sessionId: SessionId)`. Per-language test: passing a raw string to `close` fails at type-check.",
-        "SessionId format validation (UUIDv7 per §6.2.1.1(a), round 5): every SDK's SessionId constructor validates the raw string is a canonical UUIDv7 representation (8-4-4-4-12 lowercase hex, 128 bits, version-byte 7). Python `SessionId(str)` re-validates on construction (runtime); TypeScript branded type constructor runs a regex validator; Swift `SessionId(raw:)` throws if the format is invalid; Kotlin @JvmInline value class has a companion factory that throws IllegalArgumentException on malformed input. Per-language test: a non-UUIDv7 string (e.g., 'sess-abc' or a UUIDv4) fails SessionId construction.",
+        "SessionId format validation (UUIDv7 per §6.2.1.1(a), round 6 pure CSPRNG): every SDK's SessionId constructor validates that the raw string is a canonical UUIDv7 per RFC 9562 §5.7 — 8-4-4-4-12 lowercase hex (36 characters), 128 bits total, version nibble 0111, variant bits 10, and the 48-bit timestamp prefix within [now - 10 minutes, now + 10 minutes] (§9.14 clock skew tolerance). The remaining 74 bits (rand_b) MUST be CSPRNG-sampled per RFC 9562 §5.7; NO DID-derived material, no monotonic counter, and no process-local state may be mixed into rand_b. Per-language SDK construction MUST use a CSPRNG source (Python `secrets.token_bytes`, TS `crypto.getRandomValues`, Swift `SystemRandomNumberGenerator`, Kotlin `SecureRandom`) — per-SDK test asserts the rand_b tail distribution is uniform across >=10000 generated SessionIds (chi-squared goodness-of-fit p >= 0.01) and passing the caller's DID twice produces two statistically independent rand_b samples (no correlation). Python `SessionId(str)` re-validates on construction (runtime); TypeScript branded type constructor runs a regex validator + version/variant/timestamp-window check; Swift `SessionId(raw:)` throws if format is invalid; Kotlin @JvmInline value class companion factory throws IllegalArgumentException on malformed input. Per-language test: a non-UUIDv7 string (e.g., 'sess-abc' or a UUIDv4) fails SessionId construction; a UUIDv7 with timestamp outside the 10-minute window fails construction.",
         "Swift newtypes for invokeCrossContext (API MINOR, round 5): Swift SDK defines `struct DID: Sendable, Hashable { public let raw: String }` and `struct OutletId: Sendable, Hashable { public let raw: String }`; ctx.outlets.invokeCrossContext(target: DID, outletId: OutletId, input: Value, ucan: UCAN) uses the typed arguments to prevent target/outletId swap at call sites. Test: `invokeCrossContext(target: OutletId('foo'), outletId: DID('did:dht:...'))` fails at compile time because DID and OutletId are not interchangeable. Cross-SDK propagation recommended but not strictly required — Python (NewType), TypeScript (branded string) may adopt DID/OutletId newtypes symmetrically; the minimum required is Swift to close the swap-risk."
       ],
       "actionItems": [
@@ -1572,15 +1578,16 @@
         "JSON round-trip test on a fully-populated OutletError",
         "An invalid code (e.g., SCP-TOOL-7000) returns OutletErrorConstructionFailed",
         "cargo test -p scp-protocol succeeds",
-        "struct OutletError exists with exactly 8 wire fields: code (tag 1), slug (tag 2), class (tag 3), message (tag 4), retry (tag 5), detail (tag 6), source_chain (tag 8), pad_nonce (tag 11); no fields with tags 7, 9, or 10 (reserved)",
-        "Wire field tags are numeric (via #[serde(rename = \"{n}\")] or rmp_serde equivalent); tags 1, 2, 3, 4, 5, 6, 8, 11 are present; tags 7, 9, 10 are explicitly absent (verified by serializing and inspecting the MessagePack bytes)",
-        "Forward-compat: an OutletError envelope received with a field at tag 12 (or higher) deserializes cleanly; the unknown tag is preserved in _unknown_fields and round-trips byte-identical on re-serialization (matches §5.4.4 future-tag policy — future extensions MUST use tags 12+)",
+        "struct OutletError exists with exactly 9 wire fields: code (tag 1), slug (tag 2), class (tag 3), message (tag 4), retry (tag 5), detail (tag 6), source_chain (tag 8), pad_nonce (tag 11), registration_event_id (tag 12); no fields with tags 7, 9, or 10 (reserved); reserved tags for future extension are 13+",
+        "Wire field tags are numeric (via #[serde(rename = \"{n}\")] or rmp_serde equivalent); tags 1, 2, 3, 4, 5, 6, 8, 11, 12 are present; tags 7, 9, 10 are explicitly absent (verified by serializing and inspecting the MessagePack bytes)",
+        "Forward-compat: an OutletError envelope received with a field at tag 13 (or higher) deserializes cleanly; the unknown tag is preserved in _unknown_fields and round-trips byte-identical on re-serialization (matches §5.4.4 future-tag policy — future extensions MUST use tags 13+)",
         "Forward-compat: an envelope received with a field at tag 7, 9, or 10 (reserved) deserializes with the value stored in _unknown_fields (receiver does not interpret the tag; ensures future protocol evolution does not break old SDKs)",
         "message field byte length is capped at 1024; constructor OutletError::new returns OutletErrorConstructionFailed::MessageTooLong when exceeded",
-        "message is a registered catalog key (§5.4.4 round-5): OutletRegistration carries message_catalog: Vec<MessageTemplate> (each template bounded at 1 KiB UTF-8, catalog bounded at 256 entries per outlet); the catalog is a dedicated field of OutletRegistration (NOT nested inside schema) and is covered by the V2 signature preimage via a dedicated catalog_hash term (SCP-OUT-040). OutletError::new takes a catalog_key: &str and the pinned per-outlet outlet_message_key: &[u8; 32] and constructs wire_message = HMAC-SHA-256(outlet_message_key, catalog_key_utf8)[..32]. OutletError::new rejects any catalog_key not present in the registered catalog for that outlet with OutletErrorConstructionFailed::UnregisteredMessageKey. Unit test: a catalog-miss catalog_key is rejected with the typed error; a catalog-hit returns an OutletError whose on-wire message field is the 32-byte HMAC output.",
+        "message is a registered catalog key (§5.4.4 round-5): OutletRegistration carries message_catalog: Vec<MessageTemplate> (each template bounded at 1 KiB UTF-8, catalog bounded at 256 entries per outlet); the catalog is a dedicated field of OutletRegistration (NOT nested inside schema) and is covered by the V2 signature preimage via a dedicated catalog_hash term (SCP-OUT-040). OutletError::new takes (outlet_id: &OutletId, catalog_key: &CatalogKey, class: OutletErrorClass, ...) — all inputs are typed newtypes per API MINOR round-6 (CatalogKey is shared with MessageTemplate::try_new per OUT-040; OutletId is the existing newtype) — and an IkmCommitment-derived / registration-accepted &[u8; 32] outlet_message_key parameter, and constructs wire_message = HMAC-SHA-256(outlet_message_key, catalog_key.as_str().as_bytes())[..32]. OutletError::new rejects any catalog_key not present in the registered catalog for that outlet with OutletErrorConstructionFailed::UnregisteredMessageKey. Unit test: a catalog-miss catalog_key is rejected with the typed error; a catalog-hit returns an OutletError whose on-wire message field is the 32-byte HMAC output.",
         "pad_nonce field shape (§5.4.4 round-5): OutletError.pad_nonce is [u8; 16] (fixed, NOT Option<[u8; 16]>); the field is unconditional — emitted on every envelope, padded or not. Unit test: round-trip of an envelope with a non-padded source_chain preserves the emitted 16-byte pad_nonce; wire-layer deserialization rejects an envelope whose tag-11 field is missing.",
         "detail field type-checks against a per-class schema at construction time (§5.4.4 table); a Protocol-class OutletError with detail shaped like Input-class detail is rejected with DetailShapeMismatch",
-        "Execution class panic detail uses panic_location_hash: [u8; 32] (full SHA-256, not truncated 16-byte per round-3 fix). Unit test: OutletError with class=Execution detail={panic_location_hash: [u8; 32]} round-trips; a 16-byte panic_location_hash is wire-rejected as DetailShapeMismatch."
+        "Execution class panic detail uses panic_location_hash: [u8; 32] (full SHA-256, not truncated 16-byte per round-3 fix). Unit test: OutletError with class=Execution detail={panic_location_hash: [u8; 32]} round-trips; a 16-byte panic_location_hash is wire-rejected as DetailShapeMismatch.",
+        "registration_event_id field shape (§5.4.4 round-6): OutletError.registration_event_id is [u8; 32] (fixed, NOT Option<[u8; 32]>); the field is unconditional — emitted on every envelope regardless of re-registration state. Unit test: round-trip of an envelope preserves the emitted 32-byte registration_event_id; wire-layer deserialization rejects an envelope whose tag-12 field is missing with OutletErrorConstructionFailed::MissingRegistrationEventId."
       ],
       "actionItems": [
         "Define struct OutletError with the 8 fields listed in §5.4.4 (tags 1-6, 8, 11; no i18n_key, no trace_id, no related_code)",
@@ -1590,7 +1597,7 @@
         "Add forward-compat tests covering tag 7/9/10 (reserved) and tag 12+ (future)",
         "Export from lib.rs; document each field in rustdoc with §5.4.4 citation",
         "Export OutletErrorConstructionFailed::UnregisteredMessageKey as a typed constructor error; wire the HMAC-SHA-256(outlet_message_key, catalog_key) construction into OutletError::new so the wire `message` field is the 32-byte HMAC output (§5.4.4 round-5 per-outlet-HMAC rule)",
-        "Emit pad_nonce: [u8; 16] unconditionally on every OutletError (no Option wrapper); test that non-padded envelopes still include a 16-byte nonce that round-trips byte-identical (§5.4.4 round-5 pad_nonce unconditional emission)"
+        "Emit pad_nonce: [u8; 16] AND registration_event_id: [u8; 32] unconditionally on every OutletError (no Option wrappers); test that envelopes always include both fields round-tripping byte-identical (§5.4.4 round-5 pad_nonce + round-6 registration_event_id unconditional emission)"
       ],
       "blockedBy": [
         "SCP-OUT-001"
@@ -1928,7 +1935,13 @@
         "TypeScript: error subclasses survive `instanceof` across the napi-rs FFI boundary — explicit test in bindings/typescript/tests/errors.test.ts asserts `err instanceof AuthorizationError` holds after the error crosses the bridge and again after JSON round-trip",
         "TypeScript: if napi-rs does not preserve the prototype chain natively, the SDK uses factory functions that produce tagged instances matched via a runtime class-tag check (`OutletError.isAuthorizationError(err)`); the test covers both the native and fallback paths",
         "PII lint on message: each SDK applies a regex redaction pass to `message` before surfacing to developer-facing logs — emails match /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}/ become '[redacted]'; DIDs match /did:(dht|web|key):[A-Za-z0-9._-]+/ become '[redacted]'; conformance fixture includes at least one email and one DID in message to exercise the redactor",
-        "per-class `detail` schema conformance: each SDK rejects (at the deserialization boundary) an envelope whose detail shape does not match its class (§5.4.4 table) — test covers one malformed detail per class"
+        "per-class `detail` schema conformance: each SDK rejects (at the deserialization boundary) an envelope whose detail shape does not match its class (§5.4.4 table) — test covers one malformed detail per class",
+        "Python `OutletError` subclass for OutletErrorClass::Protocol is named `OutletProtocolError` (NOT `ProtocolError`) to avoid collision with MLS `ProtocolError`. The subclass hierarchy is: `OutletError` (abstract) → `OutletProtocolError`, `AuthorizationError`, `InputError`, `ExecutionError`, `OutputError`, `EconomicError`, `TransportError`, `GovernanceError` (eight concrete subclasses). grep -rn 'class ProtocolError' bindings/python/scp_sdk/errors.py returns 0; grep -rn 'class OutletProtocolError' bindings/python/scp_sdk/errors.py returns >= 1. Python import test: `from scp_sdk.errors import OutletProtocolError` succeeds.",
+        "Credit newtype across all four SDKs (API MINOR round-6, MAJOR 24 followup): Python `Credit = NewType('Credit', int)` with a zero-rejection factory `def Credit(raw: int) -> Credit` that raises `InvalidGrant` on `raw <= 0` or `raw > 2**32 - 1`; TypeScript `export type Credit = number & { readonly __brand: 'Credit' }` with a factory `export function Credit(raw: number): Credit` that throws `InvalidGrant` on `raw <= 0` or `raw > 0xFFFFFFFF`; Swift `struct Credit: Sendable, Hashable { public let raw: UInt32; public init(_ raw: UInt32) throws }` throws `OutletError.invalidGrant` on `raw == 0`; Kotlin `@JvmInline value class Credit(val raw: UInt) { init { require(raw > 0u) { 'zero grant' } } }` throws IllegalArgumentException on raw == 0u. `grantCredit` across all four SDKs takes `Credit` (not `int`/`number`/`UInt32`/`UInt`) — per-SDK test asserts passing a raw integer to grantCredit fails at type-check/compile time.",
+        "InvalidGrant class uniformly under the `OutletError` hierarchy across all four SDKs (replaces per-language `ValueError`/`RangeError`/`IllegalArgumentException`/`OutletError.invalidGrant` inconsistency that round-5 shipped). Python: `class InvalidGrant(OutletProtocolError)` with `code = 'SCP-TOOL-6101'` and `slug = 'protocol.invalid-grant'`. TypeScript: `class InvalidGrant extends OutletProtocolError`. Swift: `case invalidGrant(Credit)` under `OutletError.protocol(..)` associated value. Kotlin: `class InvalidGrant(grant: UInt) : OutletProtocolError()`. Per-SDK test: `Credit(0)` (Python/TS factory) or `Credit(0u)` (Swift/Kotlin) raises InvalidGrant with the registered slug; passing the caught exception to `isinstance(err, OutletError)` / `err instanceof OutletError` returns true.",
+        "`OutletError.new` adopts options-object / keyword-only constructor per API MINOR round-6 (swap-risk on adjacent string args `outlet_id` and `catalog_key`): Python `OutletError.new(*, outlet_id: OutletId, catalog_key: CatalogKey, class_: OutletErrorClass, retry: RetryPolicy = RetryPolicy.Never, detail: Optional[Value] = None) -> OutletError` — keyword-only, enforced by `*` in signature; positional call fails at type-check. TypeScript `OutletError.new(opts: { outletId: OutletId; catalogKey: CatalogKey; class: OutletErrorClass; retry?: RetryPolicy; detail?: Value }): OutletError` — options-object required; positional signature not exposed. Swift keeps labeled args (`OutletError.new(outletId:catalogKey:class:retry:detail:)`) — Swift's labeled-argument idiom is already unambiguous per API MAJOR 22. Kotlin `OutletError.new(opts: OutletErrorNewOptions)` where `OutletErrorNewOptions` is a builder with required fields outletId/catalogKey/class. Per-language test asserts positional-only invocation of the catalog_key/outlet_id pair (for Python/TS/Kotlin) fails to compile or type-check.",
+        "CatalogKey newtype shared between `MessageTemplate::try_new` and `OutletError::new` (API MINOR round-6): Rust `pub struct CatalogKey(String)` in scp-protocol with a `CatalogKey::try_new(raw: &str) -> Result<Self, MalformedKey>` constructor that validates the §5.4.1 regex `^[a-z][a-z0-9-]{0,63}(\\.[a-z][a-z0-9-]{0,63})*$`. SDKs expose a typed wrapper: Python `CatalogKey = NewType('CatalogKey', str)` with a runtime-validating factory; TypeScript `export type CatalogKey = string & { readonly __brand: 'CatalogKey' }` + factory; Swift `struct CatalogKey: Sendable, Hashable { public let raw: String; public init(_ raw: String) throws }`; Kotlin `@JvmInline value class CatalogKey(val raw: String)` + companion factory. `OutletError.new` takes `CatalogKey` (not `&str`/`str`/`string`); per-SDK test asserts passing a raw string where `CatalogKey` is expected fails type-check. Eliminates the dual regex validation between MessageTemplate::try_new and OutletError::new (OUT-040 and OUT-041 previously duplicated the validator).",
+        "IkmCommitment struct encapsulation (API MINOR round-6) in crates/scp-runtime: replaces the free functions `derive_accept_time_ikm` / `sign_ikm_commitment` / `verify_ikm_commitment` (per OUT-042b) with methods on `pub struct IkmCommitment { pub ikm: [u8; 32], pub context_a_id: ContextId, pub context_b_id: ContextId, pub epoch: u64 }`. Constructors: `IkmCommitment::derive_accept_time(mls: &Mls, local_id: &ContextId, peer_id: &ContextId, epoch: u64) -> Self` (derives ikm from MLS_EXPORTER with canonical peer suffix). Methods: `IkmCommitment::sign(&self, signer: &SigningKey) -> Ed25519Signature` (computes SCP-OUTLET-IKM-COMMITMENT-V1 preimage and signs); `IkmCommitment::verify(&self, verifying_key: &VerifyingKey, sig: &Ed25519Signature) -> Result<(), IkmSignatureError>`. The struct holds the ordered context pair; swapping `context_a_id`/`context_b_id` is impossible at the type level because the struct's `canonical_pair()` method orders them lexicographically internally before generating the preimage. Rust unit test: two `IkmCommitment` values constructed with swapped `context_a_id`/`context_b_id` arguments produce byte-identical preimages (canonical-ordered) — demonstrating the ordering is authoritative, not caller-provided. Regression test (swap bug): a caller who accidentally passes (context_b, context_a) — previously a silent signature-over-wrong-preimage bug — now produces the same preimage as (context_a, context_b) and verifies identically."
       ],
       "actionItems": [
         "Generate fixture JSON from the SCP-OUT-036 registry",
@@ -1938,7 +1951,12 @@
         "Add per-SDK round-trip tests",
         "Add message-PII redaction helper to each SDK; test with email + DID fixtures",
         "Add TypeScript-specific instanceof-survival test (native + factory-fallback paths)",
-        "Add per-class detail-shape rejection test (one malformed per class)"
+        "Add per-class detail-shape rejection test (one malformed per class)",
+        "Rename Python OutletError.Protocol subclass from ProtocolError to OutletProtocolError; update all 8 concrete subclasses to inherit from the corresponding renamed class (AuthorizationError, etc. remain as-is since there is no collision)",
+        "Define Credit newtype in all 4 SDKs + InvalidGrant class under OutletError hierarchy; replace per-language range-check throws with uniform InvalidGrant",
+        "Rewrite OutletError.new across Python/TS/Kotlin to use options-object / keyword-only form; update all internal call sites",
+        "Define CatalogKey newtype in scp-protocol + SDK mirrors; update MessageTemplate::try_new and OutletError::new to consume CatalogKey",
+        "Introduce IkmCommitment struct in scp-runtime with derive_accept_time/sign/verify methods; replace free-function usages in AcceptOutletInterface handler (OUT-042b)"
       ],
       "blockedBy": [
         "SCP-OUT-025",
@@ -2100,7 +2118,7 @@
       ],
       "description": "Implement per-stream credit accounting and billing lifecycle per §5.4.5. A stream opens with `credit_window` chunks of headroom (default 32, via `ContextParams::stream_window_default`); each Data/Progress chunk decrements credit; End and Error do NOT. When credit hits 0 and no grant arrives within `stream_credit_stall_secs` (default 30), the framework cancels the stream with `OutletError { code: 'SCP-TOOL-6133', slug: 'execution.credit-stall', terminal: true }`. Every `OutletStreamCredit` MUST carry the invoker's Ed25519 signature over (context_id, outlet_id, request_id, grant, monotonic_seq, stream_epoch, caveats_binding) under domain separator `SCP-OUTLET-CREDIT-V1:`; duplicates and regressions of `monotonic_seq` are rejected as `OutletErrorClass::Authorization::CreditReplay`. Credit and billing are tightly coupled (the grant handler is the same path that tops up escrow), so they ship as a single story — splitting them would put two coder agents on the same file and create shared-state conflicts. This unified story replaces the round-3 OUT-034a/OUT-034b split. At open: escrow = `cost.amount * estimated_chunk_count` (bounded by min(credit_window, caveats.max_calls); estimated_chunk_count is coerced from caveats.max_calls per §5.4.5:422-432 when the invoker does not declare an explicit value). Each validly accepted credit grant on a non-zero-cost Action outlet tops up escrow by `cost.amount * grant` via `checked_mul`; overflow rejects the grant with `OutletErrorClass::Economic::EscrowOverflow`; insufficient invoker balance rejects with `InsufficientFunds`. Per chunk: bill `cost.amount` per Data chunk at or below cancel_ack_seq; Progress/End/Error/out-of-bound chunks are never billed. At close: issue PaymentReceipt for `chunks_billed * cost.amount` and refund unspent escrow. Error-before-first-Data refunds full escrow. Credit-stall cancel releases escrow and the chain-depth slot; operator bills for Data chunks already delivered in the stalled window. `chunks_billed` recorded in OutletInvokedEvent is verifiable against manifest + cancel_ack_seq (mismatched event is wire-rejected).",
       "acceptanceCriteria": [
-        "ContextParams has fields stream_window_default: u32 (default 32), stream_credit_stall_secs: u32 (default 30), stream_cancel_ack_secs: u32 (default 5), stream_ucan_recheck_secs: u32 (default 10), max_concurrent_inbound_streams_per_invoker: u32 (default 8), max_concurrent_inbound_streams_per_origin_invoker: u32 (default 16), max_concurrent_inbound_streams_per_outlet: u32 (default 128) — all seven registered in §9.18.B Configurable Parameters (ContextParams::interface_base_cost_minimum is NOT owned by this story; it is added by SCP-OUT-042 per §6.2.0.1 interface-spam quadratic fee)",
+        "ContextParams has fields stream_window_default: u32 (default 32), stream_credit_stall_secs: u32 (default 30), stream_cancel_ack_secs: u32 (default 5), stream_ucan_recheck_secs: u32 (default 10), max_concurrent_inbound_streams_per_invoker: u32 (default 8), max_concurrent_inbound_streams_per_origin_invoker: u32 (default 16), max_concurrent_inbound_streams_per_outlet: u32 (default 128) — all seven registered in §9.18.B Configurable Parameters (ContextParams::base_cost_scale and ContextParams::outlet_error_buffer_max_secs are NOT owned by this story; they are added by SCP-OUT-042d per §6.2.0.1 interface-spam quadratic fee and admin-removal Frozen buffer respectively)",
         "struct CreditTracker with method try_consume(&mut self) -> Result<(), OutOfCredit> and grant(&mut self, additional: u32, monotonic_seq: u64, sig: &Ed25519Signature, context_id: &str, outlet_id: &str, stream_epoch: u64, caveats_binding: &[u8; 32]) -> Result<(), GrantError>",
         "grant verifies Ed25519 signature over preimage SHA-256('SCP-OUTLET-CREDIT-V1:' || len_be32(context_id) || context_id || len_be32(outlet_id) || outlet_id || request_id || grant_be || monotonic_seq_be || stream_epoch_be || caveats_binding) under invoker_pk recorded at open — byte-for-byte matching §5.4.5:528-542; invalid signature returns GrantError::SignatureInvalid",
         "grant rejects monotonic_seq regressions/duplicates with GrantError::CreditReplay (maps to OutletErrorClass::Authorization slug authorization.credit-replay)",
@@ -2135,7 +2153,7 @@
         "cargo test -p scp-runtime succeeds"
       ],
       "actionItems": [
-        "Add stream_window_default, stream_credit_stall_secs, stream_cancel_ack_secs, stream_ucan_recheck_secs, max_concurrent_inbound_streams_per_invoker, max_concurrent_inbound_streams_per_origin_invoker, max_concurrent_inbound_streams_per_outlet to ContextParams (all seven registered in §9.18.B; interface_base_cost_minimum lands in SCP-OUT-042)",
+        "Add stream_window_default, stream_credit_stall_secs, stream_cancel_ack_secs, stream_ucan_recheck_secs, max_concurrent_inbound_streams_per_invoker, max_concurrent_inbound_streams_per_origin_invoker, max_concurrent_inbound_streams_per_outlet to ContextParams (all seven registered in §9.18.B; base_cost_scale and outlet_error_buffer_max_secs land in SCP-OUT-042d (round-6 replacement for the round-5 flat interface_base_cost_minimum))",
         "Implement CreditTracker with signature-verifying grant() that checks context_id/outlet_id/stream_epoch/caveats_binding identity binding",
         "Implement monotonic_seq tracking per (request_id) with CAS",
         "Wire try_consume into chunk emission path",
@@ -2360,14 +2378,14 @@
       "acceptanceCriteria": [
         "Public SDK surface per SCP-OUT-006: every language exposes exactly ONE public verb — `ctx.outlets.invoke(...)`. There is no `invoke_stream` at the public layer in any of Python/TypeScript/Swift/Kotlin (grep -rn 'invoke_stream\\|invokeStream' bindings/ returns 0 outside of internal wrappers that the user never calls directly)",
         "Python: `handle = ctx.outlets.invoke(id, input)` supports `await handle` -> End.aggregate AND `async for chunk in handle:` -> yields OutletStreamChunk; Progress chunks are observable in the iterator",
-        "Python: handle.grant_credit(grant: int) and handle.cancel() methods exist; grant_credit signs OutletStreamCredit over the SCP-OUTLET-CREDIT-V1 preimage (binding context_id, outlet_id, stream_epoch, caveats_binding) with the invoker key; grant_credit raises TypeError on negative grant or grant > u32::MAX per API MAJOR 23 and ValueError on grant == 0",
-        "Python: unit test — handle.grant_credit(-1) raises TypeError; handle.grant_credit(2**32) raises TypeError; handle.grant_credit(0) raises ValueError (zero grants are structurally forbidden — a zero-grant advances neither credit nor escrow); handle.grant_credit(10) succeeds",
-        "TypeScript: `handle = ctx.outlets.invoke(id, input)` satisfies `PromiseLike<Aggregate>` AND `AsyncIterable<OutletStreamChunk>`; `handle.grantCredit(grant: number)` and `handle.cancel()` are callable; Progress chunks observable; grantCredit throws RangeError on grant < 0 or grant > 0xFFFFFFFF (API MAJOR 23) and RangeError on grant === 0",
-        "TypeScript: unit test — handle.grantCredit(-1) throws RangeError; handle.grantCredit(2**32) throws RangeError; handle.grantCredit(0) throws RangeError (zero grants are structurally forbidden); handle.grantCredit(10) succeeds",
-        "Swift: `handle = try await ctx.outlets.invoke(id:input:)` conforms to `AsyncSequence` (yielding OutletStreamChunk) AND exposes `await handle.aggregate` for End.aggregate; `handle.grantCredit(grant: UInt32)` and `handle.cancel()` methods exist (Swift's UInt32 type enforces the [0, u32::MAX] range at compile time per API MAJOR 23); grantCredit(0) throws OutletError.invalidGrant",
-        "Swift: unit test — try handle.grantCredit(0) throws OutletError.invalidGrant; try handle.grantCredit(10) succeeds",
-        "Kotlin: `handle = ctx.outlets.invoke(id, input)` exposes `suspend fun aggregate(): Aggregate` AND `fun asFlow(): Flow<OutletStreamChunk>`; `suspend fun grantCredit(grant: UInt)` and `suspend fun cancel()` exist (Kotlin's UInt type enforces the [0, u32::MAX] range per API MAJOR 23); grantCredit(0u) throws IllegalArgumentException",
-        "Kotlin: unit test — handle.grantCredit(0u) throws IllegalArgumentException; handle.grantCredit(10u) succeeds",
+        "Python: handle.grant_credit(grant: Credit) and handle.cancel() methods exist (Credit newtype per OUT-031 round-6 — grant_credit consumes Credit, not int; a raw int fails at mypy --strict); grant_credit signs OutletStreamCredit over the SCP-OUTLET-CREDIT-V1 preimage (binding context_id, outlet_id, stream_epoch, caveats_binding) with the invoker key; passing Credit(0) raises InvalidGrant (an OutletProtocolError subclass) per OUT-031 round-6 uniform InvalidGrant rule",
+        "Python: unit test — constructing Credit(-1) raises InvalidGrant (not TypeError); Credit(2**32) raises InvalidGrant; Credit(0) raises InvalidGrant; handle.grant_credit(Credit(10)) succeeds; passing a raw int 10 to handle.grant_credit fails at mypy --strict (no implicit Credit coercion)",
+        "TypeScript: `handle = ctx.outlets.invoke(id, input)` satisfies `PromiseLike<Aggregate>` AND `AsyncIterable<OutletStreamChunk>`; `handle.grantCredit(grant: Credit)` and `handle.cancel()` are callable (Credit newtype per OUT-031 round-6); Progress chunks observable; constructing Credit from negative / > u32::MAX / zero throws InvalidGrant (an OutletProtocolError subclass) per OUT-031 round-6 uniform InvalidGrant rule; passing a raw number to grantCredit fails at tsc type-check",
+        "TypeScript: unit test — Credit(-1) throws InvalidGrant (not RangeError); Credit(2**32) throws InvalidGrant; Credit(0) throws InvalidGrant; handle.grantCredit(Credit(10)) succeeds; passing a raw number 10 to handle.grantCredit fails at tsc type-check",
+        "Swift: `handle = try await ctx.outlets.invoke(id:input:)` conforms to `AsyncSequence` (yielding OutletStreamChunk) AND exposes `await handle.aggregate` for End.aggregate; `handle.grantCredit(grant: Credit)` and `handle.cancel()` methods exist (Credit newtype per OUT-031 round-6 — Swift `struct Credit { public let raw: UInt32 }` with throwing init that rejects raw == 0); `Credit(0)` throws `OutletError.invalidGrant` per OUT-031 round-6",
+        "Swift: unit test — try Credit(0) throws OutletError.invalidGrant; try handle.grantCredit(Credit(10)) succeeds; passing a raw UInt32 where Credit is expected fails at compile time",
+        "Kotlin: `handle = ctx.outlets.invoke(id, input)` exposes `suspend fun aggregate(): Aggregate` AND `fun asFlow(): Flow<OutletStreamChunk>`; `suspend fun grantCredit(grant: Credit)` and `suspend fun cancel()` exist (Credit newtype per OUT-031 round-6 — Kotlin @JvmInline value class with zero-rejection init); `Credit(0u)` throws InvalidGrant (a subclass of OutletProtocolError) per OUT-031 round-6 uniform rule",
+        "Kotlin: unit test — Credit(0u) throws InvalidGrant (not IllegalArgumentException); Credit(10u) succeeds; handle.grantCredit(Credit(10u)) succeeds; passing a raw UInt where Credit is expected fails at compile time",
         "grantCredit increments monotonic_seq per §5.4.5 (strictly monotonic; SDK tracks the counter locally) and signs the preimage with the invoker's identity key",
         "End.aggregate validation matches aggregate_schema per §5.4.5",
         "InvocationHandle lifecycle guard (API MAJOR 24 + round-5 API MINOR on Python depth): calling grantCredit or cancel on a handle whose stream has reached a terminal chunk raises a typed error in each SDK. Python: `class StreamAlreadyClosed(ProtocolError)` — parent class is ProtocolError (the Python subclass for OutletErrorClass::Protocol, a direct subclass of OutletError) rather than the OutletError base itself, so the lifecycle-violation error sits at the same inheritance depth as other protocol-class errors (catalog-rotation, stream-already-open, unknown-session) across SDKs. TypeScript: `class StreamAlreadyClosed extends ProtocolError` (symmetric depth). Swift: `OutletError.streamAlreadyClosed` (enum case nested under the Protocol-class associated value). Kotlin: `class StreamAlreadyClosed : ProtocolError()` (concrete class extending the protocol-class sealed parent). Cross-SDK symmetry rationale: placing StreamAlreadyClosed under OutletError directly (the round-4 choice) positioned it at a different depth than its siblings (StreamAlreadyOpen, UnknownSession) which are under Protocol — confusing catch-block authors who expect all protocol-class errors to share a common parent. The round-5 rule: lifecycle errors sit at the same depth as their semantic-class siblings.",
@@ -2508,63 +2526,32 @@
       "details": {}
     },
     {
-      "id": "SCP-OUT-041",
-      "title": "Per-outlet outlet_message_key derivation at registration acceptance + OutletError::new(catalog_key) HMAC construction + UnregisteredMessageKey + CatalogRotationTooFrequent + SDK/bridge surfaces",
+      "id": "SCP-OUT-041a",
+      "title": "derive_outlet_message_key in scp-runtime — exporter-based key derivation + persistence + exporter-grace regression test",
       "gate": "gate-round5-fixes",
       "priority": "P0",
       "severity": "critical",
       "status": "pending",
       "files": [
-        "crates/scp-protocol/src/context/outlets/errors.rs",
-        "crates/scp-runtime/src/context/outlets/registration.rs",
         "crates/scp-runtime/src/context/outlets/message_key.rs",
         "crates/scp-runtime/src/context/manager/outlets.rs",
-        "crates/scp-ffi/src/outlets.rs",
-        "crates/scp-ffi/napi/src/outlets.rs",
-        "crates/scp-ffi/uniffi/src/scp.udl",
-        "crates/scp-ffi/uniffi/src/scp.rs",
-        "crates/scp-ffi/wasm/src/outlets.rs",
-        "bindings/python/scp_sdk/outlets.py",
-        "bindings/typescript/src/outlets.ts",
-        "bindings/swift/Sources/SCP/Outlets.swift",
-        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Outlets.kt"
+        "crates/scp-runtime/src/context/registration.rs"
       ],
-      "description": "Implement the per-outlet registration-time message HMAC key per §5.4.4 round-5 rule. On OutletRegistration acceptance the runtime evaluates `outlet_message_key = MLS_EXPORTER('scp-outlet-message-v1:' || BE32(len(outlet_id)) || outlet_id, b'', 32)` on the hosting context's current MLS epoch (the moment MLS commits the registration), and pins the 32-byte key to the outlet's state alongside the accepted event. The key lives for the lifetime of the registration (implementation_hash-locked); it rotates ONLY when the outlet is re-registered. Every OutletError emitted by this outlet sets `wire_message = HMAC-SHA-256(outlet_message_key, catalog_key_utf8)[..32]` via the OutletError::new(outlet_id, catalog_key, class, ...) constructor. The constructor rejects catalog_key values not in the registered catalog with OutletErrorConstructionFailed::UnregisteredMessageKey. CatalogRotationTooFrequent enforcement compares the prior registration's event-log append time (via `event_log.append_time_for(prior_registration_id)`) against the new registration's event-log append time — NOT the operator-declared registered_at field — and rejects any catalog-differing update within 24 hours with OutletErrorClass::Protocol::CatalogRotationTooFrequent (SCP-TOOL-6100 slug protocol.catalog-rotation-too-frequent). Bridge + SDK surfaces expose OutletError::new(catalog_key) rather than OutletError::new(message) — the catalog_key -> wire_message HMAC is the bridge's responsibility, not the application's.",
+      "description": "Implement the per-outlet registration-time message HMAC key derivation per §5.4.4 round-5 rule. On OutletRegistration acceptance the runtime evaluates `outlet_message_key = MLS_EXPORTER('scp-outlet-message-v1:' || BE32(len(outlet_id)) || outlet_id, b'', 32)` on the hosting context's current MLS epoch (the moment MLS commits the registration) and pins the 32-byte key to the outlet's state alongside the accepted event. The key lives for the lifetime of the registration (implementation_hash-locked); it rotates ONLY when the outlet is re-registered. This story ships the derive helper, the persistence path, and the grace-window regression test that closes BH5-B2; constructor refactoring and the receiver LRU are in OUT-041b; dwell-time validator is in OUT-041c; bridges + SDKs are in OUT-041d.",
       "acceptanceCriteria": [
-        "Function derive_outlet_message_key(context_mls: &Mls, outlet_id: &str) -> [u8; 32] in crates/scp-runtime/src/context/outlets/message_key.rs computes MLS_EXPORTER('scp-outlet-message-v1:' || BE32(len(outlet_id)) || outlet_id, b'', 32) on the current MLS epoch — byte-for-byte matching §5.4.4 round-5 derivation",
-        "On OutletRegistration acceptance (AcceptOutletRegistration handler), the runtime calls derive_outlet_message_key ONCE and persists the 32-byte result into the outlet's registration state under ProtocolRepository path `context/{id}/outlet/{outlet_id}/message_key` (§17.3); grep -n 'outlet_message_key' crates/scp-runtime/src/context/outlets/registration.rs returns >= 1",
+        "Function derive_outlet_message_key(context_mls: &Mls, outlet_id: &OutletId) -> [u8; 32] in crates/scp-runtime/src/context/outlets/message_key.rs computes MLS_EXPORTER('scp-outlet-message-v1:' || BE32(len(outlet_id)) || outlet_id, b'', 32) on the current MLS epoch — byte-for-byte matching §5.4.4 round-5 derivation",
+        "On OutletRegistration acceptance (AcceptOutletRegistration handler), the runtime calls derive_outlet_message_key ONCE and persists the 32-byte result into the outlet's registration state under ProtocolRepository path `context/{id}/outlet/{outlet_id}/registration/{registration_event_id}/message_key` — keyed by registration_event_id so concurrent registrations (for the LRU support added in OUT-041b) do not overwrite each other; grep -n 'outlet_message_key' crates/scp-runtime/src/context/outlets/registration.rs returns >= 1",
         "The pinned outlet_message_key does NOT re-derive at each error emission; grep -n 'MLS_EXPORTER' crates/scp-runtime/src/context/manager/outlets.rs returns 0 in any OutletError construction path (the key is read from state, not recomputed)",
         "Unit test: the same outlet_id in two distinct contexts produces two distinct outlet_message_key values (context-scoped)",
-        "Unit test: grace-window epoch transition (MLS epoch advances from E to E+1 during the grace window) does NOT change outlet_message_key — a test simulates the epoch advance while the outlet registration is live and asserts the persisted key is unchanged; no wire_message computed after the advance uses the E+1 exporter",
+        "Unit test: grace-window epoch transition (MLS epoch advances from E to E+1 during the grace window) does NOT change outlet_message_key — a test simulates the epoch advance while the outlet registration is live and asserts the persisted key is unchanged; no wire_message computed after the advance uses the E+1 exporter. Regression test for BH5-B2 epoch-grace covert channel closure.",
         "Unit test: the outlet_message_key is byte-equal across re-reads of the same accepted registration (deterministic derivation from the committed accept-time exporter)",
-        "OutletError::new(outlet_id: &str, catalog_key: &str, class: OutletErrorClass, ...) constructor: looks up the outlet's pinned outlet_message_key from registration state, verifies catalog_key is present in the outlet's registered catalog (returns OutletErrorConstructionFailed::UnregisteredMessageKey if not), computes wire_message = HMAC-SHA-256(outlet_message_key, catalog_key.as_bytes())[..32], and sets the OutletError.message field to this 32-byte opaque value",
-        "Unit test: OutletError::new('outlet_a', 'auth.denied', Authorization, ...) with 'auth.denied' present in outlet_a's catalog succeeds; OutletError::new('outlet_a', 'bogus.key', ...) returns UnregisteredMessageKey",
-        "Unit test: wire_message bytes are NOT catalog_key plaintext — a receiver who holds the outlet_message_key reverses the HMAC (via enumeration of the ≤256 catalog keys) to recover the catalog entry; a receiver who does NOT hold the key sees only the 32-byte opaque value",
-        "Unit test: the same catalog_key in two different contexts produces two different wire_message byte strings (per-context keying defeats cross-context signaling)",
-        "Unit test: the same catalog_key on the same outlet at epoch E+1 (inside the MLS grace window, immediately after an epoch advance) produces the SAME wire_message as at epoch E — regression test for the BH5-B2 epoch-grace covert channel closure",
-        "CatalogRotationTooFrequent enforcement: on a registration update whose message_catalog differs from the prior registration, the validator compares event_log.append_time_for(new_registration_id) against event_log.append_time_for(prior_registration_id); if the delta is < 24h (86400s), the registration is rejected with OutletErrorClass::Protocol::CatalogRotationTooFrequent (code SCP-TOOL-6100, slug protocol.catalog-rotation-too-frequent)",
-        "Unit test: register outlet with catalog C0 at event-log time T0; attempt to update to catalog C1 at event-log time T0 + 23.99h → rejected with CatalogRotationTooFrequent; re-attempt at T0 + 24.01h → accepted",
-        "Operator-clock-bypass regression test: attacker attempts to back-date registered_at on the update to T0 - 12h (making it appear as if 36h have passed by registered_at comparison); the rejection uses event_log.append_time_for, NOT registered_at, so the bypass fails — the update is still rejected with CatalogRotationTooFrequent because the actual event-log append happens at T0 + 12h which is < 24h after T0",
-        "SDK surface: Python OutletError(outlet_id, catalog_key, class, ...) calls FFI outlet_error_new(outlet_id, catalog_key, ...) which HMACs at the bridge boundary; the SDK never receives the raw outlet_message_key. grep -c 'outlet_error_new' bindings/python/scp_sdk/ returns >= 1",
-        "SDK surface: TypeScript OutletError.new({ outletId, catalogKey, class, ... }) calls outletErrorNew NAPI export; bun test asserts wire_message is a 32-byte opaque value, not the catalog_key string",
-        "SDK surface: Swift OutletError.new(outletId:catalogKey:class:...) calls the UniFFI binding; swift test asserts construction",
-        "SDK surface: Kotlin OutletError.new(outletId, catalogKey, class, ...) calls the UniFFI binding; gradle test asserts construction",
-        "FFI bridges: PyO3 outlet_error_new, NAPI outletErrorNew, UniFFI outlet_error_new (UDL), WASM outletErrorNew — all four bridges expose the catalog_key -> wire_message HMAC at the FFI boundary; bridge_ratchet_baseline.json is regenerated additively (new exports) and CI ratchet passes",
-        "Conformance fixture: tests/conformance/vectors/outlet_message_hmac_fixtures.json — one fixture per (outlet_id, catalog_key) pair; every bridge produces byte-identical wire_message for the same (outlet_message_key, catalog_key) input",
-        "cargo test --workspace --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing succeeds"
+        "cargo test -p scp-runtime succeeds"
       ],
       "actionItems": [
-        "Create crates/scp-runtime/src/context/outlets/message_key.rs with derive_outlet_message_key and its tests",
+        "Create crates/scp-runtime/src/context/outlets/message_key.rs with derive_outlet_message_key and its unit tests",
         "Wire derive_outlet_message_key into the AcceptOutletRegistration handler in manager/outlets.rs so the key is computed ONCE at acceptance",
-        "Persist outlet_message_key into ProtocolRepository under context/{id}/outlet/{outlet_id}/message_key",
-        "Rewrite OutletError::new to take outlet_id + catalog_key and look up the pinned key from registration state",
-        "Implement the UnregisteredMessageKey rejection in OutletError::new",
-        "Implement CatalogRotationTooFrequent in the registration-update validator using event_log.append_time_for",
-        "Add all five bridge exports (PyO3, NAPI, UniFFI ×2 for Swift/Kotlin, WASM) for outlet_error_new and the catalog-rotation validator's rejection path",
-        "Add SDK wrappers in all four language SDKs; add per-SDK unit tests for OutletError.new + CatalogRotationTooFrequent",
-        "Regenerate bridge_ratchet_baseline.json (additive — new exports only)",
-        "Add the epoch-grace closure regression test (BH5-B2)",
-        "Add the registered_at-bypass regression test (event-log-append-time vs operator-declared comparison)"
+        "Persist outlet_message_key into ProtocolRepository under context/{id}/outlet/{outlet_id}/registration/{registration_event_id}/message_key",
+        "Add the epoch-grace closure regression test (BH5-B2)"
       ],
       "blockedBy": [
         "SCP-OUT-024",
@@ -2574,10 +2561,6 @@
         {
           "file": ".docs/specs/05-contexts.md",
           "section": "### 5.4.4 Outlet Error Taxonomy"
-        },
-        {
-          "file": ".docs/specs/05-contexts.md",
-          "section": "### 5.4.1 Outlet Registration Wire Format"
         },
         {
           "file": ".docs/specs/09-security-model.md",
@@ -2591,60 +2574,240 @@
       "details": {}
     },
     {
-      "id": "SCP-OUT-042",
-      "title": "InterfaceEstablished IKM commitments + peer-suffixed MLS exporter + HKDF hop_salt + IKM signing + admin-removal salt rotation + interface-spam quadratic fee with cluster detection",
+      "id": "SCP-OUT-041b",
+      "title": "OutletError::new(OutletId, CatalogKey, class, ...) options-object constructor + UnregisteredMessageKey + registration_event_id tag-12 + per-outlet LRU receiver cache + per-context distinctness tests",
       "gate": "gate-round5-fixes",
       "priority": "P0",
       "severity": "critical",
       "status": "pending",
       "files": [
-        "crates/scp-protocol/src/context/params.rs",
-        "crates/scp-protocol/src/context/interface.rs",
-        "crates/scp-runtime/src/context/manager/interface.rs",
-        "crates/scp-runtime/src/context/interface/hop_salt.rs",
-        "crates/scp-runtime/src/context/interface/ikm_commitment.rs",
-        "crates/scp-runtime/src/context/interface/cluster_detection.rs",
-        "crates/scp-runtime/src/governance/admin_removal.rs",
-        "crates/scp-event-log/src/lib.rs"
+        "crates/scp-protocol/src/context/outlets/errors.rs",
+        "crates/scp-runtime/src/context/outlets/errors.rs",
+        "crates/scp-runtime/src/context/outlets/message_key.rs"
       ],
-      "description": "Implement §6.2.0.1 InterfaceEstablished accept-time IKM commitments, signed IKMs (BH5-m4), admin-removal rotation (BH5-s1 elevated), and cluster-aware quadratic interface-spam fee (BH5-M3). At AcceptOutletInterface, each side derives `ikm_local = MLS_EXPORTER('scp-context-hop-salt-v1:' || canonical_peer_id, b'', 32)` on the hosting context's current MLS epoch (with canonical_peer_id = the OTHER side's context_id), signs it under the current admin's `#active` key using the preimage `SHA-256('SCP-OUTLET-IKM-COMMITMENT-V1:' || len_be32(context_a_id) || context_a_id || len_be32(context_b_id) || context_b_id || epoch_be || ikm)`, and writes all four fields (ikm_a, ikm_a_sig, ikm_b, ikm_b_sig) + both epochs into the InterfaceEstablished event. Verifiers rederive hop_salt via HKDF-SHA-256 from the canonically-ordered (ikm_a, ikm_b) pair; the SCP-CONTEXT-HOP-SALT-V1: info string is registered in §9.18.2. On admin removal, the governance engine emits InterfaceSaltRotated on every active interface with a fresh ikm_local_sig'd IKM. Interface-spam quadratic fee: cluster_match_count(k) is computed over a rolling 24h window by checking three predicates (context-id, creator-did, admin-set intersection) against every prior interface; fee = max(base_cost, interface_base_cost_minimum) × (k+1)². interface_base_cost_minimum is a new ContextParams field (this story owns it, not OUT-034). InsufficientFunds at governance-approval time rejects with slug protocol.interface-spam-cost (Economic class, SCP-TOOL-6150).",
+      "description": "Build OutletError::new atop the persisted outlet_message_key from OUT-041a. Rewrite the constructor to take an options-object with typed newtypes (OutletId, CatalogKey, OutletErrorClass, etc.) per OUT-031 round-6 API MINOR fixes. Implement the receiver-side LRU (registration_event_id → outlet_message_key, capacity MESSAGE_KEY_LRU_CAPACITY = 4 per outlet) per §5.4.4 round-6. Add the registration_event_id tag-12 field on every OutletError envelope construction. Add the UnregisteredMessageKey typed constructor error. Wire the per-context distinctness test (same catalog_key in two contexts produces distinct wire_message bytes) and the cross-registration LRU regression test (in-flight error signed under prior registration resolves correctly after re-registration for up to 4 prior registrations).",
       "acceptanceCriteria": [
-        "ContextParams has field interface_base_cost_minimum: Amount — registered in §9.18.B Configurable Parameters (default: smallest non-zero economic unit in the context's currency). grep -n 'interface_base_cost_minimum' crates/scp-protocol/src/context/params.rs returns >= 1",
-        "struct InterfaceEstablished has fields epoch_a: u64, epoch_b: u64, ikm_a: [u8; 32], ikm_a_sig: Ed25519Signature, ikm_b: [u8; 32], ikm_b_sig: Ed25519Signature — all six fields present and persisted verbatim in event metadata",
-        "Function derive_accept_time_ikm(mls: &Mls, peer_context_id: &str) -> [u8; 32] computes MLS_EXPORTER('scp-context-hop-salt-v1:' || peer_context_id.as_bytes(), b'', 32) on the current MLS epoch — byte-for-byte matching §6.2.0.1 Step 1",
-        "Function sign_ikm_commitment(signer: &SigningKey, context_a_id: &str, context_b_id: &str, epoch: u64, ikm: &[u8; 32]) -> Ed25519Signature computes the SCP-OUTLET-IKM-COMMITMENT-V1 preimage and signs under the admin's #active key",
-        "Function verify_ikm_commitment(verifying_key: &VerifyingKey, context_a_id: &str, context_b_id: &str, epoch: u64, ikm: &[u8; 32], sig: &Ed25519Signature) -> Result<(), IkmSignatureError>",
-        "Function derive_hop_salt_from_committed_ikms(ikm_a: &[u8; 32], ikm_b: &[u8; 32], context_a_id: &str, context_b_id: &str) -> [u8; 32] implements §6.2.0.1 Step 2 — canonical ordering + HKDF-SHA-256 with info = 'SCP-CONTEXT-HOP-SALT-V1:' || canonical_context_pair. Cross-SDK byte-equality test across all four bridges",
-        "AcceptOutletInterface handler: derives ikm_local, signs it, and assembles the InterfaceEstablished event with (epoch_a, epoch_b, ikm_a, ikm_a_sig, ikm_b, ikm_b_sig). Both sides' signatures are verified BEFORE the event is appended — a failed verification rejects the establishment entirely with OutletErrorClass::Authorization slug authorization.ikm-signature-invalid (SCP-TOOL-6110) and the event does NOT land in either event log",
-        "Unit test: a tampered ikm_a_sig (last byte flipped) rejects at event-log append time with authorization.ikm-signature-invalid",
-        "Unit test: an ikm_a value from interface A↔B with A's signature does NOT verify when replayed as the ikm in an A↔C InterfaceEstablished event — the context-id pair is in the preimage, so a signature for A↔B cannot be reused for A↔C",
-        "Admin-removal InterfaceSaltRotated: when RemoveMember removes an admin from context X, the governance engine emits an InterfaceSaltRotated { interface_id, new_ikm_local, new_ikm_local_sig, epoch_local } on EVERY active interface context X holds. The event is signed by a remaining admin. The peer context emits its own InterfaceSaltRotated in response. Both sides then re-derive hop_salt from the NEW (ikm_a, ikm_b) pair",
-        "Unit test: admin removal triggers InterfaceSaltRotated on 3 active interfaces simultaneously; all three events are appended to the event log; peer contexts respond with their own rotation events; hop_salt for each interface is now derived from the new IKM pair; a HMAC(old_hop_salt, raw_context_id) computation does NOT match the new wire pseudonyms (removed admin's knowledge becomes useless)",
-        "Unit test: InterfaceSaltRotated.trigger_removal_did points to the removed admin's DID — the rotation trail is verifiable against the governance event that caused it",
-        "Interface-spam quadratic fee with cluster detection (§6.2.0.1): when evaluating AcceptOutletInterface, the governance engine computes cluster_match_count(k) by iterating the rolling 24h window of prior InterfaceEstablished events and incrementing k by 1 for each prior where ANY predicate holds: (1) P_i.context_id == candidate.context_id, (2) P_i.creator_did == candidate.creator_did, (3) P_i.admin_set ∩ candidate.admin_set != empty",
-        "fee = max(base_cost, interface_base_cost_minimum) × (k + 1)²; base_cost is read from context economic policy (§19.3); interface_base_cost_minimum is the new ContextParams field from this story",
-        "Unit test: 0 prior interfaces → fee = base_cost × 1² = base_cost; 4 prior interfaces matching any predicate → fee = base_cost × 5² = 25 × base_cost",
-        "Unit test: attacker spins up 100 disjoint peer contexts with rotated admin DIDs — the cluster-detection predicate (3) (admin_set intersection) catches the overlap IF the attacker uses a shared admin cluster; test creates 10 peer contexts sharing 1 admin DID with A's prior peer, verifies k counts all 10 via predicate (3); fee = base_cost × 11²",
-        "Unit test: creator_did predicate closure — a peer context whose creator_did matches a prior peer's creator_did counts toward k even if admin_set differs (a new admin set was invited but the creator_did is fixed at creation)",
-        "InsufficientFunds-at-governance-approval path: if the computed fee exceeds the proposer's balance, the AcceptOutletInterface is rejected at governance approval with OutletErrorClass::Economic::InsufficientFunds bearing slug protocol.interface-spam-cost (SCP-TOOL-6150) — rejection happens at approval time, not at hop time",
-        "Cluster-detection metadata capture: InterfaceEstablished event records candidate's context_id, creator_did (the DID captured at the candidate context's creation event), and admin_set (admin role holders at interface-acceptance time) — grep -n 'creator_did\\|admin_set' crates/scp-protocol/src/context/interface.rs returns >= 2",
-        "Domain separator SCP-OUTLET-IKM-COMMITMENT-V1: is registered in .docs/specs/09-security-model.md §9.18.2 Domain Separators table; grep -c '\"SCP-OUTLET-IKM-COMMITMENT-V1:\"' .docs/specs/09-security-model.md returns >= 1",
-        "cargo test -p scp-runtime succeeds; cargo test --workspace succeeds for workspace-level tests"
+        "OutletError::new signature is options-object / keyword-only across Rust + SDK wrappers per OUT-031 round-6: Rust `OutletError::new(opts: OutletErrorNewOpts)` where OutletErrorNewOpts carries outlet_id: OutletId, catalog_key: CatalogKey, registration_event_id: EventLogId, outlet_message_key: &[u8; 32], class: OutletErrorClass, retry: RetryPolicy, detail: Option<OutletErrorDetail>, source_chain: Vec<ContextHop>, pad_nonce: [u8; 16]",
+        "OutletError::new looks up the outlet's pinned outlet_message_key from registration state (persisted per OUT-041a at path context/{id}/outlet/{outlet_id}/registration/{registration_event_id}/message_key), verifies catalog_key is present in the outlet's registered catalog (returns OutletErrorConstructionFailed::UnregisteredMessageKey if not), computes wire_message = HMAC-SHA-256(outlet_message_key, catalog_key.as_str().as_bytes())[..32], and sets the OutletError.message field to this 32-byte opaque value",
+        "OutletError::new sets registration_event_id on the envelope to the event-log id cited in OutletErrorNewOpts.registration_event_id, emitted unconditionally per §5.4.4 round-6; grep -n 'registration_event_id:' crates/scp-protocol/src/context/outlets/errors.rs returns >= 1",
+        "Unit test: OutletError::new with catalog_key 'auth.denied' present in outlet_a's catalog succeeds; OutletError::new with 'bogus.key' returns UnregisteredMessageKey",
+        "Unit test: wire_message bytes are NOT catalog_key plaintext — a receiver who holds the outlet_message_key reverses the HMAC (via enumeration of the ≤256 catalog keys) to recover the catalog entry; a receiver who does NOT hold the key sees only the 32-byte opaque value",
+        "Unit test: the same catalog_key in two different contexts produces two different wire_message byte strings (per-context keying defeats cross-context signaling)",
+        "Unit test: the same catalog_key on the same outlet at epoch E+1 (inside the MLS grace window, immediately after an epoch advance) produces the SAME wire_message as at epoch E — regression test for the BH5-B2 epoch-grace covert channel closure",
+        "Per-outlet LRU receiver cache: OutletMessageKeyLru struct in crates/scp-runtime/src/context/outlets/message_key.rs maintains up to MESSAGE_KEY_LRU_CAPACITY = 4 (registration_event_id → outlet_message_key) entries per outlet with oldest-first eviction on new registrations; grep -c 'MESSAGE_KEY_LRU_CAPACITY' crates/scp-runtime/src/ returns >= 1",
+        "Receiver-side OutletError verification: when decoding an incoming OutletError envelope, the receiver looks up the envelope's registration_event_id in the outlet's LRU; on hit, HMAC-verifies message field under the matched key; on miss (registration aged out), rejects with UnregisteredMessageKey per §5.4.4 round-6",
+        "Regression test (in-flight error resolution across re-registration): Construct an OutletError signed under registration R1 (at event-log id E1). Re-register the outlet (catalog changed) after 24h, producing registration R2 (event-log id E2). Re-register again after another 24h, producing R3, then R4, then R5. The LRU now holds R2/R3/R4/R5 (R1 was evicted at capacity). Asserting: the R1-signed envelope with registration_event_id=E1 is rejected with UnregisteredMessageKey (evicted); a fresh envelope signed under R3 with registration_event_id=E3 resolves successfully via the LRU.",
+        "cargo test -p scp-runtime --features scp-runtime/testing succeeds"
       ],
       "actionItems": [
-        "Add interface_base_cost_minimum field to ContextParams and register in §9.18.B",
-        "Add ikm_a_sig and ikm_b_sig fields to InterfaceEstablished event struct",
-        "Implement derive_accept_time_ikm, sign_ikm_commitment, verify_ikm_commitment",
-        "Rewrite AcceptOutletInterface handler to include IKM signing and verification before event-log append",
-        "Implement derive_hop_salt_from_committed_ikms (HKDF step); add cross-SDK byte-equality conformance fixture",
-        "Implement InterfaceSaltRotated event emission in the admin_removal governance handler",
-        "Implement cluster-aware quadratic fee computation with all three predicates (context-id, creator-did, admin-set intersection)",
-        "Capture creator_did and admin_set into the InterfaceEstablished event metadata at accept-time",
-        "Add InsufficientFunds-at-governance-approval path with slug protocol.interface-spam-cost",
-        "Add adversarial unit tests for all BH5 findings: IKM sig tampering (BH5-m4), admin-removal rotation (BH5-s1), cluster detection (BH5-M3)"
+        "Refactor OutletError::new signature to options-object / keyword-only (OutletErrorNewOpts struct with typed newtypes per OUT-031)",
+        "Implement the UnregisteredMessageKey rejection in OutletError::new",
+        "Emit registration_event_id: [u8; 32] unconditionally on every OutletError envelope",
+        "Implement OutletMessageKeyLru with capacity 4 and oldest-first eviction; wire into receiver-side verification path",
+        "Add the per-context distinctness test and the cross-registration LRU regression test"
+      ],
+      "blockedBy": [
+        "SCP-OUT-041a"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.4 Outlet Error Taxonomy"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "### 9.18.A Protocol Invariants"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-outlet-redesign.md",
+          "section": "### Round 5 adjustments (April 2026)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-041c",
+      "title": "CatalogRotationTooFrequent validator using event_log.append_time_for + back-dating regression test",
+      "gate": "gate-round5-fixes",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/manager/outlets.rs"
+      ],
+      "description": "Implement the catalog-rotation dwell-time validator per §5.4.4 round-5 using the event-log append time (not the operator-declared registered_at field). Rejects any registration update whose message_catalog differs from the prior registration AND whose event-log append time is within 24h (86400s) of the prior registration's event-log append time.",
+      "acceptanceCriteria": [
+        "CatalogRotationTooFrequent enforcement: on a registration update whose message_catalog differs from the prior registration, the validator compares event_log.append_time_for(new_registration_id) against event_log.append_time_for(prior_registration_id); if the delta is < 24h (86400s), the registration is rejected with OutletErrorClass::Protocol::CatalogRotationTooFrequent (code SCP-TOOL-6100, slug protocol.catalog-rotation-too-frequent)",
+        "Unit test: register outlet with catalog C0 at event-log time T0; attempt to update to catalog C1 at event-log time T0 + 23.99h → rejected with CatalogRotationTooFrequent; re-attempt at T0 + 24.01h → accepted",
+        "Operator-clock-bypass regression test: attacker attempts to back-date registered_at on the update to T0 - 12h (making it appear as if 36h have passed by registered_at comparison); the rejection uses event_log.append_time_for, NOT registered_at, so the bypass fails — the update is still rejected with CatalogRotationTooFrequent because the actual event-log append happens at T0 + 12h which is < 24h after T0",
+        "cargo test -p scp-runtime succeeds"
+      ],
+      "actionItems": [
+        "Implement CatalogRotationTooFrequent in the registration-update validator in manager/outlets.rs using event_log.append_time_for",
+        "Add the back-dating regression test"
+      ],
+      "blockedBy": [
+        "SCP-OUT-041a"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.4 Outlet Error Taxonomy"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-outlet-redesign.md",
+          "section": "### Round 5 adjustments (April 2026)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-041d",
+      "title": "FFI surfaces + SDK wrappers (4×4) + conformance fixture + ratchet bump for OutletError::new + LRU + CatalogRotationTooFrequent",
+      "gate": "gate-round5-fixes",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-ffi/src/outlets.rs",
+        "crates/scp-ffi/napi/src/outlets.rs",
+        "crates/scp-ffi/uniffi/src/scp.udl",
+        "crates/scp-ffi/uniffi/src/scp.rs",
+        "crates/scp-ffi/wasm/src/outlets.rs",
+        "bindings/python/scp_sdk/outlets.py",
+        "bindings/python/scp_sdk/errors.py",
+        "bindings/typescript/src/outlets.ts",
+        "bindings/typescript/src/errors.ts",
+        "bindings/swift/Sources/SCP/Outlets.swift",
+        "bindings/swift/Sources/SCP/Errors.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Outlets.kt",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Errors.kt",
+        "tests/conformance/vectors/outlet_message_hmac_fixtures.json",
+        "crates/scp-ffi/bridge_ratchet_baseline.json"
+      ],
+      "description": "Surface the OUT-041a/b/c runtime functionality through all four FFI bridges (PyO3, NAPI, UniFFI, WASM) and all four language SDKs (Python, TypeScript, Swift, Kotlin). Each bridge exposes outlet_error_new with the options-object signature; each SDK exposes OutletError.new with language-idiomatic options; each SDK integrates the CatalogRotationTooFrequent rejection path. Add a shared conformance fixture (outlet_message_hmac_fixtures.json) that round-trips (outlet_id, catalog_key) pairs across all four bridges producing byte-identical wire_message output. Regenerate bridge_ratchet_baseline.json additively.",
+      "acceptanceCriteria": [
+        "SDK surface: Python OutletError.new(*, outlet_id=..., catalog_key=..., class_=..., ...) calls FFI outlet_error_new (PyO3) which HMACs at the bridge boundary; the SDK never receives the raw outlet_message_key. grep -c 'outlet_error_new' bindings/python/scp_sdk/ returns >= 1",
+        "SDK surface: TypeScript OutletError.new({ outletId, catalogKey, class, ... }) calls outletErrorNew NAPI export; bun test asserts wire_message is a 32-byte opaque value, not the catalog_key string",
+        "SDK surface: Swift OutletError.new(outletId:catalogKey:class:...) calls the UniFFI binding; swift test asserts construction; Swift retains labeled-argument form per API MAJOR 22",
+        "SDK surface: Kotlin OutletError.new(opts: OutletErrorNewOptions) where OutletErrorNewOptions is a builder carrying outletId/catalogKey/class; gradle test asserts construction",
+        "FFI bridges: PyO3 outlet_error_new, NAPI outletErrorNew, UniFFI outlet_error_new (UDL), WASM outletErrorNew — all four bridges expose the catalog_key -> wire_message HMAC at the FFI boundary with the options-object signature",
+        "FFI bridges: all four bridges expose outlet_catalog_rotation_validator (check-only path) that returns CatalogRotationTooFrequent typed error when the dwell-time rule (OUT-041c) fails; SDK wrappers surface this as a typed OutletProtocolError subclass",
+        "Per-SDK test: Python/TypeScript/Swift/Kotlin each verify that registering an outlet with catalog C0 at T0, then updating to catalog C1 at T0 + 23.99h (simulated via the test event log) produces CatalogRotationTooFrequent; T0 + 24.01h succeeds",
+        "Conformance fixture: tests/conformance/vectors/outlet_message_hmac_fixtures.json — one fixture per (outlet_id, catalog_key) pair (minimum 10 fixtures covering varied outlet_ids and catalog sizes); every bridge produces byte-identical wire_message for the same (outlet_message_key, catalog_key) input",
+        "bridge_ratchet_baseline.json is regenerated additively (new exports only — outlet_error_new, outlet_catalog_rotation_validator); CI ratchet passes",
+        "cargo test --workspace --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing succeeds",
+        "python3.12 -m pytest bindings/python/tests/test_outlet_error_new.py succeeds; bun test bindings/typescript/tests/outlet-error-new.test.ts succeeds; swift test bindings/swift/Tests/SCPTests/OutletErrorTests.swift succeeds; ./gradlew test for OutletErrorTests passes"
+      ],
+      "actionItems": [
+        "Add all four bridge exports (PyO3, NAPI, UniFFI, WASM) for outlet_error_new and outlet_catalog_rotation_validator",
+        "Add SDK wrappers in all four language SDKs",
+        "Add per-SDK unit tests for OutletError.new options-object form and CatalogRotationTooFrequent rejection",
+        "Create tests/conformance/vectors/outlet_message_hmac_fixtures.json with ≥ 10 cross-bridge fixtures",
+        "Regenerate bridge_ratchet_baseline.json (additive only — new exports)"
+      ],
+      "blockedBy": [
+        "SCP-OUT-041a",
+        "SCP-OUT-041b",
+        "SCP-OUT-041c"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.4 Outlet Error Taxonomy"
+        },
+        {
+          "file": ".docs/specs/05-contexts.md",
+          "section": "### 5.4.1 Outlet Registration Wire Format"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-outlet-redesign.md",
+          "section": "### Round 5 adjustments (April 2026)"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-outlet-redesign.md",
+          "section": "### Round 6 adjustments (April 2026)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-042a",
+      "title": "InterfaceEstablished event struct fields — epoch_a/b, ikm_a/b, ikm_a_sig/b_sig, creator_did, admin_set, capability_holder_set — serde + event-log round-trip",
+      "gate": "gate-round5-fixes",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/interface.rs",
+        "crates/scp-event-log/src/lib.rs"
+      ],
+      "description": "Add the round-5 + round-6 field set to the InterfaceEstablished event struct. Includes epoch_a/epoch_b (u64), ikm_a/ikm_b ([u8; 32]), ikm_a_sig/ikm_b_sig (Ed25519Signature), creator_did (DID), admin_set (Vec<DID>), and capability_holder_set (Vec<DID>) — the last field is the round-6 cluster-detection 4th predicate input. All fields persist verbatim in the event log. This sub-story is the schema-only commit; crypto derivation + signing goes in OUT-042b; governance wiring + admin-removal + atomic rotation go in OUT-042c; ContextParams + cluster detection + quadratic fee go in OUT-042d.",
+      "acceptanceCriteria": [
+        "struct InterfaceEstablished has fields epoch_a: u64, epoch_b: u64, ikm_a: [u8; 32], ikm_a_sig: Ed25519Signature, ikm_b: [u8; 32], ikm_b_sig: Ed25519Signature, creator_did: DID, admin_set: Vec<DID>, capability_holder_set: Vec<DID> — all nine fields present",
+        "Serde derives Serialize/Deserialize on InterfaceEstablished; MessagePack round-trip preserves every field byte-for-byte",
+        "Event-log round-trip: InterfaceEstablished appended to a scp-event-log instance and re-read via EventLog::get returns byte-identical bytes; grep -n 'capability_holder_set' crates/scp-protocol/src/context/interface.rs returns >= 1",
+        "Cluster-detection metadata capture (pre-requisite): creator_did and admin_set fields are captured at InterfaceEstablished construction time (the actual capture logic is wired in OUT-042d); the struct merely declares the fields and their types here",
+        "capability_holder_set is ordered (implementation: sort by DID string at construction) so round-trip yields deterministic bytes",
+        "cargo test -p scp-protocol succeeds; cargo test -p scp-event-log succeeds"
+      ],
+      "actionItems": [
+        "Add epoch_a/epoch_b, ikm_a_sig/ikm_b_sig, creator_did, admin_set, capability_holder_set to InterfaceEstablished struct",
+        "Ensure serde derives round-trip all fields",
+        "Add unit tests for MessagePack round-trip and event-log round-trip"
       ],
       "blockedBy": [
         "SCP-OUT-002"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "#### 6.2.0.1 Bidirectional Consent Protocol"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-outlet-redesign.md",
+          "section": "### Round 6 adjustments (April 2026)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-042b",
+      "title": "IkmCommitment crypto — derive_accept_time + sign + verify + derive_hop_salt + AcceptOutletInterface rewiring + adversarial sig/replay tests + SCP-OUTLET-IKM-COMMITMENT-V1: + SCP-OUTLET-IKM-ROTATE-V1: registration",
+      "gate": "gate-round5-fixes",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/context/interface/ikm_commitment.rs",
+        "crates/scp-runtime/src/context/interface/hop_salt.rs",
+        "crates/scp-runtime/src/context/manager/interface.rs"
+      ],
+      "description": "Implement IkmCommitment struct encapsulation per OUT-031 round-6 API MINOR, the accept-time IKM derivation (peer-suffixed MLS exporter per §6.2.0.1 Step 1), the SCP-OUTLET-IKM-COMMITMENT-V1: sign/verify, and the hop_salt HKDF derivation (Step 2). Also registers the SCP-OUTLET-IKM-ROTATE-V1: domain separator (consumed in OUT-042c). Rewires AcceptOutletInterface to use the new IkmCommitment API, verifies both sides' signatures BEFORE event-log append, and rejects on signature failure with authorization.ikm-signature-invalid.",
+      "acceptanceCriteria": [
+        "struct IkmCommitment { pub ikm: [u8; 32], pub context_a_id: ContextId, pub context_b_id: ContextId, pub epoch: u64 } in crates/scp-runtime/src/context/interface/ikm_commitment.rs",
+        "Constructor: IkmCommitment::derive_accept_time(mls: &Mls, local_id: &ContextId, peer_id: &ContextId, epoch: u64) -> Self computes MLS_EXPORTER('scp-context-hop-salt-v1:' || peer_id.as_bytes(), b'', 32) on the current MLS epoch and returns the IkmCommitment with canonical-ordered (context_a_id, context_b_id) — byte-for-byte matching §6.2.0.1 Step 1",
+        "Method: IkmCommitment::sign(&self, signer: &SigningKey) -> Ed25519Signature computes SHA-256('SCP-OUTLET-IKM-COMMITMENT-V1:' || len_be32(context_a_id) || context_a_id || len_be32(context_b_id) || context_b_id || epoch_be || ikm) under the admin's #active key",
+        "Method: IkmCommitment::verify(&self, verifying_key: &VerifyingKey, sig: &Ed25519Signature) -> Result<(), IkmSignatureError>",
+        "Function derive_hop_salt_from_committed_ikms(ikm_a: &[u8; 32], ikm_b: &[u8; 32], context_a_id: &ContextId, context_b_id: &ContextId) -> [u8; 32] implements §6.2.0.1 Step 2 — canonical ordering + HKDF-SHA-256 with info = 'SCP-CONTEXT-HOP-SALT-V1:' || canonical_context_pair",
+        "Cross-SDK byte-equality conformance test: derive_hop_salt_from_committed_ikms produces identical output across all four bridges for identical inputs",
+        "AcceptOutletInterface handler: uses IkmCommitment::derive_accept_time + sign to produce ikm_local + ikm_local_sig; assembles InterfaceEstablished with (epoch_a, epoch_b, ikm_a, ikm_a_sig, ikm_b, ikm_b_sig). Both sides' signatures are verified via IkmCommitment::verify BEFORE the event is appended — a failed verification rejects the establishment entirely with OutletErrorClass::Authorization slug authorization.ikm-signature-invalid (SCP-TOOL-6110) and the event does NOT land in either event log",
+        "Unit test: a tampered ikm_a_sig (last byte flipped) rejects at event-log append time with authorization.ikm-signature-invalid",
+        "Unit test: an ikm_a value from interface A↔B with A's signature does NOT verify when replayed as the ikm in an A↔C InterfaceEstablished event — the context-id pair is in the preimage, so a signature for A↔B cannot be reused for A↔C",
+        "Struct-encapsulation swap-bug regression test: constructing IkmCommitment with context_a_id/context_b_id swapped produces byte-identical preimage to the unswapped form (internal canonical_pair() orders them lexicographically); closes the API MINOR OUT-031 round-6 swap-risk",
+        "Domain separator SCP-OUTLET-IKM-COMMITMENT-V1: registered in .docs/specs/09-security-model.md §9.18.2; grep -c '\"SCP-OUTLET-IKM-COMMITMENT-V1:\"' .docs/specs/09-security-model.md returns >= 1",
+        "Domain separator SCP-OUTLET-IKM-ROTATE-V1: registered in .docs/specs/09-security-model.md §9.18.2 (this story registers the separator; the ROTATE-V1 preimage is exercised by OUT-042c); grep -c '\"SCP-OUTLET-IKM-ROTATE-V1:\"' .docs/specs/09-security-model.md returns >= 1",
+        "cargo test -p scp-runtime succeeds"
+      ],
+      "actionItems": [
+        "Implement IkmCommitment struct with derive_accept_time, sign, verify methods",
+        "Implement derive_hop_salt_from_committed_ikms",
+        "Rewire AcceptOutletInterface handler to use IkmCommitment API with signature verification before event-log append",
+        "Add adversarial unit tests: IKM sig tampering, cross-interface replay, struct-encapsulation swap-bug regression",
+        "Verify both SCP-OUTLET-IKM-COMMITMENT-V1: and SCP-OUTLET-IKM-ROTATE-V1: are registered in §9.18.2 (the spec commit already did this — this story ensures the runtime uses the correct separators)"
+      ],
+      "blockedBy": [
+        "SCP-OUT-042a"
       ],
       "sources": [
         {
@@ -2656,12 +2819,134 @@
           "section": "#### 9.18.2 Domain Separators"
         },
         {
+          "file": ".docs/adrs/ADR-049-outlet-redesign.md",
+          "section": "### Round 5 adjustments (April 2026)"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-outlet-redesign.md",
+          "section": "### Round 6 adjustments (April 2026)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-042c",
+      "title": "InterfaceSaltRotated emission from admin-removal governance handler — atomic RemoveMember+rotation + Frozen state enforcement + SCP-OUTLET-IKM-ROTATE-V1: preimage + removal_event_id binding + pipeline_wiring assertion",
+      "gate": "gate-round5-fixes",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-runtime/src/governance/admin_removal.rs",
+        "crates/scp-runtime/src/context/manager/interface.rs",
+        "crates/scp-runtime/src/context/interface/hop_salt.rs",
+        "crates/scp-testing/src/pipeline_wiring.rs"
+      ],
+      "description": "Implement the atomic admin-removal + InterfaceSaltRotated emission per §6.2.0.1 round-6 with the three-state hop_salt invariant (PreRotation / Frozen / PostRotation), the SCP-OUTLET-IKM-ROTATE-V1: signature preimage, the removal_event_id binding, and the peer-side Frozen response. Adds a pipeline_wiring.rs assertion forbidding a RemoveMember-admin handler from terminating without emitting the induced rotations. Registers the new slug authorization.salt-rotation-unjustified (SCP-TOOL-6115).",
+      "acceptanceCriteria": [
+        "struct InterfaceSaltRotated has fields interface_id: [u8; 32], new_ikm_local: [u8; 32], new_ikm_local_sig: Ed25519Signature, epoch_local: u64, trigger_removal_did: DID, removal_event_id: [u8; 32] — all six fields persisted in the event log",
+        "Function sign_interface_rotation(signer: &SigningKey, interface_id: &[u8; 32], context_local_id: &ContextId, context_peer_id: &ContextId, epoch_local: u64, new_ikm_local: &[u8; 32], trigger_removal_did: &DID, removal_event_id: &[u8; 32]) -> Ed25519Signature computes SHA-256('SCP-OUTLET-IKM-ROTATE-V1:' || len_be32(interface_id) || interface_id || len_be32(context_local_id) || context_local_id || len_be32(context_peer_id) || context_peer_id || epoch_local_be || new_ikm_local || len_be32(trigger_removal_did) || trigger_removal_did || len_be32(removal_event_id) || removal_event_id)",
+        "Atomic admin-removal: RemoveMember governance action carries a required induced_rotations: Vec<InterfaceSaltRotated> field. On admin-role RemoveMember proposal, the governance engine MUST populate induced_rotations with one entry per active interface the context holds. A RemoveMember-admin proposal whose induced_rotations field is empty when active interfaces exist is a governance-action validation failure",
+        "Commit atomicity: RemoveMember and every InterfaceSaltRotated in induced_rotations are appended as sibling entries within the same MLS commit batch. The rotations cite the RemoveMember's assigned event_id as their removal_event_id and share the commit's MLS epoch counter",
+        "hop_salt state machine: per-interface state is one of {PreRotation, Frozen, PostRotation}. The state transitions from PreRotation → Frozen on RemoveMember proposal, Frozen → PostRotation on InterfaceSaltRotated commit. No OutletError envelope is emitted on affected interfaces while the state is Frozen",
+        "Outbound queue discipline: during the Frozen window, new OutletError emissions on affected interfaces are buffered. On Frozen → PostRotation transition, buffered envelopes are emitted under the new hop_salt. An envelope exceeding ContextParams::outlet_error_buffer_max_secs (from OUT-042d) is dropped with governance.remove-member-buffer-overflow audit-log entry and the governance-removal timeout escalates",
+        "Verifier rule: an InterfaceSaltRotated is rejected at event-log append time with authorization.salt-rotation-unjustified (SCP-TOOL-6115) when (i) new_ikm_local_sig fails verification against the signing admin's #active key at epoch_local using the SCP-OUTLET-IKM-ROTATE-V1: preimage, (ii) removal_event_id does not reference an event whose body is an admin-removal action targeting trigger_removal_did and whose epoch is equal to or one less than epoch_local, or (iii) the removal_event_id has already been cited by a prior InterfaceSaltRotated on the same interface_id",
+        "Peer-side semantics: on shared-member-bridged receipt of InterfaceSaltRotated, the peer enters the Frozen state for the affected interface, proposes its own reciprocal InterfaceSaltRotated (with its own fresh IKM signed under the SAME SCP-OUTLET-IKM-ROTATE-V1: preimage, citing the peer-local AdminRemovalMirror event_id), and exits Frozen when its own rotation commits",
+        "Unit test: admin removal triggers InterfaceSaltRotated on 3 active interfaces simultaneously; all three events are appended to the event log in the same MLS commit batch; peer contexts respond with their own rotation events; hop_salt for each interface is now derived from the new IKM pair; a HMAC(old_hop_salt, raw_context_id) computation does NOT match the new wire pseudonyms",
+        "Unit test: InterfaceSaltRotated.trigger_removal_did and removal_event_id both reference the removed admin — the rotation trail is doubly verifiable against the governance event that caused it",
+        "Unit test: a rotation whose removal_event_id does NOT reference a prior RemoveMember event in the same event log is rejected with authorization.salt-rotation-unjustified",
+        "Unit test: replaying the same removal_event_id on a second rotation on the same interface_id is rejected with authorization.salt-rotation-unjustified",
+        "Unit test (TOCTOU closure): between RemoveMember proposal and commit, no OutletError is emitted on affected interfaces — a test artificially wedges the commit process to observe the Frozen window and asserts no envelopes emit; once the commit completes, buffered envelopes emit under the new hop_salt",
+        "pipeline_wiring assertion: crates/scp-testing/src/pipeline_wiring.rs carries an assertion `admin_removal_emits_induced_rotations` that forbids a governance handler emitting RemoveMember with admin-role from terminating without the matching InterfaceSaltRotated batch. Assertion is active (not #[ignore])",
+        "cargo test -p scp-runtime --features scp-runtime/testing succeeds; pipeline_wiring CI check passes"
+      ],
+      "actionItems": [
+        "Implement InterfaceSaltRotated struct with removal_event_id field",
+        "Implement sign_interface_rotation function using SCP-OUTLET-IKM-ROTATE-V1: preimage",
+        "Add induced_rotations: Vec<InterfaceSaltRotated> to RemoveMember governance action; populate at proposal time",
+        "Implement commit-batch atomicity in governance handler: RemoveMember + induced_rotations in same MLS commit",
+        "Implement hop_salt state machine {PreRotation, Frozen, PostRotation} on interface state",
+        "Implement Frozen-window outbound queue (buffers OutletError emissions; flushes on PostRotation; drops at outlet_error_buffer_max_secs)",
+        "Implement verifier rule rejecting rotations lacking removal_event_id binding with authorization.salt-rotation-unjustified",
+        "Implement peer-side Frozen response (reciprocal InterfaceSaltRotated from AdminRemovalMirror event)",
+        "Add pipeline_wiring.rs assertion admin_removal_emits_induced_rotations (active, not #[ignore])",
+        "Add all adversarial unit tests (sig tampering, removal_event_id missing, replay, TOCTOU)"
+      ],
+      "blockedBy": [
+        "SCP-OUT-042a",
+        "SCP-OUT-042b"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "#### 6.2.0.1 Bidirectional Consent Protocol"
+        },
+        {
+          "file": ".docs/specs/09-security-model.md",
+          "section": "#### 9.18.2 Domain Separators"
+        },
+        {
+          "file": ".docs/adrs/ADR-049-outlet-redesign.md",
+          "section": "### Round 6 adjustments (April 2026)"
+        }
+      ],
+      "details": {}
+    },
+    {
+      "id": "SCP-OUT-042d",
+      "title": "ContextParams::base_cost_scale + outlet_error_buffer_max_secs + cluster_match_count with FOUR predicates + quadratic fee + protocol.interface-spam-cost rejection + population-weighted base cost",
+      "gate": "gate-round5-fixes",
+      "priority": "P0",
+      "severity": "critical",
+      "status": "pending",
+      "files": [
+        "crates/scp-protocol/src/context/params.rs",
+        "crates/scp-runtime/src/context/interface/cluster_detection.rs",
+        "crates/scp-runtime/src/context/manager/interface.rs"
+      ],
+      "description": "Add ContextParams::base_cost_scale (new §9.18.B param replacing the round-5 flat interface_base_cost_minimum) and ContextParams::outlet_error_buffer_max_secs (round-6). Implement cluster_match_count with FOUR predicates per §6.2.0.1 round-6 (context_id, creator_did, admin_set intersection, capability_holder_set intersection). Implement the population-weighted quadratic interface-spam fee: `fee = max(base_cost, interface_base_cost_floor(ctx)) × (k+1)²` where `interface_base_cost_floor(ctx) = max(currency_atomic_unit, ceil(log2(ctx.member_count + 1)) × ContextParams::base_cost_scale)`. Add the protocol.interface-spam-cost rejection at governance approval time.",
+      "acceptanceCriteria": [
+        "ContextParams has field base_cost_scale: Amount — registered in §9.18.B Configurable Parameters (default: currency-dependent minimum meaningful fee; range [currency_atomic_unit, 1_000 × currency_atomic_unit]). grep -n 'base_cost_scale' crates/scp-protocol/src/context/params.rs returns >= 1. The round-5 flat interface_base_cost_minimum is REMOVED from ContextParams (replaced entirely by base_cost_scale + population weight)",
+        "ContextParams has field outlet_error_buffer_max_secs: u32 — registered in §9.18.B (default 30, range [5, 300]). grep -n 'outlet_error_buffer_max_secs' crates/scp-protocol/src/context/params.rs returns >= 1",
+        "Function compute_cluster_match_count(rolling_window_events: &[InterfaceEstablished], candidate: &InterfaceCandidate) -> u32 in cluster_detection.rs iterates the prior interfaces in a 24h rolling window and increments k by 1 for each prior where ANY of FOUR predicates holds: (1) P_i.context_id == candidate.context_id, (2) P_i.creator_did == candidate.creator_did, (3) P_i.admin_set ∩ candidate.admin_set != empty, (4) P_i.capability_holder_set ∩ candidate.capability_holder_set != empty",
+        "Function interface_base_cost_floor(ctx: &Context) -> Amount computes max(currency_atomic_unit(ctx.currency), ceil(log2(ctx.member_count + 1) as u32) as Amount × ctx.params.base_cost_scale)",
+        "Function compute_interface_fee(ctx: &Context, base_cost: Amount, k: u32) -> Amount computes max(base_cost, interface_base_cost_floor(ctx)).checked_mul((k + 1).pow(2) as Amount) with overflow returning Amount::MAX; base_cost is read from context economic policy (§19.3)",
+        "Unit test: 0 prior interfaces → fee = base_cost × 1² = max(base_cost, floor) × 1; 4 prior interfaces matching any predicate → fee = max(base_cost, floor) × 5² = 25 × max(base_cost, floor)",
+        "Unit test: predicate 4 (capability_holder_set intersection) closure — attacker rotates creator_did AND admin_set per peer context but reuses a stable long-lived non-admin DID holding outlet:offer:* capability; compute_cluster_match_count catches this via predicate 4 for every such prior interface",
+        "Unit test: population-weighted floor — a 1-member context has interface_base_cost_floor == ceil(log2(2)) × base_cost_scale = 1 × base_cost_scale; a 10-member context has 4 × base_cost_scale; a 500-member context has 9 × base_cost_scale",
+        "Unit test: currency_atomic_unit lower bound — a context with base_cost_scale = 0 (degenerate case where the operator-declared scale is below the atomic unit) falls back to currency_atomic_unit, still strictly > 0, closing the trivial base_cost = 0 bypass",
+        "Unit test: creator_did predicate closure — a peer context whose creator_did matches a prior peer's creator_did counts toward k even if admin_set differs",
+        "Unit test: attacker spins up 10 disjoint peer contexts sharing 1 admin DID with A's prior peer, verifies k counts all 10 via predicate (3); fee = max(base_cost, floor) × 11²",
+        "InsufficientFunds-at-governance-approval path: if compute_interface_fee exceeds the proposer's balance, the AcceptOutletInterface is rejected at governance approval with OutletErrorClass::Economic::InsufficientFunds bearing slug protocol.interface-spam-cost (SCP-TOOL-6150) — rejection happens at approval time, not at hop time",
+        "Cluster-detection metadata capture: the AcceptOutletInterface handler captures candidate's context_id, creator_did, admin_set, and capability_holder_set at interface-acceptance time into the InterfaceEstablished event metadata (uses the struct fields from OUT-042a); grep -n 'capability_holder_set' crates/scp-runtime/src/context/manager/interface.rs returns >= 2",
+        "capability_holder_set composition: the runtime enumerates DIDs in the candidate peer context holding ANY of {outlet:offer:*, outlet:query:*, outlet:call:*} capability at interface-acceptance time, sorted by DID string for determinism",
+        "Regression test: a RemoveMember-admin proposal with empty induced_rotations when active interfaces exist fails governance-action validation; this depends on the OUT-042c state machine but the validator check lives in this story for cohesion with the quadratic-fee validator (both run in the interface-governance path)",
+        "cargo test -p scp-runtime succeeds"
+      ],
+      "actionItems": [
+        "Add base_cost_scale and outlet_error_buffer_max_secs fields to ContextParams; register in §9.18.B (already registered in the spec commit — this story ensures the Rust struct matches)",
+        "Remove the round-5 interface_base_cost_minimum field from ContextParams (if present from earlier work); confirm no call sites",
+        "Implement compute_cluster_match_count with all four predicates",
+        "Implement interface_base_cost_floor (population-weighted) and compute_interface_fee (quadratic)",
+        "Wire the fee into the AcceptOutletInterface governance-approval path; emit protocol.interface-spam-cost rejection on InsufficientFunds",
+        "Populate capability_holder_set at InterfaceEstablished construction (enumerate DIDs holding outlet:offer:*/outlet:query:*/outlet:call:* at accept-time)",
+        "Add the four-predicate adversarial unit tests + the population-weighted floor tests + the currency_atomic_unit lower-bound test"
+      ],
+      "blockedBy": [
+        "SCP-OUT-042a"
+      ],
+      "sources": [
+        {
+          "file": ".docs/specs/06-cross-context-communication.md",
+          "section": "#### 6.2.0.1 Bidirectional Consent Protocol"
+        },
+        {
           "file": ".docs/specs/09-security-model.md",
           "section": "### 9.18.B Configurable Parameters"
         },
         {
           "file": ".docs/adrs/ADR-049-outlet-redesign.md",
-          "section": "### Round 5 adjustments (April 2026)"
+          "section": "### Round 6 adjustments (April 2026)"
         }
       ],
       "details": {}
