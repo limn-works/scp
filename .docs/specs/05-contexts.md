@@ -318,7 +318,7 @@ OutletError {
 }
 ```
 
-Tags `7`, `9`, and `10` are **reserved for forward-compatible evolution** and are not used in this version of the envelope. They were drafted (`related_code`, `i18n_key`, `trace_id`) and dropped before merge — the cross-reference use case is served by `source_chain.wrapped_code`; localization is an SDK-layer concern that does not belong on the wire; and telemetry `trace_id` is not a protocol-level field (see discussion [#1698](https://github.com/limn-works/scp/discussions/1698)). Tag `11` carries the `pad_nonce: [u8; 16]` field introduced below for trail-length padding verification — emitted unconditionally (no Option wrapper) on every envelope to eliminate the presence-vs-absence visibility oracle. Any future extension MUST use tags `12+` and MUST round-trip through the `_unknown_fields` forward-compat slot so old SDKs that see the new tag preserve it without interpretation.
+Tags `7`, `9`, and `10` are **reserved for forward-compatible evolution** and are not used in this version of the envelope. They were drafted (`related_code`, `i18n_key`, `trace_id`) and dropped before merge — the cross-reference use case is served by `source_chain.wrapped_code`; localization is an SDK-layer concern that does not belong on the wire; and telemetry `trace_id` is not a protocol-level field (see discussion [#1698](https://github.com/limn-works/scp/discussions/1698)). Tag `11` carries the `pad_nonce: [u8; 16]` field introduced below for trail-length padding verification — emitted unconditionally (no Option wrapper) on every envelope to eliminate the presence-vs-absence visibility oracle. Tag `12` carries the `registration_event_id: [u8; 32]` field introduced below for per-registration message-key lookup across re-registration windows — emitted unconditionally. Any future extension MUST use tags `13+` and MUST round-trip through the `_unknown_fields` forward-compat slot so old SDKs that see the new tag preserve it without interpretation.
 
 ```
 OutletErrorClass {
@@ -350,29 +350,44 @@ ContextHop {
 }
 ```
 
-`OutletError` carries one additional field outside the `ContextHop` itself, used to derive trail-padding entries and — in the un-padded case — emitted unconditionally to defeat the presence-vs-absence visibility oracle:
+`OutletError` carries two additional fields outside the `ContextHop` itself: `pad_nonce` (used to derive trail-padding entries, and — in the un-padded case — emitted unconditionally to defeat the presence-vs-absence visibility oracle) and `registration_event_id` (used by the receiver to look up the per-outlet HMAC key that was in force for the outlet registration under which this envelope was signed, so in-flight envelopes from a prior registration do not DoS themselves at lookup time when the outlet is re-registered mid-flight):
 
 ```
 OutletError {
-  ...                                  // tags 1..8 as above
-  pad_nonce:   [u8; 16],               // tag 11; ALWAYS present on every error envelope (no
-                                       // Option wrapper). Fresh-per-envelope CSPRNG-sampled
-                                       // nonce that keys the HMAC used to derive pad-slot
-                                       // `context_id` values when source_chain is padded.
-                                       // For un-padded envelopes the field is emitted but
-                                       // unused on decode (the receiver's `k == max_padded_trail_depth`
-                                       // check determines whether padding is present; the
-                                       // nonce is ignored when k matches the true length).
-                                       // Emitting unconditionally closes the visibility
-                                       // oracle where "pad_nonce absent" leaked that the
-                                       // caller had full visibility into every hop.
+  ...                                     // tags 1..8 as above
+  pad_nonce:             [u8; 16],        // tag 11; ALWAYS present on every error envelope (no
+                                          // Option wrapper). Fresh-per-envelope CSPRNG-sampled
+                                          // nonce that keys the HMAC used to derive pad-slot
+                                          // `context_id` values when source_chain is padded.
+                                          // For un-padded envelopes the field is emitted but
+                                          // unused on decode (the receiver's `k == max_padded_trail_depth`
+                                          // check determines whether padding is present; the
+                                          // nonce is ignored when k matches the true length).
+                                          // Emitting unconditionally closes the visibility
+                                          // oracle where "pad_nonce absent" leaked that the
+                                          // caller had full visibility into every hop.
+  registration_event_id: [u8; 32],        // tag 12; ALWAYS present. The event-log id of the
+                                          // OutletRegistration event under which the emitting
+                                          // outlet's outlet_message_key was derived and pinned.
+                                          // The receiver looks up the matching outlet_message_key
+                                          // in its per-outlet LRU (`registration_event_id →
+                                          // outlet_message_key`, capacity N=4 per outlet, oldest-
+                                          // first eviction) and HMAC-verifies the `message` field
+                                          // under that key. Closes the in-flight-error DoS surface
+                                          // at re-registration: an envelope signed under the prior
+                                          // outlet_message_key still resolves at the receiver for
+                                          // as long as the prior registration fits within the LRU
+                                          // window, rather than being silently rejected as
+                                          // `UnregisteredMessageKey`. The field is always emitted
+                                          // (every OutletError references the registration it was
+                                          // emitted under), so there is no presence-oracle.
 }
 ```
 
 **Code range.** `6100..=6199` within the `SCP-TOOL-` prefix, sub-allocated as follows. Distinct runtime conditions within a code share one code and differ by `slug` — the code set is intentionally compact (one to two codes per class, ~15 codes total) so the full taxonomy is memorable and the wire form is not a sprawling enumeration.
 
 - `6100-6109` — Protocol class (query/kind/amplification violations; schema/cache violations; catalog-rotation dwell-time; stream-lifecycle violations; session uniqueness)
-- `6110-6119` — Authorization class (UCAN, caveat, amplification, missing outlet, adapter denial, mid-stream revocation, credit-stream mismatch, IKM signature invalid, mask-width violation, mixed-stem/unspecified/stem-mismatch origin_kind)
+- `6110-6119` — Authorization class (UCAN, caveat, amplification, missing outlet, adapter denial, mid-stream revocation, credit-stream mismatch, IKM signature invalid, salt-rotation unjustified, mask-width violation, mixed-stem/unspecified/stem-mismatch origin_kind)
 - `6120-6129` — Input class (schema, size, non-serializable)
 - `6130-6139` — Execution class (handler panic, timeout, credit exhaustion, stream gap, cancel-ack-timeout)
 - `6140-6149` — Output class (schema, size, non-serializable)
@@ -392,6 +407,7 @@ OutletError {
 | `authorization.credit-stream-mismatch` | `SCP-TOOL-6110` | Authorization | §5.4.5 credit-grant stream identity |
 | `authorization.revoked-mid-stream` | `SCP-TOOL-6110` | Authorization | §5.4.5 revocation re-check |
 | `authorization.ikm-signature-invalid` | `SCP-TOOL-6110` | Authorization | §6.2.0.1 committed-IKM signature |
+| `authorization.salt-rotation-unjustified` | `SCP-TOOL-6115` | Authorization | §6.2.0.1 admin-removal salt-rotation trigger binding — rejects an `InterfaceSaltRotated` event whose `removal_event_id` does not reference a prior, valid, unreplayed admin-removal event within the required epoch window |
 | `attenuation.origin-kind-mixed-stem-root` | `SCP-TOOL-6114` | Authorization (attenuation sub-class) | §7.3.8 root-mint consistency |
 | `attenuation.origin-kind-stem-mismatch` | `SCP-TOOL-6114` | Authorization | §7.3.8 root-mint consistency |
 | `attenuation.origin-kind-unspecified` | `SCP-TOOL-6114` | Authorization | §7.3.8 narrow-time explicit-materialization |
@@ -494,7 +510,11 @@ Absent schemas: classes with `{}` detail have detail omitted entirely. An envelo
 
    `outlet_message_key` is pinned for the lifetime of the outlet registration (implementation_hash-locked). The key rotates ONLY when the outlet is re-registered (producing a new `registered_at`, a new `SCP-OUTLET-REGISTRATION-V2` signature, and — if MLS has advanced — a new derived key from the then-current exporter at the re-registration's acceptance epoch). A deregister-then-register sequence produces a fresh `outlet_message_key`; a silent catalog-only edit within the same outlet_id DOES trigger re-registration under the catalog-rotation discipline below, so any catalog change is paired with a fresh key.
 
-   An error whose wire-time `message` does not match any catalog entry's HMAC under the pinned `outlet_message_key` is rejected at the receiving SDK with `OutletErrorConstructionFailed::UnregisteredMessageKey`. No epoch-grace lookup window is necessary: the key is fixed at registration, not at emission, so a sender and receiver that drift one MLS epoch apart still agree on the exact same `outlet_message_key` for any outlet whose registration they both accepted.
+   **Receiver lookup across re-registration windows — `registration_event_id` and the per-outlet LRU.** At the receiver, each outlet's registration state maintains a bounded LRU keyed by `registration_event_id: [u8; 32]` with at most `MESSAGE_KEY_LRU_CAPACITY = 4` entries (protocol invariant, registered in §9.18.A). Each entry maps an outlet-registration's event-log id to the `outlet_message_key` that was pinned at that registration's acceptance. On every `OutletRegistration` acceptance, the receiver inserts `(registration_event_id, outlet_message_key)` into the LRU, evicting the oldest entry if the capacity is exceeded. When a receiver processes an `OutletError` envelope, it uses the envelope's `registration_event_id` (tag 12) to look up the matching `outlet_message_key` in the LRU; if the lookup hits, the receiver HMAC-verifies the `message` field under the matched key; if the lookup misses (the cited registration has aged out of the LRU), the receiver rejects the envelope with `OutletErrorConstructionFailed::UnregisteredMessageKey`. The LRU thus keeps up to the four most recent registrations for each outlet resolvable concurrently, covering in-flight errors that were signed under a prior registration and are still traversing cross-context hops when a re-registration lands. Four is sufficient because outlet re-registration is a governance action subject to catalog-rotation dwell (≥ 24 h between catalog-modifying re-registrations under §5.4.4 dwell rule): an envelope that is in flight longer than 4 × 24 h = 96 h is already outside any reasonable propagation window.
+
+   **Emitter rule for `registration_event_id`.** The emitting outlet always sets `OutletError.registration_event_id` equal to the event-log id of the registration whose `outlet_message_key` was used to compute `wire_message`. Because an emitting outlet always uses its currently-pinned key (and pins the key at registration acceptance), the cited `registration_event_id` is always the outlet's current registration id — not a prior one — on emission. The LRU resolution is therefore used only on cross-hop / cross-recipient propagation where a re-registration landed between emission and receipt.
+
+   An error whose wire-time `message` does not match any catalog entry's HMAC under the LRU-looked-up `outlet_message_key` is rejected at the receiving SDK with `OutletErrorConstructionFailed::UnregisteredMessageKey`. An error whose `registration_event_id` does not hit the LRU at all — because the registration has aged out — is likewise rejected with `UnregisteredMessageKey`: the receiver has no cryptographic evidence that the cited registration ever existed in the expected form, and accepting a miss on the strength of the envelope alone would admit a covert-channel surface.
 
 The catalog-plus-per-outlet-HMAC approach subsumes the earlier free-text constraint: a catalog template cannot contain input-derived bytes (the operator wrote the template at registration time, before the input existed); i18n-ready future extensions can carry per-locale variants without a wire break (the HMAC keys lookups, not content); cross-context covert signaling is structurally impossible — the wire bytes are an outlet-keyed MAC over a bounded input set of at most 256 catalog keys; and the epoch-grace wire-byte-divergence covert channel is closed because grace windows never touch the `outlet_message_key`.
 
