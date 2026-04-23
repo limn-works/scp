@@ -3222,14 +3222,13 @@ pub async fn context_create(
             // directly. The shim wraps the delegated call in the 30s
             // transport-timeout budget and is the entry point commit 12
             // will keep after `ContextManager` is deleted.
-            let manager = crate::runtime::context_manager()?;
+            // `supervisor_lenient` rather than `supervisor_expect` so the
+            // shim matches the pre-shim `context_manager()` shutdown-
+            // tolerance contract (only `suspended` is a hard error;
+            // `shutdown` warns-and-proceeds).
+            let sup = crate::runtime::supervisor_lenient()?;
             {
                 use scp_core::context::actor::commands::{CreateContextPayload, LifecycleCommand};
-                // `supervisor_lenient` rather than `supervisor_expect` so
-                // the shim matches the pre-shim `context_manager()`
-                // shutdown-tolerance contract (only `suspended` is a
-                // hard error; `shutdown` warns-and-proceeds).
-                let sup = crate::runtime::supervisor_lenient()?;
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let cmd = LifecycleCommand::CreateContext {
                     payload: Box::new(CreateContextPayload {
@@ -3252,11 +3251,12 @@ pub async fn context_create(
                     .map_err(ScpError::from)?;
             }
 
-            // Register the creator's DID as a local DID for defense-in-depth,
-            // matching NAPI's behavior.
-            manager
-                .register_local_did(identity.did.clone().into())
-                .await;
+            // Register the creator's DID as a local DID for defense-in-depth.
+            // Routes through the supervisor's direct method — the local-DID
+            // set is supervisor-wide (no per-context command target).
+            sup.register_local_did(identity.did.clone().into())
+                .await
+                .map_err(ScpError::from)?;
 
             // Register per-context UCAN validation state (revocation list,
             // nonce tracker, event log) for the UCAN pipeline.
@@ -3267,6 +3267,7 @@ pub async fn context_create(
             // single-member contexts this is a no-op (no recipients), but on
             // restored/imported contexts with existing members the announcement
             // is needed. Best-effort: if signing key is not available, skip.
+            // Routes through the ADR-049 commit-8 messaging shim.
             if local_pseudonym.is_some() {
                 let sender_did = scp_identity::DID(identity.did.clone());
                 let core_handle = scp_core::context::ContextHandle::new(
@@ -3304,9 +3305,23 @@ pub async fn context_create(
                         None
                     };
                 if let Some(sk) = sk_opt {
-                    manager
-                        .send_pseudonym_announcement(&core_handle, &sender_did, &sk)
-                        .await;
+                    use scp_core::context::actor::commands::{
+                        MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
+                    };
+                    let ann_ctx_id = core_handle.context_id().to_owned();
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let cmd = MessagingCommand::SendPseudonymAnnouncement {
+                        payload: Box::new(SendPseudonymAnnouncementPayload {
+                            context_id: ann_ctx_id.clone(),
+                            params: core_handle.params().clone(),
+                            sender_did,
+                            signing_key: SigningKeyBytes::from_signing_key(&sk),
+                        }),
+                        reply: tx,
+                    };
+                    if sup.dispatch_command(&ann_ctx_id, cmd).await.is_ok() {
+                        let _ = rx.await;
+                    }
                 }
             }
 
@@ -3408,13 +3423,11 @@ pub async fn context_join(
             // `init_context_manager_with_did` is idempotent (`OnceLock`). #1073
             crate::runtime::init_context_manager_with_did(&identity.did);
 
-            // Delegate to the shared ContextManager. Build a core ContextHandle
-            // to pass the context_id, then join via the manager.
-            //
-            // This ephemeral ContextHandle carries default params — the
-            // ContextManager ignores them, performing version compatibility
-            // checks against the stored context's params instead.
-            let manager = crate::runtime::context_manager()?;
+            // Build a core ContextHandle to pass the context_id through the
+            // lifecycle shim. This ephemeral ContextHandle carries default
+            // params — the handler performs version compatibility checks
+            // against the stored context's params instead.
+            let sup = crate::runtime::supervisor_expect()?;
             let core_handle = scp_core::context::ContextHandle::new(
                 handle.context_id.clone(),
                 scp_core::context::ContextParams::default(),
@@ -3465,18 +3478,34 @@ pub async fn context_join(
                 None
             };
 
-            manager
-                .join_context(
-                    &core_handle,
-                    key_package,
-                    spending_ucan.as_ref(),
-                    local_pseudonym,
-                )
-                .await
-                .map_err(ScpError::from)?;
+            // Route through the ADR-049 commit-9 lifecycle shim.
+            {
+                use scp_core::context::actor::commands::{JoinContextPayload, LifecycleCommand};
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = LifecycleCommand::JoinContext {
+                    payload: Box::new(JoinContextPayload {
+                        context_id: core_handle.context_id().to_owned(),
+                        params: core_handle.params().clone(),
+                        key_package,
+                        spending_ucan,
+                        local_pseudonym,
+                    }),
+                    reply: tx,
+                };
+                sup.dispatch_lifecycle_command(cmd)
+                    .await
+                    .map_err(ScpError::from)?;
+                rx.await
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("join_context shim reply dropped: {e}"),
+                        code: codes::CTX_2014.to_owned(),
+                    })?
+                    .map_err(ScpError::from)?;
+            }
 
             // §9.10.4: Send pseudonym announcement to inform existing members.
             // Best-effort: if signing key is not available, skip silently.
+            // Routes through the ADR-049 commit-8 messaging shim.
             if local_pseudonym.is_some() {
                 let sender_did = scp_identity::DID(identity.did.clone());
                 let sk_opt: Option<ed25519_dalek::SigningKey> =
@@ -3507,9 +3536,23 @@ pub async fn context_join(
                         None
                     };
                 if let Some(sk) = sk_opt {
-                    manager
-                        .send_pseudonym_announcement(&core_handle, &sender_did, &sk)
-                        .await;
+                    use scp_core::context::actor::commands::{
+                        MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
+                    };
+                    let ann_ctx_id = core_handle.context_id().to_owned();
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let cmd = MessagingCommand::SendPseudonymAnnouncement {
+                        payload: Box::new(SendPseudonymAnnouncementPayload {
+                            context_id: ann_ctx_id.clone(),
+                            params: core_handle.params().clone(),
+                            sender_did,
+                            signing_key: SigningKeyBytes::from_signing_key(&sk),
+                        }),
+                        reply: tx,
+                    };
+                    if sup.dispatch_command(&ann_ctx_id, cmd).await.is_ok() {
+                        let _ = rx.await;
+                    }
                 }
             }
 
@@ -3554,8 +3597,9 @@ pub async fn context_leave(
             }
             drop(state);
 
-            // Delegate to the shared ContextManager.
-            let manager = crate::runtime::context_manager()?;
+            // Route through the ADR-049 commit-9 lifecycle shim.
+            use scp_core::context::actor::commands::{LeaveContextPayload, LifecycleCommand};
+            let sup = crate::runtime::supervisor_expect()?;
             let core_handle = scp_core::context::ContextHandle::new(
                 handle.context_id.clone(),
                 scp_core::context::ContextParams::default(),
@@ -3565,9 +3609,24 @@ pub async fn context_leave(
                 .await;
 
             let member_did: scp_identity::DID = identity.did.clone().into();
-            manager
-                .leave_context(&core_handle, &member_did, &member_did)
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = LifecycleCommand::LeaveContext {
+                payload: Box::new(LeaveContextPayload {
+                    context_id: core_handle.context_id().to_owned(),
+                    params: core_handle.params().clone(),
+                    caller_did: member_did.clone(),
+                    member_did,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_lifecycle_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            rx.await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("leave_context shim reply dropped: {e}"),
+                    code: codes::CTX_2015.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
 
             // Deregister the context handle from the MCP lookup registry.
@@ -4497,11 +4556,22 @@ pub async fn tool_invoke_cross_context(
             drop(target_state);
 
             // Validate chain depth (context-configurable, default 8 per ADR-043).
+            // Routed through the ADR-049 query shim
+            // ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
             let max_chain_depth = {
-                let mgr = crate::runtime::context_manager()?;
-                let source_max = mgr
-                    .context_params(&source_handle.context_id)
+                use scp_core::context::actor::commands::QueriesCommand;
+                let sup = crate::runtime::supervisor_expect()?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = QueriesCommand::ContextParams {
+                    context_id: source_handle.context_id.clone(),
+                    reply: tx,
+                };
+                sup.dispatch_query(cmd).await.map_err(ScpError::from)?;
+                let source_max = rx
                     .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .flatten()
                     .and_then(|p| p.max_chain_depth);
                 scp_core::provenance::attach::effective_max_chain_depth(source_max)
             };
@@ -4628,10 +4698,21 @@ pub async fn tool_session_create(
             let mut store = handle.session_store.lock().await;
 
             // Enforce per-caller session cap (context-configured, default 1000, ADR-043).
+            // Routed through the ADR-049 query shim
+            // ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
             let cap = {
-                let mgr = crate::runtime::context_manager()?;
-                mgr.context_params(&handle.context_id)
-                    .await
+                use scp_core::context::actor::commands::QueriesCommand;
+                let sup = crate::runtime::supervisor_expect()?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = QueriesCommand::ContextParams {
+                    context_id: handle.context_id.clone(),
+                    reply: tx,
+                };
+                sup.dispatch_query(cmd).await.map_err(ScpError::from)?;
+                rx.await
+                    .ok()
+                    .and_then(Result::ok)
+                    .flatten()
                     .and_then(|p| p.session_cap)
                     .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER)
                     as usize
@@ -5750,10 +5831,21 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
-        // Read the agent's role assignment from the ContextManager's role state.
-        let manager = crate::runtime::context_manager().ok()?;
+        // Read the agent's role assignment from the ContextManager's role
+        // state via the ADR-049 query shim
+        // ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
+        use scp_core::context::actor::commands::QueriesCommand;
+        let sup = crate::runtime::supervisor_expect().ok()?;
         let role_state = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(manager.get_role_state(context_id))
+            tokio::runtime::Handle::current().block_on(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = QueriesCommand::GetRoleState {
+                    context_id: context_id.to_owned(),
+                    reply: tx,
+                };
+                sup.dispatch_query(cmd).await.ok()?;
+                rx.await.ok()?.ok().flatten()
+            })
         })?;
         role_state
             .assignments
@@ -5869,11 +5961,27 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        let manager = crate::runtime::context_manager()
-            .map_err(|e| format!("ContextManager not initialized: {e}"))?;
+        //
+        // Routed through the ADR-049 query shim
+        // ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
+        use scp_core::context::actor::commands::QueriesCommand;
+        let sup = crate::runtime::supervisor_expect()
+            .map_err(|e| format!("Supervisor not initialized: {e}"))?;
         let role_state = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(manager.get_role_state(context_id))
-        })
+            tokio::runtime::Handle::current().block_on(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = QueriesCommand::GetRoleState {
+                    context_id: context_id.to_owned(),
+                    reply: tx,
+                };
+                sup.dispatch_query(cmd)
+                    .await
+                    .map_err(|e| format!("supervisor dispatch_query failed: {e}"))?;
+                rx.await
+                    .map_err(|e| format!("query shim reply dropped: {e}"))?
+                    .map_err(|e| e.to_string())
+            })
+        })?
         .ok_or_else(|| {
             format!("context '{context_id}' not found in ContextManager for capability check")
         })?;
@@ -6067,16 +6175,39 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     fn context_members(&self, context_id: &str) -> Vec<scp_mcp::server::MemberInfo> {
-        // Read member list and role assignments from the ContextManager.
-        let Ok(manager) = crate::runtime::context_manager() else {
+        // Read member list and role assignments via the ADR-049 query shim
+        // ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)).
+        use scp_core::context::actor::commands::QueriesCommand;
+        let Ok(sup) = crate::runtime::supervisor_expect() else {
             return Vec::new();
         };
 
         let (member_dids, role_state) = tokio::task::block_in_place(|| {
             let handle = tokio::runtime::Handle::current();
-            let dids = handle.block_on(manager.member_dids(context_id));
-            let roles = handle.block_on(manager.get_role_state(context_id));
-            (dids, roles)
+            handle.block_on(async move {
+                let (dids_tx, dids_rx) = tokio::sync::oneshot::channel();
+                let dids_cmd = QueriesCommand::MemberDids {
+                    context_id: context_id.to_owned(),
+                    reply: dids_tx,
+                };
+                let dids = if sup.dispatch_query(dids_cmd).await.is_ok() {
+                    dids_rx.await.ok().and_then(Result::ok).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
+                let (roles_tx, roles_rx) = tokio::sync::oneshot::channel();
+                let roles_cmd = QueriesCommand::GetRoleState {
+                    context_id: context_id.to_owned(),
+                    reply: roles_tx,
+                };
+                let roles = if sup.dispatch_query(roles_cmd).await.is_ok() {
+                    roles_rx.await.ok().and_then(Result::ok).flatten()
+                } else {
+                    None
+                };
+                (dids, roles)
+            })
         });
 
         member_dids
@@ -8053,7 +8184,8 @@ pub async fn governance_propose(
 
 /// Casts an approval vote on a pending governance proposal.
 ///
-/// Delegates to `ContextManager::approve_governance_proposal`.
+/// Routed through the ADR-049 commit-10 governance shim
+/// ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command)).
 ///
 /// # Errors
 ///
@@ -8064,6 +8196,9 @@ pub async fn governance_approve(
     voter_did: String,
     proposal_id_hex: String,
 ) -> Result<String, ScpError> {
+    use scp_core::context::actor::commands::{
+        GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
+    };
     crate::uniffi_check_handle!(handle);
     let signing_key = resolve_uniffi_signing_key(&handle).await?;
     let context_id = handle.context_id.clone();
@@ -8072,17 +8207,27 @@ pub async fn governance_approve(
     let result = runtime()
         .spawn(async move {
             let did = scp_identity::DID(voter_did);
-            let manager = crate::runtime::context_manager()?;
-            // Box::pin — ADR-049 commit 12c.3b hoist pushed the governance
-            // path's future size past clippy's 16 KB stack budget.
-            let status = Box::pin(manager.approve_governance_proposal(
-                &context_id,
-                &proposal_id,
-                &did,
-                &signing_key,
-            ))
-            .await
-            .map_err(ScpError::from)?;
+            let sup = crate::runtime::supervisor_expect()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = GovernanceCommand::ApproveGovernanceProposal {
+                payload: Box::new(VoteOnProposalPayload {
+                    context_id,
+                    proposal_id,
+                    voter_did: did,
+                    signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+                }),
+                reply: tx,
+            };
+            sup.dispatch_governance_command(cmd)
+                .await
+                .map_err(ScpError::from)?;
+            let status = rx
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("governance approval shim reply dropped: {e}"),
+                    code: codes::CTX_2042.to_owned(),
+                })?
+                .map_err(ScpError::from)?;
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })
@@ -8105,7 +8250,8 @@ pub async fn governance_approve(
 
 /// Casts a rejection vote on a pending governance proposal.
 ///
-/// Delegates to `ContextManager::reject_governance_proposal`.
+/// Routed through the ADR-049 commit-10 governance shim
+/// ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command)).
 ///
 /// # Errors
 ///
@@ -8116,6 +8262,9 @@ pub async fn governance_reject(
     voter_did: String,
     proposal_id_hex: String,
 ) -> Result<String, ScpError> {
+    use scp_core::context::actor::commands::{
+        GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
+    };
     crate::uniffi_check_handle!(handle);
     let signing_key = resolve_uniffi_signing_key(&handle).await?;
     let context_id = handle.context_id.clone();
@@ -8124,17 +8273,27 @@ pub async fn governance_reject(
     let result = runtime()
         .spawn(async move {
             let did = scp_identity::DID(voter_did);
-            let manager = crate::runtime::context_manager()?;
-            // Box::pin — ADR-049 commit 12c.3b hoist pushed the governance
-            // path's future size past clippy's 16 KB stack budget.
-            let status = Box::pin(manager.reject_governance_proposal(
-                &context_id,
-                &proposal_id,
-                &did,
-                &signing_key,
-            ))
-            .await
-            .map_err(ScpError::from)?;
+            let sup = crate::runtime::supervisor_expect()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = GovernanceCommand::RejectGovernanceProposal {
+                payload: Box::new(VoteOnProposalPayload {
+                    context_id,
+                    proposal_id,
+                    voter_did: did,
+                    signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+                }),
+                reply: tx,
+            };
+            sup.dispatch_governance_command(cmd)
+                .await
+                .map_err(ScpError::from)?;
+            let status = rx
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("governance rejection shim reply dropped: {e}"),
+                    code: codes::CTX_2043.to_owned(),
+                })?
+                .map_err(ScpError::from)?;
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
         })
@@ -8175,11 +8334,25 @@ pub async fn governance_withdraw(
 
     let result = runtime()
         .spawn(async move {
+            use scp_core::context::actor::commands::GovernanceCommand;
             let did = scp_identity::DID(voter_did);
-            let manager = crate::runtime::context_manager()?;
-            let status = manager
-                .withdraw_governance_vote(&context_id, &proposal_id, &did)
+            let sup = crate::runtime::supervisor_expect()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = GovernanceCommand::WithdrawGovernanceVote {
+                context_id,
+                proposal_id,
+                voter_did: did,
+                reply: tx,
+            };
+            sup.dispatch_governance_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            let status = rx
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("governance withdrawal shim reply dropped: {e}"),
+                    code: codes::CTX_2044.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
 
             Ok(serde_json::json!({ "status": format!("{status:?}") }).to_string())
@@ -8203,6 +8376,9 @@ pub async fn governance_withdraw(
 
 /// Retrieves a single governance proposal by hex-encoded ID.
 ///
+/// Routed through the ADR-049 commit-10 governance shim
+/// ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command)).
+///
 /// # Errors
 ///
 /// Returns `ScpError::Context` (SCP-CTX-2045) if the proposal is not found.
@@ -8217,10 +8393,23 @@ pub async fn governance_get_proposal(
 
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
-            let proposal = manager
-                .get_proposal(&context_id, &proposal_id)
+            use scp_core::context::actor::commands::GovernanceCommand;
+            let sup = crate::runtime::supervisor_expect()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = GovernanceCommand::GetProposal {
+                context_id,
+                proposal_id,
+                reply: tx,
+            };
+            sup.dispatch_governance_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            let proposal = rx
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("get_proposal shim reply dropped: {e}"),
+                    code: codes::CTX_2045.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
 
             serde_json::to_string(&proposal).map_err(|e| ScpError::Context {
@@ -8239,6 +8428,9 @@ pub async fn governance_get_proposal(
 ///
 /// Returns a JSON array of proposals.
 ///
+/// Routed through the ADR-049 commit-10 governance shim
+/// ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command)).
+///
 /// # Errors
 ///
 /// Returns `ScpError::Context` (SCP-CTX-2046) if listing fails.
@@ -8249,10 +8441,22 @@ pub async fn governance_list_proposals(handle: Arc<ContextHandle>) -> Result<Str
 
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
-            let proposals = manager
-                .list_proposals(&context_id)
+            use scp_core::context::actor::commands::GovernanceCommand;
+            let sup = crate::runtime::supervisor_expect()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = GovernanceCommand::ListProposals {
+                context_id,
+                reply: tx,
+            };
+            sup.dispatch_governance_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            let proposals = rx
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("list_proposals shim reply dropped: {e}"),
+                    code: codes::CTX_2046.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
 
             serde_json::to_string(&proposals).map_err(|e| ScpError::Context {
@@ -8275,6 +8479,9 @@ pub async fn governance_list_proposals(handle: Arc<ContextHandle>) -> Result<Str
 ///
 /// Returns `true` if applied, `false` if no pending modification or not yet effective.
 ///
+/// Routed through the ADR-049 commit-10 governance shim
+/// ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command)).
+///
 /// # Errors
 ///
 /// Returns `ScpError::Context` (SCP-CTX-2060) if the operation fails.
@@ -8288,10 +8495,22 @@ pub async fn apply_pending_ceiling_modification(
 
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
-            manager
-                .apply_pending_ceiling_modification(&context_id, current_timestamp)
+            use scp_core::context::actor::commands::GovernanceCommand;
+            let sup = crate::runtime::supervisor_expect()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = GovernanceCommand::ApplyPendingCeilingModification {
+                context_id,
+                current_timestamp,
+                reply: tx,
+            };
+            sup.dispatch_governance_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            rx.await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("apply_pending_ceiling_modification shim reply dropped: {e}"),
+                    code: codes::CTX_2060.to_owned(),
+                })?
                 .map_err(ScpError::from)
         })
         .await
@@ -8324,7 +8543,8 @@ pub async fn finalize_close(handle: Arc<ContextHandle>) -> Result<(), ScpError> 
 
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
+            use scp_core::context::actor::commands::{TtlCloseCommand, TtlContextPayload};
+            let sup = crate::runtime::supervisor_expect()?;
             let core_handle = scp_core::context::ContextHandle::new(context_id, core_params);
             let _ = core_handle
                 .transition_to(&scp_core::context::ContextState::Active)
@@ -8333,9 +8553,22 @@ pub async fn finalize_close(handle: Arc<ContextHandle>) -> Result<(), ScpError> 
                 .transition_to(&scp_core::context::ContextState::Closing)
                 .await;
 
-            manager
-                .finalize_close(&core_handle)
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = TtlCloseCommand::FinalizeClose {
+                payload: Box::new(TtlContextPayload {
+                    context_id: core_handle.context_id().to_owned(),
+                    params: core_handle.params().clone(),
+                }),
+                reply: tx,
+            };
+            sup.dispatch_ttl_close_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            rx.await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("finalize_close shim reply dropped: {e}"),
+                    code: codes::CTX_2061.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
 
             // Update FFI handle state to Closed.
@@ -8388,19 +8621,33 @@ pub async fn create_governance_checkpoint(
 
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
-            let checkpoint = manager
-                .create_governance_checkpoint(
-                    &context_id,
+            use scp_core::context::actor::commands::{
+                CreateGovernanceCheckpointPayload, TrustRecoveryCommand,
+            };
+            let sup = crate::runtime::supervisor_expect()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = TrustRecoveryCommand::CreateGovernanceCheckpoint {
+                payload: Box::new(CreateGovernanceCheckpointPayload {
+                    context_id,
                     checkpoint_seq,
                     merkle_root,
                     event_count,
                     last_event_hash,
                     state_snapshot_hash,
-                    &did,
-                    (*creator_signature).clone(),
-                )
+                    creator_did: did,
+                    creator_signature: (*creator_signature).clone(),
+                }),
+                reply: tx,
+            };
+            sup.dispatch_trust_recovery_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            let checkpoint = rx
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("create_governance_checkpoint shim reply dropped: {e}"),
+                    code: codes::CTX_2066.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
 
             serde_json::to_string(&checkpoint).map_err(|e| ScpError::Context {
@@ -8434,7 +8681,7 @@ pub async fn add_checkpoint_cosignature(
     crate::uniffi_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
-    let mut checkpoint: scp_core::context::governance::ContextCheckpoint =
+    let checkpoint: scp_core::context::governance::ContextCheckpoint =
         serde_json::from_str(&checkpoint_json).map_err(|e| ScpError::Validation {
             msg: format!("invalid checkpoint JSON: {e}"),
             code: codes::CTX_2063.to_owned(),
@@ -8455,15 +8702,29 @@ pub async fn add_checkpoint_cosignature(
 
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
-            let status = manager
-                .add_checkpoint_cosignature(&context_id, &mut checkpoint, cosignature)
+            use scp_core::context::actor::commands::TrustRecoveryCommand;
+            let sup = crate::runtime::supervisor_expect()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = TrustRecoveryCommand::AddCheckpointCosignature {
+                context_id,
+                checkpoint: Box::new(checkpoint),
+                cosignature: Box::new(cosignature),
+                reply: tx,
+            };
+            sup.dispatch_trust_recovery_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            let (updated_checkpoint, status) = rx
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("add_checkpoint_cosignature shim reply dropped: {e}"),
+                    code: codes::CTX_2063.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
 
             let response = serde_json::json!({
                 "attestation_status": format!("{status:?}"),
-                "checkpoint": serde_json::to_value(&checkpoint).unwrap_or_default(),
+                "checkpoint": serde_json::to_value(&updated_checkpoint).unwrap_or_default(),
             });
             Ok(response.to_string())
         })
@@ -8476,34 +8737,38 @@ pub async fn add_checkpoint_cosignature(
 
 /// Restores a single persisted context from storage.
 ///
+/// Routed through the ADR-049 commit-9 lifecycle shim
+/// ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command)).
+/// The handler loads the persisted snapshot itself and reconstructs an
+/// ephemeral `ContextHandle` from it — the `ContextParams` supplied here
+/// are only used to initialise the ephemeral wrapper; the handler
+/// overwrites all memory-scope-sensitive state from the loaded snapshot.
+///
 /// # Errors
 ///
 /// Returns `ScpError::Context` (SCP-CTX-2064) if restoration fails.
 #[uniffi::export]
 pub async fn restore_context(context_id: String) -> Result<(), ScpError> {
-    let ctx_id = context_id.clone();
-
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
-            // Load the persisted snapshot to obtain the correct ContextParams
-            // (including memory_scope). Using ContextParams::default() would
-            // give Ephemeral scope, causing incorrect key destruction on
-            // subsequent finalize_close.
-            let (snapshot, _broadcast) = manager
-                .load_persisted_context_state(&ctx_id)
-                .map_err(ScpError::from)?;
-
-            let core_handle = scp_core::context::ContextHandle::new(
-                ctx_id.clone(),
-                snapshot.context_params.clone(),
-            );
-            let _ = core_handle
-                .transition_to(&scp_core::context::ContextState::Active)
-                .await;
-            manager
-                .restore_context(&ctx_id, &core_handle)
+            use scp_core::context::actor::commands::{LifecycleCommand, RestoreContextPayload};
+            let sup = crate::runtime::supervisor_expect()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = LifecycleCommand::RestoreContext {
+                payload: Box::new(RestoreContextPayload {
+                    context_id,
+                    params: scp_core::context::ContextParams::default(),
+                }),
+                reply: tx,
+            };
+            sup.dispatch_lifecycle_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            rx.await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("restore_context shim reply dropped: {e}"),
+                    code: codes::CTX_2064.to_owned(),
+                })?
                 .map_err(ScpError::from)
         })
         .await
@@ -8515,7 +8780,10 @@ pub async fn restore_context(context_id: String) -> Result<(), ScpError> {
 
 /// Restores all persisted contexts from storage.
 ///
-/// Returns a JSON array of restored context ID strings.
+/// Returns a JSON array of restored context ID strings. Routes through
+/// the supervisor-scope direct method; `restore_all_contexts` operates
+/// on the supervisor-wide context registry and has no per-context
+/// command target.
 ///
 /// # Errors
 ///
@@ -8524,11 +8792,8 @@ pub async fn restore_context(context_id: String) -> Result<(), ScpError> {
 pub async fn restore_all_contexts() -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
-            let restored = manager
-                .restore_all_contexts()
-                .await
-                .map_err(ScpError::from)?;
+            let sup = crate::runtime::supervisor_expect()?;
+            let restored = sup.restore_all_contexts().await.map_err(ScpError::from)?;
 
             serde_json::to_string(&restored).map_err(|e| ScpError::Context {
                 msg: format!("serialization failed: {e}"),
@@ -8562,6 +8827,9 @@ fn parse_uniffi_hex_32(hex_str: &str, field_name: &str) -> Result<[u8; 32], ScpE
 ///
 /// Transitions the context from `MigratingOut` to `Tombstoned`.
 ///
+/// Routed through the ADR-049 commit-10 governance shim
+/// ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command)).
+///
 /// # Errors
 ///
 /// Returns `ScpError::Context` (SCP-CTX-2050) if the context is not migrating
@@ -8574,10 +8842,21 @@ pub async fn tombstone_migrated_context(handle: Arc<ContextHandle>) -> Result<()
 
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
-            manager
-                .tombstone_migrated_context(&context_id)
+            use scp_core::context::actor::commands::GovernanceCommand;
+            let sup = crate::runtime::supervisor_expect()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = GovernanceCommand::TombstoneMigratedContext {
+                context_id,
+                reply: tx,
+            };
+            sup.dispatch_governance_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            rx.await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("tombstone shim reply dropped: {e}"),
+                    code: codes::CTX_2050.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
 
             // Sync FFI handle state to Tombstoned (§5.11A.5).
@@ -8596,6 +8875,9 @@ pub async fn tombstone_migrated_context(handle: Arc<ContextHandle>) -> Result<()
 ///
 /// Returns a JSON string with migration state fields, or `None` if the
 /// context is not migrating.
+///
+/// Routed through the ADR-049 commit-10 governance shim
+/// ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command)).
 #[uniffi::export]
 pub async fn migration_state(handle: Arc<ContextHandle>) -> Result<Option<String>, ScpError> {
     crate::uniffi_check_handle!(handle);
@@ -8603,8 +8885,23 @@ pub async fn migration_state(handle: Arc<ContextHandle>) -> Result<Option<String
 
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
-            let state = manager.migration_state(&context_id).await;
+            use scp_core::context::actor::commands::GovernanceCommand;
+            let sup = crate::runtime::supervisor_expect()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = GovernanceCommand::MigrationState {
+                context_id,
+                reply: tx,
+            };
+            sup.dispatch_governance_command(cmd)
+                .await
+                .map_err(ScpError::from)?;
+            let state = rx
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("migration_state shim reply dropped: {e}"),
+                    code: codes::CTX_2050.to_owned(),
+                })?
+                .map_err(ScpError::from)?;
             match state {
                 Some(ms) => {
                     let json = serde_json::json!({
@@ -8647,22 +8944,32 @@ pub async fn broadcast_subscribe(
     crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
+            use scp_core::context::actor::commands::{BroadcastCommand, SubscribeBroadcastPayload};
+            let sup = crate::runtime::supervisor_expect()?;
             let did: scp_identity::DID = subscriber_did.into();
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
 
-            manager
-                .subscribe_broadcast::<
-                    crate::bridge::NoOpDidResolver,
-                    crate::bridge::NoOpNonceTracker,
-                    crate::bridge::NoOpRevocationChecker,
-                    crate::bridge::NoOpProofResolver,
-                    std::hash::RandomState,
-                >(&handle.context_id, &did, None, timestamp, None)
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::SubscribeBroadcast {
+                payload: Box::new(SubscribeBroadcastPayload {
+                    context_id: handle.context_id.clone(),
+                    subscriber_did: did,
+                    ucan: None,
+                    timestamp,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_broadcast_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            rx.await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("broadcast_subscribe shim reply dropped: {e}"),
+                    code: codes::CTX_2033.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
             Ok(())
         })
@@ -8678,6 +8985,9 @@ pub async fn broadcast_subscribe(
 /// When `rotate_keys` is `true`, all authors rotate their broadcast keys
 /// for forward secrecy.
 ///
+/// Routed through the ADR-049 commit-11 broadcast shim
+/// ([`Supervisor::dispatch_broadcast_command`](scp_core::context::supervisor::Supervisor::dispatch_broadcast_command)).
+///
 /// # Errors
 ///
 /// Returns `ScpError::Context` if the context is not active or not broadcast.
@@ -8690,11 +9000,28 @@ pub async fn broadcast_unsubscribe(
     crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
+            use scp_core::context::actor::commands::{
+                BroadcastCommand, UnsubscribeBroadcastPayload,
+            };
+            let sup = crate::runtime::supervisor_expect()?;
             let did: scp_identity::DID = subscriber_did.into();
-            manager
-                .unsubscribe_broadcast(&handle.context_id, &did, rotate_keys)
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::UnsubscribeBroadcast {
+                payload: Box::new(UnsubscribeBroadcastPayload {
+                    context_id: handle.context_id.clone(),
+                    subscriber_did: did,
+                    rotate_keys,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_broadcast_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            rx.await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("broadcast_unsubscribe shim reply dropped: {e}"),
+                    code: codes::CTX_2034.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
             Ok(())
         })
@@ -8732,7 +9059,8 @@ pub async fn broadcast_publish(
     crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
+            use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastPayload};
+            let sup = crate::runtime::supervisor_expect()?;
             let did: scp_identity::DID = identity.did.clone().into();
 
             let core_id = identity
@@ -8743,18 +9071,26 @@ pub async fn broadcast_publish(
                         .to_owned(),
                     code: codes::PERM_3020.to_owned(),
                 })?;
-            let signing_key_handle = &core_id.active_signing_key;
+            let signing_key_handle = core_id.active_signing_key;
+
+            // Route through the ADR-049 commit-11 broadcast shim with custody.
+            // Publish requires the custody-bearing variant because the
+            // `KeyCustody` trait is not dyn-safe and cannot cross the actor
+            // mailbox.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::PublishBroadcast {
+                payload: Box::new(PublishBroadcastPayload {
+                    context_id: handle.context_id.clone(),
+                    author_did: did,
+                    payload,
+                    signing_key_handle,
+                }),
+                reply: tx,
+            };
 
             // Dispatch to the correct custody path (callback > in-memory).
             if let Some(ref cb) = identity.callback_custody {
-                manager
-                    .publish_broadcast(
-                        &handle.context_id,
-                        &did,
-                        &payload,
-                        cb.as_ref(),
-                        signing_key_handle,
-                    )
+                sup.dispatch_broadcast_command_with_custody(cmd, cb.as_ref())
                     .await
                     .map_err(ScpError::from)?;
             } else {
@@ -8769,14 +9105,7 @@ pub async fn broadcast_publish(
                             code: codes::PERM_3021.to_owned(),
                         }
                     })?;
-                    manager
-                        .publish_broadcast(
-                            &handle.context_id,
-                            &did,
-                            &payload,
-                            &imc.0,
-                            signing_key_handle,
-                        )
+                    sup.dispatch_broadcast_command_with_custody(cmd, &imc.0)
                         .await
                         .map_err(ScpError::from)?;
                 }
@@ -8791,6 +9120,13 @@ pub async fn broadcast_publish(
                     });
                 }
             }
+
+            rx.await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("publish_broadcast shim reply dropped: {e}"),
+                    code: codes::CTX_2035.to_owned(),
+                })?
+                .map_err(ScpError::from)?;
 
             Ok(())
         })
@@ -8868,7 +9204,10 @@ pub async fn broadcast_publish_asset(
     crate::uniffi_check_handle!(handle, identity);
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
+            use scp_core::context::actor::commands::{
+                BroadcastCommand, PublishBroadcastContentPayload,
+            };
+            let sup = crate::runtime::supervisor_expect()?;
             let did: scp_identity::DID = identity.did.clone().into();
 
             let core_id = identity
@@ -8880,7 +9219,7 @@ pub async fn broadcast_publish_asset(
                             .to_owned(),
                     code: codes::PERM_3020.to_owned(),
                 })?;
-            let signing_key_handle = &core_id.active_signing_key;
+            let signing_key_handle = core_id.active_signing_key;
 
             // Validate fields.
             let content_path =
@@ -8929,18 +9268,23 @@ pub async fn broadcast_publish_asset(
                 body: asset.body,
             };
 
+            // Route through the ADR-049 commit-11 broadcast shim with custody.
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::PublishBroadcastContent {
+                payload: Box::new(PublishBroadcastContentPayload {
+                    context_id: handle.context_id.clone(),
+                    author_did: did,
+                    content,
+                    signing_key_handle,
+                }),
+                reply: tx,
+            };
+
             // Dispatch to the correct custody path (callback > in-memory).
-            let envelope = if let Some(ref cb) = identity.callback_custody {
-                manager
-                    .publish_broadcast_content(
-                        &handle.context_id,
-                        &did,
-                        content,
-                        cb.as_ref(),
-                        signing_key_handle,
-                    )
+            if let Some(ref cb) = identity.callback_custody {
+                sup.dispatch_broadcast_command_with_custody(cmd, cb.as_ref())
                     .await
-                    .map_err(ScpError::from)?
+                    .map_err(ScpError::from)?;
             } else {
                 #[cfg(feature = "allow_in_memory_custody")]
                 {
@@ -8953,16 +9297,9 @@ pub async fn broadcast_publish_asset(
                             code: codes::PERM_3021.to_owned(),
                         }
                     })?;
-                    manager
-                        .publish_broadcast_content(
-                            &handle.context_id,
-                            &did,
-                            content,
-                            &imc.0,
-                            signing_key_handle,
-                        )
+                    sup.dispatch_broadcast_command_with_custody(cmd, &imc.0)
                         .await
-                        .map_err(ScpError::from)?
+                        .map_err(ScpError::from)?;
                 }
                 #[cfg(not(feature = "allow_in_memory_custody"))]
                 {
@@ -8974,7 +9311,15 @@ pub async fn broadcast_publish_asset(
                         code: codes::PERM_3022.to_owned(),
                     });
                 }
-            };
+            }
+
+            let envelope = rx
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("publish_broadcast_content shim reply dropped: {e}"),
+                    code: codes::CTX_2035.to_owned(),
+                })?
+                .map_err(ScpError::from)?;
 
             let envelope_bytes =
                 rmp_serde::to_vec_named(&envelope).map_err(|e| ScpError::Context {
@@ -9029,7 +9374,10 @@ pub async fn broadcast_publish_assets(
 
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
+            use scp_core::context::actor::commands::{
+                BroadcastCommand, PublishBroadcastContentPayload,
+            };
+            let sup = crate::runtime::supervisor_expect()?;
             let did: scp_identity::DID = identity.did.clone().into();
 
             let core_id = identity
@@ -9039,7 +9387,7 @@ pub async fn broadcast_publish_assets(
                     msg: "broadcast publish assets requires a fully created identity".to_owned(),
                     code: codes::PERM_3020.to_owned(),
                 })?;
-            let signing_key_handle = &core_id.active_signing_key;
+            let signing_key_handle = core_id.active_signing_key;
 
             // Generate deploy_id if not provided.
             let deploy_id_val = deploy_id.unwrap_or_else(|| {
@@ -9092,17 +9440,23 @@ pub async fn broadcast_publish_assets(
                     body: asset.body,
                 };
 
-                let envelope = if let Some(ref cb) = identity.callback_custody {
-                    manager
-                        .publish_broadcast_content(
-                            &handle.context_id,
-                            &did,
-                            content,
-                            cb.as_ref(),
-                            signing_key_handle,
-                        )
+                // Route each asset through the ADR-049 commit-11 broadcast
+                // shim with custody.
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = BroadcastCommand::PublishBroadcastContent {
+                    payload: Box::new(PublishBroadcastContentPayload {
+                        context_id: handle.context_id.clone(),
+                        author_did: did.clone(),
+                        content,
+                        signing_key_handle,
+                    }),
+                    reply: tx,
+                };
+
+                if let Some(ref cb) = identity.callback_custody {
+                    sup.dispatch_broadcast_command_with_custody(cmd, cb.as_ref())
                         .await
-                        .map_err(ScpError::from)?
+                        .map_err(ScpError::from)?;
                 } else {
                     #[cfg(feature = "allow_in_memory_custody")]
                     {
@@ -9112,16 +9466,9 @@ pub async fn broadcast_publish_assets(
                                 code: codes::PERM_3021.to_owned(),
                             }
                         })?;
-                        manager
-                            .publish_broadcast_content(
-                                &handle.context_id,
-                                &did,
-                                content,
-                                &imc.0,
-                                signing_key_handle,
-                            )
+                        sup.dispatch_broadcast_command_with_custody(cmd, &imc.0)
                             .await
-                            .map_err(ScpError::from)?
+                            .map_err(ScpError::from)?;
                     }
                     #[cfg(not(feature = "allow_in_memory_custody"))]
                     {
@@ -9130,7 +9477,15 @@ pub async fn broadcast_publish_assets(
                             code: codes::PERM_3022.to_owned(),
                         });
                     }
-                };
+                }
+
+                let envelope = rx
+                    .await
+                    .map_err(|e| ScpError::Context {
+                        msg: format!("publish_broadcast_content shim reply dropped: {e}"),
+                        code: codes::CTX_2035.to_owned(),
+                    })?
+                    .map_err(ScpError::from)?;
 
                 let envelope_bytes =
                     rmp_serde::to_vec_named(&envelope).map_err(|e| ScpError::Context {
@@ -9178,12 +9533,27 @@ pub async fn broadcast_block_subscriber(
     crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
+            use scp_core::context::actor::commands::{BroadcastBlockPayload, BroadcastCommand};
+            let sup = crate::runtime::supervisor_expect()?;
             let subscriber: scp_identity::DID = subscriber_did.into();
             let blocker: scp_identity::DID = blocker_did.into();
-            manager
-                .block_broadcast_subscriber(&handle.context_id, &blocker, &subscriber)
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::BlockBroadcastSubscriber {
+                payload: Box::new(BroadcastBlockPayload {
+                    context_id: handle.context_id.clone(),
+                    author_did: blocker,
+                    subscriber_did: subscriber,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_broadcast_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            rx.await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("block_broadcast_subscriber shim reply dropped: {e}"),
+                    code: codes::CTX_2036.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
             Ok(())
         })
@@ -9199,6 +9569,9 @@ pub async fn broadcast_block_subscriber(
 /// Forward-only: the unblocked subscriber can request the current key on
 /// next pull but cannot decrypt content from the block period.
 ///
+/// Routed through the ADR-049 commit-11 broadcast shim
+/// ([`Supervisor::dispatch_broadcast_command`](scp_core::context::supervisor::Supervisor::dispatch_broadcast_command)).
+///
 /// # Errors
 ///
 /// - [`ScpError::Context`] with `SCP-CTX-2037` if the tokio task fails.
@@ -9213,12 +9586,27 @@ pub async fn broadcast_unblock_subscriber(
     crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
+            use scp_core::context::actor::commands::{BroadcastBlockPayload, BroadcastCommand};
+            let sup = crate::runtime::supervisor_expect()?;
             let subscriber: scp_identity::DID = subscriber_did.into();
             let unblocker: scp_identity::DID = unblocker_did.into();
-            manager
-                .unblock_broadcast_subscriber(&handle.context_id, &unblocker, &subscriber)
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::UnblockBroadcastSubscriber {
+                payload: Box::new(BroadcastBlockPayload {
+                    context_id: handle.context_id.clone(),
+                    author_did: unblocker,
+                    subscriber_did: subscriber,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_broadcast_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            rx.await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("unblock_broadcast_subscriber shim reply dropped: {e}"),
+                    code: codes::CTX_2037.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
             Ok(())
         })
@@ -9234,6 +9622,9 @@ pub async fn broadcast_unblock_subscriber(
 /// Validates the author DID is locally controlled and processes the key
 /// distribution request.
 ///
+/// Routed through the ADR-049 commit-11 broadcast shim
+/// ([`Supervisor::dispatch_broadcast_command`](scp_core::context::supervisor::Supervisor::dispatch_broadcast_command)).
+///
 /// # Errors
 ///
 /// Returns `ScpError::Context` if the operation fails.
@@ -9246,12 +9637,26 @@ pub async fn broadcast_handle_key_request(
     crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
+            use scp_core::context::actor::commands::BroadcastCommand;
+            let sup = crate::runtime::supervisor_expect()?;
             let author: scp_identity::DID = author_did.into();
             let requester: scp_identity::DID = requester_did.into();
-            let decision = manager
-                .handle_broadcast_key_request(&handle.context_id, &author, &requester)
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::HandleBroadcastKeyRequest {
+                context_id: handle.context_id.clone(),
+                author_did: author,
+                requester_did: requester,
+                reply: tx,
+            };
+            sup.dispatch_broadcast_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            let decision = rx
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("handle_broadcast_key_request shim reply dropped: {e}"),
+                    code: codes::CTX_2037.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
             Ok(format!("{decision:?}"))
         })
@@ -9265,8 +9670,12 @@ pub async fn broadcast_handle_key_request(
 /// Returns the number of broadcast subscribers for a context.
 ///
 /// Returns `None` if the context is not registered or not a broadcast context.
+///
+/// Routed through the ADR-049 commit-11 broadcast shim
+/// ([`Supervisor::dispatch_broadcast_command`](scp_core::context::supervisor::Supervisor::dispatch_broadcast_command)).
 #[uniffi::export]
 pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u64> {
+    use scp_core::context::actor::commands::BroadcastCommand;
     let check: Result<(), ScpError> = (|| {
         crate::uniffi_check_handle!(handle);
         Ok(())
@@ -9274,18 +9683,23 @@ pub async fn broadcast_subscriber_count(handle: Arc<ContextHandle>) -> Option<u6
     if check.is_err() {
         return None;
     }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return None;
+    let sup = crate::runtime::supervisor_expect().ok()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::BroadcastSubscriberCount {
+        context_id: handle.context_id.clone(),
+        reply: tx,
     };
-    manager
-        .broadcast_subscriber_count(&handle.context_id)
-        .await
-        .map(|n| n as u64)
+    sup.dispatch_broadcast_command(cmd).await.ok()?;
+    rx.await.ok()?.ok()?.map(|n| n as u64)
 }
 
 /// Returns `true` if the given DID is a broadcast subscriber.
+///
+/// Routed through the ADR-049 commit-11 broadcast shim
+/// ([`Supervisor::dispatch_broadcast_command`](scp_core::context::supervisor::Supervisor::dispatch_broadcast_command)).
 #[uniffi::export]
 pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) -> bool {
+    use scp_core::context::actor::commands::BroadcastCommand;
     let check: Result<(), ScpError> = (|| {
         crate::uniffi_check_handle!(handle);
         Ok(())
@@ -9293,20 +9707,31 @@ pub async fn broadcast_is_subscriber(handle: Arc<ContextHandle>, did: String) ->
     if check.is_err() {
         return false;
     }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
+    let Ok(sup) = crate::runtime::supervisor_expect() else {
         return false;
     };
-    manager
-        .is_broadcast_subscriber(&handle.context_id, &did)
-        .await
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::IsBroadcastSubscriber {
+        context_id: handle.context_id.clone(),
+        did,
+        reply: tx,
+    };
+    if sup.dispatch_broadcast_command(cmd).await.is_err() {
+        return false;
+    }
+    rx.await.ok().and_then(Result::ok).unwrap_or(false)
 }
 
 /// Returns the broadcast admission policy for a context.
 ///
 /// Returns the policy as a string: `"Open"` or `"Gated"`.
 /// Returns `None` if the context is not a broadcast context.
+///
+/// Routed through the ADR-049 commit-11 broadcast shim
+/// ([`Supervisor::dispatch_broadcast_command`](scp_core::context::supervisor::Supervisor::dispatch_broadcast_command)).
 #[uniffi::export]
 pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
+    use scp_core::context::actor::commands::BroadcastCommand;
     let check: Result<(), ScpError> = (|| {
         crate::uniffi_check_handle!(handle);
         Ok(())
@@ -9314,13 +9739,14 @@ pub async fn broadcast_admission(handle: Arc<ContextHandle>) -> Option<String> {
     if check.is_err() {
         return None;
     }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
-        return None;
+    let sup = crate::runtime::supervisor_expect().ok()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::BroadcastAdmission {
+        context_id: handle.context_id.clone(),
+        reply: tx,
     };
-    manager
-        .broadcast_admission(&handle.context_id)
-        .await
-        .map(|a| format!("{a:?}"))
+    sup.dispatch_broadcast_command(cmd).await.ok()?;
+    rx.await.ok()?.ok()?.map(|a| format!("{a:?}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -9497,8 +9923,12 @@ fn format_context_event(event: &scp_core::context::membership::ContextEvent) -> 
 ///
 /// Returns a list of event descriptions as JSON strings. Returns empty
 /// if the context is not registered.
+///
+/// Routed through the ADR-049 commit-8 messaging shim
+/// ([`Supervisor::dispatch_command`](scp_core::context::supervisor::Supervisor::dispatch_command)).
 #[uniffi::export]
 pub async fn context_drain_events(handle: Arc<ContextHandle>) -> Vec<String> {
+    use scp_core::context::actor::commands::MessagingCommand;
     let check: Result<(), ScpError> = (|| {
         crate::uniffi_check_handle!(handle);
         Ok(())
@@ -9506,15 +9936,22 @@ pub async fn context_drain_events(handle: Arc<ContextHandle>) -> Vec<String> {
     if check.is_err() {
         return Vec::new();
     }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
+    let Ok(sup) = crate::runtime::supervisor_expect() else {
         return Vec::new();
     };
-    manager
-        .drain_events(&handle.context_id)
-        .await
-        .iter()
-        .map(format_context_event)
-        .collect()
+    let context_id = handle.context_id.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = MessagingCommand::DrainEvents {
+        context_id: context_id.clone(),
+        reply: tx,
+    };
+    if sup.dispatch_command(&context_id, cmd).await.is_err() {
+        return Vec::new();
+    }
+    match rx.await {
+        Ok(Ok(events)) => events.iter().map(format_context_event).collect(),
+        _ => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9524,7 +9961,8 @@ pub async fn context_drain_events(handle: Arc<ContextHandle>) -> Vec<String> {
 /// Generates and stores a per-member access key for explicit lifecycle
 /// management.
 ///
-/// Delegates to [`ContextManager::generate_context_access_key`].
+/// Routed through the ADR-049 commit-9 lifecycle shim
+/// ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command)).
 ///
 /// # Errors
 ///
@@ -9536,17 +9974,31 @@ pub async fn access_key_generate(
     member_did: String,
     caller_did: String,
 ) -> Result<(), ScpError> {
-    let manager = crate::runtime::context_manager_expect()?;
-    manager
-        .generate_context_access_key(&context_id, &member_did, &caller_did)
+    use scp_core::context::actor::commands::LifecycleCommand;
+    let sup = crate::runtime::supervisor_expect()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = LifecycleCommand::GenerateContextAccessKey {
+        context_id,
+        member_did,
+        caller_did,
+        reply: tx,
+    };
+    sup.dispatch_lifecycle_command(cmd)
         .await
+        .map_err(ScpError::from)?;
+    rx.await
+        .map_err(|e| ScpError::Context {
+            msg: format!("shim reply dropped: {e}"),
+            code: codes::CTX_2070.to_owned(),
+        })?
         .map_err(ScpError::from)
 }
 
 /// Revokes (removes) a member's access key from the context's access key
 /// store.
 ///
-/// Delegates to [`ContextManager::revoke_context_access_key`].
+/// Routed through the ADR-049 commit-9 lifecycle shim
+/// ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command)).
 ///
 /// # Errors
 ///
@@ -9558,17 +10010,31 @@ pub async fn access_key_revoke(
     member_did: String,
     caller_did: String,
 ) -> Result<(), ScpError> {
-    let manager = crate::runtime::context_manager_expect()?;
-    manager
-        .revoke_context_access_key(&context_id, &member_did, &caller_did)
+    use scp_core::context::actor::commands::LifecycleCommand;
+    let sup = crate::runtime::supervisor_expect()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = LifecycleCommand::RevokeContextAccessKey {
+        context_id,
+        member_did,
+        caller_did,
+        reply: tx,
+    };
+    sup.dispatch_lifecycle_command(cmd)
         .await
+        .map_err(ScpError::from)?;
+    rx.await
+        .map_err(|e| ScpError::Context {
+            msg: format!("shim reply dropped: {e}"),
+            code: codes::CTX_2071.to_owned(),
+        })?
         .map_err(ScpError::from)
 }
 
 /// Restores a member's access key by generating a new key at the next
 /// epoch.
 ///
-/// Delegates to [`ContextManager::restore_context_access_key`].
+/// Routed through the ADR-049 commit-9 lifecycle shim
+/// ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command)).
 ///
 /// # Errors
 ///
@@ -9580,10 +10046,23 @@ pub async fn access_key_restore(
     member_did: String,
     caller_did: String,
 ) -> Result<(), ScpError> {
-    let manager = crate::runtime::context_manager_expect()?;
-    manager
-        .restore_context_access_key(&context_id, &member_did, &caller_did)
+    use scp_core::context::actor::commands::LifecycleCommand;
+    let sup = crate::runtime::supervisor_expect()?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = LifecycleCommand::RestoreContextAccessKey {
+        context_id,
+        member_did,
+        caller_did,
+        reply: tx,
+    };
+    sup.dispatch_lifecycle_command(cmd)
         .await
+        .map_err(ScpError::from)?;
+    rx.await
+        .map_err(|e| ScpError::Context {
+            msg: format!("shim reply dropped: {e}"),
+            code: codes::CTX_2072.to_owned(),
+        })?
         .map_err(ScpError::from)
 }
 
@@ -9595,6 +10074,9 @@ pub async fn access_key_restore(
 ///
 /// Transitions from `Active` to `Expired`, destroys keys per memory scope.
 ///
+/// Routed through the ADR-049 commit-9 TTL-close shim
+/// ([`Supervisor::dispatch_ttl_close_command`](scp_core::context::supervisor::Supervisor::dispatch_ttl_close_command)).
+///
 /// # Errors
 ///
 /// Returns `ScpError::Context` if the context is not active.
@@ -9604,7 +10086,8 @@ pub async fn context_handle_ttl_expiry(handle: Arc<ContextHandle>) -> Result<(),
     crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
+            use scp_core::context::actor::commands::{TtlCloseCommand, TtlContextPayload};
+            let sup = crate::runtime::supervisor_expect()?;
             let core_handle = scp_core::context::ContextHandle::new(
                 handle.context_id.clone(),
                 scp_core::context::ContextParams::default(),
@@ -9612,9 +10095,23 @@ pub async fn context_handle_ttl_expiry(handle: Arc<ContextHandle>) -> Result<(),
             let _ = core_handle
                 .transition_to(&scp_core::context::ContextState::Active)
                 .await;
-            manager
-                .handle_ttl_expiry(&core_handle)
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = TtlCloseCommand::ExecuteTtlClose {
+                payload: Box::new(TtlContextPayload {
+                    context_id: core_handle.context_id().to_owned(),
+                    params: core_handle.params().clone(),
+                }),
+                reply: tx,
+            };
+            sup.dispatch_ttl_close_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            rx.await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("handle_ttl_expiry shim reply dropped: {e}"),
+                    code: codes::CTX_2038.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
 
             // Update the FFI handle state to reflect expiry.
@@ -9634,6 +10131,9 @@ pub async fn context_handle_ttl_expiry(handle: Arc<ContextHandle>) -> Result<(),
 ///
 /// Returns `true` if all members have consented (unanimous approval).
 ///
+/// Routed through the ADR-049 commit-9 TTL-close shim
+/// ([`Supervisor::dispatch_ttl_close_command`](scp_core::context::supervisor::Supervisor::dispatch_ttl_close_command)).
+///
 /// # Errors
 ///
 /// Returns `ScpError::Context` if the context is not registered or the
@@ -9647,12 +10147,25 @@ pub async fn context_propose_ttl_extension(
     crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
+            use scp_core::context::actor::commands::TtlCloseCommand;
+            let sup = crate::runtime::supervisor_expect()?;
             let did: scp_identity::DID = member_did.into();
             let duration = std::time::Duration::from_secs(proposed_seconds);
-            manager
-                .propose_ttl_extension(&handle.context_id, &did, duration)
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = TtlCloseCommand::ExtendTtl {
+                context_id: handle.context_id.clone(),
+                member_did: did,
+                proposed_duration: duration,
+                reply: tx,
+            };
+            sup.dispatch_ttl_close_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            rx.await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("propose_ttl_extension shim reply dropped: {e}"),
+                    code: codes::CTX_2039.to_owned(),
+                })?
                 .map_err(ScpError::from)
         })
         .await
@@ -9665,8 +10178,12 @@ pub async fn context_propose_ttl_extension(
 /// Resets the TTL timer after a successful unanimous extension.
 ///
 /// Cancels the old timer and spawns a new one with the given duration.
+///
+/// Routed through the ADR-049 commit-9 TTL-close shim
+/// ([`Supervisor::dispatch_ttl_close_command`](scp_core::context::supervisor::Supervisor::dispatch_ttl_close_command)).
 #[uniffi::export]
 pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u64) {
+    use scp_core::context::actor::commands::{TtlCloseCommand, TtlTimerPayload};
     let check: Result<(), ScpError> = (|| {
         crate::uniffi_check_handle!(handle);
         Ok(())
@@ -9674,7 +10191,7 @@ pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u6
     if check.is_err() {
         return;
     }
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
+    let Ok(sup) = crate::runtime::supervisor_expect() else {
         return;
     };
     let core_handle = scp_core::context::ContextHandle::new(
@@ -9685,9 +10202,18 @@ pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u6
         .transition_to(&scp_core::context::ContextState::Active)
         .await;
     let duration = std::time::Duration::from_secs(new_seconds);
-    manager
-        .reset_ttl_timer(&handle.context_id, duration, core_handle)
-        .await;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = TtlCloseCommand::ResetTtlTimer {
+        payload: Box::new(TtlTimerPayload {
+            context_id: core_handle.context_id().to_owned(),
+            params: core_handle.params().clone(),
+            duration,
+        }),
+        reply: tx,
+    };
+    if sup.dispatch_ttl_close_command(cmd).await.is_ok() {
+        let _ = rx.await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -9699,13 +10225,17 @@ pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u6
 /// Used for defense-in-depth validation in broadcast key request handling.
 /// Ensures the `ContextManager` is initialized (idempotent) since local DID
 /// registration is valid before any context exists.
+///
+/// Routes through the supervisor's direct `register_local_did` method — the
+/// local-DID set is supervisor-wide (no per-context command target).
 #[uniffi::export]
 pub async fn register_local_did(did: String) -> Result<(), ScpError> {
     validate_did(&did)?;
     crate::runtime::init_context_manager_with_did(&did);
-    let manager = crate::runtime::context_manager_expect()?;
-    manager.register_local_did(did.into()).await;
-    Ok(())
+    let sup = crate::runtime::supervisor_expect()?;
+    sup.register_local_did(did.into())
+        .await
+        .map_err(ScpError::from)
 }
 
 /// Returns `true` if the given DID is registered as locally controlled.
@@ -9722,70 +10252,11 @@ pub async fn is_local_did(did: String) -> bool {
     // DID-less `init_context_manager` path's permissiveness but now with a
     // real MLS credential identity.
     crate::runtime::init_context_manager_with_did(&did);
-    let Ok(manager) = crate::runtime::context_manager_expect() else {
+    let Ok(sup) = crate::runtime::supervisor_expect() else {
         return false;
     };
     let did_ref: scp_identity::DID = did.into();
-    manager.is_local_did(&did_ref).await
-}
-
-// ---------------------------------------------------------------------------
-// No-op validation trait stubs for subscribe_broadcast generic params
-//
-// These are minimal implementations satisfying the generic bounds on
-// ContextManager::subscribe_broadcast. Broadcast subscription in open mode
-// does not require UCAN validation; gated mode validation will be wired
-// when the full UCAN pipeline is integrated with the FFI layer.
-// ---------------------------------------------------------------------------
-
-pub(crate) struct NoOpDidResolver;
-impl scp_core::crypto::ucan::validate::DidResolver for NoOpDidResolver {
-    fn resolve_public_key(
-        &self,
-        _did: &str,
-    ) -> Result<[u8; 32], scp_core::crypto::ucan::UcanError> {
-        Err(scp_core::crypto::ucan::UcanError::MalformedToken(
-            "NoOpDidResolver: no DID resolution available".into(),
-        ))
-    }
-}
-
-pub(crate) struct NoOpNonceTracker;
-impl scp_core::crypto::ucan::validate::NonceTracker for NoOpNonceTracker {
-    fn check_replay(
-        &self,
-        _nonce: &str,
-        _token_expiry: u64,
-    ) -> Result<(), scp_core::crypto::ucan::UcanError> {
-        Ok(())
-    }
-
-    fn record(
-        &mut self,
-        _nonce: &str,
-        _token_expiry: u64,
-    ) -> Result<(), scp_core::crypto::ucan::UcanError> {
-        Ok(())
-    }
-}
-
-pub(crate) struct NoOpRevocationChecker;
-impl scp_core::crypto::ucan::validate::RevocationChecker for NoOpRevocationChecker {
-    fn is_revoked(&self, _token_cid: &str) -> bool {
-        false
-    }
-}
-
-pub(crate) struct NoOpProofResolver;
-impl scp_core::crypto::ucan::validate::ProofResolver for NoOpProofResolver {
-    fn resolve_proof(
-        &self,
-        cid: &str,
-    ) -> Result<scp_core::crypto::ucan::UcanToken, scp_core::crypto::ucan::UcanError> {
-        Err(scp_core::crypto::ucan::UcanError::DelegationChainBroken(
-            format!("NoOpProofResolver: no proof available for CID {cid}"),
-        ))
-    }
+    sup.is_local_did(&did_ref).await.unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -10435,6 +10906,9 @@ pub fn get_economic_policy(handle: Arc<ContextHandle>) -> Result<Option<String>,
 /// Returns the serialized bytes of a `StoredValue<ContextExport>` envelope
 /// (§17.5), suitable for backup, migration, or transfer to another node.
 ///
+/// Routed through the ADR-049 commit-9 lifecycle shim
+/// ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command)).
+///
 /// # Errors
 ///
 /// Returns `ScpError::Context` if the context does not exist, export fails,
@@ -10446,10 +10920,23 @@ pub async fn context_export(handle: Arc<ContextHandle>) -> Result<Vec<u8>, ScpEr
     let creator_did = handle.creator_did.clone();
     runtime()
         .spawn(async move {
-            let manager = crate::runtime::context_manager()?;
-            let export = manager
-                .export_context(&ctx_id, scp_identity::DID::from(creator_did))
+            use scp_core::context::actor::commands::LifecycleCommand;
+            let sup = crate::runtime::supervisor_expect()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = LifecycleCommand::ExportContext {
+                context_id: ctx_id,
+                exporter_did: scp_identity::DID::from(creator_did),
+                reply: tx,
+            };
+            sup.dispatch_lifecycle_command(cmd)
                 .await
+                .map_err(ScpError::from)?;
+            let export = rx
+                .await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("export_context shim reply dropped: {e}"),
+                    code: codes::CTX_2030.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
             scp_core::context::export_import::serialize_export(&export).map_err(|e| {
                 ScpError::Context {
@@ -10480,6 +10967,7 @@ pub async fn context_export(handle: Arc<ContextHandle>) -> Result<Vec<u8>, ScpEr
 pub async fn context_import(data: Vec<u8>) -> Result<String, ScpError> {
     runtime()
         .spawn(async move {
+            use scp_core::context::actor::commands::LifecycleCommand;
             let export =
                 scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
                     ScpError::Context {
@@ -10497,12 +10985,24 @@ pub async fn context_import(data: Vec<u8>) -> Result<String, ScpError> {
             validate_did(&export.exporter_did.0)?;
             crate::runtime::init_context_manager_with_did(&export.exporter_did.0);
 
-            let manager = crate::runtime::context_manager()?;
+            // Route through the ADR-049 commit-9 lifecycle shim.
+            let sup = crate::runtime::supervisor_expect()?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = LifecycleCommand::ImportContext {
+                export: Box::new(export),
+                reply: tx,
+            };
             // Box::pin — `import_context` builds a large `PerContextState`
             // in-place (ADR-049 commit 12c.2 hoist); the resulting future
             // crosses clippy's 16 KB stack budget without heap-boxing.
-            Box::pin(manager.import_context(export))
+            Box::pin(sup.dispatch_lifecycle_command(cmd))
                 .await
+                .map_err(ScpError::from)?;
+            rx.await
+                .map_err(|e| ScpError::Context {
+                    msg: format!("import_context shim reply dropped: {e}"),
+                    code: codes::CTX_2032.to_owned(),
+                })?
                 .map_err(ScpError::from)?;
             Ok(context_id)
         })

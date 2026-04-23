@@ -14,16 +14,16 @@ The manager is initialized via `init_context_manager_with_did(local_did)` with a
 
 Bridge functions access the manager via `crate::runtime::context_manager()`.
 
-### No-Op Validation Trait Stubs (`bridge.rs`)
+### Broadcast subscribe routes through the supervisor shim
 
-Four no-op adapter structs satisfy the generic bounds on `ContextManager::subscribe_broadcast`:
-
-| Adapter | Implements | Purpose |
-|---------|-----------|---------|
-| `NoOpDidResolver` | `DidResolver` | Returns error (no resolution in FFI layer) |
-| `NoOpNonceTracker` | `NonceTracker` | Always accepts (no replay prevention in FFI layer) |
-| `NoOpRevocationChecker` | `RevocationChecker` | Never revoked |
-| `NoOpProofResolver` | `ProofResolver` | Returns error (no proof resolution in FFI layer) |
+`broadcast_subscribe` no longer invokes the generic
+`ContextManager::subscribe_broadcast::<DidResolver, NonceTracker, RevocationChecker, ProofResolver>`
+typed path. After the ADR-049 commit-11 shim landed, the bridge routes
+through `Supervisor::dispatch_broadcast_command` with a
+`BroadcastCommand::SubscribeBroadcast` payload — the no-op
+UCAN-validation trait stubs (`NoOpDidResolver` / `NoOpNonceTracker` /
+`NoOpRevocationChecker` / `NoOpProofResolver`) were deleted once the
+typed callsite went away.
 
 ### Module Structure
 

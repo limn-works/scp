@@ -37,6 +37,11 @@ use std::path::PathBuf;
 /// The bare `bridge_instance()` string match is intentional: every call
 /// site — whether `?`-propagating, `.ok()`-downgrading, or chained —
 /// invokes the same lifecycle check inside `bridge_instance()` itself.
+///
+/// The `supervisor_expect()` / `supervisor_lenient()` entries correspond
+/// to the ADR-049 commit-9/10/11 shim paths — both resolve
+/// `DEFAULT_BRIDGE_INSTANCE` and invoke the same suspended/shutdown
+/// checks as `context_manager()`, so they're real lifecycle gates.
 const GATE_PATTERNS: &[&str] = &[
     "default_bridge_instance()",
     "bridge_instance()",
@@ -44,14 +49,24 @@ const GATE_PATTERNS: &[&str] = &[
     "context_manager().ok_or_else",
     "context_manager_expect()?",
     "= crate::runtime::context_manager_expect()",
+    "supervisor_expect()",
+    "supervisor_lenient()",
     "check_ready",
     "ensure_bridge_instance",
 ];
 
 /// Patterns that indicate a function body touches `ContextManager` state
 /// (Category A). The presence of any of these marks the function as
-/// stateful and therefore requires a gate.
-const CM_PATTERNS: &[&str] = &["context_manager()", "context_manager_expect()"];
+/// stateful and therefore requires a gate. `supervisor_expect()` /
+/// `supervisor_lenient()` are the ADR-049 shim-path equivalents — an
+/// export that resolves the supervisor is touching the same per-context
+/// state the manager-path exports do.
+const CM_PATTERNS: &[&str] = &[
+    "context_manager()",
+    "context_manager_expect()",
+    "supervisor_expect()",
+    "supervisor_lenient()",
+];
 
 /// Patterns that indicate a function body touches `CoreFields` state
 /// (Category B). Category A takes precedence over B when both patterns
