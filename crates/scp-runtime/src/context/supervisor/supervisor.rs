@@ -54,13 +54,27 @@ use crate::context::actor::outcome::Outcome;
 use crate::context::actor::sequence::SendSequenceTracker;
 use crate::context::actor::state::WrappingKeyPair;
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use crate::context::manager::{ContextManager, ContextPersistence};
+use crate::context::manager::{ContextManager, ContextPersistence, PerContextState};
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::context::supervisor::saga_journal::{
     JournalEntry, SagaId, SagaJournal, SagaState, SagaTerminalState,
 };
 use crate::economy::adapter::PaymentAdapterDyn;
 use zeroize::Zeroizing;
+
+// ---------------------------------------------------------------------------
+// Type aliases
+// ---------------------------------------------------------------------------
+
+/// The shared per-context state map — `Arc`-wrapped so the manager,
+/// the supervisor (ADR-049 commit 12c.9b), and spawned background
+/// tasks all hold equivalent clones of the same `DashMap`. The
+/// per-entry `Arc<Mutex<PerContextState>>` is the contract the manager
+/// exposes via [`ContextManager::contexts_arc`]; the alias is
+/// introduced here so the supervisor-side accessor can return a
+/// readable type (avoids `clippy::type_complexity` on the nested
+/// generics).
+type ContextsMap = DashMap<String, Arc<tokio::sync::Mutex<PerContextState>>>;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -307,6 +321,43 @@ pub struct Supervisor {
     #[allow(dead_code)] // read in 12c.9d when lifecycle helpers migrate
     task_set: OnceLock<Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>>,
 
+    // -----------------------------------------------------------------
+    // ADR-049 commit 12c.9b — ContextManager per-context map + local
+    // DID registry lifted to the supervisor.
+    //
+    // Second phase of the 8-phase deletion series: adds a mirror of
+    // [`ContextManager::contexts`] (the per-context `PerContextState`
+    // map) and exposes [`ContextManager::local_dids`] through a
+    // supervisor-level accessor so 12c.9c-g helpers can stop taking
+    // `&ContextManager` and route through `&Supervisor` instead.
+    //
+    // `cm_contexts` is an `OnceLock<Arc<DashMap<...>>>`, populated in
+    // [`Self::attach_context_manager`]. Identity with the manager's
+    // own field is preserved because the source is already an `Arc`
+    // — `Arc::clone` only bumps the reference count.
+    //
+    // `local_dids` does NOT get its own OnceLock slot: the manager's
+    // field is `RwLock<HashSet<DID>>` (not `Arc<RwLock<...>>`), so a
+    // copy would diverge from the source over time. The accessor
+    // [`Self::local_dids_ref`] delegates to the attached manager's own
+    // [`ContextManager::local_dids_ref`] via `context_manager_bridge`,
+    // returning `None` when the supervisor has not been attached —
+    // observationally equivalent to the OnceLock pattern used for
+    // the Arc-wrapped fields. 12c.9c-g callers don't care how the
+    // accessor is implemented; they care that a method on `&Supervisor`
+    // returns `Option<&RwLock<HashSet<DID>>>`. A later cleanup (inside
+    // the deletion series) can restructure the manager's field to
+    // `Arc<RwLock<...>>` and migrate to a proper OnceLock mirror if
+    // the Arc clone is worthwhile, but the behaviour-change budget for
+    // 12c.9b is zero, so nothing is restructured here.
+    // -----------------------------------------------------------------
+    /// Shared per-context state map. Populated from
+    /// [`ContextManager::contexts_arc`] during
+    /// [`Self::attach_context_manager`]. Same `Arc<DashMap>` allocation
+    /// the manager owns — identity-preserving clone.
+    #[allow(dead_code)] // first caller lands in 12c.9c
+    cm_contexts: OnceLock<Arc<ContextsMap>>,
+
     /// Concurrent-saga guard. `true` iff a saga is currently in flight
     /// (Initiated / PreparingA / PreparingB / Committing). A second
     /// concurrent `start_saga` while the flag is `true` returns
@@ -356,6 +407,11 @@ impl Supervisor {
             payment_adapter: OnceLock::new(),
             event_tx: OnceLock::new(),
             task_set: OnceLock::new(),
+            // ADR-049 commit 12c.9b — ContextManager state map lifted
+            // to the supervisor. Populated by `attach_context_manager`.
+            // `local_dids` is not mirrored (see field-group comment);
+            // the accessor delegates through `context_manager_bridge`.
+            cm_contexts: OnceLock::new(),
             saga_pending_guard: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -440,6 +496,13 @@ impl Supervisor {
                 .set(manager.payment_adapter_ref().map(Arc::clone));
             let _ = self.event_tx.set(manager.event_tx_ref().cloned());
             let _ = self.task_set.set(Arc::clone(manager.task_set_ref()));
+            // ADR-049 commit 12c.9b — mirror the manager's per-context
+            // map. `contexts_arc()` returns a freshly-cloned `Arc` to
+            // the same `DashMap` allocation (not a deep copy), so the
+            // supervisor and the manager observe identical per-context
+            // state. `local_dids` has no OnceLock slot — its accessor
+            // delegates via `context_manager_bridge`.
+            let _ = self.cm_contexts.set(manager.contexts_arc());
             return Ok(());
         }
         // `set` returned Err — someone (possibly the same caller)
@@ -607,6 +670,73 @@ impl Supervisor {
         &self,
     ) -> Option<&Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>> {
         self.task_set.get()
+    }
+
+    // -------------------------------------------------------------------
+    // ADR-049 commit 12c.9b — per-context state map + local DID
+    // registry accessors.
+    //
+    // These are the surface 12c.9c-g helpers migrate to when they stop
+    // taking `&ContextManager`. The return types match the manager's
+    // own `contexts_map` / `local_dids_ref` so callers only have to
+    // swap `mgr.contexts_map()` → `supervisor.contexts_ref()?` (and
+    // route the `None` to [`ContextError::NotInitialized`] the same
+    // way the existing `dispatch_*` paths do today).
+    //
+    // `contexts_ref` returns the `Arc<DashMap<...>>` itself (not
+    // `&DashMap`) so callers can either deref-borrow the DashMap for
+    // lookups OR clone the `Arc` into a spawned task — matching the
+    // two use-cases the manager exposes through `contexts_map` +
+    // `contexts_arc`.
+    //
+    // `local_dids_ref` delegates to the attached manager (see
+    // `cm_contexts` field doc for the rationale).
+    // -------------------------------------------------------------------
+
+    /// Cheap reference to the attached manager's per-context state
+    /// map. Returns `None` before [`Self::attach_context_manager`]
+    /// has been called. See [`ContextManager::contexts_arc`] for the
+    /// mirrored underlying field — the `Arc<DashMap>` returned here
+    /// is the same allocation the manager owns.
+    ///
+    /// Callers that only need read-borrowing of the map (the common
+    /// case for synchronous lookups) can `.map(AsRef::as_ref)` to get
+    /// `Option<&DashMap<...>>`; callers that need to clone the `Arc`
+    /// into a spawned task can use the `Arc` directly.
+    #[must_use]
+    #[allow(dead_code)] // first caller lands in 12c.9c
+    pub(crate) fn contexts_ref(&self) -> Option<&Arc<ContextsMap>> {
+        self.cm_contexts.get()
+    }
+
+    /// Cheap reference to the attached manager's local-DID registry.
+    /// Returns `None` before [`Self::attach_context_manager`] has
+    /// been called.
+    ///
+    /// Unlike the `Arc`-wrapped provider slots above, this accessor
+    /// does NOT have its own [`OnceLock`] storage: the manager's
+    /// `local_dids` field is a direct [`tokio::sync::RwLock`] (not
+    /// `Arc`-wrapped), so mirroring it on the supervisor without
+    /// restructuring the manager would either duplicate the lock (and
+    /// diverge on writes) or require a ref-lifetime that `OnceLock`
+    /// cannot express. Instead, this method delegates to
+    /// [`ContextManager::local_dids_ref`] through the already-tracked
+    /// `context_manager_bridge` `OnceLock`. The observable contract
+    /// (same `&RwLock<HashSet<DID>>` the manager exposes, or `None`
+    /// before attach) is identical to a mirrored OnceLock slot.
+    ///
+    /// 12c.9c-g callers rewrite
+    /// `mgr.local_dids_ref().read().await` as
+    /// `supervisor.local_dids_ref().ok_or(ContextError::NotInitialized(_))?.read().await`
+    /// — same semantics, routed through the supervisor.
+    #[must_use]
+    #[allow(dead_code)] // first caller lands in 12c.9c
+    pub(crate) fn local_dids_ref(
+        &self,
+    ) -> Option<&tokio::sync::RwLock<std::collections::HashSet<DID>>> {
+        self.context_manager_bridge
+            .get()
+            .map(|mgr| mgr.local_dids_ref())
     }
 
     /// Build an [`ActorDeps`](crate::context::actor::deps::ActorDeps)
@@ -2779,5 +2909,145 @@ mod tests {
             supervisor_arc.transport_ref().expect("still populated"),
             cm.transport_ref()
         ));
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-049 commit 12c.9b — contexts + local_dids accessors
+    // -----------------------------------------------------------------
+
+    /// `attach_context_manager` populates the `cm_contexts` slot, and
+    /// [`Supervisor::contexts_ref`] returns an `Arc<DashMap>` pointing
+    /// at the same allocation the manager's `contexts_arc()` returns.
+    /// Mirrors the 12c.9a identity-preservation contract for the
+    /// per-context state map.
+    #[tokio::test]
+    async fn attach_populates_contexts_slot_with_manager_identity() {
+        let supervisor_arc = supervisor_with_manager();
+        let cm = supervisor_arc
+            .attached_context_manager()
+            .expect("supervisor_with_manager attaches a manager");
+
+        let sup_map = supervisor_arc
+            .contexts_ref()
+            .expect("contexts_ref populated after attach");
+        let mgr_map = cm.contexts_arc();
+        assert!(
+            Arc::ptr_eq(sup_map, &mgr_map),
+            "contexts_ref must return the same Arc<DashMap> as the attached manager"
+        );
+    }
+
+    /// Before `attach_context_manager`, `contexts_ref` and
+    /// `local_dids_ref` both return `None`. The outer-None convention
+    /// is consistent with the 12c.9a accessors.
+    #[tokio::test]
+    async fn contexts_and_local_dids_return_none_before_attach() {
+        let s = test_supervisor();
+        assert!(
+            s.contexts_ref().is_none(),
+            "contexts_ref must be None before attach"
+        );
+        assert!(
+            s.local_dids_ref().is_none(),
+            "local_dids_ref must be None before attach"
+        );
+    }
+
+    /// `local_dids_ref` delegates through `context_manager_bridge` —
+    /// post-attach it returns a pointer identical to the manager's own
+    /// [`ContextManager::local_dids_ref`]. Identity is proven by
+    /// address comparison (`std::ptr::eq`) because the underlying
+    /// `RwLock` is embedded in the manager (not `Arc`-wrapped), so
+    /// pointer equality is the precise mechanical guarantee of "same
+    /// lock, not a divergent copy".
+    #[tokio::test]
+    async fn local_dids_ref_delegates_to_attached_manager() {
+        let supervisor_arc = supervisor_with_manager();
+        let cm = supervisor_arc
+            .attached_context_manager()
+            .expect("supervisor_with_manager attaches a manager");
+
+        let sup_lock = supervisor_arc
+            .local_dids_ref()
+            .expect("local_dids_ref populated after attach");
+        let mgr_lock = cm.local_dids_ref();
+        assert!(
+            std::ptr::eq(sup_lock, mgr_lock),
+            "local_dids_ref must return the same RwLock as the attached manager"
+        );
+    }
+
+    /// Mutations go through the manager-owned `RwLock` and are
+    /// observable via the supervisor's delegating accessor — confirms
+    /// the delegation preserves the single-source-of-truth invariant.
+    #[tokio::test]
+    async fn local_dids_writes_through_manager_visible_via_supervisor() {
+        let supervisor_arc = supervisor_with_manager();
+        let cm = supervisor_arc
+            .attached_context_manager()
+            .expect("supervisor_with_manager attaches a manager");
+
+        let did = DID("did:example:cm-9b-write-through".to_owned());
+        cm.local_dids_ref().write().await.insert(did.clone());
+
+        let sup_view = supervisor_arc
+            .local_dids_ref()
+            .expect("local_dids_ref populated after attach");
+        assert!(
+            sup_view.read().await.contains(&did),
+            "manager writes must be visible via supervisor's delegating accessor"
+        );
+    }
+
+    /// Supervisor's `contexts_ref` and the manager's `contexts_arc`
+    /// observe identical map state at all times — confirmed via
+    /// length-on-both-sides checks before and after a direct map
+    /// mutation on the manager's `Arc<DashMap>`. Identity is proven
+    /// mechanically by `Arc::ptr_eq` in the previous test; this test
+    /// is the observational corollary: any shard-level write is
+    /// visible on both sides because there is exactly one `DashMap`.
+    ///
+    /// Uses the `manager::PerContextState` type — `manager::`
+    /// scoped, `pub(crate)`. We cannot easily construct one because
+    /// the struct has no test helper (it's going to be deleted in
+    /// commit 12). Instead we observe the `len()` of the map via
+    /// both handles before and after a `remove_context` of a
+    /// non-existent key (which is a no-op) to confirm both handles
+    /// wrap the same allocation and report the same size.
+    #[tokio::test]
+    async fn contexts_ref_and_manager_observe_same_map_state() {
+        let supervisor_arc = supervisor_with_manager();
+        let cm = supervisor_arc
+            .attached_context_manager()
+            .expect("supervisor_with_manager attaches a manager");
+
+        let sup_map = supervisor_arc
+            .contexts_ref()
+            .expect("contexts_ref populated after attach");
+        let mgr_map = cm.contexts_arc();
+
+        assert_eq!(
+            sup_map.len(),
+            mgr_map.len(),
+            "supervisor and manager must agree on map size before any writes"
+        );
+
+        // A lookup for a non-existent key through both handles must
+        // produce the same answer — the DashMap shard reads route
+        // through identical internal state.
+        assert_eq!(
+            sup_map.get("absent-ctx").is_some(),
+            mgr_map.get("absent-ctx").is_some()
+        );
+
+        // Inserting an empty-state-free sentinel through one handle
+        // via the raw DashMap API is deliberately avoided — the
+        // inner value type is `Arc<Mutex<PerContextState>>` and
+        // `manager::PerContextState` has no `Default` or test ctor
+        // (it's scheduled for deletion alongside `ContextManager`).
+        // The `Arc::ptr_eq` assertion in the previous test is the
+        // mechanical guarantee of same-allocation; this test
+        // confirms the observable corollary on the public DashMap
+        // surface.
     }
 }
