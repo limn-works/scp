@@ -155,6 +155,30 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
     }
 }
 
+/// Snapshots the hex-encoded Ed25519 verifying-key bytes for the identity's
+/// `#0` (DID-deriving) signing key. Used by every `Identity` constructor to
+/// populate the ADR-046 parity-testing field — two bridges generating an
+/// identity under the same deterministic `seed` produce byte-identical
+/// hex output here.
+///
+/// Intentionally swallows errors (`.ok()`) because a missing verifying-key
+/// only disables the parity-harness assertion; the rest of the identity
+/// remains usable. Nine call-sites across identity construction
+/// (`create`, `rotate_active_key`, `add_agent_key`, `rotate_agent_key`,
+/// `remove_agent_key`, `identity_migrate` in-memory arm,
+/// `identity_migrate` callback arm, `identity_create_with_custody`,
+/// `identity_create_with_agent_key`) delegate here.
+async fn snapshot_verifying_key_hex<C: KeyCustody>(
+    custody: &C,
+    key: &KeyHandle,
+) -> Option<String> {
+    custody
+        .public_key(key)
+        .await
+        .ok()
+        .map(|pk| hex::encode(pk.as_bytes()))
+}
+
 /// Creates a `DidDht` instance with a signing function derived from the
 /// custody held inside an [`OpaqueInMemoryKeyCustody`].
 ///
@@ -1500,11 +1524,8 @@ impl Identity {
                 .await
                 .map_err(ScpError::from)?;
 
-            let verifying_key_hex = callback
-                .public_key(&new_identity.identity_key)
-                .await
-                .ok()
-                .map(|pk| hex::encode(pk.as_bytes()));
+            let verifying_key_hex =
+                snapshot_verifying_key_hex(callback.as_ref(), &new_identity.identity_key).await;
 
             let handle = Arc::new(Self {
                 did: new_identity.did.clone(),
@@ -1529,12 +1550,8 @@ impl Identity {
                 .await
                 .map_err(ScpError::from)?;
 
-            let verifying_key_hex = custody
-                .0
-                .public_key(&new_identity.identity_key)
-                .await
-                .ok()
-                .map(|pk| hex::encode(pk.as_bytes()));
+            let verifying_key_hex =
+                snapshot_verifying_key_hex(&custody.0, &new_identity.identity_key).await;
 
             let handle = Arc::new(Self {
                 did: new_identity.did.clone(),
@@ -1673,12 +1690,8 @@ impl Identity {
                         .await
                         .map_err(ScpError::from)?;
 
-                    let verifying_key_hex = custody
-                        .0
-                        .public_key(&updated_identity.identity_key)
-                        .await
-                        .ok()
-                        .map(|pk| hex::encode(pk.as_bytes()));
+                    let verifying_key_hex =
+                        snapshot_verifying_key_hex(&custody.0, &updated_identity.identity_key).await;
 
                     let handle = Arc::new(Self {
                         did,
@@ -1774,12 +1787,8 @@ impl Identity {
                         .await
                         .map_err(ScpError::from)?;
 
-                    let verifying_key_hex = custody_for_key
-                        .0
-                        .public_key(&updated_identity.identity_key)
-                        .await
-                        .ok()
-                        .map(|pk| hex::encode(pk.as_bytes()));
+                    let verifying_key_hex =
+                        snapshot_verifying_key_hex(&custody_for_key.0, &updated_identity.identity_key).await;
 
                     let handle = Arc::new(Self {
                         did,
@@ -1872,12 +1881,8 @@ impl Identity {
                         .await
                         .map_err(ScpError::from)?;
 
-                    let verifying_key_hex = custody
-                        .0
-                        .public_key(&updated_identity.identity_key)
-                        .await
-                        .ok()
-                        .map(|pk| hex::encode(pk.as_bytes()));
+                    let verifying_key_hex =
+                        snapshot_verifying_key_hex(&custody.0, &updated_identity.identity_key).await;
 
                     let handle = Arc::new(Self {
                         did,
@@ -6892,12 +6897,8 @@ impl Scp {
                                 dht.create(&key_custody.0).await.map_err(ScpError::from)?;
 
                             // Snapshot the #0 (identity) verifying key for ADR-046 parity.
-                            let verifying_key_hex = key_custody
-                                .0
-                                .public_key(&identity.identity_key)
-                                .await
-                                .ok()
-                                .map(|pk| hex::encode(pk.as_bytes()));
+                            let verifying_key_hex =
+                                snapshot_verifying_key_hex(&key_custody.0, &identity.identity_key).await;
 
                             // Initialize the production DID resolver for UCAN
                             // validation on this instance (H4 — matching
@@ -6990,11 +6991,8 @@ impl Scp {
                     .map_err(ScpError::from)?;
 
                 // Snapshot the #0 (identity) verifying key for ADR-046 parity.
-                let verifying_key_hex = callback_custody
-                    .public_key(&identity.identity_key)
-                    .await
-                    .ok()
-                    .map(|pk| hex::encode(pk.as_bytes()));
+                let verifying_key_hex =
+                    snapshot_verifying_key_hex(callback_custody.as_ref(), &identity.identity_key).await;
 
                 // Initialize the production DID resolver for UCAN validation
                 // on this instance.
@@ -12650,11 +12648,8 @@ impl Scp {
                         .map_err(ScpError::from)?;
 
                     let new_did = new_identity.did.clone();
-                    let verifying_key_hex = cc
-                        .public_key(&new_identity.identity_key)
-                        .await
-                        .ok()
-                        .map(|pk| hex::encode(pk.as_bytes()));
+                    let verifying_key_hex =
+                        snapshot_verifying_key_hex(cc.as_ref(), &new_identity.identity_key).await;
                     let handle = Arc::new(Identity {
                         did: new_identity.did.clone(),
                         custody_type,
@@ -12748,12 +12743,8 @@ impl Scp {
                                 .map_err(ScpError::from)?;
 
                             // Snapshot the #0 verifying key for ADR-046 parity.
-                            let verifying_key_hex = key_custody
-                                .0
-                                .public_key(&identity.identity_key)
-                                .await
-                                .ok()
-                                .map(|pk| hex::encode(pk.as_bytes()));
+                            let verifying_key_hex =
+                                snapshot_verifying_key_hex(&key_custody.0, &identity.identity_key).await;
 
                             // Initialize the production DID resolver for UCAN
                             // validation on this instance.

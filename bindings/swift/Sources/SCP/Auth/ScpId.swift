@@ -177,7 +177,7 @@ public enum ScpId {
     public static let defaultChallenge: ChallengeFn = { _, _ in
         throw ScpError.Validation(
             msg: "scpidChallenge default is not wired after façade deletion — pass an SCP-bound closure (see SCP.scpidChallenge)",
-            code: "SCP-VALID-7300"
+            code: "SCP-IDENT-1046"
         )
     }
 
@@ -187,7 +187,7 @@ public enum ScpId {
     public static let defaultSign: SignFn = { _, _, _ in
         throw ScpError.Validation(
             msg: "scpidSign default is not wired after façade deletion — pass an SCP-bound closure (see SCP.scpidSign)",
-            code: "SCP-VALID-7300"
+            code: "SCP-IDENT-1046"
         )
     }
 
@@ -200,7 +200,7 @@ public enum ScpId {
     public static let defaultVerify: VerifyFn = { _, _ in
         throw ScpError.Validation(
             msg: "scpidVerify default is not wired after façade deletion — pass an SCP-bound closure (see SCP.scpidVerify)",
-            code: "SCP-VALID-7300"
+            code: "SCP-IDENT-1046"
         )
     }
 

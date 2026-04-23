@@ -1301,6 +1301,12 @@ impl CoreFields {
         // their partial sockets torn down (#1696) rather than ending up
         // as unowned `NativeRelayAdapter` instances.
         let mut results: Vec<(String, Result<_, _>)> = Vec::new();
+        // Track the first panic so callers don't see a silent success when
+        // every spawned dial task panicked (leaving `results` empty).
+        // Without this, `install_reconnected_adapters` would return
+        // `Ok(())` despite no adapters being installed — a split-brain
+        // where `resume()` reports success but transport is broken.
+        let mut first_panic_failure: Option<LifecycleError> = None;
         loop {
             tokio::select! {
                 biased;
@@ -1325,12 +1331,20 @@ impl CoreFields {
                                 "reconnect_transport_if_pending: spawned task panicked — \
                                  ignoring this URL for this reconnect cycle"
                             );
+                            if first_panic_failure.is_none() {
+                                first_panic_failure = Some(LifecycleError::ReconnectFailed {
+                                    url: String::new(),
+                                    reason: format!(
+                                        "spawned reconnect task panicked: {join_err}"
+                                    ),
+                                });
+                            }
                         }
                     }
                 }
             }
         }
-        self.install_reconnected_adapters(results, &cancel)
+        self.install_reconnected_adapters(results, &cancel, first_panic_failure)
     }
 
     /// Sorts the per-URL dial outcomes, registers the successful adapters
@@ -1346,13 +1360,17 @@ impl CoreFields {
             Result<scp_transport::native::adapter::NativeRelayAdapter, String>,
         )>,
         cancel: &tokio_util::sync::CancellationToken,
+        first_panic_failure: Option<LifecycleError>,
     ) -> Result<(), LifecycleError> {
         // Sort by URL before registering adapters so the adapter ordering
         // inside `TransportManager` is deterministic regardless of
         // network-timing jitter across the spawned tasks.
         results.sort_by(|a, b| a.0.cmp(&b.0));
         let mut manager = scp_transport::TransportManager::builder();
-        let mut first_failure: Option<LifecycleError> = None;
+        // Seed `first_failure` with any panic the outer loop captured so
+        // a silent-success path can't swallow the case where every
+        // spawned task panicked (empty `results`, no per-URL failure).
+        let mut first_failure: Option<LifecycleError> = first_panic_failure;
         let mut connected_count = 0_usize;
         for (url, outcome) in results {
             match outcome {
