@@ -104,6 +104,17 @@ use crate::context::builder::ContextEventLogProvider;
 use crate::context::manager::{
     self, ContextManager, PSEUDONYM_ANNOUNCEMENT_TAG, PerContextState, PseudonymAnnouncement,
 };
+use crate::context::supervisor::Supervisor;
+
+/// Shared expectation message for `Supervisor::attached_context_manager()`
+/// and `Supervisor::*_ref()` accessors inside helpers. The attach-time
+/// contract (see
+/// [`Supervisor::attach_context_manager`](crate::context::supervisor::Supervisor::attach_context_manager))
+/// installs the manager (and lifts every provider slot) before any FFI
+/// caller or test can invoke a helper, so unwrap is panic-only under a
+/// contract violation.
+const ATTACHED_EXPECT: &str = "messaging_helpers: Supervisor must be fully attached before helper invocation \
+     (set by Supervisor::attach_context_manager during bridge construction)";
 
 /// Alias for the broadcast channel used to fan out [`ContextEvent`]s to
 /// external subscribers (webhook dispatcher, SDK event streams).
@@ -603,7 +614,7 @@ pub fn run_buffered_post_delivery(
 #[allow(clippy::too_many_arguments)] // Hoisted body retains the legacy signature plus explicit collaborators per task spec.
 #[allow(clippy::significant_drop_tightening)] // Legacy body held guards across await points deliberately — narrowing changes lock-ordering semantics.
 pub async fn send_message(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     clock: &Arc<dyn Clock>,
     key_resolver: &KeyResolver,
     handle: &ContextHandle,
@@ -613,6 +624,9 @@ pub async fn send_message(
     source_provenance: Option<&SourceContextInfo>,
     spending_ucan: Option<&UcanToken>,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
     // Routing ID computation is deferred to Phase 1 (under lock) where
@@ -904,20 +918,33 @@ pub async fn send_message(
 /// forwarder in `ContextManager::deliver_incoming` calls this function
 /// with `self` as `mgr` and `&self.clock` / `&self.key_resolver` as the
 /// explicit collaborators.
-#[allow(clippy::significant_drop_tightening)] // Legacy body held guards across await points deliberately — narrowing changes lock-ordering semantics.
+#[allow(clippy::significant_drop_tightening)]
+// Legacy body held guards across await points deliberately — narrowing changes lock-ordering semantics.
+#[allow(
+    clippy::too_many_lines,
+    reason = "verbatim hoist of the legacy receive path — splitting would \
+              fragment the three-phase decrypt/verify/deliver pipeline"
+)]
 pub async fn deliver_incoming(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     clock: &Arc<dyn Clock>,
     key_resolver: &KeyResolver,
     context_id: &str,
     encrypted_blob: &[u8],
 ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
     // Phase 1: state check + read local member DID + access key.
     // Read local_dids FIRST (RwLock read, low contention) to avoid
     // nested lock ordering issues with the contexts Mutex.
-    let local_dids = mgr.local_dids_ref().read().await;
+    let local_dids = supervisor
+        .local_dids_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .read()
+        .await;
     let (local_member_did, access_key) = {
         let ctx_arc = mgr
             .get_context_arc_pub(context_id)
@@ -1091,12 +1118,12 @@ pub async fn deliver_incoming(
 /// Byte-identical to the legacy
 /// [`ContextManager::encrypt_and_send`](crate::context::manager::ContextManager::encrypt_and_send)
 /// method form. The `self.transport.send_message(rid, &encrypted)`
-/// call becomes `mgr.transport_ref().send_message(rid, &encrypted)` —
+/// call becomes `supervisor.transport_ref().ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?.send_message(rid, &encrypted)` —
 /// the literal `.send_message(` call-text is preserved so pipeline
 /// wiring assertions continue to match.
 #[allow(clippy::too_many_arguments)] // Retains legacy method signature plus explicit `mgr` param per ADR-049 §12c.1b.
 pub fn encrypt_and_send(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     broadcast_envelope: Option<BroadcastEnvelope>,
     signing_key: Option<&ed25519_dalek::SigningKey>,
     context_id: &str,
@@ -1116,8 +1143,12 @@ pub fn encrypt_and_send(
             ContextError::CryptoFailed("signing key required for encrypted send".into())
         })?;
         let result = build_encrypted_envelope(
-            mgr.clock_ref(),
-            mgr.crypto_ref(),
+            supervisor
+                .clock_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+            supervisor
+                .crypto_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
             context_id,
             sender_did,
             payload,
@@ -1137,7 +1168,11 @@ pub fn encrypt_and_send(
     let mut last_err = None;
     let mut any_success = false;
     for rid in routing_ids {
-        match mgr.transport_ref().send_message(rid, &encrypted) {
+        match supervisor
+            .transport_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .send_message(rid, &encrypted)
+        {
             Ok(()) => {
                 any_success = true;
                 crate::metrics::record_message_sent();
@@ -1179,10 +1214,13 @@ pub fn encrypt_and_send(
 ///
 /// Byte-identical to the legacy method form.
 pub async fn authorize_send_payment(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     sender_did: &DID,
 ) -> Result<Option<manager::economy::PaidActionAuthorization>, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     mgr.authorize_paid_action(
         scp_protocol::economy::types::PaidActionType::MessageSend,
         sender_did,
@@ -1219,12 +1257,24 @@ pub async fn authorize_send_payment(
 ///
 /// Byte-identical to the legacy method form.
 pub async fn capture_send_payment(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     auth: Option<manager::economy::PaidActionAuthorization>,
     sender_did: &DID,
     context_id: &str,
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
 ) {
+    // ADR-049 commit 12c.9c — `capture_send_payment` returns `()` so
+    // an unpopulated attach slot degrades to a no-op. The attach
+    // contract guarantees the slot is populated at call time; the
+    // early-return is defense-in-depth against a contract violation.
+    let Some(mgr) = supervisor.attached_context_manager() else {
+        tracing::error!(
+            context_id,
+            "capture_send_payment: Supervisor is not attached — \
+             skipping payment capture (contract violation; see ADR-049 commit 12c.9c)"
+        );
+        return;
+    };
     if let Some(a) = auth
         && let Err(e) = mgr.complete_paid_action(a, sender_did, context_id).await
     {
@@ -1273,7 +1323,7 @@ pub async fn capture_send_payment(
 #[allow(clippy::too_many_arguments)] // Retains legacy method signature plus explicit `mgr` param per ADR-049 §12c.1b.
 #[allow(clippy::significant_drop_tightening)] // Legacy body held `relock_context` guard across await points deliberately — narrowing changes lock-ordering semantics.
 pub async fn finalize_send(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     sender_did: &DID,
@@ -1282,19 +1332,24 @@ pub async fn finalize_send(
     signing_key: Option<&ed25519_dalek::SigningKey>,
     ctx_gen: &manager::ContextGeneration,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // M12: Append event log BEFORE consequence evaluation so that
     // event_log_entries_for_consequences sees the current event.
     // Periodic consequence timers only read from the event log (not
     // the receive buffer), so the event must be persisted first.
-    mgr.event_log_ref().append_context_event(
-        context_id_bytes,
-        "MessageSent",
-        sender_did.as_ref(),
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(context_id_bytes, "MessageSent", sender_did.as_ref())?;
     // Phase 3 reacquire with generation check — detects if the context
     // was removed and recreated between Phase 1 and Phase 3.
     {
-        let now = mgr.clock_ref().now_secs();
+        let now = supervisor
+            .clock_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .now_secs();
         if let Ok(mut guard) = mgr.relock_context(ctx_gen).await {
             let ctx = &mut *guard;
             if manager::require_active(&ctx.handle).is_err() {
@@ -1308,7 +1363,7 @@ pub async fn finalize_send(
                 sequence_number: sequence,
                 payload: payload.to_vec(),
             };
-            ctx.emit_event(sent_event, context_id, mgr.event_tx_ref());
+            ctx.emit_event(sent_event, context_id, supervisor.event_tx_ref());
 
             // Velocity already recorded in send_message Phase 1 (M4: before
             // economy enforcement). No duplicate record_message here.
@@ -1323,7 +1378,9 @@ pub async fn finalize_send(
                 ctx,
                 context_id,
                 now,
-                &**mgr.event_log_ref(),
+                &**supervisor
+                    .event_log_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
             );
             let consequence_rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
             // evaluate_consequence_rules is called as an expression_statement
@@ -1342,9 +1399,13 @@ pub async fn finalize_send(
                     now,
                     triggered: &send_triggered,
                     rules: &consequence_rules,
-                    clock: &**mgr.clock_ref(),
-                    event_log: &**mgr.event_log_ref(),
-                    event_tx: mgr.event_tx_ref(),
+                    clock: &**supervisor
+                        .clock_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                    event_log: &**supervisor
+                        .event_log_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                    event_tx: supervisor.event_tx_ref(),
                 },
             );
 
@@ -1414,16 +1475,21 @@ pub async fn finalize_send(
 ///
 /// Byte-identical to the legacy method form. Pipeline-wiring assertion
 /// `fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", ".open(")`
-/// is satisfied because `mgr.crypto_ref().open(...)` preserves the
+/// is satisfied because `supervisor.crypto_ref().ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?.open(...)` preserves the
 /// literal `.open(` text.
 pub fn decrypt_and_dispatch(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     encrypted_blob: &[u8],
 ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
+    // `mgr` is unused in this helper post-12c.9c (crypto is reached via
+    // `supervisor.crypto_ref()`); the derivation is omitted.
     let decrypt_start = std::time::Instant::now();
-    let open_result = mgr.crypto_ref().open(context_id_bytes, encrypted_blob)?;
+    let open_result = supervisor
+        .crypto_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .open(context_id_bytes, encrypted_blob)?;
     crate::metrics::record_decrypt_duration(decrypt_start.elapsed());
 
     match open_result {
@@ -1434,11 +1500,10 @@ pub fn decrypt_and_dispatch(
             payload,
         } => {
             tracing::debug!(sender_did = %sender_did, context_id = %context_id, "received MLS-wrapped management message");
-            mgr.crypto_ref().process_incoming_sender_key(
-                context_id_bytes,
-                &sender_did,
-                &payload,
-            )?;
+            supervisor
+                .crypto_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                .process_incoming_sender_key(context_id_bytes, &sender_did, &payload)?;
             Ok(None)
         }
     }
@@ -1468,11 +1533,14 @@ pub fn decrypt_and_dispatch(
 /// below.
 #[allow(clippy::significant_drop_tightening)] // Legacy body held per-context guard across await points deliberately — narrowing changes lock-ordering semantics.
 pub async fn validate_and_drain_timeouts(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
     now_ms: u64,
 ) -> Result<SequenceCheck, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let ctx_arc = mgr
         .get_context_arc_pub(context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
@@ -1502,7 +1570,7 @@ pub async fn validate_and_drain_timeouts(
             first_delivered_sequence: gap_info.first_buffered_sequence,
             reason: format!("{:?}", gap_info.reason),
         };
-        ctx.emit_event(gap_event, context_id, mgr.event_tx_ref());
+        ctx.emit_event(gap_event, context_id, supervisor.event_tx_ref());
         for msg in &messages {
             // Re-check membership and capability — sender may have been
             // removed or had capability revoked while the message was
@@ -1525,7 +1593,7 @@ pub async fn validate_and_drain_timeouts(
                 &msg.sender_did,
                 &msg.plaintext,
                 context_id,
-                mgr.event_tx_ref(),
+                supervisor.event_tx_ref(),
             ) {
                 // Bug fix (#1534): buffered messages now receive the same
                 // post-delivery governance treatment as directly delivered
@@ -1536,9 +1604,13 @@ pub async fn validate_and_drain_timeouts(
                     &context_id_bytes,
                     &msg.sender_did,
                     event_name,
-                    &**mgr.clock_ref(),
-                    &**mgr.event_log_ref(),
-                    mgr.event_tx_ref(),
+                    &**supervisor
+                        .clock_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                    &**supervisor
+                        .event_log_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                    supervisor.event_tx_ref(),
                 );
             }
         }
@@ -1568,13 +1640,16 @@ pub async fn validate_and_drain_timeouts(
 /// Byte-identical to the legacy method form.
 #[allow(clippy::significant_drop_tightening)] // Legacy body held per-context guard across await points deliberately — narrowing changes lock-ordering semantics.
 pub async fn buffer_ahead_message(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
     sender_did: &str,
     plaintext: &[u8],
     now_ms: u64,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let buffered_msg = scp_protocol::envelope::validation::BufferedMessage {
         inner: inner.clone(),
         sender_did: sender_did.to_owned(),
@@ -1602,7 +1677,7 @@ pub async fn buffer_ahead_message(
             first_delivered_sequence: gap_info.first_buffered_sequence,
             reason: format!("{:?}", gap_info.reason),
         };
-        ctx.emit_event(gap_event, context_id, mgr.event_tx_ref());
+        ctx.emit_event(gap_event, context_id, supervisor.event_tx_ref());
 
         for msg in &messages {
             // Re-check membership and capability — sender may have been
@@ -1626,7 +1701,7 @@ pub async fn buffer_ahead_message(
                 &msg.sender_did,
                 &msg.plaintext,
                 context_id,
-                mgr.event_tx_ref(),
+                supervisor.event_tx_ref(),
             ) {
                 // Bug fix (#1534): overflow-forced delivery now runs
                 // consequence evaluation, matching the direct path.
@@ -1636,9 +1711,13 @@ pub async fn buffer_ahead_message(
                     &context_id_bytes,
                     &msg.sender_did,
                     event_name,
-                    &**mgr.clock_ref(),
-                    &**mgr.event_log_ref(),
-                    mgr.event_tx_ref(),
+                    &**supervisor
+                        .clock_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                    &**supervisor
+                        .event_log_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                    supervisor.event_tx_ref(),
                 );
             }
         }
@@ -1672,7 +1751,7 @@ pub async fn buffer_ahead_message(
 #[allow(clippy::too_many_lines)] // Matches legacy method shape exactly; splitting further would fragment the shared lock scope.
 #[allow(clippy::significant_drop_tightening)] // Legacy body held per-context guard across await points deliberately — narrowing changes lock-ordering semantics.
 pub async fn deliver_message_and_drain_buffered(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     context_id_bytes: &[u8; 32],
     sender_did: &str,
@@ -1680,6 +1759,9 @@ pub async fn deliver_message_and_drain_buffered(
     plaintext: &[u8],
     skip_velocity: bool,
 ) -> Result<bool, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let sender_did_obj = DID(sender_did.to_owned());
 
     let ctx_arc = mgr
@@ -1750,7 +1832,7 @@ pub async fn deliver_message_and_drain_buffered(
             member_did: announced_did,
             pseudonym: announcement.pseudonym,
         };
-        ctx.emit_event(announce_event, context_id, mgr.event_tx_ref());
+        ctx.emit_event(announce_event, context_id, supervisor.event_tx_ref());
         // Advance sequence tracker for the announcement message.
         ctx.sequence_tracker
             .advance(context_id, sender_did, inner.sequence, inner.timestamp);
@@ -1780,7 +1862,7 @@ pub async fn deliver_message_and_drain_buffered(
                 &msg.sender_did,
                 &msg.plaintext,
                 context_id,
-                mgr.event_tx_ref(),
+                supervisor.event_tx_ref(),
             ) {
                 // Bug fix (#1534): drain_consecutive within announcement
                 // path now runs consequence evaluation per message.
@@ -1790,9 +1872,13 @@ pub async fn deliver_message_and_drain_buffered(
                     context_id_bytes,
                     &msg.sender_did,
                     event_name,
-                    &**mgr.clock_ref(),
-                    &**mgr.event_log_ref(),
-                    mgr.event_tx_ref(),
+                    &**supervisor
+                        .clock_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                    &**supervisor
+                        .event_log_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                    supervisor.event_tx_ref(),
                 );
             }
         }
@@ -1802,17 +1888,20 @@ pub async fn deliver_message_and_drain_buffered(
         // the announcement path, allowing a malicious member to send
         // announcements at high velocity without triggering rate-limiting
         // consequences. Now both paths share identical post-delivery logic.
-        let now = mgr.clock_ref().now_secs();
+        let now = supervisor
+            .clock_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .now_secs();
         if !skip_velocity {
             ctx.governance
                 .velocity_tracker
                 .record_message(&DID(sender_did.to_owned()), now);
         }
-        if let Err(e) = mgr.event_log_ref().append_context_event(
-            context_id_bytes,
-            "PseudonymAnnounced",
-            sender_did,
-        ) {
+        if let Err(e) = supervisor
+            .event_log_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .append_context_event(context_id_bytes, "PseudonymAnnounced", sender_did)
+        {
             tracing::warn!(
                 context_id,
                 sender_did,
@@ -1825,7 +1914,9 @@ pub async fn deliver_message_and_drain_buffered(
                 ctx,
                 context_id,
                 now,
-                &**mgr.event_log_ref(),
+                &**supervisor
+                    .event_log_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
             );
             let recv_triggered =
                 evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
@@ -1838,9 +1929,13 @@ pub async fn deliver_message_and_drain_buffered(
                     now,
                     triggered: &recv_triggered,
                     rules: &consequence_rules,
-                    clock: &**mgr.clock_ref(),
-                    event_log: &**mgr.event_log_ref(),
-                    event_tx: mgr.event_tx_ref(),
+                    clock: &**supervisor
+                        .clock_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                    event_log: &**supervisor
+                        .event_log_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                    event_tx: supervisor.event_tx_ref(),
                 },
             );
         }
@@ -1856,7 +1951,7 @@ pub async fn deliver_message_and_drain_buffered(
         sender_did: sender_did_obj,
         payload: plaintext.to_vec(),
     };
-    ctx.emit_event(recv_event, context_id, mgr.event_tx_ref());
+    ctx.emit_event(recv_event, context_id, supervisor.event_tx_ref());
 
     // Drain consecutive buffered messages that are now unblocked (§9.8.5).
     let next_expected = inner.sequence.saturating_add(1);
@@ -1885,7 +1980,7 @@ pub async fn deliver_message_and_drain_buffered(
             &msg.sender_did,
             &msg.plaintext,
             context_id,
-            mgr.event_tx_ref(),
+            supervisor.event_tx_ref(),
         ) {
             // Bug fix (#1534): drain_consecutive within normal message
             // path now runs consequence evaluation per message.
@@ -1895,9 +1990,13 @@ pub async fn deliver_message_and_drain_buffered(
                 context_id_bytes,
                 &msg.sender_did,
                 event_name,
-                &**mgr.clock_ref(),
-                &**mgr.event_log_ref(),
-                mgr.event_tx_ref(),
+                &**supervisor
+                    .clock_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                &**supervisor
+                    .event_log_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                supervisor.event_tx_ref(),
             );
         }
     }
@@ -1927,9 +2026,10 @@ pub async fn deliver_message_and_drain_buffered(
     // and dropping the whole delivery on a log-append failure is too
     // strict — the receiver has already validated decryption, signature,
     // membership, capability, and sequence.
-    if let Err(e) =
-        mgr.event_log_ref()
-            .append_context_event(context_id_bytes, "MessageReceived", sender_did)
+    if let Err(e) = supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(context_id_bytes, "MessageReceived", sender_did)
     {
         tracing::warn!(
             context_id,
@@ -1946,7 +2046,10 @@ pub async fn deliver_message_and_drain_buffered(
     // when the sender is a locally-controlled DID. On single-node setups
     // the send path already recorded velocity; counting it again here would
     // double-count the message and inflate consequence trigger counters.
-    let now = mgr.clock_ref().now_secs();
+    let now = supervisor
+        .clock_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .now_secs();
     if !skip_velocity {
         ctx.governance
             .velocity_tracker
@@ -1958,7 +2061,9 @@ pub async fn deliver_message_and_drain_buffered(
             ctx,
             context_id,
             now,
-            &**mgr.event_log_ref(),
+            &**supervisor
+                .event_log_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
         );
         let recv_triggered =
             evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
@@ -1971,9 +2076,13 @@ pub async fn deliver_message_and_drain_buffered(
                 now,
                 triggered: &recv_triggered,
                 rules: &consequence_rules,
-                clock: &**mgr.clock_ref(),
-                event_log: &**mgr.event_log_ref(),
-                event_tx: mgr.event_tx_ref(),
+                clock: &**supervisor
+                    .clock_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                event_log: &**supervisor
+                    .event_log_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                event_tx: supervisor.event_tx_ref(),
             },
         );
     }

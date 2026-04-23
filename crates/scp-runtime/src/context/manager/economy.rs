@@ -762,7 +762,24 @@ impl ContextManager {
         &self,
         receipts: &[PaymentReceipt],
     ) -> Vec<Result<ReceiptVerification, ReceiptVerificationError>> {
-        crate::context::economy_helpers::verify_payment_receipts(self, receipts).await
+        // ADR-049 commit 12c.9c — helper now takes `&Supervisor`;
+        // reach it through the `Weak<Supervisor>` back-pointer
+        // installed by `Supervisor::attach_context_manager`. On a
+        // detach-contract violation (unreachable in practice), map
+        // every receipt to `NoVerifierForAdapter` — matching the
+        // "no adapter configured" branch inside the helper.
+        let Some(sup) = self.supervisor() else {
+            return receipts
+                .iter()
+                .map(|r| {
+                    Err(ReceiptVerificationError::NoVerifierForAdapter {
+                        receipt_id: r.receipt_id,
+                        adapter_id: r.adapter_id.clone(),
+                    })
+                })
+                .collect();
+        };
+        crate::context::economy_helpers::verify_payment_receipts(&sup, receipts).await
     }
 }
 

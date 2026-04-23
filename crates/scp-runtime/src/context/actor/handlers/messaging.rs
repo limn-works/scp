@@ -62,6 +62,7 @@ use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::sequence::SequenceReservation;
 use crate::context::manager::ContextManager;
+use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for mutation handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
@@ -88,12 +89,12 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// body reads state and encrypts in-place against the actor's owned
 /// backends).
 pub async fn dispatch(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     _deps: &ActorDeps,
     send_tracker: &mut SendSequenceTracker,
     cmd: MessagingCommand,
 ) -> Outcome<()> {
-    dispatch_inner(mgr, send_tracker, cmd).await
+    dispatch_inner(supervisor, send_tracker, cmd).await
 }
 
 /// Shim-callable dispatch. Used by
@@ -109,17 +110,27 @@ pub async fn dispatch(
 /// a send / deliver through the shim would force every bridge into a
 /// placeholder-deps dance before commits 9-11 land the real dep wiring.
 /// This entry point exists to avoid that churn — it takes only the
-/// manager, the send tracker, and the command.
+/// supervisor, the send tracker, and the command.
+///
+/// # Supervisor receiver (ADR-049 commit 12c.9c)
+///
+/// Takes `&Supervisor` so the hoisted
+/// [`messaging_helpers`](crate::context::messaging_helpers) free
+/// functions can read the lifted provider slots directly. Each
+/// delegated call either reads `supervisor.X_ref()` for lifted
+/// providers or derives `&ContextManager` via
+/// `supervisor.attached_context_manager().expect(...)` for the
+/// remaining manager-only surface.
 pub(crate) async fn dispatch_from_shim(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     send_tracker: &mut SendSequenceTracker,
     cmd: MessagingCommand,
 ) -> Outcome<()> {
-    dispatch_inner(mgr, send_tracker, cmd).await
+    dispatch_inner(supervisor, send_tracker, cmd).await
 }
 
 async fn dispatch_inner(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     send_tracker: &mut SendSequenceTracker,
     cmd: MessagingCommand,
 ) -> Outcome<()> {
@@ -132,7 +143,7 @@ async fn dispatch_inner(
             // not need to preserve the Box.
             let p = *payload;
             handle_send_message(
-                mgr,
+                supervisor,
                 send_tracker,
                 &p.context_id,
                 p.params,
@@ -149,14 +160,14 @@ async fn dispatch_inner(
             context_id,
             envelope_bytes,
             reply,
-        } => handle_deliver_incoming(mgr, &context_id, &envelope_bytes, reply).await,
+        } => handle_deliver_incoming(supervisor, &context_id, &envelope_bytes, reply).await,
         MessagingCommand::DrainEvents { context_id, reply } => {
-            handle_drain_events(mgr, &context_id, reply).await
+            handle_drain_events(supervisor, &context_id, reply).await
         }
         MessagingCommand::SendPseudonymAnnouncement { payload, reply } => {
             let p = *payload;
             handle_send_pseudonym_announcement(
-                mgr,
+                supervisor,
                 p.context_id,
                 p.params,
                 &p.sender_did,
@@ -175,7 +186,7 @@ async fn dispatch_inner(
 /// drop (RAII rollback) on any failure path.
 #[allow(clippy::too_many_arguments)] // unavoidable — matches ContextManager::send_message signature
 async fn handle_send_message(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     send_tracker: &mut SendSequenceTracker,
     context_id: &str,
     params: scp_protocol::context::params::ContextParams,
@@ -186,12 +197,20 @@ async fn handle_send_message(
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    // Clone the `Arc<ContextManager>` up-front so the
-    // `SequenceReservation`'s mutable borrow of `send_tracker` and the
-    // subsequent use of the manager do not conflict. Cloning the Arc is
-    // a cheap refcount bump; the handler needs it alive across the
-    // delegated await regardless.
-    let manager: Arc<ContextManager> = Arc::clone(mgr);
+    // Derive the attached manager once so we can read its `clock_ref`
+    // and `key_resolver_ref` without re-hopping through the supervisor
+    // per argument. The attach contract guarantees this is populated;
+    // on violation we surface `NotInitialized` through the reply and
+    // the handler's `Outcome`.
+    let Some(manager) = supervisor.attached_context_manager() else {
+        let err = ContextError::NotInitialized(
+            "handle_send_message: ContextManager must be attached".to_owned(),
+        );
+        let sketch = outcome_error_sketch(&err);
+        let _ = reply.send(Err(err));
+        return Outcome::err(sketch);
+    };
+    let manager: &Arc<ContextManager> = manager;
 
     // Step 1: reserve the next actor-shape sequence number. The RAII
     // guard rolls back on any early `?` return below, on transport
@@ -221,14 +240,14 @@ async fn handle_send_message(
         return Outcome::err(sketch);
     }
 
-    // Step 3: delegate to the legacy byte-identical implementation,
+    // Step 3: delegate to the hoisted byte-identical implementation,
     // wrapped in the per-call transport-timeout budget. The closure
     // rebuilds the signing key from the zeroizing bytes held in the
     // command.
     let sk = signing_key.map(crate::context::actor::commands::SigningKeyBytes::to_signing_key);
     let sk_ref = sk.as_ref();
     let send_fut = crate::context::messaging_helpers::send_message(
-        &manager,
+        supervisor,
         manager.clock_ref(),
         manager.key_resolver_ref(),
         &handle,
@@ -321,14 +340,22 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
 /// actor state (including the `recv_tracker`) in commit 12 when the
 /// receive-sequence tracker moves onto the actor state.
 async fn handle_deliver_incoming(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     envelope_bytes: &[u8],
     reply: crate::context::actor::commands::DeliverIncomingReply,
 ) -> Outcome<()> {
-    let manager: Arc<ContextManager> = Arc::clone(mgr);
+    let Some(manager) = supervisor.attached_context_manager() else {
+        let err = ContextError::NotInitialized(
+            "handle_deliver_incoming: ContextManager must be attached".to_owned(),
+        );
+        let sketch = outcome_error_sketch(&err);
+        let _ = reply.send(Err(err));
+        return Outcome::err(sketch);
+    };
+    let manager: &Arc<ContextManager> = manager;
     let deliver_fut = crate::context::messaging_helpers::deliver_incoming(
-        &manager,
+        supervisor,
         manager.clock_ref(),
         manager.key_resolver_ref(),
         context_id,
@@ -364,12 +391,22 @@ async fn handle_deliver_incoming(
 /// `Err(ContextNotRegistered)`. `mutated: true` because draining the
 /// receive buffer empties it.
 async fn handle_drain_events(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     reply: crate::context::actor::commands::DrainEventsReply,
 ) -> Outcome<()> {
-    let manager: Arc<ContextManager> = Arc::clone(mgr);
-    let drain_fut = crate::context::queries_helpers::drain_events(&manager, context_id);
+    // `queries_helpers::drain_events` still takes `&ContextManager` at
+    // this point in the ADR-049 commit ladder (migrated in a later
+    // commit of 12c.9). Derive it from the supervisor.
+    let Some(manager) = supervisor.attached_context_manager() else {
+        // Drain returns `Vec<_>` (no error channel). On contract
+        // violation, reply with an empty vec — matches the hoisted
+        // helper's "unknown context" semantics.
+        let _ = reply.send(Ok(Vec::new()));
+        return Outcome::ok(());
+    };
+    let manager: &Arc<ContextManager> = manager;
+    let drain_fut = crate::context::queries_helpers::drain_events(manager, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, drain_fut).await {
         Ok(events) => (Outcome::ok_mutated(()), Ok(events)),
@@ -405,14 +442,22 @@ async fn handle_drain_events(
 /// `messaging_helpers`, this dispatch will switch to the hoisted
 /// free function transparently.
 async fn handle_send_pseudonym_announcement(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     sender_did: &scp_identity::DID,
     signing_key: &crate::context::actor::commands::SigningKeyBytes,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager: Arc<ContextManager> = Arc::clone(mgr);
+    let Some(manager) = supervisor.attached_context_manager() else {
+        let err = ContextError::NotInitialized(
+            "handle_send_pseudonym_announcement: ContextManager must be attached".to_owned(),
+        );
+        let sketch = outcome_error_sketch(&err);
+        let _ = reply.send(Err(err));
+        return Outcome::err(sketch);
+    };
+    let manager: &Arc<ContextManager> = manager;
 
     // Rebuild the ephemeral handle the legacy method takes by
     // reference; transition it to `Active` so the underlying

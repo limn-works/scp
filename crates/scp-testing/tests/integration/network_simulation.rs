@@ -1091,12 +1091,15 @@ async fn application_layer_demo() {
     let transport_for_manager: Box<dyn scp_core::context::builder::ContextTransportProvider> =
         Box::new(DemoTransport::new());
 
-    let manager = ContextManager::new(
+    // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor` so
+    // `ContextManager`'s messaging/governance/broadcast/economy
+    // forwarders can resolve their `Weak<Supervisor>` back-pointer.
+    let manager = scp_core::context::attach_test_supervisor(ContextManager::new(
         Box::new(DemoCrypto),
         transport_for_manager,
         Box::new(DemoEventLog::default()),
         demo_key_resolver(),
-    );
+    ));
 
     let alice: DID = "did:dht:z6MkAliceApp".into();
     let bob: DID = "did:dht:z6MkBobApp".into();

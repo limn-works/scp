@@ -9,9 +9,20 @@
 //! `broadcast_subscriber_count`, `is_broadcast_subscriber`,
 //! `broadcast_admission`) now forward to hoisted `pub async fn` free
 //! functions in [`crate::context::broadcast_helpers`]. See the helper
-//! module for the authoritative bodies; the methods here are one-line
+//! module for the authoritative bodies; the methods here are thin
 //! forwarders that preserve the legacy `mgr.X(...)` call shape during
 //! the commits-10-to-12 shim window.
+//!
+//! # Supervisor back-pointer (ADR-049 commit 12c.9c)
+//!
+//! The hoisted helpers now take `supervisor: &Supervisor`. Each
+//! forwarder resolves its supervisor through the `Weak<Supervisor>`
+//! back-pointer installed on [`ContextManager`] by
+//! [`Supervisor::attach_context_manager`](crate::context::supervisor::Supervisor::attach_context_manager)
+//! during bridge construction. `self.supervisor().expect(...)` is the
+//! canonical call shape — unwrap-or-panic is safe because the
+//! bridge-construction contract attaches before any FFI caller sees
+//! the `ContextManager`.
 
 use std::hash::BuildHasher;
 
@@ -67,8 +78,13 @@ impl ContextManager {
         P: ProofResolver + Send + Sync,
         S: BuildHasher + Send + Sync,
     {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::subscribe_broadcast — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::broadcast_helpers::subscribe_broadcast(
-            self,
+            &sup,
             context_id,
             subscriber_did,
             ucan,
@@ -100,8 +116,13 @@ impl ContextManager {
         subscriber_did: &DID,
         rotate_keys: bool,
     ) -> Result<UnsubscribeResult, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::unsubscribe_broadcast — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::broadcast_helpers::unsubscribe_broadcast(
-            self,
+            &sup,
             context_id,
             subscriber_did,
             rotate_keys,
@@ -137,8 +158,13 @@ impl ContextManager {
         custody: &impl scp_platform::KeyCustody,
         signing_key_handle: &scp_platform::KeyHandle,
     ) -> Result<BroadcastEnvelope, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::publish_broadcast — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::broadcast_helpers::publish_broadcast(
-            self,
+            &sup,
             context_id,
             author_did,
             payload,
@@ -173,8 +199,14 @@ impl ContextManager {
         custody: &impl scp_platform::KeyCustody,
         signing_key_handle: &scp_platform::KeyHandle,
     ) -> Result<BroadcastEnvelope, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::publish_broadcast_content — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::broadcast_helpers::publish_broadcast_content(
-            self,
+            &sup,
             context_id,
             author_did,
             content,
@@ -208,8 +240,14 @@ impl ContextManager {
         author_did: &DID,
         subscriber_did: &DID,
     ) -> Result<BlockResult, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::block_broadcast_subscriber — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::broadcast_helpers::block_broadcast_subscriber(
-            self,
+            &sup,
             context_id,
             author_did,
             subscriber_did,
@@ -243,8 +281,14 @@ impl ContextManager {
         author_did: &DID,
         subscriber_did: &DID,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::unblock_broadcast_subscriber — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::broadcast_helpers::unblock_broadcast_subscriber(
-            self,
+            &sup,
             context_id,
             author_did,
             subscriber_did,
@@ -285,8 +329,14 @@ impl ContextManager {
         author_did: &DID,
         requester_did: &DID,
     ) -> Result<KeyRequestDecision, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::handle_broadcast_key_request — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::broadcast_helpers::handle_broadcast_key_request(
-            self,
+            &sup,
             context_id,
             author_did,
             requester_did,
@@ -303,7 +353,11 @@ impl ContextManager {
     /// free function (ADR-049 commit 12c.4).
     #[instrument(skip_all, fields(context_id))]
     pub async fn broadcast_subscriber_count(&self, context_id: &str) -> Option<usize> {
-        crate::context::broadcast_helpers::broadcast_subscriber_count(self, context_id).await
+        // ADR-049 commit 12c.9c — `Option`-returning forwarder: a
+        // missing supervisor collapses to `None`, matching the hoisted
+        // helper's own "no data" return for an unregistered context.
+        let sup = self.supervisor()?;
+        crate::context::broadcast_helpers::broadcast_subscriber_count(&sup, context_id).await
     }
 
     /// Returns `true` if the given DID is a subscriber in a broadcast context.
@@ -313,7 +367,12 @@ impl ContextManager {
     /// function (ADR-049 commit 12c.4).
     #[instrument(skip_all, fields(context_id))]
     pub async fn is_broadcast_subscriber(&self, context_id: &str, did: &str) -> bool {
-        crate::context::broadcast_helpers::is_broadcast_subscriber(self, context_id, did).await
+        // ADR-049 commit 12c.9c — `bool`-returning forwarder: a
+        // missing supervisor collapses to `false` (not a subscriber).
+        let Some(sup) = self.supervisor() else {
+            return false;
+        };
+        crate::context::broadcast_helpers::is_broadcast_subscriber(&sup, context_id, did).await
     }
 
     /// Returns the admission policy for a broadcast context.
@@ -325,6 +384,9 @@ impl ContextManager {
     /// function (ADR-049 commit 12c.4).
     #[instrument(skip_all, fields(context_id))]
     pub async fn broadcast_admission(&self, context_id: &str) -> Option<BroadcastAdmission> {
-        crate::context::broadcast_helpers::broadcast_admission(self, context_id).await
+        // ADR-049 commit 12c.9c — `Option`-returning forwarder: a
+        // missing supervisor collapses to `None`.
+        let sup = self.supervisor()?;
+        crate::context::broadcast_helpers::broadcast_admission(&sup, context_id).await
     }
 }

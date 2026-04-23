@@ -457,8 +457,22 @@ impl Supervisor {
     /// was populated concurrently between the emptiness check and the
     /// read-back (should not occur under the documented single-attach
     /// contract but returned rather than panicked on).
+    ///
+    /// # Receiver shape
+    ///
+    /// Takes `self: &Arc<Self>` (ADR-049 commit 12c.9c) so the method
+    /// can derive a [`std::sync::Weak<Supervisor>`] via
+    /// [`Arc::downgrade`] and install it on the attached manager as a
+    /// back-pointer. The manager needs this back-pointer so its
+    /// messaging, broadcast, governance, and economy forwarders
+    /// (`manager/{messaging,broadcast,governance,economy}.rs`) can
+    /// reach the hoisted helpers that now take `&Supervisor` rather
+    /// than `&ContextManager`. The cycle is broken by the `Weak`: the
+    /// supervisor owns `Arc<ContextManager>`, the manager owns
+    /// `Weak<Supervisor>` — dropping the supervisor drops the manager
+    /// drops the weak without leaking.
     pub fn attach_context_manager(
-        &self,
+        self: &Arc<Self>,
         manager: &Arc<ContextManager>,
     ) -> Result<(), ContextError> {
         // `OnceLock::set` consumes its argument, so we clone the `Arc`
@@ -503,6 +517,15 @@ impl Supervisor {
             // state. `local_dids` has no OnceLock slot — its accessor
             // delegates via `context_manager_bridge`.
             let _ = self.cm_contexts.set(manager.contexts_arc());
+            // ADR-049 commit 12c.9c — install the `Weak<Supervisor>`
+            // back-pointer on the manager. This is the final wiring
+            // step in the two-way attach: after this line the
+            // manager's forwarders can reach the helpers through
+            // `self.supervisor().expect(...).as_ref()`. `Arc::downgrade`
+            // is cheap (refcount bump on the weak-count side only),
+            // and the `set_supervisor` contract matches this one
+            // (idempotent on identity, `InvalidState` on divergence).
+            manager.set_supervisor(&Arc::downgrade(self))?;
             return Ok(());
         }
         // `set` returned Err — someone (possibly the same caller)
@@ -1053,7 +1076,11 @@ impl Supervisor {
         // held during this await so the delegated
         // `cm.send_message(...)` call inside the handler acquires the
         // same mutex without contention.
-        let outcome = handlers::messaging::dispatch_from_shim(cm, &mut taken_tracker, cmd).await;
+        // ADR-049 commit 12c.9c — messaging handler takes `&Supervisor`
+        // so it can read lifted provider slots directly; `cm` is
+        // resolved from `self.attached_context_manager()` inside the
+        // handler's `handle_send_message` helper.
+        let outcome = handlers::messaging::dispatch_from_shim(self, &mut taken_tracker, cmd).await;
 
         // Phase C: swap the (committed or rolled-back) tracker back
         // in. If another task concurrently reserved a number on the
@@ -1207,7 +1234,10 @@ impl Supervisor {
         &self,
         cmd: GovernanceCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
+        // ADR-049 commit 12c.9c — governance handler takes
+        // `&Supervisor`. Attach check up front preserves the FFI
+        // error surface.
+        let _cm = self.attached_context_manager().ok_or_else(|| {
             ContextError::NotInitialized(
                 "Supervisor::dispatch_governance_command — no ContextManager attached".to_owned(),
             )
@@ -1216,7 +1246,7 @@ impl Supervisor {
         // `Box::pin` — see the matching comment on
         // `handlers::governance::dispatch` for the 16-KB stack-future
         // rationale.
-        Ok(Box::pin(handlers::governance::dispatch_from_shim(cm, cmd)).await)
+        Ok(Box::pin(handlers::governance::dispatch_from_shim(self, cmd)).await)
     }
 
     /// Dispatch an [`EconomyCommand`] through the migration shim
@@ -1239,13 +1269,18 @@ impl Supervisor {
         &self,
         cmd: EconomyCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
+        // ADR-049 commit 12c.9c — the economy handler now takes
+        // `&Supervisor` (the helper reads `payment_adapter_ref()` off
+        // the lifted slot). Verify the manager is attached up-front so
+        // FFI callers see the same `NotInitialized` error surface as
+        // before the 12c.9c rewire.
+        let _cm = self.attached_context_manager().ok_or_else(|| {
             ContextError::NotInitialized(
                 "Supervisor::dispatch_economy_command — no ContextManager attached".to_owned(),
             )
         })?;
 
-        Ok(handlers::economy::dispatch_from_shim(cm, cmd).await)
+        Ok(handlers::economy::dispatch_from_shim(self, cmd).await)
     }
 
     /// Dispatch a [`TrustRecoveryCommand`] through the migration shim
@@ -1555,13 +1590,16 @@ impl Supervisor {
         &self,
         cmd: BroadcastCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
+        // ADR-049 commit 12c.9c — broadcast handlers now take
+        // `&Supervisor`. Verify attach up front so FFI callers see the
+        // familiar `NotInitialized` surface.
+        let _cm = self.attached_context_manager().ok_or_else(|| {
             ContextError::NotInitialized(
                 "Supervisor::dispatch_broadcast_command — no ContextManager attached".to_owned(),
             )
         })?;
 
-        Ok(Box::pin(handlers::broadcast::dispatch_from_shim(cm, cmd)).await)
+        Ok(Box::pin(handlers::broadcast::dispatch_from_shim(self, cmd)).await)
     }
 
     /// Dispatch a [`BroadcastCommand`] through the migration shim with
@@ -1580,7 +1618,8 @@ impl Supervisor {
         cmd: BroadcastCommand,
         custody: &C,
     ) -> Result<Outcome<()>, ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
+        // ADR-049 commit 12c.9c — see `dispatch_broadcast_command`.
+        let _cm = self.attached_context_manager().ok_or_else(|| {
             ContextError::NotInitialized(
                 "Supervisor::dispatch_broadcast_command_with_custody — no ContextManager attached"
                     .to_owned(),
@@ -1589,7 +1628,7 @@ impl Supervisor {
 
         Ok(
             Box::pin(handlers::broadcast::dispatch_from_shim_with_custody(
-                cm, cmd, custody,
+                self, cmd, custody,
             ))
             .await,
         )

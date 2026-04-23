@@ -28,6 +28,16 @@ pub(super) fn noop_key_resolver() -> KeyResolver {
     Arc::new(|_| None)
 }
 
+/// Thin re-export of the crate-level
+/// [`crate::context::attach_test_supervisor`] helper (ADR-049 commit
+/// 12c.9c) so existing call-sites in `manager/tests/*` that use
+/// `super::attach_test_supervisor(...)` keep compiling without a
+/// path rewrite. See the crate-level helper's doc comment for the
+/// full rationale including the intentional `Arc<Supervisor>` leak.
+pub(super) fn attach_test_supervisor(mgr: ContextManager) -> Arc<ContextManager> {
+    crate::context::attach_test_supervisor(mgr)
+}
+
 /// Derives a deterministic Ed25519 seed from a DID string.
 /// Used by both `mock_key_resolver` and `signing_key_for_did` to
 /// ensure signing keys and resolved verifying keys match.
@@ -1468,7 +1478,7 @@ pub(super) async fn setup_failing_capture_manager_with_context(
     context_id: &str,
     creator_did: &str,
 ) -> (
-    ContextManager,
+    Arc<ContextManager>,
     ContextHandle,
     std::sync::Arc<MockEventLogWithActorDid>,
 ) {
@@ -1480,14 +1490,16 @@ pub(super) async fn setup_failing_capture_manager_with_context(
     // validated. The mock_key_resolver resolves keys deterministically from
     // the DID, matching dummy_spending_ucan_for's signing key — required for
     // validate_spending_ucan_signed to pass the signature check.
-    let manager = ContextManager::builder()
-        .crypto(Box::new(MockCrypto::default()))
-        .transport(Box::new(MockTransport::connected()))
-        .event_log(Box::new(ArcEventLog(event_log.clone())))
-        .payment_adapter(Arc::new(FailingCapturePaymentAdapter))
-        .key_resolver(mock_key_resolver())
-        .build()
-        .unwrap();
+    let manager = attach_test_supervisor(
+        ContextManager::builder()
+            .crypto(Box::new(MockCrypto::default()))
+            .transport(Box::new(MockTransport::connected()))
+            .event_log(Box::new(ArcEventLog(event_log.clone())))
+            .payment_adapter(Arc::new(FailingCapturePaymentAdapter))
+            .key_resolver(mock_key_resolver())
+            .build()
+            .unwrap(),
+    );
 
     // Grant the creator enough budget for the operations under test.
     // We use a non-zero EconomicPolicy so the capture path actually runs.
@@ -1543,13 +1555,13 @@ pub(super) async fn setup_failing_capture_manager_with_context(
 // Helper: create a manager with default mocks and a registered context
 // -----------------------------------------------------------------------
 
-pub(super) async fn setup_active_context() -> (ContextManager, ContextHandle) {
-    let manager = ContextManager::new(
+pub(super) async fn setup_active_context() -> (Arc<ContextManager>, ContextHandle) {
+    let manager = attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         ceiling: vec![
@@ -1575,13 +1587,14 @@ pub(super) async fn setup_active_context() -> (ContextManager, ContextHandle) {
 /// Like `setup_active_context` but uses `mock_key_resolver()` so that
 /// checkpoint signature verification succeeds in tests. Use with
 /// `signing_key_for_did` to produce correctly-signed checkpoints.
-pub(super) async fn setup_active_context_with_key_resolver() -> (ContextManager, ContextHandle) {
-    let manager = ContextManager::new(
+pub(super) async fn setup_active_context_with_key_resolver() -> (Arc<ContextManager>, ContextHandle)
+{
+    let manager = attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         ceiling: vec![
@@ -1684,14 +1697,14 @@ pub(super) fn approved_governance_proposal(
 /// Both authors are registered in the `BroadcastContext` (for publish
 /// capability) and in `MembershipState` (for sequence number tracking).
 /// Both author DIDs are registered as locally controlled (#234).
-pub(super) async fn setup_broadcast_context_two_authors() -> (ContextManager, ContextHandle, String)
-{
-    let manager = ContextManager::new(
+pub(super) async fn setup_broadcast_context_two_authors()
+-> (Arc<ContextManager>, ContextHandle, String) {
+    let manager = attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     // Register both author DIDs as locally controlled (#234).
     manager.register_local_did("did:key:alice".into()).await;
@@ -1742,13 +1755,13 @@ pub(super) async fn setup_broadcast_context_two_authors() -> (ContextManager, Co
 
 /// Helper: creates a broadcast context with `MemberBan` in ceiling,
 /// admin (alice) and subscriber (sub1).
-pub(super) async fn setup_broadcast_with_member_ban() -> (ContextManager, String) {
-    let manager = ContextManager::new(
+pub(super) async fn setup_broadcast_with_member_ban() -> (Arc<ContextManager>, String) {
+    let manager = attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     manager.register_local_did("did:key:alice".into()).await;
 
@@ -1806,13 +1819,13 @@ pub(super) async fn setup_broadcast_with_member_ban() -> (ContextManager, String
 
 /// Helper: creates an encrypted context with `MemberBan` in ceiling,
 /// admin (alice) and member (bob).
-pub(super) async fn setup_encrypted_with_member_ban() -> (ContextManager, String) {
-    let manager = ContextManager::new(
+pub(super) async fn setup_encrypted_with_member_ban() -> (Arc<ContextManager>, String) {
+    let manager = attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     manager.register_local_did("did:key:alice".into()).await;
     manager.register_local_did("did:key:bob".into()).await;
@@ -1889,13 +1902,13 @@ pub(super) fn test_tool_registration(id: &str) -> ToolRegistration {
 
 /// Helper: creates a broadcast context with an author (author1),
 /// registers `did:key:author1` as a local DID.
-pub(super) async fn setup_broadcast_context() -> (ContextManager, ContextHandle, String) {
-    let manager = ContextManager::new(
+pub(super) async fn setup_broadcast_context() -> (Arc<ContextManager>, ContextHandle, String) {
+    let manager = attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     // Register the author DID as locally controlled (#234).
     manager.register_local_did("did:key:author1".into()).await;

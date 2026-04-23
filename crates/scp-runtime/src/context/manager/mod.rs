@@ -9,7 +9,7 @@
 //! `.docs/adrs/phase-2.md` for the full context lifecycle specification.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ use super::governance::timeout::{
     DeadlockDetectionState, GovernanceTimeoutTask, collect_active_voters,
     process_pending_proposals, update_detection_state,
 };
+use super::supervisor::Supervisor;
 use super::ttl::{CloseResult, TtlExtension, TtlTimer};
 use scp_identity::DID;
 use scp_primitives::Clock;
@@ -2368,6 +2369,25 @@ pub struct ContextManager {
     ///
     /// Created via [`with_event_channel`](Self::with_event_channel).
     event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+    /// Weak back-pointer to the owning [`Supervisor`] (ADR-049 commit
+    /// 12c.9c).
+    ///
+    /// Populated by [`Supervisor::attach_context_manager`] via
+    /// [`Self::set_supervisor`]. `Weak` (not `Arc`) to break the
+    /// [`Supervisor`] ↔ [`ContextManager`] ownership cycle: the
+    /// [`Supervisor`] owns an [`Arc<ContextManager>`] through its
+    /// `context_manager_bridge` slot, and this field points back at the
+    /// [`Supervisor`] via a non-owning [`Weak`] — so dropping the
+    /// [`Supervisor`] drops the [`ContextManager`] drops the `Weak`
+    /// without leaking.
+    ///
+    /// Read through [`Self::supervisor`]. Used by the messaging,
+    /// broadcast, governance, and economy forwarders in
+    /// `manager/{messaging,broadcast,governance,economy}.rs` to reach
+    /// the hoisted helpers that now take `&Supervisor` rather than
+    /// `&ContextManager` (ADR-049 commit 12c.9c). Deleted alongside the
+    /// manager itself in commit 12c.9h.
+    supervisor: OnceLock<Weak<Supervisor>>,
 }
 
 // Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
@@ -2406,6 +2426,11 @@ impl ContextManager {
             task_set: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
             next_generation: std::sync::atomic::AtomicU64::new(1),
             event_tx: None,
+            // ADR-049 commit 12c.9c — populated by
+            // `Supervisor::attach_context_manager` via
+            // `set_supervisor`. Empty until the owning Supervisor
+            // attaches this manager.
+            supervisor: OnceLock::new(),
         }
     }
 
@@ -2445,6 +2470,8 @@ impl ContextManager {
             task_set: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
             next_generation: std::sync::atomic::AtomicU64::new(1),
             event_tx: None,
+            // ADR-049 commit 12c.9c — see matching comment in `new`.
+            supervisor: OnceLock::new(),
         }
     }
 
@@ -3159,6 +3186,82 @@ impl ContextManager {
         &self,
     ) -> Option<&Arc<dyn crate::economy::adapter::PaymentAdapterDyn>> {
         self.payment_adapter.as_ref()
+    }
+
+    /// Populate the [`Weak<Supervisor>`] back-pointer on this manager
+    /// (ADR-049 commit 12c.9c).
+    ///
+    /// Called exactly once by [`Supervisor::attach_context_manager`]
+    /// during the two-way attach. Idempotent on identical input: a
+    /// second call with the same upgraded [`Arc<Supervisor>`] is a
+    /// no-op (the `OnceLock::set` returns `Err` but identity matches);
+    /// a second call with a different upgraded [`Arc<Supervisor>`]
+    /// returns [`ContextError::InvalidState`] — re-attach is not
+    /// supported.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::InvalidState`] if a different
+    /// [`Supervisor`] is already bound. The identity check compares
+    /// upgraded [`Arc`] pointers (`Arc::ptr_eq`). If the previously-
+    /// bound supervisor has already been dropped (upgrade yields
+    /// `None`), identity cannot be confirmed and the call errors — but
+    /// this path is unreachable in practice: the supervisor owns the
+    /// manager, so the manager observing its supervisor dropped would
+    /// mean the manager itself is mid-drop.
+    pub(in crate::context) fn set_supervisor(
+        &self,
+        weak: &Weak<Supervisor>,
+    ) -> Result<(), ContextError> {
+        // `OnceLock::set` consumes the argument, so we clone the
+        // `Weak` only when the slot is empty — avoiding a spurious
+        // refcount bump on the idempotent re-attach path.
+        if self.supervisor.set(weak.clone()).is_ok() {
+            return Ok(());
+        }
+        // Slot already populated — accept identical pointer as idempotent.
+        let existing = self
+            .supervisor
+            .get()
+            .ok_or_else(|| {
+                ContextError::InvalidState(
+                    "ContextManager::set_supervisor — OnceLock slot observed empty after a \
+                     failed `set`; this should be unreachable and indicates an impl bug"
+                        .to_owned(),
+                )
+            })?
+            .upgrade();
+        let incoming = weak.upgrade();
+        match (existing, incoming) {
+            (Some(e), Some(i)) if Arc::ptr_eq(&e, &i) => Ok(()),
+            _ => Err(ContextError::InvalidState(
+                "ContextManager::set_supervisor — a different Supervisor is already \
+                 attached; re-attach is not supported"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    /// Upgrade the stored [`Weak<Supervisor>`] back-pointer into an
+    /// [`Arc<Supervisor>`].
+    ///
+    /// Returns `None` if [`Supervisor::attach_context_manager`] has
+    /// not been called (slot empty) or the [`Supervisor`] has been
+    /// dropped (`Weak::upgrade` returns `None`). The `Weak` path is
+    /// unreachable in practice — the supervisor owns the manager, so
+    /// the manager cannot outlive its supervisor — but the accessor
+    /// returns `Option` to avoid panicking inside getters.
+    ///
+    /// Callers on the forwarder path (`manager/{messaging, broadcast,
+    /// governance, economy}.rs`) unwrap the `Option` with
+    /// `.expect("ContextManager::supervisor — Supervisor must be
+    /// attached before forwarder invocation")` because the forwarders
+    /// are only reachable through FFI/test paths that call
+    /// [`Supervisor::attach_context_manager`] during bridge
+    /// construction (see `crates/scp-ffi/common/src/bridge_instance.rs`).
+    #[must_use]
+    pub(in crate::context) fn supervisor(&self) -> Option<Arc<Supervisor>> {
+        self.supervisor.get().and_then(Weak::upgrade)
     }
 
     /// Cheap reference to the manager's `standing_contexts` map. Used by

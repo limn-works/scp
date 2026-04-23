@@ -1015,7 +1015,13 @@ impl ContextManager {
         context_id: &str,
         proposal: &GovernanceProposal,
     ) -> Result<GovernanceActionResult, ContextError> {
-        crate::context::governance_helpers::execute_governance_action(self, context_id, proposal)
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_governance_action — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
+        crate::context::governance_helpers::execute_governance_action(&sup, context_id, proposal)
             .await
     }
 
@@ -1034,8 +1040,14 @@ impl ContextManager {
         proposal: &GovernanceProposal,
         ctx_gen: &super::ContextGeneration,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::finalize_governance_action — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::finalize_governance_action(
-            self, context_id, proposal, ctx_gen,
+            &sup, context_id, proposal, ctx_gen,
         )
         .await
     }
@@ -1051,7 +1063,13 @@ impl ContextManager {
         context_id: &str,
         proposal: &GovernanceProposal,
     ) -> Result<GovernanceActionResult, ContextError> {
-        crate::context::governance_helpers::dispatch_governance_action(self, context_id, proposal)
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::dispatch_governance_action — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
+        crate::context::governance_helpers::dispatch_governance_action(&sup, context_id, proposal)
             .await
     }
 
@@ -1071,8 +1089,14 @@ impl ContextManager {
         pid: ProposalId,
         actor_did: &str,
     ) -> Result<GovernanceActionResult, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::dispatch_context_governance_action — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::dispatch_context_governance_action(
-            self, context_id, action, pid, actor_did,
+            &sup, context_id, action, pid, actor_did,
         )
         .await
     }
@@ -1087,8 +1111,14 @@ impl ContextManager {
         pid: ProposalId,
         actor_did: &str,
     ) -> Result<GovernanceActionResult, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::dispatch_content_governance_action — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::dispatch_content_governance_action(
-            self, context_id, action, pid, actor_did,
+            &sup, context_id, action, pid, actor_did,
         )
         .await
     }
@@ -1141,12 +1171,18 @@ impl ContextManager {
         ),
         ContextError,
     > {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::propose_governance_action — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         // Box::pin — the hoisted body's locals (proposal context, governance
         // engine snapshot, MLS coordination future) cross clippy's 16 KB
         // stack budget for async futures. Heap-allocate per-call.
         Box::pin(
             crate::context::governance_helpers::propose_governance_action(
-                self,
+                &sup,
                 context_id,
                 proposer_did,
                 action,
@@ -1181,8 +1217,14 @@ impl ContextManager {
         ),
         ContextError,
     > {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::propose_governance_action_inner — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::propose_governance_action_inner(
-            self,
+            &sup,
             context_id,
             proposer_did,
             action,
@@ -1225,14 +1267,21 @@ impl ContextManager {
         approve: bool,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
-        crate::context::governance_helpers::vote_on_proposal(
-            self,
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::vote_on_proposal — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        // Box::pin — the hoisted body's state crosses clippy's 16-KB
+        // async-future budget (governance + MLS coordinator locals).
+        Box::pin(crate::context::governance_helpers::vote_on_proposal(
+            &sup,
             context_id,
             proposal_id,
             voter_did,
             approve,
             signing_key,
-        )
+        ))
         .await
     }
 
@@ -1252,8 +1301,13 @@ impl ContextManager {
         signing_key: &ed25519_dalek::SigningKey,
         check_vote_capability: bool,
     ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::vote_on_proposal_inner — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::vote_on_proposal_inner(
-            self,
+            &sup,
             context_id,
             proposal_id,
             voter_did,
@@ -1276,7 +1330,12 @@ impl ContextManager {
         context_id: &str,
         proposal_id: &ProposalId,
     ) -> Result<GovernanceProposal, ContextError> {
-        crate::context::governance_helpers::get_proposal(self, context_id, proposal_id).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::get_proposal — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::governance_helpers::get_proposal(&sup, context_id, proposal_id).await
     }
 
     /// Lists all governance proposals for a context.
@@ -1293,7 +1352,12 @@ impl ContextManager {
         &self,
         context_id: &str,
     ) -> Result<Vec<GovernanceProposal>, ContextError> {
-        crate::context::governance_helpers::list_proposals(self, context_id).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::list_proposals — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::governance_helpers::list_proposals(&sup, context_id).await
     }
 
     /// Submits a new governance proposal with capability validation.
@@ -1326,12 +1390,18 @@ impl ContextManager {
         action: GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<ProposalOutcome, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::propose_governance_action_checked — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         // Box::pin — see sibling `propose_governance_action`. The
         // `_checked` variant additionally carries a UCAN capability
         // verification future, so its frame is at least as large.
         Box::pin(
             crate::context::governance_helpers::propose_governance_action_checked(
-                self,
+                &sup,
                 context_id,
                 proposer_did,
                 action,
@@ -1361,12 +1431,21 @@ impl ContextManager {
         voter_did: &DID,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<ProposalStatus, ContextError> {
-        crate::context::governance_helpers::approve_governance_proposal(
-            self,
-            context_id,
-            proposal_id,
-            voter_did,
-            signing_key,
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::approve_governance_proposal — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
+        // Box::pin — see `vote_on_proposal` for the 16-KB budget rationale.
+        Box::pin(
+            crate::context::governance_helpers::approve_governance_proposal(
+                &sup,
+                context_id,
+                proposal_id,
+                voter_did,
+                signing_key,
+            ),
         )
         .await
     }
@@ -1391,12 +1470,21 @@ impl ContextManager {
         voter_did: &DID,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<ProposalStatus, ContextError> {
-        crate::context::governance_helpers::reject_governance_proposal(
-            self,
-            context_id,
-            proposal_id,
-            voter_did,
-            signing_key,
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::reject_governance_proposal — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
+        // Box::pin — see `vote_on_proposal` for the 16-KB budget rationale.
+        Box::pin(
+            crate::context::governance_helpers::reject_governance_proposal(
+                &sup,
+                context_id,
+                proposal_id,
+                voter_did,
+                signing_key,
+            ),
         )
         .await
     }
@@ -1420,8 +1508,13 @@ impl ContextManager {
         proposal_id: &ProposalId,
         voter_did: &DID,
     ) -> Result<ProposalStatus, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::withdraw_governance_vote — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::withdraw_governance_vote(
-            self,
+            &sup,
             context_id,
             proposal_id,
             voter_did,
@@ -1445,8 +1538,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_suspend_member — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_suspend_member(
-            self,
+            &sup,
             context_id,
             did,
             capabilities,
@@ -1481,8 +1579,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<usize, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_revoke — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_revoke(
-            self,
+            &sup,
             context_id,
             did,
             access,
@@ -1508,8 +1611,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_restore_access — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_restore_access(
-            self,
+            &sup,
             context_id,
             did,
             capabilities,
@@ -1527,8 +1635,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_add_member — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_add_member(
-            self,
+            &sup,
             context_id,
             did,
             role,
@@ -1545,8 +1658,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_remove_member — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_remove_member(
-            self,
+            &sup,
             context_id,
             did,
             proposal_id,
@@ -1563,8 +1681,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_change_role — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_change_role(
-            self,
+            &sup,
             context_id,
             did,
             new_role,
@@ -1584,8 +1707,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_register_tool — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_register_tool(
-            self,
+            &sup,
             context_id,
             registration,
             proposal_id,
@@ -1601,8 +1729,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_remove_tool — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_remove_tool(
-            self,
+            &sup,
             context_id,
             tool_id,
             proposal_id,
@@ -1618,8 +1751,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_modify_ceiling — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_modify_ceiling(
-            self,
+            &sup,
             context_id,
             new_ceiling,
             proposal_id,
@@ -1645,8 +1783,14 @@ impl ContextManager {
         context_id: &str,
         current_timestamp: u64,
     ) -> Result<bool, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::apply_pending_ceiling_modification — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::apply_pending_ceiling_modification(
-            self,
+            &sup,
             context_id,
             current_timestamp,
         )
@@ -1661,8 +1805,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_close_context — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_close_context(
-            self,
+            &sup,
             context_id,
             reason,
             proposal_id,
@@ -1682,8 +1831,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_extend_ttl — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_extend_ttl(
-            self,
+            &sup,
             context_id,
             additional_secs,
             approvals,
@@ -1700,8 +1854,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_transfer_admin — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_transfer_admin(
-            self,
+            &sup,
             context_id,
             new_admin,
             proposal_id,
@@ -1719,8 +1878,14 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_create_child_context — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_create_child_context(
-            self,
+            &sup,
             context_id,
             params,
             proposal_id,
@@ -1736,8 +1901,14 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_modify_pruning_policy — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_modify_pruning_policy(
-            self,
+            &sup,
             context_id,
             new_policy,
             proposal_id,
@@ -1755,8 +1926,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_add_signer — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_add_signer(
-            self,
+            &sup,
             context_id,
             did,
             proposal_id,
@@ -1774,8 +1950,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_remove_signer — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_remove_signer(
-            self,
+            &sup,
             context_id,
             did,
             proposal_id,
@@ -1791,8 +1972,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_modify_threshold — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_modify_threshold(
-            self,
+            &sup,
             context_id,
             new_threshold,
             proposal_id,
@@ -1811,8 +1997,14 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_establish_tool_interface — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_establish_tool_interface(
-            self,
+            &sup,
             context_id,
             interface,
             proposal_id,
@@ -1829,8 +2021,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_reset_member — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_reset_member(
-            self,
+            &sup,
             context_id,
             did,
             reason,
@@ -1849,8 +2046,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_resolve_conflict — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_resolve_conflict(
-            self,
+            &sup,
             context_id,
             proposal_a,
             proposal_b,
@@ -1878,8 +2080,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_promote_context — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_promote_context(
-            self,
+            &sup,
             context_id,
             approvals,
             proposal_id,
@@ -1914,8 +2121,14 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_rotate_content_keys — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_rotate_content_keys(
-            self,
+            &sup,
             context_id,
             reason,
             proposal_id,
@@ -1932,8 +2145,14 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_reconfigure_governance — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_reconfigure_governance(
-            self,
+            &sup,
             context_id,
             changes,
             justification,
@@ -1967,8 +2186,14 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_set_economic_policy — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_set_economic_policy(
-            self,
+            &sup,
             context_id,
             policy,
             proposal_id,
@@ -1992,8 +2217,9 @@ impl ContextManager {
         context_id: &str,
         current_timestamp: u64,
     ) -> Result<bool, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| ContextError::NotInitialized("ContextManager::apply_pending_economic_policy_change — Supervisor must be attached".to_owned()))?;
         crate::context::governance_helpers::apply_pending_economic_policy_change(
-            self,
+            &sup,
             context_id,
             current_timestamp,
         )
@@ -2021,8 +2247,13 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_approve_spend — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_approve_spend(
-            self,
+            &sup,
             context_id,
             spender,
             amount,
@@ -2047,8 +2278,14 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_lock_economic_policy — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_lock_economic_policy(
-            self,
+            &sup,
             context_id,
             proposal_id,
             actor_did,
@@ -2076,8 +2313,14 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_modify_hard_rate_limit — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_modify_hard_rate_limit(
-            self,
+            &sup,
             context_id,
             new_config,
             proposal_id,
@@ -2108,8 +2351,14 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<MigrationProposedResult, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_propose_context_migration — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_propose_context_migration(
-            self,
+            &sup,
             context_id,
             new_contextparams,
             reason,
@@ -2137,8 +2386,14 @@ impl ContextManager {
         proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::execute_cancel_context_migration — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::execute_cancel_context_migration(
-            self,
+            &sup,
             context_id,
             proposal_id,
             actor_did,
@@ -2160,7 +2415,13 @@ impl ContextManager {
     ///   or the grace period has not expired.
     #[instrument(skip_all, fields(context_id))]
     pub async fn tombstone_migrated_context(&self, context_id: &str) -> Result<(), ContextError> {
-        crate::context::governance_helpers::tombstone_migrated_context(self, context_id).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::tombstone_migrated_context — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
+        crate::context::governance_helpers::tombstone_migrated_context(&sup, context_id).await
     }
 
     /// Returns the migration state for a context, if any.
@@ -2168,7 +2429,10 @@ impl ContextManager {
     /// Returns `None` if the context is not registered or not migrating.
     #[instrument(skip_all, fields(context_id))]
     pub async fn migration_state(&self, context_id: &str) -> Option<MigrationState> {
-        crate::context::governance_helpers::migration_state(self, context_id).await
+        // ADR-049 commit 12c.9c — `Option`-returning forwarder: a
+        // missing supervisor collapses to `None`.
+        let sup = self.supervisor()?;
+        crate::context::governance_helpers::migration_state(&sup, context_id).await
     }
 
     /// Translates governance events from timeout processing into
@@ -2582,8 +2846,14 @@ impl ContextManager {
         operation: CommitOperation,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::try_broadcast_commit_or_enqueue — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::governance_helpers::try_broadcast_commit_or_enqueue(
-            self,
+            &sup,
             context_id,
             commit_bytes,
             operation,
@@ -2885,6 +3155,11 @@ impl ContextManager {
         &self,
         context_id: &str,
     ) -> Result<CommitFaultMarker, ContextError> {
-        crate::context::governance_helpers::acknowledge_commit_fault(self, context_id).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::acknowledge_commit_fault — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::governance_helpers::acknowledge_commit_fault(&sup, context_id).await
     }
 }

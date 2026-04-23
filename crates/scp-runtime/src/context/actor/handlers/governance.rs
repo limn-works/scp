@@ -5,8 +5,9 @@
 //! # Commit 10 scope
 //!
 //! Migrates the dispatch shape: the handler takes
-//! `&Arc<ContextManager>` + [`ActorDeps`] + [`GovernanceCommand`], returns
-//! `Outcome<()>`.
+//! `&Supervisor` + [`ActorDeps`] + [`GovernanceCommand`], returns
+//! `Outcome<()>` (ADR-049 commit 12c.9c — prior revisions threaded
+//! `&Arc<ContextManager>` directly).
 //!
 //! The underlying byte-identical implementation still lives on
 //! [`ContextManager`](crate::context::manager::ContextManager): each
@@ -56,7 +57,6 @@
 //! — that is a mutation regardless of whether any observable state
 //! changes beyond the marker slot.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use scp_protocol::context::ContextError;
@@ -69,7 +69,7 @@ use crate::context::actor::commands::{
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::manager::ContextManager;
+use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for governance handlers. Plan
 /// §"Transport timeouts inside actor handlers": 30 seconds.
@@ -80,12 +80,12 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Plan-conforming dispatch signature: matches the post-refactor actor
 /// `run()` loop's call shape
-/// (`handlers::governance::dispatch(&mgr, &self.deps, cmd).await`).
+/// (`handlers::governance::dispatch(&supervisor, &self.deps, cmd).await`).
 /// `deps` is accepted for symmetry — the governance handler does not
 /// yet touch deps during the shim period. Commit 12 rewires these paths
 /// once the manager surface is deleted.
 pub async fn dispatch(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     _deps: &ActorDeps,
     cmd: GovernanceCommand,
 ) -> Outcome<()> {
@@ -94,7 +94,7 @@ pub async fn dispatch(
     // future each variant wraps) cross clippy's 16-KB stack budget for
     // async futures. Boxing here moves the per-variant state onto the
     // heap once per dispatch.
-    Box::pin(dispatch_inner(mgr, cmd)).await
+    Box::pin(dispatch_inner(supervisor, cmd)).await
 }
 
 /// Shim-callable dispatch. Used by
@@ -109,24 +109,29 @@ pub async fn dispatch(
 /// matching the pattern established for queries (commit 7), messaging
 /// (commit 8), and lifecycle + ttl_close (commit 9).
 pub(crate) async fn dispatch_from_shim(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     cmd: GovernanceCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner(mgr, cmd)).await
+    Box::pin(dispatch_inner(supervisor, cmd)).await
 }
 
-async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: GovernanceCommand) -> Outcome<()> {
+#[allow(
+    clippy::too_many_lines,
+    reason = "exhaustive GovernanceCommand match — splitting loses the \
+              unified dispatch surface that pipeline-wiring tests assert"
+)]
+async fn dispatch_inner(supervisor: &Supervisor, cmd: GovernanceCommand) -> Outcome<()> {
     match cmd {
         GovernanceCommand::Placeholder { reply } => reply_not_implemented(reply),
         GovernanceCommand::ProposeGovernanceAction { payload, reply } => {
             Box::pin(handle_propose_governance_action(
-                mgr, *payload, reply, false,
+                supervisor, *payload, reply, false,
             ))
             .await
         }
         GovernanceCommand::ProposeGovernanceActionChecked { payload, reply } => {
             Box::pin(handle_propose_governance_action_checked(
-                mgr, *payload, reply,
+                supervisor, *payload, reply,
             ))
             .await
         }
@@ -134,12 +139,23 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: GovernanceCommand) -> Ou
             payload,
             approve,
             reply,
-        } => Box::pin(handle_vote_on_proposal(mgr, *payload, approve, reply)).await,
+        } => {
+            Box::pin(handle_vote_on_proposal(
+                supervisor, *payload, approve, reply,
+            ))
+            .await
+        }
         GovernanceCommand::ApproveGovernanceProposal { payload, reply } => {
-            Box::pin(handle_approve_governance_proposal(mgr, *payload, reply)).await
+            Box::pin(handle_approve_governance_proposal(
+                supervisor, *payload, reply,
+            ))
+            .await
         }
         GovernanceCommand::RejectGovernanceProposal { payload, reply } => {
-            Box::pin(handle_reject_governance_proposal(mgr, *payload, reply)).await
+            Box::pin(handle_reject_governance_proposal(
+                supervisor, *payload, reply,
+            ))
+            .await
         }
         GovernanceCommand::WithdrawGovernanceVote {
             context_id,
@@ -147,43 +163,63 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: GovernanceCommand) -> Ou
             voter_did,
             reply,
         } => {
-            handle_withdraw_governance_vote(mgr, &context_id, &proposal_id, &voter_did, reply).await
+            handle_withdraw_governance_vote(
+                supervisor,
+                &context_id,
+                &proposal_id,
+                &voter_did,
+                reply,
+            )
+            .await
         }
         GovernanceCommand::ExecuteGovernanceAction { payload, reply } => {
-            Box::pin(handle_execute_governance_action(mgr, *payload, reply)).await
+            Box::pin(handle_execute_governance_action(
+                supervisor, *payload, reply,
+            ))
+            .await
         }
         GovernanceCommand::GetProposal {
             context_id,
             proposal_id,
             reply,
-        } => handle_get_proposal(mgr, &context_id, &proposal_id, reply).await,
+        } => handle_get_proposal(supervisor, &context_id, &proposal_id, reply).await,
         GovernanceCommand::ListProposals { context_id, reply } => {
-            handle_list_proposals(mgr, &context_id, reply).await
+            handle_list_proposals(supervisor, &context_id, reply).await
         }
         GovernanceCommand::ApplyPendingCeilingModification {
             context_id,
             current_timestamp,
             reply,
         } => {
-            handle_apply_pending_ceiling_modification(mgr, &context_id, current_timestamp, reply)
-                .await
+            handle_apply_pending_ceiling_modification(
+                supervisor,
+                &context_id,
+                current_timestamp,
+                reply,
+            )
+            .await
         }
         GovernanceCommand::ApplyPendingEconomicPolicyChange {
             context_id,
             current_timestamp,
             reply,
         } => {
-            handle_apply_pending_economic_policy_change(mgr, &context_id, current_timestamp, reply)
-                .await
+            handle_apply_pending_economic_policy_change(
+                supervisor,
+                &context_id,
+                current_timestamp,
+                reply,
+            )
+            .await
         }
         GovernanceCommand::TombstoneMigratedContext { context_id, reply } => {
-            handle_tombstone_migrated_context(mgr, &context_id, reply).await
+            handle_tombstone_migrated_context(supervisor, &context_id, reply).await
         }
         GovernanceCommand::MigrationState { context_id, reply } => {
-            handle_migration_state(mgr, &context_id, reply).await
+            handle_migration_state(supervisor, &context_id, reply).await
         }
         GovernanceCommand::AcknowledgeCommitFault { context_id, reply } => {
-            handle_acknowledge_commit_fault(mgr, &context_id, reply).await
+            handle_acknowledge_commit_fault(supervisor, &context_id, reply).await
         }
     }
 }
@@ -195,12 +231,11 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: GovernanceCommand) -> Ou
 /// helper handles only the unchecked variant (checked has its own
 /// helper because the reply type differs).
 async fn handle_propose_governance_action(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: ProposeGovernanceActionPayload,
     reply: ProposeGovernanceActionReply,
     _checked: bool,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
     let signing_key = p.signing_key.to_signing_key();
 
@@ -212,7 +247,7 @@ async fn handle_propose_governance_action(
     let propose_fut = async move {
         Box::pin(
             crate::context::governance_helpers::propose_governance_action(
-                &manager,
+                supervisor,
                 &p.context_id,
                 &p.proposer_did,
                 p.action,
@@ -248,11 +283,10 @@ async fn handle_propose_governance_action(
 /// [`ContextManager::propose_governance_action_checked`](crate::context::manager::ContextManager::propose_governance_action_checked)
 /// under a 30s timeout.
 async fn handle_propose_governance_action_checked(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: ProposeGovernanceActionPayload,
     reply: ProposeGovernanceActionCheckedReply,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
     let signing_key = p.signing_key.to_signing_key();
 
@@ -261,7 +295,7 @@ async fn handle_propose_governance_action_checked(
     let propose_fut = async move {
         Box::pin(
             crate::context::governance_helpers::propose_governance_action_checked(
-                &manager,
+                supervisor,
                 &p.context_id,
                 &p.proposer_did,
                 p.action,
@@ -296,12 +330,11 @@ async fn handle_propose_governance_action_checked(
 /// [`ContextManager::vote_on_proposal`](crate::context::manager::ContextManager::vote_on_proposal)
 /// under a 30s timeout.
 async fn handle_vote_on_proposal(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: VoteOnProposalPayload,
     approve: bool,
     reply: VoteOnProposalReply,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
     let signing_key = p.signing_key.to_signing_key();
 
@@ -311,7 +344,7 @@ async fn handle_vote_on_proposal(
     // heap allocation per-call rather than per-handler.
     let vote_fut = async move {
         Box::pin(crate::context::governance_helpers::vote_on_proposal(
-            &manager,
+            supervisor,
             &p.context_id,
             &p.proposal_id,
             &p.voter_did,
@@ -348,11 +381,10 @@ async fn handle_vote_on_proposal(
 /// [`ContextManager::approve_governance_proposal`](crate::context::manager::ContextManager::approve_governance_proposal)
 /// under a 30s timeout.
 async fn handle_approve_governance_proposal(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: VoteOnProposalPayload,
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
     let signing_key = p.signing_key.to_signing_key();
 
@@ -360,7 +392,7 @@ async fn handle_approve_governance_proposal(
     let approve_fut = async move {
         Box::pin(
             crate::context::governance_helpers::approve_governance_proposal(
-                &manager,
+                supervisor,
                 &p.context_id,
                 &p.proposal_id,
                 &p.voter_did,
@@ -397,11 +429,10 @@ async fn handle_approve_governance_proposal(
 /// [`ContextManager::reject_governance_proposal`](crate::context::manager::ContextManager::reject_governance_proposal)
 /// under a 30s timeout.
 async fn handle_reject_governance_proposal(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: VoteOnProposalPayload,
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
     let signing_key = p.signing_key.to_signing_key();
 
@@ -409,7 +440,7 @@ async fn handle_reject_governance_proposal(
     let reject_fut = async move {
         Box::pin(
             crate::context::governance_helpers::reject_governance_proposal(
-                &manager,
+                supervisor,
                 &p.context_id,
                 &p.proposal_id,
                 &p.voter_did,
@@ -445,15 +476,14 @@ async fn handle_reject_governance_proposal(
 /// [`ContextManager::withdraw_governance_vote`](crate::context::manager::ContextManager::withdraw_governance_vote)
 /// under a 30s timeout.
 async fn handle_withdraw_governance_vote(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     proposal_id: &scp_protocol::context::governance::ProposalId,
     voter_did: &scp_identity::DID,
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let withdraw_fut = crate::context::governance_helpers::withdraw_governance_vote(
-        &manager,
+        supervisor,
         context_id,
         proposal_id,
         voter_did,
@@ -482,17 +512,16 @@ async fn handle_withdraw_governance_vote(
 /// [`ContextManager::execute_governance_action`](crate::context::manager::ContextManager::execute_governance_action)
 /// under a 30s timeout.
 async fn handle_execute_governance_action(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: ExecuteGovernanceActionPayload,
     reply: oneshot::Sender<Result<crate::context::manager::GovernanceActionResult, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
     let proposal = p.proposal;
 
     let execute_fut = async move {
         crate::context::governance_helpers::execute_governance_action(
-            &manager,
+            supervisor,
             &p.context_id,
             &proposal,
         )
@@ -522,16 +551,15 @@ async fn handle_execute_governance_action(
 /// [`ContextManager::get_proposal`](crate::context::manager::ContextManager::get_proposal)
 /// under a 30s timeout.
 async fn handle_get_proposal(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     proposal_id: &scp_protocol::context::governance::ProposalId,
     reply: oneshot::Sender<
         Result<scp_protocol::context::governance::GovernanceProposal, ContextError>,
     >,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let get_fut =
-        crate::context::governance_helpers::get_proposal(&manager, context_id, proposal_id);
+        crate::context::governance_helpers::get_proposal(supervisor, context_id, proposal_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, get_fut).await {
         Ok(Ok(proposal)) => (Outcome::ok(()), Ok(proposal)),
@@ -557,14 +585,13 @@ async fn handle_get_proposal(
 /// [`ContextManager::list_proposals`](crate::context::manager::ContextManager::list_proposals)
 /// under a 30s timeout.
 async fn handle_list_proposals(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     reply: oneshot::Sender<
         Result<Vec<scp_protocol::context::governance::GovernanceProposal>, ContextError>,
     >,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-    let list_fut = crate::context::governance_helpers::list_proposals(&manager, context_id);
+    let list_fut = crate::context::governance_helpers::list_proposals(supervisor, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, list_fut).await {
         Ok(Ok(proposals)) => (Outcome::ok(()), Ok(proposals)),
@@ -590,14 +617,13 @@ async fn handle_list_proposals(
 /// [`ContextManager::apply_pending_ceiling_modification`](crate::context::manager::ContextManager::apply_pending_ceiling_modification)
 /// under a 30s timeout.
 async fn handle_apply_pending_ceiling_modification(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     current_timestamp: u64,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let apply_fut = crate::context::governance_helpers::apply_pending_ceiling_modification(
-        &manager,
+        supervisor,
         context_id,
         current_timestamp,
     );
@@ -634,14 +660,13 @@ async fn handle_apply_pending_ceiling_modification(
 /// [`ContextManager::apply_pending_economic_policy_change`](crate::context::manager::ContextManager::apply_pending_economic_policy_change)
 /// under a 30s timeout.
 async fn handle_apply_pending_economic_policy_change(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     current_timestamp: u64,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let apply_fut = crate::context::governance_helpers::apply_pending_economic_policy_change(
-        &manager,
+        supervisor,
         context_id,
         current_timestamp,
     );
@@ -677,13 +702,12 @@ async fn handle_apply_pending_economic_policy_change(
 /// [`ContextManager::tombstone_migrated_context`](crate::context::manager::ContextManager::tombstone_migrated_context)
 /// under a 30s timeout.
 async fn handle_tombstone_migrated_context(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let tombstone_fut =
-        crate::context::governance_helpers::tombstone_migrated_context(&manager, context_id);
+        crate::context::governance_helpers::tombstone_migrated_context(supervisor, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, tombstone_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
@@ -711,12 +735,11 @@ async fn handle_tombstone_migrated_context(
 /// (no error) — timeout is mapped to `TransportTimeout` on the reply
 /// side, consistent with other read handlers.
 async fn handle_migration_state(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     reply: oneshot::Sender<Result<Option<crate::context::manager::MigrationState>, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-    let migration_fut = crate::context::governance_helpers::migration_state(&manager, context_id);
+    let migration_fut = crate::context::governance_helpers::migration_state(supervisor, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, migration_fut).await {
         Ok(state) => (Outcome::ok(()), Ok(state)),
@@ -737,13 +760,12 @@ async fn handle_migration_state(
 /// [`ContextManager::acknowledge_commit_fault`](crate::context::manager::ContextManager::acknowledge_commit_fault)
 /// under a 30s timeout.
 async fn handle_acknowledge_commit_fault(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     reply: oneshot::Sender<Result<crate::context::manager::CommitFaultMarker, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let ack_fut =
-        crate::context::governance_helpers::acknowledge_commit_fault(&manager, context_id);
+        crate::context::governance_helpers::acknowledge_commit_fault(supervisor, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, ack_fut).await {
         Ok(Ok(marker)) => (Outcome::ok_mutated(()), Ok(marker)),

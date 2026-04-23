@@ -6,12 +6,12 @@ use super::*;
 
 #[tokio::test]
 async fn manager_create_context_encrypted_success() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let handle = manager
         .create_context_bare("mgr-ctx-1".into(), ContextParams::default())
@@ -25,12 +25,12 @@ async fn manager_create_context_encrypted_success() {
 
 #[tokio::test]
 async fn manager_create_context_broadcast_success() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         mode: ContextMode::Broadcast,
@@ -53,12 +53,12 @@ async fn manager_create_context_succeeds_when_transport_disconnected() {
     // Context creation is a local operation — it should succeed even
     // when `is_connected()` returns false. Transport connectivity is
     // not a Phase 1 gate.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::default()), // not connected
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let result = manager
         .create_context_bare("mgr-ctx-dc".into(), ContextParams::default())
@@ -74,12 +74,12 @@ async fn manager_create_context_rollback_on_crypto_failure() {
     let crypto = MockCrypto::default();
     crypto.fail_create_mls.store(true, Ordering::Relaxed);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let result = manager
         .create_context_bare("mgr-ctx-fail".into(), ContextParams::default())
@@ -94,12 +94,12 @@ async fn manager_create_context_rollback_on_crypto_failure() {
 
 #[tokio::test]
 async fn manager_preserves_params_on_handle() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         mode: ContextMode::Broadcast,
@@ -307,13 +307,13 @@ async fn leave_rejects_when_context_not_active() {
 /// Helper: creates a context whose ceiling includes `member:remove` so
 /// that the admin can remove other members. Adds an observer member
 /// (`did:key:observer`) alongside the admin creator (`did:key:creator`).
-async fn setup_context_with_member_remove() -> (ContextManager, ContextHandle) {
-    let manager = ContextManager::new(
+async fn setup_context_with_member_remove() -> (Arc<ContextManager>, ContextHandle) {
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         ceiling: vec![
@@ -437,7 +437,7 @@ async fn leave_self_removal_always_allowed() {
 /// membership counts.
 #[tokio::test]
 async fn concurrent_joins_and_sends_do_not_corrupt_state() {
-    let manager = std::sync::Arc::new(ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -515,7 +515,7 @@ async fn concurrent_joins_and_sends_do_not_corrupt_state() {
 async fn panic_does_not_poison_mutex() {
     use std::sync::Arc;
 
-    let manager = Arc::new(ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -702,13 +702,13 @@ async fn persist_drop_restore_roundtrip() {
     let persistence = Arc::new(MockContextPersistence::default());
 
     // Create a context with persistence.
-    let manager = ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         Box::new(MockContextPersistence::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         mode: ContextMode::Broadcast,
@@ -805,7 +805,7 @@ async fn persist_drop_restore_roundtrip() {
         .unwrap();
 
     // Create a new manager with the seeded persistence.
-    let manager2 = ContextManager::with_persistence(
+    let manager2 = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -814,7 +814,7 @@ async fn persist_drop_restore_roundtrip() {
             broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
         }),
         noop_key_resolver(),
-    );
+    ));
 
     // Restore the context.
     let handle2 = ContextHandle::new("persist-ctx-2".to_owned(), params);
@@ -938,7 +938,7 @@ async fn restore_preserves_executed_proposals() {
         .unwrap();
 
     // Create manager and restore.
-    let manager = ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -947,7 +947,7 @@ async fn restore_preserves_executed_proposals() {
             broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
         }),
         noop_key_resolver(),
-    );
+    ));
 
     let handle = ContextHandle::new("replay-ctx".to_owned(), params);
     handle.transition_to(&ContextState::Active).await.unwrap();
@@ -1050,7 +1050,7 @@ async fn restore_respawns_ttl_timer() {
 
     persistence.persist_context("ttl-ctx", &snapshot).unwrap();
 
-    let manager = ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -1059,7 +1059,7 @@ async fn restore_respawns_ttl_timer() {
             broadcasts: std::sync::Mutex::new(HashMap::new()),
         }),
         noop_key_resolver(),
-    );
+    ));
 
     let handle = ContextHandle::new("ttl-ctx".to_owned(), params);
     handle.transition_to(&ContextState::Active).await.unwrap();
@@ -1150,7 +1150,7 @@ async fn restore_all_contexts_restores_persisted() {
         persistence.persist_context(ctx_name, &snapshot).unwrap();
     }
 
-    let manager = ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -1159,7 +1159,7 @@ async fn restore_all_contexts_restores_persisted() {
             broadcasts: std::sync::Mutex::new(HashMap::new()),
         }),
         noop_key_resolver(),
-    );
+    ));
 
     let mut restored = manager.restore_all_contexts().await.unwrap();
     restored.sort();
@@ -1252,7 +1252,7 @@ async fn restore_context_rejects_duplicate() {
         .persist_broadcast("dup-ctx", &bc_snapshot)
         .unwrap();
 
-    let manager = ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -1261,7 +1261,7 @@ async fn restore_context_rejects_duplicate() {
             broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
         }),
         noop_key_resolver(),
-    );
+    ));
 
     // First restore.
     let handle1 = ContextHandle::new("dup-ctx".to_owned(), params.clone());
@@ -1374,7 +1374,7 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
         .persist_broadcast("grace-incon-ctx", &bc_snapshot)
         .unwrap();
 
-    let manager = ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -1383,7 +1383,7 @@ async fn restore_context_sets_needs_reconnect_on_grace_inconsistency() {
             broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
         }),
         noop_key_resolver(),
-    );
+    ));
 
     let handle = ContextHandle::new("grace-incon-ctx".to_owned(), params);
     handle.transition_to(&ContextState::Active).await.unwrap();
@@ -1501,7 +1501,7 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
         .persist_broadcast("grace-ok-ctx", &bc_snapshot)
         .unwrap();
 
-    let manager = ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -1510,7 +1510,7 @@ async fn restore_context_no_reconnect_when_grace_consistent() {
             broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
         }),
         noop_key_resolver(),
-    );
+    ));
 
     let handle = ContextHandle::new("grace-ok-ctx".to_owned(), params);
     handle.transition_to(&ContextState::Active).await.unwrap();
@@ -1640,7 +1640,7 @@ async fn restore_preserves_spending_nonce_tracker_across_restart() {
         .unwrap();
 
     // Simulate restart: fresh manager with the pre-populated persistence.
-    let manager = ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -1649,7 +1649,7 @@ async fn restore_preserves_spending_nonce_tracker_across_restart() {
             broadcasts: std::sync::Mutex::new(persistence.broadcasts.lock().unwrap().clone()),
         }),
         noop_key_resolver(),
-    );
+    ));
 
     let handle = ContextHandle::new("nonce-persist-ctx".to_owned(), params);
     handle.transition_to(&ContextState::Active).await.unwrap();
@@ -1778,20 +1778,20 @@ fn reconnect_test_snapshot(
 /// Creates a manager with persistence pre-loaded, then restores all contexts.
 async fn manager_with_reconnect_snapshots(
     snapshots: &[(&str, super::ContextSnapshot)],
-) -> ContextManager {
+) -> Arc<ContextManager> {
     let persistence = MockContextPersistence::default();
     for (ctx_id, snap) in snapshots {
         let bc = test_broadcast_snapshot(ctx_id);
         persistence.persist_context(ctx_id, snap).unwrap();
         persistence.persist_broadcast(ctx_id, &bc).unwrap();
     }
-    let manager = ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         Box::new(persistence),
         noop_key_resolver(),
-    );
+    ));
     for (ctx_id, _) in snapshots {
         let handle = ContextHandle::new((*ctx_id).to_owned(), ContextParams::default());
         handle.transition_to(&ContextState::Active).await.unwrap();
@@ -1818,12 +1818,12 @@ async fn contexts_needing_reconnect_returns_flagged_contexts() {
 /// reconnection.
 #[tokio::test]
 async fn prepare_reconnection_returns_none_when_no_reconnect_needed() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let result = manager
         .prepare_reconnection(
@@ -2023,12 +2023,12 @@ async fn execute_reconnection_clears_flag_on_context_gone() {
 
 #[tokio::test]
 async fn create_context_rejects_incompatible_min_protocol_version() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let params = ContextParams {
         min_protocol_version: Some((2, 0)), // SDK is 1.0, this is unreachable
         ..ContextParams::default()
@@ -2049,12 +2049,12 @@ async fn create_context_rejects_incompatible_min_protocol_version() {
 
 #[tokio::test]
 async fn create_context_accepts_compatible_min_protocol_version() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let params = ContextParams {
         min_protocol_version: Some((1, 0)), // matches SDK version
         ..ContextParams::default()
@@ -2070,12 +2070,12 @@ async fn create_context_accepts_compatible_min_protocol_version() {
 
 #[tokio::test]
 async fn create_context_accepts_none_min_protocol_version() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let params = ContextParams {
         min_protocol_version: None, // defaults to (1,0) — always compatible
         ..ContextParams::default()
@@ -2161,12 +2161,12 @@ fn builder_storage_auto_wires_persistence_and_event_log() {
 
 #[tokio::test]
 async fn standing_context_creates_new_bilateral_persistent_context() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkLocalAlice");
     let carol = DID::from("did:dht:z6MkCarol");
@@ -2194,12 +2194,12 @@ async fn standing_context_creates_new_bilateral_persistent_context() {
 
 #[tokio::test]
 async fn standing_context_returns_existing_active_context() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkLocalAlice");
     let bob = DID::from("did:dht:z6MkBob");
@@ -2217,12 +2217,12 @@ async fn standing_context_returns_existing_active_context() {
 
 #[tokio::test]
 async fn standing_context_recreates_when_peer_has_left() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkLocalAlice");
     let dave = DID::from("did:dht:z6MkDave");
@@ -2270,12 +2270,12 @@ async fn standing_context_recreates_when_peer_has_left() {
 
 #[tokio::test]
 async fn standing_context_recreates_when_context_expired() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkLocalAlice");
     let eve = DID::from("did:dht:z6MkEve");
@@ -2313,12 +2313,12 @@ async fn standing_context_recreates_when_context_expired() {
 
 #[tokio::test]
 async fn reconnect_all_standing_reconnects_active_contexts() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkLocalAlice");
     manager.register_local_did(alice.clone()).await;
@@ -2355,12 +2355,12 @@ async fn reconnect_all_standing_reconnects_active_contexts() {
 
 #[tokio::test]
 async fn reconnect_all_standing_with_no_contexts_returns_zero() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let reconnected = manager.reconnect_all_standing().await.unwrap();
     assert_eq!(reconnected, 0);
@@ -2368,12 +2368,12 @@ async fn reconnect_all_standing_with_no_contexts_returns_zero() {
 
 #[tokio::test]
 async fn standing_context_is_idempotent() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkLocalAlice");
     let frank = DID::from("did:dht:z6MkFrank");
@@ -2392,12 +2392,12 @@ async fn standing_context_is_idempotent() {
 
 #[tokio::test]
 async fn register_standing_context_populates_tracking() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let grace = DID::from("did:dht:z6MkGrace");
 
@@ -2455,12 +2455,12 @@ fn standing_context_id_is_deterministic() {
 /// `Active` immediately after creation (no spurious fall-through).
 #[tokio::test]
 async fn test_standing_context_returns_existing_active() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkLocalAliceH6");
     let bob = DID::from("did:dht:z6MkBobH6");
@@ -2497,12 +2497,12 @@ async fn test_standing_context_returns_existing_active() {
 /// `state()` value).
 #[tokio::test]
 async fn test_standing_context_creates_new_after_expired() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkLocalAliceH6Exp");
     let eve = DID::from("did:dht:z6MkEveH6");
@@ -2569,7 +2569,7 @@ async fn test_standing_context_no_deadlock_under_contention() {
     use std::time::Duration;
     use tokio::time::timeout;
 
-    let manager = Arc::new(ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -2657,12 +2657,12 @@ async fn test_standing_context_no_deadlock_under_contention() {
 async fn auto_accept_blocked_by_economics_rejects_join() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = ContextParams {
         ceiling: vec![
@@ -2711,12 +2711,12 @@ async fn sybil_reject_insufficient_signals() {
     // actual rejection.
     use super::super::lifecycle::evaluate_sybil_resistance;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams::default();
     let _handle = manager
@@ -2741,12 +2741,12 @@ async fn sybil_reject_insufficient_signals() {
 async fn budget_exceeded_on_join_rejects() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = ContextParams {
         ceiling: vec![
@@ -2811,12 +2811,12 @@ async fn budget_exceeded_on_join_rejects() {
 async fn test_spawn_ttl_timer_decays_governance_on_expiry() {
     use scp_protocol::context::params::Capability;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     // Use a short-fuse TTL so the spawned timer fires quickly. Pair the
     // governance close capability so the context is otherwise valid.
@@ -2921,12 +2921,12 @@ async fn test_spawn_ttl_timer_decays_governance_on_expiry() {
 async fn test_spawn_ttl_timer_cancels_governance_timeout_task() {
     use scp_protocol::context::params::Capability;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         ttl: Some(std::time::Duration::from_millis(50)),
@@ -2996,12 +2996,12 @@ async fn capture_join_payment_failure_appends_event_log_entry() {
     use std::sync::Arc;
 
     let event_log = Arc::new(MockEventLogWithActorDid::default());
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(ArcEventLog(event_log.clone())),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         ceiling: vec![
@@ -3202,13 +3202,13 @@ fn c3_export_from_snapshot(
     .unwrap()
 }
 
-fn c3_manager() -> ContextManager {
-    ContextManager::new(
+fn c3_manager() -> Arc<ContextManager> {
+    super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    )
+    ))
 }
 
 /// C3 test 1: an attacker-crafted snapshot with `approved_proposals`
@@ -3569,7 +3569,7 @@ async fn restore_context_preserves_budget_tracker() {
         .persist_context("c3-restore-budget", &snapshot)
         .unwrap();
 
-    let manager = ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -3578,7 +3578,7 @@ async fn restore_context_preserves_budget_tracker() {
             broadcasts: std::sync::Mutex::new(HashMap::new()),
         }),
         noop_key_resolver(),
-    );
+    ));
 
     let handle = ContextHandle::new("c3-restore-budget".to_owned(), params);
     handle.transition_to(&ContextState::Active).await.unwrap();
@@ -3659,7 +3659,7 @@ async fn restore_context_validates_consequence_rules() {
         .persist_context("c3-restore-bad-rules", &snapshot)
         .unwrap();
 
-    let manager = ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -3668,7 +3668,7 @@ async fn restore_context_validates_consequence_rules() {
             broadcasts: std::sync::Mutex::new(HashMap::new()),
         }),
         noop_key_resolver(),
-    );
+    ));
 
     let handle = ContextHandle::new("c3-restore-bad-rules".to_owned(), params);
     handle.transition_to(&ContextState::Active).await.unwrap();
@@ -3791,12 +3791,12 @@ async fn import_context_rejects_epoch_floor_regression() {
     // Stage incoming epochs: Alice at 50 (regression).
     *mock.pending_restore_epochs.lock().unwrap() = Some(vec![(alice_did.to_owned(), 50)]);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(mock),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     // Use create_context (not create_context_bare) so the context slot is
     // registered in the manager's contexts map.  import_context checks the
@@ -3856,12 +3856,12 @@ async fn import_context_accepts_epoch_advance_within_ceiling() {
     // Stage incoming epochs: Alice at 200 (advance of 100, within ceiling).
     *mock.pending_restore_epochs.lock().unwrap() = Some(vec![(alice_did.to_owned(), 200)]);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(mock),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     // Use create_context so the slot is registered in the manager's contexts map.
     let handle = manager
@@ -3909,12 +3909,12 @@ async fn import_context_rejects_epoch_advance_beyond_ceiling() {
     // Stage incoming epochs: Alice at 2000 (100 + 1900 > MAX_EPOCH_ADVANCE=1000).
     *mock.pending_restore_epochs.lock().unwrap() = Some(vec![(alice_did.to_owned(), 2000)]);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(mock),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     // Use create_context so the slot is registered in the manager's contexts map.
     let handle = manager
@@ -3963,12 +3963,12 @@ async fn import_context_fresh_context_accepts_any_epoch_within_ceiling() {
     // Stage incoming epochs: Alice at 500.
     *mock.pending_restore_epochs.lock().unwrap() = Some(vec![(alice_did.to_owned(), 500)]);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(mock),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     // No create_context_bare call — fresh slot (no prior context).
     let export = make_epoch_test_export(ctx_id);
@@ -3988,13 +3988,16 @@ async fn import_context_fresh_context_accepts_any_epoch_within_ceiling() {
 /// Verify that `leave_context` fires `MemberLeft` on the event channel.
 #[tokio::test]
 async fn event_channel_receives_member_left_on_leave() {
-    let mut manager = ContextManager::new(
+    // ADR-049 commit 12c.9c — configure event channel on raw manager
+    // before wrapping with supervisor (`&mut self` requirement).
+    let mut raw = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
     );
-    manager.with_event_channel(1024);
+    raw.with_event_channel(1024);
+    let manager = super::attach_test_supervisor(raw);
     let mut rx = manager.subscribe_events().expect("channel configured");
 
     let params = ContextParams {
@@ -4053,7 +4056,7 @@ async fn flush_all_contexts_persists_degraded_snapshot_for_locked_context() {
     let persistence_for_cm: Box<dyn super::ContextPersistence> =
         Box::new(MockContextPersistence::default());
 
-    let manager = Arc::new(ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -4080,7 +4083,7 @@ async fn flush_all_contexts_persists_degraded_snapshot_for_locked_context() {
     //
     // Rebuild with shared persistence (wrap clone in Box).
     let shared_persistence: Arc<MockContextPersistence> = Arc::clone(&persistence);
-    let manager = Arc::new(ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -4145,13 +4148,13 @@ async fn flush_all_contexts_full_snapshot_when_lock_available() {
     // snapshot path and `needs_reconnect` is false (the context was
     // created cleanly).
     let persistence: Arc<MockContextPersistence> = Arc::new(MockContextPersistence::default());
-    let manager = ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         Box::new(SharedMockPersistence(Arc::clone(&persistence))),
         noop_key_resolver(),
-    );
+    ));
     let _handle = manager
         .create_context(
             "unlocked-ctx".into(),
@@ -4194,13 +4197,13 @@ async fn persist_context_snapshot_marks_reconnect_on_export_error() {
         .fail_export_crypto_state
         .store(true, Ordering::Relaxed);
 
-    let manager = ContextManager::with_persistence(
+    let manager = super::attach_test_supervisor(ContextManager::with_persistence(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         Box::new(SharedMockPersistence(Arc::clone(&persistence))),
         noop_key_resolver(),
-    );
+    ));
 
     let _handle = manager
         .create_context(
@@ -4297,12 +4300,12 @@ async fn take_context_state_removes_entry() {
     // Subsequent `get_context_arc_pub` calls must return
     // `ContextNotRegistered` — the contract 12b.2b relies on when
     // spawning an actor with owned state.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let creator = DID("did:example:creator".into());
     let _handle = manager
@@ -4329,12 +4332,12 @@ async fn take_context_state_removes_entry() {
 
 #[tokio::test]
 async fn take_context_state_missing_context_returns_not_registered() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     // `Arc<Mutex<PerContextState>>` does not implement `Debug` (the
     // inner state carries non-`Debug` fields like `ScpMlsGroup`), so
@@ -4352,12 +4355,12 @@ async fn take_context_state_missing_context_returns_not_registered() {
 async fn take_context_state_returns_arc_holding_state() {
     // The returned Arc holds the moved state. Lock it and verify the
     // handle matches what was registered.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let creator = DID("did:example:creator".into());
     let _handle = manager

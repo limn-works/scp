@@ -242,13 +242,15 @@ fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
 // Manager factory
 // ---------------------------------------------------------------------------
 
-fn new_manager() -> ContextManager {
-    ContextManager::new(
+fn new_manager() -> std::sync::Arc<ContextManager> {
+    // ADR-049 commit 12c.9c — see
+    // `tests/content_access_governance_integration.rs::new_manager`.
+    scp_runtime::context::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog),
         mock_key_resolver(),
-    )
+    ))
 }
 
 fn governance_ceiling() -> Vec<Capability> {

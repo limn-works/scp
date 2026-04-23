@@ -84,7 +84,7 @@ fn approved_rotate_proposal(context_id: &str) -> GovernanceProposal {
 /// admin can execute remove/leave actions. Returns a tuple of:
 ///   `(manager, context_id, admin_did, victim_did, transport_handle, clock)`.
 async fn setup_retry_manager() -> (
-    ContextManager,
+    Arc<ContextManager>,
     String,
     DID,
     DID,
@@ -93,14 +93,16 @@ async fn setup_retry_manager() -> (
 ) {
     let transport = Arc::new(RetriableMockTransport::default());
     let clock = Arc::new(TestClock::new(1_000_000));
-    let manager = ContextManager::builder()
-        .crypto(Box::new(MockCrypto::default()))
-        .transport(Box::new(ArcRetriableTransport(Arc::clone(&transport))))
-        .event_log(Box::new(MockEventLog::default()))
-        .clock(Arc::clone(&clock) as Arc<dyn scp_primitives::Clock>)
-        .key_resolver(noop_key_resolver())
-        .build()
-        .unwrap();
+    let manager = super::attach_test_supervisor(
+        ContextManager::builder()
+            .crypto(Box::new(MockCrypto::default()))
+            .transport(Box::new(ArcRetriableTransport(Arc::clone(&transport))))
+            .event_log(Box::new(MockEventLog::default()))
+            .clock(Arc::clone(&clock) as Arc<dyn scp_primitives::Clock>)
+            .key_resolver(noop_key_resolver())
+            .build()
+            .unwrap(),
+    );
 
     let params = ContextParams {
         ceiling: vec![

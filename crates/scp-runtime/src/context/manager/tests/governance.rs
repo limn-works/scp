@@ -85,12 +85,12 @@ fn public_metadata_exposes_all_governance_variants() {
 
 #[tokio::test]
 async fn create_context_rejects_threshold_exceeding_signers() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         governance: scp_protocol::context::params::GovernanceModel::Threshold {
@@ -114,12 +114,12 @@ async fn create_context_rejects_threshold_exceeding_signers() {
 
 #[tokio::test]
 async fn create_context_rejects_threshold_zero() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         governance: scp_protocol::context::params::GovernanceModel::Threshold {
@@ -143,12 +143,12 @@ async fn create_context_rejects_threshold_zero() {
 
 #[tokio::test]
 async fn create_context_rejects_majority_empty_voters() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         governance: scp_protocol::context::params::GovernanceModel::Majority {
@@ -174,12 +174,12 @@ async fn create_context_rejects_majority_empty_voters() {
 
 #[tokio::test]
 async fn create_context_rejects_unanimity_empty_voters() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         governance: scp_protocol::context::params::GovernanceModel::Unanimity {
@@ -211,12 +211,12 @@ async fn create_context_rejects_unanimity_empty_voters() {
 async fn single_admin_propose_auto_executes() {
     use scp_protocol::context::governance::GovernanceAction;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let creator_did: DID = "did:dht:z6MkCreator".into();
     let signing_key = signing_key_for_did(&creator_did);
@@ -288,12 +288,12 @@ async fn single_admin_propose_auto_executes() {
 async fn threshold_context_proposal_lifecycle() {
     use scp_protocol::context::governance::{GovernanceAction, ProposalStatus};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let alice: DID = "did:dht:z6MkAlice".into();
     let bob: DID = "did:dht:z6MkBob".into();
@@ -370,12 +370,12 @@ async fn threshold_context_proposal_lifecycle() {
 async fn majority_context_proposal_lifecycle() {
     use scp_protocol::context::governance::{GovernanceAction, ProposalStatus};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let alice: DID = "did:dht:z6MkAlice".into();
     let bob: DID = "did:dht:z6MkBob".into();
@@ -434,12 +434,12 @@ async fn majority_context_proposal_lifecycle() {
 async fn unanimity_context_single_rejection_defeats_proposal() {
     use scp_protocol::context::governance::{GovernanceAction, ProposalStatus};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let alice: DID = "did:dht:z6MkAlice".into();
     let bob: DID = "did:dht:z6MkBob".into();
@@ -533,12 +533,12 @@ async fn unanimity_context_single_rejection_defeats_proposal() {
 async fn non_eligible_voter_rejected() {
     use scp_protocol::context::governance::GovernanceAction;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let alice: DID = "did:dht:z6MkAlice".into();
     let bob: DID = "did:dht:z6MkBob".into();
@@ -736,12 +736,12 @@ async fn promote_context_succeeds_when_policy_is_promotable() {
     use scp_protocol::context::governance::{GovernanceProposal, SignedVote, VoteType};
     use scp_protocol::context::params::{MemoryScope, PromotionPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         promotion_policy: PromotionPolicy::Promotable,
@@ -819,12 +819,12 @@ async fn promote_context_does_not_mutate_promotion_policy() {
     use scp_protocol::context::governance::{GovernanceProposal, SignedVote, VoteType};
     use scp_protocol::context::params::{MemoryScope, PromotionPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         promotion_policy: PromotionPolicy::Promotable,
@@ -896,13 +896,13 @@ async fn promote_context_does_not_mutate_promotion_policy() {
 /// Helper: create a context with a specific ceiling for ceiling enforcement tests.
 async fn setup_context_with_ceiling(
     ceiling: Vec<Capability>,
-) -> (ContextManager, ContextHandle, String) {
-    let manager = ContextManager::new(
+) -> (Arc<ContextManager>, ContextHandle, String) {
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         ceiling,
@@ -1081,12 +1081,12 @@ async fn create_child_context_rejected_without_ceiling_capability() {
 /// #339: `Revoke` (write) is rejected when `MemberBan` is not in ceiling.
 #[tokio::test]
 async fn revoke_rejected_without_member_ban_ceiling() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     manager.register_local_did("did:key:alice".into()).await;
     manager.register_local_did("did:key:bob".into()).await;
@@ -1140,12 +1140,12 @@ async fn revoke_rejected_without_member_ban_ceiling() {
 /// `GovernanceModel::SingleAdmin` is specified.
 #[tokio::test]
 async fn governance_single_admin_engine_constructed() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let params = ContextParams {
         governance: GovernanceModel::SingleAdmin,
         ..ContextParams::default()
@@ -1171,12 +1171,12 @@ async fn governance_single_admin_engine_constructed() {
 /// when `GovernanceModel::Threshold` is specified.
 #[tokio::test]
 async fn governance_threshold_engine_constructed() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
     let signer2: DID = "did:key:signer2".into();
     let params = ContextParams {
@@ -1216,12 +1216,12 @@ async fn governance_threshold_engine_constructed() {
 /// when `GovernanceModel::Majority` is specified.
 #[tokio::test]
 async fn governance_majority_engine_constructed() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
     let params = ContextParams {
         governance: GovernanceModel::Majority {
@@ -1252,12 +1252,12 @@ async fn governance_majority_engine_constructed() {
 /// when `GovernanceModel::Unanimity` is specified.
 #[tokio::test]
 async fn governance_unanimity_engine_constructed() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
     let params = ContextParams {
         governance: GovernanceModel::Unanimity {
@@ -1293,12 +1293,12 @@ async fn governance_unanimity_engine_constructed() {
 /// Threshold > `signers.len()`.
 #[tokio::test]
 async fn governance_invalid_threshold_too_high_rejected() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
     let params = ContextParams {
         governance: GovernanceModel::Threshold {
@@ -1321,12 +1321,12 @@ async fn governance_invalid_threshold_too_high_rejected() {
 /// AC 8/12: Invalid `GovernanceModelConfig` — threshold == 0 rejected.
 #[tokio::test]
 async fn governance_invalid_threshold_zero_rejected() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
     let params = ContextParams {
         governance: GovernanceModel::Threshold {
@@ -1349,12 +1349,12 @@ async fn governance_invalid_threshold_zero_rejected() {
 /// AC 8/12: Invalid `GovernanceModelConfig` — empty signers for Threshold.
 #[tokio::test]
 async fn governance_invalid_empty_signers_rejected() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
     let params = ContextParams {
         governance: GovernanceModel::Threshold {
@@ -1377,12 +1377,12 @@ async fn governance_invalid_empty_signers_rejected() {
 /// AC 8/12: Invalid `GovernanceModelConfig` — `min_participation_bps` > 10000.
 #[tokio::test]
 async fn governance_invalid_min_participation_rejected() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
     let params = ContextParams {
         governance: GovernanceModel::Majority {
@@ -1403,12 +1403,12 @@ async fn governance_invalid_min_participation_rejected() {
 /// AC 8: GovernanceModel/GovernanceModelConfig mismatch is rejected.
 #[tokio::test]
 async fn governance_model_config_mismatch_rejected() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
     let params = ContextParams {
         governance: GovernanceModel::SingleAdmin,
@@ -1499,12 +1499,12 @@ async fn governance_ucan_tokens_minted_for_single_admin() {
 /// governance model variants without explicit `GovernanceModelConfig`.
 #[tokio::test]
 async fn governance_default_engine_all_variants() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
 
     let models = [
@@ -1541,13 +1541,13 @@ async fn governance_default_engine_all_variants() {
 
 /// Helper: creates a manager with an active context whose ceiling includes
 /// governance capabilities, so propose/vote operations succeed.
-async fn setup_governance_context() -> (ContextManager, ContextHandle, String) {
-    let manager = ContextManager::new(
+async fn setup_governance_context() -> (Arc<ContextManager>, ContextHandle, String) {
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         ceiling: vec![
@@ -1706,12 +1706,12 @@ async fn governance_vote_without_capability_rejected() {
 /// SCP-268 AC8: governance events are recorded in the event log.
 #[tokio::test]
 async fn governance_propose_checked_records_events() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::<MockEventLog>::from(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         ceiling: vec![
@@ -1753,12 +1753,12 @@ async fn governance_threshold_propose_approve_lifecycle() {
     let alice_did: DID = "did:key:alice".into();
     let bob_did: DID = "did:key:bob".into();
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         ceiling: vec![
@@ -1839,12 +1839,12 @@ async fn governance_threshold_propose_approve_lifecycle() {
 /// SCP-268: proposing on a non-existent context returns `MembershipFailed`.
 #[tokio::test]
 async fn governance_propose_checked_on_nonexistent_context() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin_did: DID = "did:key:admin".into();
     let signing_key = signing_key_for_did(&admin_did);
@@ -1930,12 +1930,12 @@ fn approved_proposal(
 async fn governance_dispatch_returns_typed_results() {
     use scp_protocol::context::governance::{GovernanceProposal, SignedVote, VoteType};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -2047,12 +2047,12 @@ async fn governance_auto_execution_single_admin() {
 #[tokio::test]
 async fn governance_auto_execution_threshold_on_approval() {
     let creator: DID = "did:key:creator".into();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.governance = GovernanceModel::Threshold {
@@ -2102,12 +2102,12 @@ async fn governance_auto_execution_threshold_on_approval() {
 async fn close_context_through_governance_threshold() {
     let creator: DID = "did:key:creator".into();
     let signer2: DID = "did:key:signer2".into();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.governance = GovernanceModel::Threshold {
@@ -2135,12 +2135,12 @@ async fn close_context_through_governance_threshold() {
 /// SCP-270 AC17: `ExtendTtl` unanimity override — partial approval rejected.
 #[tokio::test]
 async fn extend_ttl_rejects_without_unanimity() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let mut params = governance_params();
     params.ttl = Some(std::time::Duration::from_hours(1));
     let _handle = manager
@@ -2190,12 +2190,12 @@ async fn extend_ttl_rejects_without_unanimity() {
 /// SCP-270 AC17: `ExtendTtl` unanimity override — unanimous approval succeeds.
 #[tokio::test]
 async fn extend_ttl_succeeds_with_unanimity() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let mut params = governance_params();
     params.ttl = Some(std::time::Duration::from_hours(1));
     let _handle = manager
@@ -2251,12 +2251,12 @@ async fn promote_context_requires_unanimity() {
     use scp_protocol::context::governance::{GovernanceProposal, SignedVote, VoteType};
     use scp_protocol::context::params::{MemoryScope, PromotionPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.promotion_policy = PromotionPolicy::Promotable;
@@ -2333,12 +2333,12 @@ async fn promote_context_requires_unanimity() {
 #[tokio::test]
 async fn governance_bypass_prevented_for_multi_admin_close() {
     let creator: DID = "did:key:creator".into();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     // Create a Majority governance context.
     let mut params = governance_params();
@@ -2375,12 +2375,12 @@ async fn close_context_single_admin_succeeds() {
 /// SCP-270 AC11: `AddSigner` mints `GovernanceVote` + `GovernancePropose` UCANs.
 #[tokio::test]
 async fn add_signer_mints_governance_ucans() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let mut params = governance_params();
     params.governance = GovernanceModel::Threshold {
         threshold: 1,
@@ -2445,12 +2445,12 @@ async fn add_signer_mints_governance_ucans() {
 /// SCP-270 AC12: `RemoveSigner` revokes governance UCANs and validates threshold.
 #[tokio::test]
 async fn remove_signer_revokes_governance_ucans() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let mut params = governance_params();
     // Only creator is an initial signer; signer3 will be added dynamically.
     params.governance = GovernanceModel::Threshold {
@@ -2595,12 +2595,12 @@ async fn scp274_single_admin_full_lifecycle() {
 async fn scp274_threshold_full_lifecycle() {
     let creator: DID = "did:key:creator".into();
     let signer2: DID = "did:key:signer2".into();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
     let mut params = governance_params();
     params.governance = GovernanceModel::Threshold {
         threshold: 2,
@@ -2664,12 +2664,12 @@ async fn scp274_threshold_full_lifecycle() {
 #[tokio::test]
 async fn scp274_majority_full_lifecycle() {
     let creator: DID = "did:key:creator".into();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
     let mut params = governance_params();
     params.governance = GovernanceModel::Majority {
         eligible_voters: vec![creator.clone()],
@@ -2714,12 +2714,12 @@ async fn scp274_majority_full_lifecycle() {
 async fn scp274_unanimity_full_lifecycle() {
     let creator: DID = "did:key:creator".into();
     let member2: DID = "did:key:member2".into();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
     let mut params = governance_params();
     params.governance = GovernanceModel::Unanimity {
         eligible_voters: vec![creator.clone(), member2.clone()],
@@ -2773,12 +2773,12 @@ async fn scp274_unanimity_full_lifecycle() {
 async fn scp274_rejected_proposal_does_not_execute() {
     let creator: DID = "did:key:creator".into();
     let signer2: DID = "did:key:signer2".into();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
     let mut params = governance_params();
     params.governance = GovernanceModel::Threshold {
         threshold: 2,
@@ -2834,12 +2834,12 @@ async fn scp274_rejected_proposal_does_not_execute() {
 async fn scp274_governance_events_in_log() {
     let creator: DID = "did:key:creator".into();
     let signer2: DID = "did:key:signer2".into();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
     let mut params = governance_params();
     params.governance = GovernanceModel::Threshold {
         threshold: 2,
@@ -2904,12 +2904,12 @@ async fn scp274_governance_events_in_log() {
 #[tokio::test]
 async fn scp274_bypass_prevention() {
     let creator: DID = "did:key:creator".into();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
     let mut params = governance_params();
     params.governance = GovernanceModel::Majority {
         eligible_voters: vec![creator.clone()],
@@ -2928,12 +2928,12 @@ async fn scp274_bypass_prevention() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn scp274_exercises_seven_action_variants() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let params = governance_params();
     let _handle = manager
         .create_context("scp274-7a".into(), params, "did:key:admin".into(), None)
@@ -3107,12 +3107,12 @@ async fn scp274_exercises_seven_action_variants() {
 
 #[tokio::test]
 async fn scp274_extend_ttl_unanimity_override_in_threshold() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let mut params = governance_params();
     params.ttl = Some(std::time::Duration::from_hours(1));
     params.governance = GovernanceModel::Threshold {
@@ -3177,12 +3177,12 @@ async fn scp274_extend_ttl_unanimity_override_in_threshold() {
 async fn scp274_promote_context_unanimity_override_in_majority() {
     use scp_protocol::context::params::{MemoryScope, PromotionPolicy};
     let creator: DID = "did:key:creator".into();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let mut params = governance_params();
     params.governance = GovernanceModel::Majority {
         eligible_voters: vec![creator.clone()],
@@ -3237,12 +3237,12 @@ async fn scp274_promote_context_unanimity_override_in_majority() {
 
 #[tokio::test]
 async fn scp274_conflict_detection_change_role() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let params = governance_params();
     let _handle = manager
         .create_context(
@@ -3306,7 +3306,7 @@ async fn scp274_conflict_detection_change_role() {
             .approved_proposals
             .insert(proposal_a.proposal_id, (proposal_a.clone(), now, now));
         let events = crate::context::governance_helpers::detect_and_handle_conflicts(
-            &manager,
+            &manager.supervisor().expect("test: supervisor attached"),
             ctx,
             &proposal_b,
         );
@@ -3432,12 +3432,12 @@ fn pending_ceiling_is_effective_true_after_period_expires() {
 async fn execute_modify_ceiling_sets_pending_with_72h_period() {
     use scp_protocol::context::governance::GovernanceAction;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let alice: DID = "did:dht:z6MkAlice".into();
     let key_a = signing_key_for_did(&alice);
@@ -3494,12 +3494,12 @@ async fn execute_modify_ceiling_sets_pending_with_72h_period() {
 async fn apply_pending_ceiling_modification_respects_notification_period() {
     use scp_protocol::context::governance::GovernanceAction;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let alice: DID = "did:dht:z6MkAlice".into();
     let key_a = signing_key_for_did(&alice);
@@ -3577,12 +3577,12 @@ async fn execute_modify_ceiling_emits_ceiling_change_notification() {
     use scp_protocol::context::governance::GovernanceAction;
     use scp_protocol::context::membership::ContextEvent;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let alice: DID = "did:dht:z6MkAlice".into();
     let key_a = signing_key_for_did(&alice);
@@ -3731,12 +3731,12 @@ async fn execute_set_economic_policy_stages_with_24h_delay() {
     use scp_protocol::context::governance::GovernanceAction;
     use scp_protocol::economy::types::{CostSchedule, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let alice: DID = "did:dht:z6MkAlice".into();
     let key_a = signing_key_for_did(&alice);
@@ -3804,12 +3804,12 @@ async fn apply_pending_economic_policy_change_respects_notification_period() {
     use scp_protocol::context::governance::GovernanceAction;
     use scp_protocol::economy::types::{CostSchedule, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let alice: DID = "did:dht:z6MkAlice".into();
     let key_a = signing_key_for_did(&alice);
@@ -3903,12 +3903,12 @@ async fn execute_set_economic_policy_emits_notification_event() {
     use scp_protocol::context::membership::ContextEvent;
     use scp_protocol::economy::types::{CostSchedule, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let alice: DID = "did:dht:z6MkAlice".into();
     let key_a = signing_key_for_did(&alice);
@@ -3971,12 +3971,12 @@ async fn execute_set_economic_policy_rejects_when_already_pending() {
     use scp_protocol::context::governance::GovernanceAction;
     use scp_protocol::economy::types::{CostSchedule, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let alice: DID = "did:dht:z6MkAlice".into();
     let key_a = signing_key_for_did(&alice);
@@ -4037,12 +4037,12 @@ async fn modify_hard_rate_limit_updates_live_limiter() {
     use scp_protocol::context::governance::GovernanceAction;
     use scp_protocol::economy::antispam::HardRateLimitConfig;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let alice: DID = "did:dht:z6MkAlice".into();
     let key_a = signing_key_for_did(&alice);
@@ -4131,12 +4131,12 @@ async fn modify_hard_rate_limit_clamps_preserved_state_when_tightening() {
     use scp_protocol::context::governance::GovernanceAction;
     use scp_protocol::economy::antispam::HardRateLimitConfig;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let alice: DID = "did:dht:z6MkAlice".into();
     let key_a = signing_key_for_did(&alice);
@@ -4221,12 +4221,12 @@ async fn modify_hard_rate_limit_rejects_invalid_config() {
     use scp_protocol::context::governance::GovernanceAction;
     use scp_protocol::economy::antispam::HardRateLimitConfig;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
     let alice: DID = "did:dht:z6MkAlice".into();
     let key_a = signing_key_for_did(&alice);
 
@@ -4277,15 +4277,15 @@ async fn modify_hard_rate_limit_rejects_invalid_config() {
 // -----------------------------------------------------------------------
 
 /// Helper: create a `SingleAdmin` context with a spender member added.
-async fn setup_budget_context(ctx_id: &str) -> (ContextManager, DID, DID) {
+async fn setup_budget_context(ctx_id: &str) -> (Arc<ContextManager>, DID, DID) {
     let admin_did: DID = "did:key:admin".into();
     let spender_did: DID = "did:key:spender".into();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
     let params = ContextParams {
         ceiling: vec![
             scp_protocol::context::params::Capability::new("messages:read"),
@@ -4385,12 +4385,12 @@ async fn approve_spend_grants_budget_to_member_tracker() {
 async fn approve_spend_rejects_non_member_spender() {
     let admin_did: DID = "did:key:admin".into();
     let non_member: DID = "did:key:nonmember".into();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
     let params = ContextParams {
         ceiling: vec![
             scp_protocol::context::params::Capability::new("messages:read"),
@@ -5303,12 +5303,12 @@ async fn test_remove_member_sender_key_before_mls_removal() {
         inner: MockCrypto::default(),
     };
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -5373,12 +5373,12 @@ async fn test_consequence_rule_triggers_enforcement_event() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = None;
@@ -5446,12 +5446,12 @@ async fn test_economy_cost_deducted_on_send() {
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
     // `mock_key_resolver` resolves the deterministic test key for the actor
     // so the new validation pipeline succeeds.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -5530,12 +5530,12 @@ async fn test_cooldown_prevents_consequence_retrigger() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -5638,12 +5638,12 @@ async fn test_budget_exceeded_blocks_send() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -5723,12 +5723,12 @@ async fn test_access_revocation_revokes_read_and_write() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -5806,12 +5806,12 @@ async fn role_demotion_changes_member_role() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     // Add an "observer" role definition so demotion has a target.
@@ -5886,12 +5886,12 @@ async fn role_demotion_changes_member_role() {
 /// Standing decay clears participation cache and cooldown state.
 #[tokio::test]
 async fn test_participation_decay_clears_caches() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     // Add ContextClose capability to allow close_context.
@@ -5961,12 +5961,12 @@ async fn test_rotate_content_keys_advances_epoch() {
         ..MockCrypto::default()
     };
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -6015,12 +6015,12 @@ async fn test_capability_suspension_no_match_returns_false() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -6109,12 +6109,12 @@ async fn test_capability_suspension_no_match_returns_false() {
 async fn test_auto_accept_blocked_for_paid_contexts() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -6162,12 +6162,12 @@ async fn test_auto_accept_blocked_for_paid_contexts() {
 async fn pending_removal_blocks_proposal() {
     use scp_protocol::context::governance::{GovernanceAction, GovernanceProposal, ProposalStatus};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let alice: DID = "did:dht:z6MkAlice".into();
@@ -6233,12 +6233,12 @@ async fn pending_removal_blocks_proposal() {
 /// when they have a pending removal (#1530).
 #[tokio::test]
 async fn participation_influences_governance_eligibility() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let key_admin = signing_key_for_did(&admin);
@@ -6265,12 +6265,12 @@ async fn participation_influences_governance_eligibility() {
 /// Participation decay clears participation cache (#1530).
 #[tokio::test]
 async fn decay_participation_clears_state() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -6330,12 +6330,12 @@ async fn sender_key_before_mls_removal_ordering() {
     // Shared call-order tracker that survives after crypto moves into manager.
     let call_order = Arc::clone(&crypto.call_order);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let alice: DID = "did:dht:z6MkAlice".into();
@@ -6449,12 +6449,12 @@ async fn budget_exceeded_on_tool_invoke() {
 /// Participation record is updated after message send (#1530).
 #[tokio::test]
 async fn participation_record_updated_after_message_send() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -6517,12 +6517,12 @@ async fn consequence_triggers_after_governance_action() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let key_admin = signing_key_for_did(&admin);
@@ -6614,12 +6614,12 @@ async fn cooldown_expires_allows_retrigger() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -6723,12 +6723,12 @@ async fn cooldown_expires_allows_retrigger() {
 /// Empty consequence rules means no evaluation happens (#1531).
 #[tokio::test]
 async fn empty_consequence_rules_no_evaluation() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -6800,12 +6800,12 @@ async fn event_log_entries_feed_consequence_evaluation() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     // Use threshold=3 so it only fires after we accumulate enough events.
@@ -6891,12 +6891,12 @@ async fn remaining_members_keys_after_removal() {
         Arc::clone(&crypto.call_order)
     };
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let alice: DID = "did:dht:z6MkAlice".into();
@@ -6965,12 +6965,12 @@ async fn remaining_members_keys_after_removal() {
 /// Broadcast mode `RotateContentKeys` calls `rotate_all_author_keys` (#1548).
 #[tokio::test]
 async fn broadcast_rotation_calls_rotate_author_keys() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let key_admin = signing_key_for_did(&admin);
@@ -7022,12 +7022,12 @@ async fn encrypted_rotation_updates_epoch_counter() {
         ..MockCrypto::default()
     };
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let key_admin = signing_key_for_did(&admin);
@@ -7085,12 +7085,12 @@ async fn full_send_consequence_enforcement_round_trip() {
     use std::time::Duration;
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     // Economic policy with per-message cost.
@@ -7216,12 +7216,12 @@ async fn full_send_consequence_enforcement_round_trip() {
 /// Governance action -> participation update -> eligibility round trip (#1530).
 #[tokio::test]
 async fn governance_participation_round_trip() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let key_admin = signing_key_for_did(&admin);
@@ -7290,12 +7290,12 @@ async fn capability_suspension_blocks_subsequent_send() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.consequence_rules = vec![ConsequenceRule {
@@ -7370,12 +7370,12 @@ async fn access_revocation_blocks_subsequent_send() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.consequence_rules = vec![ConsequenceRule {
@@ -7437,12 +7437,12 @@ async fn access_revocation_blocks_subsequent_send() {
 async fn join_context_with_join_cost_no_budget_rejected() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     // Set per_join cost but NOT a per_join cost that triggers auto_accept_blocked
@@ -7502,12 +7502,12 @@ async fn eligibility_blocks_low_participation() {
     let bob: DID = "did:dht:z6MkBob".into();
     let key_bob = signing_key_for_did(&bob);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.governance = scp_protocol::context::params::GovernanceModel::Threshold {
@@ -7604,12 +7604,12 @@ async fn eligibility_allows_good_participation() {
     let alice: DID = "did:dht:z6MkAlice".into();
     let key_alice = signing_key_for_did(&alice);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.governance = scp_protocol::context::params::GovernanceModel::Threshold {
@@ -7692,12 +7692,12 @@ async fn consequence_triggers_on_message_send() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.consequence_rules = vec![ConsequenceRule {
@@ -7772,12 +7772,12 @@ async fn send_message_deducts_budget() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -8035,12 +8035,12 @@ async fn test_tool_invoke_setup(
 /// Velocity tracker records messages after send (#1537).
 #[tokio::test]
 async fn velocity_tracker_records_messages() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -8154,12 +8154,12 @@ async fn encrypted_rotation_advance_epoch_called() {
         ..MockCrypto::default()
     };
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let key_admin = signing_key_for_did(&admin);
@@ -8209,11 +8209,18 @@ async fn encrypted_rotation_advance_epoch_called() {
 async fn paid_join_end_to_end_with_adapter() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let mut manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+    // ADR-049 commit 12c.9c — build with payment adapter up-front so we
+    // never need `&mut self` after the manager is wrapped in `Arc` by
+    // `attach_test_supervisor`.
+    let manager = super::attach_test_supervisor(
+        ContextManager::builder()
+            .crypto(Box::new(MockCrypto::default()))
+            .transport(Box::new(MockTransport::connected()))
+            .event_log(Box::new(MockEventLog::default()))
+            .key_resolver(noop_key_resolver())
+            .payment_adapter(Arc::new(crate::economy::adapter::NoOpPaymentAdapter))
+            .build()
+            .unwrap(),
     );
 
     let mut params = governance_params();
@@ -8235,9 +8242,6 @@ async fn paid_join_end_to_end_with_adapter() {
         .create_context("paid-join-ctx".into(), params, "did:key:admin".into(), None)
         .await
         .unwrap();
-
-    // Set up payment adapter.
-    manager.set_payment_adapter(Arc::new(crate::economy::adapter::NoOpPaymentAdapter));
 
     // The join_context path blocks auto-accept for paid contexts. Verify the
     // auto-accept block fires even with an adapter configured.
@@ -8309,12 +8313,12 @@ async fn paid_join_end_to_end_with_adapter() {
 /// Verifies that joining a context runs sybil evaluation without error.
 #[tokio::test]
 async fn sybil_resistance_evaluated_on_join() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let handle = manager
@@ -8348,12 +8352,12 @@ async fn sybil_resistance_evaluated_on_join() {
 async fn join_context_deducts_budget_when_granted() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     // Set per_join cost but also per_message so context has economic policy.
@@ -8459,12 +8463,12 @@ async fn join_context_deducts_budget_when_granted() {
 /// contains a `participation_count` > 0 in the `participation_cache` (#1530).
 #[tokio::test]
 async fn participation_record_updated_after_governance() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkPartGov".into();
     let key_admin = signing_key_for_did(&admin);
@@ -8534,12 +8538,12 @@ async fn test_send_rejected_insufficient_budget() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -8659,12 +8663,12 @@ async fn test_tool_invoke_rejected_insufficient_budget() {
 async fn test_join_rejected_insufficient_budget() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -8714,12 +8718,12 @@ async fn test_join_rejected_insufficient_budget() {
 async fn test_execute_paid_action_skips_without_adapter() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -8768,11 +8772,17 @@ async fn test_execute_paid_action_skips_without_adapter() {
 async fn test_execute_paid_action_full_flow_with_adapter() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let mut manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+    // ADR-049 commit 12c.9c — build with adapter up-front; see
+    // `paid_join_end_to_end_with_adapter` for the rationale.
+    let manager = super::attach_test_supervisor(
+        ContextManager::builder()
+            .crypto(Box::new(MockCrypto::default()))
+            .transport(Box::new(MockTransport::connected()))
+            .event_log(Box::new(MockEventLog::default()))
+            .key_resolver(noop_key_resolver())
+            .payment_adapter(Arc::new(crate::economy::adapter::NoOpPaymentAdapter))
+            .build()
+            .unwrap(),
     );
 
     let mut params = governance_params();
@@ -8805,9 +8815,6 @@ async fn test_execute_paid_action_full_flow_with_adapter() {
             .grant(&"did:key:admin".into(), Amount::new(100));
     }
 
-    // Set up NoOpPaymentAdapter.
-    manager.set_payment_adapter(Arc::new(crate::economy::adapter::NoOpPaymentAdapter));
-
     // authorize_paid_action → complete_paid_action (escrow pattern).
     let auth = manager
         .authorize_paid_action(
@@ -8835,12 +8842,12 @@ async fn test_execute_paid_action_full_flow_with_adapter() {
 /// Free context (no `economic_policy`) does not deduct budget (#1537).
 #[tokio::test]
 async fn test_free_context_no_budget_deduction() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     // No economic_policy set (free context).
     let params = governance_params();
@@ -8901,12 +8908,12 @@ async fn test_free_context_no_budget_deduction() {
 /// After removing one member, remaining member can still `send_message` (#1541).
 #[tokio::test]
 async fn test_remaining_members_unaffected_after_removal() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkRemAdm".into();
     let alice: DID = "did:dht:z6MkRemAlice".into();
@@ -8965,12 +8972,12 @@ async fn test_remaining_members_unaffected_after_removal() {
 /// emitted (#1548).
 #[tokio::test]
 async fn test_broadcast_rotation_rotates_author_keys() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkBcRot".into();
     let key_admin = signing_key_for_did(&admin);
@@ -9019,12 +9026,12 @@ async fn test_encrypted_rotation_increments_epoch() {
         ..MockCrypto::default()
     };
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkEncRot".into();
     let key_admin = signing_key_for_did(&admin);
@@ -9063,12 +9070,12 @@ async fn test_send_consequence_economy_round_trip() {
     use std::time::Duration;
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -9165,12 +9172,12 @@ async fn test_send_consequence_economy_round_trip() {
 /// `check_proposer_eligibility` (#1530).
 #[tokio::test]
 async fn test_governance_eligibility_participation_round_trip() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkStandRT".into();
     let key_admin = signing_key_for_did(&admin);
@@ -9236,12 +9243,12 @@ async fn test_paid_join_with_consequence_evaluation() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -9366,12 +9373,12 @@ async fn test_full_lifecycle_economy() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -9584,7 +9591,7 @@ async fn velocity_escalation_raises_effective_cost() {
 
 /// Setup helper for the velocity-escalation test.
 async fn setup_velocity_escalation_context() -> (
-    ContextManager,
+    Arc<ContextManager>,
     crate::context::ContextHandle,
     DID,
     ed25519_dalek::SigningKey,
@@ -9598,12 +9605,12 @@ async fn setup_velocity_escalation_context() -> (
     // messages, which now require signature-verified spending UCANs.
     // `mock_key_resolver` resolves the deterministic test key for the
     // admin so the new validation pipeline succeeds.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
     let mut params = governance_params();
     // Pricing formula: base 1/msg + step thresholds on SenderVelocity.
     params.economic_policy = Some(EconomicPolicy {
@@ -9664,12 +9671,12 @@ async fn rotate_sender_key_called_after_remove_member() {
     let crypto = MockCrypto::default();
     let call_order = Arc::clone(&crypto.call_order);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let alice: DID = "did:dht:z6MkAlice".into();
@@ -9735,12 +9742,12 @@ async fn rotate_sender_key_error_propagates() {
     let crypto = MockCrypto::default();
     crypto.fail_rotate_sender_key.store(true, Ordering::Relaxed);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let alice: DID = "did:dht:z6MkAlice".into();
@@ -9783,12 +9790,12 @@ async fn rotate_sender_key_called_on_leave() {
     let crypto = MockCrypto::default();
     let call_order = Arc::clone(&crypto.call_order);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let alice: DID = "did:dht:z6MkAlice".into();
@@ -9858,12 +9865,12 @@ async fn rotate_sender_key_called_on_leave() {
 async fn test_paid_send_rejected_without_spending_ucan() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -9970,12 +9977,12 @@ async fn test_free_send_ok_without_spending_ucan() {
 async fn test_paid_join_rejected_without_spending_ucan() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -10020,12 +10027,12 @@ async fn test_paid_join_rejected_without_spending_ucan() {
 /// Free join (no `economic_policy`) succeeds without a spending UCAN.
 #[tokio::test]
 async fn test_free_join_ok_without_spending_ucan() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let handle = manager
@@ -10054,12 +10061,12 @@ async fn test_free_join_ok_without_spending_ucan() {
 /// which implements `event_log_entries()` for read-back verification.
 #[tokio::test]
 async fn test_event_log_stores_actor_did() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLogWithActorDid::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let handle = manager
@@ -10124,12 +10131,12 @@ async fn test_consequence_evaluation_uses_full_history() {
     use std::time::Duration;
 
     // Use MockEventLogWithActorDid so event_log_entries() returns real data.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLogWithActorDid::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     // Threshold=2: consequence triggers when 2+ MessageSent events are seen.
@@ -10249,12 +10256,12 @@ async fn paid_send_with_valid_spending_ucan_succeeds() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -10361,12 +10368,12 @@ async fn spending_ucan_on_free_context_ignored() {
 async fn zero_cost_per_message_no_ucan_required() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -10430,12 +10437,12 @@ async fn zero_cost_per_message_no_ucan_required() {
 async fn none_per_message_no_ucan_required() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -10495,12 +10502,12 @@ async fn multiple_sends_unique_spending_ucans_all_succeed() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -10588,12 +10595,12 @@ async fn multiple_sends_unique_spending_ucans_all_succeed() {
 async fn paid_join_with_spending_ucan_still_blocked_by_auto_accept() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -10664,12 +10671,12 @@ async fn rotate_sender_key_not_called_when_remove_member_fails() {
     crypto.fail_remove_member.store(true, Ordering::Relaxed);
     let call_order = Arc::clone(&crypto.call_order);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let alice: DID = "did:dht:z6MkAlice".into();
@@ -10731,12 +10738,12 @@ async fn rotate_sender_key_not_called_when_remove_member_fails() {
 
 #[tokio::test]
 async fn join_context_stores_actor_did() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLogWithActorDid::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let handle = manager
@@ -10785,12 +10792,12 @@ async fn join_context_stores_actor_did() {
 
 #[tokio::test]
 async fn leave_context_stores_actor_did() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLogWithActorDid::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let handle = manager
@@ -10841,12 +10848,12 @@ async fn leave_context_stores_actor_did() {
 
 #[tokio::test]
 async fn governance_action_stores_actor_did() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLogWithActorDid::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let target: DID = "did:dht:z6MkTarget".into();
@@ -10898,12 +10905,12 @@ async fn governance_action_stores_actor_did() {
 
 #[tokio::test]
 async fn context_created_event_has_creator_actor_did() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLogWithActorDid::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -10947,12 +10954,12 @@ async fn no_auto_grant_requires_explicit_budget() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -11052,12 +11059,12 @@ async fn no_double_charge_on_paid_send() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -11135,12 +11142,12 @@ async fn capability_suspension_exact_match_no_false_positive() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     // Create context without consequence rules, then inject the rule directly
@@ -11250,12 +11257,12 @@ async fn capability_suspension_write_revokes_write() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.consequence_rules = vec![ConsequenceRule {
@@ -11333,12 +11340,12 @@ async fn capability_suspension_read_revokes_read() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.consequence_rules = vec![ConsequenceRule {
@@ -11413,12 +11420,12 @@ async fn role_demotion_nonexistent_role_reports_failure() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     // The only valid role assignment targets are those defined by the role state.
@@ -11517,13 +11524,17 @@ async fn execute_paid_action_skips_zero_cost() {
     use crate::economy::adapter::NoOpPaymentAdapter;
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let mut manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+    // ADR-049 commit 12c.9c — build with adapter up-front.
+    let manager = super::attach_test_supervisor(
+        ContextManager::builder()
+            .crypto(Box::new(MockCrypto::default()))
+            .transport(Box::new(MockTransport::connected()))
+            .event_log(Box::new(MockEventLog::default()))
+            .key_resolver(noop_key_resolver())
+            .payment_adapter(Arc::new(NoOpPaymentAdapter))
+            .build()
+            .unwrap(),
     );
-    manager.set_payment_adapter(Arc::new(NoOpPaymentAdapter));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -11577,12 +11588,12 @@ async fn execute_paid_action_skips_zero_cost() {
 
 #[tokio::test]
 async fn verify_receipts_no_adapter_returns_no_verifier_error() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let receipt = crate::economy::adapter::PaymentReceipt {
         receipt_id: [1u8; 32],
@@ -11624,12 +11635,12 @@ async fn verify_receipts_no_adapter_returns_no_verifier_error() {
 
 #[tokio::test]
 async fn participation_cache_cleared_after_member_leaves() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let alice: DID = "did:dht:z6MkAlice".into();
@@ -11728,12 +11739,12 @@ async fn capability_suspension_empty_caps_no_action() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     // Create context without consequence rules, then inject directly to
@@ -11846,12 +11857,12 @@ async fn multiple_consequence_rules_all_trigger() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.consequence_rules = vec![
@@ -11946,12 +11957,12 @@ async fn aggregate_velocity_via_manager_send() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -12033,13 +12044,17 @@ async fn aggregate_velocity_via_manager_send() {
 async fn verify_receipts_with_noop_adapter_returns_valid() {
     use crate::economy::adapter::NoOpPaymentAdapter;
 
-    let mut manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        noop_key_resolver(),
+    // ADR-049 commit 12c.9c — build with adapter up-front.
+    let manager = super::attach_test_supervisor(
+        ContextManager::builder()
+            .crypto(Box::new(MockCrypto::default()))
+            .transport(Box::new(MockTransport::connected()))
+            .event_log(Box::new(MockEventLog::default()))
+            .key_resolver(noop_key_resolver())
+            .payment_adapter(Arc::new(NoOpPaymentAdapter))
+            .build()
+            .unwrap(),
     );
-    manager.set_payment_adapter(Arc::new(NoOpPaymentAdapter));
 
     let receipt = crate::economy::adapter::PaymentReceipt {
         receipt_id: [1u8; 32],
@@ -12086,12 +12101,12 @@ async fn test_warning_count_trigger_fires_behavioral() {
     use std::time::Duration;
 
     // Use MockEventLogWithActorDid so event log entries are queryable.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLogWithActorDid::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkAdmin".into();
     let target: DID = "did:dht:z6MkTarget".into();
@@ -12189,12 +12204,12 @@ async fn test_participation_actions_against_populated() {
     // Use MockEventLogWithActorDid so event log entries are readable.
     // Wrap in Arc so we can inspect entries after construction.
     let event_log = std::sync::Arc::new(MockEventLogWithActorDid::default());
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(ArcEventLog(event_log.clone())),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkAdmin".into();
     let target: DID = "did:dht:z6MkTarget".into();
@@ -12253,12 +12268,12 @@ async fn test_participation_actions_against_populated() {
 
 #[tokio::test]
 async fn event_log_entries_merge_buffer_and_history() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLogWithActorDid::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -12328,12 +12343,12 @@ async fn buffer_event_timestamp_bounds_m18() {
     use super::super::governance::event_log_entries_for_consequences;
 
     let event_log = MockEventLog::default();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let _handle = manager
         .create_context(
@@ -12462,12 +12477,12 @@ async fn buffer_event_timestamp_bounds_m18() {
 async fn budget_not_deducted_on_transport_failure() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(FailingTransport),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -12561,12 +12576,12 @@ async fn eligibility_check_uses_context_manager_clock() {
     // Verify the ContextManager is constructed with a clock and uses it
     // for governance operations. The default clock is SystemClock, but the
     // builder allows injection.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let key_admin = signing_key_for_did(&admin);
@@ -12607,12 +12622,12 @@ async fn observable_metrics_time_of_day_populated() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -12680,12 +12695,12 @@ async fn context_message_rate_from_aggregate_velocity() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -13044,12 +13059,12 @@ async fn consequence_timer_fires_without_user_action() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
 
@@ -13128,12 +13143,12 @@ async fn consequence_timer_respects_cooldown() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
 
@@ -13210,12 +13225,12 @@ async fn consequence_timer_respects_cooldown() {
 async fn consequence_timer_noop_without_rules() {
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let mut params = governance_params();
@@ -13402,12 +13417,12 @@ fn evaluate_cost_enforce_gate() {
 async fn test_fabricated_spending_ucan_rejected() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -13506,15 +13521,15 @@ async fn test_fabricated_spending_ucan_rejected() {
 
 /// Helper: paid context with `per_message=10`, sender already granted 1000 budget,
 /// and a `mock_key_resolver` so the C1 signature pipeline has a key to resolve.
-async fn c1_paid_context(name: &str, sender_did: &DID) -> (ContextManager, ContextHandle) {
+async fn c1_paid_context(name: &str, sender_did: &DID) -> (Arc<ContextManager>, ContextHandle) {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -13886,12 +13901,12 @@ async fn test_spending_ucan_happy_path_c1() {
 async fn test_capability_failure_no_budget_leak() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -13984,12 +13999,12 @@ async fn test_capture_failure_budget_retained() {
     // by verifying that send_message succeeds and the budget is deducted.
     //
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(scp_protocol::economy::types::EconomicPolicy {
@@ -14061,12 +14076,12 @@ async fn spending_ucan_nonce_replay_rejected() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -14184,12 +14199,12 @@ async fn test_sender_key_failure_still_removes_from_mls() {
     // Use the call_order to verify MLS removal happened.
     let call_order = Arc::clone(&crypto.call_order);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkSKFail".into();
     let alice: DID = "did:dht:z6MkSKAlice".into();
@@ -14240,12 +14255,12 @@ async fn test_consequence_failure_escalates() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     // Role demotion to a nonexistent role will fail (success=false).
@@ -14373,12 +14388,12 @@ async fn test_velocity_includes_current_message() {
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     // C1 (PR #1606): paid sends require signature-verified spending UCANs.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(EconomicPolicy {
@@ -14479,12 +14494,12 @@ async fn test_member_reset_rotates_sender_keys() {
     };
 
     let crypto = MockCrypto::default();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkAlice");
     let bob = DID::from("did:dht:z6MkBob");
@@ -14549,12 +14564,12 @@ async fn test_governance_close_decays_participation() {
         GovernanceAction, GovernanceProposal, ProposalStatus, SignedVote, VoteType,
     };
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkAlice");
 
@@ -14668,17 +14683,17 @@ async fn test_governance_close_decays_participation() {
     reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 fn h17_h16_make_manager() -> (
-    ContextManager,
+    Arc<ContextManager>,
     std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
 ) {
     let transport = MockTransport::connected();
     let sent = transport.sent_messages_handle();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(transport),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
     (manager, sent)
 }
 
@@ -14703,10 +14718,10 @@ async fn h17_setup_alice_and_bob(
     context_id: &str,
     bob_consequence_rules: Vec<super::ConsequenceRule>,
 ) -> (
-    ContextManager,
+    Arc<ContextManager>,
     super::ContextHandle,
     std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
-    ContextManager,
+    Arc<ContextManager>,
 ) {
     let alice_did_str = "did:key:alice";
     let bob_did_str = "did:key:bob";
@@ -15146,12 +15161,12 @@ async fn execute_revoke_write_rotates_sender_key() {
     let crypto = MockCrypto::default();
     let call_order = Arc::clone(&crypto.call_order);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkAlice");
     let bob = DID::from("did:dht:z6MkBob");
@@ -15211,12 +15226,12 @@ async fn execute_revoke_both_rotates_sender_key() {
     let crypto = MockCrypto::default();
     let call_order = Arc::clone(&crypto.call_order);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkAlice");
     let bob = DID::from("did:dht:z6MkBob");
@@ -15276,12 +15291,12 @@ async fn execute_revoke_read_does_not_rotate_sender_key() {
     let crypto = MockCrypto::default();
     let call_order = Arc::clone(&crypto.call_order);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkAlice");
     let bob = DID::from("did:dht:z6MkBob");
@@ -15343,12 +15358,12 @@ async fn execute_revoke_rotation_failure_still_completes() {
     // Inject rotation failure before the action runs.
     crypto.fail_rotate_sender_key.store(true, Ordering::Relaxed);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkAlice");
     let bob = DID::from("did:dht:z6MkBob");
@@ -15406,12 +15421,12 @@ async fn execute_revoke_rotation_failure_still_completes() {
 
 #[tokio::test]
 async fn test_decay_participation_clears_velocity_tracker() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkAlice");
     let handle = manager
@@ -15452,12 +15467,12 @@ async fn test_decay_participation_clears_velocity_tracker() {
 
 #[tokio::test]
 async fn test_evict_stale_entries_removes_non_members() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let alice = DID::from("did:dht:z6MkAlice");
     let handle = manager
@@ -15594,12 +15609,12 @@ async fn enforce_triggered_consequences_skips_absent_member() {
 async fn earned_capacity_limits_governance_proposals() {
     use scp_protocol::trust::sybil::ContextSybilPolicy;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let key_admin = signing_key_for_did(&admin);
@@ -15662,12 +15677,12 @@ async fn earned_capacity_limits_governance_proposals() {
 /// limits (backward compatibility). Unlimited proposals should succeed.
 #[tokio::test]
 async fn no_sybil_policy_allows_unlimited_proposals() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let key_admin = signing_key_for_did(&admin);
@@ -15715,12 +15730,12 @@ async fn no_sybil_policy_allows_unlimited_proposals() {
 async fn earned_capacity_evicts_stale_timestamps() {
     use scp_protocol::trust::sybil::ContextSybilPolicy;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkCreator".into();
     let key_admin = signing_key_for_did(&admin);
@@ -15773,12 +15788,12 @@ async fn earned_capacity_evicts_stale_timestamps() {
 /// "newly joined" member on the first tick instead of a stable member.
 #[tokio::test]
 async fn governed_context_seeds_last_known_members_with_creator() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let creator: DID = "did:key:creator-seed".into();
     let params = ContextParams {
@@ -15822,12 +15837,12 @@ async fn governed_context_seeds_last_known_members_with_creator() {
 #[tokio::test]
 async fn revoke_access_event_carries_target_did_payload() {
     let event_log = std::sync::Arc::new(MockEventLogWithActorDid::default());
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(ArcEventLog(event_log.clone())),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:key:rev-admin".into();
     let target: DID = "did:key:rev-target".into();
@@ -15893,12 +15908,12 @@ async fn revoke_access_event_carries_target_did_payload() {
 /// trigger consequences prematurely.
 #[tokio::test]
 async fn consequence_evaluation_caps_buffer_events() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let creator: DID = "did:key:cap-creator".into();
     let params = ContextParams {
@@ -15994,12 +16009,12 @@ async fn create_with_governance_rejects_threshold_zero() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
     let (governance, governance_config) = h1_threshold_config(&creator);
     let params = ContextParams {
@@ -16034,12 +16049,12 @@ async fn create_with_governance_rejects_empty_custom_trigger() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
     let (governance, governance_config) = h1_threshold_config(&creator);
     let params = ContextParams {
@@ -16081,12 +16096,12 @@ async fn create_with_governance_rejects_remove_member_action() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
     let target: DID = "did:key:victim".into();
     let (governance, governance_config) = h1_threshold_config(&creator);
@@ -16133,12 +16148,12 @@ async fn create_with_governance_rejects_revoke_access_without_config_opt_in() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
     let target: DID = "did:key:victim".into();
     let (governance, governance_config) = h1_threshold_config(&creator);
@@ -16184,12 +16199,12 @@ async fn create_with_governance_accepts_revoke_access_with_config_opt_in() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
     let target: DID = "did:key:victim".into();
     let (governance, governance_config) = h1_threshold_config(&creator);
@@ -16229,12 +16244,12 @@ async fn create_with_governance_accepts_valid_rules() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let creator: DID = "did:key:admin1".into();
     let (governance, governance_config) = h1_threshold_config(&creator);
     let params = ContextParams {
@@ -16281,12 +16296,12 @@ async fn create_with_governance_accepts_valid_rules() {
 async fn h2_execute_change_role_works_when_creator_demoted() {
     use scp_protocol::context::roles::Capability as RoleCapability;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let params = governance_params();
     let _handle = manager
         .create_context(
@@ -16388,12 +16403,12 @@ async fn h2_execute_change_role_works_when_creator_demoted() {
 async fn h2_execute_add_member_works_when_creator_demoted() {
     use scp_protocol::context::roles::Capability as RoleCapability;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let params = governance_params();
     let _handle = manager
         .create_context(
@@ -16481,12 +16496,12 @@ async fn h2_execute_add_member_works_when_creator_demoted() {
 /// the token plumbing while migrating to the system path.
 #[tokio::test]
 async fn h2_execute_change_role_updates_tokens_correctly() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let params = governance_params();
     let _handle = manager
         .create_context(
@@ -16653,19 +16668,21 @@ async fn h10_setup_with_test_clock(
     context_id: &str,
     start_secs: u64,
 ) -> (
-    super::ContextManager,
+    Arc<super::ContextManager>,
     super::ContextHandle,
     std::sync::Arc<scp_primitives::TestClock>,
 ) {
     let clock = std::sync::Arc::new(scp_primitives::TestClock::new(start_secs));
-    let manager = super::ContextManager::builder()
-        .crypto(Box::new(MockCrypto::default()))
-        .transport(Box::new(MockTransport::connected()))
-        .event_log(Box::new(MockEventLog::default()))
-        .key_resolver(noop_key_resolver())
-        .clock(clock.clone() as std::sync::Arc<dyn scp_primitives::Clock>)
-        .build()
-        .expect("builder must succeed");
+    let manager = super::attach_test_supervisor(
+        super::ContextManager::builder()
+            .crypto(Box::new(MockCrypto::default()))
+            .transport(Box::new(MockTransport::connected()))
+            .event_log(Box::new(MockEventLog::default()))
+            .key_resolver(noop_key_resolver())
+            .clock(clock.clone() as std::sync::Arc<dyn scp_primitives::Clock>)
+            .build()
+            .expect("builder must succeed"),
+    );
 
     let params = governance_params();
     let handle = manager
@@ -16742,10 +16759,16 @@ async fn h10_governance_freeze_not_triggered_by_timestamp_collision() {
     let mut g = arc.lock().await;
     let ctx = &mut *g;
 
-    let events_a =
-        crate::context::governance_helpers::detect_and_handle_conflicts(&manager, ctx, &proposal_a);
-    let events_b =
-        crate::context::governance_helpers::detect_and_handle_conflicts(&manager, ctx, &proposal_b);
+    let events_a = crate::context::governance_helpers::detect_and_handle_conflicts(
+        &manager.supervisor().expect("test: supervisor attached"),
+        ctx,
+        &proposal_a,
+    );
+    let events_b = crate::context::governance_helpers::detect_and_handle_conflicts(
+        &manager.supervisor().expect("test: supervisor attached"),
+        ctx,
+        &proposal_b,
+    );
 
     // Wall clock did NOT advance.
     assert_eq!(
@@ -16838,8 +16861,11 @@ async fn h10_approved_proposals_stores_monotonic_seq() {
         );
 
         for p in &proposals {
-            let _ =
-                crate::context::governance_helpers::detect_and_handle_conflicts(&manager, ctx, p);
+            let _ = crate::context::governance_helpers::detect_and_handle_conflicts(
+                &manager.supervisor().expect("test: supervisor attached"),
+                ctx,
+                p,
+            );
         }
 
         // Counter must have advanced exactly 3 times.
@@ -16907,10 +16933,16 @@ async fn h10_next_proposal_seq_persists_across_snapshot() {
             .clone();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
-        let _ =
-            crate::context::governance_helpers::detect_and_handle_conflicts(&manager, ctx, &p_a);
-        let _ =
-            crate::context::governance_helpers::detect_and_handle_conflicts(&manager, ctx, &p_b);
+        let _ = crate::context::governance_helpers::detect_and_handle_conflicts(
+            &manager.supervisor().expect("test: supervisor attached"),
+            ctx,
+            &p_a,
+        );
+        let _ = crate::context::governance_helpers::detect_and_handle_conflicts(
+            &manager.supervisor().expect("test: supervisor attached"),
+            ctx,
+            &p_b,
+        );
         assert_eq!(ctx.governance.next_proposal_seq, 2);
         super::ContextManager::snapshot_context(ctx)
     };
@@ -16996,10 +17028,16 @@ async fn h10_import_context_resets_next_proposal_seq() {
             .clone();
         let mut g = arc.lock().await;
         let ctx = &mut *g;
-        let _ =
-            crate::context::governance_helpers::detect_and_handle_conflicts(&manager, ctx, &p_a);
-        let _ =
-            crate::context::governance_helpers::detect_and_handle_conflicts(&manager, ctx, &p_b);
+        let _ = crate::context::governance_helpers::detect_and_handle_conflicts(
+            &manager.supervisor().expect("test: supervisor attached"),
+            ctx,
+            &p_a,
+        );
+        let _ = crate::context::governance_helpers::detect_and_handle_conflicts(
+            &manager.supervisor().expect("test: supervisor attached"),
+            ctx,
+            &p_b,
+        );
         super::ContextManager::snapshot_context(ctx)
     };
 
@@ -17024,12 +17062,12 @@ async fn h10_import_context_resets_next_proposal_seq() {
     };
 
     // Import into a fresh manager so we can observe the post-import state.
-    let importer = super::ContextManager::new(
+    let importer = super::attach_test_supervisor(super::ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     importer
         .import_context(export)
         .await
@@ -17121,7 +17159,7 @@ async fn h10_conflict_resolution_uses_seq_not_timestamp() {
         let mut g = arc.lock().await;
         let ctx = &mut *g;
         let _events_a = crate::context::governance_helpers::detect_and_handle_conflicts(
-            &manager,
+            &manager.supervisor().expect("test: supervisor attached"),
             ctx,
             &proposal_a,
         );
@@ -17132,7 +17170,7 @@ async fn h10_conflict_resolution_uses_seq_not_timestamp() {
         assert_eq!(clock.now_secs(), 1_500_000, "TestClock rewound");
 
         let events_b = crate::context::governance_helpers::detect_and_handle_conflicts(
-            &manager,
+            &manager.supervisor().expect("test: supervisor attached"),
             ctx,
             &proposal_b,
         );
@@ -17242,12 +17280,12 @@ async fn suspend_all_consequence_preserves_mls_membership() {
     let crypto = MockCrypto::default();
     let call_order = Arc::clone(&crypto.call_order);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkAdminH20A".into();
     let alice: DID = "did:dht:z6MkAliceH20A".into();
@@ -17484,12 +17522,12 @@ async fn suspend_capability_consequence_preserves_mls_membership() {
     let crypto = MockCrypto::default();
     let call_order = Arc::clone(&crypto.call_order);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkAdminH20B".into();
     let alice: DID = "did:dht:z6MkAliceH20B".into();
@@ -17661,12 +17699,12 @@ async fn restore_access_after_suspend_all_regrants_capabilities() {
     let crypto = MockCrypto::default();
     let call_order = Arc::clone(&crypto.call_order);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let admin: DID = "did:dht:z6MkAdminH20C".into();
     let alice: DID = "did:dht:z6MkAliceH20C".into();
@@ -17892,12 +17930,12 @@ async fn consequence_enforced_appended_to_durable_event_log() {
     use std::time::Duration;
 
     let event_log = std::sync::Arc::new(MockEventLogWithActorDid::default());
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(ArcEventLog(event_log.clone())),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = None;
@@ -18036,12 +18074,12 @@ async fn consequence_escalation_appended_with_distinct_event_type() {
     use std::time::Duration;
 
     let event_log = std::sync::Arc::new(MockEventLogWithActorDid::default());
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(ArcEventLog(event_log.clone())),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -18164,12 +18202,12 @@ async fn consequence_events_visible_to_subsequent_rule_evaluation() {
     use std::time::Duration;
 
     let event_log = std::sync::Arc::new(MockEventLogWithActorDid::default());
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(ArcEventLog(event_log.clone())),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let _handle = manager
@@ -18484,12 +18522,12 @@ fn consequence_event_log_append_ordering() {
 #[tokio::test]
 async fn consequence_rule_with_empty_rules_no_durable_append() {
     let event_log = std::sync::Arc::new(MockEventLogWithActorDid::default());
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(ArcEventLog(event_log.clone())),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.consequence_rules = vec![];

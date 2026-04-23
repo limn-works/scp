@@ -62,12 +62,12 @@ async fn member_role_assignment() {
 /// and `is_local_did` confirms it.
 #[tokio::test]
 async fn register_local_did_is_queryable() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let did: DID = "did:key:local1".into();
     assert!(!manager.is_local_did(&did).await);
@@ -235,12 +235,12 @@ async fn handle_broadcast_key_request_deny_does_not_leak_block_info() {
 #[tokio::test]
 async fn handle_broadcast_key_request_rejects_non_local_did_before_context_lookup() {
     // Create a manager but don't create any contexts.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     // Neither the author DID nor the context exist.
     let result = manager
@@ -397,12 +397,12 @@ async fn threshold_signers_bounded_at_64() {
 async fn get_broadcast_key_for_local_author_returns_key_and_epoch() {
     use zeroize::Zeroizing;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::<MockCrypto>::default(),
         Box::new(MockTransport::default()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let creator_did: DID = "did:key:creator1".into();
     manager.register_local_did(creator_did.clone()).await;
@@ -431,12 +431,12 @@ async fn get_broadcast_key_for_local_author_returns_key_and_epoch() {
 
 #[tokio::test]
 async fn get_broadcast_key_for_local_author_rejects_non_local_did() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::<MockCrypto>::default(),
         Box::new(MockTransport::default()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let creator_did: DID = "did:key:creator2".into();
     manager.register_local_did(creator_did.clone()).await;
@@ -465,12 +465,12 @@ async fn get_broadcast_key_for_local_author_rejects_non_local_did() {
 
 #[tokio::test]
 async fn get_broadcast_key_for_local_author_rejects_unknown_context() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::<MockCrypto>::default(),
         Box::new(MockTransport::default()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let did: DID = "did:key:creator3".into();
     manager.register_local_did(did.clone()).await;
@@ -488,12 +488,12 @@ async fn get_broadcast_key_for_local_author_rejects_unknown_context() {
 
 #[tokio::test]
 async fn get_broadcast_key_for_local_author_rejects_encrypted_context() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::<MockCrypto>::default(),
         Box::new(MockTransport::default()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let creator_did: DID = "did:key:creator4".into();
     manager.register_local_did(creator_did.clone()).await;

@@ -190,6 +190,75 @@ const fn _assert_send_sync() {
     assert_send_sync::<ContextParams>();
 }
 
+// ---------------------------------------------------------------------------
+// Test-only convenience: attach a fresh Supervisor to a ContextManager.
+// ---------------------------------------------------------------------------
+
+/// Wraps a manager in an Arc + attaches a fresh test-only Supervisor
+/// (ADR-049 commit 12c.9c).
+///
+/// After commit 12c.9c every `ContextManager` method that forwards to
+/// the hoisted messaging / broadcast / governance / economy helpers
+/// goes through `self.supervisor().ok_or_else(...)?`. Tests that
+/// invoke those methods directly on a fresh manager MUST first call
+/// this wrapper so the `Weak<Supervisor>` back-pointer is populated;
+/// otherwise the forwarder returns [`ContextError::NotInitialized`].
+///
+/// Returns [`Arc<manager::ContextManager>`] so tests can continue to
+/// access `manager.contexts`, `manager.create_context(...)`, etc. via
+/// [`std::sync::Arc`] auto-deref.
+///
+/// # Non-production
+///
+/// The supervisor is created via
+/// [`supervisor::Supervisor::for_query_shim`] which installs no-op
+/// persistence and saga journals. Tests that exercise those specific
+/// subsystems must construct their own supervisor explicitly.
+///
+/// # Supervisor lifetime
+///
+/// The constructed [`std::sync::Arc<supervisor::Supervisor>`] is
+/// leaked via [`std::mem::forget`] so the supervisor outlives this
+/// stack frame. The manager holds only a
+/// [`std::sync::Weak<supervisor::Supervisor>`] back-pointer; without
+/// the leak, the supervisor's last strong reference would drop here
+/// and the `Weak` would become immediately stale, which would cause
+/// every forwarder call on `manager` to return `NotInitialized`.
+/// Leaking is acceptable in test-only code — the process exits
+/// shortly and the OS reclaims memory. Production callers (FFI
+/// bridges, `Node`, `scp-node`) construct the supervisor with a
+/// long-lived strong reference (e.g. `BridgeInstance::supervisor:
+/// Arc<Supervisor>`), so no leak is needed there.
+///
+/// # Panics
+///
+/// Panics if [`supervisor::Supervisor::attach_context_manager`]
+/// returns an error. That happens only on misuse (attaching a
+/// manager that has already been bound to a different supervisor) —
+/// a test-only contract violation.
+#[cfg(any(test, feature = "testing"))]
+#[allow(
+    clippy::panic,
+    reason = "test-only helper: attach failure is a contract violation and should abort the test"
+)]
+#[must_use]
+pub fn attach_test_supervisor(mgr: manager::ContextManager) -> Arc<manager::ContextManager> {
+    let manager = Arc::new(mgr);
+    let supervisor = Arc::new(supervisor::Supervisor::for_query_shim());
+    // The Result is infallible in practice: a freshly-constructed
+    // Supervisor attaching a freshly-constructed manager cannot
+    // observe an already-populated OnceLock. A programmer misuse
+    // (attaching a manager that already has a different supervisor)
+    // would hit the identity mismatch branch below; we intentionally
+    // panic because tests should never attach twice.
+    if let Err(e) = supervisor.attach_context_manager(&manager) {
+        panic!("attach_test_supervisor: attach failed (contract violation): {e}");
+    }
+    // See doc comment "Supervisor lifetime" for the leak rationale.
+    std::mem::forget(supervisor);
+    manager
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

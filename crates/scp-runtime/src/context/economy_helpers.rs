@@ -20,13 +20,23 @@
 //!
 //! [`verify_payment_receipts`] is **behavior-preserving by construction**.
 //! Its body is a verbatim copy of the legacy inherent method's body with
-//! `self.payment_adapter` replaced by `mgr.payment_adapter_ref()`.
+//! `self.payment_adapter` replaced by
+//! `supervisor.payment_adapter_ref()` (ADR-049 commit 12c.9c).
 //!
 //! The legacy inherent method on
 //! [`ContextManager`](crate::context::manager::ContextManager) remains as
 //! a one-line forwarder; it is deleted alongside the outer shim in a later
 //! ADR-049 commit when the actor handler body owns the economy path
 //! directly.
+//!
+//! # Supervisor receiver (ADR-049 commit 12c.9c)
+//!
+//! [`verify_payment_receipts`] takes `supervisor: &Supervisor`. The
+//! payment adapter is lifted onto the supervisor by
+//! [`Supervisor::attach_context_manager`] (commit 12c.9a). The legacy
+//! forwarder on [`ContextManager`] threads `self.supervisor()` into the
+//! helper through the `Weak<Supervisor>` back-pointer installed at
+//! attach time.
 //!
 //! # Top-level method hoisted (actor-handler entry point)
 //!
@@ -42,7 +52,7 @@
 //! commit. They migrate implicitly with the messaging / lifecycle
 //! handlers, not as dedicated commands.
 
-use crate::context::manager::ContextManager;
+use crate::context::supervisor::Supervisor;
 use crate::economy::adapter::PaymentReceipt;
 use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
 
@@ -62,12 +72,12 @@ use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
 /// If no payment adapter is configured, all receipts return
 /// [`ReceiptVerificationError::NoVerifierForAdapter`].
 pub async fn verify_payment_receipts(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     receipts: &[PaymentReceipt],
 ) -> Vec<Result<ReceiptVerification, ReceiptVerificationError>> {
     let mut results = Vec::with_capacity(receipts.len());
     for receipt in receipts {
-        let result = match mgr.payment_adapter_ref() {
+        let result = match supervisor.payment_adapter_ref() {
             Some(adapter) if adapter.adapter_id() == receipt.adapter_id => adapter
                 .verify_dyn(receipt)
                 .await

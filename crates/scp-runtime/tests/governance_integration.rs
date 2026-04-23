@@ -223,13 +223,15 @@ fn eve() -> DID {
 // Manager factory
 // ---------------------------------------------------------------------------
 
-fn new_manager() -> ContextManager {
-    ContextManager::new(
+fn new_manager() -> std::sync::Arc<ContextManager> {
+    // ADR-049 commit 12c.9c — see
+    // `tests/content_access_governance_integration.rs::new_manager`.
+    scp_runtime::context::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog),
         mock_key_resolver(),
-    )
+    ))
 }
 
 /// Standard ceiling that includes all governance-relevant capabilities.

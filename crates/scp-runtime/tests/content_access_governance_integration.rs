@@ -215,13 +215,16 @@ fn dave() -> DID {
 // Manager factory
 // ---------------------------------------------------------------------------
 
-fn new_manager() -> ContextManager {
-    ContextManager::new(
+fn new_manager() -> std::sync::Arc<ContextManager> {
+    // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor` so
+    // the `ContextManager` forwarders (which now route through a
+    // `Weak<Supervisor>` back-pointer) can resolve their supervisor.
+    scp_runtime::context::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog),
         mock_key_resolver(),
-    )
+    ))
 }
 
 /// Standard ceiling that includes all governance-relevant capabilities,
@@ -244,7 +247,7 @@ fn governance_ceiling() -> Vec<Capability> {
 
 /// Creates a Threshold(2-of-3) context with Alice, Bob, Carol as signers
 /// and adds Dave as a member via governance.
-async fn setup_threshold_context_with_dave(ctx_id: &str) -> ContextManager {
+async fn setup_threshold_context_with_dave(ctx_id: &str) -> std::sync::Arc<ContextManager> {
     let manager = new_manager();
     let params = ContextParams {
         ceiling: governance_ceiling(),

@@ -134,12 +134,12 @@ async fn send_message_assigns_monotonic_sequence_numbers() {
 /// unchanged. Fixes #1420 (phantom events), sequence burn on failure.
 #[tokio::test]
 async fn send_message_transport_failure_no_phantom_event() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(FailingTransport),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         ceiling: vec![
@@ -362,19 +362,19 @@ async fn report_degraded_mode_noop_for_exact() {
     reason = "Test scaffolding for `std::sync::Mutex`-based test harnesses; migrated to `tokio::sync::Mutex` in commit 11 of ADR-049 (actor refactor), where all 8 submodule handlers complete their migration. See plan §Commit ladder."
 )]
 async fn setup_two_member_verified_context() -> (
-    ContextManager,
+    Arc<ContextManager>,
     ContextHandle,
     Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
 ) {
     let transport = MockTransport::connected();
     let sent = transport.sent_messages_handle();
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(transport),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         ceiling: vec![
@@ -662,12 +662,12 @@ async fn revoked_member_cannot_decrypt_new_messages() {
 
     // Create a separate manager simulating Bob's device. Bob has the same
     // context but only his own membership. His access key was revoked.
-    let bob_manager = ContextManager::new(
+    let bob_manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
     bob_manager.register_local_did("did:key:bob".into()).await;
 
     let bob_params = ContextParams {
@@ -1325,12 +1325,12 @@ async fn send_message_produces_valid_outer_envelope() {
     let sent_handle = transport.sent_messages_handle();
     let routing_handle = transport.routing_ids_handle();
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(transport),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         ceiling: vec![
@@ -1579,12 +1579,12 @@ async fn velocity_consequence_trigger_on_send() {
     };
     use std::time::Duration;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = ContextParams {
         ceiling: vec![
@@ -1677,12 +1677,12 @@ async fn escalation_kicks_in_at_velocity_threshold_10() {
     // C1 (PR #1606): paid sends require signature-verified spending
     // UCANs. `mock_key_resolver` resolves the deterministic test key
     // for `did:key:sender` so the new validation pipeline succeeds.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(escalation_test_policy());
@@ -1796,12 +1796,12 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
     use scp_protocol::context::tools::registry::ToolRegistry;
     use scp_protocol::economy::types::Amount;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     // Creator needs ToolInvokeAll to pass the tools::invoke auth check.
@@ -1911,12 +1911,12 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
 /// this.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn try_consume_hard_rate_limit_async_variant_is_safe_from_async_context() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let alice: DID = "did:key:alice".into();
     let _handle = manager
         .create_context(
@@ -1972,7 +1972,7 @@ fn any_context_helper_survives_current_thread_runtime() {
     // Create the manager outside the runtime scope, then use it
     // from within the runtime's block_on. The helper takes
     // `&Arc<Self>` so we need a full Arc here.
-    let manager = StdArc::new(ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -2030,7 +2030,7 @@ fn any_context_helper_survives_no_runtime() {
     use std::sync::Arc as StdArc;
     // Build a throwaway runtime JUST to create the context, then
     // drop it so the helper is called from a no-runtime environment.
-    let manager = StdArc::new(ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
@@ -2077,12 +2077,12 @@ fn any_context_helper_survives_no_runtime() {
 /// `Handle::block_on` panics.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn block_in_place_bridge_pattern_survives_mcp_sync_in_async_call() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let alice: DID = "did:key:alice".into();
     let _handle = manager
         .create_context(
@@ -2126,12 +2126,12 @@ async fn tool_invoke_respects_hard_rate_limit() {
     use scp_protocol::context::tools::registry::ToolRegistry;
     use scp_protocol::economy::types::Amount;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params
@@ -2232,12 +2232,12 @@ async fn tool_invoke_failure_refunds_hard_rate_limit_token() {
     use scp_protocol::context::tools::registry::ToolRegistry;
     use scp_protocol::economy::types::Amount;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params
@@ -2567,19 +2567,24 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
     use scp_protocol::context::tools::registry::ToolRegistry;
     use scp_protocol::economy::types::Amount;
 
-    let mut manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        mock_key_resolver(),
-    );
-
     // Wire the recording payment adapter so authorize/capture/void are
     // observable. The Arc handle is cloned BEFORE the adapter is moved
     // into the manager so the test can read the call log after invocation.
+    // ADR-049 commit 12c.9c — adapter must be installed via the builder
+    // because `set_payment_adapter` takes `&mut self`, which is not
+    // callable through `Arc<ContextManager>`.
     let adapter = RecordingPaymentAdapter::new();
     let calls_handle = adapter.calls_handle();
-    manager.set_payment_adapter(Arc::new(adapter));
+    let manager = super::attach_test_supervisor(
+        ContextManager::builder()
+            .crypto(Box::new(MockCrypto::default()))
+            .transport(Box::new(MockTransport::connected()))
+            .event_log(Box::new(MockEventLog::default()))
+            .key_resolver(mock_key_resolver())
+            .payment_adapter(Arc::new(adapter))
+            .build()
+            .unwrap(),
+    );
 
     // Build a context with a paid economic policy and ToolInvokeAll in the
     // ceiling so the creator can invoke tools.
@@ -2770,16 +2775,20 @@ async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
     use scp_protocol::context::tools::registry::ToolRegistry;
     use scp_protocol::economy::types::Amount;
 
-    let mut manager = ContextManager::new(
-        Box::new(MockCrypto::default()),
-        Box::new(MockTransport::connected()),
-        Box::new(MockEventLog::default()),
-        mock_key_resolver(),
-    );
-
+    // ADR-049 commit 12c.9c — adapter installed via builder (see the
+    // sibling `record_payment_tokens` test for the rationale).
     let adapter = RecordingPaymentAdapter::new();
     let calls_handle = adapter.calls_handle();
-    manager.set_payment_adapter(Arc::new(adapter));
+    let manager = super::attach_test_supervisor(
+        ContextManager::builder()
+            .crypto(Box::new(MockCrypto::default()))
+            .transport(Box::new(MockTransport::connected()))
+            .event_log(Box::new(MockEventLog::default()))
+            .key_resolver(mock_key_resolver())
+            .payment_adapter(Arc::new(adapter))
+            .build()
+            .unwrap(),
+    );
 
     let mut params = governance_params();
     params
@@ -2905,12 +2914,12 @@ async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
 async fn join_context_records_velocity_for_joiner() {
     use scp_protocol::context::membership::KeyPackage;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
     let handle = manager
@@ -2961,12 +2970,12 @@ async fn enforcement_failure_rolls_back_velocity_and_rate_limit() {
     // bound to `did:key:sender`. `mock_key_resolver` produces a
     // deterministic key from the DID string and matches what
     // `signing_key_for_did` (used by `dummy_spending_ucan`) signs with.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(escalation_test_policy());
@@ -3060,12 +3069,12 @@ async fn enforcement_failure_rolls_back_velocity_and_rate_limit() {
 /// free contexts).
 #[tokio::test]
 async fn hard_rate_limit_rejects_burst_over_ten() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     // Free context — no economic_policy set. The hard rate limit is
     // independent of cost and should still fire.
@@ -3130,12 +3139,12 @@ async fn governance_actions_stay_free_under_priced_policy() {
     use scp_protocol::context::governance::GovernanceAction;
     use scp_protocol::economy::types::Amount;
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params.economic_policy = Some(escalation_test_policy());
@@ -3393,14 +3402,16 @@ async fn capture_send_payment_success_no_failure_event() {
 
     // C1b: spending UCANs are cryptographically validated on send_message.
     // Wire mock_key_resolver so the Ed25519 signature check can pass.
-    let manager = ContextManager::builder()
-        .crypto(Box::new(MockCrypto::default()))
-        .transport(Box::new(MockTransport::connected()))
-        .event_log(Box::new(ArcEventLog(event_log.clone())))
-        .payment_adapter(StdArc::new(NoOpPaymentAdapter))
-        .key_resolver(mock_key_resolver())
-        .build()
-        .unwrap();
+    let manager = super::attach_test_supervisor(
+        ContextManager::builder()
+            .crypto(Box::new(MockCrypto::default()))
+            .transport(Box::new(MockTransport::connected()))
+            .event_log(Box::new(ArcEventLog(event_log.clone())))
+            .payment_adapter(StdArc::new(NoOpPaymentAdapter))
+            .key_resolver(mock_key_resolver())
+            .build()
+            .unwrap(),
+    );
 
     let params = ContextParams {
         ceiling: vec![
@@ -3509,12 +3520,12 @@ fn minimal_inner_envelope(
 /// and verifying that velocity remains 0 when the flag is set.
 #[tokio::test]
 async fn deliver_message_skips_velocity_for_local_sender() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     manager
         .register_local_did("did:key:local-sender".into())
@@ -3660,7 +3671,7 @@ async fn setup_two_member_context_with(
     event_log: Box<dyn ContextEventLogProvider>,
     clock: Option<Arc<dyn scp_primitives::Clock>>,
 ) -> (
-    ContextManager,
+    Arc<ContextManager>,
     ContextHandle,
     std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
 ) {
@@ -3675,7 +3686,8 @@ async fn setup_two_member_context_with(
     if let Some(c) = clock {
         builder = builder.clock(c);
     }
-    let manager = builder.build().expect("manager build must succeed");
+    let manager =
+        super::attach_test_supervisor(builder.build().expect("manager build must succeed"));
 
     let params = ContextParams {
         ceiling: vec![
@@ -3999,18 +4011,18 @@ async fn c1b_paid_tool_context(
     name: &str,
     invoker: &DID,
 ) -> (
-    ContextManager,
+    Arc<ContextManager>,
     scp_protocol::context::tools::registry::ToolRegistry,
 ) {
     use scp_protocol::context::tools::registry::ToolRegistry;
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let mut params = governance_params();
     params
@@ -4426,12 +4438,12 @@ async fn tool_invoke_happy_path_with_valid_spending_ucan() {
 /// Verifies that creating a context with a pseudonym stores it in `PerContextState`.
 #[tokio::test]
 async fn create_context_with_pseudonym_stores_in_state() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     let pseudonym: [u8; 32] = [42u8; 32];
 
     let _handle = manager
@@ -4456,12 +4468,12 @@ async fn create_context_with_pseudonym_stores_in_state() {
 /// Verifies that creating a context without a pseudonym stores None.
 #[tokio::test]
 async fn create_context_without_pseudonym_stores_none() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let _handle = manager
         .create_context(
@@ -4522,12 +4534,12 @@ async fn send_message_encrypted_uses_pseudonym_fanout() {
     let transport = MockTransport::connected();
     let routing_ids = transport.routing_ids_handle();
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(transport),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         ceiling: vec![
@@ -4599,12 +4611,12 @@ async fn send_message_encrypted_uses_pseudonym_fanout() {
 async fn forged_pseudonym_announcement_rejected() {
     use super::super::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = governance_params();
 
@@ -4691,13 +4703,16 @@ async fn forged_pseudonym_announcement_rejected() {
 /// broadcast receiver and that `send_message` fires `MessageSent` on it.
 #[tokio::test]
 async fn event_channel_receives_message_sent() {
-    let mut manager = ContextManager::new(
+    // ADR-049 commit 12c.9c — `with_event_channel` takes `&mut self`,
+    // so set up the channel BEFORE wrapping with supervisor.
+    let mut raw = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
     );
-    manager.with_event_channel(1024);
+    raw.with_event_channel(1024);
+    let manager = super::attach_test_supervisor(raw);
     let mut rx = manager.subscribe_events().expect("channel configured");
 
     let params = ContextParams {
@@ -4747,25 +4762,27 @@ async fn event_channel_receives_message_sent() {
 /// Verify that `subscribe_events` returns `None` when no channel is configured.
 #[tokio::test]
 async fn event_channel_none_when_not_configured() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     assert!(manager.subscribe_events().is_none(), "no channel => None");
 }
 
 /// Verify that leaving a context fires `MemberLeft` on the event channel.
 #[tokio::test]
 async fn event_channel_receives_member_left_on_leave() {
-    let mut manager = ContextManager::new(
+    // ADR-049 commit 12c.9c — see sibling `event_channel_receives_message_sent`.
+    let mut raw = ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
     );
-    manager.with_event_channel(1024);
+    raw.with_event_channel(1024);
+    let manager = super::attach_test_supervisor(raw);
     let mut rx = manager.subscribe_events().expect("channel configured");
 
     let params = ContextParams {

@@ -34,13 +34,12 @@
 //! deletes the adapter: the supervisor passes the
 //! `&Arc<ContextManager>` directly and no scratch tracker is allocated.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::context::actor::commands::EconomyCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::manager::ContextManager;
+use crate::context::supervisor::Supervisor;
 use crate::economy::receipt::ReceiptVerificationError;
 use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
@@ -49,20 +48,29 @@ use tokio::sync::oneshot;
 /// timeouts inside actor handlers": 30 seconds.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch an [`EconomyCommand`] against an attached manager + deps
+/// Dispatch an [`EconomyCommand`] against an attached supervisor + deps
 /// bundle.
 ///
 /// Plan-conforming dispatch signature: matches the post-refactor actor
 /// `run()` loop's call shape
-/// (`handlers::economy::dispatch(&mgr, &self.deps, cmd).await`).
+/// (`handlers::economy::dispatch(supervisor, &self.deps, cmd).await`).
 /// `deps` is accepted for symmetry — the economy handler does not yet
 /// touch deps during the shim period. Commit 12 rewires these paths.
+///
+/// # Supervisor receiver (ADR-049 commit 12c.9c)
+///
+/// Takes `&Supervisor` so the delegated
+/// [`economy_helpers::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts)
+/// call can read the lifted `payment_adapter` slot directly off the
+/// supervisor. Prior revisions threaded `&Arc<ContextManager>` and
+/// called `manager.payment_adapter_ref()`; after 12c.9a the adapter
+/// lives on the supervisor.
 pub async fn dispatch(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     _deps: &ActorDeps,
     cmd: EconomyCommand,
 ) -> Outcome<()> {
-    dispatch_inner(mgr, cmd).await
+    dispatch_inner(supervisor, cmd).await
 }
 
 /// Shim-callable dispatch. Used by
@@ -70,34 +78,33 @@ pub async fn dispatch(
 /// during the commits-10-to-11 migration window — deleted in commit 12
 /// when the shim dissolves.
 pub(crate) async fn dispatch_from_shim(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     cmd: EconomyCommand,
 ) -> Outcome<()> {
-    dispatch_inner(mgr, cmd).await
+    dispatch_inner(supervisor, cmd).await
 }
 
-async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: EconomyCommand) -> Outcome<()> {
+async fn dispatch_inner(supervisor: &Supervisor, cmd: EconomyCommand) -> Outcome<()> {
     match cmd {
         EconomyCommand::Placeholder { reply } => reply_not_implemented(reply),
         EconomyCommand::VerifyPaymentReceipts { receipts, reply } => {
-            handle_verify_payment_receipts(mgr, *receipts, reply).await
+            handle_verify_payment_receipts(supervisor, *receipts, reply).await
         }
     }
 }
 
 /// Handle [`EconomyCommand::VerifyPaymentReceipts`] — delegates to
-/// [`ContextManager::verify_payment_receipts`](crate::context::manager::ContextManager::verify_payment_receipts)
-/// under a 30s timeout. Read-only — the method does not mutate
+/// [`economy_helpers::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts)
+/// under a 30s timeout. Read-only — the helper does not mutate
 /// per-context state; it calls the configured payment adapter's
 /// `verify_dyn` method per receipt and collates results.
 async fn handle_verify_payment_receipts(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     receipts: Vec<crate::economy::adapter::PaymentReceipt>,
     reply: crate::context::actor::commands::VerifyPaymentReceiptsReply,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-
-    let verify_fut = crate::context::economy_helpers::verify_payment_receipts(&manager, &receipts);
+    let verify_fut =
+        crate::context::economy_helpers::verify_payment_receipts(supervisor, &receipts);
 
     let results = match tokio::time::timeout(HANDLER_TIMEOUT, verify_fut).await {
         Ok(vec) => vec,

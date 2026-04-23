@@ -116,6 +116,14 @@ use tracing::instrument;
 use crate::context::manager::governance::{
     check_proposer_eligibility, dispatch_consequences, event_log_entries_for_consequences,
 };
+use crate::context::supervisor::Supervisor;
+
+/// Shared expectation message for `Supervisor::attached_context_manager()`
+/// and `Supervisor::*_ref()` accessors inside helpers. The attach-time
+/// contract installs the manager (and lifts every provider slot)
+/// before any FFI caller or test can invoke a helper.
+const ATTACHED_EXPECT: &str = "governance_helpers: Supervisor must be fully attached before helper invocation \
+     (set by Supervisor::attach_context_manager during bridge construction)";
 use crate::context::manager::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
     ContentKeysRotatedResult, ContextGeneration, ContextManager,
@@ -156,10 +164,13 @@ use crate::context::manager::{
 /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
 #[instrument(skip_all, fields(context_id))]
 pub async fn execute_governance_action(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     proposal: &GovernanceProposal,
 ) -> Result<GovernanceActionResult, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // Gate: only approved proposals can be executed.
     if !matches!(proposal.status, ProposalStatus::Approved) {
         return Err(ContextError::PermissionDenied(format!(
@@ -194,7 +205,10 @@ pub async fn execute_governance_action(
                 "governance proposal has already been executed".into(),
             ));
         }
-        let now = mgr.clock_ref().now_secs();
+        let now = supervisor
+            .clock_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .now_secs();
         // Evict entries older than the TTL before inserting.
         ctx.governance
             .executed_proposals
@@ -209,7 +223,7 @@ pub async fn execute_governance_action(
     // variant exists yet. Governance actions are free until the economy
     // spec adds a governance cost tier. Tracked by #1537.
 
-    let result = match dispatch_governance_action(mgr, context_id, proposal).await {
+    let result = match dispatch_governance_action(supervisor, context_id, proposal).await {
         Ok(r) => r,
         Err(e) => {
             // Roll back the executed marker on dispatch failure so the
@@ -233,7 +247,7 @@ pub async fn execute_governance_action(
 
     // Post-dispatch: MLS coordination, event emission, checkpoint
     // triggering, and cleanup are in a helper to stay within line limits.
-    finalize_governance_action(mgr, context_id, proposal, &ctx_gen).await?;
+    finalize_governance_action(supervisor, context_id, proposal, &ctx_gen).await?;
 
     Ok(result)
 }
@@ -252,11 +266,14 @@ pub async fn execute_governance_action(
 /// focused on validation and dispatch.
 #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
 pub async fn finalize_governance_action(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     proposal: &GovernanceProposal,
     ctx_gen: &ContextGeneration,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // For MLS-mutating actions (AddMember, RemoveMember, Revoke,
     // ResetMember), increment the epoch counter, place the old epoch into
     // the grace store (§23.11), record the coordination in the
@@ -282,7 +299,10 @@ pub async fn finalize_governance_action(
             // auditable link between the governance proposal and the MLS
             // epoch transition.
             if let Some(operation) = mls_op {
-                let timestamp = mgr.clock_ref().now_secs();
+                let timestamp = supervisor
+                    .clock_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                    .now_secs();
                 // Best-effort: log but do not fail if recording fails
                 // (epoch_after > epoch_before is guaranteed by saturating_add).
                 let _ = ctx.epoch.coordinator.record_coordination(
@@ -328,12 +348,15 @@ pub async fn finalize_governance_action(
         || serde_json::json!({"action_type": action_variant}),
         |d| serde_json::json!({"target_did": d.as_ref(), "action_type": action_variant}),
     ));
-    mgr.event_log_ref().append_context_event_with_payload(
-        &context_id_bytes,
-        ContextManager::governance_event_label(&executed_event),
-        proposal.proposer_did.as_ref(),
-        payload.as_ref(),
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            ContextManager::governance_event_label(&executed_event),
+            proposal.proposer_did.as_ref(),
+            payload.as_ref(),
+        )?;
 
     // Single lock acquisition for all post-event-log state mutations
     // (#1428 — eliminates TOCTOU window from multiple lock acquisitions).
@@ -354,7 +377,7 @@ pub async fn finalize_governance_action(
                 resulting_epoch,
                 target_did,
             };
-            ctx.emit_event(gov_event, context_id, mgr.event_tx_ref());
+            ctx.emit_event(gov_event, context_id, supervisor.event_tx_ref());
 
             // 2. Trigger checkpoint cosignature collection for multi-admin
             //    contexts (ADR-031 §9, issue #630). SingleAdmin contexts
@@ -371,7 +394,7 @@ pub async fn finalize_governance_action(
                         at_epoch: ctx.epoch.mls_epoch,
                     },
                     context_id,
-                    mgr.event_tx_ref(),
+                    supervisor.event_tx_ref(),
                 );
             }
 
@@ -392,10 +415,17 @@ pub async fn finalize_governance_action(
                 ctx,
                 context_id,
                 &proposal.proposer_did,
-                mgr.clock_ref().now_secs(),
-                &**mgr.clock_ref(),
-                &**mgr.event_log_ref(),
-                mgr.event_tx_ref(),
+                supervisor
+                    .clock_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                    .now_secs(),
+                &**supervisor
+                    .clock_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                &**supervisor
+                    .event_log_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                supervisor.event_tx_ref(),
             );
             if let Some(target) = proposal.action.target_did()
                 && target != &proposal.proposer_did
@@ -404,10 +434,17 @@ pub async fn finalize_governance_action(
                     ctx,
                     context_id,
                     target,
-                    mgr.clock_ref().now_secs(),
-                    &**mgr.clock_ref(),
-                    &**mgr.event_log_ref(),
-                    mgr.event_tx_ref(),
+                    supervisor
+                        .clock_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                        .now_secs(),
+                    &**supervisor
+                        .clock_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                    &**supervisor
+                        .event_log_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+                    supervisor.event_tx_ref(),
                 );
             }
 
@@ -416,8 +453,13 @@ pub async fn finalize_governance_action(
             let gov_events = event_log_entries_for_consequences(
                 ctx,
                 context_id,
-                mgr.clock_ref().now_secs(),
-                &**mgr.event_log_ref(),
+                supervisor
+                    .clock_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                    .now_secs(),
+                &**supervisor
+                    .event_log_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
             );
             let gov_merkle = mgr
                 .event_log_ref()
@@ -429,7 +471,10 @@ pub async fn finalize_governance_action(
                     proposal.proposer_did.as_ref(),
                     context_id,
                     gov_merkle,
-                    mgr.clock_ref().now_secs(),
+                    supervisor
+                        .clock_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                        .now_secs(),
                 )
                 && record.participation_count > 0
             {
@@ -466,15 +511,18 @@ pub async fn finalize_governance_action(
 /// dispatch.
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch_governance_action(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     proposal: &GovernanceProposal,
 ) -> Result<GovernanceActionResult, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let pid = proposal.proposal_id;
     let actor = proposal.proposer_did.as_ref();
     match &proposal.action {
         GovernanceAction::SuspendCapability { did, capabilities } => {
-            execute_suspend_member(mgr, context_id, did, capabilities, pid, actor).await?;
+            execute_suspend_member(supervisor, context_id, did, capabilities, pid, actor).await?;
             Ok(GovernanceActionResult::MemberSuspended(
                 SuspendMemberResult {
                     did: did.clone(),
@@ -509,7 +557,7 @@ pub async fn dispatch_governance_action(
                         capabilities: vec![], // all — indicated by empty
                     },
                     context_id,
-                    mgr.event_tx_ref(),
+                    supervisor.event_tx_ref(),
                 );
 
                 if mgr.has_persistence() {
@@ -523,11 +571,10 @@ pub async fn dispatch_governance_action(
                 mgr.persist_context_snapshot(context_id, snapshot);
             }
             let context_id_bytes = context_id_to_bytes(context_id);
-            mgr.event_log_ref().append_context_event(
-                &context_id_bytes,
-                "MemberSuspendedAll",
-                actor,
-            )?;
+            supervisor
+                .event_log_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                .append_context_event(&context_id_bytes, "MemberSuspendedAll", actor)?;
             {
                 if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
                     let mut guard = ctx_arc.lock().await;
@@ -538,7 +585,7 @@ pub async fn dispatch_governance_action(
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::RevokeAccess { did, access } => {
-            let r = execute_revoke(mgr, context_id, did, *access, pid, actor).await?;
+            let r = execute_revoke(supervisor, context_id, did, *access, pid, actor).await?;
             Ok(GovernanceActionResult::AccessRevoked(RevokeResult {
                 did: did.clone(),
                 access: *access,
@@ -546,7 +593,7 @@ pub async fn dispatch_governance_action(
             }))
         }
         GovernanceAction::RestoreAccess { did, capabilities } => {
-            execute_restore_access(mgr, context_id, did, capabilities, pid, actor).await?;
+            execute_restore_access(supervisor, context_id, did, capabilities, pid, actor).await?;
             Ok(GovernanceActionResult::AccessRestored(
                 RestoreAccessResult {
                     did: did.clone(),
@@ -555,14 +602,15 @@ pub async fn dispatch_governance_action(
             ))
         }
         GovernanceAction::PromoteContext => {
-            execute_promote_context(mgr, context_id, &proposal.approvals, pid, actor).await?;
+            execute_promote_context(supervisor, context_id, &proposal.approvals, pid, actor)
+                .await?;
             Ok(GovernanceActionResult::ContextPromoted)
         }
         // ExtendTtl needs proposal.approvals for unanimity override
         // (ADR-031 §4d, spec §5.10).
         GovernanceAction::ExtendTtl { additional_secs } => {
             execute_extend_ttl(
-                mgr,
+                supervisor,
                 context_id,
                 *additional_secs,
                 &proposal.approvals,
@@ -573,7 +621,7 @@ pub async fn dispatch_governance_action(
             Ok(GovernanceActionResult::TtlExtended)
         }
         GovernanceAction::SetEconomicPolicy { policy } => {
-            execute_set_economic_policy(mgr, context_id, policy, pid, actor).await?;
+            execute_set_economic_policy(supervisor, context_id, policy, pid, actor).await?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::ApproveSpend {
@@ -581,15 +629,18 @@ pub async fn dispatch_governance_action(
             amount,
             purpose,
         } => {
-            execute_approve_spend(mgr, context_id, spender, *amount, purpose, pid, actor).await?;
+            execute_approve_spend(
+                supervisor, context_id, spender, *amount, purpose, pid, actor,
+            )
+            .await?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::LockEconomicPolicy => {
-            execute_lock_economic_policy(mgr, context_id, pid, actor).await?;
+            execute_lock_economic_policy(supervisor, context_id, pid, actor).await?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::ModifyHardRateLimit { new_config } => {
-            execute_modify_hard_rate_limit(mgr, context_id, new_config, pid, actor).await?;
+            execute_modify_hard_rate_limit(supervisor, context_id, new_config, pid, actor).await?;
             Ok(GovernanceActionResult::Executed)
         }
         // SuspendCapability, SuspendAccess, RevokeAccess are handled above.
@@ -614,7 +665,8 @@ pub async fn dispatch_governance_action(
         | GovernanceAction::ReconfigureGovernance { .. }
         | GovernanceAction::ProposeContextMigration { .. }
         | GovernanceAction::CancelContextMigration => {
-            dispatch_context_governance_action(mgr, context_id, &proposal.action, pid, actor).await
+            dispatch_context_governance_action(supervisor, context_id, &proposal.action, pid, actor)
+                .await
         }
     }
 }
@@ -633,7 +685,7 @@ pub async fn dispatch_governance_action(
 ///   key rotation, conflict resolution, and reconfiguration (9 variants).
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch_context_governance_action(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     action: &GovernanceAction,
     pid: ProposalId,
@@ -641,43 +693,45 @@ pub async fn dispatch_context_governance_action(
 ) -> Result<GovernanceActionResult, ContextError> {
     match action {
         GovernanceAction::AddMember { did, role } => {
-            execute_add_member(mgr, context_id, did, role, pid, actor_did).await?;
+            execute_add_member(supervisor, context_id, did, role, pid, actor_did).await?;
             Ok(GovernanceActionResult::MemberAdded)
         }
         GovernanceAction::RemoveMember { did, .. } => {
-            execute_remove_member(mgr, context_id, did, pid, actor_did).await?;
+            execute_remove_member(supervisor, context_id, did, pid, actor_did).await?;
             Ok(GovernanceActionResult::MemberRemoved)
         }
         GovernanceAction::ChangeRole { did, new_role } => {
-            execute_change_role(mgr, context_id, did, new_role, pid, actor_did).await?;
+            execute_change_role(supervisor, context_id, did, new_role, pid, actor_did).await?;
             Ok(GovernanceActionResult::RoleChanged)
         }
         GovernanceAction::RegisterTool { registration } => {
-            execute_register_tool(mgr, context_id, registration, pid, actor_did).await?;
+            execute_register_tool(supervisor, context_id, registration, pid, actor_did).await?;
             Ok(GovernanceActionResult::ToolRegistered)
         }
         GovernanceAction::RemoveTool { tool_id } => {
-            execute_remove_tool(mgr, context_id, tool_id, pid, actor_did).await?;
+            execute_remove_tool(supervisor, context_id, tool_id, pid, actor_did).await?;
             Ok(GovernanceActionResult::ToolRemoved)
         }
         GovernanceAction::ModifyCeiling { new_ceiling } => {
-            execute_modify_ceiling(mgr, context_id, new_ceiling, pid, actor_did).await?;
+            execute_modify_ceiling(supervisor, context_id, new_ceiling, pid, actor_did).await?;
             Ok(GovernanceActionResult::CeilingModified)
         }
         GovernanceAction::CloseContext { reason } => {
-            execute_close_context(mgr, context_id, reason.as_deref(), pid, actor_did).await?;
+            execute_close_context(supervisor, context_id, reason.as_deref(), pid, actor_did)
+                .await?;
             Ok(GovernanceActionResult::ContextClosed)
         }
         GovernanceAction::TransferAdmin { new_admin } => {
-            execute_transfer_admin(mgr, context_id, new_admin, pid, actor_did).await?;
+            execute_transfer_admin(supervisor, context_id, new_admin, pid, actor_did).await?;
             Ok(GovernanceActionResult::AdminTransferred)
         }
         GovernanceAction::CreateChildContext { params } => {
-            execute_create_child_context(mgr, context_id, params, pid, actor_did).await?;
+            execute_create_child_context(supervisor, context_id, params, pid, actor_did).await?;
             Ok(GovernanceActionResult::ChildContextCreated)
         }
         GovernanceAction::ModifyPruningPolicy { new_policy } => {
-            execute_modify_pruning_policy(mgr, context_id, new_policy, pid, actor_did).await?;
+            execute_modify_pruning_policy(supervisor, context_id, new_policy, pid, actor_did)
+                .await?;
             Ok(GovernanceActionResult::PruningPolicyModified)
         }
         GovernanceAction::ProposeContextMigration {
@@ -687,7 +741,7 @@ pub async fn dispatch_context_governance_action(
             auto_invite,
         } => {
             let result = execute_propose_context_migration(
-                mgr,
+                supervisor,
                 context_id,
                 new_context_params,
                 reason,
@@ -700,7 +754,7 @@ pub async fn dispatch_context_governance_action(
             Ok(GovernanceActionResult::MigrationProposed(result))
         }
         GovernanceAction::CancelContextMigration => {
-            execute_cancel_context_migration(mgr, context_id, pid, actor_did).await?;
+            execute_cancel_context_migration(supervisor, context_id, pid, actor_did).await?;
             Ok(GovernanceActionResult::MigrationCancelled)
         }
         // Content access, structural, and reconfiguration actions
@@ -713,7 +767,7 @@ pub async fn dispatch_context_governance_action(
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::RotateContentKeys { .. }
         | GovernanceAction::ReconfigureGovernance { .. } => {
-            dispatch_content_governance_action(mgr, context_id, action, pid, actor_did).await
+            dispatch_content_governance_action(supervisor, context_id, action, pid, actor_did).await
         }
         // SuspendMember, Revoke, RestoreAccess, PromoteContext, ExtendTtl,
         // economic, and rate-limit actions are handled in
@@ -741,7 +795,7 @@ pub async fn dispatch_context_governance_action(
 /// actions. Companion to [`dispatch_context_governance_action`].
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch_content_governance_action(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     action: &GovernanceAction,
     pid: ProposalId,
@@ -749,23 +803,25 @@ pub async fn dispatch_content_governance_action(
 ) -> Result<GovernanceActionResult, ContextError> {
     match action {
         GovernanceAction::AddSigner { did } => {
-            execute_add_signer(mgr, context_id, did, pid, actor_did).await?;
+            execute_add_signer(supervisor, context_id, did, pid, actor_did).await?;
             Ok(GovernanceActionResult::SignerAdded)
         }
         GovernanceAction::RemoveSigner { did } => {
-            execute_remove_signer(mgr, context_id, did, pid, actor_did).await?;
+            execute_remove_signer(supervisor, context_id, did, pid, actor_did).await?;
             Ok(GovernanceActionResult::SignerRemoved)
         }
         GovernanceAction::ModifyThreshold { new_threshold } => {
-            execute_modify_threshold(mgr, context_id, *new_threshold, pid, actor_did).await?;
+            execute_modify_threshold(supervisor, context_id, *new_threshold, pid, actor_did)
+                .await?;
             Ok(GovernanceActionResult::ThresholdModified)
         }
         GovernanceAction::EstablishToolInterface { interface } => {
-            execute_establish_tool_interface(mgr, context_id, interface, pid, actor_did).await?;
+            execute_establish_tool_interface(supervisor, context_id, interface, pid, actor_did)
+                .await?;
             Ok(GovernanceActionResult::ToolInterfaceEstablished)
         }
         GovernanceAction::ResetMember { did, reason } => {
-            execute_reset_member(mgr, context_id, did, reason, pid, actor_did).await?;
+            execute_reset_member(supervisor, context_id, did, reason, pid, actor_did).await?;
             Ok(GovernanceActionResult::MemberReset)
         }
         GovernanceAction::ResolveConflict {
@@ -774,13 +830,14 @@ pub async fn dispatch_content_governance_action(
             resolution,
         } => {
             execute_resolve_conflict(
-                mgr, context_id, proposal_a, proposal_b, resolution, pid, actor_did,
+                supervisor, context_id, proposal_a, proposal_b, resolution, pid, actor_did,
             )
             .await?;
             Ok(GovernanceActionResult::ConflictResolved)
         }
         GovernanceAction::RotateContentKeys { reason } => {
-            execute_rotate_content_keys(mgr, context_id, reason.as_deref(), pid, actor_did).await?;
+            execute_rotate_content_keys(supervisor, context_id, reason.as_deref(), pid, actor_did)
+                .await?;
             Ok(GovernanceActionResult::ContentKeysRotated(
                 ContentKeysRotatedResult {
                     reason: reason.clone(),
@@ -791,8 +848,15 @@ pub async fn dispatch_content_governance_action(
             changes,
             justification,
         } => {
-            execute_reconfigure_governance(mgr, context_id, changes, justification, pid, actor_did)
-                .await?;
+            execute_reconfigure_governance(
+                supervisor,
+                context_id,
+                changes,
+                justification,
+                pid,
+                actor_did,
+            )
+            .await?;
             Ok(GovernanceActionResult::GovernanceReconfigured(
                 GovernanceReconfiguredResult {
                     changes_applied: changes.len(),
@@ -889,7 +953,7 @@ pub fn build_governance_context(ctx: &PerContextState, clock: &dyn Clock) -> Gov
 ///   the action is invalid.
 #[instrument(skip_all, fields(context_id))]
 pub async fn propose_governance_action(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     proposer_did: &DID,
     action: GovernanceAction,
@@ -902,7 +966,15 @@ pub async fn propose_governance_action(
     ),
     ContextError,
 > {
-    propose_governance_action_inner(mgr, context_id, proposer_did, action, signing_key, false).await
+    propose_governance_action_inner(
+        supervisor,
+        context_id,
+        proposer_did,
+        action,
+        signing_key,
+        false,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -920,7 +992,7 @@ pub async fn propose_governance_action(
 /// eliminating the TOCTOU race in `propose_governance_action_checked`.
 #[allow(clippy::too_many_lines)]
 pub async fn propose_governance_action_inner(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     proposer_did: &DID,
     action: GovernanceAction,
@@ -934,6 +1006,9 @@ pub async fn propose_governance_action_inner(
     ),
     ContextError,
 > {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let (proposal, events, should_execute, invalidated_by_conflict, in_freeze, conflict_events) = {
         let ctx_arc = mgr
             .get_context_arc(context_id)
@@ -990,21 +1065,29 @@ pub async fn propose_governance_action_inner(
         check_proposer_eligibility(
             ctx,
             proposer_did,
-            mgr.clock_ref().now_secs(),
-            &**mgr.event_log_ref(),
+            supervisor
+                .clock_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                .now_secs(),
+            &**supervisor
+                .event_log_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
         )?;
 
         // SCP-272: Check and auto-resolve expired governance freezes (48-hour timeout).
-        let freeze_events = check_and_resolve_expired_freezes(mgr, ctx);
+        let freeze_events = check_and_resolve_expired_freezes(supervisor, ctx);
         if !freeze_events.is_empty() {
             let cid_bytes = context_id_to_bytes(context_id);
             for event in &freeze_events {
                 if let GovernanceEvent::ConflictResolved { .. } = event {
-                    mgr.event_log_ref().append_context_event(
-                        &cid_bytes,
-                        "GovernanceFreezeExpired",
-                        proposer_did.as_ref(),
-                    )?;
+                    supervisor
+                        .event_log_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                        .append_context_event(
+                            &cid_bytes,
+                            "GovernanceFreezeExpired",
+                            proposer_did.as_ref(),
+                        )?;
                     ctx.checkpoint_events_since += 1;
                 }
             }
@@ -1019,7 +1102,12 @@ pub async fn propose_governance_action_inner(
             ));
         }
 
-        let gov_ctx = build_governance_context(ctx, &**mgr.clock_ref());
+        let gov_ctx = build_governance_context(
+            ctx,
+            &**supervisor
+                .clock_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+        );
 
         let (proposal, events) = ctx
             .governance
@@ -1032,12 +1120,17 @@ pub async fn propose_governance_action_inner(
             .proposal_timestamps
             .entry(proposer_did.to_string())
             .or_default()
-            .push(mgr.clock_ref().now_secs());
+            .push(
+                supervisor
+                    .clock_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                    .now_secs(),
+            );
 
         let should_execute = proposal.status == ProposalStatus::Approved;
 
         let conflict_events = if should_execute {
-            detect_and_handle_conflicts(mgr, ctx, &proposal)
+            detect_and_handle_conflicts(supervisor, ctx, &proposal)
         } else {
             Vec::new()
         };
@@ -1067,19 +1160,25 @@ pub async fn propose_governance_action_inner(
         for event in &conflict_events {
             match event {
                 GovernanceEvent::ConflictDetected { .. } => {
-                    mgr.event_log_ref().append_context_event(
-                        &context_id_bytes,
-                        "GovernanceConflictDetected",
-                        proposer_did.as_ref(),
-                    )?;
+                    supervisor
+                        .event_log_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                        .append_context_event(
+                            &context_id_bytes,
+                            "GovernanceConflictDetected",
+                            proposer_did.as_ref(),
+                        )?;
                     conflict_event_count += 1;
                 }
                 GovernanceEvent::ConflictResolved { .. } => {
-                    mgr.event_log_ref().append_context_event(
-                        &context_id_bytes,
-                        "GovernanceConflictResolved",
-                        proposer_did.as_ref(),
-                    )?;
+                    supervisor
+                        .event_log_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                        .append_context_event(
+                            &context_id_bytes,
+                            "GovernanceConflictResolved",
+                            proposer_did.as_ref(),
+                        )?;
                     conflict_event_count += 1;
                 }
                 _ => {}
@@ -1097,7 +1196,7 @@ pub async fn propose_governance_action_inner(
     // If the proposal was auto-approved (SingleAdmin), execute immediately
     // — unless it was invalidated by conflict or governance is frozen.
     let execution_result = if should_execute && !invalidated_by_conflict && !in_freeze {
-        Some(execute_governance_action(mgr, context_id, &proposal).await?)
+        Some(execute_governance_action(supervisor, context_id, &proposal).await?)
     } else {
         None
     };
@@ -1145,7 +1244,7 @@ pub async fn propose_governance_action_inner(
 ///   already voted, or the proposal is not pending.
 #[instrument(skip_all, fields(context_id))]
 pub async fn vote_on_proposal(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     proposal_id: &ProposalId,
     voter_did: &DID,
@@ -1153,7 +1252,7 @@ pub async fn vote_on_proposal(
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
     vote_on_proposal_inner(
-        mgr,
+        supervisor,
         context_id,
         proposal_id,
         voter_did,
@@ -1176,7 +1275,7 @@ pub async fn vote_on_proposal(
 #[allow(clippy::too_many_lines)]
 #[instrument(skip_all, fields(context_id))]
 pub async fn vote_on_proposal_inner(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     proposal_id: &ProposalId,
     voter_did: &DID,
@@ -1184,6 +1283,9 @@ pub async fn vote_on_proposal_inner(
     signing_key: &ed25519_dalek::SigningKey,
     check_vote_capability: bool,
 ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let (status, events, proposal_for_execution, conflict_events) = {
         let ctx_arc = mgr
             .get_context_arc(context_id)
@@ -1230,7 +1332,12 @@ pub async fn vote_on_proposal_inner(
             )));
         }
 
-        let gov_ctx = build_governance_context(ctx, &**mgr.clock_ref());
+        let gov_ctx = build_governance_context(
+            ctx,
+            &**supervisor
+                .clock_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+        );
 
         let (status, events) = if approve {
             ctx.governance
@@ -1255,7 +1362,7 @@ pub async fn vote_on_proposal_inner(
         let conflict_events = proposal_for_execution
             .as_ref()
             .map_or_else(Vec::new, |proposal| {
-                detect_and_handle_conflicts(mgr, ctx, proposal)
+                detect_and_handle_conflicts(supervisor, ctx, proposal)
             });
 
         (status, events, proposal_for_execution, conflict_events)
@@ -1269,19 +1376,25 @@ pub async fn vote_on_proposal_inner(
         for event in &conflict_events {
             match event {
                 GovernanceEvent::ConflictDetected { .. } => {
-                    mgr.event_log_ref().append_context_event(
-                        &context_id_bytes,
-                        "GovernanceConflictDetected",
-                        voter_did.as_ref(),
-                    )?;
+                    supervisor
+                        .event_log_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                        .append_context_event(
+                            &context_id_bytes,
+                            "GovernanceConflictDetected",
+                            voter_did.as_ref(),
+                        )?;
                     conflict_event_count += 1;
                 }
                 GovernanceEvent::ConflictResolved { .. } => {
-                    mgr.event_log_ref().append_context_event(
-                        &context_id_bytes,
-                        "GovernanceConflictResolved",
-                        voter_did.as_ref(),
-                    )?;
+                    supervisor
+                        .event_log_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                        .append_context_event(
+                            &context_id_bytes,
+                            "GovernanceConflictResolved",
+                            voter_did.as_ref(),
+                        )?;
                     conflict_event_count += 1;
                 }
                 _ => {}
@@ -1316,7 +1429,7 @@ pub async fn vote_on_proposal_inner(
         };
 
         if !in_freeze && !invalidated_by_conflict {
-            execute_governance_action(mgr, context_id, &proposal).await?;
+            execute_governance_action(supervisor, context_id, &proposal).await?;
         }
     }
 
@@ -1345,10 +1458,13 @@ pub async fn vote_on_proposal_inner(
 /// - [`ContextError::GovernanceFailed`] if the proposal is not found.
 #[instrument(skip_all, fields(context_id))]
 pub async fn get_proposal(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     proposal_id: &ProposalId,
 ) -> Result<GovernanceProposal, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let ctx_arc = mgr
         .get_context_arc(context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
@@ -1382,9 +1498,12 @@ pub async fn get_proposal(
 /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
 #[instrument(skip_all, fields(context_id))]
 pub async fn list_proposals(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
 ) -> Result<Vec<GovernanceProposal>, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let ctx_arc = mgr
         .get_context_arc(context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
@@ -1422,7 +1541,7 @@ pub async fn list_proposals(
 ///   `GovernancePropose` capability.
 #[instrument(skip_all, fields(context_id))]
 pub async fn propose_governance_action_checked(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     proposer_did: &DID,
     action: GovernanceAction,
@@ -1433,9 +1552,15 @@ pub async fn propose_governance_action_checked(
     // under the same lock as the proposal submission. This eliminates
     // the TOCTOU race where a separate check-then-act pattern allowed
     // capability revocation between the check and the propose.
-    let (proposal, _events, execution_result) =
-        propose_governance_action_inner(mgr, context_id, proposer_did, action, signing_key, true)
-            .await?;
+    let (proposal, _events, execution_result) = propose_governance_action_inner(
+        supervisor,
+        context_id,
+        proposer_did,
+        action,
+        signing_key,
+        true,
+    )
+    .await?;
 
     let status = proposal.status.clone();
     Ok(ProposalOutcome {
@@ -1463,7 +1588,7 @@ pub async fn propose_governance_action_checked(
 ///   capability or the engine rejects the vote.
 #[instrument(skip_all, fields(context_id))]
 pub async fn approve_governance_proposal(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     proposal_id: &ProposalId,
     voter_did: &DID,
@@ -1473,7 +1598,7 @@ pub async fn approve_governance_proposal(
     // the same lock as the vote) — eliminates the TOCTOU window from
     // the previous separate lock block.
     let (status, _events) = vote_on_proposal_inner(
-        mgr,
+        supervisor,
         context_id,
         proposal_id,
         voter_did,
@@ -1504,7 +1629,7 @@ pub async fn approve_governance_proposal(
 ///   capability or the engine rejects the vote.
 #[instrument(skip_all, fields(context_id))]
 pub async fn reject_governance_proposal(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     proposal_id: &ProposalId,
     voter_did: &DID,
@@ -1514,7 +1639,7 @@ pub async fn reject_governance_proposal(
     // the same lock as the vote) — eliminates the TOCTOU window from
     // the previous separate lock block.
     let (status, _events) = vote_on_proposal_inner(
-        mgr,
+        supervisor,
         context_id,
         proposal_id,
         voter_did,
@@ -1545,11 +1670,14 @@ pub async fn reject_governance_proposal(
 ///   withdrawal (proposal not found, voter hasn't voted, etc.).
 #[instrument(skip_all, fields(context_id))]
 pub async fn withdraw_governance_vote(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     proposal_id: &ProposalId,
     voter_did: &DID,
 ) -> Result<ProposalStatus, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let (status, events) = {
         let ctx_arc = mgr
             .get_context_arc(context_id)
@@ -1558,7 +1686,12 @@ pub async fn withdraw_governance_vote(
         let ctx = &mut *guard;
         require_active(&ctx.handle)?;
 
-        let gov_ctx = build_governance_context(ctx, &**mgr.clock_ref());
+        let gov_ctx = build_governance_context(
+            ctx,
+            &**supervisor
+                .clock_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+        );
         ctx.governance
             .engine
             .withdraw_vote(proposal_id, voter_did, &gov_ctx)
@@ -1568,11 +1701,14 @@ pub async fn withdraw_governance_vote(
     let context_id_bytes = context_id_to_bytes(context_id);
     let mut event_count: u64 = 0;
     for event in &events {
-        mgr.event_log_ref().append_context_event(
-            &context_id_bytes,
-            ContextManager::governance_event_label(event),
-            voter_did.as_ref(),
-        )?;
+        supervisor
+            .event_log_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .append_context_event(
+                &context_id_bytes,
+                ContextManager::governance_event_label(event),
+                voter_did.as_ref(),
+            )?;
         event_count += 1;
     }
     if event_count > 0
@@ -1609,13 +1745,16 @@ pub async fn withdraw_governance_vote(
 ///
 /// Requires the `MemberBan` capability in the context's ceiling (§5.3).
 pub async fn execute_suspend_member(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     did: &DID,
     capabilities: &[Capability],
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -1648,7 +1787,7 @@ pub async fn execute_suspend_member(
                 capabilities: capabilities.to_vec(),
             },
             context_id,
-            mgr.event_tx_ref(),
+            supervisor.event_tx_ref(),
         );
 
         if mgr.has_persistence() {
@@ -1661,7 +1800,9 @@ pub async fn execute_suspend_member(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "MemberSuspended", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -1695,13 +1836,16 @@ pub async fn execute_suspend_member(
 /// Returns the number of rotated authors (for broadcast contexts).
 #[allow(clippy::too_many_lines)]
 pub async fn execute_revoke(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     did: &DID,
     access: AccessScope,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<usize, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (rotated_count, ctx_snapshot, bc_snapshot, needs_sender_key_rotation) = {
@@ -1747,7 +1891,7 @@ pub async fn execute_revoke(
             ctx.emit_event(
                 ContextEvent::WriteAccessRevoked { did: did.clone() },
                 context_id,
-                mgr.event_tx_ref(),
+                supervisor.event_tx_ref(),
             );
         }
 
@@ -1782,12 +1926,12 @@ pub async fn execute_revoke(
             ctx.emit_event(
                 ContextEvent::ReadAccessRevoked { did: did.clone() },
                 context_id,
-                mgr.event_tx_ref(),
+                supervisor.event_tx_ref(),
             );
             ctx.emit_event(
                 ContextEvent::AccessKeyRevoked { did: did.clone() },
                 context_id,
-                mgr.event_tx_ref(),
+                supervisor.event_tx_ref(),
             );
         }
 
@@ -1815,12 +1959,15 @@ pub async fn execute_revoke(
     if let Some(ref bc_snap) = bc_snapshot {
         mgr.persist_broadcast_snapshot(context_id, bc_snap);
     }
-    mgr.event_log_ref().append_context_event_with_payload(
-        &context_id_bytes,
-        "AccessRevoked",
-        actor_did,
-        Some(&serde_json::json!({"target_did": did.as_ref()})),
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event_with_payload(
+            &context_id_bytes,
+            "AccessRevoked",
+            actor_did,
+            Some(&serde_json::json!({"target_did": did.as_ref()})),
+        )?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -1835,7 +1982,11 @@ pub async fn execute_revoke(
     // during revoke, so rotation failure does not leave the group in an
     // inconsistent state — warn and continue.
     if needs_sender_key_rotation {
-        if let Err(e) = mgr.crypto_ref().rotate_sender_key(&context_id_bytes) {
+        if let Err(e) = supervisor
+            .crypto_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .rotate_sender_key(&context_id_bytes)
+        {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -1867,13 +2018,16 @@ pub async fn execute_revoke(
 ///
 /// Requires the `MemberBan` capability in the context's ceiling (§5.3).
 pub async fn execute_restore_access(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     did: &DID,
     capabilities: &[Capability],
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (ctx_snapshot, bc_snapshot) = {
@@ -1937,13 +2091,13 @@ pub async fn execute_restore_access(
             }
 
             let read_event = ContextEvent::ReadAccessRestored { did: did.clone() };
-            ctx.emit_event(read_event, context_id, mgr.event_tx_ref());
+            ctx.emit_event(read_event, context_id, supervisor.event_tx_ref());
 
             let key_event = ContextEvent::AccessKeyRestored {
                 did: did.clone(),
                 new_epoch: 1,
             };
-            ctx.emit_event(key_event, context_id, mgr.event_tx_ref());
+            ctx.emit_event(key_event, context_id, supervisor.event_tx_ref());
 
             snap
         } else {
@@ -1952,7 +2106,7 @@ pub async fn execute_restore_access(
 
         if capabilities.contains(&Capability::MessagesWrite) {
             let write_event = ContextEvent::WriteAccessRestored { did: did.clone() };
-            ctx.emit_event(write_event, context_id, mgr.event_tx_ref());
+            ctx.emit_event(write_event, context_id, supervisor.event_tx_ref());
         }
 
         let snap = if mgr.has_persistence() {
@@ -1969,7 +2123,9 @@ pub async fn execute_restore_access(
     if let Some(ref bc_snap) = bc_snapshot {
         mgr.persist_broadcast_snapshot(context_id, bc_snap);
     }
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "AccessRestored", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -1987,13 +2143,16 @@ pub async fn execute_restore_access(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_add_member(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     did: &DID,
     role: &str,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -2020,8 +2179,15 @@ pub async fn execute_add_member(
         // been demoted, removed, or never held RoleAssign. See
         // `enforce_assign_role` (line 74) for the matching consequence
         // path that already uses this pattern.
-        let tokens = roles::system_assign_role(&mut ctx.role_state, did, role, &**mgr.clock_ref())
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        let tokens = roles::system_assign_role(
+            &mut ctx.role_state,
+            did,
+            role,
+            &**supervisor
+                .clock_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+        )
+        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         // creator_did is still consumed below by push_welcome_event for
         // the WelcomeGenerated provenance field.
         let creator_did = ctx.role_state.creator_did.clone();
@@ -2041,7 +2207,7 @@ pub async fn execute_add_member(
             member_did: did.clone(),
             role_name: role.to_owned(),
         };
-        ctx.emit_event(join_event, context_id, mgr.event_tx_ref());
+        ctx.emit_event(join_event, context_id, supervisor.event_tx_ref());
 
         // Emit WelcomeGenerated event if the add produced a Welcome message.
         push_welcome_event(
@@ -2050,7 +2216,7 @@ pub async fn execute_add_member(
             &DID(creator_did),
             did,
             add_output,
-            mgr.event_tx_ref(),
+            supervisor.event_tx_ref(),
         );
 
         if mgr.has_persistence() {
@@ -2063,7 +2229,9 @@ pub async fn execute_add_member(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "MemberJoined", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -2080,12 +2248,15 @@ pub async fn execute_add_member(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_remove_member(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     did: &DID,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (remove_output, snapshot) = {
@@ -2134,7 +2305,11 @@ pub async fn execute_remove_member(
         // If rotation fails after MLS removal succeeded, returning Err
         // would leave the system inconsistent (member removed from MLS
         // but governance action appears to have failed).
-        if let Err(e) = mgr.crypto_ref().rotate_sender_key(&context_id_bytes) {
+        if let Err(e) = supervisor
+            .crypto_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .rotate_sender_key(&context_id_bytes)
+        {
             tracing::warn!(
                 context_id,
                 error = %e,
@@ -2158,7 +2333,7 @@ pub async fn execute_remove_member(
         let left_event = ContextEvent::MemberLeft {
             member_did: did.clone(),
         };
-        ctx.emit_event(left_event, context_id, mgr.event_tx_ref());
+        ctx.emit_event(left_event, context_id, supervisor.event_tx_ref());
 
         (
             remove_output,
@@ -2176,7 +2351,7 @@ pub async fn execute_remove_member(
     // and the context fail-closes only after MAX_COMMIT_RETRIES /
     // MAX_COMMIT_AGE_SECS exhaust.
     try_broadcast_commit_or_enqueue(
-        mgr,
+        supervisor,
         context_id,
         remove_output.commit_bytes,
         CommitOperation::RemoveMember {
@@ -2199,7 +2374,9 @@ pub async fn execute_remove_member(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "MemberLeft", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -2216,13 +2393,16 @@ pub async fn execute_remove_member(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_change_role(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     did: &DID,
     new_role: &str,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -2247,9 +2427,15 @@ pub async fn execute_change_role(
         // been demoted, removed, or never held RoleAssign. See
         // `enforce_assign_role` (line 74) for the matching consequence
         // path that already uses this pattern.
-        let tokens =
-            roles::system_assign_role(&mut ctx.role_state, did, new_role, &**mgr.clock_ref())
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        let tokens = roles::system_assign_role(
+            &mut ctx.role_state,
+            did,
+            new_role,
+            &**supervisor
+                .clock_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+        )
+        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
         // Update membership tracking with new role.
         if let Some(info) = ctx.membership.get_mut(did) {
@@ -2267,7 +2453,9 @@ pub async fn execute_change_role(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "RoleAssigned", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -2287,12 +2475,15 @@ pub async fn execute_change_role(
 /// context's ceiling (§5.3). Without this capability in the ceiling,
 /// the context does not support tool registration.
 pub async fn execute_register_tool(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     registration: &ToolRegistration,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -2326,7 +2517,9 @@ pub async fn execute_register_tool(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ToolRegistered", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -2343,12 +2536,15 @@ pub async fn execute_register_tool(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_remove_tool(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     tool_id: &str,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -2372,7 +2568,9 @@ pub async fn execute_remove_tool(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ToolRemoved", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -2389,12 +2587,15 @@ pub async fn execute_remove_tool(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_modify_ceiling(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     new_ceiling: &[Capability],
     proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -2423,7 +2624,10 @@ pub async fn execute_modify_ceiling(
 
         // M7: Instead of applying immediately, enter notification period.
         // Members are notified and may leave before the expansion takes effect.
-        let now = mgr.clock_ref().now_secs();
+        let now = supervisor
+            .clock_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .now_secs();
         let effective_at = now + CEILING_CHANGE_NOTIFICATION_PERIOD_SECS;
         ctx.governance.pending_ceiling_modification = Some(PendingCeilingModification {
             new_capabilities: new_ceiling.to_vec(),
@@ -2442,7 +2646,7 @@ pub async fn execute_modify_ceiling(
                 proposal_id,
             },
             context_id,
-            mgr.event_tx_ref(),
+            supervisor.event_tx_ref(),
         );
 
         if mgr.has_persistence() {
@@ -2455,11 +2659,10 @@ pub async fn execute_modify_ceiling(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref().append_context_event(
-        &context_id_bytes,
-        "CeilingModificationPending",
-        actor_did,
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(&context_id_bytes, "CeilingModificationPending", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -2487,10 +2690,13 @@ pub async fn execute_modify_ceiling(
 /// Returns `ContextError` if the context is not found or is not active.
 #[instrument(skip_all, fields(context_id))]
 pub async fn apply_pending_ceiling_modification(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     current_timestamp: u64,
 ) -> Result<bool, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (applied, snapshot) = {
@@ -2522,7 +2728,9 @@ pub async fn apply_pending_ceiling_modification(
         if let Some(snapshot) = snapshot {
             mgr.persist_context_snapshot(context_id, snapshot);
         }
-        mgr.event_log_ref()
+        supervisor
+            .event_log_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
             .append_context_event(&context_id_bytes, "CeilingModified", "")?;
         {
             if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -2542,12 +2750,15 @@ pub async fn apply_pending_ceiling_modification(
 
 #[allow(clippy::option_if_let_else)]
 pub async fn execute_close_context(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     _reason: Option<&str>,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Extract handle under lock, then drop lock before the async
@@ -2596,7 +2807,9 @@ pub async fn execute_close_context(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ContextClosing", actor_did)?;
     {
         if let Ok(mut guard) = mgr.relock_context(&ctx_gen).await {
@@ -2615,13 +2828,16 @@ pub async fn execute_close_context(
 /// current members regardless of governance model — protocol-level
 /// override per ADR-031 §4d and spec §5.10.
 pub async fn execute_extend_ttl(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     additional_secs: u64,
     approvals: &[scp_protocol::context::governance::SignedVote],
     proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (snapshot, new_remaining, handle, old_deadline, new_deadline, consenting_members) = {
@@ -2650,11 +2866,14 @@ pub async fn execute_extend_ttl(
                 "proposal_id": hex::encode(proposal_id),
                 "rejecting_members": rejecting_members,
             });
-            mgr.event_log_ref().append_context_event(
-                &context_id_bytes,
-                &rejected_payload.to_string(),
-                actor_did,
-            )?;
+            supervisor
+                .event_log_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                .append_context_event(
+                    &context_id_bytes,
+                    &rejected_payload.to_string(),
+                    actor_did,
+                )?;
             ctx.checkpoint_events_since += 1;
             return Err(ContextError::PermissionDenied(format!(
                 "TTL extension requires unanimous consent — {} of {} members have not approved",
@@ -2675,10 +2894,14 @@ pub async fn execute_extend_ttl(
         let old_dl = ctx.ttl.timer.deadline_unix_secs.unwrap_or(0);
 
         // Extend the TTL deadline and compute the remaining duration
-        // for the replacement timer task.
+        // for the replacement timer task. Pull `now` out of the
+        // closure so we can propagate a `NotInitialized` error via `?`.
+        let now = supervisor
+            .clock_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .now_secs();
         let remaining_secs = ctx.ttl.timer.deadline_unix_secs.as_mut().map(|deadline| {
             *deadline = deadline.saturating_add(additional_secs);
-            let now = mgr.clock_ref().now_secs();
             deadline.saturating_sub(now)
         });
 
@@ -2719,11 +2942,10 @@ pub async fn execute_extend_ttl(
         "proposal_id": hex::encode(proposal_id),
         "consenting_members": consenting_members,
     });
-    mgr.event_log_ref().append_context_event(
-        &context_id_bytes,
-        &extended_payload.to_string(),
-        actor_did,
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(&context_id_bytes, &extended_payload.to_string(), actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -2739,12 +2961,15 @@ pub async fn execute_extend_ttl(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_transfer_admin(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     new_admin: &DID,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -2780,16 +3005,29 @@ pub async fn execute_transfer_admin(
             .map(|(did, _)| did.clone())
             .collect();
         for admin_did in &current_admins {
-            roles::system_assign_role(&mut ctx.role_state, admin_did, "member", &**mgr.clock_ref())
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+            roles::system_assign_role(
+                &mut ctx.role_state,
+                admin_did,
+                "member",
+                &**supervisor
+                    .clock_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+            )
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
             if let Some(info) = ctx.membership.get_mut(admin_did) {
                 "member".clone_into(&mut info.role_name);
             }
         }
         // Promote new admin.
-        let tokens =
-            roles::system_assign_role(&mut ctx.role_state, new_admin, "admin", &**mgr.clock_ref())
-                .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+        let tokens = roles::system_assign_role(
+            &mut ctx.role_state,
+            new_admin,
+            "admin",
+            &**supervisor
+                .clock_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+        )
+        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
         if let Some(info) = ctx.membership.get_mut(new_admin) {
             "admin".clone_into(&mut info.role_name);
             info.tokens = tokens;
@@ -2805,7 +3043,9 @@ pub async fn execute_transfer_admin(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "AdminTransferred", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -2824,12 +3064,15 @@ pub async fn execute_transfer_admin(
 /// Creates a child context from this parent. Requires `ChildContextCreate`
 /// in the parent context's ceiling (§5.3, §5.13).
 pub async fn execute_create_child_context(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     _params: &ContextParams,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
     // Validate parent context is active and ceiling allows child creation.
     {
@@ -2854,11 +3097,10 @@ pub async fn execute_create_child_context(
     // Child context creation is delegated to `create_context` by the
     // caller with the parent_context_id field set. This method records
     // the governance event on the parent.
-    mgr.event_log_ref().append_context_event(
-        &context_id_bytes,
-        "ChildContextCreated",
-        actor_did,
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(&context_id_bytes, "ChildContextCreated", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -2874,12 +3116,15 @@ pub async fn execute_create_child_context(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_modify_pruning_policy(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     new_policy: &PruningPolicy,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Validate retention multipliers are non-zero.
@@ -2942,11 +3187,10 @@ pub async fn execute_modify_pruning_policy(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref().append_context_event(
-        &context_id_bytes,
-        "PruningPolicyModified",
-        actor_did,
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(&context_id_bytes, "PruningPolicyModified", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -2964,12 +3208,15 @@ pub async fn execute_modify_pruning_policy(
 /// Adds a signer to the threshold set and mints `GovernanceVote` +
 /// `GovernancePropose` UCANs for the new signer (ADR-031 §6).
 pub async fn execute_add_signer(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     did: &DID,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -3004,7 +3251,11 @@ pub async fn execute_add_signer(
                 with: format!("scp:ctx:{context_id}/{cap}"),
                 can: "invoke".to_owned(),
             };
-            let nonce = scp_protocol::crypto::ucan::nonce::generate_nonce(&**mgr.clock_ref());
+            let nonce = scp_protocol::crypto::ucan::nonce::generate_nonce(
+                &**supervisor
+                    .clock_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+            );
             let token = roles::UcanToken {
                 iss: creator_did.clone(),
                 aud: did.to_string(),
@@ -3033,7 +3284,9 @@ pub async fn execute_add_signer(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "SignerAdded", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -3052,12 +3305,15 @@ pub async fn execute_add_signer(
 /// Removes a signer from the threshold set, revokes their governance
 /// UCANs, and validates threshold <= remaining signers (ADR-031 §6).
 pub async fn execute_remove_signer(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     did: &DID,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -3117,7 +3373,9 @@ pub async fn execute_remove_signer(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "SignerRemoved", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -3134,12 +3392,15 @@ pub async fn execute_remove_signer(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_modify_threshold(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     new_threshold: u32,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -3168,7 +3429,9 @@ pub async fn execute_modify_threshold(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ThresholdModified", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -3188,12 +3451,15 @@ pub async fn execute_modify_threshold(
 /// in the context's ceiling (§5.3, §6.2). Without this capability in the
 /// ceiling, the context does not support tool interface exposure.
 pub async fn execute_establish_tool_interface(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     interface: &ToolInterface,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -3227,11 +3493,10 @@ pub async fn execute_establish_tool_interface(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref().append_context_event(
-        &context_id_bytes,
-        "ToolInterfaceEstablished",
-        actor_did,
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(&context_id_bytes, "ToolInterfaceEstablished", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -3247,13 +3512,16 @@ pub async fn execute_establish_tool_interface(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_reset_member(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     did: &DID,
     _reason: &str,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
     {
         let ctx_arc = mgr
@@ -3284,7 +3552,7 @@ pub async fn execute_reset_member(
     // is enqueued on transport failure and retried by the governance
     // timeout task with exponential backoff.
     try_broadcast_commit_or_enqueue(
-        mgr,
+        supervisor,
         context_id,
         remove_output.commit_bytes,
         CommitOperation::ResetMember {
@@ -3295,7 +3563,7 @@ pub async fn execute_reset_member(
     )
     .await?;
     try_broadcast_commit_or_enqueue(
-        mgr,
+        supervisor,
         context_id,
         add_output.commit_bytes,
         CommitOperation::ResetMember {
@@ -3322,7 +3590,11 @@ pub async fn execute_reset_member(
              sender key layer may retain stale key"
         );
     }
-    if let Err(e) = mgr.crypto_ref().rotate_sender_key(&context_id_bytes) {
+    if let Err(e) = supervisor
+        .crypto_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .rotate_sender_key(&context_id_bytes)
+    {
         tracing::warn!(
             context_id,
             error = %e,
@@ -3340,7 +3612,9 @@ pub async fn execute_reset_member(
         );
     }
 
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "MemberReset", actor_did)?;
 
     // Track the epoch reset so the governance timeout task can invalidate
@@ -3361,8 +3635,13 @@ pub async fn execute_reset_member(
 // execute_resolve_conflict
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "verbatim hoist of the legacy method — splitting would fragment \
+              the single-lock conflict-resolution scope"
+)]
 pub async fn execute_resolve_conflict(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     proposal_a: &ProposalId,
     proposal_b: &ProposalId,
@@ -3370,6 +3649,9 @@ pub async fn execute_resolve_conflict(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -3454,11 +3736,17 @@ pub async fn execute_resolve_conflict(
                 };
                 // Only invalidate the loser — the winner remains eligible
                 // for normal execution.
-                let now = mgr.clock_ref().now_secs();
+                let now = supervisor
+                    .clock_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                    .now_secs();
                 ctx.governance.executed_proposals.insert(*loser, now);
             }
             scp_protocol::context::governance::ConflictResolution::InvalidateBoth => {
-                let now = mgr.clock_ref().now_secs();
+                let now = supervisor
+                    .clock_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                    .now_secs();
                 ctx.governance.executed_proposals.insert(*proposal_a, now);
                 ctx.governance.executed_proposals.insert(*proposal_b, now);
             }
@@ -3477,11 +3765,10 @@ pub async fn execute_resolve_conflict(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref().append_context_event(
-        &context_id_bytes,
-        "GovernanceConflictResolved",
-        actor_did,
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(&context_id_bytes, "GovernanceConflictResolved", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -3507,12 +3794,15 @@ pub async fn execute_resolve_conflict(
 /// On success: TTL is removed, memory scope transitions to `Full`, existing
 /// event log and key material are preserved.
 pub async fn execute_promote_context(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     approvals: &[scp_protocol::context::governance::SignedVote],
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -3567,7 +3857,9 @@ pub async fn execute_promote_context(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ContextPromoted", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -3603,12 +3895,15 @@ pub async fn execute_promote_context(
 /// All members receive new access keys. Historical content remains
 /// accessible with old keys (retained by the store).
 pub async fn execute_rotate_content_keys(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     reason: Option<&str>,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (epoch_output, snapshot, bc_snapshot) = {
@@ -3630,7 +3925,10 @@ pub async fn execute_rotate_content_keys(
             (None, snap)
         } else {
             // Encrypted mode: advance MLS epoch via propose_update (#1548).
-            let epoch_out = mgr.crypto_ref().advance_epoch(&context_id_bytes)?;
+            let epoch_out = supervisor
+                .crypto_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                .advance_epoch(&context_id_bytes)?;
 
             // Encrypted mode: regenerate per-member access keys at a new
             // epoch (§9.17.2 step 6, ADR-038). MLS key rotation and access
@@ -3664,7 +3962,7 @@ pub async fn execute_rotate_content_keys(
         let rotated_event = ContextEvent::ContentKeysRotated {
             reason: reason.map(String::from),
         };
-        ctx.emit_event(rotated_event, context_id, mgr.event_tx_ref());
+        ctx.emit_event(rotated_event, context_id, supervisor.event_tx_ref());
 
         let snap = if mgr.has_persistence() {
             Some(ContextManager::snapshot_context(ctx))
@@ -3678,7 +3976,7 @@ pub async fn execute_rotate_content_keys(
     // PR #1606 C6: enqueue for persistent retry on transport failure.
     if let Some(epoch_out) = epoch_output {
         try_broadcast_commit_or_enqueue(
-            mgr,
+            supervisor,
             context_id,
             epoch_out.commit_bytes,
             CommitOperation::RotateContentKeys {
@@ -3696,7 +3994,9 @@ pub async fn execute_rotate_content_keys(
         mgr.persist_broadcast_snapshot(context_id, snap);
     }
 
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ContentKeysRotated", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -3713,13 +4013,16 @@ pub async fn execute_rotate_content_keys(
 // ---------------------------------------------------------------------------
 
 pub async fn execute_reconfigure_governance(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     changes: &[scp_protocol::context::governance::GovernanceReconfigAction],
     justification: &scp_protocol::context::governance::DeadlockJustification,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     if changes.is_empty() {
         return Err(ContextError::PermissionDenied(
             "reconfigure_governance requires at least one change".to_owned(),
@@ -3805,11 +4108,10 @@ pub async fn execute_reconfigure_governance(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref().append_context_event(
-        &context_id_bytes,
-        "GovernanceReconfigured",
-        actor_did,
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(&context_id_bytes, "GovernanceReconfigured", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -3842,12 +4144,15 @@ pub async fn execute_reconfigure_governance(
 /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
 /// - [`ContextError::ContextNotActive`] if the context is not active.
 pub async fn execute_set_economic_policy(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     policy: &EconomicPolicy,
     proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // Validate that pricing formula only references available metrics.
     scp_protocol::economy::policy::validate_economic_policy_metrics(Some(policy))
         .map_err(|e| ContextError::PermissionDenied(format!("invalid economic policy: {e}")))?;
@@ -3879,7 +4184,10 @@ pub async fn execute_set_economic_policy(
         }
 
         // §19.3: Stage the change with a 24-hour notification period.
-        let now = mgr.clock_ref().now_secs();
+        let now = supervisor
+            .clock_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .now_secs();
         let effective_at = now + ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS;
         ctx.governance.pending_economic_policy_change = Some(PendingEconomicPolicyChange {
             new_policy: policy.clone(),
@@ -3896,7 +4204,7 @@ pub async fn execute_set_economic_policy(
                 proposal_id,
             },
             context_id,
-            mgr.event_tx_ref(),
+            supervisor.event_tx_ref(),
         );
 
         if mgr.has_persistence() {
@@ -3909,11 +4217,10 @@ pub async fn execute_set_economic_policy(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref().append_context_event(
-        &context_id_bytes,
-        "EconomicPolicyChanged",
-        actor_did,
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(&context_id_bytes, "EconomicPolicyChanged", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -3939,10 +4246,13 @@ pub async fn execute_set_economic_policy(
 /// Returns `ContextError` if the context is not found or is not active.
 #[instrument(skip_all, fields(context_id))]
 pub async fn apply_pending_economic_policy_change(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     current_timestamp: u64,
 ) -> Result<bool, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (applied, snapshot) = {
@@ -3974,7 +4284,9 @@ pub async fn apply_pending_economic_policy_change(
         if let Some(snapshot) = snapshot {
             mgr.persist_context_snapshot(context_id, snapshot);
         }
-        mgr.event_log_ref()
+        supervisor
+            .event_log_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
             .append_context_event(&context_id_bytes, "EconomicPolicyApplied", "")?;
         {
             if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -4005,7 +4317,7 @@ pub async fn apply_pending_economic_policy_change(
 ///   or the spender is not a member.
 /// - [`ContextError::ContextNotActive`] if the context is not active.
 pub async fn execute_approve_spend(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     spender: &DID,
     amount: scp_protocol::economy::types::Amount,
@@ -4013,6 +4325,9 @@ pub async fn execute_approve_spend(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -4047,7 +4362,9 @@ pub async fn execute_approve_spend(
         "amount": amount,
         "purpose": purpose,
     });
-    mgr.event_log_ref()
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, &payload.to_string(), actor_did)?;
     Ok(())
 }
@@ -4065,11 +4382,14 @@ pub async fn execute_approve_spend(
 /// - [`ContextError::ContextNotRegistered`] if the context is not registered.
 /// - [`ContextError::ContextNotActive`] if the context is not active.
 pub async fn execute_lock_economic_policy(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
@@ -4106,11 +4426,10 @@ pub async fn execute_lock_economic_policy(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref().append_context_event(
-        &context_id_bytes,
-        "EconomicPolicyLocked",
-        actor_did,
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(&context_id_bytes, "EconomicPolicyLocked", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -4139,12 +4458,15 @@ pub async fn execute_lock_economic_policy(
 /// - [`ContextError::ContextNotActive`] if the context is not active.
 /// - [`ContextError::GovernanceFailed`] if `new_config` fails validation.
 pub async fn execute_modify_hard_rate_limit(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     new_config: &scp_protocol::economy::antispam::HardRateLimitConfig,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Validate BEFORE touching per-context state so a malformed
@@ -4175,7 +4497,10 @@ pub async fn execute_modify_hard_rate_limit(
         scp_protocol::economy::antispam::TokenBucketLimiter::validate_and_sanitize_snapshot(
             &mut preserved_state,
             new_config,
-            mgr.clock_ref().now_secs(),
+            supervisor
+                .clock_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                .now_secs(),
             scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
         )
         .map_err(|e| {
@@ -4199,11 +4524,10 @@ pub async fn execute_modify_hard_rate_limit(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref().append_context_event(
-        &context_id_bytes,
-        "HardRateLimitModified",
-        actor_did,
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(&context_id_bytes, "HardRateLimitModified", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -4231,7 +4555,7 @@ pub async fn execute_modify_hard_rate_limit(
 /// - [`ContextError::InvalidTransition`] if the state transition fails.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn execute_propose_context_migration(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     new_context_params: &scp_protocol::context::params::ContextParams,
     reason: &str,
@@ -4240,6 +4564,9 @@ pub async fn execute_propose_context_migration(
     proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<MigrationProposedResult, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Generate a deterministic destination context ID from the source
@@ -4253,7 +4580,10 @@ pub async fn execute_propose_context_migration(
         hex::encode(hasher.finalize())
     };
 
-    let now = mgr.clock_ref().now_secs();
+    let now = supervisor
+        .clock_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .now_secs();
     let grace_period_end = now.saturating_add(grace_period_secs);
 
     // Prepare destination params with migration_source metadata
@@ -4379,7 +4709,7 @@ pub async fn execute_propose_context_migration(
 
     // Destination context created successfully — now safe to broadcast
     // the migration events that were buffered above.
-    if let Some(tx) = mgr.event_tx_ref() {
+    if let Some(tx) = supervisor.event_tx_ref() {
         let _ = tx.send((context_id.to_owned(), strip_event_payload(&proposed_event)));
         let _ = tx.send((context_id.to_owned(), strip_event_payload(&started_event)));
     }
@@ -4387,11 +4717,10 @@ pub async fn execute_propose_context_migration(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref().append_context_event(
-        &context_id_bytes,
-        "ContextMigrationStarted",
-        actor_did,
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(&context_id_bytes, "ContextMigrationStarted", actor_did)?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -4421,11 +4750,14 @@ pub async fn execute_propose_context_migration(
 /// - [`ContextError::PermissionDenied`] if the context is not migrating.
 /// - [`ContextError::InvalidTransition`] if the state transition fails.
 pub async fn execute_cancel_context_migration(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Transition and state mutation happen under the same lock to prevent
@@ -4471,7 +4803,7 @@ pub async fn execute_cancel_context_migration(
                 original_proposal_id: original_pid,
             },
             context_id,
-            mgr.event_tx_ref(),
+            supervisor.event_tx_ref(),
         );
 
         let snapshot = if mgr.has_persistence() {
@@ -4485,14 +4817,17 @@ pub async fn execute_cancel_context_migration(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref().append_context_event(
-        &context_id_bytes,
-        &format!(
-            "ContextMigrationCancelled:{}",
-            hex::encode(original_proposal_id)
-        ),
-        actor_did,
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(
+            &context_id_bytes,
+            &format!(
+                "ContextMigrationCancelled:{}",
+                hex::encode(original_proposal_id)
+            ),
+            actor_did,
+        )?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -4521,12 +4856,18 @@ pub async fn execute_cancel_context_migration(
 ///   or the grace period has not expired.
 #[instrument(skip_all, fields(context_id))]
 pub async fn tombstone_migrated_context(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
-    let now = mgr.clock_ref().now_secs();
+    let now = supervisor
+        .clock_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .now_secs();
 
     // State transition and mutation happen under the same lock to prevent
     // a race where migration_state is cleared but the transition to
@@ -4580,7 +4921,7 @@ pub async fn tombstone_migrated_context(
             destination_context_id: dest_id.clone(),
             migration_proposal_id: m_pid,
         };
-        ctx.emit_event(tombstone_event, context_id, mgr.event_tx_ref());
+        ctx.emit_event(tombstone_event, context_id, supervisor.event_tx_ref());
 
         // Cancel TTL timer and governance timeout task.
         ctx.ttl.timer.cancel();
@@ -4603,15 +4944,18 @@ pub async fn tombstone_migrated_context(
     if let Some(snapshot) = snapshot {
         mgr.persist_context_snapshot(context_id, snapshot);
     }
-    mgr.event_log_ref().append_context_event(
-        &context_id_bytes,
-        &format!(
-            "ContextTombstoned:{}:{}",
-            destination_id,
-            hex::encode(migration_pid)
-        ),
-        "",
-    )?;
+    supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .append_context_event(
+            &context_id_bytes,
+            &format!(
+                "ContextTombstoned:{}:{}",
+                destination_id,
+                hex::encode(migration_pid)
+            ),
+            "",
+        )?;
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -4630,7 +4974,8 @@ pub async fn tombstone_migrated_context(
 ///
 /// Returns `None` if the context is not registered or not migrating.
 #[instrument(skip_all, fields(context_id))]
-pub async fn migration_state(mgr: &ContextManager, context_id: &str) -> Option<MigrationState> {
+pub async fn migration_state(supervisor: &Supervisor, context_id: &str) -> Option<MigrationState> {
+    let mgr = supervisor.attached_context_manager()?;
     let ctx_arc = mgr.get_context_arc(context_id).ok()?;
 
     let guard = ctx_arc.lock().await;
@@ -4677,7 +5022,7 @@ pub async fn migration_state(mgr: &ContextManager, context_id: &str) -> Option<M
 /// A vector of governance events to emit (empty if no conflicts)
 #[allow(clippy::unused_self)] // method for API consistency within ContextManager
 pub fn detect_and_handle_conflicts(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     ctx: &mut PerContextState,
     new_proposal: &GovernanceProposal,
 ) -> Vec<GovernanceEvent> {
@@ -4687,7 +5032,17 @@ pub fn detect_and_handle_conflicts(
     // Wall-clock timestamp — used ONLY for the audit slot of
     // `approved_proposals` and for the freeze start time. Never
     // used for sequence comparison (H10).
-    let current_timestamp = mgr.clock_ref().now_secs();
+    //
+    // ADR-049 commit 12c.9c — `detect_and_handle_conflicts` cannot
+    // propagate an error (the signature returns `Vec<_>`), so an
+    // unpopulated clock slot degrades to `0`. The attach contract
+    // (see [`ATTACHED_EXPECT`]) guarantees the slot is populated at
+    // call time; the `0` fallback is defense-in-depth against a
+    // contract violation and would be observable only as a stale
+    // `approved_at` timestamp in the audit trail.
+    let current_timestamp = supervisor
+        .clock_ref()
+        .map_or(0, scp_primitives::Clock::now_secs);
 
     // H10: assign the monotonic seq for the new proposal up front,
     // and bump the counter immediately so any nested or concurrent
@@ -4815,14 +5170,19 @@ pub fn detect_and_handle_conflicts(
 /// A vector of governance events to emit (empty if no expired freezes)
 #[allow(clippy::unused_self)] // method for API consistency within ContextManager
 pub fn check_and_resolve_expired_freezes(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     ctx: &mut PerContextState,
 ) -> Vec<GovernanceEvent> {
     use scp_protocol::context::governance::GovernanceEvent;
 
     const FREEZE_TIMEOUT_SECONDS: u64 = 48 * 60 * 60; // 48 hours
 
-    let current_timestamp = mgr.clock_ref().now_secs();
+    // See the matching comment on `detect_and_handle_conflicts` —
+    // the `Vec<GovernanceEvent>` return prevents error propagation;
+    // a missing clock degrades to `0`.
+    let current_timestamp = supervisor
+        .clock_ref()
+        .map_or(0, scp_primitives::Clock::now_secs);
 
     if let Some((proposal_a, proposal_b, freeze_start)) = ctx.governance.freeze
         && current_timestamp.saturating_sub(freeze_start) >= FREEZE_TIMEOUT_SECONDS
@@ -4875,27 +5235,38 @@ pub fn check_and_resolve_expired_freezes(
 /// Returns [`ContextError::EventLogFailed`] if the durable event log
 /// append fails (rare; persistence is best-effort, but a failed log
 /// append indicates a deeper subsystem fault).
+#[allow(
+    clippy::too_many_lines,
+    reason = "verbatim hoist of the legacy method — splitting would fragment \
+              the single-lock broadcast-enqueue scope"
+)]
 pub async fn try_broadcast_commit_or_enqueue(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     commit_bytes: Vec<u8>,
     operation: CommitOperation,
     actor_did: &str,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     if commit_bytes.is_empty() {
         // No-op: nothing to broadcast (e.g., broadcast-mode contexts).
         return Ok(());
     }
     let routing_id = scp_protocol::context::context_routing_id(context_id);
     // First attempt: try to send immediately.
-    match mgr.transport_ref().send_message(&routing_id, &commit_bytes) {
+    match supervisor
+        .transport_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .send_message(&routing_id, &commit_bytes)
+    {
         Ok(()) => {
             let context_id_bytes = context_id_to_bytes(context_id);
-            mgr.event_log_ref().append_context_event(
-                &context_id_bytes,
-                "CommitBroadcasted",
-                actor_did,
-            )?;
+            supervisor
+                .event_log_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                .append_context_event(&context_id_bytes, "CommitBroadcasted", actor_did)?;
             {
                 if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
                     let mut guard = ctx_arc.lock().await;
@@ -4906,7 +5277,10 @@ pub async fn try_broadcast_commit_or_enqueue(
             Ok(())
         }
         Err(e) => {
-            let now = mgr.clock_ref().now_secs();
+            let now = supervisor
+                .clock_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                .now_secs();
             let error_str = e.to_string();
             let backoff = commit_retry_backoff(1);
             let pending = PendingCommit {
@@ -4944,7 +5318,7 @@ pub async fn try_broadcast_commit_or_enqueue(
                             attempts: 1,
                         },
                         context_id,
-                        mgr.event_tx_ref(),
+                        supervisor.event_tx_ref(),
                     );
                     return Ok(());
                 }
@@ -4956,14 +5330,13 @@ pub async fn try_broadcast_commit_or_enqueue(
                         attempt: 1,
                     },
                     context_id,
-                    mgr.event_tx_ref(),
+                    supervisor.event_tx_ref(),
                 );
             }
-            mgr.event_log_ref().append_context_event(
-                &context_id_bytes,
-                "CommitBroadcastPending",
-                actor_did,
-            )?;
+            supervisor
+                .event_log_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                .append_context_event(&context_id_bytes, "CommitBroadcastPending", actor_did)?;
             {
                 if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
                     let mut guard = ctx_arc.lock().await;
@@ -5003,9 +5376,12 @@ pub async fn try_broadcast_commit_or_enqueue(
 /// marker is set.
 #[instrument(skip_all, fields(context_id))]
 pub async fn acknowledge_commit_fault(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
 ) -> Result<CommitFaultMarker, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let ctx_arc = mgr
         .get_context_arc(context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;

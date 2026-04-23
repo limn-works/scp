@@ -6,12 +6,12 @@ use super::*;
 
 #[tokio::test]
 async fn cac009_tier1_encrypted_block_unblock() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     manager.register_local_did("did:key:alice".into()).await;
     let params = ContextParams {
         mode: ContextMode::Encrypted,
@@ -105,12 +105,12 @@ async fn cac009_tier1_encrypted_block_unblock() {
 
 #[tokio::test]
 async fn cac009_tier2_global_block_multiple_contexts() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     manager.register_local_did("did:key:alice".into()).await;
     let make_params = || ContextParams {
         mode: ContextMode::Encrypted,
@@ -512,12 +512,12 @@ async fn cac009_forward_only_verification() {
 #[tokio::test]
 async fn cac010_threshold_revoke_read_access() {
     let creator: DID = "did:key:alice".into();
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         mock_key_resolver(),
-    );
+    ));
     let mut params = governance_params();
     params.mode = ContextMode::Broadcast;
     params.memory_scope = MemoryScope::Full;
@@ -788,12 +788,12 @@ async fn test_recovery_advance_epoch_calls_crypto_provider() {
         ..MockCrypto::default()
     };
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let _handle = manager
         .create_context(
@@ -844,12 +844,12 @@ async fn test_recovery_advance_epoch_rollback_on_crypto_failure() {
     let crypto = MockCrypto::default();
     crypto.fail_advance_epoch.store(true, Ordering::Relaxed);
 
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(crypto),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let _handle = manager
         .create_context(
@@ -886,12 +886,12 @@ async fn test_recovery_advance_epoch_rollback_on_crypto_failure() {
 
 #[tokio::test]
 async fn test_recovery_advance_epoch_rejects_inactive_context() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let handle = manager
         .create_context(

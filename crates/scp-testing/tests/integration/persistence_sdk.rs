@@ -181,14 +181,17 @@ async fn context_create_persists_membership_to_sqlite() {
     // Phase 1: create + flush.
     {
         let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
-        let manager = ContextManager::builder()
-            .crypto(Box::new(
-                scp_core::crypto::mls::provider::MlsCryptoProvider::new(ALICE_DID.to_owned()),
-            ))
-            .storage(storage)
-            .key_resolver(permissive_key_resolver())
-            .build()
-            .unwrap();
+        // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor`.
+        let manager = scp_core::context::attach_test_supervisor(
+            ContextManager::builder()
+                .crypto(Box::new(
+                    scp_core::crypto::mls::provider::MlsCryptoProvider::new(ALICE_DID.to_owned()),
+                ))
+                .storage(storage)
+                .key_resolver(permissive_key_resolver())
+                .build()
+                .unwrap(),
+        );
 
         manager.register_local_did(alice.clone()).await;
         let handle = manager
@@ -265,14 +268,17 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
     // ---- Phase 1: First "process" creates state and flushes. ----
     {
         let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
-        let manager = ContextManager::builder()
-            .crypto(Box::new(
-                scp_core::crypto::mls::provider::MlsCryptoProvider::new(ALICE_DID.to_owned()),
-            ))
-            .storage(storage)
-            .key_resolver(permissive_key_resolver())
-            .build()
-            .unwrap();
+        // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor`.
+        let manager = scp_core::context::attach_test_supervisor(
+            ContextManager::builder()
+                .crypto(Box::new(
+                    scp_core::crypto::mls::provider::MlsCryptoProvider::new(ALICE_DID.to_owned()),
+                ))
+                .storage(storage)
+                .key_resolver(permissive_key_resolver())
+                .build()
+                .unwrap(),
+        );
 
         manager.register_local_did(alice.clone()).await;
         let _handle = manager

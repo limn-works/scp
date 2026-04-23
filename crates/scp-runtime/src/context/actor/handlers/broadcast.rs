@@ -47,7 +47,6 @@
 //! land, the saga-initiator path returns
 //! `ContextError::NotImplemented`.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use scp_platform::KeyCustody;
@@ -62,66 +61,73 @@ use crate::context::actor::commands::{
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::manager::ContextManager;
+use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for broadcast handlers.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch a [`BroadcastCommand`] against an attached manager + deps
-/// bundle.
+/// Dispatch a [`BroadcastCommand`] against an attached supervisor +
+/// deps bundle.
 ///
 /// Publish variants require a key custody reference which cannot cross
 /// the actor mailbox; this entry point rejects them with a typed error
 /// directing the caller to the generic
 /// [`dispatch_from_shim_with_custody`] path instead.
+///
+/// # Supervisor receiver (ADR-049 commit 12c.9c)
+///
+/// Takes `&Supervisor` so the delegated
+/// [`broadcast_helpers`](crate::context::broadcast_helpers) free
+/// functions can read the lifted provider slots (crypto, transport,
+/// event_log, event_tx, clock, local_dids) directly off the supervisor.
+/// Each helper derives `&ContextManager` internally for the remaining
+/// manager-only surface (`get_context_arc`, `has_persistence`, etc.)
+/// via `supervisor.attached_context_manager().expect(...)`.
 pub async fn dispatch(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     _deps: &ActorDeps,
     cmd: BroadcastCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner_no_custody(mgr, cmd)).await
+    Box::pin(dispatch_inner_no_custody(supervisor, cmd)).await
 }
 
 /// Shim-callable dispatch for NON-publish broadcast variants. See the
 /// publish-specific entry points below.
 pub(crate) async fn dispatch_from_shim(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     cmd: BroadcastCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner_no_custody(mgr, cmd)).await
+    Box::pin(dispatch_inner_no_custody(supervisor, cmd)).await
 }
 
 /// Shim-callable dispatch for publish variants that need a key custody
 /// reference. The caller (shim) provides its concrete custody type; the
-/// handler passes it straight through to the legacy
-/// [`ContextManager::publish_broadcast`](crate::context::manager::ContextManager::publish_broadcast)
-/// / [`ContextManager::publish_broadcast_content`](crate::context::manager::ContextManager::publish_broadcast_content)
-/// methods.
+/// handler passes it straight through to the hoisted
+/// [`broadcast_helpers::publish_broadcast`](crate::context::broadcast_helpers::publish_broadcast)
+/// / [`broadcast_helpers::publish_broadcast_content`](crate::context::broadcast_helpers::publish_broadcast_content)
+/// free functions.
 pub(crate) async fn dispatch_from_shim_with_custody<C: KeyCustody>(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     cmd: BroadcastCommand,
     custody: &C,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner_with_custody(mgr, cmd, custody)).await
+    Box::pin(dispatch_inner_with_custody(supervisor, cmd, custody)).await
 }
 
-async fn dispatch_inner_no_custody(
-    mgr: &Arc<ContextManager>,
-    cmd: BroadcastCommand,
-) -> Outcome<()> {
+async fn dispatch_inner_no_custody(supervisor: &Supervisor, cmd: BroadcastCommand) -> Outcome<()> {
     match cmd {
         BroadcastCommand::Placeholder { reply } => reply_not_implemented(reply),
         BroadcastCommand::SubscribeBroadcast { payload, reply } => {
-            handle_subscribe_broadcast(mgr, *payload, reply).await
+            handle_subscribe_broadcast(supervisor, *payload, reply).await
         }
         BroadcastCommand::UnsubscribeBroadcast { payload, reply } => {
-            handle_unsubscribe_broadcast(mgr, *payload, reply).await
+            handle_unsubscribe_broadcast(supervisor, *payload, reply).await
         }
         BroadcastCommand::BlockBroadcastSubscriber { payload, reply } => {
-            handle_block_broadcast_subscriber(mgr, *payload, reply).await
+            handle_block_broadcast_subscriber(supervisor, *payload, reply).await
         }
         BroadcastCommand::UnblockBroadcastSubscriber { payload, reply } => {
-            handle_unblock_broadcast_subscriber(mgr, *payload, reply).await
+            handle_unblock_broadcast_subscriber(supervisor, *payload, reply).await
         }
         BroadcastCommand::HandleBroadcastKeyRequest {
             context_id,
@@ -130,7 +136,7 @@ async fn dispatch_inner_no_custody(
             reply,
         } => {
             handle_handle_broadcast_key_request(
-                mgr,
+                supervisor,
                 &context_id,
                 &author_did,
                 &requester_did,
@@ -139,15 +145,15 @@ async fn dispatch_inner_no_custody(
             .await
         }
         BroadcastCommand::BroadcastSubscriberCount { context_id, reply } => {
-            handle_broadcast_subscriber_count(mgr, &context_id, reply).await
+            handle_broadcast_subscriber_count(supervisor, &context_id, reply).await
         }
         BroadcastCommand::IsBroadcastSubscriber {
             context_id,
             did,
             reply,
-        } => handle_is_broadcast_subscriber(mgr, &context_id, &did, reply).await,
+        } => handle_is_broadcast_subscriber(supervisor, &context_id, &did, reply).await,
         BroadcastCommand::BroadcastAdmission { context_id, reply } => {
-            handle_broadcast_admission(mgr, &context_id, reply).await
+            handle_broadcast_admission(supervisor, &context_id, reply).await
         }
         BroadcastCommand::PublishBroadcast { reply, .. } => {
             // Publish variants require a custody reference that cannot
@@ -172,56 +178,52 @@ async fn dispatch_inner_no_custody(
 }
 
 async fn dispatch_inner_with_custody<C: KeyCustody>(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     cmd: BroadcastCommand,
     custody: &C,
 ) -> Outcome<()> {
     match cmd {
         BroadcastCommand::PublishBroadcast { payload, reply } => {
-            handle_publish_broadcast(mgr, *payload, custody, reply).await
+            handle_publish_broadcast(supervisor, *payload, custody, reply).await
         }
         BroadcastCommand::PublishBroadcastContent { payload, reply } => {
-            handle_publish_broadcast_content(mgr, *payload, custody, reply).await
+            handle_publish_broadcast_content(supervisor, *payload, custody, reply).await
         }
         // Non-publish variants do not need a custody reference. Fall
         // through to the no-custody dispatch so the custody-generic
         // shim method can carry every variant (not just publish).
-        other => dispatch_inner_no_custody(mgr, other).await,
+        other => dispatch_inner_no_custody(supervisor, other).await,
     }
 }
 
 async fn handle_subscribe_broadcast(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: SubscribeBroadcastPayload,
     reply: SubscribeBroadcastReply,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
 
-    let subscribe_fut = async move {
-        // Pass `None` for the validation-context generic — gated
-        // broadcasts still validate inline via the inline UCAN token
-        // path. The full validation context is plumbed through the
-        // FFI bridges' own UCAN registry and not carried through the
-        // mailbox. The no-op turbofish types satisfy the legacy
-        // method's generic bounds; passing `None` for the optional
-        // `validation_ctx` argument short-circuits the full pipeline.
-        crate::context::broadcast_helpers::subscribe_broadcast::<
-            NoopDidResolver,
-            NoopNonceTracker,
-            NoopRevocationChecker,
-            NoopProofResolver,
-            std::collections::hash_map::RandomState,
-        >(
-            &manager,
-            &p.context_id,
-            &p.subscriber_did,
-            p.ucan.as_ref(),
-            p.timestamp,
-            None,
-        )
-        .await
-    };
+    // Pass `None` for the validation-context generic — gated
+    // broadcasts still validate inline via the inline UCAN token
+    // path. The full validation context is plumbed through the
+    // FFI bridges' own UCAN registry and not carried through the
+    // mailbox. The no-op turbofish types satisfy the helper's
+    // generic bounds; passing `None` for the optional
+    // `validation_ctx` argument short-circuits the full pipeline.
+    let subscribe_fut = crate::context::broadcast_helpers::subscribe_broadcast::<
+        NoopDidResolver,
+        NoopNonceTracker,
+        NoopRevocationChecker,
+        NoopProofResolver,
+        std::collections::hash_map::RandomState,
+    >(
+        supervisor,
+        &p.context_id,
+        &p.subscriber_did,
+        p.ucan.as_ref(),
+        p.timestamp,
+        None,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, subscribe_fut).await {
         Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
@@ -243,22 +245,18 @@ async fn handle_subscribe_broadcast(
 }
 
 async fn handle_unsubscribe_broadcast(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: UnsubscribeBroadcastPayload,
     reply: UnsubscribeBroadcastReply,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
 
-    let unsub_fut = async move {
-        crate::context::broadcast_helpers::unsubscribe_broadcast(
-            &manager,
-            &p.context_id,
-            &p.subscriber_did,
-            p.rotate_keys,
-        )
-        .await
-    };
+    let unsub_fut = crate::context::broadcast_helpers::unsubscribe_broadcast(
+        supervisor,
+        &p.context_id,
+        &p.subscriber_did,
+        p.rotate_keys,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, unsub_fut).await {
         Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
@@ -280,16 +278,15 @@ async fn handle_unsubscribe_broadcast(
 }
 
 async fn handle_publish_broadcast<C: KeyCustody>(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: PublishBroadcastPayload,
     custody: &C,
     reply: PublishBroadcastReply,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
 
     let publish_fut = crate::context::broadcast_helpers::publish_broadcast(
-        &manager,
+        supervisor,
         &p.context_id,
         &p.author_did,
         &p.payload,
@@ -317,16 +314,15 @@ async fn handle_publish_broadcast<C: KeyCustody>(
 }
 
 async fn handle_publish_broadcast_content<C: KeyCustody>(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: PublishBroadcastContentPayload,
     custody: &C,
     reply: PublishBroadcastReply,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
 
     let publish_fut = crate::context::broadcast_helpers::publish_broadcast_content(
-        &manager,
+        supervisor,
         &p.context_id,
         &p.author_did,
         p.content,
@@ -354,22 +350,18 @@ async fn handle_publish_broadcast_content<C: KeyCustody>(
 }
 
 async fn handle_block_broadcast_subscriber(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: BroadcastBlockPayload,
     reply: BlockBroadcastSubscriberReply,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
 
-    let block_fut = async move {
-        crate::context::broadcast_helpers::block_broadcast_subscriber(
-            &manager,
-            &p.context_id,
-            &p.author_did,
-            &p.subscriber_did,
-        )
-        .await
-    };
+    let block_fut = crate::context::broadcast_helpers::block_broadcast_subscriber(
+        supervisor,
+        &p.context_id,
+        &p.author_did,
+        &p.subscriber_did,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, block_fut).await {
         Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
@@ -391,22 +383,18 @@ async fn handle_block_broadcast_subscriber(
 }
 
 async fn handle_unblock_broadcast_subscriber(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: BroadcastBlockPayload,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
 
-    let unblock_fut = async move {
-        crate::context::broadcast_helpers::unblock_broadcast_subscriber(
-            &manager,
-            &p.context_id,
-            &p.author_did,
-            &p.subscriber_did,
-        )
-        .await
-    };
+    let unblock_fut = crate::context::broadcast_helpers::unblock_broadcast_subscriber(
+        supervisor,
+        &p.context_id,
+        &p.author_did,
+        &p.subscriber_did,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, unblock_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
@@ -428,15 +416,14 @@ async fn handle_unblock_broadcast_subscriber(
 }
 
 async fn handle_handle_broadcast_key_request(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     author_did: &scp_identity::DID,
     requester_did: &scp_identity::DID,
     reply: HandleBroadcastKeyRequestReply,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let key_req_fut = crate::context::broadcast_helpers::handle_broadcast_key_request(
-        &manager,
+        supervisor,
         context_id,
         author_did,
         requester_did,
@@ -462,13 +449,12 @@ async fn handle_handle_broadcast_key_request(
 }
 
 async fn handle_broadcast_subscriber_count(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     reply: oneshot::Sender<Result<Option<usize>, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let count_fut =
-        crate::context::broadcast_helpers::broadcast_subscriber_count(&manager, context_id);
+        crate::context::broadcast_helpers::broadcast_subscriber_count(supervisor, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, count_fut).await {
         Ok(count) => (Outcome::ok(()), Ok(count)),
@@ -486,14 +472,13 @@ async fn handle_broadcast_subscriber_count(
 }
 
 async fn handle_is_broadcast_subscriber(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     did: &str,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let is_fut =
-        crate::context::broadcast_helpers::is_broadcast_subscriber(&manager, context_id, did);
+        crate::context::broadcast_helpers::is_broadcast_subscriber(supervisor, context_id, did);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, is_fut).await {
         Ok(is) => (Outcome::ok(()), Ok(is)),
@@ -511,13 +496,12 @@ async fn handle_is_broadcast_subscriber(
 }
 
 async fn handle_broadcast_admission(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     reply: BroadcastAdmissionReply,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let admission_fut =
-        crate::context::broadcast_helpers::broadcast_admission(&manager, context_id);
+        crate::context::broadcast_helpers::broadcast_admission(supervisor, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, admission_fut).await {
         Ok(admission) => (Outcome::ok(()), Ok(admission)),

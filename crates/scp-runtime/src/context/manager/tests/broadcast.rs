@@ -751,12 +751,12 @@ async fn broadcast_leave_context_unsubscribes() {
 #[tokio::test]
 async fn broadcast_close_context_drops_state() {
     // Need context:close capability for the admin.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
 
     let params = ContextParams {
         mode: ContextMode::Broadcast,
@@ -1310,12 +1310,12 @@ async fn revoke_read_access_bans_subscriber_in_broadcast() {
 #[tokio::test]
 async fn revoke_read_access_rejected_without_member_ban_ceiling() {
     // Create a broadcast context WITHOUT MemberBan in ceiling.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     manager.register_local_did("did:key:alice".into()).await;
     manager.register_local_did("did:key:bob".into()).await;
     let params = ContextParams {
@@ -1457,12 +1457,12 @@ async fn restore_read_access_unbans_subscriber_in_broadcast() {
 #[tokio::test]
 async fn restore_read_access_rejected_without_member_ban_ceiling() {
     // Create a broadcast context WITHOUT MemberBan in ceiling.
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     manager.register_local_did("did:key:alice".into()).await;
     let params = ContextParams {
         mode: ContextMode::Broadcast,
@@ -2500,12 +2500,12 @@ async fn revoke_write_access_full_scope_broadcast() {
 /// SCP-CAC-007: `Revoke (write)` fails without `MemberBan` in ceiling.
 #[tokio::test]
 async fn revoke_write_access_rejected_without_member_ban() {
-    let manager = ContextManager::new(
+    let manager = super::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         noop_key_resolver(),
-    );
+    ));
     manager.register_local_did("did:key:alice".into()).await;
     manager.register_local_did("did:key:bob".into()).await;
 

@@ -97,8 +97,10 @@ impl ContextTransportProvider for CapturingTransport {
 pub struct FullStackNode {
     /// This node's DID.
     pub did: DID,
-    /// The `ContextManager` with real crypto.
-    pub manager: ContextManager,
+    /// The `ContextManager` with real crypto, wrapped in `Arc` so the
+    /// fresh test [`Supervisor`] can attach to it (ADR-049 commit
+    /// 12c.9c). Callers access manager methods through `Arc` auto-deref.
+    pub manager: Arc<ContextManager>,
     /// Direct access to the crypto provider for `join_from_welcome` and
     /// `decrypt_message` (methods not on the `ContextCryptoProvider` trait).
     pub crypto: Arc<E2eCryptoProvider>,
@@ -131,7 +133,15 @@ impl FullStackNode {
         let transport_box: Box<dyn ContextTransportProvider> =
             Box::new(CapturingTransport::new(Arc::clone(&sent)));
 
-        let manager = ContextManager::new(crypto_box, transport_box, event_log_box, key_resolver);
+        // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor`
+        // so `ContextManager`'s messaging/governance/broadcast/economy
+        // forwarders can resolve their `Weak<Supervisor>` back-pointer.
+        let manager = scp_core::context::attach_test_supervisor(ContextManager::new(
+            crypto_box,
+            transport_box,
+            event_log_box,
+            key_resolver,
+        ));
 
         Self {
             did,

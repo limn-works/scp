@@ -345,13 +345,17 @@ fn test_signing_key() -> ed25519_dalek::SigningKey {
 }
 
 /// Creates a ContextManager with default mock providers and standard capabilities.
-fn make_manager() -> ContextManager {
-    ContextManager::new(
+///
+/// ADR-049 commit 12c.9c — returns `Arc<ContextManager>` so the
+/// attached `Supervisor` can be installed before the manager's
+/// hoisted forwarders are invoked.
+fn make_manager() -> std::sync::Arc<ContextManager> {
+    scp_core::context::attach_test_supervisor(ContextManager::new(
         Box::new(MockCrypto::default()),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog::default()),
         test_key_resolver(),
-    )
+    ))
 }
 
 /// Standard encrypted context params with messages:read, messages:write,

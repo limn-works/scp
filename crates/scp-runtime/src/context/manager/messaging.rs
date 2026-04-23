@@ -17,6 +17,17 @@
 //! [`ContextManager`] have been reduced to one-line forwarders that pass
 //! `self` plus the clock and key resolver to the free function.
 //!
+//! # Supervisor back-pointer (commit 12c.9c of ADR-049)
+//!
+//! The hoisted messaging helpers now take `supervisor: &Supervisor`.
+//! Each forwarder resolves its supervisor through the
+//! `Weak<Supervisor>` back-pointer installed on [`ContextManager`] by
+//! [`Supervisor::attach_context_manager`](crate::context::supervisor::Supervisor::attach_context_manager)
+//! during bridge construction. `self.supervisor().expect(...)` is the
+//! canonical call shape — unwrap-or-panic is safe because the
+//! bridge-construction contract attaches before any FFI caller sees
+//! the `ContextManager`.
+//!
 //! # Transitive hoist (commit 12c.1b of ADR-049)
 //!
 //! Commit 12c.1b extends the hoist to every messaging transitive
@@ -103,8 +114,13 @@ impl ContextManager {
         source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::send_message — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::messaging_helpers::send_message(
-            self,
+            &sup,
             self.clock_ref(),
             self.key_resolver_ref(),
             handle,
@@ -143,8 +159,13 @@ impl ContextManager {
         source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
         routing_ids: &[[u8; 32]],
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::encrypt_and_send — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::messaging_helpers::encrypt_and_send(
-            self,
+            &sup,
             broadcast_envelope,
             signing_key,
             context_id,
@@ -170,7 +191,12 @@ impl ContextManager {
         context_id: &str,
         sender_did: &DID,
     ) -> Result<Option<super::economy::PaidActionAuthorization>, ContextError> {
-        crate::context::messaging_helpers::authorize_send_payment(self, context_id, sender_did)
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::authorize_send_payment — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::messaging_helpers::authorize_send_payment(&sup, context_id, sender_did)
             .await
     }
 
@@ -191,8 +217,20 @@ impl ContextManager {
         context_id: &str,
         deducted_cost: Option<scp_protocol::economy::types::Amount>,
     ) {
+        // ADR-049 commit 12c.9c — `()`-returning forwarder: a missing
+        // supervisor degrades to a no-op log (the helper logs the
+        // same contract violation internally when reached directly
+        // from the hoisted path).
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
+                context_id,
+                "ContextManager::capture_send_payment — Supervisor is not attached; \
+                 skipping payment capture (contract violation; see ADR-049 commit 12c.9c)"
+            );
+            return;
+        };
         crate::context::messaging_helpers::capture_send_payment(
-            self,
+            &sup,
             auth,
             sender_did,
             context_id,
@@ -216,8 +254,13 @@ impl ContextManager {
         signing_key: Option<&ed25519_dalek::SigningKey>,
         ctx_gen: &ContextGeneration,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::finalize_send — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::messaging_helpers::finalize_send(
-            self,
+            &sup,
             context_id,
             context_id_bytes,
             sender_did,
@@ -240,8 +283,13 @@ impl ContextManager {
         context_id_bytes: &[u8; 32],
         encrypted_blob: &[u8],
     ) -> Result<Option<scp_protocol::context::builder::OpenedEnvelope>, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::decrypt_and_dispatch — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::messaging_helpers::decrypt_and_dispatch(
-            self,
+            &sup,
             context_id,
             context_id_bytes,
             encrypted_blob,
@@ -278,8 +326,13 @@ impl ContextManager {
         context_id: &str,
         encrypted_blob: &[u8],
     ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::deliver_incoming — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::messaging_helpers::deliver_incoming(
-            self,
+            &sup,
             self.clock_ref(),
             self.key_resolver_ref(),
             context_id,
@@ -298,8 +351,14 @@ impl ContextManager {
         inner: &scp_protocol::envelope::inner::InnerEnvelope,
         now_ms: u64,
     ) -> Result<SequenceCheck, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::validate_and_drain_timeouts — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::messaging_helpers::validate_and_drain_timeouts(
-            self, context_id, inner, now_ms,
+            &sup, context_id, inner, now_ms,
         )
         .await
     }
@@ -316,8 +375,13 @@ impl ContextManager {
         plaintext: &[u8],
         now_ms: u64,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::buffer_ahead_message — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::messaging_helpers::buffer_ahead_message(
-            self, context_id, inner, sender_did, plaintext, now_ms,
+            &sup, context_id, inner, sender_did, plaintext, now_ms,
         )
         .await
     }
@@ -339,8 +403,14 @@ impl ContextManager {
         plaintext: &[u8],
         skip_velocity: bool,
     ) -> Result<bool, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::deliver_message_and_drain_buffered — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::messaging_helpers::deliver_message_and_drain_buffered(
-            self,
+            &sup,
             context_id,
             context_id_bytes,
             sender_did,
