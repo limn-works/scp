@@ -928,11 +928,9 @@ fn bridge_dispatch_create_context(
     let rt = crate::runtime()?;
     let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     let sup = Arc::clone(sup);
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
     let ctx_id = context_id.to_owned();
     let creator_did_for_register = scp_identity::DID(identity_did.to_owned());
+    let sup_for_register = Arc::clone(&sup);
     let outcome = rt.block_on(async move {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = LifecycleCommand::CreateContext {
@@ -955,8 +953,17 @@ fn bridge_dispatch_create_context(
             })?
             .map_err(|e| scp_core::context::ContextError::CreationFailed(e.to_string()))?;
         // Register the creator's DID as a local DID for defense-in-depth,
-        // matching NAPI's behavior.
-        mgr.register_local_did(creator_did_for_register).await;
+        // matching NAPI's behavior. Routes through the supervisor's direct
+        // method (no per-context command — the local-DID set is
+        // supervisor-wide).
+        sup_for_register
+            .register_local_did(creator_did_for_register)
+            .await
+            .map_err(|e| {
+                scp_core::context::ContextError::CreationFailed(format!(
+                    "register_local_did failed: {e}"
+                ))
+            })?;
         Ok::<(), scp_core::context::ContextError>(())
     });
     outcome.map_err(|e| {
@@ -1043,19 +1050,30 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
     if local_pseudonym.is_some()
         && let Ok(sk) = resolve_signing_key(identity_did)
     {
+        use scp_core::context::actor::commands::{
+            MessagingCommand, SendPseudonymAnnouncementPayload, SigningKeyBytes,
+        };
         let rt = crate::runtime()?;
-        let mgr = crate::runtime::context_manager()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let mgr = mgr.clone();
+        let sup =
+            crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let sup = Arc::clone(sup);
         let sender_did = scp_identity::DID(identity_did.to_owned());
         let core_params = build_core_context_params(&handle.params)?;
-        let temp_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
+        let ann_ctx_id = context_id.clone();
         rt.block_on(async move {
-            let _ = temp_handle
-                .transition_to(&scp_core::context::ContextState::Active)
-                .await;
-            mgr.send_pseudonym_announcement(&temp_handle, &sender_did, &sk)
-                .await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = MessagingCommand::SendPseudonymAnnouncement {
+                payload: Box::new(SendPseudonymAnnouncementPayload {
+                    context_id: ann_ctx_id.clone(),
+                    params: core_params,
+                    sender_did,
+                    signing_key: SigningKeyBytes::from_signing_key(&sk),
+                }),
+                reply: tx,
+            };
+            if sup.dispatch_command(&ann_ctx_id, cmd).await.is_ok() {
+                let _ = rx.await;
+            }
         });
     }
 
@@ -1107,6 +1125,131 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
     Ok(handle)
 }
 
+/// Dispatches `LifecycleCommand::JoinContext` and the §9.10.4 pseudonym
+/// announcement through the supervisor shim. Extracted from
+/// [`py_context_join`] to keep that function under the `too_many_lines`
+/// clippy threshold.
+fn bridge_dispatch_join_context(
+    handle: &PyContextHandle,
+    identity_did: &str,
+    spending_ucan: Option<scp_core::crypto::ucan::UcanToken>,
+) -> PyResult<()> {
+    use scp_core::context::actor::commands::{
+        JoinContextPayload, LifecycleCommand, MessagingCommand, SendPseudonymAnnouncementPayload,
+        SigningKeyBytes,
+    };
+    let context_id = handle.context_id.clone();
+    let member_did = identity_did.to_owned();
+    let rt = crate::runtime()?;
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
+
+    // Generate a real MLS key package for the joining member (#1324).
+    // The key package contains the joiner's SCP credential (DID) and is
+    // validated by MlsCryptoProvider::validate_key_package before MLS
+    // group addition.
+    let kp_bytes = generate_mls_key_package_bytes(identity_did)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    let key_package = scp_core::context::membership::KeyPackage {
+        owner_did: scp_identity::DID(member_did.clone()),
+        mls_key_package_bytes: Some(kp_bytes),
+    };
+
+    // §9.10.4: Derive pseudonym for the joining member so it can be
+    // stored in PerContextState and announced to other members.
+    let local_pseudonym: Option<[u8; 32]> = crate::runtime::with_identity(identity_did, |entry| {
+        let rt = crate::runtime()
+            .map_err(|e| crate::error::ScpPyError::identity(format!("runtime init failed: {e}")))?;
+        let pseudonym = rt.block_on(async {
+            entry
+                .custody
+                .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
+                .await
+        });
+        let pk = pseudonym
+            .map_err(|e| {
+                crate::error::ScpPyError::identity(format!("pseudonym derivation failed: {e}"))
+            })?
+            .public_key;
+        let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
+            crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
+        })?;
+        Ok(bytes)
+    })
+    .ok();
+
+    // §9.10.4: pass the pseudonym to join_context so it is stored in
+    // PerContextState for subsequent send_message fan-out.
+    let core_params = build_core_context_params(&handle.params)?;
+    let join_ctx_id = context_id.clone();
+    let join_params = core_params.clone();
+    let sup_for_join = Arc::clone(&sup);
+    rt.block_on(async move {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::JoinContext {
+            payload: Box::new(JoinContextPayload {
+                context_id: join_ctx_id,
+                params: join_params,
+                key_package,
+                spending_ucan,
+                local_pseudonym,
+            }),
+            reply: tx,
+        };
+        sup_for_join
+            .dispatch_lifecycle_command(cmd)
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "supervisor dispatch_lifecycle_command failed: {e}"
+                ))
+            })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("join shim reply dropped: {e}")))?
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}"))
+            })
+    })?;
+
+    // §9.10.4: Send pseudonym announcement to inform existing members.
+    if local_pseudonym.is_some()
+        && let Ok(sk) = resolve_signing_key(identity_did)
+    {
+        let sender_did = scp_identity::DID(member_did.clone());
+        let ann_ctx_id = context_id.clone();
+        let sup_for_ann = Arc::clone(&sup);
+        rt.block_on(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = MessagingCommand::SendPseudonymAnnouncement {
+                payload: Box::new(SendPseudonymAnnouncementPayload {
+                    context_id: ann_ctx_id.clone(),
+                    params: core_params,
+                    sender_did,
+                    signing_key: SigningKeyBytes::from_signing_key(&sk),
+                }),
+                reply: tx,
+            };
+            if sup_for_ann.dispatch_command(&ann_ctx_id, cmd).await.is_ok() {
+                let _ = rx.await;
+            }
+        });
+    }
+
+    // Also update FFI bridge state's role_state for UCAN/tool capability checks.
+    crate::runtime::with_ffi_state(&context_id, |st| {
+        st.role_state.members.insert(member_did);
+        Ok(())
+    })
+    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+    // Bridge: drain events (MemberJoined) from ContextManager's receive
+    // buffer and deliver to the FFI receive channel (#332).
+    drain_and_deliver(&context_id);
+
+    Ok(())
+}
+
 /// Joins an existing SCP context.
 ///
 /// # Arguments
@@ -1155,107 +1298,9 @@ fn py_context_join(
     #[cfg(not(test))]
     crate::runtime::init_context_manager(identity_did);
 
-    // Delegate join to the shared ContextManager for membership tracking.
-    {
-        let context_id = handle.context_id.clone();
-        let member_did = identity_did.to_owned();
-        let rt = crate::runtime()?;
-        let mgr = crate::runtime::context_manager()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let mgr = mgr.clone();
-
-        // Generate a real MLS key package for the joining member (#1324).
-        // The key package contains the joiner's SCP credential (DID) and is
-        // validated by MlsCryptoProvider::validate_key_package before MLS
-        // group addition.
-        let kp_bytes = generate_mls_key_package_bytes(identity_did)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        let key_package = scp_core::context::membership::KeyPackage {
-            owner_did: scp_identity::DID(member_did.clone()),
-            mls_key_package_bytes: Some(kp_bytes),
-        };
-
-        // §9.10.4: Derive pseudonym for the joining member so it can be
-        // stored in PerContextState and announced to other members.
-        let local_pseudonym: Option<[u8; 32]> =
-            crate::runtime::with_identity(identity_did, |entry| {
-                let rt = crate::runtime().map_err(|e| {
-                    crate::error::ScpPyError::identity(format!("runtime init failed: {e}"))
-                })?;
-                let pseudonym = rt.block_on(async {
-                    entry
-                        .custody
-                        .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
-                        .await
-                });
-                let pk = pseudonym
-                    .map_err(|e| {
-                        crate::error::ScpPyError::identity(format!(
-                            "pseudonym derivation failed: {e}"
-                        ))
-                    })?
-                    .public_key;
-                let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
-                    crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
-                })?;
-                Ok(bytes)
-            })
-            .ok();
-
-        // Look up the ContextHandle from a completed create_context call.
-        // The ContextManager stores PerContextState keyed by context_id.
-        // We need the handle to delegate. Since the handle is stored in
-        // ContextManager's internal state, we create a temporary handle
-        // matching the context's params for the join call.
-        let core_params = build_core_context_params(&handle.params)?;
-        let temp_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
-        // Transition the temp handle to Active to match the real state.
-        // §9.10.4: pass the pseudonym to join_context so it is stored in
-        // PerContextState for subsequent send_message fan-out.
-        rt.block_on(async {
-            let _ = temp_handle
-                .transition_to(&scp_core::context::ContextState::Active)
-                .await;
-            mgr.join_context(
-                &temp_handle,
-                key_package,
-                spending_ucan.as_ref(),
-                local_pseudonym,
-            )
-            .await
-        })
-        .map_err(|e| PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}")))?;
-
-        // §9.10.4: Send pseudonym announcement to inform existing members.
-        if local_pseudonym.is_some()
-            && let Ok(sk) = resolve_signing_key(identity_did)
-        {
-            let sender_did = scp_identity::DID(member_did.clone());
-            let temp_handle2 = scp_core::context::ContextHandle::new(
-                context_id.clone(),
-                build_core_context_params(&handle.params)?,
-            );
-            rt.block_on(async move {
-                let _ = temp_handle2
-                    .transition_to(&scp_core::context::ContextState::Active)
-                    .await;
-                mgr.send_pseudonym_announcement(&temp_handle2, &sender_did, &sk)
-                    .await;
-            });
-        }
-
-        // Also update FFI bridge state's role_state for UCAN/tool capability checks.
-        crate::runtime::with_ffi_state(&context_id, |st| {
-            st.role_state.members.insert(member_did.clone());
-            Ok(())
-        })
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        // Bridge: drain events (MemberJoined) from ContextManager's receive
-        // buffer and deliver to the FFI receive channel (#332).
-        drain_and_deliver(&context_id);
-    }
+    // Delegate join to the shared ContextManager via the ADR-049 commit-9
+    // lifecycle shim and pseudonym-announcement messaging shim.
+    bridge_dispatch_join_context(handle, identity_did, spending_ucan)?;
 
     Ok(())
 }
@@ -1287,27 +1332,41 @@ fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
     }
     drop(state);
 
-    // Delegate leave to the shared ContextManager for membership tracking.
+    // Delegate leave to the shared ContextManager via the ADR-049 commit-9
+    // lifecycle shim.
     {
+        use scp_core::context::actor::commands::{LeaveContextPayload, LifecycleCommand};
         let context_id = handle.context_id.clone();
         let member_did = scp_identity::DID(identity_did.to_owned());
         let rt = crate::runtime()?;
-        let mgr = crate::runtime::context_manager()
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let mgr = mgr.clone();
+        let sup =
+            crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let sup = Arc::clone(sup);
 
         let core_params = build_core_context_params(&handle.params)?;
-        let temp_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
-        rt.block_on(async {
-            let _ = temp_handle
-                .transition_to(&scp_core::context::ContextState::Active)
-                .await;
+        let leave_ctx_id = context_id.clone();
+        rt.block_on(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
             // Self-removal: caller_did == member_did.
-            mgr.leave_context(&temp_handle, &member_did, &member_did)
-                .await
-        })
-        .map_err(|e| {
-            PyRuntimeError::new_err(format!("ContextManager leave_context failed: {e}"))
+            let cmd = LifecycleCommand::LeaveContext {
+                payload: Box::new(LeaveContextPayload {
+                    context_id: leave_ctx_id,
+                    params: core_params,
+                    caller_did: member_did.clone(),
+                    member_did,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "supervisor dispatch_lifecycle_command failed: {e}"
+                ))
+            })?;
+            rx.await
+                .map_err(|e| PyRuntimeError::new_err(format!("leave shim reply dropped: {e}")))?
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("ContextManager leave_context failed: {e}"))
+                })
         })?;
 
         // Also update FFI bridge state's role_state.
@@ -1696,15 +1755,34 @@ fn convert_context_event(
 }
 
 fn drain_and_deliver(context_id: &str) {
+    use scp_core::context::actor::commands::MessagingCommand;
     let Ok(rt) = crate::runtime() else {
         return;
     };
-    let mgr = match crate::runtime::context_manager() {
-        Ok(mgr) => mgr.clone(),
-        Err(_) => return,
+    // Route through the ADR-049 commit-8 messaging shim. Best-effort —
+    // if the supervisor is not initialised or the dispatch fails, this
+    // function silently no-ops (matches the legacy behaviour of returning
+    // an empty events vec on unknown context).
+    let Ok(sup) = crate::runtime::supervisor() else {
+        return;
     };
+    let sup = Arc::clone(sup);
+    let context_id_owned = context_id.to_owned();
 
-    let events = rt.block_on(mgr.drain_events(context_id));
+    let events = rt.block_on(async move {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::DrainEvents {
+            context_id: context_id_owned.clone(),
+            reply: tx,
+        };
+        if sup.dispatch_command(&context_id_owned, cmd).await.is_err() {
+            return Vec::new();
+        }
+        match rx.await {
+            Ok(Ok(events)) => events,
+            _ => Vec::new(),
+        }
+    });
 
     for event in events {
         let (sender_did, payload, timestamp) = convert_context_event(event);
@@ -1868,27 +1946,44 @@ fn py_get_economic_policy(handle: &PyContextHandle) -> PyResult<Option<String>> 
 #[pyfunction]
 #[pyo3(signature = (context_id,))]
 fn py_context_export(context_id: &str) -> PyResult<Vec<u8>> {
+    use scp_core::context::actor::commands::{LifecycleCommand, QueriesCommand};
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-9 lifecycle / query shims.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let ctx_id = context_id.to_owned();
 
-    // Use the first registered local DID as the exporter.
-    let exporter_did = rt
-        .block_on(async {
-            // Get a local DID from the context's membership.
-            let contexts = mgr.member_dids(&ctx_id).await;
-            contexts.into_iter().next()
-        })
-        .map_or_else(
-            || scp_identity::DID::from("did:key:unknown-exporter"),
-            scp_identity::DID::from,
-        );
+    let export = rt.block_on(async move {
+        // Use the first registered local DID as the exporter.
+        let (md_tx, md_rx) = tokio::sync::oneshot::channel();
+        let md_cmd = QueriesCommand::MemberDids {
+            context_id: ctx_id.clone(),
+            reply: md_tx,
+        };
+        let exporter_did = match sup.dispatch_query(md_cmd).await {
+            Ok(_) => match md_rx.await {
+                Ok(Ok(dids)) => dids.into_iter().next().map_or_else(
+                    || scp_identity::DID::from("did:key:unknown-exporter"),
+                    scp_identity::DID::from,
+                ),
+                _ => scp_identity::DID::from("did:key:unknown-exporter"),
+            },
+            Err(_) => scp_identity::DID::from("did:key:unknown-exporter"),
+        };
 
-    let export = rt
-        .block_on(mgr.export_context(&ctx_id, exporter_did))
-        .map_err(|e| PyRuntimeError::new_err(format!("context export failed: {e}")))?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::ExportContext {
+            context_id: ctx_id,
+            exporter_did,
+            reply: tx,
+        };
+        sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_lifecycle_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("export shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(format!("context export failed: {e}")))
+    })?;
 
     scp_core::context::export_import::serialize_export(&export)
         .map_err(|e| PyRuntimeError::new_err(format!("export serialization failed: {e}")))
@@ -1914,6 +2009,7 @@ fn py_context_export(context_id: &str) -> PyResult<Vec<u8>> {
 #[pyfunction]
 #[pyo3(signature = (data,))]
 fn py_context_import(data: &[u8]) -> PyResult<String> {
+    use scp_core::context::actor::commands::LifecycleCommand;
     let export = scp_core::context::export_import::deserialize_export(data).map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!("invalid export data: {e}"))
     })?;
@@ -1933,73 +2029,26 @@ fn py_context_import(data: &[u8]) -> PyResult<String> {
     crate::runtime::init_context_manager(&export.exporter_did.0);
 
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-9 lifecycle shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
 
-    rt.block_on(mgr.import_context(export))
-        .map_err(|e| PyRuntimeError::new_err(format!("context import failed: {e}")))?;
+    rt.block_on(async move {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::ImportContext {
+            export: Box::new(export),
+            reply: tx,
+        };
+        sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_lifecycle_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("import shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(format!("context import failed: {e}")))?;
+        Ok::<(), PyErr>(())
+    })?;
 
     Ok(context_id)
-}
-
-// ---------------------------------------------------------------------------
-// No-op UCAN validation trait stubs for subscribe_broadcast (#369)
-//
-// Minimal implementations satisfying the generic bounds on
-// ContextManager::subscribe_broadcast. Broadcast subscription in open mode
-// does not require UCAN validation; gated mode validation will be wired
-// when the full UCAN pipeline is integrated with the FFI layer.
-// ---------------------------------------------------------------------------
-
-struct NoOpDidResolver;
-impl scp_core::crypto::ucan::validate::DidResolver for NoOpDidResolver {
-    fn resolve_public_key(
-        &self,
-        _did: &str,
-    ) -> Result<[u8; 32], scp_core::crypto::ucan::UcanError> {
-        Err(scp_core::crypto::ucan::UcanError::MalformedToken(
-            "NoOpDidResolver: no DID resolution available".into(),
-        ))
-    }
-}
-
-struct NoOpNonceTracker;
-impl scp_core::crypto::ucan::validate::NonceTracker for NoOpNonceTracker {
-    fn check_replay(
-        &self,
-        _nonce: &str,
-        _token_expiry: u64,
-    ) -> Result<(), scp_core::crypto::ucan::UcanError> {
-        Ok(())
-    }
-
-    fn record(
-        &mut self,
-        _nonce: &str,
-        _token_expiry: u64,
-    ) -> Result<(), scp_core::crypto::ucan::UcanError> {
-        Ok(())
-    }
-}
-
-struct NoOpRevocationChecker;
-impl scp_core::crypto::ucan::validate::RevocationChecker for NoOpRevocationChecker {
-    fn is_revoked(&self, _token_cid: &str) -> bool {
-        false
-    }
-}
-
-struct NoOpProofResolver;
-impl scp_core::crypto::ucan::validate::ProofResolver for NoOpProofResolver {
-    fn resolve_proof(
-        &self,
-        cid: &str,
-    ) -> Result<scp_core::crypto::ucan::UcanToken, scp_core::crypto::ucan::UcanError> {
-        Err(scp_core::crypto::ucan::UcanError::DelegationChainBroken(
-            format!("NoOpProofResolver: no proof available for CID {cid}"),
-        ))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2067,9 +2116,6 @@ const fn governance_action_result_name(
 fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyResult<String> {
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
     let context_id = handle.context_id.clone();
     let handle_state = handle.state.clone();
     let proposal_json_owned = proposal_json.to_owned();
@@ -2085,7 +2131,7 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
 
     rt.block_on(async move {
         use scp_core::context::actor::commands::{
-            ExecuteGovernanceActionPayload, GovernanceCommand,
+            ExecuteGovernanceActionPayload, GovernanceCommand, QueriesCommand,
         };
 
         let proposal: scp_core::context::governance::GovernanceProposal =
@@ -2122,8 +2168,17 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
         // NOTE: Cannot call `sync_role_state_from_manager()` here because that
         // function uses `rt.block_on()` and we are already inside `rt.block_on()`.
         // Nested `block_on` panics with "Cannot start a runtime from within a
-        // runtime." Instead, inline the async logic with `.await`.
-        match mgr.get_role_state(&context_id).await {
+        // runtime." Instead, dispatch the role-state query inline.
+        let (rs_tx, rs_rx) = tokio::sync::oneshot::channel();
+        let rs_cmd = QueriesCommand::GetRoleState {
+            context_id: context_id.clone(),
+            reply: rs_tx,
+        };
+        let role_state_lookup = match sup.dispatch_query(rs_cmd).await {
+            Ok(_) => rs_rx.await.ok().and_then(Result::ok).flatten(),
+            Err(_) => None,
+        };
+        match role_state_lookup {
             Some(new_role_state) => {
                 if let Err(e) = crate::runtime::with_ffi_state(&context_id, |st| {
                     st.role_state = new_role_state;
@@ -2197,17 +2252,28 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_tombstone_migrated_context(handle: &PyContextHandle) -> PyResult<()> {
+    use scp_core::context::actor::commands::GovernanceCommand;
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-10 governance shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
     let handle_state = handle.state.clone();
 
     rt.block_on(async move {
-        mgr.tombstone_migrated_context(&context_id)
-            .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::TombstoneMigratedContext {
+            context_id,
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "supervisor dispatch_governance_command failed: {e}"
+            ))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("tombstone shim reply dropped: {e}")))?
             .map_err(|e| {
                 PyRuntimeError::new_err(format!("tombstone_migrated_context failed: {e}"))
             })?;
@@ -2238,15 +2304,31 @@ fn py_tombstone_migrated_context(handle: &PyContextHandle) -> PyResult<()> {
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_migration_state(handle: &PyContextHandle) -> PyResult<Option<String>> {
+    use scp_core::context::actor::commands::GovernanceCommand;
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-10 governance shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
 
     rt.block_on(async move {
-        let state = mgr.migration_state(&context_id).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::MigrationState {
+            context_id,
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "supervisor dispatch_governance_command failed: {e}"
+            ))
+        })?;
+        let state = rx
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("migration_state shim reply dropped: {e}"))
+            })?
+            .map_err(|e| PyRuntimeError::new_err(format!("migration_state failed: {e}")))?;
         match state {
             Some(ms) => {
                 let json = serde_json::json!({
@@ -2517,29 +2599,45 @@ fn py_governance_reject(
     identity_did: &str,
     proposal_id_hex: &str,
 ) -> PyResult<String> {
+    use scp_core::context::actor::commands::{
+        GovernanceCommand, SigningKeyBytes, VoteOnProposalPayload,
+    };
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-10 governance shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
     let signing_key = resolve_signing_key(identity_did)?;
     let voter_did = scp_identity::DID(identity_did.to_owned());
     let proposal_id = parse_proposal_id(proposal_id_hex)?;
 
     rt.block_on(async move {
-        // Box::pin — ADR-049 commit 12c.3b hoist pushed the governance
-        // path's future size past clippy's 16 KB stack budget.
-        let status = Box::pin(mgr.reject_governance_proposal(
-            &context_id,
-            &proposal_id,
-            &voter_did,
-            &signing_key,
-        ))
-        .await
-        .map_err(|e| {
-            PyRuntimeError::new_err(format!("SCP-CTX-2043: governance rejection failed: {e}"))
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::RejectGovernanceProposal {
+            payload: Box::new(VoteOnProposalPayload {
+                context_id: context_id.clone(),
+                proposal_id,
+                voter_did,
+                signing_key: SigningKeyBytes::from_signing_key(&signing_key),
+            }),
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "SCP-CTX-2043: supervisor dispatch_governance_command failed: {e}"
+            ))
         })?;
+        let status = rx
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2043: governance reject shim reply dropped: {e}"
+                ))
+            })?
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("SCP-CTX-2043: governance rejection failed: {e}"))
+            })?;
 
         if let Err(e) = crate::runtime::sync_role_state_from_manager(&context_id) {
             tracing::warn!(
@@ -2579,19 +2677,36 @@ fn py_governance_withdraw(
     identity_did: &str,
     proposal_id_hex: &str,
 ) -> PyResult<String> {
+    use scp_core::context::actor::commands::GovernanceCommand;
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-10 governance shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
     let voter_did = scp_identity::DID(identity_did.to_owned());
     let proposal_id = parse_proposal_id(proposal_id_hex)?;
 
     rt.block_on(async move {
-        let status = mgr
-            .withdraw_governance_vote(&context_id, &proposal_id, &voter_did)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::WithdrawGovernanceVote {
+            context_id: context_id.clone(),
+            proposal_id,
+            voter_did,
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "SCP-CTX-2044: supervisor dispatch_governance_command failed: {e}"
+            ))
+        })?;
+        let status = rx
             .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2044: governance withdraw shim reply dropped: {e}"
+                ))
+            })?
             .map_err(|e| {
                 PyRuntimeError::new_err(format!(
                     "SCP-CTX-2044: governance vote withdrawal failed: {e}"
@@ -2635,18 +2750,36 @@ fn py_governance_get_proposal(
     handle: &PyContextHandle,
     proposal_id_hex: String,
 ) -> PyResult<String> {
+    use scp_core::context::actor::commands::GovernanceCommand;
     crate::pyscp_check_handle!(handle);
     let context_id = handle.context_id.clone();
     let proposal_id = parse_proposal_id(&proposal_id_hex)?;
 
-    let mgr = crate::runtime::context_manager()
+    // Route through the ADR-049 commit-10 governance shim.
+    let sup = crate::runtime::supervisor()
         .map_err(|e| PyRuntimeError::new_err(format!("SCP-CTX-2040: {e}")))?;
+    let sup = Arc::clone(sup);
     let rt = crate::runtime().map_err(|e| PyRuntimeError::new_err(format!("SCP-CTX-2040: {e}")))?;
 
     rt.block_on(async move {
-        let proposal = mgr
-            .get_proposal(&context_id, &proposal_id)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::GetProposal {
+            context_id,
+            proposal_id,
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "SCP-CTX-2045: supervisor dispatch_governance_command failed: {e}"
+            ))
+        })?;
+        let proposal = rx
             .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2045: get proposal shim reply dropped: {e}"
+                ))
+            })?
             .map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2045: get proposal failed: {e}"))
             })?;
@@ -2665,17 +2798,37 @@ fn py_governance_get_proposal(
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_governance_list_proposals(handle: &PyContextHandle) -> PyResult<String> {
+    use scp_core::context::actor::commands::GovernanceCommand;
     crate::pyscp_check_handle!(handle);
     let context_id = handle.context_id.clone();
 
-    let mgr = crate::runtime::context_manager()
+    // Route through the ADR-049 commit-10 governance shim.
+    let sup = crate::runtime::supervisor()
         .map_err(|e| PyRuntimeError::new_err(format!("SCP-CTX-2040: {e}")))?;
+    let sup = Arc::clone(sup);
     let rt = crate::runtime().map_err(|e| PyRuntimeError::new_err(format!("SCP-CTX-2040: {e}")))?;
 
     rt.block_on(async move {
-        let proposals = mgr.list_proposals(&context_id).await.map_err(|e| {
-            PyRuntimeError::new_err(format!("SCP-CTX-2046: list proposals failed: {e}"))
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::ListProposals {
+            context_id,
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "SCP-CTX-2046: supervisor dispatch_governance_command failed: {e}"
+            ))
         })?;
+        let proposals = rx
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2046: list proposals shim reply dropped: {e}"
+                ))
+            })?
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("SCP-CTX-2046: list proposals failed: {e}"))
+            })?;
 
         serde_json::to_string(&proposals).map_err(|e| {
             PyRuntimeError::new_err(format!("SCP-CTX-2046: serialization failed: {e}"))
@@ -2711,16 +2864,32 @@ fn py_apply_pending_ceiling_modification(
     handle: &PyContextHandle,
     current_timestamp: u64,
 ) -> PyResult<bool> {
+    use scp_core::context::actor::commands::GovernanceCommand;
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-10 governance shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
 
     rt.block_on(async move {
-        mgr.apply_pending_ceiling_modification(&context_id, current_timestamp)
-            .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::ApplyPendingCeilingModification {
+            context_id,
+            current_timestamp,
+            reply: tx,
+        };
+        sup.dispatch_governance_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "SCP-CTX-2060: supervisor dispatch_governance_command failed: {e}"
+            ))
+        })?;
+        rx.await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2060: apply ceiling shim reply dropped: {e}"
+                ))
+            })?
             .map_err(|e| {
                 PyRuntimeError::new_err(format!(
                     "SCP-CTX-2060: apply_pending_ceiling_modification failed: {e}"
@@ -2746,27 +2915,38 @@ fn py_apply_pending_ceiling_modification(
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_finalize_close(handle: &PyContextHandle) -> PyResult<()> {
+    use scp_core::context::actor::commands::{TtlCloseCommand, TtlContextPayload};
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-9 TTL-close shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let core_params = build_core_context_params(&handle.params)?;
     let context_id = handle.context_id.clone();
 
     rt.block_on(async move {
-        let core_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
-        // The core ContextHandle starts in Creating. Transition to Active
-        // then to Closing to match the expected state for finalize_close.
-        let _ = core_handle
-            .transition_to(&scp_core::context::ContextState::Active)
-            .await;
-        let _ = core_handle
-            .transition_to(&scp_core::context::ContextState::Closing)
-            .await;
-        mgr.finalize_close(&core_handle).await.map_err(|e| {
-            PyRuntimeError::new_err(format!("SCP-CTX-2061: finalize_close failed: {e}"))
-        })
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = TtlCloseCommand::FinalizeClose {
+            payload: Box::new(TtlContextPayload {
+                context_id,
+                params: core_params,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "SCP-CTX-2061: supervisor dispatch_ttl_close_command failed: {e}"
+            ))
+        })?;
+        rx.await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2061: finalize_close shim reply dropped: {e}"
+                ))
+            })?
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("SCP-CTX-2061: finalize_close failed: {e}"))
+            })
     })?;
 
     // Update FFI handle state to reflect close.
@@ -2814,11 +2994,14 @@ fn py_create_governance_checkpoint(
     creator_did: &str,
     creator_signature_hex: &str,
 ) -> PyResult<String> {
+    use scp_core::context::actor::commands::{
+        CreateGovernanceCheckpointPayload, TrustRecoveryCommand,
+    };
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-10 trust-recovery shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
 
     let merkle_root = parse_hex_32(merkle_root_hex, "merkle_root")?;
@@ -2830,18 +3013,34 @@ fn py_create_governance_checkpoint(
     let did = scp_identity::DID(creator_did.to_owned());
 
     rt.block_on(async move {
-        let checkpoint = mgr
-            .create_governance_checkpoint(
-                &context_id,
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = TrustRecoveryCommand::CreateGovernanceCheckpoint {
+            payload: Box::new(CreateGovernanceCheckpointPayload {
+                context_id,
                 checkpoint_seq,
                 merkle_root,
                 event_count,
                 last_event_hash,
                 state_snapshot_hash,
-                &did,
+                creator_did: did,
                 creator_signature,
-            )
+            }),
+            reply: tx,
+        };
+        sup.dispatch_trust_recovery_command(cmd)
             .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2062: supervisor dispatch_trust_recovery_command failed: {e}"
+                ))
+            })?;
+        let checkpoint = rx
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2062: create_governance_checkpoint shim reply dropped: {e}"
+                ))
+            })?
             .map_err(|e| {
                 PyRuntimeError::new_err(format!(
                     "SCP-CTX-2062: create_governance_checkpoint failed: {e}"
@@ -2880,14 +3079,15 @@ fn py_add_checkpoint_cosignature(
     signer_did: &str,
     signature_hex: &str,
 ) -> PyResult<String> {
+    use scp_core::context::actor::commands::TrustRecoveryCommand;
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-10 trust-recovery shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
 
-    let mut checkpoint: scp_core::context::governance::ContextCheckpoint =
+    let checkpoint: scp_core::context::governance::ContextCheckpoint =
         serde_json::from_str(checkpoint_json).map_err(|e| {
             PyValueError::new_err(format!("SCP-CTX-2063: invalid checkpoint JSON: {e}"))
         })?;
@@ -2901,9 +3101,27 @@ fn py_add_checkpoint_cosignature(
     };
 
     rt.block_on(async move {
-        let status = mgr
-            .add_checkpoint_cosignature(&context_id, &mut checkpoint, cosignature)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = TrustRecoveryCommand::AddCheckpointCosignature {
+            context_id,
+            checkpoint: Box::new(checkpoint),
+            cosignature: Box::new(cosignature),
+            reply: tx,
+        };
+        sup.dispatch_trust_recovery_command(cmd)
             .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2063: supervisor dispatch_trust_recovery_command failed: {e}"
+                ))
+            })?;
+        let (updated_checkpoint, status) = rx
+            .await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "SCP-CTX-2063: add_checkpoint_cosignature shim reply dropped: {e}"
+                ))
+            })?
             .map_err(|e| {
                 PyRuntimeError::new_err(format!(
                     "SCP-CTX-2063: add_checkpoint_cosignature failed: {e}"
@@ -2912,7 +3130,7 @@ fn py_add_checkpoint_cosignature(
 
         let response = serde_json::json!({
             "attestation_status": format!("{status:?}"),
-            "checkpoint": serde_json::to_value(&checkpoint).unwrap_or_default(),
+            "checkpoint": serde_json::to_value(&updated_checkpoint).unwrap_or_default(),
         });
         Ok(response.to_string())
     })
@@ -2933,34 +3151,39 @@ fn py_add_checkpoint_cosignature(
 #[pyfunction]
 #[pyo3(signature = (context_id,))]
 fn py_restore_context(context_id: &str) -> PyResult<()> {
+    use scp_core::context::actor::commands::{LifecycleCommand, RestoreContextPayload};
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-9 lifecycle shim. The handler
+    // reconstructs an ephemeral ContextHandle and delegates to the
+    // manager's restore_context, which loads its own snapshot from
+    // persistence — the ContextParams we supply here is only used to
+    // initialise the ephemeral handle wrapper (default is acceptable
+    // because restore_context overwrites all memory-scope-sensitive
+    // state from the loaded snapshot anyway).
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id_owned = context_id.to_owned();
 
     rt.block_on(async move {
-        // Load the persisted snapshot to obtain the correct ContextParams
-        // (including memory_scope). Using ContextParams::default() would
-        // give Ephemeral scope, causing incorrect key destruction on
-        // subsequent finalize_close.
-        let (snapshot, _broadcast) = mgr
-            .load_persisted_context_state(&context_id_owned)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::RestoreContext {
+            payload: Box::new(RestoreContextPayload {
+                context_id: context_id_owned,
+                params: scp_core::context::ContextParams::default(),
+            }),
+            reply: tx,
+        };
+        sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "SCP-CTX-2064: supervisor dispatch_lifecycle_command failed: {e}"
+            ))
+        })?;
+        rx.await
             .map_err(|e| {
                 PyRuntimeError::new_err(format!(
-                    "SCP-CTX-2064: failed to load persisted state: {e}"
+                    "SCP-CTX-2064: restore_context shim reply dropped: {e}"
                 ))
-            })?;
-
-        let core_handle = scp_core::context::ContextHandle::new(
-            context_id_owned.clone(),
-            snapshot.context_params.clone(),
-        );
-        let _ = core_handle
-            .transition_to(&scp_core::context::ContextState::Active)
-            .await;
-        mgr.restore_context(&context_id_owned, &core_handle)
-            .await
+            })?
             .map_err(|e| {
                 PyRuntimeError::new_err(format!("SCP-CTX-2064: restore_context failed: {e}"))
             })
@@ -2985,12 +3208,15 @@ fn py_restore_context(context_id: &str) -> PyResult<()> {
 #[pyo3(signature = ())]
 fn py_restore_all_contexts() -> PyResult<String> {
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the supervisor-scope direct method; restore_all_contexts
+    // operates on the supervisor-wide context registry and has no per-context
+    // command target. The supervisor forwards to ContextManager today;
+    // commit 12 will move the body onto the supervisor itself.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
 
     rt.block_on(async move {
-        let restored = mgr.restore_all_contexts().await.map_err(|e| {
+        let restored = sup.restore_all_contexts().await.map_err(|e| {
             PyRuntimeError::new_err(format!("SCP-CTX-2065: restore_all_contexts failed: {e}"))
         })?;
 
@@ -3030,12 +3256,13 @@ fn parse_hex_32(hex_str: &str, field_name: &str) -> PyResult<[u8; 32]> {
 #[pyfunction]
 #[pyo3(signature = (handle, subscriber_did))]
 fn py_broadcast_subscribe(handle: &PyContextHandle, subscriber_did: &str) -> PyResult<()> {
+    use scp_core::context::actor::commands::{BroadcastCommand, SubscribeBroadcastPayload};
     crate::pyscp_check_handle!(handle);
     validate::validate_did(subscriber_did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-11 broadcast shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
     let did: scp_identity::DID = subscriber_did.to_owned().into();
     let timestamp = std::time::SystemTime::now()
@@ -3044,15 +3271,22 @@ fn py_broadcast_subscribe(handle: &PyContextHandle, subscriber_did: &str) -> PyR
         .as_secs();
 
     rt.block_on(async move {
-        mgr.subscribe_broadcast::<
-            NoOpDidResolver,
-            NoOpNonceTracker,
-            NoOpRevocationChecker,
-            NoOpProofResolver,
-            std::hash::RandomState,
-        >(&context_id, &did, None, timestamp, None)
-        .await
-        .map_err(|e| PyRuntimeError::new_err(format!("broadcast subscribe failed: {e}")))?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::SubscribeBroadcast {
+            payload: Box::new(SubscribeBroadcastPayload {
+                context_id,
+                subscriber_did: did,
+                ucan: None,
+                timestamp,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_broadcast_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(format!("broadcast subscribe failed: {e}")))?;
         Ok(())
     })
 }
@@ -3069,18 +3303,31 @@ fn py_broadcast_unsubscribe(
     subscriber_did: &str,
     rotate_keys: bool,
 ) -> PyResult<()> {
+    use scp_core::context::actor::commands::{BroadcastCommand, UnsubscribeBroadcastPayload};
     crate::pyscp_check_handle!(handle);
     validate::validate_did(subscriber_did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-11 broadcast shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
     let did: scp_identity::DID = subscriber_did.to_owned().into();
 
     rt.block_on(async move {
-        mgr.unsubscribe_broadcast(&context_id, &did, rotate_keys)
-            .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::UnsubscribeBroadcast {
+            payload: Box::new(UnsubscribeBroadcastPayload {
+                context_id,
+                subscriber_did: did,
+                rotate_keys,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_broadcast_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
             .map_err(|e| PyRuntimeError::new_err(format!("broadcast unsubscribe failed: {e}")))?;
         Ok(())
     })
@@ -3103,12 +3350,15 @@ fn py_broadcast_publish(
     author_did: &str,
     payload: Vec<u8>,
 ) -> PyResult<()> {
+    use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastPayload};
     crate::pyscp_check_handle!(handle);
     validate::validate_did(author_did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-11 broadcast shim. Publish requires
+    // the custody-bearing variant because the KeyCustody trait is not
+    // dyn-safe and cannot cross the actor mailbox.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
     let author_did_owned = author_did.to_owned();
 
@@ -3118,17 +3368,28 @@ fn py_broadcast_publish(
         let did: scp_identity::DID = author_did_owned.clone().into();
 
         rt.block_on(async move {
-            mgr.publish_broadcast(
-                &context_id,
-                &did,
-                &payload,
-                custody.as_ref(),
-                &signing_key_handle,
-            )
-            .await
-            .map_err(|e| {
-                crate::error::ScpPyError::context(format!("broadcast publish failed: {e}"))
-            })?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::PublishBroadcast {
+                payload: Box::new(PublishBroadcastPayload {
+                    context_id,
+                    author_did: did,
+                    payload,
+                    signing_key_handle,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
+                .await
+                .map_err(|e| {
+                    crate::error::ScpPyError::context(format!(
+                        "supervisor dispatch_broadcast_command_with_custody failed: {e}"
+                    ))
+                })?;
+            rx.await
+                .map_err(|e| crate::error::ScpPyError::context(format!("shim reply dropped: {e}")))?
+                .map_err(|e| {
+                    crate::error::ScpPyError::context(format!("broadcast publish failed: {e}"))
+                })?;
             Ok(())
         })
     })
@@ -3158,12 +3419,13 @@ fn py_broadcast_publish_asset(
     body: Vec<u8>,
     deploy_id: Option<&str>,
 ) -> PyResult<HashMap<String, String>> {
+    use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastContentPayload};
     crate::pyscp_check_handle!(handle);
     validate::validate_did(author_did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-11 broadcast shim with custody.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
     let author_did_owned = author_did.to_owned();
     let path_owned = path.to_owned();
@@ -3215,15 +3477,26 @@ fn py_broadcast_publish_asset(
         };
 
         rt.block_on(async move {
-            let envelope = mgr
-                .publish_broadcast_content(
-                    &context_id,
-                    &did,
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = BroadcastCommand::PublishBroadcastContent {
+                payload: Box::new(PublishBroadcastContentPayload {
+                    context_id,
+                    author_did: did,
                     content,
-                    custody.as_ref(),
-                    &signing_key_handle,
-                )
+                    signing_key_handle,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_broadcast_command_with_custody(cmd, custody.as_ref())
                 .await
+                .map_err(|e| {
+                    crate::error::ScpPyError::context(format!(
+                        "supervisor dispatch_broadcast_command_with_custody failed: {e}"
+                    ))
+                })?;
+            let envelope = rx
+                .await
+                .map_err(|e| crate::error::ScpPyError::context(format!("shim reply dropped: {e}")))?
                 .map_err(|e| {
                     crate::error::ScpPyError::context(format!(
                         "broadcast publish asset failed: {e}"
@@ -3278,6 +3551,87 @@ fn build_batch_publish_dict(
     })
 }
 
+/// Static publish context for [`dispatch_publish_one_asset`] — fields that
+/// stay constant across every asset in a batch. Bundling them keeps the
+/// publish helper under the `too_many_arguments` clippy threshold.
+struct PublishAssetContext<'a, C: scp_platform::KeyCustody> {
+    sup: &'a Arc<scp_core::context::supervisor::Supervisor>,
+    custody: &'a C,
+    context_id: &'a str,
+    did: &'a scp_identity::DID,
+    signing_key_handle: scp_platform::KeyHandle,
+    deploy_id: &'a str,
+}
+
+/// Publishes a single broadcast-content asset through the supervisor's
+/// custody-bearing shim. Used by [`py_broadcast_publish_assets`] inside
+/// the per-asset loop and extracted to keep that function below the
+/// `too_many_lines` clippy threshold.
+async fn dispatch_publish_one_asset<C: scp_platform::KeyCustody>(
+    ctx: &PublishAssetContext<'_, C>,
+    path: String,
+    content_type: String,
+    body: Vec<u8>,
+) -> Result<HashMap<String, String>, crate::error::ScpPyError> {
+    use scp_core::context::actor::commands::{BroadcastCommand, PublishBroadcastContentPayload};
+    let content_path = scp_core::context::ContentPath::new(path)
+        .map_err(|e| crate::error::ScpPyError::context(format!("invalid path: {e}")))?;
+    let mime_type = scp_core::context::MimeType::new(content_type)
+        .map_err(|e| crate::error::ScpPyError::context(format!("invalid content_type: {e}")))?;
+
+    let etag = scp_core::context::compute_etag(&body);
+    let content = scp_core::context::BroadcastContent {
+        version: scp_core::context::BROADCAST_CONTENT_VERSION,
+        metadata: scp_core::context::ContentMetadata {
+            path: Some(content_path),
+            content_type: Some(mime_type),
+            deploy_id: Some(ctx.deploy_id.to_owned()),
+            etag: Some(etag.clone()),
+            immutable: false,
+        },
+        body,
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = BroadcastCommand::PublishBroadcastContent {
+        payload: Box::new(PublishBroadcastContentPayload {
+            context_id: ctx.context_id.to_owned(),
+            author_did: ctx.did.clone(),
+            content,
+            signing_key_handle: ctx.signing_key_handle,
+        }),
+        reply: tx,
+    };
+    ctx.sup
+        .dispatch_broadcast_command_with_custody(cmd, ctx.custody)
+        .await
+        .map_err(|e| {
+            crate::error::ScpPyError::context(format!(
+                "supervisor dispatch_broadcast_command_with_custody failed: {e}"
+            ))
+        })?;
+    let envelope = rx
+        .await
+        .map_err(|e| crate::error::ScpPyError::context(format!("shim reply dropped: {e}")))?
+        .map_err(|e| {
+            crate::error::ScpPyError::context(format!("broadcast publish asset failed: {e}"))
+        })?;
+
+    let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
+        crate::error::ScpPyError::context(format!("failed to serialize envelope for blob_id: {e}"))
+    })?;
+    let blob_id = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(&envelope_bytes))
+    };
+
+    let mut result = HashMap::new();
+    result.insert("blob_id".to_owned(), blob_id);
+    result.insert("etag".to_owned(), etag);
+    result.insert("deploy_id".to_owned(), ctx.deploy_id.to_owned());
+    Ok(result)
+}
+
 /// Publishes multiple assets to a broadcast context as structured content (SCP-290).
 ///
 /// Each asset is an `(path, content_type, body)` tuple. All assets are published
@@ -3308,9 +3662,9 @@ fn py_broadcast_publish_assets(
 
     validate::validate_did(author_did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-11 broadcast shim with custody.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
     let author_did_owned = author_did.to_owned();
 
@@ -3341,56 +3695,18 @@ fn py_broadcast_publish_assets(
         let did: scp_identity::DID = author_did_owned.clone().into();
 
         rt.block_on(async move {
+            let publish_ctx = PublishAssetContext {
+                sup: &sup,
+                custody: custody.as_ref(),
+                context_id: &context_id,
+                did: &did,
+                signing_key_handle,
+                deploy_id: &deploy_id_owned,
+            };
             let mut results = Vec::with_capacity(assets.len());
             for (path, content_type, body) in assets {
-                let content_path = scp_core::context::ContentPath::new(path)
-                    .map_err(|e| crate::error::ScpPyError::context(format!("invalid path: {e}")))?;
-                let mime_type = scp_core::context::MimeType::new(content_type).map_err(|e| {
-                    crate::error::ScpPyError::context(format!("invalid content_type: {e}"))
-                })?;
-
-                let etag = scp_core::context::compute_etag(&body);
-                let content = scp_core::context::BroadcastContent {
-                    version: scp_core::context::BROADCAST_CONTENT_VERSION,
-                    metadata: scp_core::context::ContentMetadata {
-                        path: Some(content_path),
-                        content_type: Some(mime_type),
-                        deploy_id: Some(deploy_id_owned.clone()),
-                        etag: Some(etag.clone()),
-                        immutable: false,
-                    },
-                    body,
-                };
-
-                let envelope = mgr
-                    .publish_broadcast_content(
-                        &context_id,
-                        &did,
-                        content,
-                        custody.as_ref(),
-                        &signing_key_handle,
-                    )
-                    .await
-                    .map_err(|e| {
-                        crate::error::ScpPyError::context(format!(
-                            "broadcast publish asset failed: {e}"
-                        ))
-                    })?;
-
-                let envelope_bytes = rmp_serde::to_vec_named(&envelope).map_err(|e| {
-                    crate::error::ScpPyError::context(format!(
-                        "failed to serialize envelope for blob_id: {e}"
-                    ))
-                })?;
-                let blob_id = {
-                    use sha2::{Digest, Sha256};
-                    hex::encode(Sha256::digest(&envelope_bytes))
-                };
-
-                let mut result = HashMap::new();
-                result.insert("blob_id".to_owned(), blob_id);
-                result.insert("etag".to_owned(), etag);
-                result.insert("deploy_id".to_owned(), deploy_id_owned.clone());
+                let result =
+                    dispatch_publish_one_asset(&publish_ctx, path, content_type, body).await?;
                 results.push(result);
             }
 
@@ -3414,20 +3730,33 @@ fn py_broadcast_block_subscriber(
     subscriber_did: &str,
     blocker_did: &str,
 ) -> PyResult<()> {
+    use scp_core::context::actor::commands::{BroadcastBlockPayload, BroadcastCommand};
     crate::pyscp_check_handle!(handle);
     validate::validate_did(subscriber_did)?;
     validate::validate_did(blocker_did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-11 broadcast shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
     let subscriber: scp_identity::DID = subscriber_did.to_owned().into();
     let blocker: scp_identity::DID = blocker_did.to_owned().into();
 
     rt.block_on(async move {
-        mgr.block_broadcast_subscriber(&context_id, &blocker, &subscriber)
-            .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::BlockBroadcastSubscriber {
+            payload: Box::new(BroadcastBlockPayload {
+                context_id,
+                author_did: blocker,
+                subscriber_did: subscriber,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_broadcast_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
             .map_err(|e| PyRuntimeError::new_err(format!("broadcast block failed: {e}")))?;
         Ok(())
     })
@@ -3448,20 +3777,33 @@ fn py_broadcast_unblock_subscriber(
     subscriber_did: &str,
     unblocker_did: &str,
 ) -> PyResult<()> {
+    use scp_core::context::actor::commands::{BroadcastBlockPayload, BroadcastCommand};
     crate::pyscp_check_handle!(handle);
     validate::validate_did(subscriber_did)?;
     validate::validate_did(unblocker_did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-11 broadcast shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
     let subscriber: scp_identity::DID = subscriber_did.to_owned().into();
     let unblocker: scp_identity::DID = unblocker_did.to_owned().into();
 
     rt.block_on(async move {
-        mgr.unblock_broadcast_subscriber(&context_id, &unblocker, &subscriber)
-            .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::UnblockBroadcastSubscriber {
+            payload: Box::new(BroadcastBlockPayload {
+                context_id,
+                author_did: unblocker,
+                subscriber_did: subscriber,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_broadcast_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
             .map_err(|e| PyRuntimeError::new_err(format!("broadcast unblock failed: {e}")))?;
         Ok(())
     })
@@ -3483,21 +3825,32 @@ fn py_broadcast_handle_key_request(
     author_did: &str,
     requester_did: &str,
 ) -> PyResult<String> {
+    use scp_core::context::actor::commands::BroadcastCommand;
     crate::pyscp_check_handle!(handle);
     validate::validate_did(author_did)?;
     validate::validate_did(requester_did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-11 broadcast shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
     let author: scp_identity::DID = author_did.to_owned().into();
     let requester: scp_identity::DID = requester_did.to_owned().into();
 
     rt.block_on(async move {
-        let decision = mgr
-            .handle_broadcast_key_request(&context_id, &author, &requester)
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::HandleBroadcastKeyRequest {
+            context_id,
+            author_did: author,
+            requester_did: requester,
+            reply: tx,
+        };
+        sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_broadcast_command failed: {e}"))
+        })?;
+        let decision = rx
             .await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
             .map_err(|e| {
                 PyRuntimeError::new_err(format!("broadcast key request handling failed: {e}"))
             })?;
@@ -3508,47 +3861,93 @@ fn py_broadcast_handle_key_request(
 /// Returns the number of broadcast subscribers for a context.
 ///
 /// Returns `None` if the context is not registered or not a broadcast context.
+///
+/// Routed through the ADR-049 commit-11 broadcast shim
+/// ([`Supervisor::dispatch_broadcast_command`](scp_core::context::supervisor::Supervisor::dispatch_broadcast_command)).
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_broadcast_subscriber_count(handle: &PyContextHandle) -> PyResult<Option<u64>> {
+    use scp_core::context::actor::commands::BroadcastCommand;
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
-    Ok(rt
-        .block_on(mgr.broadcast_subscriber_count(&context_id))
-        .map(|n| n as u64))
+    rt.block_on(async move {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::BroadcastSubscriberCount {
+            context_id,
+            reply: tx,
+        };
+        sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_broadcast_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map(|opt| opt.map(|n| n as u64))
+    })
 }
 
 /// Returns `True` if the given DID is a broadcast subscriber.
+///
+/// Routed through the ADR-049 commit-11 broadcast shim.
 #[pyfunction]
 #[pyo3(signature = (handle, did))]
 fn py_broadcast_is_subscriber(handle: &PyContextHandle, did: &str) -> PyResult<bool> {
+    use scp_core::context::actor::commands::BroadcastCommand;
     crate::pyscp_check_handle!(handle);
     validate::validate_did(did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
-    Ok(rt.block_on(mgr.is_broadcast_subscriber(&context_id, did)))
+    let did_owned = did.to_owned();
+    rt.block_on(async move {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::IsBroadcastSubscriber {
+            context_id,
+            did: did_owned,
+            reply: tx,
+        };
+        sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_broadcast_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    })
 }
 
 /// Returns the broadcast admission policy for a context.
 ///
 /// Returns the policy as a string: `"Open"` or `"Gated"`.
 /// Returns `None` if the context is not a broadcast context.
+///
+/// Routed through the ADR-049 commit-11 broadcast shim.
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_broadcast_admission(handle: &PyContextHandle) -> PyResult<Option<String>> {
+    use scp_core::context::actor::commands::BroadcastCommand;
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
-    Ok(rt
-        .block_on(mgr.broadcast_admission(&context_id))
-        .map(|a| format!("{a:?}")))
+    rt.block_on(async move {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = BroadcastCommand::BroadcastAdmission {
+            context_id,
+            reply: tx,
+        };
+        sup.dispatch_broadcast_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_broadcast_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            .map(|opt| opt.map(|a| format!("{a:?}")))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3686,20 +4085,36 @@ fn py_context_member_role(handle: &PyContextHandle, did: &str) -> PyResult<Optio
 ///
 /// Returns a list of event descriptions as debug strings. Returns empty
 /// if the context is not registered.
+///
+/// Routed through the ADR-049 commit-8 messaging shim
+/// ([`Supervisor::dispatch_command`](scp_core::context::supervisor::Supervisor::dispatch_command)).
+/// `drain_events` lives on the messaging enum because the receive buffer
+/// is the messaging path's downstream sink (fed by `deliver_incoming`,
+/// consumed by FFI receive polling).
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_context_drain_events(handle: &PyContextHandle) -> PyResult<Vec<String>> {
+    use scp_core::context::actor::commands::MessagingCommand;
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
-    Ok(rt
-        .block_on(mgr.drain_events(&context_id))
-        .into_iter()
-        .map(|e| format!("{e:?}"))
-        .collect())
+    rt.block_on(async move {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::DrainEvents {
+            context_id: context_id.clone(),
+            reply: tx,
+        };
+        sup.dispatch_command(&context_id, cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_command failed: {e}"))
+        })?;
+        let events = rx
+            .await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(format!("drain_events failed: {e}")))?;
+        Ok(events.into_iter().map(|e| format!("{e:?}")).collect())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3716,21 +4131,29 @@ fn py_context_drain_events(handle: &PyContextHandle) -> PyResult<Vec<String>> {
 #[pyfunction]
 #[pyo3(signature = (handle,))]
 fn py_context_handle_ttl_expiry(handle: &PyContextHandle) -> PyResult<()> {
+    use scp_core::context::actor::commands::{TtlCloseCommand, TtlContextPayload};
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-9 TTL-close shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
     let core_params = build_core_context_params(&handle.params)?;
 
     rt.block_on(async move {
-        let core_handle = scp_core::context::ContextHandle::new(context_id, core_params);
-        let _ = core_handle
-            .transition_to(&scp_core::context::ContextState::Active)
-            .await;
-        mgr.handle_ttl_expiry(&core_handle)
-            .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = TtlCloseCommand::ExecuteTtlClose {
+            payload: Box::new(TtlContextPayload {
+                context_id,
+                params: core_params,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_ttl_close_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
             .map_err(|e| PyRuntimeError::new_err(format!("TTL expiry handling failed: {e}")))?;
         Ok::<(), PyErr>(())
     })?;
@@ -3760,19 +4183,30 @@ fn py_context_propose_ttl_extension(
     member_did: &str,
     proposed_seconds: u64,
 ) -> PyResult<bool> {
+    use scp_core::context::actor::commands::TtlCloseCommand;
     crate::pyscp_check_handle!(handle);
     validate::validate_did(member_did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-9 TTL-close shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
     let did: scp_identity::DID = member_did.to_owned().into();
     let duration = std::time::Duration::from_secs(proposed_seconds);
 
     rt.block_on(async move {
-        mgr.propose_ttl_extension(&context_id, &did, duration)
-            .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = TtlCloseCommand::ExtendTtl {
+            context_id,
+            member_did: did,
+            proposed_duration: duration,
+            reply: tx,
+        };
+        sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_ttl_close_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
             .map_err(|e| PyRuntimeError::new_err(format!("TTL extension proposal failed: {e}")))
     })
 }
@@ -3783,23 +4217,34 @@ fn py_context_propose_ttl_extension(
 #[pyfunction]
 #[pyo3(signature = (handle, new_seconds))]
 fn py_context_reset_ttl_timer(handle: &PyContextHandle, new_seconds: u64) -> PyResult<()> {
+    use scp_core::context::actor::commands::{TtlCloseCommand, TtlTimerPayload};
     crate::pyscp_check_handle!(handle);
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mgr = mgr.clone();
+    // Route through the ADR-049 commit-9 TTL-close shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
     let context_id = handle.context_id.clone();
     let core_params = build_core_context_params(&handle.params)?;
+    let duration = std::time::Duration::from_secs(new_seconds);
 
     rt.block_on(async move {
-        let core_handle = scp_core::context::ContextHandle::new(context_id.clone(), core_params);
-        let _ = core_handle
-            .transition_to(&scp_core::context::ContextState::Active)
-            .await;
-        let duration = std::time::Duration::from_secs(new_seconds);
-        mgr.reset_ttl_timer(&context_id, duration, core_handle)
-            .await;
-    });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = TtlCloseCommand::ResetTtlTimer {
+            payload: Box::new(TtlTimerPayload {
+                context_id,
+                params: core_params,
+                duration,
+            }),
+            reply: tx,
+        };
+        sup.dispatch_ttl_close_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!("supervisor dispatch_ttl_close_command failed: {e}"))
+        })?;
+        rx.await
+            .map_err(|e| PyRuntimeError::new_err(format!("shim reply dropped: {e}")))?
+            .map_err(|e| PyRuntimeError::new_err(format!("TTL reset failed: {e}")))?;
+        Ok::<(), PyErr>(())
+    })?;
     Ok(())
 }
 
@@ -4299,16 +4744,39 @@ fn parse_template_id(
 #[pyfunction]
 #[pyo3(name = "access_key_generate", signature = (context_id, member_did, caller_did))]
 fn py_access_key_generate(context_id: &str, member_did: &str, caller_did: &str) -> PyResult<()> {
+    use scp_core::context::actor::commands::LifecycleCommand;
     validate::validate_context_id(context_id)?;
     validate::validate_did(member_did)?;
     validate::validate_did(caller_did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    rt.block_on(mgr.generate_context_access_key(context_id, member_did, caller_did))
-        .map_err(|e| {
-            PyRuntimeError::new_err(format!("[SCP-CTX-2070] access key generation failed: {e}"))
-        })
+    // Route through the ADR-049 commit-9 lifecycle shim
+    // ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command)).
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
+    let context_id_owned = context_id.to_owned();
+    let member_did_owned = member_did.to_owned();
+    let caller_did_owned = caller_did.to_owned();
+    rt.block_on(async move {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::GenerateContextAccessKey {
+            context_id: context_id_owned,
+            member_did: member_did_owned,
+            caller_did: caller_did_owned,
+            reply: tx,
+        };
+        sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "[SCP-CTX-2070] supervisor dispatch_lifecycle_command failed: {e}"
+            ))
+        })?;
+        rx.await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("[SCP-CTX-2070] shim reply dropped: {e}"))
+            })?
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("[SCP-CTX-2070] access key generation failed: {e}"))
+            })
+    })
 }
 
 /// Revokes (removes) a member's access key from the context's access key
@@ -4323,16 +4791,38 @@ fn py_access_key_generate(context_id: &str, member_did: &str, caller_did: &str) 
 #[pyfunction]
 #[pyo3(name = "access_key_revoke", signature = (context_id, member_did, caller_did))]
 fn py_access_key_revoke(context_id: &str, member_did: &str, caller_did: &str) -> PyResult<()> {
+    use scp_core::context::actor::commands::LifecycleCommand;
     validate::validate_context_id(context_id)?;
     validate::validate_did(member_did)?;
     validate::validate_did(caller_did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    rt.block_on(mgr.revoke_context_access_key(context_id, member_did, caller_did))
-        .map_err(|e| {
-            PyRuntimeError::new_err(format!("[SCP-CTX-2071] access key revocation failed: {e}"))
-        })
+    // Route through the ADR-049 commit-9 lifecycle shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
+    let context_id_owned = context_id.to_owned();
+    let member_did_owned = member_did.to_owned();
+    let caller_did_owned = caller_did.to_owned();
+    rt.block_on(async move {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::RevokeContextAccessKey {
+            context_id: context_id_owned,
+            member_did: member_did_owned,
+            caller_did: caller_did_owned,
+            reply: tx,
+        };
+        sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "[SCP-CTX-2071] supervisor dispatch_lifecycle_command failed: {e}"
+            ))
+        })?;
+        rx.await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("[SCP-CTX-2071] shim reply dropped: {e}"))
+            })?
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("[SCP-CTX-2071] access key revocation failed: {e}"))
+            })
+    })
 }
 
 /// Restores a member's access key by generating a new key at the next
@@ -4347,16 +4837,40 @@ fn py_access_key_revoke(context_id: &str, member_did: &str, caller_did: &str) ->
 #[pyfunction]
 #[pyo3(name = "access_key_restore", signature = (context_id, member_did, caller_did))]
 fn py_access_key_restore(context_id: &str, member_did: &str, caller_did: &str) -> PyResult<()> {
+    use scp_core::context::actor::commands::LifecycleCommand;
     validate::validate_context_id(context_id)?;
     validate::validate_did(member_did)?;
     validate::validate_did(caller_did)?;
     let rt = crate::runtime()?;
-    let mgr =
-        crate::runtime::context_manager().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    rt.block_on(mgr.restore_context_access_key(context_id, member_did, caller_did))
-        .map_err(|e| {
-            PyRuntimeError::new_err(format!("[SCP-CTX-2072] access key restoration failed: {e}"))
-        })
+    // Route through the ADR-049 commit-9 lifecycle shim.
+    let sup = crate::runtime::supervisor().map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let sup = Arc::clone(sup);
+    let context_id_owned = context_id.to_owned();
+    let member_did_owned = member_did.to_owned();
+    let caller_did_owned = caller_did.to_owned();
+    rt.block_on(async move {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = LifecycleCommand::RestoreContextAccessKey {
+            context_id: context_id_owned,
+            member_did: member_did_owned,
+            caller_did: caller_did_owned,
+            reply: tx,
+        };
+        sup.dispatch_lifecycle_command(cmd).await.map_err(|e| {
+            PyRuntimeError::new_err(format!(
+                "[SCP-CTX-2072] supervisor dispatch_lifecycle_command failed: {e}"
+            ))
+        })?;
+        rx.await
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("[SCP-CTX-2072] shim reply dropped: {e}"))
+            })?
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!(
+                    "[SCP-CTX-2072] access key restoration failed: {e}"
+                ))
+            })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -5149,25 +5663,74 @@ mod tests {
 
     use scp_ffi_common::test_helpers::approved_proposal;
 
+    /// Test helper: dispatch `LifecycleCommand::CreateContext` through the
+    /// supervisor. Mirrors `bridge_dispatch_create_context` but is callable
+    /// from tests with a pre-built `ContextParams`.
+    fn test_dispatch_create_context(
+        ctx_id: &str,
+        params: scp_core::context::ContextParams,
+        creator: &str,
+    ) {
+        use scp_core::context::actor::commands::{CreateContextPayload, LifecycleCommand};
+        let sup = crate::runtime::supervisor().unwrap();
+        let sup = Arc::clone(sup);
+        let rt = crate::runtime().unwrap();
+        let ctx_id_owned = ctx_id.to_owned();
+        let creator_did = scp_identity::DID(creator.to_owned());
+        rt.block_on(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = LifecycleCommand::CreateContext {
+                payload: Box::new(CreateContextPayload {
+                    context_id: ctx_id_owned,
+                    params,
+                    creator_did,
+                    local_pseudonym: None,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_lifecycle_command(cmd).await.unwrap();
+            rx.await.unwrap().unwrap();
+        });
+    }
+
+    /// Test helper: dispatch `GovernanceCommand::ExecuteGovernanceAction`
+    /// through the supervisor.
+    fn test_dispatch_execute_governance(
+        ctx_id: &str,
+        proposal: scp_core::context::governance::GovernanceProposal,
+    ) {
+        use scp_core::context::actor::commands::{
+            ExecuteGovernanceActionPayload, GovernanceCommand,
+        };
+        let sup = crate::runtime::supervisor().unwrap();
+        let sup = Arc::clone(sup);
+        let rt = crate::runtime().unwrap();
+        let ctx_id_owned = ctx_id.to_owned();
+        rt.block_on(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = GovernanceCommand::ExecuteGovernanceAction {
+                payload: Box::new(ExecuteGovernanceActionPayload {
+                    context_id: ctx_id_owned,
+                    proposal,
+                }),
+                reply: tx,
+            };
+            sup.dispatch_governance_command(cmd).await.unwrap();
+            rx.await.unwrap().unwrap();
+        });
+    }
+
     #[test]
     fn role_state_syncs_after_change_role() {
         crate::init_runtime().ok();
         let ctx_id = format!("sync-role-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkCreatorSync1";
         crate::runtime::register_context(&ctx_id, creator, &[]).unwrap();
-        let mgr = crate::runtime::context_manager().unwrap();
-        let rt = crate::runtime().unwrap();
         let params = scp_core::context::ContextParams {
             ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
             ..scp_core::context::ContextParams::default()
         };
-        rt.block_on(mgr.create_context(
-            ctx_id.clone(),
-            params,
-            scp_identity::DID(creator.to_owned()),
-            None,
-        ))
-        .unwrap();
+        test_dispatch_create_context(&ctx_id, params, creator);
         let new_did = "did:key:z6MkNewMember1";
         let add = approved_proposal(
             [1u8; 32],
@@ -5178,8 +5741,7 @@ mod tests {
             },
             creator,
         );
-        rt.block_on(mgr.execute_governance_action(&ctx_id, &add))
-            .unwrap();
+        test_dispatch_execute_governance(&ctx_id, add);
         crate::runtime::sync_role_state_from_manager(&ctx_id).unwrap();
         let change = approved_proposal(
             [2u8; 32],
@@ -5190,8 +5752,7 @@ mod tests {
             },
             creator,
         );
-        rt.block_on(mgr.execute_governance_action(&ctx_id, &change))
-            .unwrap();
+        test_dispatch_execute_governance(&ctx_id, change);
         crate::runtime::sync_role_state_from_manager(&ctx_id).unwrap();
         crate::runtime::with_context(&ctx_id, |st| {
             let assignment = st
@@ -5215,19 +5776,11 @@ mod tests {
         let ctx_id = format!("sync-add-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkCreatorSync2";
         crate::runtime::register_context(&ctx_id, creator, &[]).unwrap();
-        let mgr = crate::runtime::context_manager().unwrap();
-        let rt = crate::runtime().unwrap();
         let params = scp_core::context::ContextParams {
             ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
             ..scp_core::context::ContextParams::default()
         };
-        rt.block_on(mgr.create_context(
-            ctx_id.clone(),
-            params,
-            scp_identity::DID(creator.to_owned()),
-            None,
-        ))
-        .unwrap();
+        test_dispatch_create_context(&ctx_id, params, creator);
         let new_did = "did:key:z6MkAdded1";
         crate::runtime::with_context(&ctx_id, |st| {
             assert!(!st.role_state.members.contains(new_did));
@@ -5243,8 +5796,7 @@ mod tests {
             },
             creator,
         );
-        rt.block_on(mgr.execute_governance_action(&ctx_id, &add))
-            .unwrap();
+        test_dispatch_execute_governance(&ctx_id, add);
         crate::runtime::sync_role_state_from_manager(&ctx_id).unwrap();
         crate::runtime::with_context(&ctx_id, |st| {
             assert!(st.role_state.members.contains(new_did));
@@ -5268,19 +5820,11 @@ mod tests {
         let creator = "did:key:z6MkCreatorSync3";
         let target = "did:key:z6MkRemoveTarget";
         crate::runtime::register_context(&ctx_id, creator, &[]).unwrap();
-        let mgr = crate::runtime::context_manager().unwrap();
-        let rt = crate::runtime().unwrap();
         let params = scp_core::context::ContextParams {
             ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
             ..scp_core::context::ContextParams::default()
         };
-        rt.block_on(mgr.create_context(
-            ctx_id.clone(),
-            params,
-            scp_identity::DID(creator.to_owned()),
-            None,
-        ))
-        .unwrap();
+        test_dispatch_create_context(&ctx_id, params, creator);
         let add = approved_proposal(
             [4u8; 32],
             &ctx_id,
@@ -5290,8 +5834,7 @@ mod tests {
             },
             creator,
         );
-        rt.block_on(mgr.execute_governance_action(&ctx_id, &add))
-            .unwrap();
+        test_dispatch_execute_governance(&ctx_id, add);
         crate::runtime::sync_role_state_from_manager(&ctx_id).unwrap();
         crate::runtime::with_context(&ctx_id, |st| {
             assert!(st.role_state.members.contains(target));
@@ -5307,8 +5850,7 @@ mod tests {
             },
             creator,
         );
-        rt.block_on(mgr.execute_governance_action(&ctx_id, &rm))
-            .unwrap();
+        test_dispatch_execute_governance(&ctx_id, rm);
         crate::runtime::sync_role_state_from_manager(&ctx_id).unwrap();
         crate::runtime::with_context(&ctx_id, |st| {
             assert!(!st.role_state.members.contains(target));

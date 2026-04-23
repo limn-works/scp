@@ -1550,13 +1550,32 @@ pub fn remove_ffi_state(context_id: &str) {
 /// context is not registered in either the manager or the FFI state registry,
 /// or the tokio runtime is unavailable.
 pub fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpPyError> {
-    let mgr = context_manager()?;
+    use scp_core::context::actor::commands::QueriesCommand;
+    let sup = supervisor()?;
     let rt = super::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
-    let new_role_state = rt.block_on(mgr.get_role_state(context_id)).ok_or_else(|| {
-        ScpPyError::context(format!(
-            "context '{context_id}' not found in ContextManager"
-        ))
-    })?;
+    let context_id_owned = context_id.to_owned();
+    // Route through the ADR-049 query shim. The handler returns
+    // `Ok(None)` when the context is unknown, matching the legacy
+    // `ContextManager::get_role_state` `Option` contract.
+    let new_role_state = rt
+        .block_on(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = QueriesCommand::GetRoleState {
+                context_id: context_id_owned,
+                reply: tx,
+            };
+            sup.dispatch_query(cmd).await.map_err(|e| {
+                ScpPyError::context(format!("supervisor dispatch_query failed: {e}"))
+            })?;
+            rx.await
+                .map_err(|e| ScpPyError::context(format!("query shim reply dropped: {e}")))?
+                .map_err(|e| ScpPyError::context(e.to_string()))
+        })?
+        .ok_or_else(|| {
+            ScpPyError::context(format!(
+                "context '{context_id}' not found in ContextManager"
+            ))
+        })?;
 
     with_ffi_state(context_id, |st| {
         st.role_state = new_role_state;
