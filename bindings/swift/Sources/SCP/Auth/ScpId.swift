@@ -176,7 +176,7 @@ public enum ScpId {
     /// `scpidChallenge` UniFFI export was removed in Phase 4 PR 5 (ADR-048).
     public static let defaultChallenge: ChallengeFn = { _, _ in
         throw ScpError.Validation(
-            message: "scpidChallenge default is not wired after façade deletion — pass an SCP-bound closure (see SCP.scpidChallenge)",
+            msg: "scpidChallenge default is not wired after façade deletion — pass an SCP-bound closure (see SCP.scpidChallenge)",
             code: "SCP-VALID-7300"
         )
     }
@@ -186,16 +186,22 @@ public enum ScpId {
     /// `scpidSign` UniFFI export was removed in Phase 4 PR 5 (ADR-048).
     public static let defaultSign: SignFn = { _, _, _ in
         throw ScpError.Validation(
-            message: "scpidSign default is not wired after façade deletion — pass an SCP-bound closure (see SCP.scpidSign)",
+            msg: "scpidSign default is not wired after façade deletion — pass an SCP-bound closure (see SCP.scpidSign)",
             code: "SCP-VALID-7300"
         )
     }
 
-    /// Default verify function — delegates to UniFFI
-    /// ``scpidVerify(responseJson:challengeJson:)``. `scpidVerify` is
-    /// stateless and kept as a free function.
-    public static let defaultVerify: VerifyFn = { responseJson, challengeJson in
-        try scpidVerify(responseJson: responseJson, challengeJson: challengeJson)
+    /// Default verify function — placeholder; callers must supply an
+    /// `SCP`-bound closure because the free `scpidVerify` UniFFI export
+    /// was removed in Phase 4 PR 5 (ADR-048) and replaced with
+    /// `Scp::scpid_verify` (per-instance) so the DID resolver used for
+    /// signature verification is routed through the caller's own `SCP`
+    /// rather than a process-global default.
+    public static let defaultVerify: VerifyFn = { _, _ in
+        throw ScpError.Validation(
+            msg: "scpidVerify default is not wired after façade deletion — pass an SCP-bound closure (see SCP.scpidVerify)",
+            code: "SCP-VALID-7300"
+        )
     }
 
 

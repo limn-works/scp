@@ -859,8 +859,15 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.identityAttestDevice] on [inner]. */
     suspend fun identityAttestDevice(identity: Identity): String = inner.identityAttestDevice(identity = identity)
 
-    /** Forwards to [NativeScp.identityCreate] on [inner]. */
-    suspend fun identityCreate(custody: String): Identity = inner.identityCreate(custody = custody)
+    /**
+     * Forwards to [NativeScp.identityCreate] on [inner].
+     *
+     * [seed] is a testing-only parameter for the ADR-046 cross-bridge
+     * parity harness; pass `null` from production callers (in-memory
+     * custody uses OS RNG when [seed] is `null`).
+     */
+    suspend fun identityCreate(custody: String, seed: ByteArray? = null): Identity =
+        inner.identityCreate(custody = custody, seed = seed)
 
     /** Forwards to [NativeScp.identityCreateLinkAttestation] on [inner]. */
     @Suppress("LongParameterList")

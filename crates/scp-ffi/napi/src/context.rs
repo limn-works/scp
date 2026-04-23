@@ -88,7 +88,7 @@ fn generate_mls_key_package_bytes(did: &str) -> Result<Vec<u8>, ScpNapiError> {
 ///
 /// ```js
 /// const ctx = await contextCreate(identity.did, paramsJson);
-/// console.log(ctx.contextId);      // "ctx-..."
+/// console.log(ctx.contextId);      // 64-char lowercase hex per spec §18.4.1
 /// console.log(ctx.state);          // "active"
 /// console.log(ctx.creatorDid);     // "did:dht:z..."
 /// ```

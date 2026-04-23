@@ -2021,7 +2021,7 @@ describeStorageNapi("SCP storage integration (real NAPI)", () => {
     }
   });
 
-  it("SQLite persistence — mismatched-key reopen falls back without corrupting the DB", async () => {
+  it("SQLite persistence — mismatched-key reopen throws without corrupting the DB", async () => {
     const goodKey = new Uint8Array(32).fill(0x22);
     const badKey = new Uint8Array(32).fill(0x33);
     const dir = await mkdtemp(join(tmpdir(), "scp-integration-sqlite-"));
@@ -2034,15 +2034,18 @@ describeStorageNapi("SCP storage integration (real NAPI)", () => {
         await first.shutdown(1);
       }
 
-      // Second open with a wrong key. The NAPI layer falls back to
-      // in-memory (matching PyO3's `with_storage_py` behaviour) —
-      // construction succeeds; what matters is the original DB isn't
-      // corrupted. We assert no throw and then confirm the file is
-      // still readable with the correct key.
-      const wrong = new SCP({ storage: { type: "sqlite", path: dir, key: badKey } });
-      await wrong.shutdown(1);
+      // Second open with a wrong key MUST throw — `SqliteStorage::new`
+      // fails at the `PRAGMA key` / WAL-mode step because `SQLCipher`
+      // rejects the key as "file is not a database". The NAPI bridge
+      // propagates that through `ValidationError` (SCP-VALID-7005).
+      // The former silent fallback to in-memory was a split-brain that
+      // let writes vanish on drop; main's 9fa80e13c replaced it with
+      // hard-error propagation.
+      expect(() => new SCP({ storage: { type: "sqlite", path: dir, key: badKey } })).toThrow();
 
-      // Third open with the correct key — must still succeed.
+      // Third open with the correct key — must still succeed, proving
+      // the failed mismatched-key attempt did not corrupt or truncate
+      // the encrypted database file.
       const recovered = new SCP({ storage: { type: "sqlite", path: dir, key: goodKey } });
       try {
         expect(recovered.instanceId).toBeDefined();

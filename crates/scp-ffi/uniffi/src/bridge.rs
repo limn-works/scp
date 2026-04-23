@@ -7259,7 +7259,15 @@ impl Scp {
             .spawn(async move {
                 validate_did(&identity.did)?;
 
-                let context_id = format!("ctx-{}", Uuid::new_v4());
+                // Spec §18.4.1: context IDs MUST be 64-char lowercase hex so
+                // they embed in `scp://context/<context_id_hex>` URIs. Mirrors
+                // PyO3's `generate_context_id` in `crates/scp-ffi/src/types.rs`.
+                let context_id = {
+                    use rand::Rng;
+                    let mut bytes = [0u8; 32];
+                    rand::thread_rng().fill(&mut bytes);
+                    hex::encode(bytes)
+                };
 
                 // Convert bridge ContextParams to scp-core ContextParams.
                 let core_params = bridge_params_to_core(&params)?;

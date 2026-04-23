@@ -32,8 +32,10 @@ import java.io.File
 import java.nio.file.Files
 import kotlin.io.path.exists
 import kotlin.io.path.pathString
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
+import uniffi.scp.ScpException
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -149,6 +151,13 @@ class PersistenceTest {
 
             val scp1 = makeSqliteScp(dir.toFile())
             val id1 = scp1.instanceId
+            // Post-9fa80e13c: SqliteStorage::new propagates open failures
+            // instead of falling back to in-memory, so the first instance
+            // must release the DB before a second open can succeed. This
+            // matches the Swift `testSqliteReopenWithSamePathAndKeySucceeds`
+            // shape.
+            scp1.shutdown(bridge(), 1.seconds)
+            createdInstances.remove(scp1)
 
             val scp2 = makeSqliteScp(dir.toFile())
             val id2 = scp2.instanceId
@@ -167,17 +176,25 @@ class PersistenceTest {
             dir.toFile().deleteOnExit()
 
             // First open with the correct key — creates the encrypted DB.
-            makeSqliteScp(dir.toFile())
+            val scp1 = makeSqliteScp(dir.toFile())
+            scp1.shutdown(bridge(), 1.seconds)
+            createdInstances.remove(scp1)
 
-            // Second open with a wrong key. The UniFFI bridge currently
-            // logs the error and falls back to an in-memory-only
-            // instance — construction therefore succeeds, and the test
-            // guards against corruption of the original DB file.
+            // Second open with a wrong key MUST throw — `SqliteStorage::new`
+            // fails at the `PRAGMA key` / WAL-mode step because `SQLCipher`
+            // rejects the key as "file is not a database". The UniFFI
+            // bridge propagates that through `ScpException.Validation`.
+            // Main's 9fa80e13c replaced the former silent fallback to
+            // in-memory (split-brain where writes silently vanished) with
+            // hard-error propagation.
             val wrongKey = ByteArray(32) { 0x11 }
-            val scp2 = SCP.withSqlite(dir.toFile(), wrongKey)
-            createdInstances += scp2
+            assertFailsWith<ScpException.Validation> {
+                SCP.withSqlite(dir.toFile(), wrongKey)
+            }
 
-            // Third open with the correct key — must still succeed.
+            // Third open with the correct key — must still succeed, proving
+            // the failed mismatched-key attempt did not corrupt or truncate
+            // the encrypted database file.
             makeSqliteScp(dir.toFile())
         }
 }

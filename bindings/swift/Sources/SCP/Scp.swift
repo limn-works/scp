@@ -491,8 +491,13 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/identityCreate`` on ``inner``.
-    func identityCreate(custody: String) async throws -> Identity {
-        try await inner.identityCreate(custody: custody)
+    ///
+    /// `seed` is a testing-only parameter for the ADR-046 cross-bridge
+    /// parity harness; pass `nil` from production callers (the
+    /// `allow_in_memory_custody` in-memory path uses OS RNG when `seed`
+    /// is `nil`).
+    func identityCreate(custody: String, seed: Data? = nil) async throws -> Identity {
+        try await inner.identityCreate(custody: custody, seed: seed)
     }
 
     /// Forwards to ``Scp/identityCreateLinkAttestation`` on ``inner``.
@@ -716,8 +721,13 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/scpidSign`` on ``inner``.
-    func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String) throws -> String {
-        try inner.scpidSign(identity: identity, signingKeyId: signingKeyId, challengeJson: challengeJson)
+    /// Forwards to ``Scp/scpidSign`` on ``inner``.
+    ///
+    /// `signedAtOverride` is a testing-only parameter for the ADR-046
+    /// cross-bridge parity harness; pass `nil` from production callers.
+    /// Production builds reject non-`nil` values with `SCP-VALID-7007`.
+    func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String, signedAtOverride: UInt64? = nil) throws -> String {
+        try inner.scpidSign(identity: identity, signingKeyId: signingKeyId, challengeJson: challengeJson, signedAtOverride: signedAtOverride)
     }
 
     /// Forwards to ``Scp/scpidVerify`` on ``inner``.
