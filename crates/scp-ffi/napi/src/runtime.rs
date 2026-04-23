@@ -1524,17 +1524,40 @@ pub fn remove_context(context_id: &str) {
 /// Returns `ScpNapiError` if the context is not registered in either the
 /// manager or the UCAN state registry.
 pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpNapiError> {
-    let mgr = context_manager().map_err(|e| ScpNapiError::Context {
+    use scp_core::context::actor::commands::QueriesCommand;
+    let sup = supervisor().map_err(|e| ScpNapiError::Context {
         message: e.to_string(),
         code: codes::CTX_2000.to_owned(),
     })?;
-    let new_role_state =
-        mgr.get_role_state(context_id)
-            .await
-            .ok_or_else(|| ScpNapiError::Context {
-                message: format!("context '{context_id}' not found in ContextManager"),
-                code: codes::CTX_2023.to_owned(),
-            })?;
+    let sup = Arc::clone(sup);
+    // Route through the ADR-049 query shim. The handler returns
+    // `Ok(None)` when the context is unknown, matching the legacy
+    // `ContextManager::get_role_state` `Option` contract.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = QueriesCommand::GetRoleState {
+        context_id: context_id.to_owned(),
+        reply: tx,
+    };
+    sup.dispatch_query(cmd)
+        .await
+        .map_err(|e| ScpNapiError::Context {
+            message: format!("supervisor dispatch_query failed: {e}"),
+            code: codes::CTX_2000.to_owned(),
+        })?;
+    let new_role_state = rx
+        .await
+        .map_err(|e| ScpNapiError::Context {
+            message: format!("query shim reply dropped: {e}"),
+            code: codes::CTX_2000.to_owned(),
+        })?
+        .map_err(|e| ScpNapiError::Context {
+            message: e.to_string(),
+            code: codes::CTX_2000.to_owned(),
+        })?
+        .ok_or_else(|| ScpNapiError::Context {
+            message: format!("context '{context_id}' not found in ContextManager"),
+            code: codes::CTX_2023.to_owned(),
+        })?;
 
     with_context(context_id, |st| {
         st.role_state = new_role_state;
