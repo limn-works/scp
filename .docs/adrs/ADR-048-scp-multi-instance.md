@@ -144,6 +144,41 @@ concurrency.
 
 No round-3 findings remain open against §7.
 
+### 7a. Post-merge integration with ADR-046 bridge parity + ADR-047 bridge symmetry
+
+After §7 landed on the branch, `origin/main` advanced with three PRs that needed to integrate atomically with the façade-delete surface:
+
+- **#1682** — ADR-046 bridge-parity harness + ADR-047 bridge-symmetry enforcement.
+- **#1697** — retro review-fix consolidation.
+- **#1699** — P0/P1 review follow-up.
+
+The two workstreams touched the same bridge surfaces from opposite ends: §7 moved free-function façade exports to `Scp::*` instance methods, while ADR-046 added new parameters (`seed`, `signed_at_override`) and fields (`verifying_key_hex`) to those same façade functions. Integration required porting ADR-046's parity features onto §7's per-instance methods rather than resurrecting the façade. Scope of the merge integration:
+
+**Identity construction — `verifying_key_hex` field.** The `Identity` struct in every non-WASM bridge gains a `verifying_key_hex: Option<String>` field (hex-encoded Ed25519 verifying-key bytes for the identity key, VM `#0` — the DID-deriving key, not `#active`). Chosen because the WASM bridge uses a simplified single-key model in production where the DID-deriving key *is* the signing key; exposing the identity key gives byte-exact parity across all four bridges under a deterministic `seed`. Populated at every constructor site across PyO3 (`PyIdentity::new` / `PyIdentity::from_document` factory methods, 8+ sites), NAPI (`NapiIdentityInner` literal, 13 sites), UniFFI (`Identity { ... }` literal, 7 sites), WASM (`WasmIdentity { ... }` literal, 8 sites). Populated via `custody.public_key(&identity.identity_key).await.ok().map(|pk| hex::encode(pk.as_bytes()))` — an ADR-046 stability contract, not an exposed API at the SDK layer (read via `identity.verifying_key()`).
+
+**Identity creation — `seed: Option<Vec<u8>>` parameter.** `Scp::identity_create(custody, seed)` on every non-WASM bridge accepts an optional 32-byte deterministic RNG seed. When `Some(bytes)`, `InMemoryKeyCustody::from_seed_bytes(bytes)` replaces the default `OsRng`-backed `InMemoryKeyCustody::new()`, making subsequent `generate_keypair` calls produce byte-identical Ed25519 keys across bridges. Rejected with `SCP-VALID-7007` for:
+- length ≠ 32 bytes,
+- non-`in_memory` custody (Platform/Software paths panic-reject the parameter — seeded determinism is only meaningful for in-process testing custody).
+
+Swift / Kotlin SDK wrappers expose `seed: Data? = nil` / `seed: ByteArray? = null` defaults so production callers retain the single-argument call shape.
+
+**SCPID signing — `signed_at_override: Option<u64>`.** `Scp::scpid_sign(identity, signing_key_id, challenge_json, signed_at_override)` accepts a Unix-millisecond timestamp that substitutes for the wall clock in the canonical hash. Only accepted when scp-core is built with the `testing` feature; production builds reject non-`None` values with `SCP-VALID-7007`. This affordance drives the cross-bridge parity harness's byte-exact SCPID signatures — two bridges signing the same challenge under the same seed with the same `signed_at_override` produce identical signatures. The feature gate is compile-time — a `testing`-enabled artifact reaching production is the threat model and is addressed by release-channel discipline (no `testing` feature on production wheels / jars / xcframeworks).
+
+**§18.4.1 context_id alignment.** Main's fix to emit 64-char lowercase hex context IDs across all four bridges (`hex::encode(32 random bytes)`, matching PyO3's reference `generate_context_id`) is preserved in `Scp::context_create` on every non-WASM bridge. The UniFFI per-instance method regressed to `ctx-<uuid>` during the merge because PR 5 had authored the per-instance `Scp::context_create` before main's fix landed on free-function `context_create`; the regression was caught by the preserved `context_create_returns_active_context` test and fixed in the post-merge SDK follow-up commit.
+
+**Enforcement alignment.**
+
+- `scripts/check-call-invariants.py` rule `did-resolver-init-on-identity-create` expected callee `ensure_did_resolver_initialized`; NAPI and UniFFI had renamed to `_on` suffix (per-instance helper convention), PyO3 had not. Unified PyO3 on `_on` and updated the matrix rule's `required_callee`. Rule ID unchanged; `required_rule_ids_digest` unchanged — the rule-level contract is unchanged, only the implementation pattern tracked a rename.
+- `scripts/bridge-aliases.json` PyO3 alias lists contained `py_*` free-function names; PR 5 renamed to PyScp method form. Extended each PyO3 alias list to include both forms (97 operations). Per-bridge symmetry check still independent — adding method-form aliases to PyO3 does not mask missing coverage in NAPI/UniFFI/WASM.
+
+**Swift `ScpId` defaults.** The free `scpidSign` / `scpidVerify` UniFFI exports were deleted in PR 5 (per-instance `Scp::scpid_sign` / `Scp::scpid_verify` replace them, routing the Identity handle-affinity check + DID resolver through the caller's own `SCP`). `ScpId.defaultSign` / `defaultChallenge` / `defaultVerify` in `bindings/swift/Sources/SCP/Auth/ScpId.swift` consequently cannot delegate to the deleted free functions; they throw `SCP-VALID-7300` pointing at `SCP.scpidSign` / `SCP.scpidChallenge` / `SCP.scpidVerify`. No consumer code in `Sources/` / `Tests/` / `examples/` depends on the defaults — the exported `ScpId.sign(scp:identity:signingKeyId:challenge:)` / `ScpId.verify(scp:response:challenge:)` methods already require an explicit `SCP` parameter.
+
+**Follow-ups remaining on this integration axis (non-blocking for the ship):**
+
+- `bindings/python/tests/bridge_parity/` harness driver references `ctx.scp_core.py_identity_create(...)` — PR-5-era deletion leaves the harness broken until it is rewritten to construct an `SCP` instance and call `scp.identity_create(...)`. Rust-side parity plumbing (seed, verifying_key_hex, signed_at_override) is complete across all 3 non-WASM bridges; only the Python driver needs updating.
+- Helper runners (`bindings/python/tests/bridge_parity/helpers/{node,swift,kotlin}_bridge_runner/`) need the same update — each currently drives through bridge-specific free-function names.
+- The shared `Scp::context_create` context-id generation is duplicated across all four bridges — a future extraction into `scp-ffi-common::generate_context_id()` would have caught the UniFFI regression at type-check time rather than test-run time.
+
 ## Consequences
 
 - **Tests parallel-safe on every bridge.** Per-test `SCP` fixtures eliminate `BRIDGE_LIFECYCLE_SERIAL`, per-test `beforeAll` in NAPI, and the module-scope poisoning on every SDK. pytest-xdist, Gradle parallel tests, and XCTest concurrency all work.
