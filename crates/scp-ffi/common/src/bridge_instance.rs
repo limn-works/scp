@@ -866,10 +866,12 @@ impl CoreFields {
         // Best-effort: errors are logged inside flush_all_contexts_sync and do
         // not prevent suspension from completing. Skipped if the
         // ContextManager hasn't been set yet (i.e., suspend before any
-        // context operation has run).
-        if let Some(cm) = self.context_manager.get() {
-            cm.flush_all_contexts_sync();
-        }
+        // context operation has run) — in that case the supervisor's forwarder
+        // returns `Err(ContextError::NotInitialized)`, which we discard to
+        // preserve the prior silent-skip behavior. No other error variants are
+        // reachable: the supervisor is a thin shim over the infallible
+        // `ContextManager::flush_all_contexts_sync`.
+        let _ = self.supervisor.flush_all_contexts_sync();
         if let Err(e) = self.clear_transport() {
             // Revert the suspended flag — the instance is not cleanly
             // suspended if transport wasn't cleared.
@@ -1221,10 +1223,12 @@ impl CoreFields {
     /// restore is a best-effort rehydration. A caller that needs failure
     /// visibility calls `ContextManager::restore_all_contexts` directly.
     pub async fn restore_all_persisted_contexts(&self) {
-        let Some(cm) = self.context_manager.get() else {
-            return;
-        };
-        match cm.restore_all_contexts().await {
+        // Supervisor forwards to `ContextManager::restore_all_contexts` when a
+        // manager is attached, and returns `Err(ContextError::NotInitialized)`
+        // otherwise. Both the no-manager path and the "no persistence provider
+        // configured" path are expected for ephemeral bridges and share the
+        // same debug-log-and-continue behavior as before the rewire.
+        match self.supervisor.restore_all_contexts().await {
             Ok(restored) => {
                 tracing::debug!(
                     count = restored.len(),
@@ -1234,9 +1238,12 @@ impl CoreFields {
             Err(e) => {
                 // `no persistence provider configured` is the expected path
                 // for ephemeral bridges; log at debug rather than warn.
+                // `NotInitialized` (no ContextManager attached yet) is likewise
+                // an expected no-op — the bridge hasn't seen its first
+                // identity_create / context_create.
                 tracing::debug!(
                     error = %e,
-                    "restore_all_persisted_contexts: skipped (no-op is expected when persistence is not configured)"
+                    "restore_all_persisted_contexts: skipped (no-op is expected when persistence is not configured or no ContextManager is attached)"
                 );
             }
         }
@@ -1728,7 +1735,7 @@ impl CoreFields {
             urls.clear();
         }
 
-        if let Some(cm) = self.context_manager.get() {
+        if self.has_context_manager() {
             // Persistence flush must honor the caller-supplied deadline.
             // The flush is now natively async (per-context bounded
             // `Mutex::lock` with a 250ms budget and degraded-snapshot
@@ -1736,14 +1743,30 @@ impl CoreFields {
             // so aggregate storage latency cannot push us past the caller's
             // shutdown budget. Zero budget falls through to a best-effort
             // inline flush (matches the sync shutdown path's contract).
+            //
+            // Supervisor::flush_all_contexts/shutdown_all_contexts are thin
+            // forwarders over the infallible ContextManager methods; the only
+            // reachable error is `NotInitialized`, which we have already
+            // gated out above via `has_context_manager()`. Any error returned
+            // here indicates the manager was detached between the check and
+            // the call — we log rather than panic since shutdown must finish.
             if flush_budget.is_zero() {
                 tracing::warn!(
                     "shutdown flush budget exhausted before flush_all_contexts — \
                      context state may not be persisted"
                 );
             } else {
-                match tokio::time::timeout(flush_budget, cm.flush_all_contexts()).await {
-                    Ok(()) => {}
+                match tokio::time::timeout(flush_budget, self.supervisor.flush_all_contexts()).await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            error = %e,
+                            "flush_all_contexts returned an error during shutdown \
+                             (likely ContextManager detached mid-flight) — \
+                             context state may not be persisted"
+                        );
+                    }
                     Err(_elapsed) => {
                         tracing::warn!(
                             budget_ms = flush_budget.as_millis(),
@@ -1753,7 +1776,13 @@ impl CoreFields {
                     }
                 }
             }
-            cm.shutdown_all_contexts();
+            if let Err(e) = self.supervisor.shutdown_all_contexts() {
+                tracing::warn!(
+                    error = %e,
+                    "shutdown_all_contexts returned an error during shutdown \
+                     (likely ContextManager detached mid-flight)"
+                );
+            }
         }
 
         self.finish_shutdown_cleanup();
@@ -1774,9 +1803,27 @@ impl CoreFields {
             urls.clear();
         }
 
-        if let Some(cm) = self.context_manager.get() {
-            cm.flush_all_contexts_sync();
-            cm.shutdown_all_contexts();
+        if self.has_context_manager() {
+            // Supervisor::flush_all_contexts_sync and shutdown_all_contexts
+            // are thin forwarders over the infallible ContextManager methods.
+            // `has_context_manager()` above rules out `NotInitialized`; any
+            // non-Ok return indicates the manager was detached mid-flight,
+            // which we log since sync shutdown must finish regardless.
+            if let Err(e) = self.supervisor.flush_all_contexts_sync() {
+                tracing::warn!(
+                    error = %e,
+                    "flush_all_contexts_sync returned an error during shutdown \
+                     (likely ContextManager detached mid-flight) — \
+                     context state may not be persisted"
+                );
+            }
+            if let Err(e) = self.supervisor.shutdown_all_contexts() {
+                tracing::warn!(
+                    error = %e,
+                    "shutdown_all_contexts returned an error during shutdown \
+                     (likely ContextManager detached mid-flight)"
+                );
+            }
         }
 
         self.finish_shutdown_cleanup();
