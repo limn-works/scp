@@ -618,8 +618,18 @@ impl MlsCryptoProvider {
 }
 
 #[allow(clippy::significant_drop_tightening)]
-impl ContextCryptoProvider for MlsCryptoProvider {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+impl MlsCryptoProvider {
+    /// Validates that the creator's identity is valid and the signing key is
+    /// accessible.
+    ///
+    /// Called during Phase 1 (validation) before any side effects. This is a
+    /// read-only check that does not create or modify any state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::IdentityValidationFailed`] if the
+    /// identity is invalid or the signing key cannot be accessed.
+    pub fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
         // Validate that the local DID is a valid did:dht:z... format.
         if !self.local_did.starts_with("did:dht:z") {
             return Err(ContextCreationError::IdentityValidationFailed(
@@ -629,7 +639,15 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    /// Creates an MLS group for the given context.
+    ///
+    /// Called only when `mode == Encrypted`. The provider stores the group
+    /// state internally, keyed by `context_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if MLS group creation fails.
+    pub fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let credential = self.make_credential()?;
         let wrapping_pk = self
             .wrapping_public_key
@@ -661,7 +679,14 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    /// Generates a sender key for the given context.
+    ///
+    /// For `Encrypted` mode this is an AES-256 sender key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if sender key generation fails.
+    pub fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let mut contexts = self
             .contexts
             .lock()
@@ -676,7 +701,15 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    /// Initializes a broadcast key for the given context.
+    ///
+    /// Called only when `mode == Broadcast`. The provider stores the
+    /// broadcast key internally, keyed by `context_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if broadcast key initialisation fails.
+    pub fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let key = generate_sender_key();
         let mut broadcast_keys = self
             .broadcast_keys
@@ -686,7 +719,12 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    /// Destroys the MLS group created for the given context (rollback).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if destruction fails.
+    pub fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         let mut contexts = self
             .contexts
             .lock()
@@ -697,7 +735,12 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+    /// Destroys the sender key created for the given context (rollback).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError`] if destruction fails.
+    pub fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
         // Zeroize the sender key in context state (if present).
         {
             let mut contexts = self
@@ -731,7 +774,18 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn validate_key_package(
+    /// Validates a joiner's key package.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_did` - The DID of the key package owner.
+    /// * `key_package_bytes` - Optional TLS-serialized MLS `KeyPackage` bytes.
+    ///   `None` for mock providers; production providers require `Some`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::InvalidKeyPackage`] if the key package is invalid.
+    pub fn validate_key_package(
         &self,
         owner_did: &str,
         key_package_bytes: Option<&[u8]>,
@@ -783,7 +837,23 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn add_member(
+    /// Adds a member to the MLS group (ADR-001 `add_member()`).
+    ///
+    /// Returns an [`AddMemberOutput`] containing the TLS-serialized MLS
+    /// Welcome (for the joiner) and Commit (for existing members). Non-MLS
+    /// providers return `AddMemberOutput::default()` (empty bytes).
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` - The 32-byte context identifier.
+    /// * `member_did` - The DID of the member to add.
+    /// * `key_package_bytes` - Optional TLS-serialized MLS `KeyPackage` bytes.
+    ///   `None` for mock providers; production providers require `Some`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if the MLS operation fails.
+    pub fn add_member(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -850,7 +920,16 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn remove_member(
+    /// Removes a member from the MLS group (ADR-001 `remove_member()`).
+    ///
+    /// Returns a [`RemoveMemberOutput`] containing the TLS-serialized MLS
+    /// Commit (for remaining members to process). Non-MLS providers return
+    /// `RemoveMemberOutput::default()` (empty bytes).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if the MLS operation fails.
+    pub fn remove_member(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -930,7 +1009,12 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn distribute_sender_key(
+    /// Distributes sender key bundle to a new member via ADR-007.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if distribution fails.
+    pub fn distribute_sender_key(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -998,7 +1082,12 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn remove_member_sender_key(
+    /// Removes a member's sender key from all members' stores.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if removal fails.
+    pub fn remove_member_sender_key(
         &self,
         context_id: &[u8; 32],
         member_did: &str,
@@ -1031,7 +1120,25 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn rotate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+    /// Rotates the local sender key for a context (§9.16.4).
+    ///
+    /// Generates a fresh AES-256 sender key, increments `sender_key_epoch`,
+    /// updates the local sender key store, HPKE-seals the new key to each
+    /// remaining member's wrapping public key, and queues distribution
+    /// messages in `pending_distributions`.
+    ///
+    /// Called after a member is removed (governance or voluntary departure)
+    /// so that the removed party cannot decrypt future messages encrypted
+    /// with the new sender key.
+    ///
+    /// The default implementation is a no-op (`Ok(())`) so that mock and
+    /// test providers compile without changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if key generation, HPKE
+    /// sealing, or internal lock acquisition fails.
+    pub fn rotate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
         let ctx_id_hex = hex::encode(context_id);
         let mut contexts = self
             .contexts
@@ -1130,7 +1237,23 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn drain_pending_sender_key_messages(
+    /// Drains pending sender key distribution messages for a context.
+    ///
+    /// Returns `(target_did, serialized_message)` pairs that should be
+    /// delivered to the target members via transport. Each message is a
+    /// serialized `SenderKeyDistributionMessage::KeyResponse` containing
+    /// an HPKE-sealed sender key.
+    ///
+    /// The default implementation returns an empty vector (no pending
+    /// distributions). Production providers that HPKE-seal sender keys
+    /// during [`distribute_sender_key`](Self::distribute_sender_key) should
+    /// override this to drain their pending queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if the internal lock is
+    /// poisoned.
+    pub fn drain_pending_sender_key_messages(
         &self,
         context_id: &[u8; 32],
     ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
@@ -1144,7 +1267,21 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(std::mem::take(&mut state.pending_distributions))
     }
 
-    fn process_incoming_sender_key(
+    /// Processes an incoming sender key distribution message from a remote
+    /// member.
+    ///
+    /// Deserializes the message, extracts the sender key, and stores it in
+    /// the local sender key store so subsequent messages from `sender_did`
+    /// can be decrypted.
+    ///
+    /// The default implementation is a no-op. Production providers that
+    /// support HPKE sender key distribution should override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if deserialization, HPKE
+    /// decryption, or storage fails.
+    pub fn process_incoming_sender_key(
         &self,
         context_id: &[u8; 32],
         sender_did: &str,
@@ -1212,7 +1349,22 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         }
     }
 
-    fn handle_sender_key_request(
+    /// Handles an incoming sender key request from a remote member.
+    ///
+    /// Verifies the request, checks replay protection, and HPKE-seals the
+    /// local sender key to the requester's wrapping pubkey.
+    ///
+    /// Returns `Some(serialized_response)` if the requester should receive
+    /// a key, or `None` if the request was silently dropped (e.g., blocked).
+    ///
+    /// The default implementation returns an error indicating the provider
+    /// does not support sender key request handling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if signature verification,
+    /// HPKE encryption, or serialization fails.
+    pub fn handle_sender_key_request(
         &self,
         context_id: &[u8; 32],
         request_bytes: &[u8],
@@ -1312,7 +1464,20 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(Some(message))
     }
 
-    fn seal(
+    /// Seals an inner envelope for transport: serializes, sender-key encrypts,
+    /// MLS encrypts, wraps in outer envelope.
+    ///
+    /// This is the primary send-path crypto operation. The caller constructs
+    /// the `InnerEnvelope` (including signing); this method handles all
+    /// encryption layers.
+    ///
+    /// The default implementation returns an error. Production providers
+    /// (`MlsCryptoProvider`) override this with the full envelope pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if any encryption step fails.
+    pub fn seal(
         &self,
         context_id: &[u8; 32],
         inner: &scp_protocol::envelope::inner::InnerEnvelope,
@@ -1378,7 +1543,25 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn open(
+    /// Opens a received envelope: MLS decrypts, sender-key decrypts,
+    /// deserializes, verifies membership + padding + integrity check.
+    ///
+    /// Returns [`OpenResult::Application`] for application messages,
+    /// [`OpenResult::Control`] for MLS Commit/Proposal messages, or
+    /// [`OpenResult::Management`] for MLS-wrapped management messages
+    /// (identified by the [`MANAGEMENT_MSG_MAGIC`] prefix).
+    ///
+    /// Signature verification is NOT performed here — the caller
+    /// (`ContextManager`) handles it via `key_resolver` after `open` returns.
+    ///
+    /// The default implementation returns an error. Production providers
+    /// (`MlsCryptoProvider`) override this with the full receive pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if MLS decryption, sender key
+    /// decryption, deserialization, padding strip, or integrity check fails.
+    pub fn open(
         &self,
         context_id: &[u8; 32],
         outer_bytes: &[u8],
@@ -1516,7 +1699,20 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn mls_encrypt_management(
+    /// MLS-encrypts a management payload for group-authenticated delivery.
+    ///
+    /// Prepends the [`MANAGEMENT_MSG_MAGIC`] prefix, MLS-encrypts the result,
+    /// and wraps in an outer envelope. Used to send sender key distributions
+    /// that are authenticated by MLS membership.
+    ///
+    /// The default implementation returns an error. Production providers
+    /// (`MlsCryptoProvider`) override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if MLS encryption or
+    /// serialization fails.
+    pub fn mls_encrypt_management(
         &self,
         context_id: &[u8; 32],
         plaintext: &[u8],
@@ -1554,7 +1750,22 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn advance_epoch(
+    /// Advances the MLS epoch for post-compromise security (§9.12 step 2).
+    ///
+    /// Issues an MLS Update proposal + self-Commit, ratcheting the group to
+    /// a new epoch with fresh key material. After this call, the compromised
+    /// old epoch key is useless for future messages.
+    ///
+    /// Returns an [`AdvanceEpochOutput`] containing the TLS-serialized MLS
+    /// Commit message that must be distributed to all group members.
+    ///
+    /// The default implementation is a no-op returning empty output so that
+    /// mock and test providers compile without changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if the MLS update/commit fails.
+    pub fn advance_epoch(
         &self,
         context_id: &[u8; 32],
     ) -> Result<scp_protocol::context::builder::AdvanceEpochOutput, ContextError> {
@@ -1582,7 +1793,25 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         })
     }
 
-    fn export_crypto_state(&self, context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
+    /// Exports the per-context cryptographic state as an opaque byte blob
+    /// for persistence alongside the `ContextSnapshot`.
+    ///
+    /// The returned bytes capture all state needed to resume MLS encryption
+    /// and decryption for this context after a process restart: the MLS group
+    /// state (tree, epoch secrets, key schedule), the local sender key, the
+    /// sender key store (all member keys), the sender key epoch, and per-member
+    /// wrapping public keys.
+    ///
+    /// Returns an empty `Vec` if no crypto state exists for the given context
+    /// (e.g., mock providers or broadcast-only contexts).
+    ///
+    /// The default implementation returns an empty `Vec` (no state to persist).
+    /// Production providers that manage MLS groups MUST override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if serialization fails.
+    pub fn export_crypto_state(&self, context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
         let contexts = self
             .contexts
             .lock()
@@ -1700,7 +1929,25 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         result
     }
 
-    fn restore_crypto_state(&self, context_id: &[u8; 32], data: &[u8]) -> Result<(), ContextError> {
+    /// Restores per-context cryptographic state from a previously exported
+    /// byte blob (produced by [`export_crypto_state`](Self::export_crypto_state)).
+    ///
+    /// Called during `ContextManager::restore_context` to reinstate MLS
+    /// groups and sender keys after a process restart. If `data` is empty,
+    /// this is a no-op (the provider was never persisted or is a mock).
+    ///
+    /// The default implementation is a no-op. Production providers that
+    /// manage MLS groups MUST override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if deserialization fails or
+    /// the data is corrupt.
+    pub fn restore_crypto_state(
+        &self,
+        context_id: &[u8; 32],
+        data: &[u8],
+    ) -> Result<(), ContextError> {
         if data.is_empty() {
             return Ok(());
         }
@@ -1893,7 +2140,20 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn export_sender_key_epochs(&self, context_id: &[u8; 32]) -> Vec<(String, u64)> {
+    /// Returns the per-sender epoch high-water marks for a given context.
+    ///
+    /// Each `(sender_did, epoch)` pair represents the highest sender key epoch
+    /// seen from that participant.  Used by [`ContextManager::import_context`]
+    /// to capture the local floors **before** destroying existing crypto state
+    /// so the incoming snapshot can be validated against them.
+    ///
+    /// Returns an empty `Vec` when the context has no epoch state (mock
+    /// providers, broadcast-only contexts, or providers that do not track
+    /// epochs).
+    ///
+    /// The default implementation returns an empty `Vec`.  Production
+    /// providers that maintain a `SenderKeyStore` MUST override this.
+    pub fn export_sender_key_epochs(&self, context_id: &[u8; 32]) -> Vec<(String, u64)> {
         let Ok(contexts) = self.contexts.lock() else {
             return Vec::new();
         };
@@ -1904,7 +2164,32 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         state.sender_key_store.epochs_for_context(&ctx_id_hex)
     }
 
-    fn validate_and_merge_epoch_floors(
+    /// Validates that the per-sender epoch floors in the just-restored crypto
+    /// state do not regress any entry in `local_floors`, then applies a
+    /// max-merge so `max(local, imported)` is the effective floor for every
+    /// sender (spec §23.17 Invariant 3 + Invariant 4).
+    ///
+    /// Call this AFTER `restore_crypto_state` during `import_context`, passing
+    /// the floors captured via `export_sender_key_epochs` **before** the
+    /// destroy+restore cycle.
+    ///
+    /// Rejects (returns `Err`) if any imported epoch is below its local floor
+    /// (regression) **or** exceeds `local_floor + max_advance_per_sender`
+    /// (epoch-poisoning guard). No state is mutated on failure.
+    ///
+    /// The default implementation is a no-op (`Ok`). Production providers MUST
+    /// override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::SnapshotFloorRegression`] on regression or
+    /// ceiling violation.
+    // Parameter type `Vec<(String, u64)>` is fixed by the `ContextCryptoProvider`
+    // trait signature (the forwarder impl below passes ownership through from a
+    // trait-object call). Switching to `&[(String, u64)]` is a signature change
+    // that belongs with trait deletion in commit 12c.9e.6 of ADR-049.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn validate_and_merge_epoch_floors(
         &self,
         context_id: &[u8; 32],
         local_floors: Vec<(String, u64)>,
@@ -1967,7 +2252,16 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(())
     }
 
-    fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
+    /// Generates a key package for joining a group via Welcome.
+    /// Returns TLS-serialized key package bytes. The provider retains the
+    /// private state needed to process the incoming Welcome.
+    ///
+    /// Default: not supported (returns error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if key package generation fails.
+    pub fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
         use tls_codec::Serialize as TlsSerializeTrait;
 
         let credential = self
@@ -2004,7 +2298,15 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         Ok(kp_bytes)
     }
 
-    fn join_from_welcome(
+    /// Joins an MLS group from a TLS-serialized Welcome message.
+    /// Consumes the retained key package state from `prepare_key_package_for_join`.
+    ///
+    /// Default: not supported (returns error).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] if Welcome processing fails.
+    pub fn join_from_welcome(
         &self,
         context_id: &[u8; 32],
         welcome_bytes: &[u8],
@@ -2055,6 +2357,195 @@ impl ContextCryptoProvider for MlsCryptoProvider {
         );
 
         Ok(())
+    }
+}
+
+/// Forwarder impl: dispatch the 25 trait methods to the inherent impl on
+/// `MlsCryptoProvider`. The inherent impl holds the real bodies; this block
+/// exists only so `dyn ContextCryptoProvider` callers keep compiling.
+/// Callsites migrate to the inherent API in commit 12c.9e.2; this forwarder
+/// disappears in commit 12c.9e.6 of ADR-049.
+//
+// `needless_pass_by_value` is suppressed on this forwarder because the trait
+// signatures fix the parameter types (e.g., `local_floors: Vec<(String, u64)>`
+// in `validate_and_merge_epoch_floors`). The inherent impl consumes those
+// values; the forwarder simply passes ownership through. Changing the trait
+// signature to `&[_]` is a separate decision that belongs with trait deletion
+// in commit 12c.9e.6 of ADR-049, not here.
+#[allow(clippy::needless_pass_by_value)]
+impl ContextCryptoProvider for MlsCryptoProvider {
+    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+        Self::validate_creator_identity(self)
+    }
+
+    fn create_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Self::create_mls_group(self, context_id)
+    }
+
+    fn generate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Self::generate_sender_key(self, context_id)
+    }
+
+    fn init_broadcast_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Self::init_broadcast_key(self, context_id)
+    }
+
+    fn destroy_mls_group(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Self::destroy_mls_group(self, context_id)
+    }
+
+    fn destroy_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
+        Self::destroy_sender_key(self, context_id)
+    }
+
+    fn validate_key_package(
+        &self,
+        owner_did: &str,
+        key_package_bytes: Option<&[u8]>,
+    ) -> Result<(), ContextError> {
+        Self::validate_key_package(self, owner_did, key_package_bytes)
+    }
+
+    fn add_member(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+        key_package_bytes: Option<&[u8]>,
+    ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
+        Self::add_member(self, context_id, member_did, key_package_bytes)
+    }
+
+    fn remove_member(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+    ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
+        Self::remove_member(self, context_id, member_did)
+    }
+
+    fn distribute_sender_key(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+    ) -> Result<(), ContextError> {
+        Self::distribute_sender_key(self, context_id, member_did)
+    }
+
+    fn remove_member_sender_key(
+        &self,
+        context_id: &[u8; 32],
+        member_did: &str,
+    ) -> Result<(), ContextError> {
+        Self::remove_member_sender_key(self, context_id, member_did)
+    }
+
+    fn rotate_sender_key(&self, context_id: &[u8; 32]) -> Result<(), ContextError> {
+        Self::rotate_sender_key(self, context_id)
+    }
+
+    fn drain_pending_sender_key_messages(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
+        Self::drain_pending_sender_key_messages(self, context_id)
+    }
+
+    fn process_incoming_sender_key(
+        &self,
+        context_id: &[u8; 32],
+        sender_did: &str,
+        message_bytes: &[u8],
+    ) -> Result<(), ContextError> {
+        Self::process_incoming_sender_key(self, context_id, sender_did, message_bytes)
+    }
+
+    fn handle_sender_key_request(
+        &self,
+        context_id: &[u8; 32],
+        request_bytes: &[u8],
+        requester_public_key: &[u8],
+        blocked_dids: &std::collections::HashSet<String>,
+    ) -> Result<Option<Vec<u8>>, ContextError> {
+        Self::handle_sender_key_request(
+            self,
+            context_id,
+            request_bytes,
+            requester_public_key,
+            blocked_dids,
+        )
+    }
+
+    fn seal(
+        &self,
+        context_id: &[u8; 32],
+        inner: &scp_protocol::envelope::inner::InnerEnvelope,
+        routing_id: &[u8],
+        blob_ttl: u32,
+    ) -> Result<Vec<u8>, ContextError> {
+        Self::seal(self, context_id, inner, routing_id, blob_ttl)
+    }
+
+    fn open(
+        &self,
+        context_id: &[u8; 32],
+        outer_bytes: &[u8],
+    ) -> Result<scp_protocol::context::builder::OpenResult, ContextError> {
+        Self::open(self, context_id, outer_bytes)
+    }
+
+    fn mls_encrypt_management(
+        &self,
+        context_id: &[u8; 32],
+        plaintext: &[u8],
+        routing_id: &[u8],
+        blob_ttl: u32,
+    ) -> Result<Vec<u8>, ContextError> {
+        Self::mls_encrypt_management(self, context_id, plaintext, routing_id, blob_ttl)
+    }
+
+    fn advance_epoch(
+        &self,
+        context_id: &[u8; 32],
+    ) -> Result<scp_protocol::context::builder::AdvanceEpochOutput, ContextError> {
+        Self::advance_epoch(self, context_id)
+    }
+
+    fn export_crypto_state(&self, context_id: &[u8; 32]) -> Result<Vec<u8>, ContextError> {
+        Self::export_crypto_state(self, context_id)
+    }
+
+    fn restore_crypto_state(&self, context_id: &[u8; 32], data: &[u8]) -> Result<(), ContextError> {
+        Self::restore_crypto_state(self, context_id, data)
+    }
+
+    fn export_sender_key_epochs(&self, context_id: &[u8; 32]) -> Vec<(String, u64)> {
+        Self::export_sender_key_epochs(self, context_id)
+    }
+
+    fn validate_and_merge_epoch_floors(
+        &self,
+        context_id: &[u8; 32],
+        local_floors: Vec<(String, u64)>,
+        max_advance_per_sender: u64,
+    ) -> Result<(), ContextError> {
+        Self::validate_and_merge_epoch_floors(
+            self,
+            context_id,
+            local_floors,
+            max_advance_per_sender,
+        )
+    }
+
+    fn prepare_key_package_for_join(&self) -> Result<Vec<u8>, ContextError> {
+        Self::prepare_key_package_for_join(self)
+    }
+
+    fn join_from_welcome(
+        &self,
+        context_id: &[u8; 32],
+        welcome_bytes: &[u8],
+    ) -> Result<(), ContextError> {
+        Self::join_from_welcome(self, context_id, welcome_bytes)
     }
 }
 
