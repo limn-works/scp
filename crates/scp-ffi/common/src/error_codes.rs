@@ -512,7 +512,30 @@ pub const VALID_7005: &str = "SCP-VALID-7005";
 /// Validation type error.
 pub const VALID_7006: &str = "SCP-VALID-7006";
 /// Validation format error.
+///
+/// Used when a caller passed bytes that are malformed or of the wrong
+/// length — e.g. a parity-harness seed that is not exactly 32 bytes, or
+/// a `signed_at_override` `BigInt` that cannot be represented losslessly
+/// as a `u64`.
 pub const VALID_7007: &str = "SCP-VALID-7007";
+/// Testing-only feature requires the `testing` feature flag.
+///
+/// Returned by FFI entry points when a caller supplies a parity-harness
+/// affordance (`seed` on `identity_create`, `signed_at_override` on
+/// `scpid_sign`) in a build that was NOT compiled with the `testing`
+/// feature enabled. These are ADR-046 cross-bridge parity-harness
+/// inputs, not production APIs — production bundles reject them with
+/// this code.
+pub const VALID_7008: &str = "SCP-VALID-7008";
+/// Seed requires `InMemoryKeyCustody`.
+///
+/// Returned when a caller passes a deterministic parity-harness `seed`
+/// together with a custody type other than `"in_memory"`. Seeded
+/// determinism is only meaningful for the in-process `InMemoryKeyCustody`
+/// backend — platform/software/file custody all produce keys outside the
+/// seeded RNG, so accepting a seed with them would silently lie about
+/// reproducibility.
+pub const VALID_7009: &str = "SCP-VALID-7009";
 /// UCAN token validation error.
 pub const VALID_7010: &str = "SCP-VALID-7010";
 /// UCAN mint validation error.

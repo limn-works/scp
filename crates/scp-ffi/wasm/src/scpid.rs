@@ -165,7 +165,7 @@ pub fn scpid_sign(
             message: "signed_at_override requires the `testing` feature — not available \
                       in production WASM builds"
                 .to_owned(),
-            code: codes::VALID_7007.to_owned(),
+            code: codes::VALID_7008.to_owned(),
         }
         .into_js());
     }

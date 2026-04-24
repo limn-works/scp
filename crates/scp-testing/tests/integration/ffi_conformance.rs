@@ -472,7 +472,6 @@ fn any_source_has_fn(sources: &[&'static str], name: &str) -> bool {
     sources.iter().any(|s| source_has_fn(s, name))
 }
 
-
 // ---------------------------------------------------------------------------
 // Per-bridge detection
 // ---------------------------------------------------------------------------

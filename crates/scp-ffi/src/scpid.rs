@@ -108,7 +108,7 @@ impl crate::scp::PyScp {
                 message:
                     "signed_at_override requires the scp-core `testing` feature — not available in production builds"
                         .to_string(),
-                code: codes::VALID_7007.to_string(),
+                code: codes::VALID_7008.to_string(),
             }
             .into());
         }

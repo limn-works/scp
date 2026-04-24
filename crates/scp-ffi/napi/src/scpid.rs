@@ -98,7 +98,7 @@ pub(crate) fn scpid_sign_on(
             message:
                 "signed_at_override requires the scp-core `testing` feature — not available in production builds"
                     .to_owned(),
-            code: codes::VALID_7007.to_owned(),
+            code: codes::VALID_7008.to_owned(),
         }));
     }
 
