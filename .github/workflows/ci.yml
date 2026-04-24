@@ -886,8 +886,11 @@ jobs:
       - protocol-deps
       - bridge-globals
       - fallback-registry
-      - default-in-tests
       - handle-affinity
+      - no-mutable-globals-rust
+      - no-mutable-globals-python
+      - no-mutable-globals-ts
+      - no-mutable-globals-kotlin
       - wasm-protocol
       - rust-fmt
       - rust-clippy
@@ -919,8 +922,11 @@ jobs:
             "${{ needs.protocol-deps.result }}" \
             "${{ needs.bridge-globals.result }}" \
             "${{ needs.fallback-registry.result }}" \
-            "${{ needs.default-in-tests.result }}" \
             "${{ needs.handle-affinity.result }}" \
+            "${{ needs.no-mutable-globals-rust.result }}" \
+            "${{ needs.no-mutable-globals-python.result }}" \
+            "${{ needs.no-mutable-globals-ts.result }}" \
+            "${{ needs.no-mutable-globals-kotlin.result }}" \
             "${{ needs.wasm-protocol.result }}" \
             "${{ needs.rust-fmt.result }}" \
             "${{ needs.rust-clippy.result }}" \
