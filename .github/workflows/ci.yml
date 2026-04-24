@@ -809,22 +809,21 @@ jobs:
         # the Python harness launches directly — NOT via `gradle run`,
         # which would wire the Gradle daemon into the stdio pipe.
         #
-        # `-x :scp-kt:generateUniffiBindings` skips the composite
-        # scp-kt project's bindings-regeneration task. Without this
-        # exclusion, Gradle would re-invoke `cargo build -p
-        # scp-ffi-uniffi --features=allow_in_memory_custody` (without
-        # `testing`), overwriting the dylib we just built with both
-        # features. The parity harness drives `signed_at_override`,
-        # which is `#[cfg(feature = "testing")]`-gated — so the
-        # overwritten dylib rejects the parameter and the Kotlin job
-        # fails. The bindings generated in the previous step are
-        # already committed to `scp-kt/src/main/kotlin/.../internal/`,
-        # so skipping the regeneration task is safe.
+        # `-Pscp.uniffi.extraFeatures=testing` threads the `testing`
+        # cargo feature through scp-kt's `generateUniffiBindings` task
+        # (see build.gradle.kts). Without it, the task's invocation of
+        # `generate-uniffi-kotlin.sh --features=allow_in_memory_custody`
+        # would re-run `cargo build -p scp-ffi-uniffi` without
+        # `testing`, overwriting the dylib we just built (line above)
+        # with both features. The parity harness drives
+        # `signed_at_override`, which is `#[cfg(feature = "testing")]`-
+        # gated — so the overwritten dylib rejects the parameter and
+        # the Kotlin job fails.
         run: |
           bindings/kotlin/gradlew \
             -p bindings/python/tests/bridge_parity/helpers/kotlin_bridge_runner \
             installDist --no-daemon \
-            -x :scp-kt:generateUniffiBindings
+            -Pscp.uniffi.extraFeatures=testing
       - name: Run parity tests (UniFFI Kotlin only)
         env:
           # JNA loads the UniFFI cdylib via the system library path.

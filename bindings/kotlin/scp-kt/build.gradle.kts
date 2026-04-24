@@ -123,7 +123,18 @@ tasks.register<Exec>("generateUniffiBindings") {
     group = "codegen"
     description = "Generate Kotlin bindings from the scp-ffi-uniffi Rust crate via UniFFI"
     workingDir = rootProject.projectDir.parentFile.parentFile
-    commandLine("./scripts/generate-uniffi-kotlin.sh", "--features=allow_in_memory_custody")
+    // Extra cargo features passed alongside the default `allow_in_memory_custody`.
+    // The bridge-parity CI job sets `-Pscp.uniffi.extraFeatures=testing` so the
+    // regenerated cdylib keeps the `signed_at_override` parity affordance
+    // (`#[cfg(feature = "testing")]`). Production consumers leave it unset so
+    // the testing surface is not linked into release binaries.
+    val extraFeatures = providers.gradleProperty("scp.uniffi.extraFeatures").getOrElse("")
+    val featuresArg = if (extraFeatures.isEmpty()) {
+        "--features=allow_in_memory_custody"
+    } else {
+        "--features=allow_in_memory_custody,$extraFeatures"
+    }
+    commandLine("./scripts/generate-uniffi-kotlin.sh", featuresArg)
     // Invalidate on any Rust change under the uniffi crate so stale bindings never compile.
     inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/uniffi/src")))
     inputs.files(fileTree(rootProject.projectDir.parentFile.parentFile.resolve("crates/scp-ffi/common/src")))
