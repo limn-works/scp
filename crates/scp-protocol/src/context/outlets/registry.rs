@@ -1,14 +1,14 @@
 //! Tool registration storage, registration, update, and verification.
 //!
 //! Implements the core tool registry for SCP contexts per ADR-010. Each
-//! context maintains its own [`ToolRegistry`] that stores [`ToolRegistration`]
+//! context maintains its own [`OutletRegistry`] that stores [`OutletRegistration`]
 //! entries. Tools are registered, updated, and verified through free functions
 //! that take the registry and role state as parameters.
 //!
 //! # Event Log Integration
 //!
 //! Registration, update, and verification functions return event payloads
-//! ([`ToolRegisteredEvent`], [`ToolUpdatedEvent`], [`ToolVerifiedEvent`])
+//! ([`OutletRegisteredEvent`], [`OutletUpdatedEvent`], [`OutletVerifiedEvent`])
 //! alongside their primary results. The caller is responsible for appending
 //! these events to the context's event log.
 //!
@@ -19,13 +19,13 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DID, ToolError, ToolId, ToolRegisteredEvent, ToolUpdatedEvent, ToolVerifiedEvent,
-    has_admin_role, has_tool_register_capability, schema,
+    DID, OutletError, OutletId, OutletRegisteredEvent, OutletUpdatedEvent, OutletVerifiedEvent,
+    has_admin_role, has_outlet_register_capability, schema,
 };
 use crate::context::roles::ContextRoleState;
 
 // ---------------------------------------------------------------------------
-// ToolSchema
+// OutletSchema
 // ---------------------------------------------------------------------------
 
 /// MCP-compatible JSON Schema for a tool's input and output.
@@ -33,7 +33,7 @@ use crate::context::roles::ContextRoleState;
 /// Both `input_schema` and `output_schema` must be valid JSON Schema objects
 /// (at minimum, a JSON object with a `"type"` field). See spec section 8.5.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolSchema {
+pub struct OutletSchema {
     /// JSON Schema describing the tool's expected input.
     pub input_schema: serde_json::Value,
     /// JSON Schema describing the tool's output.
@@ -41,7 +41,7 @@ pub struct ToolSchema {
 }
 
 // ---------------------------------------------------------------------------
-// TestVector
+// OutletTestVector
 // ---------------------------------------------------------------------------
 
 /// A known input-output pair for tool verification.
@@ -50,7 +50,7 @@ pub struct ToolSchema {
 /// tool with test inputs and verify the output matches the expected result.
 /// See spec section 7.3.3.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TestVector {
+pub struct OutletTestVector {
     /// The test input to provide to the tool.
     pub input: serde_json::Value,
     /// The expected output from the tool.
@@ -60,7 +60,7 @@ pub struct TestVector {
 }
 
 // ---------------------------------------------------------------------------
-// ToolCost
+// OutletCost
 // ---------------------------------------------------------------------------
 
 /// Per-invocation cost metadata for a tool (spec §5.4.1, §19.3).
@@ -69,7 +69,7 @@ pub struct TestVector {
 /// external API can pass through its cost. Tool costs carry their own payee
 /// DID (may differ from context payee).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolCost {
+pub struct OutletCost {
     /// Cost per invocation in the smallest currency unit.
     pub amount: u64,
     /// ISO 4217 or protocol-defined currency code.
@@ -83,7 +83,7 @@ pub struct ToolCost {
 }
 
 // ---------------------------------------------------------------------------
-// ToolRegistration
+// OutletRegistration
 // ---------------------------------------------------------------------------
 
 /// Full tool registration entry for an SCP context.
@@ -98,24 +98,24 @@ pub struct ToolCost {
 /// independent verification that the registration was created by the claimed
 /// registrant. Both fields default to zero/empty for backward compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolRegistration {
+pub struct OutletRegistration {
     /// Unique identifier for this tool within the context.
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     /// Human-readable name of the tool.
     pub name: String,
     /// Description of the tool's purpose and behavior.
     pub description: String,
     /// MCP-compatible JSON Schema for input and output.
-    pub schema: ToolSchema,
+    pub schema: OutletSchema,
     /// SHA-256 hash of the tool implementation. Used for integrity verification.
     /// Any change to the implementation produces a new hash.
     pub implementation_hash: [u8; 32],
     /// Known input-output pairs for continuous verification.
-    pub test_vectors: Vec<TestVector>,
+    pub test_vectors: Vec<OutletTestVector>,
     /// The DID of the operator accountable for this tool.
     pub operator_did: DID,
     /// Optional per-invocation cost metadata (spec §5.4.1, §19.3).
-    pub cost: Option<ToolCost>,
+    pub cost: Option<OutletCost>,
     /// Unix timestamp (seconds) when the tool was registered.
     ///
     /// Provides temporal provenance for tool registrations. Defaults to 0 for
@@ -135,7 +135,7 @@ pub struct ToolRegistration {
 }
 
 // ---------------------------------------------------------------------------
-// ToolVerificationResult
+// OutletVerificationResult
 // ---------------------------------------------------------------------------
 
 /// Result of verifying a tool against its test vectors.
@@ -143,9 +143,9 @@ pub struct ToolRegistration {
 /// Contains per-vector pass/fail status and an overall integrity assessment.
 /// See ADR-010 acceptance criterion 5.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolVerificationResult {
+pub struct OutletVerificationResult {
     /// The tool that was verified.
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     /// Per-vector results in the same order as the tool's test vectors.
     pub vector_results: Vec<VectorResult>,
     /// Overall integrity assessment: `true` if all vectors passed.
@@ -164,20 +164,20 @@ pub struct VectorResult {
 }
 
 // ---------------------------------------------------------------------------
-// ToolRegistry
+// OutletRegistry
 // ---------------------------------------------------------------------------
 
 /// In-memory tool storage for a single SCP context.
 ///
 /// Maps tool IDs to their full registration entries. Each context maintains
-/// its own `ToolRegistry`. See ADR-010.
+/// its own `OutletRegistry`. See ADR-010.
 #[derive(Debug, Clone, Default)]
-pub struct ToolRegistry {
+pub struct OutletRegistry {
     /// Registered tools, keyed by tool ID.
-    tools: HashMap<ToolId, ToolRegistration>,
+    tools: HashMap<OutletId, OutletRegistration>,
 }
 
-impl ToolRegistry {
+impl OutletRegistry {
     /// Creates a new empty tool registry.
     #[must_use]
     pub fn new() -> Self {
@@ -188,14 +188,14 @@ impl ToolRegistry {
 
     /// Returns the registration for the given tool ID, if it exists.
     #[must_use]
-    pub fn get(&self, tool_id: &str) -> Option<&ToolRegistration> {
-        self.tools.get(tool_id)
+    pub fn get(&self, outlet_id: &str) -> Option<&OutletRegistration> {
+        self.tools.get(outlet_id)
     }
 
     /// Returns `true` if the registry contains the given tool ID.
     #[must_use]
-    pub fn contains(&self, tool_id: &str) -> bool {
-        self.tools.contains_key(tool_id)
+    pub fn contains(&self, outlet_id: &str) -> bool {
+        self.tools.contains_key(outlet_id)
     }
 
     /// Returns the number of registered tools.
@@ -211,31 +211,31 @@ impl ToolRegistry {
     }
 
     /// Returns an iterator over all registered tool IDs.
-    pub fn tool_ids(&self) -> impl Iterator<Item = &ToolId> {
+    pub fn tool_ids(&self) -> impl Iterator<Item = &OutletId> {
         self.tools.keys()
     }
 
     /// Returns an iterator over all registrations.
-    pub fn registrations(&self) -> impl Iterator<Item = &ToolRegistration> {
+    pub fn registrations(&self) -> impl Iterator<Item = &OutletRegistration> {
         self.tools.values()
     }
 
     /// Inserts a tool registration. Returns the previous registration if one
     /// existed for this tool ID.
-    pub fn insert(&mut self, registration: ToolRegistration) -> Option<ToolRegistration> {
+    pub fn insert(&mut self, registration: OutletRegistration) -> Option<OutletRegistration> {
         self.tools
-            .insert(registration.tool_id.clone(), registration)
+            .insert(registration.outlet_id.clone(), registration)
     }
 
     /// Removes a tool registration by ID. Returns the removed registration
     /// if one existed, or `None` if the tool was not registered.
-    pub fn remove(&mut self, tool_id: &str) -> Option<ToolRegistration> {
-        self.tools.remove(tool_id)
+    pub fn remove(&mut self, outlet_id: &str) -> Option<OutletRegistration> {
+        self.tools.remove(outlet_id)
     }
 }
 
 // ---------------------------------------------------------------------------
-// register_tool
+// register_outlet
 // ---------------------------------------------------------------------------
 
 /// Registers a new tool in the context's tool registry.
@@ -248,36 +248,36 @@ impl ToolRegistry {
 /// 5. Tool ID is not already registered.
 ///
 /// On success, stores the registration and returns the tool ID along with a
-/// [`ToolRegisteredEvent`] for the caller to append to the event log.
+/// [`OutletRegisteredEvent`] for the caller to append to the event log.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError`] on validation failure.
-pub fn register_tool(
-    registry: &mut ToolRegistry,
+/// Returns [`OutletError`] on validation failure.
+pub fn register_outlet(
+    registry: &mut OutletRegistry,
     role_state: &ContextRoleState,
-    registration: ToolRegistration,
+    registration: OutletRegistration,
     registrant_did: &str,
-) -> Result<(ToolId, ToolRegisteredEvent), ToolError> {
+) -> Result<(OutletId, OutletRegisteredEvent), OutletError> {
     // 1. Validate registrant has ToolRegister capability.
-    if !has_tool_register_capability(role_state, registrant_did) {
-        return Err(ToolError::RegistrantNotAuthorized {
+    if !has_outlet_register_capability(role_state, registrant_did) {
+        return Err(OutletError::RegistrantNotAuthorized {
             did: registrant_did.to_owned(),
         });
     }
 
     // 2. Validate schemas.
     schema::validate_schema(&registration.schema.input_schema)
-        .map_err(ToolError::InvalidInputSchema)?;
+        .map_err(OutletError::InvalidInputSchema)?;
     schema::validate_schema(&registration.schema.output_schema)
-        .map_err(ToolError::InvalidOutputSchema)?;
+        .map_err(OutletError::InvalidOutputSchema)?;
 
     // 2b. Enforce schema specificity floor (spec section 6.2, 9.2.1).
     if let Err((side, field_count)) = schema::validate_specificity_floor(
         &registration.schema.input_schema,
         &registration.schema.output_schema,
     ) {
-        return Err(ToolError::SchemaSpecificityFloor {
+        return Err(OutletError::SchemaSpecificityFloor {
             side: side.to_owned(),
             field_count,
             min_fields: schema::MIN_SCHEMA_FIELDS,
@@ -291,15 +291,15 @@ pub fn register_tool(
     validate_did(&registration.operator_did)?;
 
     // 5. Check for duplicate tool ID.
-    if registry.contains(&registration.tool_id) {
-        return Err(ToolError::ToolAlreadyRegistered {
-            tool_id: registration.tool_id,
+    if registry.contains(&registration.outlet_id) {
+        return Err(OutletError::OutletAlreadyRegistered {
+            outlet_id: registration.outlet_id,
         });
     }
 
     // Build event payload.
-    let event = ToolRegisteredEvent {
-        tool_id: registration.tool_id.clone(),
+    let event = OutletRegisteredEvent {
+        outlet_id: registration.outlet_id.clone(),
         name: registration.name.clone(),
         description: registration.description.clone(),
         implementation_hash: registration.implementation_hash,
@@ -308,14 +308,14 @@ pub fn register_tool(
         test_vector_count: registration.test_vectors.len(),
     };
 
-    let tool_id = registration.tool_id.clone();
+    let outlet_id = registration.outlet_id.clone();
     registry.insert(registration);
 
-    Ok((tool_id, event))
+    Ok((outlet_id, event))
 }
 
 // ---------------------------------------------------------------------------
-// update_tool
+// update_outlet
 // ---------------------------------------------------------------------------
 
 /// Updates an existing tool registration in the registry.
@@ -332,19 +332,19 @@ pub fn register_tool(
 ///
 /// # Errors
 ///
-/// Returns [`ToolError`] on validation failure.
-pub fn update_tool(
-    registry: &mut ToolRegistry,
+/// Returns [`OutletError`] on validation failure.
+pub fn update_outlet(
+    registry: &mut OutletRegistry,
     role_state: &ContextRoleState,
-    tool_id: &str,
-    new_registration: ToolRegistration,
+    outlet_id: &str,
+    new_registration: OutletRegistration,
     updater_did: &str,
-) -> Result<ToolUpdatedEvent, ToolError> {
+) -> Result<OutletUpdatedEvent, OutletError> {
     // 1. Look up the existing registration.
     let old_registration = registry
-        .get(tool_id)
-        .ok_or_else(|| ToolError::ToolNotFound {
-            tool_id: tool_id.to_owned(),
+        .get(outlet_id)
+        .ok_or_else(|| OutletError::OutletNotFound {
+            outlet_id: outlet_id.to_owned(),
         })?
         .clone();
 
@@ -352,31 +352,31 @@ pub fn update_tool(
     let is_operator = old_registration.operator_did == updater_did;
     let is_admin = has_admin_role(role_state, updater_did);
     if !is_operator && !is_admin {
-        return Err(ToolError::UpdaterNotAuthorized {
+        return Err(OutletError::UpdaterNotAuthorized {
             did: updater_did.to_owned(),
         });
     }
 
     // 3. Validate tool ID matches.
-    if new_registration.tool_id != tool_id {
-        return Err(ToolError::ToolIdMismatch {
-            expected: tool_id.to_owned(),
-            actual: new_registration.tool_id,
+    if new_registration.outlet_id != outlet_id {
+        return Err(OutletError::OutletIdMismatch {
+            expected: outlet_id.to_owned(),
+            actual: new_registration.outlet_id,
         });
     }
 
     // 4. Validate schemas.
     schema::validate_schema(&new_registration.schema.input_schema)
-        .map_err(ToolError::InvalidInputSchema)?;
+        .map_err(OutletError::InvalidInputSchema)?;
     schema::validate_schema(&new_registration.schema.output_schema)
-        .map_err(ToolError::InvalidOutputSchema)?;
+        .map_err(OutletError::InvalidOutputSchema)?;
 
     // 4b. Enforce schema specificity floor (spec section 6.2, 9.2.1).
     if let Err((side, field_count)) = schema::validate_specificity_floor(
         &new_registration.schema.input_schema,
         &new_registration.schema.output_schema,
     ) {
-        return Err(ToolError::SchemaSpecificityFloor {
+        return Err(OutletError::SchemaSpecificityFloor {
             side: side.to_owned(),
             field_count,
             min_fields: schema::MIN_SCHEMA_FIELDS,
@@ -407,8 +407,8 @@ pub fn update_tool(
         changed_fields.push("operator_did".to_owned());
     }
 
-    let event = ToolUpdatedEvent {
-        tool_id: tool_id.to_owned(),
+    let event = OutletUpdatedEvent {
+        outlet_id: outlet_id.to_owned(),
         old_implementation_hash: old_registration.implementation_hash,
         new_implementation_hash: new_registration.implementation_hash,
         updater_did: updater_did.into(),
@@ -421,7 +421,7 @@ pub fn update_tool(
 }
 
 // ---------------------------------------------------------------------------
-// verify_tool
+// verify_outlet
 // ---------------------------------------------------------------------------
 
 /// Verifies a tool by running all its test vectors.
@@ -431,27 +431,27 @@ pub fn update_tool(
 /// stored test vectors (the tool executor is not yet integrated). The caller
 /// provides actual outputs via the `executor` function parameter.
 ///
-/// Returns a [`ToolVerificationResult`] with per-vector pass/fail status and
-/// overall integrity assessment, plus a [`ToolVerifiedEvent`] for the event
+/// Returns a [`OutletVerificationResult`] with per-vector pass/fail status and
+/// overall integrity assessment, plus a [`OutletVerifiedEvent`] for the event
 /// log.
 ///
 /// See ADR-010 acceptance criterion 5.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::ToolNotFound`] if the tool is not in the registry.
-pub fn verify_tool<F>(
-    registry: &ToolRegistry,
-    tool_id: &str,
+/// Returns [`OutletError::OutletNotFound`] if the tool is not in the registry.
+pub fn verify_outlet<F>(
+    registry: &OutletRegistry,
+    outlet_id: &str,
     executor: F,
-) -> Result<(ToolVerificationResult, ToolVerifiedEvent), ToolError>
+) -> Result<(OutletVerificationResult, OutletVerifiedEvent), OutletError>
 where
     F: Fn(&serde_json::Value) -> serde_json::Value,
 {
     let registration = registry
-        .get(tool_id)
-        .ok_or_else(|| ToolError::ToolNotFound {
-            tool_id: tool_id.to_owned(),
+        .get(outlet_id)
+        .ok_or_else(|| OutletError::OutletNotFound {
+            outlet_id: outlet_id.to_owned(),
         })?;
 
     let mut vector_results = Vec::with_capacity(registration.test_vectors.len());
@@ -471,14 +471,14 @@ where
     let failed_count = vector_results.len() - passed_count;
     let integrity_ok = failed_count == 0;
 
-    let result = ToolVerificationResult {
-        tool_id: tool_id.to_owned(),
+    let result = OutletVerificationResult {
+        outlet_id: outlet_id.to_owned(),
         vector_results,
         integrity_ok,
     };
 
-    let event = ToolVerifiedEvent {
-        tool_id: tool_id.to_owned(),
+    let event = OutletVerifiedEvent {
+        outlet_id: outlet_id.to_owned(),
         passed: passed_count,
         failed: failed_count,
         integrity_ok,
@@ -494,23 +494,35 @@ where
 /// Computes the canonical bytes for tool registration signature verification.
 ///
 /// The signed payload is a SHA-256 hash of a canonical struct containing all
-/// `ToolRegistration` fields except `signature` itself, in a deterministic
+/// `OutletRegistration` fields except `signature` itself, in a deterministic
 /// order. JSON schema fields use RFC 8785 JCS canonical serialization.
 ///
 /// The canonical representation includes:
-/// - `tool_id`, `name`, `description`
+/// - `outlet_id`
+/// - `kind_byte` (per §5.4.1: 0x00 = Query, 0x01 = Action). SCP-OUT-002 uses the
+///   placeholder `0x01` (Action, the fail-safe default per §5.4.2) so signatures
+///   remain valid across the rename commit. SCP-OUT-011 adds the real `kind`
+///   field to [`OutletRegistration`] and wires the actual byte here.
+/// - `name`, `description`
 /// - `input_schema`, `output_schema` (JCS canonical JSON bytes)
 /// - `implementation_hash` (32 bytes)
 /// - `test_vectors` (count + hashes)
 /// - `operator_did`
 /// - `registered_at` (timestamp)
 /// - `cost` (if present)
+///
+/// Note: the V2 spec preimage (§5.4.1) uses `description_hash`, `schema_hash`,
+/// `test_vectors_hash`, `cost_hash`, and `catalog_hash` in place of inline
+/// length-prefixed bytes, and reorders `operator_did` and `registered_at`.
+/// Those structural changes ship with SCP-OUT-011 / SCP-OUT-013 / SCP-OUT-024.
+/// SCP-OUT-002 introduces only the V2 domain separator and the `kind_byte`
+/// position; the remaining layout changes are scoped to downstream stories.
 #[must_use]
-pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration) -> Vec<u8> {
+pub fn compute_outlet_registration_canonical_bytes(registration: &OutletRegistration) -> Vec<u8> {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
-    hasher.update(b"SCP-TOOL-REGISTRATION-V1:");
+    hasher.update(b"SCP-OUTLET-REGISTRATION-V2:");
     // Length-prefix helper for variable-length fields.
     #[allow(clippy::cast_possible_truncation)]
     let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
@@ -518,7 +530,11 @@ pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration
         hasher.update(bytes);
     };
 
-    length_prefix(&mut hasher, registration.tool_id.as_bytes());
+    length_prefix(&mut hasher, registration.outlet_id.as_bytes());
+    // Placeholder kind_byte (0x01 = Action, the fail-safe default per §5.4.2).
+    // SCP-OUT-011 introduces the real kind field on OutletRegistration and
+    // replaces this constant with the declared kind.
+    hasher.update([0x01_u8]);
     length_prefix(&mut hasher, registration.name.as_bytes());
     length_prefix(&mut hasher, registration.description.as_bytes());
 
@@ -574,20 +590,20 @@ pub fn compute_tool_registration_canonical_bytes(registration: &ToolRegistration
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::SignatureVerificationFailed`] if:
+/// Returns [`OutletError::SignatureVerificationFailed`] if:
 /// - The signature is non-empty but not 64 bytes.
 /// - The signature does not verify against the public key.
-pub fn verify_tool_registration_signature(
-    registration: &ToolRegistration,
+pub fn verify_outlet_registration_signature(
+    registration: &OutletRegistration,
     registrant_public_key: &ed25519_dalek::VerifyingKey,
-) -> Result<(), ToolError> {
+) -> Result<(), OutletError> {
     // Empty signature = backward-compatible registration without provenance.
     if registration.signature.is_empty() {
         return Ok(());
     }
 
     let sig_bytes: [u8; 64] = registration.signature.as_slice().try_into().map_err(|_| {
-        ToolError::SignatureVerificationFailed {
+        OutletError::SignatureVerificationFailed {
             reason: format!(
                 "signature must be 64 bytes, got {}",
                 registration.signature.len()
@@ -596,11 +612,11 @@ pub fn verify_tool_registration_signature(
     })?;
 
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    let canonical = compute_tool_registration_canonical_bytes(registration);
+    let canonical = compute_outlet_registration_canonical_bytes(registration);
 
     registrant_public_key
         .verify_strict(&canonical, &signature)
-        .map_err(|e| ToolError::SignatureVerificationFailed {
+        .map_err(|e| OutletError::SignatureVerificationFailed {
             reason: format!("Ed25519 verification failed: {e}"),
         })
 }
@@ -613,9 +629,9 @@ pub fn verify_tool_registration_signature(
 ///
 /// Phase 2 check: a DID must be non-empty and start with `"did:"`. Full DID
 /// resolution is deferred to the identity subsystem.
-fn validate_did(did: &str) -> Result<(), ToolError> {
+fn validate_did(did: &str) -> Result<(), OutletError> {
     if did.is_empty() || !did.starts_with("did:") {
-        return Err(ToolError::UnresolvableDid {
+        return Err(OutletError::UnresolvableDid {
             did: did.to_owned(),
         });
     }
@@ -644,8 +660,8 @@ mod tests {
         CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolRegister,
-            Capability::ToolInvokeAll,
+            Capability::OutletRegister,
+            Capability::OutletCallAll,
             Capability::RoleAssign,
             Capability::MemberInvite,
             Capability::MemberRemove,
@@ -676,7 +692,7 @@ mod tests {
         let member_caps: HashSet<Capability> = [
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvokeAll,
+            Capability::OutletCallAll,
         ]
         .into_iter()
         .collect();
@@ -687,12 +703,12 @@ mod tests {
     }
 
     /// Creates a valid tool registration for testing.
-    fn valid_registration(tool_id: &str) -> ToolRegistration {
-        ToolRegistration {
-            tool_id: tool_id.to_owned(),
+    fn valid_registration(outlet_id: &str) -> OutletRegistration {
+        OutletRegistration {
+            outlet_id: outlet_id.to_owned(),
             name: "calculator".to_owned(),
             description: "A simple calculator tool".to_owned(),
-            schema: ToolSchema {
+            schema: OutletSchema {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -710,12 +726,12 @@ mod tests {
             },
             implementation_hash: [0xAB; 32],
             test_vectors: vec![
-                TestVector {
+                OutletTestVector {
                     input: serde_json::json!({"operation": "add", "a": 1, "b": 2}),
                     expected_output: serde_json::json!({"result": 3}),
                     description: "1 + 2 = 3".to_owned(),
                 },
-                TestVector {
+                OutletTestVector {
                     input: serde_json::json!({"operation": "mul", "a": 3, "b": 4}),
                     expected_output: serde_json::json!({"result": 12}),
                     description: "3 * 4 = 12".to_owned(),
@@ -728,15 +744,15 @@ mod tests {
         }
     }
 
-    // ----- register_tool tests -----
+    // ----- register_outlet tests -----
 
     #[test]
     fn register_tool_succeeds_with_valid_registration() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
         let registration = valid_registration("tool-1");
 
-        let result = register_tool(
+        let result = register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -744,9 +760,9 @@ mod tests {
         );
         assert!(result.is_ok());
 
-        let (tool_id, event) = result.unwrap();
-        assert_eq!(tool_id, "tool-1");
-        assert_eq!(event.tool_id, "tool-1");
+        let (outlet_id, event) = result.unwrap();
+        assert_eq!(outlet_id, "tool-1");
+        assert_eq!(event.outlet_id, "tool-1");
         assert_eq!(event.name, "calculator");
         assert_eq!(event.test_vector_count, 2);
         assert_eq!(event.registrant_did, "did:dht:z6MkCreator");
@@ -759,13 +775,13 @@ mod tests {
     #[test]
     fn register_tool_validates_schemas_are_valid_json_schema() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
         // Invalid input schema (not an object).
         let mut registration = valid_registration("tool-1");
         registration.schema.input_schema = serde_json::json!("not an object");
 
-        let result = register_tool(
+        let result = register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -773,7 +789,7 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(
-            matches!(result.unwrap_err(), ToolError::InvalidInputSchema(_)),
+            matches!(result.unwrap_err(), OutletError::InvalidInputSchema(_)),
             "expected InvalidInputSchema"
         );
 
@@ -781,7 +797,7 @@ mod tests {
         let mut registration = valid_registration("tool-1");
         registration.schema.output_schema = serde_json::json!({"properties": {}});
 
-        let result = register_tool(
+        let result = register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -789,7 +805,7 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(
-            matches!(result.unwrap_err(), ToolError::InvalidOutputSchema(_)),
+            matches!(result.unwrap_err(), OutletError::InvalidOutputSchema(_)),
             "expected InvalidOutputSchema"
         );
     }
@@ -797,11 +813,11 @@ mod tests {
     #[test]
     fn register_tool_rejects_schema_below_specificity_floor() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
         // Both schemas have only 1 property -- below the MIN_SCHEMA_FIELDS (2) floor.
         let mut registration = valid_registration("tool-1");
-        registration.schema = ToolSchema {
+        registration.schema = OutletSchema {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -816,7 +832,7 @@ mod tests {
             }),
         };
 
-        let result = register_tool(
+        let result = register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -825,7 +841,10 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, ToolError::SchemaSpecificityFloor { min_fields: 2, .. }),
+            matches!(
+                err,
+                OutletError::SchemaSpecificityFloor { min_fields: 2, .. }
+            ),
             "expected SchemaSpecificityFloor, got {err:?}"
         );
     }
@@ -833,11 +852,11 @@ mod tests {
     #[test]
     fn register_tool_accepts_schema_meeting_specificity_floor_on_input() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
         // Input has 2 properties, output has 0 -- should pass.
         let mut registration = valid_registration("tool-1");
-        registration.schema = ToolSchema {
+        registration.schema = OutletSchema {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -850,7 +869,7 @@ mod tests {
             }),
         };
 
-        let result = register_tool(
+        let result = register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -865,10 +884,10 @@ mod tests {
     #[test]
     fn register_tool_rejects_registrant_without_tool_register_capability() {
         let role_state = test_role_state_with_member("did:dht:z6MkCreator", "did:dht:z6MkMember");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
         let registration = valid_registration("tool-1");
 
-        let result = register_tool(
+        let result = register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -877,7 +896,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, ToolError::RegistrantNotAuthorized { .. }),
+            matches!(err, OutletError::RegistrantNotAuthorized { .. }),
             "expected RegistrantNotAuthorized, got {err:?}"
         );
     }
@@ -885,11 +904,11 @@ mod tests {
     #[test]
     fn register_tool_rejects_empty_operator_did() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
         let mut registration = valid_registration("tool-1");
         registration.operator_did = DID::from("");
 
-        let result = register_tool(
+        let result = register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -897,7 +916,7 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(
-            matches!(result.unwrap_err(), ToolError::UnresolvableDid { .. }),
+            matches!(result.unwrap_err(), OutletError::UnresolvableDid { .. }),
             "expected UnresolvableDid"
         );
     }
@@ -905,11 +924,11 @@ mod tests {
     #[test]
     fn register_tool_rejects_malformed_operator_did() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
         let mut registration = valid_registration("tool-1");
         registration.operator_did = "not-a-did".into();
 
-        let result = register_tool(
+        let result = register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -918,17 +937,17 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ToolError::UnresolvableDid { .. }
+            OutletError::UnresolvableDid { .. }
         ));
     }
 
     #[test]
     fn register_tool_rejects_duplicate_tool_id() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
         let registration = valid_registration("tool-1");
-        register_tool(
+        register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -937,7 +956,7 @@ mod tests {
         .unwrap();
 
         let registration2 = valid_registration("tool-1");
-        let result = register_tool(
+        let result = register_outlet(
             &mut registry,
             &role_state,
             registration2,
@@ -945,24 +964,27 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(
-            matches!(result.unwrap_err(), ToolError::ToolAlreadyRegistered { .. }),
-            "expected ToolAlreadyRegistered"
+            matches!(
+                result.unwrap_err(),
+                OutletError::OutletAlreadyRegistered { .. }
+            ),
+            "expected OutletAlreadyRegistered"
         );
     }
 
     #[test]
     fn register_tool_with_cost() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
         let mut registration = valid_registration("tool-1");
-        registration.cost = Some(ToolCost {
+        registration.cost = Some(OutletCost {
             amount: 100,
             currency: "USD".to_owned(),
             payee: "did:dht:z6MkPayee".into(),
             cost_formula: None,
         });
 
-        let result = register_tool(
+        let result = register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -976,17 +998,17 @@ mod tests {
         assert_eq!(stored.cost.as_ref().unwrap().currency, "USD");
     }
 
-    // ----- update_tool tests -----
+    // ----- update_outlet tests -----
 
     #[test]
     fn update_tool_succeeds_by_operator() {
         let role_state = test_role_state_with_member("did:dht:z6MkCreator", "did:dht:z6MkOperator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
         // Register with operator DID.
         let mut registration = valid_registration("tool-1");
         registration.operator_did = "did:dht:z6MkOperator".into();
-        register_tool(
+        register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -1000,7 +1022,7 @@ mod tests {
         new_reg.name = "updated-calculator".to_owned();
         new_reg.implementation_hash = [0xCD; 32];
 
-        let result = update_tool(
+        let result = update_outlet(
             &mut registry,
             &role_state,
             "tool-1",
@@ -1018,10 +1040,10 @@ mod tests {
     #[test]
     fn update_tool_succeeds_by_admin() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
         let registration = valid_registration("tool-1");
-        register_tool(
+        register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -1033,7 +1055,7 @@ mod tests {
         let mut new_reg = valid_registration("tool-1");
         new_reg.description = "updated description".to_owned();
 
-        let result = update_tool(
+        let result = update_outlet(
             &mut registry,
             &role_state,
             "tool-1",
@@ -1052,11 +1074,11 @@ mod tests {
     #[test]
     fn update_tool_logs_old_and_new_hashes() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
         let mut registration = valid_registration("tool-1");
         registration.implementation_hash = [0x11; 32];
-        register_tool(
+        register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -1067,7 +1089,7 @@ mod tests {
         let mut new_reg = valid_registration("tool-1");
         new_reg.implementation_hash = [0x22; 32];
 
-        let event = update_tool(
+        let event = update_outlet(
             &mut registry,
             &role_state,
             "tool-1",
@@ -1084,10 +1106,10 @@ mod tests {
     #[test]
     fn update_tool_rejects_non_operator_non_admin() {
         let role_state = test_role_state_with_member("did:dht:z6MkCreator", "did:dht:z6MkMember");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
         let registration = valid_registration("tool-1");
-        register_tool(
+        register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -1096,7 +1118,7 @@ mod tests {
         .unwrap();
 
         let new_reg = valid_registration("tool-1");
-        let result = update_tool(
+        let result = update_outlet(
             &mut registry,
             &role_state,
             "tool-1",
@@ -1106,17 +1128,17 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ToolError::UpdaterNotAuthorized { .. }
+            OutletError::UpdaterNotAuthorized { .. }
         ));
     }
 
     #[test]
     fn update_tool_rejects_nonexistent_tool() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
         let new_reg = valid_registration("tool-missing");
-        let result = update_tool(
+        let result = update_outlet(
             &mut registry,
             &role_state,
             "tool-missing",
@@ -1126,17 +1148,17 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ToolError::ToolNotFound { .. }
+            OutletError::OutletNotFound { .. }
         ));
     }
 
     #[test]
     fn update_tool_rejects_mismatched_tool_id() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
         let registration = valid_registration("tool-1");
-        register_tool(
+        register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -1144,9 +1166,9 @@ mod tests {
         )
         .unwrap();
 
-        // new_reg has different tool_id.
+        // new_reg has different outlet_id.
         let new_reg = valid_registration("tool-2");
-        let result = update_tool(
+        let result = update_outlet(
             &mut registry,
             &role_state,
             "tool-1",
@@ -1156,19 +1178,19 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ToolError::ToolIdMismatch { .. }
+            OutletError::OutletIdMismatch { .. }
         ));
     }
 
-    // ----- verify_tool tests -----
+    // ----- verify_outlet tests -----
 
     #[test]
     fn verify_tool_returns_correct_pass_fail_per_test_vector() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
         let registration = valid_registration("tool-1");
-        register_tool(
+        register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -1189,9 +1211,9 @@ mod tests {
             }
         };
 
-        let (result, event) = verify_tool(&registry, "tool-1", executor).unwrap();
+        let (result, event) = verify_outlet(&registry, "tool-1", executor).unwrap();
 
-        assert_eq!(result.tool_id, "tool-1");
+        assert_eq!(result.outlet_id, "tool-1");
         assert_eq!(result.vector_results.len(), 2);
 
         // First vector (add) should pass.
@@ -1215,10 +1237,10 @@ mod tests {
     #[test]
     fn verify_tool_all_vectors_pass() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
         let registration = valid_registration("tool-1");
-        register_tool(
+        register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -1247,7 +1269,7 @@ mod tests {
             }
         };
 
-        let (result, event) = verify_tool(&registry, "tool-1", executor).unwrap();
+        let (result, event) = verify_outlet(&registry, "tool-1", executor).unwrap();
 
         assert!(result.integrity_ok);
         assert_eq!(event.passed, 2);
@@ -1257,23 +1279,23 @@ mod tests {
 
     #[test]
     fn verify_tool_rejects_nonexistent_tool() {
-        let registry = ToolRegistry::new();
-        let result = verify_tool(&registry, "tool-missing", |_| serde_json::json!(null));
+        let registry = OutletRegistry::new();
+        let result = verify_outlet(&registry, "tool-missing", |_| serde_json::json!(null));
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ToolError::ToolNotFound { .. }
+            OutletError::OutletNotFound { .. }
         ));
     }
 
     #[test]
     fn verify_tool_with_no_test_vectors_passes() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
         let mut registration = valid_registration("tool-1");
         registration.test_vectors = vec![];
-        register_tool(
+        register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -1282,7 +1304,7 @@ mod tests {
         .unwrap();
 
         let (result, event) =
-            verify_tool(&registry, "tool-1", |_| serde_json::json!(null)).unwrap();
+            verify_outlet(&registry, "tool-1", |_| serde_json::json!(null)).unwrap();
 
         assert!(result.integrity_ok);
         assert!(result.vector_results.is_empty());
@@ -1290,34 +1312,34 @@ mod tests {
         assert_eq!(event.failed, 0);
     }
 
-    // ----- ToolRegistry tests -----
+    // ----- OutletRegistry tests -----
 
     #[test]
     fn tool_registry_starts_empty() {
-        let registry = ToolRegistry::new();
+        let registry = OutletRegistry::new();
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
     }
 
     #[test]
     fn tool_registry_get_returns_none_for_missing() {
-        let registry = ToolRegistry::new();
+        let registry = OutletRegistry::new();
         assert!(registry.get("nonexistent").is_none());
     }
 
     #[test]
     fn tool_registry_iterators() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
-        register_tool(
+        register_outlet(
             &mut registry,
             &role_state,
             valid_registration("tool-a"),
             "did:dht:z6MkCreator",
         )
         .unwrap();
-        register_tool(
+        register_outlet(
             &mut registry,
             &role_state,
             valid_registration("tool-b"),
@@ -1331,40 +1353,40 @@ mod tests {
         assert!(ids.contains(&&"tool-a".to_owned()));
         assert!(ids.contains(&&"tool-b".to_owned()));
 
-        let regs: Vec<&ToolRegistration> = registry.registrations().collect();
+        let regs: Vec<&OutletRegistration> = registry.registrations().collect();
         assert_eq!(regs.len(), 2);
     }
 
-    // ----- ToolRegistration serialization -----
+    // ----- OutletRegistration serialization -----
 
     #[test]
     fn tool_registration_serialization_roundtrip() {
         let registration = valid_registration("tool-1");
         let json = serde_json::to_string(&registration).unwrap();
-        let deserialized: ToolRegistration = serde_json::from_str(&json).unwrap();
+        let deserialized: OutletRegistration = serde_json::from_str(&json).unwrap();
         assert_eq!(registration, deserialized);
     }
 
     #[test]
     fn tool_schema_serialization_roundtrip() {
-        let schema = ToolSchema {
+        let schema = OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "string"}),
         };
         let json = serde_json::to_string(&schema).unwrap();
-        let deserialized: ToolSchema = serde_json::from_str(&json).unwrap();
+        let deserialized: OutletSchema = serde_json::from_str(&json).unwrap();
         assert_eq!(schema, deserialized);
     }
 
     #[test]
     fn test_vector_serialization_roundtrip() {
-        let vector = TestVector {
+        let vector = OutletTestVector {
             input: serde_json::json!({"x": 1}),
             expected_output: serde_json::json!({"y": 2}),
             description: "test description".to_owned(),
         };
         let json = serde_json::to_string(&vector).unwrap();
-        let deserialized: TestVector = serde_json::from_str(&json).unwrap();
+        let deserialized: OutletTestVector = serde_json::from_str(&json).unwrap();
         assert_eq!(vector, deserialized);
     }
 
@@ -1386,26 +1408,26 @@ mod tests {
         assert!(validate_did("not-a-did").is_err());
     }
 
-    // ----- ToolError display -----
+    // ----- OutletError display -----
 
     #[test]
     fn tool_error_display_messages() {
-        let err = ToolError::RegistrantNotAuthorized {
+        let err = OutletError::RegistrantNotAuthorized {
             did: "did:dht:z6MkTest".into(),
         };
         assert!(format!("{err}").contains("ToolRegister capability"));
 
-        let err = ToolError::ToolNotFound {
-            tool_id: "tool-42".to_owned(),
+        let err = OutletError::OutletNotFound {
+            outlet_id: "tool-42".to_owned(),
         };
         assert!(format!("{err}").contains("tool-42"));
 
-        let err = ToolError::ToolAlreadyRegistered {
-            tool_id: "tool-dup".to_owned(),
+        let err = OutletError::OutletAlreadyRegistered {
+            outlet_id: "tool-dup".to_owned(),
         };
         assert!(format!("{err}").contains("tool-dup"));
 
-        let err = ToolError::ToolIdMismatch {
+        let err = OutletError::OutletIdMismatch {
             expected: "tool-1".to_owned(),
             actual: "tool-2".to_owned(),
         };
@@ -1413,15 +1435,15 @@ mod tests {
         assert!(format!("{err}").contains("tool-2"));
     }
 
-    // ----- update_tool event tracks all change fields -----
+    // ----- update_outlet event tracks all change fields -----
 
     #[test]
     fn update_tool_event_tracks_schema_and_vector_changes() {
         let role_state = test_role_state("did:dht:z6MkCreator");
-        let mut registry = ToolRegistry::new();
+        let mut registry = OutletRegistry::new();
 
         let registration = valid_registration("tool-1");
-        register_tool(
+        register_outlet(
             &mut registry,
             &role_state,
             registration,
@@ -1431,7 +1453,7 @@ mod tests {
 
         // Update with changed schema and test vectors but same name/description.
         let mut new_reg = valid_registration("tool-1");
-        new_reg.schema = ToolSchema {
+        new_reg.schema = OutletSchema {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1448,7 +1470,7 @@ mod tests {
         };
         new_reg.test_vectors = vec![];
 
-        let event = update_tool(
+        let event = update_outlet(
             &mut registry,
             &role_state,
             "tool-1",
@@ -1463,18 +1485,18 @@ mod tests {
         assert!(event.changed_fields.contains(&"test_vectors".to_owned()));
     }
 
-    // ----- ToolCost -----
+    // ----- OutletCost -----
 
     #[test]
     fn tool_cost_serialization_roundtrip() {
-        let cost = ToolCost {
+        let cost = OutletCost {
             amount: 500,
             currency: "USD".to_owned(),
             payee: "did:dht:z6MkPayee".into(),
             cost_formula: Some("linear".to_owned()),
         };
         let json = serde_json::to_string(&cost).unwrap();
-        let deserialized: ToolCost = serde_json::from_str(&json).unwrap();
+        let deserialized: OutletCost = serde_json::from_str(&json).unwrap();
         assert_eq!(cost, deserialized);
     }
 }

@@ -27,13 +27,13 @@ use super::addressing::HandleTarget;
 // ---------------------------------------------------------------------------
 
 /// Standard tool name for handle registration.
-pub const TOOL_HANDLE_REGISTER: &str = "handle_register";
+pub const OUTLET_HANDLE_REGISTER: &str = "handle_register";
 
 /// Standard tool name for handle lookup.
-pub const TOOL_HANDLE_LOOKUP: &str = "handle_lookup";
+pub const OUTLET_HANDLE_LOOKUP: &str = "handle_lookup";
 
 /// Standard tool name for handle deregistration.
-pub const TOOL_HANDLE_DEREGISTER: &str = "handle_deregister";
+pub const OUTLET_HANDLE_DEREGISTER: &str = "handle_deregister";
 
 /// Maximum number of entries in a single handle registry (§22.3.1).
 const MAX_HANDLE_ENTRIES: usize = 10_000;

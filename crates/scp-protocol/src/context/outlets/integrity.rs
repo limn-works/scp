@@ -1,6 +1,6 @@
 //! Schema-based tool integrity verification and scheduling.
 //!
-//! Extends the exact-match [`verify_tool`](super::verify_tool) with
+//! Extends the exact-match [`verify_outlet`](super::verify_outlet) with
 //! schema-based verification that checks structural compatibility (same keys,
 //! compatible types) rather than exact value equality. Produces
 //! [`ChallengeVerification`] results for integration with the trust subsystem.
@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{ToolError, ToolId, ToolRegistry, ToolVerificationResult, VectorResult};
+use super::{OutletError, OutletId, OutletRegistry, OutletVerificationResult, VectorResult};
 use crate::trust::challenge::{ChallengeType, ChallengeVerification, VerificationMethod};
 use scp_primitives::Clock;
 use scp_primitives::DID;
@@ -91,7 +91,7 @@ pub struct SchemaVectorResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaVerificationResult {
     /// The tool that was verified.
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     /// Per-vector results.
     pub vector_results: Vec<SchemaVectorResult>,
     /// Overall integrity assessment: true if all vectors passed.
@@ -100,7 +100,7 @@ pub struct SchemaVerificationResult {
 
 /// Verifies a tool's integrity using schema-based output comparison.
 ///
-/// Unlike [`verify_tool`](super::verify_tool) which requires exact value
+/// Unlike [`verify_outlet`](super::verify_outlet) which requires exact value
 /// equality, this function checks that the actual output is *structurally
 /// compatible* with the expected output: same keys, compatible types,
 /// recursive matching. Extra keys in the actual output are allowed.
@@ -111,21 +111,21 @@ pub struct SchemaVerificationResult {
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::ToolNotFound`] if the tool is not in the registry.
+/// Returns [`OutletError::OutletNotFound`] if the tool is not in the registry.
 pub fn verify_tool_integrity<F>(
-    registry: &ToolRegistry,
-    tool_id: &str,
+    registry: &OutletRegistry,
+    outlet_id: &str,
     verifier_did: &DID,
     clock: &dyn Clock,
     executor: F,
-) -> Result<(ChallengeVerification, SchemaVerificationResult), ToolError>
+) -> Result<(ChallengeVerification, SchemaVerificationResult), OutletError>
 where
     F: Fn(&Value) -> Value,
 {
     let registration = registry
-        .get(tool_id)
-        .ok_or_else(|| ToolError::ToolNotFound {
-            tool_id: tool_id.to_owned(),
+        .get(outlet_id)
+        .ok_or_else(|| OutletError::OutletNotFound {
+            outlet_id: outlet_id.to_owned(),
         })?;
 
     let operator_did = registration.operator_did.clone();
@@ -158,7 +158,7 @@ where
 
     let now = clock.now_secs();
 
-    let challenge_id = format!("tool-integrity-{tool_id}-{now}");
+    let challenge_id = format!("tool-integrity-{outlet_id}-{now}");
 
     let verification = ChallengeVerification {
         verification_id: challenge_id,
@@ -177,7 +177,7 @@ where
         #[allow(clippy::cast_possible_truncation)] // subset of vector count, bounded well below u32::MAX
         pass_count: passed_count as u32,
         result: serde_json::json!({
-            "tool_id": tool_id,
+            "outlet_id": outlet_id,
             "vectors_passed": passed_count,
             "vectors_total": vector_results.len(),
             "integrity_ok": integrity_ok,
@@ -189,7 +189,7 @@ where
     };
 
     let schema_result = SchemaVerificationResult {
-        tool_id: tool_id.to_owned(),
+        outlet_id: outlet_id.to_owned(),
         vector_results,
         integrity_ok,
     };
@@ -197,12 +197,12 @@ where
     Ok((verification, schema_result))
 }
 
-/// Converts a [`SchemaVerificationResult`] to a [`ToolVerificationResult`]
+/// Converts a [`SchemaVerificationResult`] to a [`OutletVerificationResult`]
 /// for backward compatibility with the existing exact-match API.
 #[must_use]
-pub fn schema_result_to_tool_result(result: &SchemaVerificationResult) -> ToolVerificationResult {
-    ToolVerificationResult {
-        tool_id: result.tool_id.clone(),
+pub fn schema_result_to_tool_result(result: &SchemaVerificationResult) -> OutletVerificationResult {
+    OutletVerificationResult {
+        outlet_id: result.outlet_id.clone(),
         vector_results: result
             .vector_results
             .iter()
@@ -222,9 +222,9 @@ pub fn schema_result_to_tool_result(result: &SchemaVerificationResult) -> ToolVe
 
 /// A scheduled verification entry for a tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolVerificationSchedule {
+pub struct OutletVerificationSchedule {
     /// The tool to verify.
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     /// Verification interval in seconds.
     pub interval_secs: u64,
     /// Unix timestamp (seconds) of the last verification, or None if never
@@ -242,7 +242,7 @@ pub struct ToolVerificationSchedule {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VerificationScheduler {
     /// Scheduled verification entries keyed by tool ID.
-    schedules: HashMap<ToolId, ToolVerificationSchedule>,
+    schedules: HashMap<OutletId, OutletVerificationSchedule>,
 }
 
 impl VerificationScheduler {
@@ -261,18 +261,18 @@ impl VerificationScheduler {
     ///
     pub fn schedule_tool_verification(
         &mut self,
-        tool_id: &str,
+        outlet_id: &str,
         interval_secs: u64,
         clock: &dyn Clock,
-    ) -> &ToolVerificationSchedule {
+    ) -> &OutletVerificationSchedule {
         let now = clock.now_secs();
-        let schedule = ToolVerificationSchedule {
-            tool_id: tool_id.to_owned(),
+        let schedule = OutletVerificationSchedule {
+            outlet_id: outlet_id.to_owned(),
             interval_secs,
             last_verified_at: None,
             next_verification_at: now,
         };
-        let key = tool_id.to_owned();
+        let key = outlet_id.to_owned();
         self.schedules.insert(key.clone(), schedule);
         &self.schedules[&key]
     }
@@ -280,38 +280,38 @@ impl VerificationScheduler {
     /// Removes the verification schedule for a tool.
     ///
     /// Returns true if a schedule was removed.
-    pub fn unschedule_tool_verification(&mut self, tool_id: &str) -> bool {
-        self.schedules.remove(tool_id).is_some()
+    pub fn unschedule_tool_verification(&mut self, outlet_id: &str) -> bool {
+        self.schedules.remove(outlet_id).is_some()
     }
 
     /// Returns the schedule for a tool, if any.
     #[must_use]
-    pub fn get_schedule(&self, tool_id: &str) -> Option<&ToolVerificationSchedule> {
-        self.schedules.get(tool_id)
+    pub fn get_schedule(&self, outlet_id: &str) -> Option<&OutletVerificationSchedule> {
+        self.schedules.get(outlet_id)
     }
 
     /// Returns all tool IDs that are due for verification at the given
     /// timestamp.
     #[must_use]
-    pub fn tools_due_at(&self, now: u64) -> Vec<ToolId> {
+    pub fn tools_due_at(&self, now: u64) -> Vec<OutletId> {
         self.schedules
             .values()
             .filter(|s| now >= s.next_verification_at)
-            .map(|s| s.tool_id.clone())
+            .map(|s| s.outlet_id.clone())
             .collect()
     }
 
     /// Returns all tool IDs that are currently due for verification.
     #[must_use]
-    pub fn tools_due_now(&self, clock: &dyn Clock) -> Vec<ToolId> {
+    pub fn tools_due_now(&self, clock: &dyn Clock) -> Vec<OutletId> {
         let now = clock.now_secs();
         self.tools_due_at(now)
     }
 
     /// Records that a tool was verified at the given timestamp, advancing
     /// the next verification time.
-    pub fn record_verification(&mut self, tool_id: &str, verified_at: u64) {
-        if let Some(schedule) = self.schedules.get_mut(tool_id) {
+    pub fn record_verification(&mut self, outlet_id: &str, verified_at: u64) {
+        if let Some(schedule) = self.schedules.get_mut(outlet_id) {
             schedule.last_verified_at = Some(verified_at);
             schedule.next_verification_at = verified_at + schedule.interval_secs;
         }
@@ -330,7 +330,7 @@ impl VerificationScheduler {
     }
 
     /// Returns an iterator over all schedules.
-    pub fn schedules(&self) -> impl Iterator<Item = &ToolVerificationSchedule> {
+    pub fn schedules(&self) -> impl Iterator<Item = &OutletVerificationSchedule> {
         self.schedules.values()
     }
 }
@@ -343,17 +343,17 @@ impl VerificationScheduler {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::context::tools::registry::{TestVector, ToolRegistration, ToolSchema};
+    use crate::context::outlets::registry::{OutletRegistration, OutletSchema, OutletTestVector};
     use scp_primitives::Clock;
     use serde_json::json;
 
-    fn make_registry(tool_id: &str, test_vectors: Vec<TestVector>) -> ToolRegistry {
-        let mut registry = ToolRegistry::new();
-        let reg = ToolRegistration {
-            tool_id: tool_id.to_owned(),
-            name: format!("Test Tool {tool_id}"),
+    fn make_registry(outlet_id: &str, test_vectors: Vec<OutletTestVector>) -> OutletRegistry {
+        let mut registry = OutletRegistry::new();
+        let reg = OutletRegistration {
+            outlet_id: outlet_id.to_owned(),
+            name: format!("Test Tool {outlet_id}"),
             description: "A test tool".to_owned(),
-            schema: ToolSchema {
+            schema: OutletSchema {
                 input_schema: json!({"type": "object"}),
                 output_schema: json!({"type": "object"}),
             },
@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn verify_integrity_all_pass() {
-        let vectors = vec![TestVector {
+        let vectors = vec![OutletTestVector {
             input: json!({"x": 1}),
             expected_output: json!({"result": 42, "status": "ok"}),
             description: "basic test".to_owned(),
@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn verify_integrity_schema_mismatch() {
-        let vectors = vec![TestVector {
+        let vectors = vec![OutletTestVector {
             input: json!({"x": 1}),
             expected_output: json!({"result": 42}),
             description: "expects number".to_owned(),
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn verify_integrity_tool_not_found() {
-        let registry = ToolRegistry::new();
+        let registry = OutletRegistry::new();
         let verifier = DID::from("did:dht:verifier");
 
         let clock = scp_primitives::SystemClock;
@@ -506,20 +506,20 @@ mod tests {
             .unwrap_err();
 
         match err {
-            ToolError::ToolNotFound { tool_id } => assert_eq!(tool_id, "missing"),
-            other => panic!("expected ToolNotFound, got: {other}"),
+            OutletError::OutletNotFound { outlet_id } => assert_eq!(outlet_id, "missing"),
+            other => panic!("expected OutletNotFound, got: {other}"),
         }
     }
 
     #[test]
     fn verify_integrity_multiple_vectors_pass() {
         let vectors = vec![
-            TestVector {
+            OutletTestVector {
                 input: json!({}),
                 expected_output: json!({"a": 1}),
                 description: "pass".to_owned(),
             },
-            TestVector {
+            OutletTestVector {
                 input: json!({}),
                 expected_output: json!({"a": 1}),
                 description: "also pass".to_owned(),
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn schema_result_conversion() {
         let schema_result = SchemaVerificationResult {
-            tool_id: "t1".to_owned(),
+            outlet_id: "t1".to_owned(),
             vector_results: vec![
                 SchemaVectorResult {
                     description: "ok".to_owned(),
@@ -557,7 +557,7 @@ mod tests {
             integrity_ok: false,
         };
         let tool_result = schema_result_to_tool_result(&schema_result);
-        assert_eq!(tool_result.tool_id, "t1");
+        assert_eq!(tool_result.outlet_id, "t1");
         assert!(!tool_result.integrity_ok);
         assert_eq!(tool_result.vector_results.len(), 2);
         assert!(tool_result.vector_results[0].passed);
@@ -571,7 +571,7 @@ mod tests {
         assert!(scheduler.is_empty());
 
         let schedule = scheduler.schedule_tool_verification("tool-a", 300, &clock);
-        assert_eq!(schedule.tool_id, "tool-a");
+        assert_eq!(schedule.outlet_id, "tool-a");
         assert_eq!(schedule.interval_secs, 300);
         assert!(schedule.last_verified_at.is_none());
 

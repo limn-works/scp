@@ -8,7 +8,7 @@
 //! # Flow
 //!
 //! 1. Source context admin calls [`expose_tool`] to propose sharing a tool.
-//!    This creates a [`ProposeToolInterface`] governance action.
+//!    This creates a [`ProposeOutletInterface`] governance action.
 //! 2. On governance approval, an [`InterfaceOffer`] is published (7-day expiry).
 //! 3. Target context admin calls [`accept_tool_interface`] with an
 //!    [`InboundPolicy`] to accept.
@@ -25,9 +25,9 @@ use scp_primitives::Clock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::lifecycle::{ToolStatus, sha256_json};
-use super::registry::{ToolRegistration, ToolRegistry};
-use super::{DID, ToolError, ToolId, has_admin_role};
+use super::lifecycle::{OutletStatus, sha256_json};
+use super::registry::{OutletRegistration, OutletRegistry};
+use super::{DID, OutletError, OutletId, has_admin_role};
 use crate::context::roles::ContextRoleState;
 use crate::provenance::DataProvenance;
 use crate::provenance::attach::{SourceContextInfo, attach_provenance, effective_max_chain_depth};
@@ -87,7 +87,7 @@ pub const OFFER_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundPolicy {
     /// DIDs in the source context authorized to use this interface.
-    /// Empty means any member with the `ToolInterface` capability.
+    /// Empty means any member with the `OutletInterface` capability.
     /// Enforced in [`invoke_cross_context`].
     pub allowed_callers: Vec<DID>,
     /// Maximum calls per minute from the source context's perspective.
@@ -121,7 +121,7 @@ impl Default for OutboundPolicy {
 /// Controls which roles in the source context can call and response constraints.
 /// Fields are enforced in [`invoke_cross_context`]:
 /// - `allowed_source_roles`: advisory — role-based filtering is enforced by
-///   the source context's governance engine (via `has_tool_invoke_capability`),
+///   the source context's governance engine (via `has_outlet_call_capability`),
 ///   not repeated here. The field signals the target's expectations.
 /// - `max_calls_per_minute`: enforced by the per-interface [`RateLimit`]
 ///   (effective limit is `min(outbound, inbound)`).
@@ -134,7 +134,7 @@ impl Default for OutboundPolicy {
 pub struct InboundPolicy {
     /// Roles in the source context whose members can call. Empty means any role.
     /// Advisory: role enforcement is the source context governance engine's
-    /// responsibility (it checks `has_tool_invoke_capability`).
+    /// responsibility (it checks `has_outlet_call_capability`).
     pub allowed_source_roles: Vec<String>,
     /// Maximum calls per minute from the target context's perspective.
     /// Enforced by the per-interface [`RateLimit`].
@@ -164,9 +164,9 @@ impl Default for InboundPolicy {
 
 /// Governance action: propose exposing a tool to another context (§6.2.0.1 step 1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProposeToolInterface {
+pub struct ProposeOutletInterface {
     /// The tool to expose.
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     /// The context to expose the tool to.
     pub target_context: ContextId,
     /// Outbound policy for the interface.
@@ -181,7 +181,7 @@ pub struct ProposeToolInterface {
 /// 7 days if not accepted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceOffer {
-    /// `SHA-256("SCP-OFFER-ID-V1:" || len(source_context_id) || source_context_id || len(tool_id) || tool_id || len(target_context_id) || target_context_id || timestamp)`.
+    /// `SHA-256("SCP-OFFER-ID-V1:" || len(source_context_id) || source_context_id || len(outlet_id) || outlet_id || len(target_context_id) || target_context_id || timestamp)`.
     /// Domain-separated and length-prefixed (4-byte big-endian) to prevent collisions.
     pub offer_id: [u8; 32],
     /// The context exposing the tool.
@@ -189,7 +189,7 @@ pub struct InterfaceOffer {
     /// The context the tool is offered to.
     pub target_context: ContextId,
     /// Full tool registration (schema, metadata).
-    pub tool_schema: ToolRegistration,
+    pub outlet_schema: OutletRegistration,
     /// Outbound policy set by the source context.
     pub outbound_policy: OutboundPolicy,
     /// Unix timestamp (ms) when the offer expires (7 days from creation).
@@ -197,7 +197,7 @@ pub struct InterfaceOffer {
 }
 
 impl InterfaceOffer {
-    /// Computes the offer ID as `SHA-256("SCP-OFFER-ID-V1:" || len(source_context) || source_context || len(tool_id) || tool_id || len(target_context) || target_context || timestamp)`.
+    /// Computes the offer ID as `SHA-256("SCP-OFFER-ID-V1:" || len(source_context) || source_context || len(outlet_id) || outlet_id || len(target_context) || target_context || timestamp)`.
     ///
     /// The domain separator `"SCP-OFFER-ID-V1:"` ensures this hash cannot
     /// collide with hashes from other SCP subsystems. Each string field is
@@ -208,7 +208,7 @@ impl InterfaceOffer {
     #[allow(clippy::cast_possible_truncation)] // Protocol IDs are far below u32::MAX bytes.
     pub fn compute_offer_id(
         source_context: &str,
-        tool_id: &str,
+        outlet_id: &str,
         target_context: &str,
         timestamp: u64,
     ) -> [u8; 32] {
@@ -216,8 +216,8 @@ impl InterfaceOffer {
         hasher.update(b"SCP-OFFER-ID-V1:");
         hasher.update((source_context.len() as u32).to_be_bytes());
         hasher.update(source_context.as_bytes());
-        hasher.update((tool_id.len() as u32).to_be_bytes());
-        hasher.update(tool_id.as_bytes());
+        hasher.update((outlet_id.len() as u32).to_be_bytes());
+        hasher.update(outlet_id.as_bytes());
         hasher.update((target_context.len() as u32).to_be_bytes());
         hasher.update(target_context.as_bytes());
         hasher.update(timestamp.to_be_bytes());
@@ -233,7 +233,7 @@ impl InterfaceOffer {
 
 /// Governance action: accept a tool interface offer (§6.2.0.1 step 4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AcceptToolInterface {
+pub struct AcceptOutletInterface {
     /// The offer being accepted (must match an outstanding `InterfaceOffer`).
     pub offer_id: [u8; 32],
     /// Inbound policy set by the accepting context.
@@ -245,7 +245,7 @@ pub struct AcceptToolInterface {
 /// Either context can revoke unilaterally. Recorded in the revoking context's
 /// event log as an `InterfaceRevoked` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RevokeToolInterface {
+pub struct RevokeOutletInterface {
     /// The interface being revoked (same as the offer ID that established it).
     pub interface_id: [u8; 32],
 }
@@ -260,7 +260,7 @@ pub struct InterfaceEstablished {
     /// Target context.
     pub target_context: ContextId,
     /// Tool being shared.
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     /// Unix timestamp (ms) when established.
     pub established_at: u64,
 }
@@ -617,7 +617,7 @@ impl PerCallerRateLimit {
 }
 
 // ---------------------------------------------------------------------------
-// ToolInterface
+// OutletInterface
 // ---------------------------------------------------------------------------
 
 /// A cross-context tool interface with bidirectional consent and dual policies.
@@ -628,13 +628,13 @@ impl PerCallerRateLimit {
 ///
 /// See ADR-010 section 6 and spec section 6.2, §6.2.0.1, §6.2.0.2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolInterface {
+pub struct OutletInterface {
     /// The context exposing (sourcing) the tool.
     pub source_context: ContextId,
     /// The context consuming (targeting) the tool.
     pub target_context: ContextId,
     /// The tool being shared across contexts.
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     /// Optional per-interface rate limit for calls through this interface.
     pub rate_limit: Option<RateLimit>,
     /// Per-caller rate limiter (spec §6.2.0.2). Default: 10 calls/min per caller.
@@ -663,7 +663,7 @@ pub struct CrossContextToolEvent {
     /// UUID v4 request identifier.
     pub request_id: String,
     /// The tool that was invoked.
-    pub tool_id: ToolId,
+    pub outlet_id: OutletId,
     /// The context that initiated the call (source).
     pub source_context: ContextId,
     /// The context that received the call (target).
@@ -671,7 +671,7 @@ pub struct CrossContextToolEvent {
     /// The DID of the invoker.
     pub invoker_did: DID,
     /// Terminal status of the invocation.
-    pub status: ToolStatus,
+    pub status: OutletStatus,
     /// SHA-256 hash of the input (hex-encoded).
     pub input_hash: String,
     /// SHA-256 hash of the output (hex-encoded), if output was produced.
@@ -691,7 +691,7 @@ pub struct CrossContextToolEvent {
 /// Initiates a cross-context tool interface proposal from the source context.
 ///
 /// The caller (admin of the source context) proposes sharing a specific tool
-/// with the target context. The returned [`ToolInterface`] has
+/// with the target context. The returned [`OutletInterface`] has
 /// `approved_by_source = true` and `approved_by_target = false`. The target
 /// context must call [`accept_tool_interface`] to complete the handshake.
 ///
@@ -701,7 +701,7 @@ pub struct CrossContextToolEvent {
 /// # Arguments
 ///
 /// * `context` - The source context handle.
-/// * `tool_id` - The ID of the tool to expose.
+/// * `outlet_id` - The ID of the tool to expose.
 /// * `to_context` - The target context ID.
 /// * `role_state` - The source context's role state for capability checking.
 /// * `admin_did` - The DID of the admin proposing the interface.
@@ -711,38 +711,38 @@ pub struct CrossContextToolEvent {
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::InterfaceAdminRequired`] if the caller is not an admin.
-/// Returns [`ToolError::ToolNotFound`] if the tool is not in the registry.
+/// Returns [`OutletError::InterfaceAdminRequired`] if the caller is not an admin.
+/// Returns [`OutletError::OutletNotFound`] if the tool is not in the registry.
 #[allow(clippy::too_many_arguments)]
 pub fn expose_tool(
     context_id: &str,
-    tool_id: &ToolId,
+    outlet_id: &OutletId,
     to_context: &ContextId,
     role_state: &ContextRoleState,
     admin_did: &str,
-    registry: &ToolRegistry,
+    registry: &OutletRegistry,
     rate_limit: Option<RateLimit>,
     outbound_policy: Option<OutboundPolicy>,
-) -> Result<ToolInterface, ToolError> {
+) -> Result<OutletInterface, OutletError> {
     // Require admin capability.
     if !has_admin_role(role_state, admin_did) {
-        return Err(ToolError::InterfaceAdminRequired {
+        return Err(OutletError::InterfaceAdminRequired {
             did: admin_did.to_owned(),
         });
     }
 
     // Verify the tool exists in the source context's registry.
-    if !registry.contains(tool_id) {
-        return Err(ToolError::ToolNotFound {
-            tool_id: tool_id.to_owned(),
+    if !registry.contains(outlet_id) {
+        return Err(OutletError::OutletNotFound {
+            outlet_id: outlet_id.to_owned(),
         });
     }
 
     let default_window = Duration::from_secs(DEFAULT_WINDOW_SECONDS);
-    Ok(ToolInterface {
+    Ok(OutletInterface {
         source_context: context_id.to_owned(),
         target_context: to_context.to_owned(),
-        tool_id: tool_id.to_owned(),
+        outlet_id: outlet_id.to_owned(),
         rate_limit,
         per_caller_rate_limit: Some(PerCallerRateLimit::new(
             u64::from(DEFAULT_PER_CALLER_CALLS_PER_MINUTE),
@@ -771,13 +771,13 @@ pub fn expose_tool(
 /// An [`InterfaceOffer`] to be published in the source context's event log.
 #[must_use]
 pub fn create_interface_offer(
-    interface: &ToolInterface,
-    tool_registration: &ToolRegistration,
+    interface: &OutletInterface,
+    tool_registration: &OutletRegistration,
     timestamp_ms: u64,
 ) -> InterfaceOffer {
     let offer_id = InterfaceOffer::compute_offer_id(
         &interface.source_context,
-        &interface.tool_id,
+        &interface.outlet_id,
         &interface.target_context,
         timestamp_ms,
     );
@@ -788,7 +788,7 @@ pub fn create_interface_offer(
         offer_id,
         source_context: interface.source_context.clone(),
         target_context: interface.target_context.clone(),
-        tool_schema: tool_registration.clone(),
+        outlet_schema: tool_registration.clone(),
         outbound_policy,
         expires_at: timestamp_ms.saturating_add(OFFER_EXPIRY_MS),
     }
@@ -840,26 +840,26 @@ pub fn revoke_tool_interface(
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::InterfaceAdminRequired`] if the caller is not an admin.
-/// Returns [`ToolError::InterfaceContextMismatch`] if the interface's target
+/// Returns [`OutletError::InterfaceAdminRequired`] if the caller is not an admin.
+/// Returns [`OutletError::InterfaceContextMismatch`] if the interface's target
 /// context does not match the provided context handle.
 pub fn accept_tool_interface(
     context_id: &str,
-    interface: &mut ToolInterface,
+    interface: &mut OutletInterface,
     role_state: &ContextRoleState,
     admin_did: &str,
     inbound_policy: Option<InboundPolicy>,
-) -> Result<(), ToolError> {
+) -> Result<(), OutletError> {
     // Require admin capability.
     if !has_admin_role(role_state, admin_did) {
-        return Err(ToolError::InterfaceAdminRequired {
+        return Err(OutletError::InterfaceAdminRequired {
             did: admin_did.to_owned(),
         });
     }
 
     // Verify the interface targets this context.
     if interface.target_context != context_id {
-        return Err(ToolError::InterfaceContextMismatch {
+        return Err(OutletError::InterfaceContextMismatch {
             expected: interface.target_context.clone(),
             actual: context_id.to_owned(),
         });
@@ -903,29 +903,29 @@ pub fn accept_tool_interface(
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::ChainDepthExceeded`] if `chain_depth` exceeds the
+/// Returns [`OutletError::ChainDepthExceeded`] if `chain_depth` exceeds the
 /// source context's effective max chain depth (default 8 per ADR-043).
-/// Returns [`ToolError::InterfaceNotApproved`] if either context has not
+/// Returns [`OutletError::InterfaceNotApproved`] if either context has not
 /// approved the interface.
-/// Returns [`ToolError::InterfaceRateLimited`] if either the per-interface
+/// Returns [`OutletError::InterfaceRateLimited`] if either the per-interface
 /// or per-caller rate limit is exceeded.
-/// Returns [`ToolError::InterfaceCallerNotAllowed`] if the invoker is not
+/// Returns [`OutletError::InterfaceCallerNotAllowed`] if the invoker is not
 /// in the outbound policy's `allowed_callers` list.
-/// Returns [`ToolError::InterfacePayloadTooLarge`] if the serialized input
+/// Returns [`OutletError::InterfacePayloadTooLarge`] if the serialized input
 /// exceeds the outbound policy's `max_payload_bytes`.
-/// Returns [`ToolError::InterfaceResponseTooLarge`] if the serialized output
+/// Returns [`OutletError::InterfaceResponseTooLarge`] if the serialized output
 /// exceeds the inbound policy's `max_response_bytes`.
-/// Returns [`ToolError::InterfaceAdminRequired`] if the invoker lacks the
+/// Returns [`OutletError::InterfaceAdminRequired`] if the invoker lacks the
 /// required capability in the source context.
 #[allow(clippy::too_many_arguments)]
 pub fn invoke_cross_context<F>(
     source_context_id: &str,
     source_max_chain_depth: Option<u8>,
-    interface: &mut ToolInterface,
+    interface: &mut OutletInterface,
     input: &serde_json::Value,
     invoker_did: &DID,
     source_role_state: &ContextRoleState,
-    target_registry: &ToolRegistry,
+    target_registry: &OutletRegistry,
     chain_depth: u8,
     executor: F,
     clock: &dyn Clock,
@@ -936,7 +936,7 @@ pub fn invoke_cross_context<F>(
         CrossContextToolEvent,
         CrossContextToolEvent,
     ),
-    ToolError,
+    OutletError,
 >
 where
     F: FnOnce(&serde_json::Value) -> Result<serde_json::Value, String>,
@@ -945,7 +945,7 @@ where
     // (spec §24.4). Falls back to DEFAULT_MAX_CHAIN_DEPTH (8) when unconfigured (ADR-043).
     let max_depth = effective_max_chain_depth(source_max_chain_depth);
     if chain_depth > max_depth {
-        return Err(ToolError::ChainDepthExceeded {
+        return Err(OutletError::ChainDepthExceeded {
             depth: chain_depth,
             max_depth,
         });
@@ -953,7 +953,7 @@ where
 
     // 1. Both sides must have approved.
     if !interface.approved_by_source || !interface.approved_by_target {
-        return Err(ToolError::InterfaceNotApproved {
+        return Err(OutletError::InterfaceNotApproved {
             source_approved: interface.approved_by_source,
             target_approved: interface.approved_by_target,
         });
@@ -961,7 +961,7 @@ where
 
     // Verify the source context matches the interface.
     if interface.source_context != source_context_id {
-        return Err(ToolError::InterfaceContextMismatch {
+        return Err(OutletError::InterfaceContextMismatch {
             expected: interface.source_context.clone(),
             actual: source_context_id.to_owned(),
         });
@@ -975,7 +975,7 @@ where
         // Window durations are always far below u64::MAX milliseconds.
         let window_ms = rate_limit.window.as_millis() as u64;
         let retry_after_secs = rate_limit.retry_after_secs(clock);
-        return Err(ToolError::InterfaceRateLimited {
+        return Err(OutletError::InterfaceRateLimited {
             max_calls: rate_limit.max_calls,
             window_ms,
             retry_after_secs,
@@ -989,7 +989,7 @@ where
     {
         let window_ms = per_caller_rl.window.as_millis() as u64;
         let retry_after_secs = per_caller_rl.retry_after_secs_for(invoker_did, clock);
-        return Err(ToolError::InterfaceRateLimited {
+        return Err(OutletError::InterfaceRateLimited {
             max_calls: per_caller_rl.max_calls_per_caller,
             window_ms,
             retry_after_secs,
@@ -998,9 +998,9 @@ where
 
     // 4. Outbound policy enforcement (§6.2.0.1): allowed_callers and payload size.
     if let Some(ref outbound) = interface.outbound_policy {
-        // allowed_callers: empty means any member with ToolInterface capability.
+        // allowed_callers: empty means any member with OutletInterface capability.
         if !outbound.allowed_callers.is_empty() && !outbound.allowed_callers.contains(invoker_did) {
-            return Err(ToolError::InterfaceCallerNotAllowed {
+            return Err(OutletError::InterfaceCallerNotAllowed {
                 did: invoker_did.to_string(),
             });
         }
@@ -1008,7 +1008,7 @@ where
         // max_payload_bytes: check serialized input size.
         let input_bytes = serde_json::to_vec(input).unwrap_or_default();
         if input_bytes.len() > outbound.max_payload_bytes as usize {
-            return Err(ToolError::InterfacePayloadTooLarge {
+            return Err(OutletError::InterfacePayloadTooLarge {
                 actual: input_bytes.len(),
                 max: outbound.max_payload_bytes,
             });
@@ -1016,29 +1016,29 @@ where
     }
 
     // 5. Source context governance: invoker must have tool invoke capability.
-    if !super::has_tool_invoke_capability(source_role_state, invoker_did, &interface.tool_id) {
-        return Err(ToolError::InterfaceInvokerNotAuthorized {
+    if !super::has_outlet_call_capability(source_role_state, invoker_did, &interface.outlet_id) {
+        return Err(OutletError::InterfaceInvokerNotAuthorized {
             did: invoker_did.to_string(),
-            tool_id: interface.tool_id.clone(),
+            outlet_id: interface.outlet_id.clone(),
         });
     }
 
     // 6. Target context governance: tool must exist in target registry.
-    if !target_registry.contains(&interface.tool_id) {
-        return Err(ToolError::ToolNotFound {
-            tool_id: interface.tool_id.clone(),
+    if !target_registry.contains(&interface.outlet_id) {
+        return Err(OutletError::OutletNotFound {
+            outlet_id: interface.outlet_id.clone(),
         });
     }
 
     // 7. Execute the tool.
     let output =
-        executor(input).map_err(|msg| ToolError::InterfaceExecutionFailed { message: msg })?;
+        executor(input).map_err(|msg| OutletError::InterfaceExecutionFailed { message: msg })?;
 
     // 8. Inbound policy enforcement (§6.2.0.1): response payload size.
     if let Some(ref inbound) = interface.inbound_policy {
         let response_bytes = serde_json::to_vec(&output).unwrap_or_default();
         if response_bytes.len() > inbound.max_response_bytes as usize {
-            return Err(ToolError::InterfaceResponseTooLarge {
+            return Err(OutletError::InterfaceResponseTooLarge {
                 actual: response_bytes.len(),
                 max: inbound.max_response_bytes,
             });
@@ -1098,7 +1098,7 @@ fn build_invocation_provenance(
 /// Builds matched event payloads for the source and target contexts of a
 /// cross-context tool invocation. Both events share the same `request_id`.
 fn build_cross_context_events(
-    interface: &ToolInterface,
+    interface: &OutletInterface,
     input: &serde_json::Value,
     output: &serde_json::Value,
     invoker_did: &DID,
@@ -1110,11 +1110,11 @@ fn build_cross_context_events(
 
     let source_event = CrossContextToolEvent {
         request_id: request_id.clone(),
-        tool_id: interface.tool_id.clone(),
+        outlet_id: interface.outlet_id.clone(),
         source_context: interface.source_context.clone(),
         target_context: interface.target_context.clone(),
         invoker_did: invoker_did.to_owned(),
-        status: ToolStatus::Success,
+        status: OutletStatus::Success,
         input_hash: input_hash.clone(),
         output_hash: output_hash.clone(),
         provenance: Some(provenance.clone()),
@@ -1122,11 +1122,11 @@ fn build_cross_context_events(
 
     let target_event = CrossContextToolEvent {
         request_id,
-        tool_id: interface.tool_id.clone(),
+        outlet_id: interface.outlet_id.clone(),
         source_context: interface.source_context.clone(),
         target_context: interface.target_context.clone(),
         invoker_did: invoker_did.to_owned(),
-        status: ToolStatus::Success,
+        status: OutletStatus::Success,
         input_hash,
         output_hash,
         provenance: Some(provenance.clone()),
@@ -1147,8 +1147,8 @@ mod tests {
 
     use super::*;
     use crate::context::MemoryScope;
+    use crate::context::outlets::registry::{OutletRegistry, OutletSchema, register_outlet};
     use crate::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
-    use crate::context::tools::registry::{ToolRegistry, ToolSchema, register_tool};
     use crate::provenance::attach::SourceContextInfo;
     use crate::provenance::evaluate::{SourceContextState, evaluate_quality};
     use crate::provenance::{CounterpartyPolicy, DiscoveryMethod, SourceType};
@@ -1162,8 +1162,8 @@ mod tests {
         CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolRegister,
-            Capability::ToolInvokeAll,
+            Capability::OutletRegister,
+            Capability::OutletCallAll,
             Capability::RoleAssign,
             Capability::MemberInvite,
             Capability::MemberRemove,
@@ -1213,13 +1213,13 @@ mod tests {
     fn setup_registry_with_tool(
         role_state: &ContextRoleState,
         registrant_did: &str,
-    ) -> ToolRegistry {
-        let mut registry = ToolRegistry::new();
-        let registration = ToolRegistration {
-            tool_id: "calculator".to_owned(),
+    ) -> OutletRegistry {
+        let mut registry = OutletRegistry::new();
+        let registration = OutletRegistration {
+            outlet_id: "calculator".to_owned(),
             name: "Calculator".to_owned(),
             description: "A simple calculator".to_owned(),
-            schema: ToolSchema {
+            schema: OutletSchema {
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1241,7 +1241,7 @@ mod tests {
             registered_at: 0,
             signature: Vec::new(),
         };
-        register_tool(&mut registry, role_state, registration, registrant_did).unwrap();
+        register_outlet(&mut registry, role_state, registration, registrant_did).unwrap();
         registry
     }
 
@@ -1297,7 +1297,7 @@ mod tests {
 
         assert_eq!(interface.source_context, "ctx-source");
         assert_eq!(interface.target_context, "ctx-target");
-        assert_eq!(interface.tool_id, "calculator");
+        assert_eq!(interface.outlet_id, "calculator");
         assert!(interface.approved_by_source);
         assert!(!interface.approved_by_target);
         assert!(interface.rate_limit.is_none());
@@ -1334,7 +1334,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, ToolError::InterfaceAdminRequired { .. }),
+            matches!(err, OutletError::InterfaceAdminRequired { .. }),
             "expected InterfaceAdminRequired, got {err:?}"
         );
     }
@@ -1348,7 +1348,7 @@ mod tests {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
-        let registry = ToolRegistry::new(); // Empty registry
+        let registry = OutletRegistry::new(); // Empty registry
 
         let result = expose_tool(
             &source_context,
@@ -1364,7 +1364,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ToolError::ToolNotFound { .. }
+            OutletError::OutletNotFound { .. }
         ));
     }
 
@@ -1413,10 +1413,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_context = test_context_id("ctx-target");
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
@@ -1452,10 +1452,10 @@ mod tests {
             test_role_state_with_non_admin_member("ctx-target", admin_did, member_did);
         let target_context = test_context_id("ctx-target");
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
@@ -1475,7 +1475,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, ToolError::InterfaceAdminRequired { .. }),
+            matches!(err, OutletError::InterfaceAdminRequired { .. }),
             "expected InterfaceAdminRequired, got {err:?}"
         );
     }
@@ -1490,10 +1490,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-wrong", admin_did);
         let target_context = test_context_id("ctx-wrong");
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
@@ -1513,7 +1513,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ToolError::InterfaceContextMismatch { .. }
+            OutletError::InterfaceContextMismatch { .. }
         ));
     }
 
@@ -1529,10 +1529,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
@@ -1560,15 +1560,15 @@ mod tests {
         assert_eq!(output, serde_json::json!({"result": 7.0}));
 
         // Both events should record the cross-context call.
-        assert_eq!(source_event.tool_id, "calculator");
+        assert_eq!(source_event.outlet_id, "calculator");
         assert_eq!(source_event.source_context, "ctx-source");
         assert_eq!(source_event.target_context, "ctx-target");
         assert_eq!(source_event.invoker_did, admin_did);
-        assert_eq!(source_event.status, ToolStatus::Success);
+        assert_eq!(source_event.status, OutletStatus::Success);
         assert!(!source_event.input_hash.is_empty());
         assert!(source_event.output_hash.is_some());
 
-        assert_eq!(target_event.tool_id, "calculator");
+        assert_eq!(target_event.outlet_id, "calculator");
         assert_eq!(target_event.source_context, "ctx-source");
         assert_eq!(target_event.target_context, "ctx-target");
         assert_eq!(target_event.invoker_did, admin_did);
@@ -1589,10 +1589,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
@@ -1620,7 +1620,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ToolError::InterfaceNotApproved {
+                OutletError::InterfaceNotApproved {
                     source_approved: true,
                     target_approved: false,
                 }
@@ -1637,10 +1637,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: false, // Source has NOT approved
@@ -1668,7 +1668,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ToolError::InterfaceNotApproved {
+                OutletError::InterfaceNotApproved {
                     source_approved: false,
                     target_approved: true,
                 }
@@ -1685,10 +1685,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: false,
@@ -1714,7 +1714,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ToolError::InterfaceNotApproved { .. }
+            OutletError::InterfaceNotApproved { .. }
         ));
     }
 
@@ -1730,10 +1730,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             // Zero burst to test base limit rejection.
             rate_limit: Some(RateLimit::with_burst(
                 2,
@@ -1800,7 +1800,7 @@ mod tests {
         assert!(result3.is_err());
         let err = result3.unwrap_err();
         assert!(
-            matches!(err, ToolError::InterfaceRateLimited { max_calls: 2, .. }),
+            matches!(err, OutletError::InterfaceRateLimited { max_calls: 2, .. }),
             "expected InterfaceRateLimited, got {err:?}"
         );
     }
@@ -1817,10 +1817,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
@@ -1849,13 +1849,13 @@ mod tests {
         assert_eq!(source_event.invoker_did, admin_did);
         assert_eq!(source_event.source_context, "ctx-source");
         assert_eq!(source_event.target_context, "ctx-target");
-        assert_eq!(source_event.status, ToolStatus::Success);
+        assert_eq!(source_event.status, OutletStatus::Success);
 
         // Verify provenance in target event.
         assert_eq!(target_event.invoker_did, admin_did);
         assert_eq!(target_event.source_context, "ctx-source");
         assert_eq!(target_event.target_context, "ctx-target");
-        assert_eq!(target_event.status, ToolStatus::Success);
+        assert_eq!(target_event.status, OutletStatus::Success);
 
         // Both events have correct hashes.
         let expected_input_hash = sha256_json(&input);
@@ -1885,10 +1885,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
@@ -1914,7 +1914,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ToolError::InterfaceInvokerNotAuthorized { .. }
+            OutletError::InterfaceInvokerNotAuthorized { .. }
         ));
     }
 
@@ -1927,12 +1927,12 @@ mod tests {
         let admin_did = "did:dht:z6MkAdmin";
         let source_role_state = test_role_state("ctx-source", admin_did);
         let source_context = test_context_id("ctx-source");
-        let target_registry = ToolRegistry::new(); // Empty target registry
+        let target_registry = OutletRegistry::new(); // Empty target registry
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
@@ -1958,7 +1958,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ToolError::ToolNotFound { .. }
+            OutletError::OutletNotFound { .. }
         ));
     }
 
@@ -2007,15 +2007,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ToolInterface: serialization roundtrip
+    // OutletInterface: serialization roundtrip
     // -----------------------------------------------------------------------
 
     #[test]
     fn tool_interface_serialization_roundtrip() {
-        let interface = ToolInterface {
+        let interface = OutletInterface {
             source_context: "ctx-a".to_owned(),
             target_context: "ctx-b".to_owned(),
-            tool_id: "tool-1".to_owned(),
+            outlet_id: "tool-1".to_owned(),
             rate_limit: Some(RateLimit::new(
                 50,
                 Duration::from_mins(2),
@@ -2028,10 +2028,10 @@ mod tests {
             inbound_policy: None,
         };
         let json = serde_json::to_string(&interface).unwrap();
-        let deserialized: ToolInterface = serde_json::from_str(&json).unwrap();
+        let deserialized: OutletInterface = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.source_context, "ctx-a");
         assert_eq!(deserialized.target_context, "ctx-b");
-        assert_eq!(deserialized.tool_id, "tool-1");
+        assert_eq!(deserialized.outlet_id, "tool-1");
         assert!(deserialized.approved_by_source);
         assert!(!deserialized.approved_by_target);
         assert!(deserialized.rate_limit.is_some());
@@ -2045,11 +2045,11 @@ mod tests {
     fn cross_context_tool_event_serialization_roundtrip() {
         let event = CrossContextToolEvent {
             request_id: "req-1".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             source_context: "ctx-a".to_owned(),
             target_context: "ctx-b".to_owned(),
             invoker_did: "did:dht:z6MkTest".into(),
-            status: ToolStatus::Success,
+            status: OutletStatus::Success,
             input_hash: "abcd1234".to_owned(),
             output_hash: Some("efgh5678".to_owned()),
             provenance: None,
@@ -2057,8 +2057,8 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: CrossContextToolEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.request_id, "req-1");
-        assert_eq!(deserialized.tool_id, "calculator");
-        assert_eq!(deserialized.status, ToolStatus::Success);
+        assert_eq!(deserialized.outlet_id, "calculator");
+        assert_eq!(deserialized.status, OutletStatus::Success);
     }
 
     // -----------------------------------------------------------------------
@@ -2073,10 +2073,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
@@ -2105,7 +2105,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ToolError::ChainDepthExceeded {
+                OutletError::ChainDepthExceeded {
                     depth: 9,
                     max_depth: 8,
                 }
@@ -2122,10 +2122,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
@@ -2167,10 +2167,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
@@ -2200,7 +2200,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, ToolError::InterfaceExecutionFailed { .. }),
+            matches!(err, OutletError::InterfaceExecutionFailed { .. }),
             "expected InterfaceExecutionFailed, got {err:?}"
         );
         assert!(err.to_string().contains("computation failed"));
@@ -2325,11 +2325,11 @@ mod tests {
             offer_id: [0u8; 32],
             source_context: "ctx-a".to_owned(),
             target_context: "ctx-b".to_owned(),
-            tool_schema: ToolRegistration {
-                tool_id: "t".to_owned(),
+            outlet_schema: OutletRegistration {
+                outlet_id: "t".to_owned(),
                 name: "T".to_owned(),
                 description: "test".to_owned(),
-                schema: ToolSchema {
+                schema: OutletSchema {
                     input_schema: serde_json::json!({"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}}),
                     output_schema: serde_json::json!({"type": "object", "properties": {"r": {"type": "number"}}}),
                 },
@@ -2364,10 +2364,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
@@ -2411,7 +2411,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ToolError::ChainDepthExceeded {
+                OutletError::ChainDepthExceeded {
                     depth: 2,
                     max_depth: 1
                 }
@@ -2607,10 +2607,10 @@ mod tests {
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
         // Base limit: 2 calls, burst allowance: 5.
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: Some(RateLimit::with_burst(
                 2,
                 Duration::from_hours(1),
@@ -2680,7 +2680,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, ToolError::InterfaceRateLimited { max_calls: 2, .. }),
+            matches!(err, OutletError::InterfaceRateLimited { max_calls: 2, .. }),
             "expected InterfaceRateLimited, got {err:?}"
         );
     }
@@ -2864,10 +2864,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
@@ -2928,10 +2928,10 @@ mod tests {
         let target_role_state = test_role_state("ctx-target", admin_did);
         let target_registry = setup_registry_with_tool(&target_role_state, admin_did);
 
-        let mut interface = ToolInterface {
+        let mut interface = OutletInterface {
             source_context: "ctx-source".to_owned(),
             target_context: "ctx-target".to_owned(),
-            tool_id: "calculator".to_owned(),
+            outlet_id: "calculator".to_owned(),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,

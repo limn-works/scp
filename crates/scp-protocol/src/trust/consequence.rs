@@ -493,14 +493,14 @@ fn validate_severity_shape(
                         &format!("SuspendCapability[{i}] Custom"),
                         MAX_CONSEQUENCE_STRING_LEN,
                     )?;
-                } else if let Capability::ToolInvoke(tool_id) = cap {
-                    if tool_id.is_empty() {
+                } else if let Capability::OutletCall(outlet_id) = cap {
+                    if outlet_id.is_empty() {
                         return Err(ConsequenceValidationError(format!(
-                            "SuspendCapability[{i}] ToolInvoke has empty tool_id",
+                            "SuspendCapability[{i}] ToolInvoke has empty outlet_id",
                         )));
                     }
                     validate_consequence_string(
-                        tool_id,
+                        outlet_id,
                         &format!("SuspendCapability[{i}] ToolInvoke"),
                         MAX_CONSEQUENCE_STRING_LEN,
                     )?;
@@ -1466,15 +1466,15 @@ mod tests {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
-                capabilities: vec![Capability::ToolInvoke(String::new())],
+                capabilities: vec![Capability::OutletCall(String::new())],
             }),
             threshold: 1,
             window: Duration::from_mins(1),
         };
         let err = rule.validate().unwrap_err();
         assert!(
-            err.to_string().contains("ToolInvoke has empty tool_id"),
-            "should reject empty tool_id, got: {err}"
+            err.to_string().contains("ToolInvoke has empty outlet_id"),
+            "should reject empty outlet_id, got: {err}"
         );
     }
 
@@ -1796,7 +1796,7 @@ mod tests {
         let rule = ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendCapability {
-                capabilities: vec![Capability::ToolInvoke("calculator".to_owned())],
+                capabilities: vec![Capability::OutletCall("calculator".to_owned())],
             }),
             threshold: 1,
             window: Duration::from_mins(1),
@@ -1809,7 +1809,7 @@ mod tests {
         };
         assert_eq!(
             capabilities,
-            &vec![Capability::ToolInvoke("calculator".to_owned())]
+            &vec![Capability::OutletCall("calculator".to_owned())]
         );
     }
 
@@ -1818,7 +1818,7 @@ mod tests {
         let caps = vec![
             Capability::MessagesWrite,
             Capability::GovernanceVote,
-            Capability::ToolInvoke("calculator".to_owned()),
+            Capability::OutletCall("calculator".to_owned()),
             Capability::Custom("rate_limit_bypass".to_owned()),
         ];
         let rule = ConsequenceRule {

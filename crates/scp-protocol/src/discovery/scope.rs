@@ -26,13 +26,13 @@ use super::addressing::AddressingError;
 // ---------------------------------------------------------------------------
 
 /// Standard tool name for scope registration.
-pub const TOOL_SCOPE_REGISTER: &str = "scope_register";
+pub const OUTLET_SCOPE_REGISTER: &str = "scope_register";
 
 /// Standard tool name for scope lookup.
-pub const TOOL_SCOPE_LOOKUP: &str = "scope_lookup";
+pub const OUTLET_SCOPE_LOOKUP: &str = "scope_lookup";
 
 /// Standard tool name for scope deregistration.
-pub const TOOL_SCOPE_DEREGISTER: &str = "scope_deregister";
+pub const OUTLET_SCOPE_DEREGISTER: &str = "scope_deregister";
 
 /// Maximum length for a scope name (§22.3.5).
 const MAX_SCOPE_NAME_LENGTH: usize = 64;

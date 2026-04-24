@@ -141,8 +141,8 @@ pub struct OperationalMetadata {
     /// Filtered by `visibility_policy.economic_policy`.
     pub economic_policy: Option<String>,
     /// Number of active tool interfaces (inbound + outbound, §6.2).
-    /// Filtered by `visibility_policy.tool_interface_count`.
-    pub tool_count: Option<u64>,
+    /// Filtered by `visibility_policy.outlet_interface_count`.
+    pub outlet_count: Option<u64>,
     /// Child context IDs, if this is a parent context (§5.13).
     /// Filtered by `visibility_policy.child_context_info`.
     pub child_contexts: Option<Vec<ContextId>>,
@@ -182,7 +182,7 @@ mod tests {
             name: Some("Test Context".to_owned()),
             description: Some("A test context".to_owned()),
             economic_policy: None,
-            tool_count: Some(0),
+            outlet_count: Some(0),
             child_contexts: None,
         }
     }
@@ -231,7 +231,7 @@ mod tests {
         assert!(op.name.is_none());
         assert!(op.description.is_none());
         assert!(op.economic_policy.is_none());
-        assert!(op.tool_count.is_none());
+        assert!(op.outlet_count.is_none());
         assert!(op.child_contexts.is_none());
     }
 
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(deserialized.context_age_secs, Some(60));
         assert_eq!(deserialized.creator_did, Some(DID::from("did:dht:zAlice")));
         assert_eq!(deserialized.name.as_deref(), Some("Test Context"));
-        assert_eq!(deserialized.tool_count, Some(0));
+        assert_eq!(deserialized.outlet_count, Some(0));
     }
 
     #[test]

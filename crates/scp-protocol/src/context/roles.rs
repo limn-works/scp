@@ -19,13 +19,16 @@
 //!
 //! Built-in roles are always available in every context:
 //! - `admin` -- all capabilities in the ceiling.
-//! - `moderator` -- `MessagesRead`, `MessagesWrite`, `ToolInvokeAll`,
-//!   `MemberRemove`, `GovernancePropose` (§5.9 elected moderators).
-//! - `member` -- `MessagesRead`, `MessagesWrite`, `ToolInvokeAll`.
+//! - `moderator` -- `MessagesRead`, `MessagesWrite`, `OutletQueryAll`,
+//!   `OutletCallAll`, `MemberRemove`, `GovernancePropose` (§5.9 elected
+//!   moderators).
+//! - `member` -- `MessagesRead`, `MessagesWrite`, `OutletQueryAll`,
+//!   `OutletCallAll`.
 //! - `observer` -- `MessagesRead` only.
 //!
 //! Broadcast-specific roles:
-//! - `author` -- `MessagesWrite`, `MessagesRead`, `ToolInvokeAll`.
+//! - `author` -- `MessagesWrite`, `MessagesRead`, `OutletQueryAll`,
+//!   `OutletCallAll`.
 //! - `subscriber` -- `MessagesRead` only.
 //!
 //! Custom roles are defined at context creation with arbitrary capability
@@ -43,15 +46,15 @@ use super::ContextError;
 use crate::crypto::ucan::nonce::generate_nonce;
 
 // ---------------------------------------------------------------------------
-// ToolId
+// OutletId
 // ---------------------------------------------------------------------------
 
-/// Identifier for a tool registered within a context.
+/// Identifier for an outlet registered within a context.
 ///
-/// This is a simple string type alias. The full `ToolRegistration` type is
-/// defined in `params.rs`; this type identifies a specific tool for
-/// capability scoping (e.g., `ToolInvoke(tool_id)`).
-pub type ToolId = String;
+/// This is a simple string type alias. The full `OutletRegistration` type is
+/// defined in `params.rs`; this type identifies a specific outlet for
+/// capability scoping (e.g., `OutletCall(outlet_id)`, `OutletQuery(outlet_id)`).
+pub type OutletId = String;
 
 // ---------------------------------------------------------------------------
 // Capability
@@ -71,12 +74,18 @@ pub enum Capability {
     MessagesRead,
     /// Write (send) messages in the context.
     MessagesWrite,
-    /// Invoke a specific registered tool, identified by [`ToolId`].
-    ToolInvoke(ToolId),
-    /// Invoke any registered tool in the context.
-    ToolInvokeAll,
-    /// Register new tools in the context.
-    ToolRegister,
+    /// Invoke a specific registered Query (read-only) outlet, identified by
+    /// [`OutletId`] (§5.4.2).
+    OutletQuery(OutletId),
+    /// Invoke any registered Query outlet in the context (§5.4.2).
+    OutletQueryAll,
+    /// Invoke a specific registered Action (mutating) outlet, identified by
+    /// [`OutletId`] (§5.4.2).
+    OutletCall(OutletId),
+    /// Invoke any registered Action outlet in the context (§5.4.2).
+    OutletCallAll,
+    /// Register new outlets in the context.
+    OutletRegister,
     /// Invite new members to the context.
     MemberInvite,
     /// Remove members from the context.
@@ -91,8 +100,8 @@ pub enum Capability {
     ContextClose,
     /// Create child contexts with this context as parent (spec section 5.13).
     ChildContextCreate,
-    /// Cross-context tool interface exposure (spec section 6.2).
-    ToolInterface,
+    /// Cross-context outlet interface exposure (spec section 6.2).
+    OutletInterface,
     /// Bridge connector participation (spec section 12).
     Bridging,
     /// Real-time voice communication via delegated media transport (spec section 10.9.1).
@@ -114,12 +123,14 @@ impl Capability {
     /// Creates a capability from a string name.
     ///
     /// Recognized names: `"messages:read"`, `"messages:write"`,
-    /// `"tool:invoke:*"`, `"tool:register"`, `"member:invite"`,
-    /// `"member:remove"`, `"role:assign"`, `"governance:propose"`,
-    /// `"governance:vote"`, `"context:close"`, `"context:child:create"`,
-    /// `"tool:interface"`, `"bridging"`, `"media:voice"`, `"media:video"`,
-    /// `"media:screen_share"`, `"member:ban"`, `"metadata:edit"`.
-    /// Names starting with `"tool:invoke:"` are parsed as `ToolInvoke(id)`.
+    /// `"outlet:query:*"`, `"outlet:call:*"`, `"outlet:register"`,
+    /// `"member:invite"`, `"member:remove"`, `"role:assign"`,
+    /// `"governance:propose"`, `"governance:vote"`, `"context:close"`,
+    /// `"context:child:create"`, `"outlet:interface"`, `"bridging"`,
+    /// `"media:voice"`, `"media:video"`, `"media:screen_share"`,
+    /// `"member:ban"`, `"metadata:edit"`.
+    /// Names starting with `"outlet:query:"` are parsed as `OutletQuery(id)`.
+    /// Names starting with `"outlet:call:"` are parsed as `OutletCall(id)`.
     /// Names starting with `"custom:"` are parsed as `Custom(remainder)`.
     /// Anything else maps to `Custom(name)`.
     #[must_use]
@@ -127,8 +138,9 @@ impl Capability {
         match name.as_ref() {
             "messages:read" => Self::MessagesRead,
             "messages:write" => Self::MessagesWrite,
-            "tool:invoke:*" => Self::ToolInvokeAll,
-            "tool:register" => Self::ToolRegister,
+            "outlet:query:*" => Self::OutletQueryAll,
+            "outlet:call:*" => Self::OutletCallAll,
+            "outlet:register" => Self::OutletRegister,
             "member:invite" => Self::MemberInvite,
             "member:remove" => Self::MemberRemove,
             "role:assign" => Self::RoleAssign,
@@ -136,29 +148,35 @@ impl Capability {
             "governance:vote" => Self::GovernanceVote,
             "context:close" => Self::ContextClose,
             "context:child:create" => Self::ChildContextCreate,
-            "tool:interface" => Self::ToolInterface,
+            "outlet:interface" => Self::OutletInterface,
             "bridging" => Self::Bridging,
             "media:voice" => Self::MediaVoice,
             "media:video" => Self::MediaVideo,
             "media:screen_share" => Self::MediaScreenShare,
             "member:ban" => Self::MemberBan,
             "metadata:edit" => Self::MetadataEdit,
-            other => other.strip_prefix("tool:invoke:").map_or_else(
+            other => other.strip_prefix("outlet:query:").map_or_else(
                 || {
-                    other.strip_prefix("custom:").map_or_else(
-                        || Self::Custom(other.to_owned()),
-                        |custom_name| Self::Custom(custom_name.to_owned()),
+                    other.strip_prefix("outlet:call:").map_or_else(
+                        || {
+                            other.strip_prefix("custom:").map_or_else(
+                                || Self::Custom(other.to_owned()),
+                                |custom_name| Self::Custom(custom_name.to_owned()),
+                            )
+                        },
+                        |id| Self::OutletCall(id.to_owned()),
                     )
                 },
-                |tool_id| Self::ToolInvoke(tool_id.to_owned()),
+                |id| Self::OutletQuery(id.to_owned()),
             ),
         }
     }
 
     /// Returns the canonical input name of this capability.
     ///
-    /// For [`ToolInvoke`](Self::ToolInvoke) variants, includes the tool ID
-    /// (e.g. `"tool:invoke:my_tool"`). For [`Custom`](Self::Custom) variants,
+    /// For [`OutletQuery`](Self::OutletQuery) and [`OutletCall`](Self::OutletCall)
+    /// variants, includes the outlet ID (e.g. `"outlet:query:my_outlet"`,
+    /// `"outlet:call:my_outlet"`). For [`Custom`](Self::Custom) variants,
     /// returns the raw name without prefix (e.g. `"foo"`, not `"custom:foo"`).
     ///
     /// **Note:** This differs from [`Display`](std::fmt::Display) for Custom
@@ -169,9 +187,11 @@ impl Capability {
         match self {
             Self::MessagesRead => std::borrow::Cow::Borrowed("messages:read"),
             Self::MessagesWrite => std::borrow::Cow::Borrowed("messages:write"),
-            Self::ToolInvoke(id) => std::borrow::Cow::Owned(format!("tool:invoke:{id}")),
-            Self::ToolInvokeAll => std::borrow::Cow::Borrowed("tool:invoke:*"),
-            Self::ToolRegister => std::borrow::Cow::Borrowed("tool:register"),
+            Self::OutletQuery(id) => std::borrow::Cow::Owned(format!("outlet:query:{id}")),
+            Self::OutletQueryAll => std::borrow::Cow::Borrowed("outlet:query:*"),
+            Self::OutletCall(id) => std::borrow::Cow::Owned(format!("outlet:call:{id}")),
+            Self::OutletCallAll => std::borrow::Cow::Borrowed("outlet:call:*"),
+            Self::OutletRegister => std::borrow::Cow::Borrowed("outlet:register"),
             Self::MemberInvite => std::borrow::Cow::Borrowed("member:invite"),
             Self::MemberRemove => std::borrow::Cow::Borrowed("member:remove"),
             Self::RoleAssign => std::borrow::Cow::Borrowed("role:assign"),
@@ -179,7 +199,7 @@ impl Capability {
             Self::GovernanceVote => std::borrow::Cow::Borrowed("governance:vote"),
             Self::ContextClose => std::borrow::Cow::Borrowed("context:close"),
             Self::ChildContextCreate => std::borrow::Cow::Borrowed("context:child:create"),
-            Self::ToolInterface => std::borrow::Cow::Borrowed("tool:interface"),
+            Self::OutletInterface => std::borrow::Cow::Borrowed("outlet:interface"),
             Self::Bridging => std::borrow::Cow::Borrowed("bridging"),
             Self::MediaVoice => std::borrow::Cow::Borrowed("media:voice"),
             Self::MediaVideo => std::borrow::Cow::Borrowed("media:video"),
@@ -192,23 +212,26 @@ impl Capability {
 
     /// Returns the `(resource, action)` pair for UCAN capability URIs.
     ///
-    /// The canonical user-facing format uses colons (e.g., `"tool:invoke:*"`),
+    /// The canonical user-facing format uses colons (e.g., `"outlet:call:*"`),
     /// but UCAN URIs use `{resource}:{action}` where `resource` is a single
     /// underscore-joined token. This method bridges the two formats:
     ///
-    /// - `tool:invoke:*`         -> `("tool_invoke", "*")`
-    /// - `tool:invoke:calculator` -> `("tool_invoke", "calculator")`
-    /// - `context:child:create`  -> `("context_child", "create")`
-    /// - `messages:write`        -> `("messages", "write")`
-    /// - `context:close`         -> `("context", "close")`
-    /// - `role:assign`           -> `("role", "assign")`
-    /// - `bridging`              -> `("bridging", "*")`
+    /// - `outlet:query:*`         -> `("outlet_query", "*")`
+    /// - `outlet:query:calculator` -> `("outlet_query", "calculator")`
+    /// - `outlet:call:*`          -> `("outlet_call", "*")`
+    /// - `outlet:call:calculator`  -> `("outlet_call", "calculator")`
+    /// - `context:child:create`   -> `("context_child", "create")`
+    /// - `messages:write`         -> `("messages", "write")`
+    /// - `context:close`          -> `("context", "close")`
+    /// - `role:assign`            -> `("role", "assign")`
+    /// - `bridging`               -> `("bridging", "*")`
     ///
     /// The returned strings are suitable for constructing
     /// [`CapabilityUri`](crate::crypto::ucan::capability::CapabilityUri) values
     /// and for building ceiling string sets (`{resource}:{action}`).
     ///
-    /// See issue #1293 for the mismatch this method resolves.
+    /// See issue #1293 for the mismatch this method resolves and §5.4.2.1 for
+    /// the outlet stem parser semantics.
     #[must_use]
     pub fn ucan_resource_action(&self) -> (std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>) {
         match self {
@@ -220,16 +243,24 @@ impl Capability {
                 std::borrow::Cow::Borrowed("messages"),
                 std::borrow::Cow::Borrowed("write"),
             ),
-            Self::ToolInvoke(id) => (
-                std::borrow::Cow::Borrowed("tool_invoke"),
+            Self::OutletQuery(id) => (
+                std::borrow::Cow::Borrowed("outlet_query"),
                 std::borrow::Cow::Borrowed(id.as_str()),
             ),
-            Self::ToolInvokeAll => (
-                std::borrow::Cow::Borrowed("tool_invoke"),
+            Self::OutletQueryAll => (
+                std::borrow::Cow::Borrowed("outlet_query"),
                 std::borrow::Cow::Borrowed("*"),
             ),
-            Self::ToolRegister => (
-                std::borrow::Cow::Borrowed("tool"),
+            Self::OutletCall(id) => (
+                std::borrow::Cow::Borrowed("outlet_call"),
+                std::borrow::Cow::Borrowed(id.as_str()),
+            ),
+            Self::OutletCallAll => (
+                std::borrow::Cow::Borrowed("outlet_call"),
+                std::borrow::Cow::Borrowed("*"),
+            ),
+            Self::OutletRegister => (
+                std::borrow::Cow::Borrowed("outlet"),
                 std::borrow::Cow::Borrowed("register"),
             ),
             Self::MemberInvite => (
@@ -260,8 +291,8 @@ impl Capability {
                 std::borrow::Cow::Borrowed("context_child"),
                 std::borrow::Cow::Borrowed("create"),
             ),
-            Self::ToolInterface => (
-                std::borrow::Cow::Borrowed("tool"),
+            Self::OutletInterface => (
+                std::borrow::Cow::Borrowed("outlet"),
                 std::borrow::Cow::Borrowed("interface"),
             ),
             Self::Bridging => (
@@ -320,7 +351,8 @@ impl Capability {
     /// ```
     /// use scp_protocol::context::roles::Capability;
     ///
-    /// assert_eq!(Capability::ToolInvokeAll.ucan_capability_name(), "tool_invoke:*");
+    /// assert_eq!(Capability::OutletCallAll.ucan_capability_name(), "outlet_call:*");
+    /// assert_eq!(Capability::OutletQueryAll.ucan_capability_name(), "outlet_query:*");
     /// assert_eq!(Capability::MessagesWrite.ucan_capability_name(), "messages:write");
     /// assert_eq!(Capability::ChildContextCreate.ucan_capability_name(), "context_child:create");
     /// ```
@@ -336,9 +368,11 @@ impl std::fmt::Display for Capability {
         match self {
             Self::MessagesRead => write!(f, "messages:read"),
             Self::MessagesWrite => write!(f, "messages:write"),
-            Self::ToolInvoke(id) => write!(f, "tool:invoke:{id}"),
-            Self::ToolInvokeAll => write!(f, "tool:invoke:*"),
-            Self::ToolRegister => write!(f, "tool:register"),
+            Self::OutletQuery(id) => write!(f, "outlet:query:{id}"),
+            Self::OutletQueryAll => write!(f, "outlet:query:*"),
+            Self::OutletCall(id) => write!(f, "outlet:call:{id}"),
+            Self::OutletCallAll => write!(f, "outlet:call:*"),
+            Self::OutletRegister => write!(f, "outlet:register"),
             Self::MemberInvite => write!(f, "member:invite"),
             Self::MemberRemove => write!(f, "member:remove"),
             Self::RoleAssign => write!(f, "role:assign"),
@@ -346,7 +380,7 @@ impl std::fmt::Display for Capability {
             Self::GovernanceVote => write!(f, "governance:vote"),
             Self::ContextClose => write!(f, "context:close"),
             Self::ChildContextCreate => write!(f, "context:child:create"),
-            Self::ToolInterface => write!(f, "tool:interface"),
+            Self::OutletInterface => write!(f, "outlet:interface"),
             Self::Bridging => write!(f, "bridging"),
             Self::MediaVoice => write!(f, "media:voice"),
             Self::MediaVideo => write!(f, "media:video"),
@@ -389,16 +423,21 @@ impl CapabilityCeiling {
     /// Returns `true` if the given capability is within the ceiling.
     ///
     /// This is the core ceiling check used during UCAN validation and role
-    /// definition. `ToolInvoke(id)` is considered within the ceiling if either
-    /// `ToolInvoke(id)` or `ToolInvokeAll` is in the ceiling.
+    /// definition. `OutletQuery(id)` is considered within the ceiling if either
+    /// `OutletQuery(id)` or `OutletQueryAll` is in the ceiling. Likewise
+    /// `OutletCall(id)` is implied by `OutletCallAll`.
     #[must_use]
     pub fn contains(&self, capability: &Capability) -> bool {
         if self.capabilities.contains(capability) {
             return true;
         }
-        // ToolInvoke(id) is implicitly allowed if ToolInvokeAll is in the ceiling.
-        if let Capability::ToolInvoke(_) = capability {
-            return self.capabilities.contains(&Capability::ToolInvokeAll);
+        // OutletQuery(id) is implicitly allowed if OutletQueryAll is in the ceiling.
+        if let Capability::OutletQuery(_) = capability {
+            return self.capabilities.contains(&Capability::OutletQueryAll);
+        }
+        // OutletCall(id) is implicitly allowed if OutletCallAll is in the ceiling.
+        if let Capability::OutletCall(_) = capability {
+            return self.capabilities.contains(&Capability::OutletCallAll);
         }
         false
     }
@@ -437,7 +476,7 @@ impl CapabilityCeiling {
 
 /// Returns the default capability ceiling for new contexts.
 ///
-/// Includes all standard SCP capabilities: messaging, tool management, role
+/// Includes all standard SCP capabilities: messaging, outlet management, role
 /// assignment, membership control, governance, and context close. Used by
 /// all FFI bridges when no explicit ceiling is provided.
 #[must_use]
@@ -445,8 +484,9 @@ pub fn default_ceiling() -> CapabilityCeiling {
     CapabilityCeiling::new([
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolRegister,
-        Capability::ToolInvokeAll,
+        Capability::OutletRegister,
+        Capability::OutletQueryAll,
+        Capability::OutletCallAll,
         Capability::RoleAssign,
         Capability::MemberInvite,
         Capability::MemberRemove,
@@ -547,17 +587,18 @@ pub fn builtin_admin(ceiling: &CapabilityCeiling) -> RoleDefinition {
 
 /// Returns the `member` built-in role definition.
 ///
-/// Members can read and write messages and invoke any registered tool.
-/// Capabilities are intersected with the ceiling -- if a capability is not
-/// in the ceiling, it is not granted.
+/// Members can read and write messages and invoke any registered Query or
+/// Action outlet. Capabilities are intersected with the ceiling -- if a
+/// capability is not in the ceiling, it is not granted.
 ///
-/// See ADR-009 acceptance criterion 2.
+/// See ADR-009 acceptance criterion 2 and §5.5.1 / §5.4.2.
 #[must_use]
 pub fn builtin_member(ceiling: &CapabilityCeiling) -> RoleDefinition {
     let desired = HashSet::from([
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolInvokeAll,
+        Capability::OutletQueryAll,
+        Capability::OutletCallAll,
     ]);
     let capabilities = desired
         .into_iter()
@@ -568,19 +609,20 @@ pub fn builtin_member(ceiling: &CapabilityCeiling) -> RoleDefinition {
 
 /// Returns the `moderator` built-in role definition.
 ///
-/// Moderators can read/write messages, invoke tools, remove members, and
-/// propose governance actions. This fills the gap between `member` (no
-/// moderation power) and `admin` (full control). Referenced in §5.9 as
-/// "elected moderators" governance pattern. Capabilities are intersected
-/// with the ceiling.
+/// Moderators can read/write messages, invoke Query and Action outlets,
+/// remove members, and propose governance actions. This fills the gap
+/// between `member` (no moderation power) and `admin` (full control).
+/// Referenced in §5.9 as "elected moderators" governance pattern.
+/// Capabilities are intersected with the ceiling.
 ///
-/// See ADR-009 acceptance criterion 2.
+/// See ADR-009 acceptance criterion 2 and §5.5.1 / §5.4.2.
 #[must_use]
 pub fn builtin_moderator(ceiling: &CapabilityCeiling) -> RoleDefinition {
     let desired = HashSet::from([
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolInvokeAll,
+        Capability::OutletQueryAll,
+        Capability::OutletCallAll,
         Capability::MemberRemove,
         Capability::GovernancePropose,
     ]);
@@ -609,17 +651,18 @@ pub fn builtin_observer(ceiling: &CapabilityCeiling) -> RoleDefinition {
 
 /// Returns the `author` broadcast-specific role definition.
 ///
-/// Authors can write and read messages and invoke any registered tool.
-/// Designed for one-to-many publishing scenarios (spec section 5.14).
-/// Capabilities are intersected with the ceiling.
+/// Authors can write and read messages and invoke any registered Query or
+/// Action outlet. Designed for one-to-many publishing scenarios
+/// (spec section 5.14). Capabilities are intersected with the ceiling.
 ///
-/// See ADR-009 acceptance criterion 2.
+/// See ADR-009 acceptance criterion 2 and §5.5.1 / §5.4.2.
 #[must_use]
 pub fn builtin_author(ceiling: &CapabilityCeiling) -> RoleDefinition {
     let desired = HashSet::from([
         Capability::MessagesWrite,
         Capability::MessagesRead,
-        Capability::ToolInvokeAll,
+        Capability::OutletQueryAll,
+        Capability::OutletCallAll,
     ]);
     let capabilities = desired
         .into_iter()
@@ -1274,8 +1317,8 @@ mod tests {
         CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvokeAll,
-            Capability::ToolRegister,
+            Capability::OutletCallAll,
+            Capability::OutletRegister,
             Capability::MemberInvite,
             Capability::MemberRemove,
             Capability::RoleAssign,
@@ -1300,9 +1343,9 @@ mod tests {
         let caps = vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvoke("tool-1".to_owned()),
-            Capability::ToolInvokeAll,
-            Capability::ToolRegister,
+            Capability::OutletCall("tool-1".to_owned()),
+            Capability::OutletCallAll,
+            Capability::OutletRegister,
             Capability::MemberInvite,
             Capability::MemberRemove,
             Capability::RoleAssign,
@@ -1325,7 +1368,7 @@ mod tests {
 
     #[test]
     fn capability_clone_preserves_equality() {
-        let cap = Capability::ToolInvoke("my-tool".to_owned());
+        let cap = Capability::OutletCall("my-tool".to_owned());
         let cloned = cap.clone();
         assert_eq!(cap, cloned);
     }
@@ -1347,11 +1390,11 @@ mod tests {
         assert_eq!(format!("{}", Capability::MessagesRead), "messages:read");
         assert_eq!(format!("{}", Capability::MessagesWrite), "messages:write");
         assert_eq!(
-            format!("{}", Capability::ToolInvoke("foo".to_owned())),
-            "tool:invoke:foo"
+            format!("{}", Capability::OutletCall("foo".to_owned())),
+            "outlet:call:foo"
         );
-        assert_eq!(format!("{}", Capability::ToolInvokeAll), "tool:invoke:*");
-        assert_eq!(format!("{}", Capability::ToolRegister), "tool:register");
+        assert_eq!(format!("{}", Capability::OutletCallAll), "outlet:call:*");
+        assert_eq!(format!("{}", Capability::OutletRegister), "outlet:register");
         assert_eq!(format!("{}", Capability::MemberInvite), "member:invite");
         assert_eq!(format!("{}", Capability::MemberRemove), "member:remove");
         assert_eq!(format!("{}", Capability::RoleAssign), "role:assign");
@@ -1377,9 +1420,9 @@ mod tests {
         let standard_caps = vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvoke("my-tool".to_owned()),
-            Capability::ToolInvokeAll,
-            Capability::ToolRegister,
+            Capability::OutletCall("my-tool".to_owned()),
+            Capability::OutletCallAll,
+            Capability::OutletRegister,
             Capability::MemberInvite,
             Capability::MemberRemove,
             Capability::RoleAssign,
@@ -1387,7 +1430,7 @@ mod tests {
             Capability::GovernanceVote,
             Capability::ContextClose,
             Capability::ChildContextCreate,
-            Capability::ToolInterface,
+            Capability::OutletInterface,
             Capability::Bridging,
             Capability::MediaVoice,
             Capability::MediaVideo,
@@ -1444,8 +1487,8 @@ mod tests {
         let caps = vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvoke("search".to_owned()),
-            Capability::ToolInvokeAll,
+            Capability::OutletCall("search".to_owned()),
+            Capability::OutletCallAll,
             Capability::MemberBan,
             Capability::Custom("my-cap".to_owned()),
         ];
@@ -1498,20 +1541,20 @@ mod tests {
 
     #[test]
     fn ceiling_tool_invoke_all_implies_specific_tool() {
-        let ceiling = CapabilityCeiling::new([Capability::ToolInvokeAll, Capability::MessagesRead]);
-        assert!(ceiling.contains(&Capability::ToolInvoke("any-tool".to_owned())));
-        assert!(ceiling.contains(&Capability::ToolInvoke("another-tool".to_owned())));
+        let ceiling = CapabilityCeiling::new([Capability::OutletCallAll, Capability::MessagesRead]);
+        assert!(ceiling.contains(&Capability::OutletCall("any-tool".to_owned())));
+        assert!(ceiling.contains(&Capability::OutletCall("another-tool".to_owned())));
     }
 
     #[test]
     fn ceiling_specific_tool_does_not_imply_all() {
         let ceiling = CapabilityCeiling::new([
-            Capability::ToolInvoke("specific-tool".to_owned()),
+            Capability::OutletCall("specific-tool".to_owned()),
             Capability::MessagesRead,
         ]);
-        assert!(ceiling.contains(&Capability::ToolInvoke("specific-tool".to_owned())));
-        assert!(!ceiling.contains(&Capability::ToolInvoke("other-tool".to_owned())));
-        assert!(!ceiling.contains(&Capability::ToolInvokeAll));
+        assert!(ceiling.contains(&Capability::OutletCall("specific-tool".to_owned())));
+        assert!(!ceiling.contains(&Capability::OutletCall("other-tool".to_owned())));
+        assert!(!ceiling.contains(&Capability::OutletCallAll));
     }
 
     #[test]
@@ -1560,10 +1603,10 @@ mod tests {
 
     #[test]
     fn check_ceiling_tool_invoke_all_covers_specific() {
-        let ceiling = CapabilityCeiling::new([Capability::ToolInvokeAll]);
+        let ceiling = CapabilityCeiling::new([Capability::OutletCallAll]);
         assert!(check_ceiling(
             &ceiling,
-            &Capability::ToolInvoke("test-tool".to_owned())
+            &Capability::OutletCall("test-tool".to_owned())
         ));
     }
 
@@ -1622,7 +1665,7 @@ mod tests {
         assert_eq!(member.name, "member");
         assert!(member.capabilities.contains(&Capability::MessagesRead));
         assert!(member.capabilities.contains(&Capability::MessagesWrite));
-        assert!(member.capabilities.contains(&Capability::ToolInvokeAll));
+        assert!(member.capabilities.contains(&Capability::OutletCallAll));
         assert_eq!(member.capabilities.len(), 3);
     }
 
@@ -1642,7 +1685,7 @@ mod tests {
         assert_eq!(moderator.name, "moderator");
         assert!(moderator.capabilities.contains(&Capability::MessagesRead));
         assert!(moderator.capabilities.contains(&Capability::MessagesWrite));
-        assert!(moderator.capabilities.contains(&Capability::ToolInvokeAll));
+        assert!(moderator.capabilities.contains(&Capability::OutletCallAll));
         assert!(moderator.capabilities.contains(&Capability::MemberRemove));
         assert!(
             moderator
@@ -1658,7 +1701,7 @@ mod tests {
         let ceiling = CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvokeAll,
+            Capability::OutletCallAll,
             Capability::MemberRemove,
         ]);
         let moderator = builtin_moderator(&ceiling);
@@ -1677,7 +1720,7 @@ mod tests {
         assert_eq!(author.name, "author");
         assert!(author.capabilities.contains(&Capability::MessagesWrite));
         assert!(author.capabilities.contains(&Capability::MessagesRead));
-        assert!(author.capabilities.contains(&Capability::ToolInvokeAll));
+        assert!(author.capabilities.contains(&Capability::OutletCallAll));
         assert_eq!(author.capabilities.len(), 3);
     }
 
@@ -1692,10 +1735,11 @@ mod tests {
 
     #[test]
     fn builtin_member_respects_ceiling() {
-        // If ToolInvokeAll is not in the ceiling, member should not have it.
+        // If OutletCallAll / OutletQueryAll are not in the ceiling, member should not have them.
         let ceiling = CapabilityCeiling::new([Capability::MessagesRead, Capability::MessagesWrite]);
         let member = builtin_member(&ceiling);
-        assert!(!member.capabilities.contains(&Capability::ToolInvokeAll));
+        assert!(!member.capabilities.contains(&Capability::OutletCallAll));
+        assert!(!member.capabilities.contains(&Capability::OutletQueryAll));
         assert_eq!(member.capabilities.len(), 2);
     }
 
@@ -1887,7 +1931,7 @@ mod tests {
         // Alice should now have member capabilities.
         assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesRead));
         assert!(state.member_has_capability("did:dht:alice", &Capability::MessagesWrite));
-        assert!(state.member_has_capability("did:dht:alice", &Capability::ToolInvokeAll));
+        assert!(state.member_has_capability("did:dht:alice", &Capability::OutletCallAll));
     }
 
     #[test]
@@ -2366,7 +2410,7 @@ mod tests {
         // member's capability set (roles.rs doesn't add custom
         // capabilities via the standard role flow but the fold must
         // handle them correctly if someone does).
-        let custom = Capability::Custom("tool:invoke:calculator".to_owned());
+        let custom = Capability::Custom("outlet:call:calculator".to_owned());
         state
             .member_capabilities
             .get_mut("did:dht:alice")
@@ -2822,16 +2866,16 @@ mod tests {
 
     #[test]
     fn ucan_resource_action_tool_invoke_all() {
-        let (resource, action) = Capability::ToolInvokeAll.ucan_resource_action();
-        assert_eq!(resource.as_ref(), "tool_invoke");
+        let (resource, action) = Capability::OutletCallAll.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "outlet_call");
         assert_eq!(action.as_ref(), "*");
     }
 
     #[test]
     fn ucan_resource_action_tool_invoke_specific() {
-        let cap = Capability::ToolInvoke("calculator".to_owned());
+        let cap = Capability::OutletCall("calculator".to_owned());
         let (resource, action) = cap.ucan_resource_action();
-        assert_eq!(resource.as_ref(), "tool_invoke");
+        assert_eq!(resource.as_ref(), "outlet_call");
         assert_eq!(action.as_ref(), "calculator");
     }
 
@@ -2877,25 +2921,25 @@ mod tests {
     #[test]
     fn ucan_resource_action_from_name_string() {
         // Parsing from the canonical colon name produces the correct UCAN pair.
-        let cap = Capability::new("tool:invoke:*");
+        let cap = Capability::new("outlet:call:*");
         let (resource, action) = cap.ucan_resource_action();
-        assert_eq!(resource.as_ref(), "tool_invoke");
+        assert_eq!(resource.as_ref(), "outlet_call");
         assert_eq!(action.as_ref(), "*");
     }
 
     #[test]
     fn ucan_resource_action_tool_invoke_specific_from_name() {
-        let cap = Capability::new("tool:invoke:calculator");
+        let cap = Capability::new("outlet:call:calculator");
         let (resource, action) = cap.ucan_resource_action();
-        assert_eq!(resource.as_ref(), "tool_invoke");
+        assert_eq!(resource.as_ref(), "outlet_call");
         assert_eq!(action.as_ref(), "calculator");
     }
 
     #[test]
     fn ucan_capability_name_format() {
         assert_eq!(
-            Capability::ToolInvokeAll.ucan_capability_name(),
-            "tool_invoke:*"
+            Capability::OutletCallAll.ucan_capability_name(),
+            "outlet_call:*"
         );
         assert_eq!(
             Capability::MessagesWrite.ucan_capability_name(),
@@ -2906,13 +2950,13 @@ mod tests {
             "context_child:create"
         );
         assert_eq!(
-            Capability::ToolInvoke("calc".to_owned()).ucan_capability_name(),
-            "tool_invoke:calc"
+            Capability::OutletCall("calc".to_owned()).ucan_capability_name(),
+            "outlet_call:calc"
         );
         assert_eq!(Capability::Bridging.ucan_capability_name(), "bridging:*");
         assert_eq!(
-            Capability::ToolRegister.ucan_capability_name(),
-            "tool:register"
+            Capability::OutletRegister.ucan_capability_name(),
+            "outlet:register"
         );
     }
 
@@ -2946,9 +2990,9 @@ mod tests {
         let caps = vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvoke("test".to_owned()),
-            Capability::ToolInvokeAll,
-            Capability::ToolRegister,
+            Capability::OutletCall("test".to_owned()),
+            Capability::OutletCallAll,
+            Capability::OutletRegister,
             Capability::MemberInvite,
             Capability::MemberRemove,
             Capability::RoleAssign,
@@ -2956,7 +3000,7 @@ mod tests {
             Capability::GovernanceVote,
             Capability::ContextClose,
             Capability::ChildContextCreate,
-            Capability::ToolInterface,
+            Capability::OutletInterface,
             Capability::Bridging,
             Capability::MediaVoice,
             Capability::MediaVideo,

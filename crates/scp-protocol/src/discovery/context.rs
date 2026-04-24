@@ -18,8 +18,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::handles::{TOOL_HANDLE_DEREGISTER, TOOL_HANDLE_LOOKUP, TOOL_HANDLE_REGISTER};
-use super::scope::{TOOL_SCOPE_DEREGISTER, TOOL_SCOPE_LOOKUP, TOOL_SCOPE_REGISTER};
+use super::handles::{OUTLET_HANDLE_DEREGISTER, OUTLET_HANDLE_LOOKUP, OUTLET_HANDLE_REGISTER};
+use super::scope::{OUTLET_SCOPE_DEREGISTER, OUTLET_SCOPE_LOOKUP, OUTLET_SCOPE_REGISTER};
 use super::{DID, RegistrationEntry};
 
 // ---------------------------------------------------------------------------
@@ -27,13 +27,13 @@ use super::{DID, RegistrationEntry};
 // ---------------------------------------------------------------------------
 
 /// Standard tool name for agent search.
-pub const TOOL_AGENT_SEARCH: &str = "agent_search";
+pub const OUTLET_AGENT_SEARCH: &str = "agent_search";
 
 /// Standard tool name for agent registration.
-pub const TOOL_AGENT_REGISTER: &str = "agent_register";
+pub const OUTLET_AGENT_REGISTER: &str = "agent_register";
 
 /// Standard tool name for agent deregistration.
-pub const TOOL_AGENT_DEREGISTER: &str = "agent_deregister";
+pub const OUTLET_AGENT_DEREGISTER: &str = "agent_deregister";
 
 // ---------------------------------------------------------------------------
 // AgentSearchParams
@@ -247,18 +247,18 @@ pub fn agent_deregister_schema() -> serde_json::Value {
 /// Returns whether a tool name matches one of the standard discovery tool
 /// names.
 #[must_use]
-pub fn is_standard_tool(name: &str) -> bool {
+pub fn is_standard_outlet(name: &str) -> bool {
     matches!(
         name,
-        TOOL_AGENT_SEARCH
-            | TOOL_AGENT_REGISTER
-            | TOOL_AGENT_DEREGISTER
-            | TOOL_SCOPE_REGISTER
-            | TOOL_SCOPE_LOOKUP
-            | TOOL_SCOPE_DEREGISTER
-            | TOOL_HANDLE_REGISTER
-            | TOOL_HANDLE_LOOKUP
-            | TOOL_HANDLE_DEREGISTER
+        OUTLET_AGENT_SEARCH
+            | OUTLET_AGENT_REGISTER
+            | OUTLET_AGENT_DEREGISTER
+            | OUTLET_SCOPE_REGISTER
+            | OUTLET_SCOPE_LOOKUP
+            | OUTLET_SCOPE_DEREGISTER
+            | OUTLET_HANDLE_REGISTER
+            | OUTLET_HANDLE_LOOKUP
+            | OUTLET_HANDLE_DEREGISTER
     )
 }
 
@@ -269,8 +269,12 @@ pub fn is_standard_tool(name: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::super::handles::{TOOL_HANDLE_DEREGISTER, TOOL_HANDLE_LOOKUP, TOOL_HANDLE_REGISTER};
-    use super::super::scope::{TOOL_SCOPE_DEREGISTER, TOOL_SCOPE_LOOKUP, TOOL_SCOPE_REGISTER};
+    use super::super::handles::{
+        OUTLET_HANDLE_DEREGISTER, OUTLET_HANDLE_LOOKUP, OUTLET_HANDLE_REGISTER,
+    };
+    use super::super::scope::{
+        OUTLET_SCOPE_DEREGISTER, OUTLET_SCOPE_LOOKUP, OUTLET_SCOPE_REGISTER,
+    };
     use super::*;
 
     const AGENT_A_DID: &str = "did:dht:z6MkAgentA";
@@ -385,25 +389,25 @@ mod tests {
         assert_eq!(event, deserialized);
     }
 
-    // -- is_standard_tool -------------------------------------------------
+    // -- is_standard_outlet -------------------------------------------------
 
     #[test]
     fn is_standard_tool_detects_standard_names() {
         // agent tools
-        assert!(is_standard_tool(TOOL_AGENT_SEARCH));
-        assert!(is_standard_tool(TOOL_AGENT_REGISTER));
-        assert!(is_standard_tool(TOOL_AGENT_DEREGISTER));
+        assert!(is_standard_outlet(OUTLET_AGENT_SEARCH));
+        assert!(is_standard_outlet(OUTLET_AGENT_REGISTER));
+        assert!(is_standard_outlet(OUTLET_AGENT_DEREGISTER));
         // scope tools
-        assert!(is_standard_tool(TOOL_SCOPE_REGISTER));
-        assert!(is_standard_tool(TOOL_SCOPE_LOOKUP));
-        assert!(is_standard_tool(TOOL_SCOPE_DEREGISTER));
+        assert!(is_standard_outlet(OUTLET_SCOPE_REGISTER));
+        assert!(is_standard_outlet(OUTLET_SCOPE_LOOKUP));
+        assert!(is_standard_outlet(OUTLET_SCOPE_DEREGISTER));
         // handle tools
-        assert!(is_standard_tool(TOOL_HANDLE_REGISTER));
-        assert!(is_standard_tool(TOOL_HANDLE_LOOKUP));
-        assert!(is_standard_tool(TOOL_HANDLE_DEREGISTER));
+        assert!(is_standard_outlet(OUTLET_HANDLE_REGISTER));
+        assert!(is_standard_outlet(OUTLET_HANDLE_LOOKUP));
+        assert!(is_standard_outlet(OUTLET_HANDLE_DEREGISTER));
         // negative cases
-        assert!(!is_standard_tool("custom_tool"));
-        assert!(!is_standard_tool(""));
+        assert!(!is_standard_outlet("custom_tool"));
+        assert!(!is_standard_outlet(""));
     }
 
     // -- AgentSearchResult serialization ----------------------------------

@@ -979,7 +979,7 @@ mod tests {
         assert_eq!(input.participation_record.context_id, "ctx-1");
         assert_eq!(input.participation_record.participation_count, 3);
         assert_eq!(
-            input.participation_record.tool_invocations.get("my-tool"),
+            input.participation_record.outlet_invocations.get("my-tool"),
             Some(&1)
         );
 

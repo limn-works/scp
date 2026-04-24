@@ -44,15 +44,15 @@ pub use super::roles::Capability;
 pub use super::roles::RoleDefinition;
 
 // ---------------------------------------------------------------------------
-// ToolRegistration (re-export from tools/registry module)
+// OutletRegistration (re-export from tools/registry module)
 // ---------------------------------------------------------------------------
 
-/// Re-export of the full [`ToolRegistration`] type from
-/// `tools/registry.rs`, which includes `tool_id`, `name`,
+/// Re-export of the full [`OutletRegistration`] type from
+/// `tools/registry.rs`, which includes `outlet_id`, `name`,
 /// `description`, `schema`, `implementation_hash`, `test_vectors`,
 /// `operator_did`, and `cost`. See ADR-010 in
 /// `.docs/adrs/phase-2.md`.
-pub use super::tools::ToolRegistration;
+pub use super::outlets::OutletRegistration;
 
 // ---------------------------------------------------------------------------
 // ContextMode
@@ -237,10 +237,10 @@ pub enum TemplateId {
     GatedBroadcast,
     /// Cross-context tool interface template (spec section 5.12.1, 6.2).
     /// Messaging + tools + tool interface exposure, full memory, TTL optional.
-    #[serde(rename = "scp:template/tool-interface")]
-    ToolInterfaceTemplate,
+    #[serde(rename = "scp:template/outlet-interface")]
+    OutletInterfaceTemplate,
     /// Tool invocation context with per-invoke cost. Extends `tool-interface`.
-    /// Requires `economic_policy` with `per_tool_invoke` set at creation.
+    /// Requires `economic_policy` with `per_outlet_call` set at creation.
     ///
     /// See spec section 19.10 and ADR-033.
     #[serde(rename = "scp:template/paid-service")]
@@ -304,7 +304,7 @@ pub struct MetadataVisibilityPolicy {
     /// Visibility of the context's economic policy.
     pub economic_policy: FieldVisibility,
     /// Visibility of the count of registered tool interfaces.
-    pub tool_interface_count: FieldVisibility,
+    pub outlet_interface_count: FieldVisibility,
     /// Visibility of child context summary information.
     pub child_context_info: FieldVisibility,
 }
@@ -543,7 +543,7 @@ pub struct PublicMetadata {
     /// Economic policy. `None` when hidden by `MemberOnly`, absent, or unavailable.
     pub economic_policy: Option<EconomicPolicy>,
     /// Count of registered tool interfaces. `None` when hidden by `MemberOnly` or unavailable.
-    pub tool_interface_count: Option<u32>,
+    pub outlet_interface_count: Option<u32>,
     /// Child context summary information. `None` when hidden by `MemberOnly` or unavailable.
     pub child_context_info: Option<Vec<String>>,
 }
@@ -564,7 +564,7 @@ pub struct RuntimeMetadata {
     /// Human-readable context description.
     pub description: Option<String>,
     /// Count of registered tool interfaces.
-    pub tool_interface_count: Option<u32>,
+    pub outlet_interface_count: Option<u32>,
     /// Child context summary information (e.g., parent context IDs, summaries).
     pub child_context_info: Option<Vec<String>>,
     /// Active bridge connectors registered in this context (spec §12.2, §12.6.1).
@@ -666,7 +666,7 @@ pub struct ContextParams {
     pub roles: Vec<RoleDefinition>,
 
     /// Initial tool registrations available within this context.
-    pub tools: Vec<ToolRegistration>,
+    pub tools: Vec<OutletRegistration>,
 
     /// Optional time-to-live. When set, the context automatically expires
     /// after this duration. Extension requires unanimous member consent.
@@ -956,9 +956,9 @@ impl ContextParams {
             name: filter_field(vis.name, runtime.name.clone()),
             description: filter_field(vis.description, runtime.description.clone()),
             economic_policy: filter_field(vis.economic_policy, self.economic_policy.clone()),
-            tool_interface_count: filter_field(
-                vis.tool_interface_count,
-                runtime.tool_interface_count,
+            outlet_interface_count: filter_field(
+                vis.outlet_interface_count,
+                runtime.outlet_interface_count,
             ),
             child_context_info: filter_field(
                 vis.child_context_info,
@@ -979,7 +979,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::context::tools::ToolSchema;
+    use crate::context::outlets::OutletSchema;
 
     #[test]
     fn context_mode_default_is_encrypted() {
@@ -1036,11 +1036,11 @@ mod tests {
                     capabilities: HashSet::from([Capability::MessagesRead]),
                 },
             ],
-            tools: vec![ToolRegistration {
-                tool_id: "recipe-search".to_owned(),
+            tools: vec![OutletRegistration {
+                outlet_id: "recipe-search".to_owned(),
                 name: "recipe-search".to_owned(),
                 description: "Search for recipes".to_owned(),
-                schema: ToolSchema {
+                schema: OutletSchema {
                     input_schema: serde_json::json!({"type": "object"}),
                     output_schema: serde_json::json!({"type": "object"}),
                 },
@@ -1102,12 +1102,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_registration_clone_eq() {
-        let tool = ToolRegistration {
-            tool_id: "search".to_owned(),
+    fn outlet_registration_clone_eq() {
+        let tool = OutletRegistration {
+            outlet_id: "search".to_owned(),
             name: "search".to_owned(),
             description: "Search tool".to_owned(),
-            schema: ToolSchema {
+            schema: OutletSchema {
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: serde_json::json!({"type": "object"}),
             },
@@ -1245,7 +1245,7 @@ mod tests {
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: Some(Amount(1)),
-                    per_tool_invoke: None,
+                    per_outlet_call: None,
                     per_join: Some(Amount(100)),
                     per_period: None,
                     per_byte_stored: None,
@@ -1342,7 +1342,7 @@ mod tests {
         assert_eq!(policy.name, FieldVisibility::PreJoin);
         assert_eq!(policy.description, FieldVisibility::PreJoin);
         assert_eq!(policy.economic_policy, FieldVisibility::PreJoin);
-        assert_eq!(policy.tool_interface_count, FieldVisibility::PreJoin);
+        assert_eq!(policy.outlet_interface_count, FieldVisibility::PreJoin);
         assert_eq!(policy.child_context_info, FieldVisibility::PreJoin);
     }
 
@@ -1355,7 +1355,7 @@ mod tests {
             name: FieldVisibility::PreJoin,
             description: FieldVisibility::PreJoin,
             economic_policy: FieldVisibility::MemberOnly,
-            tool_interface_count: FieldVisibility::PreJoin,
+            outlet_interface_count: FieldVisibility::PreJoin,
             child_context_info: FieldVisibility::MemberOnly,
         };
         let json = serde_json::to_string(&policy).unwrap();
@@ -1424,7 +1424,7 @@ mod tests {
             creator_identity: Some(DID::from("did:dht:z6MkCreator")),
             name: Some("Test Context".to_owned()),
             description: Some("A test context".to_owned()),
-            tool_interface_count: Some(3),
+            outlet_interface_count: Some(3),
             child_context_info: Some(vec!["child-1".to_owned(), "child-2".to_owned()]),
             bridges: Vec::new(),
             bridge_operator_dids: Vec::new(),
@@ -1467,7 +1467,7 @@ mod tests {
         );
         assert_eq!(meta.name, Some("Test Context".to_owned()));
         assert_eq!(meta.description, Some("A test context".to_owned()));
-        assert_eq!(meta.tool_interface_count, Some(3));
+        assert_eq!(meta.outlet_interface_count, Some(3));
         assert_eq!(
             meta.child_context_info,
             Some(vec!["child-1".to_owned(), "child-2".to_owned()])
@@ -1541,7 +1541,7 @@ mod tests {
                 name: FieldVisibility::MemberOnly,
                 description: FieldVisibility::MemberOnly,
                 economic_policy: FieldVisibility::MemberOnly,
-                tool_interface_count: FieldVisibility::MemberOnly,
+                outlet_interface_count: FieldVisibility::MemberOnly,
                 child_context_info: FieldVisibility::MemberOnly,
             },
             ..ContextParams::default()
@@ -1571,7 +1571,7 @@ mod tests {
         assert!(meta.name.is_none());
         assert!(meta.description.is_none());
         assert!(meta.economic_policy.is_none());
-        assert!(meta.tool_interface_count.is_none());
+        assert!(meta.outlet_interface_count.is_none());
         assert!(meta.child_context_info.is_none());
     }
 
@@ -1586,7 +1586,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: CurrencyCode::from("USD"),
                 per_message: Some(Amount(1)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -1630,7 +1630,7 @@ mod tests {
         assert!(meta.creator_identity.is_none());
         assert!(meta.name.is_none());
         assert!(meta.description.is_none());
-        assert!(meta.tool_interface_count.is_none());
+        assert!(meta.outlet_interface_count.is_none());
         assert!(meta.child_context_info.is_none());
     }
 
@@ -1657,7 +1657,7 @@ mod tests {
         // Remaining operational fields still visible.
         assert_eq!(meta.name, Some("Test Context".to_owned()));
         assert_eq!(meta.description, Some("A test context".to_owned()));
-        assert_eq!(meta.tool_interface_count, Some(3));
+        assert_eq!(meta.outlet_interface_count, Some(3));
         assert_eq!(
             meta.child_context_info,
             Some(vec!["child-1".to_owned(), "child-2".to_owned()])
@@ -1688,7 +1688,7 @@ mod tests {
         let meta = params.public_metadata(&runtime);
 
         // Bilateral-ephemeral: member_count, context_age, creator_identity
-        // (and description, economic_policy, tool_interface_count, child_context_info)
+        // (and description, economic_policy, outlet_interface_count, child_context_info)
         // are all MemberOnly. Only name is PreJoin.
         assert!(meta.member_count.is_none(), "member_count should be hidden");
         assert!(meta.context_age.is_none(), "context_age should be hidden");
@@ -1770,7 +1770,7 @@ mod tests {
                 name: FieldVisibility::MemberOnly,
                 description: FieldVisibility::MemberOnly,
                 economic_policy: FieldVisibility::MemberOnly,
-                tool_interface_count: FieldVisibility::MemberOnly,
+                outlet_interface_count: FieldVisibility::MemberOnly,
                 child_context_info: FieldVisibility::MemberOnly,
             },
             ..ContextParams::default()
@@ -1817,7 +1817,7 @@ mod tests {
         let params = ContextParams {
             participation_requirements: vec![
                 RequireParticipation {
-                    fact: ParticipationFact::ToolInvocationCount,
+                    fact: ParticipationFact::OutletInvocationCount,
                     threshold: ParticipationThreshold::AtLeast(100),
                     max_age_secs: 86400,
                     min_contexts: 2,

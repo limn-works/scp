@@ -32,7 +32,7 @@ pub struct ContextSummary {
     /// Unix timestamp (seconds) of the last event.
     pub last_event_at: Option<u64>,
     /// Tool invocation counts: tool name -> invocation count.
-    pub tool_invocations: HashMap<String, u64>,
+    pub outlet_invocations: HashMap<String, u64>,
     /// Governance actions taken, with counts.
     pub governance_actions: HashMap<String, u64>,
     /// Total number of events in the log.
@@ -55,7 +55,7 @@ pub struct ContextSummary {
 #[must_use]
 pub fn generate_summary(events: &[(String, u64)]) -> ContextSummary {
     let mut participants: HashMap<String, u64> = HashMap::new();
-    let mut tool_invocations: HashMap<String, u64> = HashMap::new();
+    let mut outlet_invocations: HashMap<String, u64> = HashMap::new();
     let mut governance_actions: HashMap<String, u64> = HashMap::new();
     let mut first_event_at: Option<u64> = None;
     let mut last_event_at: Option<u64> = None;
@@ -87,9 +87,9 @@ pub fn generate_summary(events: &[(String, u64)]) -> ContextSummary {
             }
         } else if event_name.starts_with("ToolInvoked") {
             if let Some(tool_name) = event_name.strip_prefix("ToolInvoked:") {
-                *tool_invocations.entry(tool_name.to_owned()).or_insert(0) += 1;
+                *outlet_invocations.entry(tool_name.to_owned()).or_insert(0) += 1;
             } else {
-                *tool_invocations.entry("unknown".to_owned()).or_insert(0) += 1;
+                *outlet_invocations.entry("unknown".to_owned()).or_insert(0) += 1;
             }
         } else if event_name.starts_with("GovernanceAction") {
             if let Some(action_name) = event_name.strip_prefix("GovernanceAction:") {
@@ -109,7 +109,7 @@ pub fn generate_summary(events: &[(String, u64)]) -> ContextSummary {
         message_count_per_participant: participants,
         first_event_at,
         last_event_at,
-        tool_invocations,
+        outlet_invocations,
         governance_actions,
         total_event_count: events.len(),
     }
@@ -125,7 +125,7 @@ pub fn summary_to_json(summary: &ContextSummary) -> serde_json::Value {
         "message_count_per_participant": summary.message_count_per_participant,
         "first_event_at": summary.first_event_at,
         "last_event_at": summary.last_event_at,
-        "tool_invocations": summary.tool_invocations,
+        "outlet_invocations": summary.outlet_invocations,
         "governance_actions": summary.governance_actions,
         "total_event_count": summary.total_event_count,
     })
@@ -151,7 +151,7 @@ pub fn summary_output_schema() -> serde_json::Value {
             "last_event_at": {
                 "type": ["integer", "null"]
             },
-            "tool_invocations": {
+            "outlet_invocations": {
                 "type": "object",
                 "additionalProperties": { "type": "integer" }
             },
@@ -168,7 +168,7 @@ pub fn summary_output_schema() -> serde_json::Value {
             "message_count_per_participant",
             "first_event_at",
             "last_event_at",
-            "tool_invocations",
+            "outlet_invocations",
             "governance_actions",
             "total_event_count"
         ]
@@ -204,7 +204,7 @@ mod tests {
         assert!(summary.message_count_per_participant.is_empty());
         assert!(summary.first_event_at.is_none());
         assert!(summary.last_event_at.is_none());
-        assert!(summary.tool_invocations.is_empty());
+        assert!(summary.outlet_invocations.is_empty());
         assert!(summary.governance_actions.is_empty());
         assert_eq!(summary.total_event_count, 0);
     }
@@ -243,8 +243,8 @@ mod tests {
             ("GovernanceAction:MemberBan".to_owned(), 105),
         ];
         let summary = generate_summary(&events);
-        assert_eq!(summary.tool_invocations.get("search"), Some(&2));
-        assert_eq!(summary.tool_invocations.get("generate"), Some(&1));
+        assert_eq!(summary.outlet_invocations.get("search"), Some(&2));
+        assert_eq!(summary.outlet_invocations.get("generate"), Some(&1));
         assert_eq!(summary.governance_actions.get("RoleAssign"), Some(&2));
         assert_eq!(summary.governance_actions.get("MemberBan"), Some(&1));
     }
@@ -271,7 +271,7 @@ mod tests {
             Some(10)
         );
         assert!(json.get("participant_dids").unwrap().is_array());
-        assert!(json.get("tool_invocations").unwrap().is_object());
+        assert!(json.get("outlet_invocations").unwrap().is_object());
         assert!(json.get("governance_actions").unwrap().is_object());
     }
 

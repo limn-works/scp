@@ -76,7 +76,7 @@ pub enum ApprovalRequirement {
     /// Changes to the child's governance model.
     GovernanceChange,
     /// New tools registered in the child.
-    ToolRegistration,
+    OutletRegistration,
     /// Modifications to the child's capability ceiling (only applicable
     /// if the child has `Governed` ceiling policy).
     CeilingChange,
@@ -752,7 +752,7 @@ mod tests {
         let intersection = compute_ceiling_intersection(&[parent]);
         assert!(intersection.contains(&Capability::MessagesRead));
         assert!(intersection.contains(&Capability::MessagesWrite));
-        assert!(!intersection.contains(&Capability::ToolInvokeAll));
+        assert!(!intersection.contains(&Capability::OutletCallAll));
     }
 
     #[test]
@@ -762,7 +762,7 @@ mod tests {
             &[
                 Capability::MessagesRead,
                 Capability::MessagesWrite,
-                Capability::ToolInvokeAll,
+                Capability::OutletCallAll,
             ],
             &[],
             OnSeverPolicy::EvictUniqueMembers,
@@ -777,7 +777,7 @@ mod tests {
         assert!(intersection.contains(&Capability::MessagesRead));
         assert!(intersection.contains(&Capability::MessagesWrite));
         assert!(
-            !intersection.contains(&Capability::ToolInvokeAll),
+            !intersection.contains(&Capability::OutletCallAll),
             "ToolInvokeAll is only in parent A, not in intersection"
         );
     }
@@ -1473,7 +1473,7 @@ mod tests {
             can_restrict_ceiling: true,
             requires_approval_for: [
                 ApprovalRequirement::GovernanceChange,
-                ApprovalRequirement::ToolRegistration,
+                ApprovalRequirement::OutletRegistration,
             ]
             .into_iter()
             .collect(),
@@ -1504,7 +1504,7 @@ mod tests {
     fn approval_requirement_variants_are_distinct() {
         let variants = [
             ApprovalRequirement::GovernanceChange,
-            ApprovalRequirement::ToolRegistration,
+            ApprovalRequirement::OutletRegistration,
             ApprovalRequirement::CeilingChange,
             ApprovalRequirement::MembershipChange,
         ];

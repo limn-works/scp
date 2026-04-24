@@ -2,20 +2,20 @@
 //!
 //! Every tool invocation follows a defined lifecycle with explicit states,
 //! timeouts, and error handling. Tool execution errors are returned in
-//! [`ToolResponse::error`], not as protocol-level errors. Schema validation
+//! [`OutletResponse::error`], not as protocol-level errors. Schema validation
 //! failures are caught by the SDK, not the tool.
 //!
 //! See ADR-010 in `.docs/adrs/phase-2.md` for the full design.
 //!
 //! # Types
 //!
-//! - [`ToolRequest`] -- A tool invocation request sent as an MLS application
+//! - [`OutletRequest`] -- A tool invocation request sent as an MLS application
 //!   message.
-//! - [`ToolResponse`] -- A tool invocation response.
-//! - [`ToolStatus`] -- The four terminal statuses of a tool invocation.
-//! - [`ToolExecutionError`] -- Structured execution error with retryable hint.
-//! - [`ToolErrorCode`] -- Error code enum covering all tool error categories.
-//! - [`ToolCancel`] -- Cancellation request referencing a pending invocation.
+//! - [`OutletResponse`] -- A tool invocation response.
+//! - [`OutletStatus`] -- The four terminal statuses of a tool invocation.
+//! - [`OutletExecutionError`] -- Structured execution error with retryable hint.
+//! - [`OutletErrorCode`] -- Error code enum covering all tool error categories.
+//! - [`OutletCancel`] -- Cancellation request referencing a pending invocation.
 
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +43,7 @@ pub const DEFAULT_TIMEOUT_MS: u32 = 30_000;
 pub const MAX_TIMEOUT_MS: u32 = 300_000;
 
 // ---------------------------------------------------------------------------
-// ToolRequest
+// OutletRequest
 // ---------------------------------------------------------------------------
 
 /// A tool invocation request, sent as an MLS application message.
@@ -54,11 +54,11 @@ pub const MAX_TIMEOUT_MS: u32 = 300_000;
 ///
 /// See ADR-010 acceptance criterion 2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolRequest {
+pub struct OutletRequest {
     /// UUID v4, unique per invocation.
     pub request_id: String,
     /// The tool to invoke.
-    pub tool_id: String,
+    pub outlet_id: String,
     /// The DID of the invoker.
     pub invoker_did: DID,
     /// The input to pass to the tool.
@@ -77,21 +77,21 @@ pub struct ToolRequest {
     pub timestamp: u64,
 }
 
-impl ToolRequest {
-    /// Creates a new `ToolRequest` with the given parameters and a generated
+impl OutletRequest {
+    /// Creates a new `OutletRequest` with the given parameters and a generated
     /// UUID v4 request ID.
     ///
     /// Uses [`DEFAULT_TIMEOUT_MS`] as the default timeout and 0 as the default
     /// chain depth.
     pub fn new(
-        tool_id: String,
+        outlet_id: String,
         invoker_did: DID,
         input: serde_json::Value,
         clock: &dyn Clock,
     ) -> Self {
         Self {
             request_id: uuid::Uuid::new_v4().to_string(),
-            tool_id,
+            outlet_id,
             invoker_did,
             input,
             timeout_ms: DEFAULT_TIMEOUT_MS,
@@ -114,7 +114,7 @@ impl ToolRequest {
 }
 
 // ---------------------------------------------------------------------------
-// ToolResponse
+// OutletResponse
 // ---------------------------------------------------------------------------
 
 /// A tool invocation response, sent as an MLS application message.
@@ -125,15 +125,15 @@ impl ToolRequest {
 ///
 /// See ADR-010 acceptance criterion 3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolResponse {
-    /// Matches the [`ToolRequest::request_id`].
+pub struct OutletResponse {
+    /// Matches the [`OutletRequest::request_id`].
     pub request_id: String,
     /// Terminal status of the invocation.
-    pub status: ToolStatus,
-    /// The tool's output, present on [`ToolStatus::Success`].
+    pub status: OutletStatus,
+    /// The tool's output, present on [`OutletStatus::Success`].
     pub output: Option<serde_json::Value>,
     /// Structured error, present on non-success statuses.
-    pub error: Option<ToolExecutionError>,
+    pub error: Option<OutletExecutionError>,
     /// Wall-clock execution time in milliseconds.
     pub execution_time_ms: u64,
     /// Provenance metadata for this response.
@@ -141,14 +141,14 @@ pub struct ToolResponse {
 }
 
 // ---------------------------------------------------------------------------
-// ToolStatus
+// OutletStatus
 // ---------------------------------------------------------------------------
 
 /// Terminal status of a tool invocation.
 ///
 /// See ADR-010 acceptance criterion 4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ToolStatus {
+pub enum OutletStatus {
     /// Tool executed successfully and produced output.
     Success,
     /// Tool execution failed with an error.
@@ -159,7 +159,7 @@ pub enum ToolStatus {
     Cancelled,
 }
 
-impl std::fmt::Display for ToolStatus {
+impl std::fmt::Display for OutletStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Success => write!(f, "Success"),
@@ -171,20 +171,20 @@ impl std::fmt::Display for ToolStatus {
 }
 
 // ---------------------------------------------------------------------------
-// ToolExecutionError
+// OutletExecutionError
 // ---------------------------------------------------------------------------
 
 /// Structured tool execution error.
 ///
-/// Returned in [`ToolResponse::error`] for non-success invocations. The
+/// Returned in [`OutletResponse::error`] for non-success invocations. The
 /// [`retryable`](Self::retryable) field indicates whether the caller should
 /// attempt the invocation again.
 ///
 /// See ADR-010 acceptance criterion 5.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolExecutionError {
+pub struct OutletExecutionError {
     /// Categorized error code.
-    pub code: ToolErrorCode,
+    pub code: OutletErrorCode,
     /// Human-readable error description.
     pub message: String,
     /// Whether the caller should retry the invocation.
@@ -192,7 +192,7 @@ pub struct ToolExecutionError {
 }
 
 // ---------------------------------------------------------------------------
-// ToolErrorCode
+// OutletErrorCode
 // ---------------------------------------------------------------------------
 
 /// Categorized error codes for tool invocation failures.
@@ -201,7 +201,7 @@ pub struct ToolExecutionError {
 ///
 /// See ADR-010 acceptance criterion 6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ToolErrorCode {
+pub enum OutletErrorCode {
     /// Input did not pass the tool's input schema validation.
     InputValidationFailed,
     /// Output did not pass the tool's output schema validation.
@@ -215,14 +215,14 @@ pub enum ToolErrorCode {
     /// Invocation was rejected due to rate limiting.
     RateLimited,
     /// The requested tool was not found in the registry.
-    ToolNotFound,
+    OutletNotFound,
     /// The invoker does not have the required capability.
     PermissionDenied,
     /// An unexpected internal error occurred.
     InternalError,
 }
 
-impl std::fmt::Display for ToolErrorCode {
+impl std::fmt::Display for OutletErrorCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InputValidationFailed => write!(f, "InputValidationFailed"),
@@ -231,7 +231,7 @@ impl std::fmt::Display for ToolErrorCode {
             Self::Timeout => write!(f, "Timeout"),
             Self::Cancelled => write!(f, "Cancelled"),
             Self::RateLimited => write!(f, "RateLimited"),
-            Self::ToolNotFound => write!(f, "ToolNotFound"),
+            Self::OutletNotFound => write!(f, "OutletNotFound"),
             Self::PermissionDenied => write!(f, "PermissionDenied"),
             Self::InternalError => write!(f, "InternalError"),
         }
@@ -239,19 +239,19 @@ impl std::fmt::Display for ToolErrorCode {
 }
 
 // ---------------------------------------------------------------------------
-// ToolCancel
+// OutletCancel
 // ---------------------------------------------------------------------------
 
 /// Cancellation request for a pending tool invocation.
 ///
-/// The invoker MAY send a `ToolCancel` referencing the `request_id` of a
+/// The invoker MAY send a `OutletCancel` referencing the `request_id` of a
 /// pending invocation. Cancellation is best-effort: if the tool responds
-/// with [`ToolStatus::Success`] before the cancel is processed, the success
+/// with [`OutletStatus::Success`] before the cancel is processed, the success
 /// response takes precedence.
 ///
 /// See ADR-010 cancellation protocol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCancel {
+pub struct OutletCancel {
     /// The request ID of the invocation to cancel.
     pub request_id: String,
     /// The DID of the invoker requesting cancellation.
@@ -261,7 +261,7 @@ pub struct ToolCancel {
 }
 
 // ---------------------------------------------------------------------------
-// ToolInvokedEvent (event log integration)
+// OutletInvokedEvent (event log integration)
 // ---------------------------------------------------------------------------
 
 /// Event payload for a `ToolInvoked` event in the context event log.
@@ -269,15 +269,15 @@ pub struct ToolCancel {
 /// Records tool invocation metadata without full input/output (which may be
 /// large). Only content hashes are stored. See ADR-010 event log recording.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolInvokedEvent {
+pub struct OutletInvokedEvent {
     /// The request ID of the invocation.
     pub request_id: String,
     /// The tool that was invoked.
-    pub tool_id: String,
+    pub outlet_id: String,
     /// The DID of the invoker.
     pub invoker_did: DID,
     /// Terminal status of the invocation.
-    pub status: ToolStatus,
+    pub status: OutletStatus,
     /// Wall-clock execution time in milliseconds.
     pub execution_time_ms: u64,
     /// SHA-256 hash of the input (hex-encoded).
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn tool_request_new_generates_uuid_v4() {
-        let request = ToolRequest::new(
+        let request = OutletRequest::new(
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({"x": 1}),
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn tool_request_clamp_timeout_below_context_max() {
-        let mut request = ToolRequest::new(
+        let mut request = OutletRequest::new(
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn tool_request_clamp_timeout_above_context_max() {
-        let mut request = ToolRequest::new(
+        let mut request = OutletRequest::new(
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn tool_request_clamp_timeout_respects_protocol_maximum() {
-        let mut request = ToolRequest::new(
+        let mut request = OutletRequest::new(
             "tool-1".to_owned(),
             "did:dht:z6MkInvoker".into(),
             serde_json::json!({}),
@@ -380,35 +380,35 @@ mod tests {
 
     #[test]
     fn tool_status_display() {
-        assert_eq!(format!("{}", ToolStatus::Success), "Success");
-        assert_eq!(format!("{}", ToolStatus::Error), "Error");
-        assert_eq!(format!("{}", ToolStatus::Timeout), "Timeout");
-        assert_eq!(format!("{}", ToolStatus::Cancelled), "Cancelled");
+        assert_eq!(format!("{}", OutletStatus::Success), "Success");
+        assert_eq!(format!("{}", OutletStatus::Error), "Error");
+        assert_eq!(format!("{}", OutletStatus::Timeout), "Timeout");
+        assert_eq!(format!("{}", OutletStatus::Cancelled), "Cancelled");
     }
 
     #[test]
     fn tool_error_code_display() {
         assert_eq!(
-            format!("{}", ToolErrorCode::InputValidationFailed),
+            format!("{}", OutletErrorCode::InputValidationFailed),
             "InputValidationFailed"
         );
         assert_eq!(
-            format!("{}", ToolErrorCode::PermissionDenied),
+            format!("{}", OutletErrorCode::PermissionDenied),
             "PermissionDenied"
         );
-        assert_eq!(format!("{}", ToolErrorCode::Timeout), "Timeout");
+        assert_eq!(format!("{}", OutletErrorCode::Timeout), "Timeout");
     }
 
     #[test]
     fn tool_status_serialization_roundtrip() {
         for status in [
-            ToolStatus::Success,
-            ToolStatus::Error,
-            ToolStatus::Timeout,
-            ToolStatus::Cancelled,
+            OutletStatus::Success,
+            OutletStatus::Error,
+            OutletStatus::Timeout,
+            OutletStatus::Cancelled,
         ] {
             let json = serde_json::to_string(&status).unwrap();
-            let deserialized: ToolStatus = serde_json::from_str(&json).unwrap();
+            let deserialized: OutletStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(status, deserialized);
         }
     }
@@ -416,28 +416,28 @@ mod tests {
     #[test]
     fn tool_error_code_serialization_roundtrip() {
         let codes = [
-            ToolErrorCode::InputValidationFailed,
-            ToolErrorCode::OutputValidationFailed,
-            ToolErrorCode::ExecutionFailed,
-            ToolErrorCode::Timeout,
-            ToolErrorCode::Cancelled,
-            ToolErrorCode::RateLimited,
-            ToolErrorCode::ToolNotFound,
-            ToolErrorCode::PermissionDenied,
-            ToolErrorCode::InternalError,
+            OutletErrorCode::InputValidationFailed,
+            OutletErrorCode::OutputValidationFailed,
+            OutletErrorCode::ExecutionFailed,
+            OutletErrorCode::Timeout,
+            OutletErrorCode::Cancelled,
+            OutletErrorCode::RateLimited,
+            OutletErrorCode::OutletNotFound,
+            OutletErrorCode::PermissionDenied,
+            OutletErrorCode::InternalError,
         ];
         for code in codes {
             let json = serde_json::to_string(&code).unwrap();
-            let deserialized: ToolErrorCode = serde_json::from_str(&json).unwrap();
+            let deserialized: OutletErrorCode = serde_json::from_str(&json).unwrap();
             assert_eq!(code, deserialized);
         }
     }
 
     #[test]
     fn tool_request_serialization_roundtrip() {
-        let request = ToolRequest {
+        let request = OutletRequest {
             request_id: "abc-123".to_owned(),
-            tool_id: "tool-1".to_owned(),
+            outlet_id: "tool-1".to_owned(),
             invoker_did: "did:dht:z6MkInvoker".into(),
             input: serde_json::json!({"a": 1}),
             timeout_ms: 5_000,
@@ -446,9 +446,9 @@ mod tests {
             timestamp: 1_000_000,
         };
         let json = serde_json::to_string(&request).unwrap();
-        let deserialized: ToolRequest = serde_json::from_str(&json).unwrap();
+        let deserialized: OutletRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.request_id, "abc-123");
-        assert_eq!(deserialized.tool_id, "tool-1");
+        assert_eq!(deserialized.outlet_id, "tool-1");
         assert_eq!(deserialized.timeout_ms, 5_000);
         assert_eq!(deserialized.chain_depth, 2);
         assert_eq!(deserialized.session_id.as_deref(), Some("sess-1"));
@@ -456,13 +456,13 @@ mod tests {
 
     #[test]
     fn tool_cancel_serialization_roundtrip() {
-        let cancel = ToolCancel {
+        let cancel = OutletCancel {
             request_id: "req-1".to_owned(),
             invoker_did: "did:dht:z6MkInvoker".into(),
             timestamp: 999,
         };
         let json = serde_json::to_string(&cancel).unwrap();
-        let deserialized: ToolCancel = serde_json::from_str(&json).unwrap();
+        let deserialized: OutletCancel = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.request_id, "req-1");
         assert_eq!(deserialized.invoker_did, "did:dht:z6MkInvoker");
         assert_eq!(deserialized.timestamp, 999);
@@ -493,34 +493,34 @@ mod tests {
 
     #[test]
     fn tool_execution_error_serialization_roundtrip() {
-        let error = ToolExecutionError {
-            code: ToolErrorCode::ExecutionFailed,
+        let error = OutletExecutionError {
+            code: OutletErrorCode::ExecutionFailed,
             message: "something broke".to_owned(),
             retryable: true,
         };
         let json = serde_json::to_string(&error).unwrap();
-        let deserialized: ToolExecutionError = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.code, ToolErrorCode::ExecutionFailed);
+        let deserialized: OutletExecutionError = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.code, OutletErrorCode::ExecutionFailed);
         assert_eq!(deserialized.message, "something broke");
         assert!(deserialized.retryable);
     }
 
     #[test]
     fn tool_invoked_event_serialization_roundtrip() {
-        let event = ToolInvokedEvent {
+        let event = OutletInvokedEvent {
             request_id: "req-1".to_owned(),
-            tool_id: "tool-1".to_owned(),
+            outlet_id: "tool-1".to_owned(),
             invoker_did: "did:dht:z6MkInvoker".into(),
-            status: ToolStatus::Success,
+            status: OutletStatus::Success,
             execution_time_ms: 42,
             input_hash: "abcd".to_owned(),
             output_hash: Some("efgh".to_owned()),
             cost: None,
         };
         let json = serde_json::to_string(&event).unwrap();
-        let deserialized: ToolInvokedEvent = serde_json::from_str(&json).unwrap();
+        let deserialized: OutletInvokedEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.request_id, "req-1");
-        assert_eq!(deserialized.status, ToolStatus::Success);
+        assert_eq!(deserialized.status, OutletStatus::Success);
         assert_eq!(deserialized.execution_time_ms, 42);
     }
 

@@ -51,9 +51,9 @@ use scp_primitives::DID;
 
 /// A tool identifier string.
 ///
-/// Matches the `ToolId` type alias in `context::roles`, but redefined here
+/// Matches the `OutletId` type alias in `context::roles`, but redefined here
 /// to avoid coupling the trust module to the context module's internals.
-pub type ToolId = String;
+pub type OutletId = String;
 
 // ---------------------------------------------------------------------------
 // TrustError
