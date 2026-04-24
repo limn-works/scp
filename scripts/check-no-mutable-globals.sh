@@ -127,6 +127,7 @@ ALLOWLIST=(
 
     # One-shot init / test-only clocks
     SYSTEM_CLOCK                    # why: test-only `scp_primitives::SystemClock` zero-sized type passed by reference from integration test.
+    FORCE_LINK                      # why: link-graph marker (`pub static FORCE_LINK: u8 = 0;`) in `crates/scp-ffi/napi-test-stubs` — test-only rlib referenced by scp-ffi-napi's `#[cfg(test)]` to pull its `cargo:rustc-link-lib=static=napi_test_stubs` build-script directive into the lib-test link args. Not shared state.
 
     # Allowlist carried over from FFI gate (shared names — this gate skips
     # the scp-ffi tree but still sees any accidental use of these names in

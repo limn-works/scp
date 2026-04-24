@@ -76,10 +76,11 @@ ALLOWLIST: frozenset[str] = frozenset(
         # precisely because asyncio cannot nest. Documented in ADR-014 AC 6.
         "sync.py::_sync_loop",
         "sync.py::_sync_loop_lock",
-        # _deprecation.py — one-time dedup set for deprecation warnings
-        # emitted by the default-bridge façade. Analog to std::sync::Once.
-        # Cleared only by the test-only `_reset_emitted_for_tests` helper.
-        "_deprecation.py::_emitted",
+        # scp.py — type alias (discriminated union over storage-config
+        # dataclasses). Not mutable state — `X | Y` evaluates to a
+        # `types.UnionType` whose `__class__` methods do not mutate the
+        # global. Dispatched on by `SCP.with_storage` at construction time.
+        "scp.py::StorageConfig",
     }
 )
 
