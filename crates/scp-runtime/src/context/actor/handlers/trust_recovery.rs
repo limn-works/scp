@@ -37,7 +37,6 @@
 //! resolver + clock). Migration paths to non-actor helper types land
 //! in commit 12 alongside the manager deletion.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use scp_protocol::context::ContextError;
@@ -49,7 +48,7 @@ use crate::context::actor::commands::{
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::manager::ContextManager;
+use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for trust-recovery handlers. Plan
 /// §"Transport timeouts inside actor handlers": 30 seconds.
@@ -65,29 +64,31 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// not yet touch deps during the shim period. Commit 12 rewires these
 /// paths.
 pub async fn dispatch(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     _deps: &ActorDeps,
     cmd: TrustRecoveryCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner(mgr, cmd)).await
+    Box::pin(dispatch_inner(supervisor, cmd)).await
 }
 
 /// Shim-callable dispatch. Used by
 /// [`Supervisor::dispatch_trust_recovery_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_trust_recovery_command)
 /// during the commits-10-to-11 migration window — deleted in commit 12
 /// when the shim dissolves.
+///
+/// # Supervisor receiver (ADR-049 commit 12c.9d)
 pub(crate) async fn dispatch_from_shim(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     cmd: TrustRecoveryCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner(mgr, cmd)).await
+    Box::pin(dispatch_inner(supervisor, cmd)).await
 }
 
-async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: TrustRecoveryCommand) -> Outcome<()> {
+async fn dispatch_inner(supervisor: &Supervisor, cmd: TrustRecoveryCommand) -> Outcome<()> {
     match cmd {
         TrustRecoveryCommand::Placeholder { reply } => reply_not_implemented(reply),
         TrustRecoveryCommand::CreateGovernanceCheckpoint { payload, reply } => {
-            handle_create_governance_checkpoint(mgr, *payload, reply).await
+            handle_create_governance_checkpoint(supervisor, *payload, reply).await
         }
         TrustRecoveryCommand::AddCheckpointCosignature {
             context_id,
@@ -95,17 +96,23 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: TrustRecoveryCommand) ->
             cosignature,
             reply,
         } => {
-            handle_add_checkpoint_cosignature(mgr, &context_id, *checkpoint, *cosignature, reply)
-                .await
+            handle_add_checkpoint_cosignature(
+                supervisor,
+                &context_id,
+                *checkpoint,
+                *cosignature,
+                reply,
+            )
+            .await
         }
         TrustRecoveryCommand::RecoveryAdvanceEpoch { context_id, reply } => {
-            handle_recovery_advance_epoch(mgr, &context_id, reply).await
+            handle_recovery_advance_epoch(supervisor, &context_id, reply).await
         }
         TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
-            handle_recovery_send_notification(mgr, *payload, reply).await
+            handle_recovery_send_notification(supervisor, *payload, reply).await
         }
         TrustRecoveryCommand::RecoveryNotifyContact { payload, reply } => {
-            handle_recovery_notify_contact(mgr, *payload, reply).await
+            handle_recovery_notify_contact(supervisor, *payload, reply).await
         }
     }
 }
@@ -117,18 +124,17 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: TrustRecoveryCommand) ->
 /// side effect when a pruning policy is configured — that is a
 /// mutation, so the handler reports `mutated: true` on success.
 async fn handle_create_governance_checkpoint(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: CreateGovernanceCheckpointPayload,
     reply: oneshot::Sender<
         Result<scp_protocol::context::governance::ContextCheckpoint, ContextError>,
     >,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
 
-    let create_fut = async move {
+    let create_fut = async {
         crate::context::trust_recovery_helpers::create_governance_checkpoint(
-            &manager,
+            supervisor,
             &p.context_id,
             p.checkpoint_seq,
             p.merkle_root,
@@ -167,7 +173,7 @@ async fn handle_create_governance_checkpoint(
 /// the handler owns the checkpoint by value and returns the mutated
 /// copy alongside the attestation status.
 async fn handle_add_checkpoint_cosignature(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     mut checkpoint: scp_protocol::context::governance::ContextCheckpoint,
     cosignature: scp_protocol::context::governance::CosignedCheckpoint,
@@ -181,9 +187,8 @@ async fn handle_add_checkpoint_cosignature(
         >,
     >,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let add_fut = crate::context::trust_recovery_helpers::add_checkpoint_cosignature(
-        &manager,
+        supervisor,
         context_id,
         &mut checkpoint,
         cosignature,
@@ -218,13 +223,12 @@ async fn handle_add_checkpoint_cosignature(
 /// [`ContextManager::recovery_advance_epoch`](crate::context::manager::ContextManager::recovery_advance_epoch)
 /// under a 30s timeout.
 async fn handle_recovery_advance_epoch(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     reply: oneshot::Sender<Result<u64, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let advance_fut =
-        crate::context::trust_recovery_helpers::recovery_advance_epoch(&manager, context_id);
+        crate::context::trust_recovery_helpers::recovery_advance_epoch(supervisor, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, advance_fut).await {
         Ok(Ok(epoch)) => (Outcome::ok_mutated(()), Ok(epoch)),
@@ -256,17 +260,16 @@ async fn handle_recovery_advance_epoch(
 /// recovery envelope but does not persist per-context state
 /// modifications — `Outcome::ok(())` on the success path.
 async fn handle_recovery_send_notification(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: RecoverySendNotificationPayload,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = p.context_id.clone();
     let signing_key = p.signing_key.to_signing_key();
 
-    let send_fut = async move {
+    let send_fut = async {
         crate::context::trust_recovery_helpers::recovery_send_notification(
-            &manager,
+            supervisor,
             &p.context_id,
             &p.sender_did,
             &p.payload,
@@ -302,17 +305,16 @@ async fn handle_recovery_send_notification(
 /// the legacy method only transmits an envelope through the first
 /// shared context it finds.
 async fn handle_recovery_notify_contact(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     p: RecoveryNotifyContactPayload,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let recovering_did = p.recovering_did.clone();
     let signing_key = p.signing_key.to_signing_key();
 
-    let notify_fut = async move {
+    let notify_fut = async {
         crate::context::trust_recovery_helpers::recovery_notify_contact(
-            &manager,
+            supervisor,
             &p.recovering_did,
             &p.contact_did,
             &p.payload,

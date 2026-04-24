@@ -98,7 +98,13 @@ use crate::context::manager::{
     self, AccessControlState, CommitOperation, ContextManager, EpochState, GovernanceState,
     PerContextState, TtlState,
 };
+use crate::context::supervisor::Supervisor;
 use crate::context::ttl::{self, CloseResult, TtlExtension, TtlTimer};
+
+/// Shared expectation message for `Supervisor::attached_context_manager()`
+/// inside helpers (ADR-049 commit 12c.9d).
+const ATTACHED_EXPECT: &str = "lifecycle_helpers: Supervisor must be fully attached before helper invocation \
+     (set by Supervisor::attach_context_manager during bridge construction)";
 
 // ---------------------------------------------------------------------------
 // 1. export_context (top-level)
@@ -124,10 +130,13 @@ use crate::context::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 /// registered, or a transport-/persistence-level error from the
 /// underlying event-log export.
 pub async fn export_context(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     exporter_did: DID,
 ) -> Result<crate::context::export_import::ContextExport, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
     let snapshot = {
@@ -172,9 +181,12 @@ pub async fn export_context(
 /// semantics. Byte-identical behavior.
 #[allow(clippy::too_many_lines)] // Reimport guard adds 10 lines to an already-100-line function.
 pub async fn import_context(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     export: crate::context::export_import::ContextExport,
 ) -> Result<ContextHandle, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // 1. Validate export.
     crate::context::export_import::validate_export_for_import(&export)?;
     // C3: Validate consequence rules on import. Uses
@@ -554,7 +566,7 @@ pub async fn import_context(
     // 9. Re-spawn TTL timer if there was remaining TTL.
     if let Some(remaining_secs) = export.snapshot.ttl_remaining_secs {
         let duration = std::time::Duration::from_secs(remaining_secs);
-        spawn_ttl_timer(mgr, &context_id, duration, handle.clone()).await;
+        spawn_ttl_timer(supervisor, &context_id, duration, handle.clone()).await;
     }
 
     Ok(handle)
@@ -572,12 +584,15 @@ pub async fn import_context(
 /// identical behavior.
 #[allow(clippy::too_many_lines)] // Context creation initializes many subsystems including pseudonym routing.
 pub async fn create_context(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: String,
     params: ContextParams,
     creator_did: DID,
     local_pseudonym: Option<[u8; 32]>,
 ) -> Result<ContextHandle, ContextCreationError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextCreationError::CreationFailed(ATTACHED_EXPECT.to_owned()))?;
     // Defense-in-depth: verify creator's SDK version satisfies min_protocol_version.
     params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
     manager::validate_governance_model(&params.governance)?;
@@ -709,7 +724,7 @@ pub async fn create_context(
     // Atomic check-and-insert — eliminates TOCTOU race between
     // contains_key and insert.
     mgr.insert_context(context_id.clone(), per_context)?;
-    finalize_create(mgr, &context_id, params.ttl, &handle).await;
+    finalize_create(supervisor, &context_id, params.ttl, &handle).await;
     Ok(handle)
 }
 
@@ -721,16 +736,23 @@ pub async fn create_context(
 /// TTL timer (hoisted body of the legacy
 /// `ContextManager::finalize_create`).
 pub async fn finalize_create(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     ttl_duration: Option<std::time::Duration>,
     handle: &ContextHandle,
 ) {
+    let Some(mgr) = supervisor.attached_context_manager() else {
+        tracing::error!(
+            context_id,
+            "finalize_create: Supervisor is not attached — skipping"
+        );
+        return;
+    };
     mgr.update_context_gauges();
     mgr.start_governance_timeout_task(context_id).await;
     mgr.persist_context_and_broadcast(context_id).await;
     if let Some(duration) = ttl_duration {
-        spawn_ttl_timer(mgr, context_id, duration, handle.clone()).await;
+        spawn_ttl_timer(supervisor, context_id, duration, handle.clone()).await;
     }
 }
 
@@ -766,12 +788,15 @@ fn generate_initial_access_key_store(
 /// method form.
 #[allow(clippy::too_many_lines)]
 pub async fn join_context(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     handle: &ContextHandle,
     key_package: KeyPackage,
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     local_pseudonym: Option<[u8; 32]>,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = manager::context_id_to_bytes(&context_id);
     let member_did = key_package.owner_did.clone();
@@ -969,7 +994,7 @@ pub async fn join_context(
     // management message before the Welcome, their `crypto.open()`
     // call fails to decrypt and the `SenderKeyRequest` fallback
     // recovers the key.
-    if let Err(e) = drain_and_deliver_sender_keys(mgr, &context_id, &context_id_bytes) {
+    if let Err(e) = drain_and_deliver_sender_keys(supervisor, &context_id, &context_id_bytes) {
         // Drain failed catastrophically — roll back MLS state, sender
         // key, escrow, and economy ticket so the join is fully aborted.
         let _ = mgr
@@ -987,7 +1012,8 @@ pub async fn join_context(
 
     // Phase 4: Membership mutation under lock. On failure: void escrow +
     // rollback ticket + rollback MLS state.
-    if let Err(e) = join_context_membership(mgr, &context_id, &member_did, add_output).await {
+    if let Err(e) = join_context_membership(supervisor, &context_id, &member_did, add_output).await
+    {
         let _ = mgr
             .crypto_ref()
             .remove_member(&context_id_bytes, &member_did);
@@ -1017,7 +1043,7 @@ pub async fn join_context(
     // capture step and marks the ticket as committed so the Drop
     // guard stays quiet.
     let deducted_cost = manager::economy::commit_economy_ticket(ticket);
-    capture_join_payment(mgr, auth, &member_did, &context_id, deducted_cost).await;
+    capture_join_payment(supervisor, auth, &member_did, &context_id, deducted_cost).await;
 
     // Append MemberJoined event to event log.
     mgr.event_log_ref().append_context_event(
@@ -1052,11 +1078,14 @@ pub async fn join_context(
 /// Performs the membership state mutations for `join_context` (Phase 4)
 /// — hoisted body of the legacy `ContextManager::join_context_membership`.
 pub async fn join_context_membership(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     member_did: &DID,
     add_output: scp_protocol::context::builder::AddMemberOutput,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let ctx_arc = mgr
         .get_context_arc(context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
@@ -1138,12 +1167,19 @@ pub async fn join_context_membership(
 /// `join_context`) — hoisted body of the legacy
 /// `ContextManager::capture_join_payment`.
 pub async fn capture_join_payment(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     auth: Option<manager::economy::PaidActionAuthorization>,
     member_did: &DID,
     context_id: &str,
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
 ) {
+    let Some(mgr) = supervisor.attached_context_manager() else {
+        tracing::error!(
+            context_id,
+            "capture_join_payment: Supervisor is not attached — skipping"
+        );
+        return;
+    };
     if let Some(a) = auth
         && let Err(e) = mgr.complete_paid_action(a, member_did, context_id).await
     {
@@ -1178,11 +1214,14 @@ pub async fn capture_join_payment(
 /// Byte-identical to the legacy method.
 #[allow(clippy::too_many_lines)]
 pub async fn leave_context(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     handle: &ContextHandle,
     caller_did: &DID,
     member_did: &DID,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = manager::context_id_to_bytes(&context_id);
 
@@ -1255,7 +1294,7 @@ pub async fn leave_context(
                  remaining members retain old sender key"
             );
         }
-        if let Err(e) = drain_and_deliver_sender_keys(mgr, &context_id, &context_id_bytes) {
+        if let Err(e) = drain_and_deliver_sender_keys(supervisor, &context_id, &context_id_bytes) {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -1355,10 +1394,13 @@ pub async fn leave_context(
 /// transport (§9.16.2). Hoisted body of the legacy
 /// `ContextManager::drain_and_deliver_sender_keys`.
 pub fn drain_and_deliver_sender_keys(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     context_id_bytes: &[u8; 32],
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let pending = mgr
         .crypto_ref()
         .drain_pending_sender_key_messages(context_id_bytes)?;
@@ -1402,11 +1444,11 @@ pub fn drain_and_deliver_sender_keys(
 /// with no signing key. Multi-admin contexts are rejected — they must
 /// route through the governance path.
 pub async fn close_context(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     handle: &ContextHandle,
     initiator_did: &DID,
 ) -> Result<CloseResult, ContextError> {
-    close_context_with_key(mgr, handle, initiator_did, None).await
+    close_context_with_key(supervisor, handle, initiator_did, None).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1421,11 +1463,14 @@ pub async fn close_context(
 /// TTL / governance-timeout cancellation, and final-checkpoint policy.
 /// Byte-identical behavior.
 pub async fn close_context_with_key(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     handle: &ContextHandle,
     initiator_did: &DID,
     signing_key: Option<&ed25519_dalek::SigningKey>,
 ) -> Result<CloseResult, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id = handle.context_id().to_owned();
 
     // Check governance model: multi-admin contexts must route through
@@ -1509,8 +1554,9 @@ pub async fn close_context_with_key(
             // checkpoint to capture the terminal event log state. This
             // ensures equivocation detection covers the full context
             // lifetime. Best-effort: skip if no signing key is available.
-            if let Some(sk) = signing_key {
-                let cp = mgr.force_create_checkpoint(&context_id, ctx, initiator_did, sk);
+            if let Some(sk) = signing_key
+                && let Some(cp) = mgr.force_create_checkpoint(&context_id, ctx, initiator_did, sk)
+            {
                 tracing::debug!(
                     context_id = %context_id,
                     event_count = cp.event_count,
@@ -1550,9 +1596,12 @@ pub async fn close_context_with_key(
 /// requests for ephemeral/summary scopes, transitions from `Closing`
 /// to `Closed`, and appends the final `ContextClosed` event.
 pub async fn finalize_close(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     handle: &ContextHandle,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id = handle.context_id().to_owned();
 
     ttl::finalize_close(
@@ -1582,9 +1631,12 @@ pub async fn finalize_close(
 /// scope, issues relay deletion requests for ephemeral/summary scopes,
 /// and appends `ContextExpired` to the event log.
 pub async fn handle_ttl_expiry(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     handle: &ContextHandle,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id = handle.context_id().to_owned();
 
     // Capture generation before async expiry work for confused-deputy
@@ -1673,11 +1725,14 @@ pub async fn handle_ttl_expiry(
 /// member has now consented (unanimous); the caller should then call
 /// [`reset_ttl_timer`] with the new duration.
 pub async fn propose_ttl_extension(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     member_did: &DID,
     proposed_duration: std::time::Duration,
 ) -> Result<bool, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // All checks and mutation within a single lock acquisition.
     let ctx_arc = mgr
         .get_context_arc(context_id)
@@ -1720,11 +1775,18 @@ pub async fn propose_ttl_extension(
 /// Cancels the old timer and spawns a new one with the given duration.
 /// Clears the extension proposal state.
 pub async fn reset_ttl_timer(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     new_duration: std::time::Duration,
     handle: ContextHandle,
 ) {
+    let Some(mgr) = supervisor.attached_context_manager() else {
+        tracing::error!(
+            context_id,
+            "reset_ttl_timer: Supervisor is not attached — skipping"
+        );
+        return;
+    };
     // Cancel old timer and clear extension state (lock, then drop).
     {
         if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
@@ -1735,7 +1797,7 @@ pub async fn reset_ttl_timer(
         }
     }
 
-    spawn_ttl_timer(mgr, context_id, new_duration, handle).await;
+    spawn_ttl_timer(supervisor, context_id, new_duration, handle).await;
 
     // Persist context state after TTL reset (best-effort).
     if mgr.has_persistence()
@@ -1761,12 +1823,12 @@ pub async fn reset_ttl_timer(
 /// handler uses this wrapper so it doesn't need to depend on the
 /// `manager` submodule's private `spawn_ttl_timer` directly.
 pub async fn start_ttl_timer(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     duration: std::time::Duration,
     handle: ContextHandle,
 ) {
-    spawn_ttl_timer(mgr, context_id, duration, handle).await;
+    spawn_ttl_timer(supervisor, context_id, duration, handle).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1781,11 +1843,18 @@ pub async fn start_ttl_timer(
 /// `ContextEvent::Expired` / `ContextEvent::ExpiryFailed` emission
 /// policy. Byte-identical to the legacy method.
 pub async fn spawn_ttl_timer(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     duration: std::time::Duration,
     handle: ContextHandle,
 ) {
+    let Some(mgr) = supervisor.attached_context_manager() else {
+        tracing::error!(
+            context_id,
+            "spawn_ttl_timer: Supervisor is not attached — skipping"
+        );
+        return;
+    };
     // Extract the cancel Notify and generation under lock, then drop.
     let (cancel, spawn_generation) = {
         let Ok(arc) = mgr.get_context_arc(context_id) else {

@@ -895,7 +895,12 @@ impl ContextManager {
         context_id: &str,
         exporter_did: DID,
     ) -> Result<crate::context::export_import::ContextExport, ContextError> {
-        crate::context::lifecycle_helpers::export_context(self, context_id, exporter_did).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::export_context — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::lifecycle_helpers::export_context(&sup, context_id, exporter_did).await
     }
 
     /// Imports a previously exported context into this manager.
@@ -956,7 +961,12 @@ impl ContextManager {
         &self,
         export: crate::context::export_import::ContextExport,
     ) -> Result<ContextHandle, ContextError> {
-        crate::context::lifecycle_helpers::import_context(self, export).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::import_context — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::lifecycle_helpers::import_context(&sup, export).await
     }
 
     /// Creates a new SCP context with the two-phase commit pattern.
@@ -998,8 +1008,13 @@ impl ContextManager {
         creator_did: DID,
         local_pseudonym: Option<[u8; 32]>,
     ) -> Result<ContextHandle, ContextCreationError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextCreationError::CreationFailed(
+                "ContextManager::create_context — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::lifecycle_helpers::create_context(
-            self,
+            &sup,
             context_id,
             params,
             creator_did,
@@ -1349,8 +1364,13 @@ impl ContextManager {
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
         local_pseudonym: Option<[u8; 32]>,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::join_context — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::lifecycle_helpers::join_context(
-            self,
+            &sup,
             handle,
             key_package,
             spending_ucan,
@@ -1374,8 +1394,13 @@ impl ContextManager {
         member_did: &DID,
         add_output: scp_protocol::context::builder::AddMemberOutput,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::join_context_membership — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::lifecycle_helpers::join_context_membership(
-            self, context_id, member_did, add_output,
+            &sup, context_id, member_did, add_output,
         )
         .await
     }
@@ -1397,8 +1422,15 @@ impl ContextManager {
         context_id: &str,
         deducted_cost: Option<scp_protocol::economy::types::Amount>,
     ) {
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
+                context_id,
+                "ContextManager::capture_join_payment — Supervisor detached; skipping"
+            );
+            return;
+        };
         crate::context::lifecycle_helpers::capture_join_payment(
-            self,
+            &sup,
             auth,
             member_did,
             context_id,
@@ -1494,7 +1526,12 @@ impl ContextManager {
         caller_did: &DID,
         member_did: &DID,
     ) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::leave_context(self, handle, caller_did, member_did).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::leave_context — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::lifecycle_helpers::leave_context(&sup, handle, caller_did, member_did).await
     }
 
     /// Drains pending sender key distribution messages and delivers them
@@ -1507,8 +1544,14 @@ impl ContextManager {
         context_id: &str,
         context_id_bytes: &[u8; 32],
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::drain_and_deliver_sender_keys — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-            self,
+            &sup,
             context_id,
             context_id_bytes,
         )

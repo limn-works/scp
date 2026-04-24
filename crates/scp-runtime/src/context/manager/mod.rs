@@ -3295,7 +3295,14 @@ impl ContextManager {
         duration: std::time::Duration,
         handle: crate::context::ContextHandle,
     ) {
-        crate::context::lifecycle_helpers::start_ttl_timer(self, context_id, duration, handle)
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
+                context_id,
+                "ContextManager::start_ttl_timer — Supervisor detached; skipping"
+            );
+            return;
+        };
+        crate::context::lifecycle_helpers::start_ttl_timer(&sup, context_id, duration, handle)
             .await;
     }
 

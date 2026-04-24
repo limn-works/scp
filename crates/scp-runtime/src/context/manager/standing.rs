@@ -93,63 +93,54 @@ impl ContextManager {
         local_did: &DID,
         peer_did: &DID,
     ) -> Result<String, ContextError> {
-        crate::context::standing_helpers::standing_context(self, local_did, peer_did).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::standing_context — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::standing_helpers::standing_context(&sup, local_did, peer_did).await
     }
 
     /// Returns the number of tracked standing contexts.
-    ///
-    /// Legacy one-line forwarder to the hoisted
-    /// [`crate::context::standing_helpers::standing_context_count`] free
-    /// function (ADR-049 commit 12c.4).
     pub async fn standing_context_count(&self) -> usize {
-        crate::context::standing_helpers::standing_context_count(self).await
+        let Some(sup) = self.supervisor() else {
+            return 0;
+        };
+        crate::context::standing_helpers::standing_context_count(&sup).await
     }
 
     /// Returns `true` if a standing context exists for the given peer DID.
-    ///
-    /// Legacy one-line forwarder to the hoisted
-    /// [`crate::context::standing_helpers::has_standing_context`] free
-    /// function (ADR-049 commit 12c.4).
     pub async fn has_standing_context(&self, peer_did: &DID) -> bool {
-        crate::context::standing_helpers::has_standing_context(self, peer_did).await
+        let Some(sup) = self.supervisor() else {
+            return false;
+        };
+        crate::context::standing_helpers::has_standing_context(&sup, peer_did).await
     }
 
     /// Registers an existing context as a standing context.
-    ///
-    /// Used during startup to restore standing contexts from persisted state.
-    /// The context must be a `bilateral-persistent` context already registered
-    /// in `self.contexts`.
-    ///
-    /// Legacy one-line forwarder to the hoisted
-    /// [`crate::context::standing_helpers::register_standing_context`]
-    /// free function (ADR-049 commit 12c.4).
     pub async fn register_standing_context(&self, peer_did: DID) {
-        crate::context::standing_helpers::register_standing_context(self, peer_did).await;
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
+                peer_did = %peer_did,
+                "ContextManager::register_standing_context — Supervisor detached; skipping"
+            );
+            return;
+        };
+        crate::context::standing_helpers::register_standing_context(&sup, peer_did).await;
     }
 
     /// Reconnects transport for all active standing contexts.
     ///
-    /// Called during SDK initialization. Iterates all tracked standing contexts
-    /// and reconnects transport for those in the `Active` state. Contexts in
-    /// terminal states (`Closed`, `Expired`) are skipped.
-    ///
-    /// This is background work -- standing contexts are available immediately
-    /// after this method returns.
-    ///
-    /// Legacy one-line forwarder to the hoisted
-    /// [`crate::context::standing_helpers::reconnect_all_standing`] free
-    /// function (ADR-049 commit 12c.4).
-    ///
-    /// # Returns
-    ///
-    /// The number of contexts successfully reconnected.
-    ///
     /// # Errors
     ///
     /// Returns [`ContextError::TransportFailed`] if any reconnection fails.
-    /// Partial reconnection results are still applied -- contexts that
-    /// succeeded remain connected.
+    /// Returns [`ContextError::NotInitialized`] if the Supervisor is detached.
     pub async fn reconnect_all_standing(&self) -> Result<usize, ContextError> {
-        crate::context::standing_helpers::reconnect_all_standing(self).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::reconnect_all_standing — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::standing_helpers::reconnect_all_standing(&sup).await
     }
 }

@@ -59,7 +59,16 @@ use scp_protocol::context::{ContextError, ContextState, TemplateId};
 use sha2::{Digest, Sha256};
 
 use crate::context::ContextHandle;
-use crate::context::manager::ContextManager;
+use crate::context::supervisor::Supervisor;
+
+/// Shared expectation message for `Supervisor::attached_context_manager()`
+/// inside helpers (ADR-049 commit 12c.9d). The attach-time contract
+/// (see
+/// [`Supervisor::attach_context_manager`](crate::context::supervisor::Supervisor::attach_context_manager))
+/// installs the manager before any FFI caller or test can invoke a
+/// helper, so unwrap is panic-only under a contract violation.
+const ATTACHED_EXPECT: &str = "standing_helpers: Supervisor must be fully attached before helper invocation \
+     (set by Supervisor::attach_context_manager during bridge construction)";
 
 // ---------------------------------------------------------------------------
 // generate_standing_context_id (pure helper, no mgr parameter)
@@ -112,10 +121,13 @@ pub fn generate_standing_context_id(local_did: &DID, peer_did: &DID) -> String {
 ///
 /// Returns [`ContextError`] if context creation fails.
 pub async fn standing_context(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     local_did: &DID,
     peer_did: &DID,
 ) -> Result<String, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id = generate_standing_context_id(local_did, peer_did);
 
     // Step 1: Check if the context exists and is Active/Creating.
@@ -212,7 +224,13 @@ pub async fn standing_context(
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::standing_context_count`](crate::context::manager::ContextManager::standing_context_count).
-pub async fn standing_context_count(mgr: &ContextManager) -> usize {
+pub async fn standing_context_count(supervisor: &Supervisor) -> usize {
+    // ADR-049 commit 12c.9d — returns `usize` so an unpopulated attach
+    // slot degrades to a safe zero. Defense-in-depth against a contract
+    // violation.
+    let Some(mgr) = supervisor.attached_context_manager() else {
+        return 0;
+    };
     mgr.standing_contexts_ref().lock().await.len()
 }
 
@@ -224,7 +242,13 @@ pub async fn standing_context_count(mgr: &ContextManager) -> usize {
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::has_standing_context`](crate::context::manager::ContextManager::has_standing_context).
-pub async fn has_standing_context(mgr: &ContextManager, peer_did: &DID) -> bool {
+pub async fn has_standing_context(supervisor: &Supervisor, peer_did: &DID) -> bool {
+    // ADR-049 commit 12c.9d — returns `bool` so an unpopulated attach
+    // slot degrades to `false`. Defense-in-depth against a contract
+    // violation.
+    let Some(mgr) = supervisor.attached_context_manager() else {
+        return false;
+    };
     mgr.standing_contexts_ref()
         .lock()
         .await
@@ -243,7 +267,17 @@ pub async fn has_standing_context(mgr: &ContextManager, peer_did: &DID) -> bool 
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::register_standing_context`](crate::context::manager::ContextManager::register_standing_context).
-pub async fn register_standing_context(mgr: &ContextManager, peer_did: DID) {
+pub async fn register_standing_context(supervisor: &Supervisor, peer_did: DID) {
+    // ADR-049 commit 12c.9d — returns `()` so an unpopulated attach
+    // slot degrades to a no-op with a tracing error for observability.
+    let Some(mgr) = supervisor.attached_context_manager() else {
+        tracing::error!(
+            peer_did = %peer_did,
+            "register_standing_context: Supervisor is not attached — skipping registration \
+             (contract violation; see ADR-049 commit 12c.9d)"
+        );
+        return;
+    };
     mgr.standing_contexts_ref()
         .lock()
         .await
@@ -274,7 +308,10 @@ pub async fn register_standing_context(mgr: &ContextManager, peer_did: DID) {
 /// Returns [`ContextError::TransportFailed`] if any reconnection fails.
 /// Partial reconnection results are still applied — contexts that
 /// succeeded remain connected.
-pub async fn reconnect_all_standing(mgr: &ContextManager) -> Result<usize, ContextError> {
+pub async fn reconnect_all_standing(supervisor: &Supervisor) -> Result<usize, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // Phase 1: Collect standing context info and local DIDs under their
     // respective locks, then release BOTH before acquiring per-context
     // Mutexes. This prevents the lock ordering inversion that would

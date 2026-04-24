@@ -632,7 +632,12 @@ async fn force_checkpoint_always_creates() {
     assert!(result.is_none(), "periodic should not fire");
 
     // But force always creates.
-    let cp = manager.force_create_checkpoint("test-ctx", ctx, &sender_did, &signing_key);
+    // `force_create_checkpoint` returns `Option` in ADR-049 commit 12c.9d
+    // (detached Supervisor → `None`); attached Supervisor always
+    // produces a checkpoint, so unwrap is test-appropriate.
+    let cp = manager
+        .force_create_checkpoint("test-ctx", ctx, &sender_did, &signing_key)
+        .unwrap();
     assert_eq!(cp.context_id, "test-ctx");
     assert_eq!(cp.sender_did, sender_did);
     assert_eq!(ctx.checkpoints.len(), 1);

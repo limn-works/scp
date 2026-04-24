@@ -1151,7 +1151,8 @@ impl Supervisor {
         &self,
         cmd: LifecycleCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
+        // ADR-049 commit 12c.9d — lifecycle handler takes `&Supervisor`.
+        let _cm = self.attached_context_manager().ok_or_else(|| {
             ContextError::NotInitialized(
                 "Supervisor::dispatch_lifecycle_command — no ContextManager attached".to_owned(),
             )
@@ -1159,9 +1160,8 @@ impl Supervisor {
 
         // `Box::pin` — the combined size of the rebuilt handle,
         // context params, and the per-variant 30s-timeout future
-        // crosses clippy's 16-KB stack budget for async futures. See
-        // the matching comment on `handlers::lifecycle::dispatch`.
-        Ok(Box::pin(handlers::lifecycle::dispatch_from_shim(cm, cmd)).await)
+        // crosses clippy's 16-KB stack budget for async futures.
+        Ok(Box::pin(handlers::lifecycle::dispatch_from_shim(self, cmd)).await)
     }
 
     /// Dispatch a mutating [`TtlCloseCommand`] through the migration
@@ -1191,13 +1191,14 @@ impl Supervisor {
         &self,
         cmd: TtlCloseCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
+        // ADR-049 commit 12c.9d — ttl_close handler takes `&Supervisor`.
+        let _cm = self.attached_context_manager().ok_or_else(|| {
             ContextError::NotInitialized(
                 "Supervisor::dispatch_ttl_close_command — no ContextManager attached".to_owned(),
             )
         })?;
 
-        Ok(handlers::ttl_close::dispatch_from_shim(cm, cmd).await)
+        Ok(handlers::ttl_close::dispatch_from_shim(self, cmd).await)
     }
 
     /// Dispatch a [`GovernanceCommand`] through the migration shim
@@ -1300,7 +1301,8 @@ impl Supervisor {
         &self,
         cmd: TrustRecoveryCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
+        // ADR-049 commit 12c.9d — trust-recovery handler takes `&Supervisor`.
+        let _cm = self.attached_context_manager().ok_or_else(|| {
             ContextError::NotInitialized(
                 "Supervisor::dispatch_trust_recovery_command — no ContextManager attached"
                     .to_owned(),
@@ -1311,7 +1313,7 @@ impl Supervisor {
         // multiple 32-byte hashes + a variable-length Ed25519 signature
         // vector; the per-variant locals cross clippy's 16-KB stack-
         // future budget.
-        Ok(Box::pin(handlers::trust_recovery::dispatch_from_shim(cm, cmd)).await)
+        Ok(Box::pin(handlers::trust_recovery::dispatch_from_shim(self, cmd)).await)
     }
 
     /// Helper: acquire the per-context lock, run the query handler
@@ -1530,13 +1532,14 @@ impl Supervisor {
         &self,
         cmd: StandingCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
+        // ADR-049 commit 12c.9d — standing handler takes `&Supervisor`.
+        let _cm = self.attached_context_manager().ok_or_else(|| {
             ContextError::NotInitialized(
                 "Supervisor::dispatch_standing_command — no ContextManager attached".to_owned(),
             )
         })?;
 
-        Ok(Box::pin(handlers::standing::dispatch_from_shim(cm, cmd)).await)
+        Ok(Box::pin(handlers::standing::dispatch_from_shim(self, cmd)).await)
     }
 
     /// Dispatch a [`ToolsCommand`] through the migration shim
@@ -1560,13 +1563,14 @@ impl Supervisor {
         &self,
         cmd: ToolsCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
+        // ADR-049 commit 12c.9d — tools handler takes `&Supervisor`.
+        let _cm = self.attached_context_manager().ok_or_else(|| {
             ContextError::NotInitialized(
                 "Supervisor::dispatch_tools_command — no ContextManager attached".to_owned(),
             )
         })?;
 
-        Ok(handlers::tools::dispatch_from_shim(cm, cmd).await)
+        Ok(handlers::tools::dispatch_from_shim(self, cmd).await)
     }
 
     /// Dispatch a [`BroadcastCommand`] through the migration shim

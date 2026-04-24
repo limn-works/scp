@@ -59,7 +59,7 @@
 
 use scp_identity::DID;
 
-use crate::context::manager::ContextManager;
+use crate::context::supervisor::Supervisor;
 
 // ---------------------------------------------------------------------------
 // 1. try_consume_hard_rate_limit (top-level, actor-handler entry point)
@@ -77,11 +77,16 @@ use crate::context::manager::ContextManager;
 /// (ADR-049 commit 12c.4). Byte-identical behavior.
 #[must_use]
 pub async fn try_consume_hard_rate_limit(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     did: &DID,
     now_secs: u64,
 ) -> bool {
+    // ADR-049 commit 12c.9d — returns `bool` so an unpopulated attach
+    // slot degrades to the legacy unknown-context pass-through (`true`).
+    let Some(mgr) = supervisor.attached_context_manager() else {
+        return true;
+    };
     let Ok(arc) = mgr.get_context_arc(context_id) else {
         return true;
     };
@@ -99,7 +104,17 @@ pub async fn try_consume_hard_rate_limit(
 /// Hoisted body of the legacy
 /// [`ContextManager::refund_hard_rate_limit`](crate::context::manager::ContextManager::refund_hard_rate_limit)
 /// (ADR-049 commit 12c.4). Byte-identical behavior.
-pub async fn refund_hard_rate_limit(mgr: &ContextManager, context_id: &str, did: &DID) {
+pub async fn refund_hard_rate_limit(supervisor: &Supervisor, context_id: &str, did: &DID) {
+    // ADR-049 commit 12c.9d — returns `()` so an unpopulated attach
+    // slot degrades to a no-op with a tracing error for observability.
+    let Some(mgr) = supervisor.attached_context_manager() else {
+        tracing::error!(
+            context_id,
+            "refund_hard_rate_limit: Supervisor is not attached — skipping refund \
+             (contract violation; see ADR-049 commit 12c.9d)"
+        );
+        return;
+    };
     if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;

@@ -273,10 +273,10 @@ fn bob() -> DID {
 #[tokio::test]
 async fn shim_standing_context_matches_legacy_context_id() {
     let (manager, supervisor) = new_fixture();
-    let manager_legacy = {
-        let (m2, _) = new_fixture();
-        m2
-    };
+    // ADR-049 commit 12c.9d: `standing_context` now resolves the
+    // Supervisor through the `Weak` back-pointer, so we must keep the
+    // legacy fixture's Supervisor alive for the duration of the test.
+    let (manager_legacy, _supervisor_legacy) = new_fixture();
     // Register the local DID on both managers so `create_context`
     // succeeds inside `standing_context`.
     manager.register_local_did(alice()).await;

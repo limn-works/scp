@@ -395,18 +395,11 @@ async fn handle_drain_events(
     context_id: &str,
     reply: crate::context::actor::commands::DrainEventsReply,
 ) -> Outcome<()> {
-    // `queries_helpers::drain_events` still takes `&ContextManager` at
-    // this point in the ADR-049 commit ladder (migrated in a later
-    // commit of 12c.9). Derive it from the supervisor.
-    let Some(manager) = supervisor.attached_context_manager() else {
-        // Drain returns `Vec<_>` (no error channel). On contract
-        // violation, reply with an empty vec — matches the hoisted
-        // helper's "unknown context" semantics.
-        let _ = reply.send(Ok(Vec::new()));
-        return Outcome::ok(());
-    };
-    let manager: &Arc<ContextManager> = manager;
-    let drain_fut = crate::context::queries_helpers::drain_events(manager, context_id);
+    // ADR-049 commit 12c.9d — `queries_helpers::drain_events` now takes
+    // `&Supervisor`. Drain returns `Vec<_>` (no error channel); the
+    // helper degrades to empty-vec on detached supervisor, matching
+    // the legacy "unknown context" semantics.
+    let drain_fut = crate::context::queries_helpers::drain_events(supervisor, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, drain_fut).await {
         Ok(events) => (Outcome::ok_mutated(()), Ok(events)),

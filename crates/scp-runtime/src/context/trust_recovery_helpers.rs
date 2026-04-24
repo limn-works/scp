@@ -63,6 +63,12 @@ use scp_protocol::context::governance::{
 use crate::context::manager::{
     ContextManager, PerContextState, context_id_to_bytes, require_active,
 };
+use crate::context::supervisor::Supervisor;
+
+/// Shared expectation message for `Supervisor::attached_context_manager()`
+/// inside helpers (ADR-049 commit 12c.9d).
+const ATTACHED_EXPECT: &str = "trust_recovery_helpers: Supervisor must be fully attached before helper invocation \
+     (set by Supervisor::attach_context_manager during bridge construction)";
 
 // ---------------------------------------------------------------------------
 // 1. create_governance_checkpoint
@@ -76,7 +82,7 @@ use crate::context::manager::{
 /// Byte-identical behavior.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_governance_checkpoint(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     checkpoint_seq: u64,
     merkle_root: [u8; 32],
@@ -86,6 +92,9 @@ pub async fn create_governance_checkpoint(
     creator_did: &DID,
     creator_signature: Vec<u8>,
 ) -> Result<ContextCheckpoint, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let ctx_arc = mgr
         .get_context_arc(context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
@@ -153,13 +162,16 @@ pub async fn create_governance_checkpoint(
 /// See the legacy method's doc comment for the full semantics.
 /// Byte-identical behavior.
 pub async fn add_checkpoint_cosignature(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     checkpoint: &mut ContextCheckpoint,
     cosignature: CosignedCheckpoint,
 ) -> Result<CheckpointAttestationStatus, ContextError> {
     use sha2::Digest as _;
 
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let ctx_arc = mgr
         .get_context_arc(context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
@@ -201,9 +213,12 @@ pub async fn add_checkpoint_cosignature(
 /// See the legacy method's doc comment for the full semantics.
 /// Byte-identical behavior.
 pub async fn recovery_advance_epoch(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
 ) -> Result<u64, ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // 1. Validate the context exists and is active (lock scoped).
@@ -295,13 +310,16 @@ pub async fn recovery_advance_epoch(
 /// See the legacy method's doc comment for the full semantics.
 /// Byte-identical behavior.
 pub async fn recovery_send_notification(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     context_id: &str,
     sender_did: &str,
     payload: &[u8],
     sequence: u64,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Look up the current MLS epoch for this context. After an epoch
@@ -364,12 +382,15 @@ pub async fn recovery_send_notification(
 /// See the legacy method's doc comment for the full semantics.
 /// Byte-identical behavior.
 pub async fn recovery_notify_contact(
-    mgr: &ContextManager,
+    supervisor: &Supervisor,
     recovering_did: &str,
     contact_did: &str,
     payload: &[u8],
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<(), ContextError> {
+    let mgr = supervisor
+        .attached_context_manager()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // Find a context where both the recovering DID and the contact DID
     // are members. The first matching context is used for delivery.
     // Collect (key, Arc) pairs first to release DashMap shard locks before
@@ -395,8 +416,15 @@ pub async fn recovery_notify_contact(
     match shared_context_id {
         Some(context_id) => {
             // Contact notifications use sequence=4 (step 5 in recovery).
-            recovery_send_notification(mgr, &context_id, recovering_did, payload, 4, signing_key)
-                .await
+            recovery_send_notification(
+                supervisor,
+                &context_id,
+                recovering_did,
+                payload,
+                4,
+                signing_key,
+            )
+            .await
         }
         None => Err(ContextError::TransportFailed(format!(
             "no shared context found between {recovering_did} and {contact_did}"

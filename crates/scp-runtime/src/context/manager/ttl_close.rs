@@ -45,7 +45,12 @@ impl ContextManager {
         handle: &ContextHandle,
         initiator_did: &DID,
     ) -> Result<CloseResult, ContextError> {
-        crate::context::lifecycle_helpers::close_context(self, handle, initiator_did).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::close_context — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::lifecycle_helpers::close_context(&sup, handle, initiator_did).await
     }
 
     /// Closes a context with an optional signing key for final checkpoint
@@ -68,8 +73,13 @@ impl ContextManager {
         initiator_did: &DID,
         signing_key: Option<&ed25519_dalek::SigningKey>,
     ) -> Result<CloseResult, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::close_context_with_key — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::lifecycle_helpers::close_context_with_key(
-            self,
+            &sup,
             handle,
             initiator_did,
             signing_key,
@@ -90,7 +100,12 @@ impl ContextManager {
     /// or if destruction operations fail.
     #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn finalize_close(&self, handle: &ContextHandle) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::finalize_close(self, handle).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::finalize_close — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::lifecycle_helpers::finalize_close(&sup, handle).await
     }
 
     /// Handles automatic TTL expiry.
@@ -106,7 +121,12 @@ impl ContextManager {
     /// in `Active` state.
     #[instrument(skip_all, fields(context_id = handle.context_id()))]
     pub async fn handle_ttl_expiry(&self, handle: &ContextHandle) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::handle_ttl_expiry(self, handle).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::handle_ttl_expiry — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::lifecycle_helpers::handle_ttl_expiry(&sup, handle).await
     }
 
     /// Proposes a TTL extension. Records consent from the given member.
@@ -128,8 +148,13 @@ impl ContextManager {
         member_did: &DID,
         proposed_duration: std::time::Duration,
     ) -> Result<bool, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::propose_ttl_extension — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::lifecycle_helpers::propose_ttl_extension(
-            self,
+            &sup,
             context_id,
             member_did,
             proposed_duration,
@@ -150,7 +175,14 @@ impl ContextManager {
         new_duration: std::time::Duration,
         handle: ContextHandle,
     ) {
-        crate::context::lifecycle_helpers::reset_ttl_timer(self, context_id, new_duration, handle)
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
+                context_id,
+                "ContextManager::reset_ttl_timer — Supervisor detached; skipping"
+            );
+            return;
+        };
+        crate::context::lifecycle_helpers::reset_ttl_timer(&sup, context_id, new_duration, handle)
             .await;
     }
 
@@ -166,7 +198,14 @@ impl ContextManager {
         duration: std::time::Duration,
         handle: ContextHandle,
     ) {
-        crate::context::lifecycle_helpers::spawn_ttl_timer(self, context_id, duration, handle)
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
+                context_id,
+                "ContextManager::spawn_ttl_timer — Supervisor detached; skipping"
+            );
+            return;
+        };
+        crate::context::lifecycle_helpers::spawn_ttl_timer(&sup, context_id, duration, handle)
             .await;
     }
 }

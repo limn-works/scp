@@ -50,7 +50,6 @@
 //! `StandingContext` get-or-create variant still routes through the
 //! legacy path, which is idempotent by construction.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use scp_protocol::context::ContextError;
@@ -59,7 +58,7 @@ use tokio::sync::oneshot;
 use crate::context::actor::commands::StandingCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::manager::ContextManager;
+use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for standing handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
@@ -72,42 +71,44 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// `run()` loop's call shape
 /// (`handlers::standing::dispatch(&mgr, &self.deps, cmd).await`).
 pub async fn dispatch(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     _deps: &ActorDeps,
     cmd: StandingCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner(mgr, cmd)).await
+    Box::pin(dispatch_inner(supervisor, cmd)).await
 }
 
 /// Shim-callable dispatch. Used by
 /// [`Supervisor::dispatch_standing_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_standing_command)
 /// during the commits-11-to-11.5 migration window.
+///
+/// # Supervisor receiver (ADR-049 commit 12c.9d)
 pub(crate) async fn dispatch_from_shim(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     cmd: StandingCommand,
 ) -> Outcome<()> {
-    Box::pin(dispatch_inner(mgr, cmd)).await
+    Box::pin(dispatch_inner(supervisor, cmd)).await
 }
 
-async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: StandingCommand) -> Outcome<()> {
+async fn dispatch_inner(supervisor: &Supervisor, cmd: StandingCommand) -> Outcome<()> {
     match cmd {
         StandingCommand::Placeholder { reply } => reply_not_implemented(reply),
         StandingCommand::StandingContext {
             local_did,
             peer_did,
             reply,
-        } => handle_standing_context(mgr, local_did, peer_did, reply).await,
+        } => handle_standing_context(supervisor, local_did, peer_did, reply).await,
         StandingCommand::StandingContextCount { reply } => {
-            handle_standing_context_count(mgr, reply).await
+            handle_standing_context_count(supervisor, reply).await
         }
         StandingCommand::HasStandingContext { peer_did, reply } => {
-            handle_has_standing_context(mgr, peer_did, reply).await
+            handle_has_standing_context(supervisor, peer_did, reply).await
         }
         StandingCommand::RegisterStandingContext { peer_did, reply } => {
-            handle_register_standing_context(mgr, peer_did, reply).await
+            handle_register_standing_context(supervisor, peer_did, reply).await
         }
         StandingCommand::ReconnectAllStanding { reply } => {
-            handle_reconnect_all_standing(mgr, reply).await
+            handle_reconnect_all_standing(supervisor, reply).await
         }
         StandingCommand::InitiateStandingPairCreate { reply, .. } => reply_saga_deferred(reply),
     }
@@ -117,14 +118,13 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: StandingCommand) -> Outc
 /// [`ContextManager::standing_context`](crate::context::manager::ContextManager::standing_context)
 /// under a 30s timeout.
 async fn handle_standing_context(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     local_did: scp_identity::DID,
     peer_did: scp_identity::DID,
     reply: oneshot::Sender<Result<String, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-    let standing_fut = async move {
-        crate::context::standing_helpers::standing_context(&manager, &local_did, &peer_did).await
+    let standing_fut = async {
+        crate::context::standing_helpers::standing_context(supervisor, &local_did, &peer_did).await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, standing_fut).await {
@@ -148,11 +148,10 @@ async fn handle_standing_context(
 
 /// Handle [`StandingCommand::StandingContextCount`] — read-only.
 async fn handle_standing_context_count(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     reply: oneshot::Sender<Result<usize, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-    let count_fut = crate::context::standing_helpers::standing_context_count(&manager);
+    let count_fut = crate::context::standing_helpers::standing_context_count(supervisor);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, count_fut).await {
         Ok(count) => (Outcome::ok(()), Ok(count)),
@@ -171,13 +170,12 @@ async fn handle_standing_context_count(
 
 /// Handle [`StandingCommand::HasStandingContext`] — read-only.
 async fn handle_has_standing_context(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     peer_did: scp_identity::DID,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-    let has_fut = async move {
-        crate::context::standing_helpers::has_standing_context(&manager, &peer_did).await
+    let has_fut = async {
+        crate::context::standing_helpers::has_standing_context(supervisor, &peer_did).await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, has_fut).await {
@@ -199,13 +197,12 @@ async fn handle_has_standing_context(
 /// [`ContextManager::register_standing_context`](crate::context::manager::ContextManager::register_standing_context)
 /// under a 30s timeout. Always mutating.
 async fn handle_register_standing_context(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     peer_did: scp_identity::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-    let register_fut = async move {
-        crate::context::standing_helpers::register_standing_context(&manager, peer_did).await;
+    let register_fut = async {
+        crate::context::standing_helpers::register_standing_context(supervisor, peer_did).await;
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, register_fut).await {
@@ -227,12 +224,11 @@ async fn handle_register_standing_context(
 /// [`ContextManager::reconnect_all_standing`](crate::context::manager::ContextManager::reconnect_all_standing)
 /// under a 30s timeout. Always mutating.
 async fn handle_reconnect_all_standing(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     reply: oneshot::Sender<Result<usize, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let reconnect_fut =
-        async move { crate::context::standing_helpers::reconnect_all_standing(&manager).await };
+        async { crate::context::standing_helpers::reconnect_all_standing(supervisor).await };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reconnect_fut).await {
         Ok(Ok(count)) => (Outcome::ok_mutated(()), Ok(count)),

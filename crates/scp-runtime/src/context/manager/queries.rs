@@ -34,7 +34,14 @@ impl ContextManager {
     /// function (ADR-049 commit 12c.5).
     #[instrument(skip_all)]
     pub async fn register_local_did(&self, did: DID) {
-        crate::context::queries_helpers::register_local_did(self, did).await;
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
+                did = %did,
+                "ContextManager::register_local_did — Supervisor detached; skipping"
+            );
+            return;
+        };
+        crate::context::queries_helpers::register_local_did(&sup, did).await;
     }
 
     /// Sets the payment adapter for the 9-step paid action flow (spec §19.2.2).
@@ -62,7 +69,10 @@ impl ContextManager {
     /// (ADR-049 commit 12c.5).
     #[instrument(skip_all)]
     pub async fn is_local_did(&self, did: &DID) -> bool {
-        crate::context::queries_helpers::is_local_did(self, did).await
+        let Some(sup) = self.supervisor() else {
+            return false;
+        };
+        crate::context::queries_helpers::is_local_did(&sup, did).await
     }
 
     /// Returns the local member's pseudonym routing ID for a context (§9.10.4).
@@ -80,7 +90,12 @@ impl ContextManager {
         &self,
         context_id: &str,
     ) -> Result<Option<[u8; 32]>, ContextError> {
-        crate::context::queries_helpers::local_pseudonym(self, context_id).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::local_pseudonym — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::queries_helpers::local_pseudonym(&sup, context_id).await
     }
 
     /// Returns the broadcast key and epoch for a locally controlled author
@@ -109,8 +124,14 @@ impl ContextManager {
         context_id: &str,
         author_did: &str,
     ) -> Result<(Zeroizing<[u8; 32]>, u64), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::get_broadcast_key_for_local_author — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::queries_helpers::get_broadcast_key_for_local_author(
-            self, context_id, author_did,
+            &sup, context_id, author_did,
         )
         .await
     }
@@ -122,7 +143,8 @@ impl ContextManager {
     /// (ADR-049 commit 12c.5).
     #[instrument(skip_all, fields(context_id))]
     pub async fn member_count(&self, context_id: &str) -> Option<usize> {
-        crate::context::queries_helpers::member_count(self, context_id).await
+        let sup = self.supervisor()?;
+        crate::context::queries_helpers::member_count(&sup, context_id).await
     }
 
     /// Returns `true` if the given DID is a member of the specified context.
@@ -132,7 +154,10 @@ impl ContextManager {
     /// (ADR-049 commit 12c.5).
     #[instrument(skip_all, fields(context_id))]
     pub async fn is_member(&self, context_id: &str, did: &str) -> bool {
-        crate::context::queries_helpers::is_member(self, context_id, did).await
+        let Some(sup) = self.supervisor() else {
+            return false;
+        };
+        crate::context::queries_helpers::is_member(&sup, context_id, did).await
     }
 
     /// Returns all member DIDs for a context.
@@ -142,7 +167,10 @@ impl ContextManager {
     /// (ADR-049 commit 12c.5).
     #[instrument(skip_all, fields(context_id))]
     pub async fn member_dids(&self, context_id: &str) -> Vec<String> {
-        crate::context::queries_helpers::member_dids(self, context_id).await
+        let Some(sup) = self.supervisor() else {
+            return Vec::new();
+        };
+        crate::context::queries_helpers::member_dids(&sup, context_id).await
     }
 
     /// Returns the role assignment for a specific member in a context.
@@ -152,7 +180,8 @@ impl ContextManager {
     /// (ADR-049 commit 12c.5).
     #[instrument(skip_all, fields(context_id))]
     pub async fn member_role(&self, context_id: &str, did: &str) -> Option<RoleAssignment> {
-        crate::context::queries_helpers::member_role(self, context_id, did).await
+        let sup = self.supervisor()?;
+        crate::context::queries_helpers::member_role(&sup, context_id, did).await
     }
 
     /// Returns a clone of the context's creation parameters, or `None` if the
@@ -163,7 +192,8 @@ impl ContextManager {
     /// (ADR-049 commit 12c.5).
     #[instrument(skip_all, fields(context_id))]
     pub async fn context_params(&self, context_id: &str) -> Option<ContextParams> {
-        crate::context::queries_helpers::context_params(self, context_id).await
+        let sup = self.supervisor()?;
+        crate::context::queries_helpers::context_params(&sup, context_id).await
     }
 
     /// Returns a clone of the role state for a context, or `None` if the
@@ -174,7 +204,8 @@ impl ContextManager {
     /// (ADR-049 commit 12c.5).
     #[instrument(skip_all, fields(context_id))]
     pub async fn get_role_state(&self, context_id: &str) -> Option<ContextRoleState> {
-        crate::context::queries_helpers::get_role_state(self, context_id).await
+        let sup = self.supervisor()?;
+        crate::context::queries_helpers::get_role_state(&sup, context_id).await
     }
 
     /// Drains all events from the receive buffer for a context.
@@ -187,7 +218,10 @@ impl ContextManager {
         &self,
         context_id: &str,
     ) -> Vec<scp_protocol::context::membership::ContextEvent> {
-        crate::context::queries_helpers::drain_events(self, context_id).await
+        let Some(sup) = self.supervisor() else {
+            return Vec::new();
+        };
+        crate::context::queries_helpers::drain_events(&sup, context_id).await
     }
 
     /// Returns the Merkle event log entries for a context.
@@ -204,7 +238,12 @@ impl ContextManager {
         context_id: &[u8; 32],
     ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
     {
-        crate::context::queries_helpers::event_log_entries(self, context_id)
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::event_log_entries — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::queries_helpers::event_log_entries(&sup, context_id)
     }
 
     /// Returns the event log provider for direct Merkle tree access.
@@ -233,8 +272,15 @@ impl ContextManager {
         compat: scp_protocol::envelope::VersionCompatibility,
         unsupported_features: Vec<String>,
     ) {
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
+                context_id,
+                "ContextManager::report_degraded_mode — Supervisor detached; skipping"
+            );
+            return;
+        };
         crate::context::queries_helpers::report_degraded_mode(
-            self,
+            &sup,
             context_id,
             compat,
             unsupported_features,
@@ -262,8 +308,14 @@ impl ContextManager {
         member_did: &str,
         caller_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::generate_context_access_key — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::queries_helpers::generate_context_access_key(
-            self, context_id, member_did, caller_did,
+            &sup, context_id, member_did, caller_did,
         )
         .await
     }
@@ -288,8 +340,14 @@ impl ContextManager {
         member_did: &str,
         caller_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::revoke_context_access_key — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::queries_helpers::revoke_context_access_key(
-            self, context_id, member_did, caller_did,
+            &sup, context_id, member_did, caller_did,
         )
         .await
     }
@@ -313,8 +371,14 @@ impl ContextManager {
         member_did: &str,
         caller_did: &str,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::restore_context_access_key — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::queries_helpers::restore_context_access_key(
-            self, context_id, member_did, caller_did,
+            &sup, context_id, member_did, caller_did,
         )
         .await
     }
@@ -331,7 +395,14 @@ impl ContextManager {
         member_did: &str,
         key: scp_protocol::crypto::access_keys::AccessKey,
     ) {
-        crate::context::queries_helpers::set_access_key(self, context_id, member_did, key).await;
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
+                context_id,
+                "ContextManager::set_access_key — Supervisor detached; skipping"
+            );
+            return;
+        };
+        crate::context::queries_helpers::set_access_key(&sup, context_id, member_did, key).await;
     }
 
     /// Removes a member's access key from a context's access key store.
@@ -341,7 +412,14 @@ impl ContextManager {
     /// (ADR-049 commit 12c.5).
     #[instrument(skip_all, fields(context_id, member_did))]
     pub async fn remove_access_key(&self, context_id: &str, member_did: &str) {
-        crate::context::queries_helpers::remove_access_key(self, context_id, member_did).await;
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
+                context_id,
+                "ContextManager::remove_access_key — Supervisor detached; skipping"
+            );
+            return;
+        };
+        crate::context::queries_helpers::remove_access_key(&sup, context_id, member_did).await;
     }
 
     /// Injects an access key into a context's access key store.
@@ -356,7 +434,14 @@ impl ContextManager {
         member_did: &str,
         key: scp_protocol::crypto::access_keys::AccessKey,
     ) {
-        crate::context::queries_helpers::inject_access_key(self, context_id, member_did, key).await;
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
+                context_id,
+                "ContextManager::inject_access_key — Supervisor detached; skipping"
+            );
+            return;
+        };
+        crate::context::queries_helpers::inject_access_key(&sup, context_id, member_did, key).await;
     }
 
     /// Retrieves a clone of the access key for a member in a context.
@@ -370,7 +455,8 @@ impl ContextManager {
         context_id: &str,
         member_did: &str,
     ) -> Option<scp_protocol::crypto::access_keys::AccessKey> {
-        crate::context::queries_helpers::get_access_key(self, context_id, member_did).await
+        let sup = self.supervisor()?;
+        crate::context::queries_helpers::get_access_key(&sup, context_id, member_did).await
     }
 
     /// Retrieves clones of ALL access keys for a context.
@@ -383,7 +469,10 @@ impl ContextManager {
         &self,
         context_id: &str,
     ) -> std::collections::HashMap<String, scp_protocol::crypto::access_keys::AccessKey> {
-        crate::context::queries_helpers::get_all_access_keys(self, context_id).await
+        let Some(sup) = self.supervisor() else {
+            return std::collections::HashMap::new();
+        };
+        crate::context::queries_helpers::get_all_access_keys(&sup, context_id).await
     }
 
     /// Grants budget to a member in a context.
@@ -398,8 +487,15 @@ impl ContextManager {
         member_did: &scp_identity::DID,
         amount: scp_protocol::economy::types::Amount,
     ) {
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
+                context_id,
+                "ContextManager::grant_budget_for_test — Supervisor detached; skipping"
+            );
+            return;
+        };
         crate::context::queries_helpers::grant_budget_for_test(
-            self, context_id, member_did, amount,
+            &sup, context_id, member_did, amount,
         )
         .await;
     }
@@ -415,7 +511,10 @@ impl ContextManager {
         context_id: &str,
         member_did: &scp_identity::DID,
     ) -> scp_protocol::economy::types::Amount {
-        crate::context::queries_helpers::remaining_budget_for_test(self, context_id, member_did)
+        let Some(sup) = self.supervisor() else {
+            return scp_protocol::economy::types::Amount::new(0);
+        };
+        crate::context::queries_helpers::remaining_budget_for_test(&sup, context_id, member_did)
             .await
     }
 
@@ -432,7 +531,10 @@ impl ContextManager {
         member_did: &scp_identity::DID,
         now_secs: u64,
     ) -> u64 {
-        crate::context::queries_helpers::velocity_for_test(self, context_id, member_did, now_secs)
+        let Some(sup) = self.supervisor() else {
+            return 0;
+        };
+        crate::context::queries_helpers::velocity_for_test(&sup, context_id, member_did, now_secs)
             .await
     }
 
@@ -444,7 +546,10 @@ impl ContextManager {
     /// (ADR-049 commit 12c.5).
     #[instrument(skip_all, fields(context_id))]
     pub async fn pending_commits(&self, context_id: &str) -> Vec<PendingCommit> {
-        crate::context::queries_helpers::pending_commits(self, context_id).await
+        let Some(sup) = self.supervisor() else {
+            return Vec::new();
+        };
+        crate::context::queries_helpers::pending_commits(&sup, context_id).await
     }
 
     /// Returns the active commit fault marker for a context, if any (PR #1606 C6).
@@ -454,7 +559,8 @@ impl ContextManager {
     /// (ADR-049 commit 12c.5).
     #[instrument(skip_all, fields(context_id))]
     pub async fn commit_fault(&self, context_id: &str) -> Option<CommitFaultMarker> {
-        crate::context::queries_helpers::commit_fault(self, context_id).await
+        let sup = self.supervisor()?;
+        crate::context::queries_helpers::commit_fault(&sup, context_id).await
     }
 
     // -------------------------------------------------------------------------
@@ -474,8 +580,9 @@ impl ContextManager {
         sender_did: &DID,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
+        let sup = self.supervisor()?;
         crate::context::queries_helpers::create_checkpoint_if_due(
-            self,
+            &sup,
             context_id,
             ctx,
             sender_did,
@@ -495,9 +602,13 @@ impl ContextManager {
         ctx: &mut super::PerContextState,
         sender_did: &DID,
         signing_key: &ed25519_dalek::SigningKey,
-    ) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+    ) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
+        // ADR-049 commit 12c.9d — returns `Option` to cope with a
+        // detached Supervisor; clippy's `expect_used`/`panic` lints are
+        // denied crate-wide so we can't panic on contract violation.
+        let sup = self.supervisor()?;
         crate::context::queries_helpers::force_create_checkpoint(
-            self,
+            &sup,
             context_id,
             ctx,
             sender_did,
@@ -526,7 +637,13 @@ impl ContextManager {
         context_id: &str,
         remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
     ) -> Result<scp_event_log::checkpoint::CheckpointComparison, ContextError> {
-        crate::context::queries_helpers::compare_remote_checkpoint(self, context_id, remote).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::compare_remote_checkpoint — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
+        crate::context::queries_helpers::compare_remote_checkpoint(&sup, context_id, remote).await
     }
 
     // -------------------------------------------------------------------
@@ -550,7 +667,12 @@ impl ContextManager {
         context_id: &str,
         leaf_index: u64,
     ) -> Result<scp_event_log::proof::InclusionProof, ContextError> {
-        crate::context::queries_helpers::prove_event_inclusion(self, context_id, leaf_index).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::prove_event_inclusion — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::queries_helpers::prove_event_inclusion(&sup, context_id, leaf_index).await
     }
 
     /// Returns a Merkle consistency proof between the tree at `old_size` and
@@ -571,7 +693,12 @@ impl ContextManager {
         context_id: &str,
         old_size: u64,
     ) -> Result<scp_event_log::proof::ConsistencyProof, ContextError> {
-        crate::context::queries_helpers::prove_event_consistency(self, context_id, old_size).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::prove_event_consistency — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::queries_helpers::prove_event_consistency(&sup, context_id, old_size).await
     }
 
     /// Verifies a Merkle inclusion proof. Pure function — no state needed.

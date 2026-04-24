@@ -46,7 +46,6 @@
 //! mailbox; it is not migrated to a command variant and continues to
 //! run on the direct manager surface (FFI bridges invoke it inline).
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use scp_protocol::context::ContextError;
@@ -55,7 +54,7 @@ use tokio::sync::oneshot;
 use crate::context::actor::commands::ToolsCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::manager::ContextManager;
+use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for tools handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
@@ -64,23 +63,22 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Dispatch a [`ToolsCommand`] against an attached manager + deps
 /// bundle.
 pub async fn dispatch(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     _deps: &ActorDeps,
     cmd: ToolsCommand,
 ) -> Outcome<()> {
-    dispatch_inner(mgr, cmd).await
+    dispatch_inner(supervisor, cmd).await
 }
 
 /// Shim-callable dispatch. Used by
 /// [`Supervisor::dispatch_tools_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_tools_command).
-pub(crate) async fn dispatch_from_shim(
-    mgr: &Arc<ContextManager>,
-    cmd: ToolsCommand,
-) -> Outcome<()> {
-    dispatch_inner(mgr, cmd).await
+///
+/// # Supervisor receiver (ADR-049 commit 12c.9d)
+pub(crate) async fn dispatch_from_shim(supervisor: &Supervisor, cmd: ToolsCommand) -> Outcome<()> {
+    dispatch_inner(supervisor, cmd).await
 }
 
-async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: ToolsCommand) -> Outcome<()> {
+async fn dispatch_inner(supervisor: &Supervisor, cmd: ToolsCommand) -> Outcome<()> {
     match cmd {
         ToolsCommand::Placeholder { reply } => reply_not_implemented(reply),
         ToolsCommand::TryConsumeHardRateLimit {
@@ -88,12 +86,14 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: ToolsCommand) -> Outcome
             did,
             now_secs,
             reply,
-        } => handle_try_consume_hard_rate_limit(mgr, &context_id, &did, now_secs, reply).await,
+        } => {
+            handle_try_consume_hard_rate_limit(supervisor, &context_id, &did, now_secs, reply).await
+        }
         ToolsCommand::RefundHardRateLimit {
             context_id,
             did,
             reply,
-        } => handle_refund_hard_rate_limit(mgr, &context_id, &did, reply).await,
+        } => handle_refund_hard_rate_limit(supervisor, &context_id, &did, reply).await,
         ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => {
             reply_saga_deferred(reply)
         }
@@ -110,15 +110,14 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: ToolsCommand) -> Outcome
 /// refund attempt on a timed-out consume is unsafe. Surfacing the
 /// timeout is the correct defensive move.
 async fn handle_try_consume_hard_rate_limit(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     did: &scp_identity::DID,
     now_secs: u64,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let consume_fut = crate::context::tools_helpers::try_consume_hard_rate_limit(
-        &manager, context_id, did, now_secs,
+        supervisor, context_id, did, now_secs,
     );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, consume_fut).await {
@@ -152,14 +151,13 @@ async fn handle_try_consume_hard_rate_limit(
 /// [`ContextManager::refund_hard_rate_limit`](crate::context::manager::ContextManager::refund_hard_rate_limit)
 /// under a 30s timeout.
 async fn handle_refund_hard_rate_limit(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: &str,
     did: &scp_identity::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let refund_fut =
-        crate::context::tools_helpers::refund_hard_rate_limit(&manager, context_id, did);
+        crate::context::tools_helpers::refund_hard_rate_limit(supervisor, context_id, did);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, refund_fut).await {
         Ok(()) => (Outcome::ok_mutated(()), Ok(())),

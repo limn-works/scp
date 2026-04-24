@@ -51,7 +51,6 @@
 //! plan's "every transport and storage call inside a handler wraps
 //! `tokio::time::timeout(30s, ...)`" contract.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use scp_protocol::context::ContextError;
@@ -63,7 +62,7 @@ use crate::context::actor::commands::{
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::manager::ContextManager;
+use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for lifecycle handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
@@ -82,7 +81,7 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// 12 rewires these paths to use `deps` directly once the manager
 /// surface is deleted.
 pub async fn dispatch(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     _deps: &ActorDeps,
     cmd: LifecycleCommand,
 ) -> Outcome<()> {
@@ -92,7 +91,7 @@ pub async fn dispatch(
     // inside each handler) crosses clippy's 16-KB stack budget for
     // async futures. Boxing here moves the per-variant state onto the
     // heap once per dispatch.
-    Box::pin(dispatch_inner(mgr, cmd)).await
+    Box::pin(dispatch_inner(supervisor, cmd)).await
 }
 
 /// Shim-callable dispatch. Used by
@@ -108,20 +107,21 @@ pub async fn dispatch(
 /// the shim without synthesizing an [`ActorDeps`] — matching the pattern
 /// established for queries (commit 7) and messaging (commit 8).
 pub(crate) async fn dispatch_from_shim(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     cmd: LifecycleCommand,
 ) -> Outcome<()> {
     // See the comment on [`dispatch`] for the `Box::pin` rationale.
-    Box::pin(dispatch_inner(mgr, cmd)).await
+    Box::pin(dispatch_inner(supervisor, cmd)).await
 }
 
-async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: LifecycleCommand) -> Outcome<()> {
+#[allow(clippy::too_many_lines)] // Flat match over every LifecycleCommand variant.
+async fn dispatch_inner(supervisor: &Supervisor, cmd: LifecycleCommand) -> Outcome<()> {
     match cmd {
         LifecycleCommand::Placeholder { reply } => reply_not_implemented(reply),
         LifecycleCommand::CreateContext { payload, reply } => {
             let p = *payload;
             handle_create_context(
-                mgr,
+                supervisor,
                 p.context_id,
                 p.params,
                 p.creator_did,
@@ -133,7 +133,7 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: LifecycleCommand) -> Out
         LifecycleCommand::JoinContext { payload, reply } => {
             let p = *payload;
             handle_join_context(
-                mgr,
+                supervisor,
                 p.context_id,
                 p.params,
                 p.key_package,
@@ -146,7 +146,7 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: LifecycleCommand) -> Out
         LifecycleCommand::LeaveContext { payload, reply } => {
             let p = *payload;
             handle_leave_context(
-                mgr,
+                supervisor,
                 p.context_id,
                 p.params,
                 p.caller_did,
@@ -157,20 +157,20 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: LifecycleCommand) -> Out
         }
         LifecycleCommand::CloseContext { payload, reply } => {
             let p = *payload;
-            handle_close_context(mgr, p.context_id, p.params, p.initiator_did, reply).await
+            handle_close_context(supervisor, p.context_id, p.params, p.initiator_did, reply).await
         }
         LifecycleCommand::ExportContext {
             context_id,
             exporter_did,
             reply,
-        } => handle_export_context(mgr, context_id, exporter_did, reply).await,
+        } => handle_export_context(supervisor, context_id, exporter_did, reply).await,
         LifecycleCommand::ImportContext { export, reply } => {
             // Box::pin — the per-variant import future crosses clippy's
             // 16 KB stack budget (ContextExport ~2 KB + the full
             // PerContextState-construction locals inside the hoisted
             // `lifecycle_helpers::import_context` body). Boxing moves the
             // state onto the heap for this variant only.
-            Box::pin(handle_import_context(mgr, export, reply)).await
+            Box::pin(handle_import_context(supervisor, export, reply)).await
         }
         LifecycleCommand::RestoreContext { payload, reply } => {
             let p = *payload;
@@ -179,7 +179,13 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: LifecycleCommand) -> Out
             // including governance / membership / broadcast / MLS
             // crypto state). The per-variant locals plus the timeout
             // future cross clippy's 16 KB stack-future budget.
-            Box::pin(handle_restore_context(mgr, p.context_id, p.params, reply)).await
+            Box::pin(handle_restore_context(
+                supervisor,
+                p.context_id,
+                p.params,
+                reply,
+            ))
+            .await
         }
         LifecycleCommand::GenerateContextAccessKey {
             context_id,
@@ -187,21 +193,28 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: LifecycleCommand) -> Out
             caller_did,
             reply,
         } => {
-            handle_generate_context_access_key(mgr, context_id, member_did, caller_did, reply).await
+            handle_generate_context_access_key(
+                supervisor, context_id, member_did, caller_did, reply,
+            )
+            .await
         }
         LifecycleCommand::RevokeContextAccessKey {
             context_id,
             member_did,
             caller_did,
             reply,
-        } => handle_revoke_context_access_key(mgr, context_id, member_did, caller_did, reply).await,
+        } => {
+            handle_revoke_context_access_key(supervisor, context_id, member_did, caller_did, reply)
+                .await
+        }
         LifecycleCommand::RestoreContextAccessKey {
             context_id,
             member_did,
             caller_did,
             reply,
         } => {
-            handle_restore_context_access_key(mgr, context_id, member_did, caller_did, reply).await
+            handle_restore_context_access_key(supervisor, context_id, member_did, caller_did, reply)
+                .await
         }
     }
 }
@@ -214,16 +227,15 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: LifecycleCommand) -> Out
 /// `handlers/standing.rs` in commit 11; commit 9's shim routes the
 /// command through the legacy method directly.
 async fn handle_create_context(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     creator_did: scp_identity::DID,
     local_pseudonym: Option<[u8; 32]>,
     reply: CreateContextReply,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let create_fut = crate::context::lifecycle_helpers::create_context(
-        &manager,
+        supervisor,
         context_id.clone(),
         params,
         creator_did,
@@ -262,7 +274,7 @@ async fn handle_create_context(
 /// under a 30s timeout.
 #[allow(clippy::too_many_arguments)] // mirrors the legacy method's signature surface
 async fn handle_join_context(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     key_package: scp_protocol::context::membership::KeyPackage,
@@ -270,8 +282,6 @@ async fn handle_join_context(
     local_pseudonym: Option<[u8; 32]>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-
     // Rebuild an ephemeral handle for the legacy method's signature.
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
@@ -284,7 +294,7 @@ async fn handle_join_context(
     }
 
     let join_fut = crate::context::lifecycle_helpers::join_context(
-        &manager,
+        supervisor,
         &handle,
         key_package,
         spending_ucan,
@@ -314,15 +324,13 @@ async fn handle_join_context(
 /// [`ContextManager::leave_context`](crate::context::manager::ContextManager::leave_context)
 /// under a 30s timeout.
 async fn handle_leave_context(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     caller_did: scp_identity::DID,
     member_did: scp_identity::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -334,7 +342,7 @@ async fn handle_leave_context(
     }
 
     let leave_fut = crate::context::lifecycle_helpers::leave_context(
-        &manager,
+        supervisor,
         &handle,
         &caller_did,
         &member_did,
@@ -366,14 +374,12 @@ async fn handle_leave_context(
 /// (`GovernanceAction::CloseContext`) — the legacy method enforces
 /// that gate, we just delegate.
 async fn handle_close_context(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     initiator_did: scp_identity::DID,
     reply: CloseContextReply,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -385,7 +391,7 @@ async fn handle_close_context(
     }
 
     let close_fut =
-        crate::context::lifecycle_helpers::close_context(&manager, &handle, &initiator_did);
+        crate::context::lifecycle_helpers::close_context(supervisor, &handle, &initiator_did);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, close_fut).await {
         Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
@@ -410,15 +416,13 @@ async fn handle_close_context(
 /// [`ContextManager::export_context`](crate::context::manager::ContextManager::export_context)
 /// under a 30s timeout.
 async fn handle_export_context(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     exporter_did: scp_identity::DID,
     reply: ExportContextReply,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-
     let export_fut =
-        crate::context::lifecycle_helpers::export_context(&manager, &context_id, exporter_did);
+        crate::context::lifecycle_helpers::export_context(supervisor, &context_id, exporter_did);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, export_fut).await {
         Ok(Ok(export)) => (Outcome::ok(()), Ok(export)),
@@ -445,11 +449,10 @@ async fn handle_export_context(
 /// by the legacy method; the handler passes the parsed export through
 /// verbatim.
 async fn handle_import_context(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     export: Box<crate::context::export_import::ContextExport>,
     reply: ImportContextReply,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let context_id = export.snapshot.context_id.clone();
 
     // Unbox at the last possible moment to minimize stack-held size
@@ -458,7 +461,7 @@ async fn handle_import_context(
     // do not inflate `handle_import_context`'s own future past clippy's
     // 16 KB stack budget (ADR-049 commit 12c.2).
     let import_fut = Box::pin(crate::context::lifecycle_helpers::import_context(
-        &manager, *export,
+        supervisor, *export,
     ));
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, import_fut).await {
@@ -491,12 +494,19 @@ async fn handle_import_context(
 /// manager. When a future commit hoists the body, this dispatch will
 /// switch to the hoisted free function transparently.
 async fn handle_restore_context(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
+    let Some(manager) = supervisor.attached_context_manager() else {
+        let err = ContextError::NotInitialized(
+            "handle_restore_context: ContextManager must be attached".to_owned(),
+        );
+        let sketch = outcome_error_sketch(&err);
+        let _ = reply.send(Err(err));
+        return Outcome::err(sketch);
+    };
 
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
@@ -535,15 +545,14 @@ async fn handle_restore_context(
 /// under a 30s timeout. Caller capability check (ContextClose) lives
 /// inside the helper body.
 async fn handle_generate_context_access_key(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     member_did: String,
     caller_did: String,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let fut = crate::context::queries_helpers::generate_context_access_key(
-        &manager,
+        supervisor,
         &context_id,
         &member_did,
         &caller_did,
@@ -573,15 +582,14 @@ async fn handle_generate_context_access_key(
 /// [`queries_helpers::revoke_context_access_key`](crate::context::queries_helpers::revoke_context_access_key)
 /// under a 30s timeout.
 async fn handle_revoke_context_access_key(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     member_did: String,
     caller_did: String,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let fut = crate::context::queries_helpers::revoke_context_access_key(
-        &manager,
+        supervisor,
         &context_id,
         &member_did,
         &caller_did,
@@ -611,15 +619,14 @@ async fn handle_revoke_context_access_key(
 /// [`queries_helpers::restore_context_access_key`](crate::context::queries_helpers::restore_context_access_key)
 /// under a 30s timeout.
 async fn handle_restore_context_access_key(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     member_did: String,
     caller_did: String,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let fut = crate::context::queries_helpers::restore_context_access_key(
-        &manager,
+        supervisor,
         &context_id,
         &member_did,
         &caller_did,

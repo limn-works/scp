@@ -1946,7 +1946,10 @@ mod tests {
             }
         }
 
-        Arc::new(ContextManager::new(
+        // ADR-049 commit 12c.9d: `create_context` / `join_context` now
+        // require an attached Supervisor. Wrap with `attach_test_supervisor`
+        // so the supervisor-dependent code paths resolve correctly.
+        crate::context::attach_test_supervisor(ContextManager::new(
             Box::new(TestCrypto),
             Box::new(TestTransport),
             Box::new(TestEventLog),

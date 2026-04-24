@@ -279,7 +279,10 @@ impl ContextManager {
         did: &DID,
         now_secs: u64,
     ) -> bool {
-        crate::context::tools_helpers::try_consume_hard_rate_limit(self, context_id, did, now_secs)
+        let Some(sup) = self.supervisor() else {
+            return true;
+        };
+        crate::context::tools_helpers::try_consume_hard_rate_limit(&sup, context_id, did, now_secs)
             .await
     }
 
@@ -289,7 +292,14 @@ impl ContextManager {
     /// [`crate::context::tools_helpers::refund_hard_rate_limit`] free
     /// function (ADR-049 commit 12c.4).
     pub async fn refund_hard_rate_limit(&self, context_id: &str, did: &DID) {
-        crate::context::tools_helpers::refund_hard_rate_limit(self, context_id, did).await;
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
+                context_id,
+                "ContextManager::refund_hard_rate_limit — Supervisor detached; skipping"
+            );
+            return;
+        };
+        crate::context::tools_helpers::refund_hard_rate_limit(&sup, context_id, did).await;
     }
 
     /// Runtime-agnostic hard-rate-limit consume for sync bridge trait

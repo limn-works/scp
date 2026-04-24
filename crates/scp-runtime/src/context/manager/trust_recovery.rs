@@ -120,8 +120,14 @@ impl ContextManager {
         creator_did: &DID,
         creator_signature: Vec<u8>,
     ) -> Result<ContextCheckpoint, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::create_governance_checkpoint — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::trust_recovery_helpers::create_governance_checkpoint(
-            self,
+            &sup,
             context_id,
             checkpoint_seq,
             merkle_root,
@@ -152,8 +158,14 @@ impl ContextManager {
         checkpoint: &mut ContextCheckpoint,
         cosignature: CosignedCheckpoint,
     ) -> Result<CheckpointAttestationStatus, ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::add_checkpoint_cosignature — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::trust_recovery_helpers::add_checkpoint_cosignature(
-            self,
+            &sup,
             context_id,
             checkpoint,
             cosignature,
@@ -175,7 +187,12 @@ impl ContextManager {
     /// - [`ContextError::CryptoFailed`] if the MLS update/commit fails.
     #[instrument(skip_all, fields(context_id))]
     pub async fn recovery_advance_epoch(&self, context_id: &str) -> Result<u64, ContextError> {
-        crate::context::trust_recovery_helpers::recovery_advance_epoch(self, context_id).await
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::recovery_advance_epoch — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::trust_recovery_helpers::recovery_advance_epoch(&sup, context_id).await
     }
 
     /// Sends an encrypted message to a context for recovery notification
@@ -197,8 +214,14 @@ impl ContextManager {
         sequence: u64,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::recovery_send_notification — Supervisor must be attached"
+                    .to_owned(),
+            )
+        })?;
         crate::context::trust_recovery_helpers::recovery_send_notification(
-            self,
+            &sup,
             context_id,
             sender_did,
             payload,
@@ -228,8 +251,13 @@ impl ContextManager {
         payload: &[u8],
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<(), ContextError> {
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::recovery_notify_contact — Supervisor must be attached".to_owned(),
+            )
+        })?;
         crate::context::trust_recovery_helpers::recovery_notify_contact(
-            self,
+            &sup,
             recovering_did,
             contact_did,
             payload,

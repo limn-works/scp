@@ -46,7 +46,6 @@
 //! plan's "every transport and storage call inside a handler wraps
 //! `tokio::time::timeout(30s, ...)`" contract.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use scp_protocol::context::ContextError;
@@ -56,7 +55,7 @@ use crate::context::ContextHandle;
 use crate::context::actor::commands::TtlCloseCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::manager::ContextManager;
+use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for TTL-close handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
@@ -71,11 +70,11 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// `deps` is accepted for symmetry — the ttl-close handler does not yet
 /// touch deps during the shim period. Commit 12 rewires these paths.
 pub async fn dispatch(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     _deps: &ActorDeps,
     cmd: TtlCloseCommand,
 ) -> Outcome<()> {
-    dispatch_inner(mgr, cmd).await
+    dispatch_inner(supervisor, cmd).await
 }
 
 /// Shim-callable dispatch. Used by
@@ -83,37 +82,39 @@ pub async fn dispatch(
 /// during the commits-9-to-11 migration window — deleted in commit 12
 /// when the shim dissolves and the actor's `run()` loop is the only
 /// caller of [`dispatch`].
+///
+/// # Supervisor receiver (ADR-049 commit 12c.9d)
 pub(crate) async fn dispatch_from_shim(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     cmd: TtlCloseCommand,
 ) -> Outcome<()> {
-    dispatch_inner(mgr, cmd).await
+    dispatch_inner(supervisor, cmd).await
 }
 
-async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: TtlCloseCommand) -> Outcome<()> {
+async fn dispatch_inner(supervisor: &Supervisor, cmd: TtlCloseCommand) -> Outcome<()> {
     match cmd {
         TtlCloseCommand::Placeholder { reply } => reply_not_implemented(reply),
         TtlCloseCommand::StartTtlTimer { payload, reply } => {
             let p = *payload;
-            handle_start_ttl_timer(mgr, p.context_id, p.params, p.duration, reply).await
+            handle_start_ttl_timer(supervisor, p.context_id, p.params, p.duration, reply).await
         }
         TtlCloseCommand::ExtendTtl {
             context_id,
             member_did,
             proposed_duration,
             reply,
-        } => handle_extend_ttl(mgr, context_id, member_did, proposed_duration, reply).await,
+        } => handle_extend_ttl(supervisor, context_id, member_did, proposed_duration, reply).await,
         TtlCloseCommand::ResetTtlTimer { payload, reply } => {
             let p = *payload;
-            handle_reset_ttl_timer(mgr, p.context_id, p.params, p.duration, reply).await
+            handle_reset_ttl_timer(supervisor, p.context_id, p.params, p.duration, reply).await
         }
         TtlCloseCommand::ExecuteTtlClose { payload, reply } => {
             let p = *payload;
-            handle_execute_ttl_close(mgr, p.context_id, p.params, reply).await
+            handle_execute_ttl_close(supervisor, p.context_id, p.params, reply).await
         }
         TtlCloseCommand::FinalizeClose { payload, reply } => {
             let p = *payload;
-            handle_finalize_close(mgr, p.context_id, p.params, reply).await
+            handle_finalize_close(supervisor, p.context_id, p.params, reply).await
         }
     }
 }
@@ -128,14 +129,12 @@ async fn dispatch_inner(mgr: &Arc<ContextManager>, cmd: TtlCloseCommand) -> Outc
 /// the task is spawned), but we still wrap it so a pathological mutex
 /// contention storm cannot block the dispatcher indefinitely.
 async fn handle_start_ttl_timer(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     duration: std::time::Duration,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -146,8 +145,12 @@ async fn handle_start_ttl_timer(
         return Outcome::err(sketch);
     }
 
-    let spawn_fut =
-        crate::context::lifecycle_helpers::start_ttl_timer(&manager, &context_id, duration, handle);
+    let spawn_fut = crate::context::lifecycle_helpers::start_ttl_timer(
+        supervisor,
+        &context_id,
+        duration,
+        handle,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, spawn_fut).await {
         Ok(()) => (Outcome::ok_mutated(()), Ok(())),
@@ -168,15 +171,14 @@ async fn handle_start_ttl_timer(
 /// [`ContextManager::propose_ttl_extension`](crate::context::manager::ContextManager::propose_ttl_extension)
 /// under a 30s timeout.
 async fn handle_extend_ttl(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     member_did: scp_identity::DID,
     proposed_duration: std::time::Duration,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
     let extend_fut = crate::context::lifecycle_helpers::propose_ttl_extension(
-        &manager,
+        supervisor,
         &context_id,
         &member_did,
         proposed_duration,
@@ -205,14 +207,12 @@ async fn handle_extend_ttl(
 /// [`ContextManager::reset_ttl_timer`](crate::context::manager::ContextManager::reset_ttl_timer)
 /// under a 30s timeout.
 async fn handle_reset_ttl_timer(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     new_duration: std::time::Duration,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -224,7 +224,7 @@ async fn handle_reset_ttl_timer(
     }
 
     let reset_fut = crate::context::lifecycle_helpers::reset_ttl_timer(
-        &manager,
+        supervisor,
         &context_id,
         new_duration,
         handle,
@@ -249,13 +249,11 @@ async fn handle_reset_ttl_timer(
 /// [`ContextManager::handle_ttl_expiry`](crate::context::manager::ContextManager::handle_ttl_expiry)
 /// under a 30s timeout.
 async fn handle_execute_ttl_close(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -266,7 +264,7 @@ async fn handle_execute_ttl_close(
         return Outcome::err(sketch);
     }
 
-    let expiry_fut = crate::context::lifecycle_helpers::handle_ttl_expiry(&manager, &handle);
+    let expiry_fut = crate::context::lifecycle_helpers::handle_ttl_expiry(supervisor, &handle);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, expiry_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
@@ -291,13 +289,11 @@ async fn handle_execute_ttl_close(
 /// [`ContextManager::finalize_close`](crate::context::manager::ContextManager::finalize_close)
 /// under a 30s timeout.
 async fn handle_finalize_close(
-    mgr: &Arc<ContextManager>,
+    supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let manager = Arc::clone(mgr);
-
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
         .transition_to(&scp_protocol::context::ContextState::Closing)
@@ -308,7 +304,7 @@ async fn handle_finalize_close(
         return Outcome::err(sketch);
     }
 
-    let finalize_fut = crate::context::lifecycle_helpers::finalize_close(&manager, &handle);
+    let finalize_fut = crate::context::lifecycle_helpers::finalize_close(supervisor, &handle);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, finalize_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
