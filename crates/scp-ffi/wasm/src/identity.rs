@@ -993,8 +993,9 @@ impl WasmDIDDocument {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Narrows a caller-supplied `testing_seed` byte slice to a
-/// zeroize-wrapped `[u8; 32]`.
+/// Narrows a caller-supplied `testing_seed` byte vector to a
+/// zeroize-wrapped `[u8; 32]` and zeroizes the source `Vec<u8>`
+/// before it drops.
 ///
 /// The caller-supplied `testing_seed` parameter is a parity-harness
 /// affordance (ADR-046), not a production API — mirrors how the
