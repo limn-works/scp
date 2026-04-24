@@ -260,6 +260,10 @@ endpoint. Overkill for the problem.
   `expected_values` golden-value pin; any future divergence is caught
   byte-exactly.
 
+### Known divergences
+
+- **`transport_status_disconnected` on UniFFI.** The UniFFI bridge's per-instance `Scp.transportStatus(manager: Arc<TransportManager>)` requires a non-optional `TransportManager` handle while PyO3/NAPI/WASM keep a handleless probe. The op is xfailed for `uniffi-kotlin` and `uniffi-swift` in `bindings/python/tests/bridge_parity/seed_operations.py:770-796`. Resolution path and rationale live in ADR-048 §7a ("Known parity regression — `transport_status` on UniFFI") — the fix is to add a handleless `Scp::transport_manager_status()` to the UniFFI bridge so the parity harness runs against the common disconnected-state shape without per-bridge fixture plumbing.
+
 ## Threat model — test-only env var forwarding
 
 The Kotlin and Swift runners need the UniFFI cdylib on the system
