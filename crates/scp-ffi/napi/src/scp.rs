@@ -343,8 +343,8 @@ impl Scp {
         match custody.as_str() {
             #[cfg(feature = "allow_in_memory_custody")]
             "in_memory" => {
-                use scp_platform::testing::InMemoryKeyCustody;
                 use scp_identity::DidDht;
+                use scp_platform::testing::InMemoryKeyCustody;
 
                 let in_memory = testing_seed_bytes
                     .map_or_else(InMemoryKeyCustody::new, InMemoryKeyCustody::from_seed_bytes);
@@ -391,19 +391,34 @@ impl Scp {
                 Ok(handle)
             }
             #[cfg(not(feature = "allow_in_memory_custody"))]
-            "in_memory" => Err(ScpNapiError::Identity {
-                message:
-                    "in_memory custody is not available in this build -- enable allow_in_memory_custody"
-                        .to_owned(),
-                code: codes::IDENT_1008.to_owned(),
-            }
-            .into()),
-            "platform" | "software" => {
+            "in_memory" => {
+                // Mirrors PyO3 `parse_custody_with_seed`
+                // (cfg(not(allow_in_memory_custody))): a `testing_seed` is
+                // a parity-harness affordance gated on the
+                // `allow_in_memory_custody` feature, so surface it as
+                // SCP-VALID-7008 ("testing-only feature requires feature
+                // flag") ahead of the generic custody-unavailable error.
                 if testing_seed_bytes.is_some() {
                     return Err(NapiError::from(ScpNapiError::Validation {
                         message:
-                            "`testing_seed` parameter is only valid for custody=\"in_memory\""
+                            "`testing_seed` parameter requires the allow_in_memory_custody feature"
                                 .to_owned(),
+                        code: codes::VALID_7008.to_owned(),
+                    }));
+                }
+                Err(ScpNapiError::Identity {
+                    message:
+                        "in_memory custody is not available in this build -- enable allow_in_memory_custody"
+                            .to_owned(),
+                    code: codes::IDENT_1008.to_owned(),
+                }
+                .into())
+            }
+            "platform" | "software" => {
+                if testing_seed_bytes.is_some() {
+                    return Err(NapiError::from(ScpNapiError::Validation {
+                        message: "`testing_seed` parameter is only valid for custody=\"in_memory\""
+                            .to_owned(),
                         code: codes::VALID_7009.to_owned(),
                     }));
                 }

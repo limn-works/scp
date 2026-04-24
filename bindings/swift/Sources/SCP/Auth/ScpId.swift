@@ -178,7 +178,7 @@ public enum ScpId {
     /// so all SCPID operations route through the caller's own `SCP`
     /// rather than a process-global default.
     public static let unboundChallenge: ChallengeFn = { _, _ in
-        throw ScpError.Validation(
+        throw ScpError.Identity(
             msg: "scpidChallenge is unbound — pass an SCP-bound closure (see SCP.scpidChallenge)",
             code: "SCP-IDENT-1046"
         )
@@ -191,7 +191,7 @@ public enum ScpId {
     /// routes through the caller's own `SCP` identity registry rather
     /// than a process-global default.
     public static let unboundSign: SignFn = { _, _, _ in
-        throw ScpError.Validation(
+        throw ScpError.Identity(
             msg: "scpidSign is unbound — pass an SCP-bound closure (see SCP.scpidSign)",
             code: "SCP-IDENT-1046"
         )
@@ -205,7 +205,7 @@ public enum ScpId {
     /// through the caller's own `SCP` rather than a process-global
     /// default.
     public static let unboundVerify: VerifyFn = { _, _ in
-        throw ScpError.Validation(
+        throw ScpError.Identity(
             msg: "scpidVerify is unbound — pass an SCP-bound closure (see SCP.scpidVerify)",
             code: "SCP-IDENT-1046"
         )

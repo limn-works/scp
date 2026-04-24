@@ -6866,7 +6866,20 @@ impl Scp {
                         #[cfg(not(feature = "allow_in_memory_custody"))]
                         {
                             let _ = &bi;
-                            let _ = testing_seed_bytes;
+                            // Mirrors PyO3 `parse_custody_with_seed`
+                            // (cfg(not(allow_in_memory_custody))):
+                            // `testing_seed` is a parity-harness affordance
+                            // gated on the `allow_in_memory_custody` feature,
+                            // so surface it as SCP-VALID-7008 ahead of the
+                            // generic custody-unavailable error.
+                            if testing_seed_bytes.is_some() {
+                                return Err(ScpError::Validation {
+                                    msg: "`testing_seed` parameter requires the \
+                                          allow_in_memory_custody feature"
+                                        .to_owned(),
+                                    code: codes::VALID_7008.to_owned(),
+                                });
+                            }
                             Err(ScpError::Identity {
                                 msg: "\"in_memory\" custody is not available in this build \
                                       — enable the \"allow_in_memory_custody\" feature for \
