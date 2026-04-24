@@ -142,7 +142,7 @@ COLLISION_COUNT=0
 while IFS=: read -r file line_num content; do
     # Skip test files entirely.
     case "$file" in
-        */tests/*|*_test.rs|*_test.ts|*_test.py|*.test.ts|*.test.js) continue ;;
+        */tests/*|*/Tests/*|*_test.rs|*_test.ts|*_test.py|*.test.ts|*.test.js|*Tests.swift|*Test.kt) continue ;;
     esac
 
     # Skip lines inside #[cfg(test)] modules (Rust inline tests).
