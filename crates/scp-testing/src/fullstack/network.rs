@@ -40,11 +40,12 @@ impl FullStackNetwork {
     /// * `key_resolver` - Resolver for governance vote verification.
     #[must_use]
     pub fn create_node(&self, did: &str, key_resolver: KeyResolver) -> FullStackNode {
+        let did_value = DID(did.to_owned());
         let crypto = Arc::new(E2eCryptoProvider::new(
-            did.to_owned(),
+            did_value.clone(),
             Arc::clone(&self.exchange),
         ));
-        FullStackNode::new(DID::from(did), crypto, key_resolver)
+        FullStackNode::new(did_value, crypto, key_resolver)
     }
 }
 

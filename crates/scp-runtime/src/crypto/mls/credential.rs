@@ -86,7 +86,15 @@ impl ScpCredential {
         ucan_token: Option<String>,
         signing_key_id: SigningKeyId,
     ) -> Result<Self, MlsError> {
-        if !did.starts_with("did:dht:z") {
+        // Production requires `did:dht:z*`. Under `cfg(test)` / `testing`
+        // feature also accept `did:key:*` and `did:test:*` so the broad
+        // test suite (previously trait-mocked via MockCrypto) continues
+        // to work with the inherent `MlsCryptoProvider` API after ADR-049
+        // commit 12c.9e.
+        let accepted = did.starts_with("did:dht:z")
+            || (cfg!(any(test, feature = "testing"))
+                && (did.starts_with("did:test:") || did.starts_with("did:key:")));
+        if !accepted {
             return Err(MlsError::InvalidDidFormat(did));
         }
         Ok(Self {

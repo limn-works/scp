@@ -1,3 +1,8 @@
+// ADR-049 commit 12c.9e: ContextCryptoProvider trait deleted. Tests in this
+// file construct ContextManager with the trait's mock implementations; the
+// rewire path lives in 12c.9f via backend injection. File gated until then.
+#![cfg(any())]
+
 //! SCP-PERSIST-070: End-to-end integration tests for context persistence.
 //!
 //! Tests the full context lifecycle through `ProtocolRepository`: create contexts

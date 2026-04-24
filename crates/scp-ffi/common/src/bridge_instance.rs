@@ -2239,58 +2239,16 @@ pub enum ShutdownError {
 mod tests {
     use super::*;
     use scp_core::context::LocalTransportProvider;
-    use scp_core::context::builder::{
-        ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
-    };
-    use scp_core::context::{AddMemberOutput, ContextError, RemoveMemberOutput};
+    use scp_core::context::builder::{ContextCreationError, ContextEventLogProvider};
+    use scp_core::crypto::mls::provider::MlsCryptoProvider;
     use std::pin::Pin;
 
     use scp_core::envelope::outer::OuterEnvelope;
     use scp_transport::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportError};
 
-    // Minimal no-op providers for constructing a ContextManager in tests.
-
-    struct NoOpCrypto;
-    impl ContextCryptoProvider for NoOpCrypto {
-        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn create_mls_group(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn generate_sender_key(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn init_broadcast_key(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn destroy_mls_group(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn destroy_sender_key(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-            Ok(())
-        }
-        fn validate_key_package(&self, _: &str, _: Option<&[u8]>) -> Result<(), ContextError> {
-            Ok(())
-        }
-        fn add_member(
-            &self,
-            _: &[u8; 32],
-            _: &str,
-            _: Option<&[u8]>,
-        ) -> Result<AddMemberOutput, ContextError> {
-            Ok(AddMemberOutput::default())
-        }
-        fn remove_member(&self, _: &[u8; 32], _: &str) -> Result<RemoveMemberOutput, ContextError> {
-            Ok(RemoveMemberOutput::default())
-        }
-        fn distribute_sender_key(&self, _: &[u8; 32], _: &str) -> Result<(), ContextError> {
-            Ok(())
-        }
-        fn remove_member_sender_key(&self, _: &[u8; 32], _: &str) -> Result<(), ContextError> {
-            Ok(())
-        }
-    }
+    // Minimal no-op event-log provider for constructing a ContextManager in
+    // tests. Crypto now uses the real `MlsCryptoProvider` directly —
+    // `ContextCryptoProvider` was deleted in commit 12c.9e of ADR-049.
 
     struct NoOpEventLog;
     impl ContextEventLogProvider for NoOpEventLog {
@@ -2315,8 +2273,9 @@ mod tests {
         // Use LocalTransportProvider (silently succeeds) for tests.
         // Key resolver returns None — no signature verification in tests.
         let key_resolver: scp_core::context::governance::KeyResolver = Arc::new(|_| None);
+        let test_did = "did:test:bridge-instance-test".to_owned();
         Arc::new(ContextManager::new(
-            Box::new(NoOpCrypto),
+            Arc::new(MlsCryptoProvider::new(test_did)),
             Box::new(LocalTransportProvider),
             Box::new(NoOpEventLog),
             key_resolver,
@@ -3496,7 +3455,7 @@ mod tests {
         // Build a ContextManager with persistence.
         let key_resolver: scp_core::context::governance::KeyResolver = Arc::new(|_| None);
         let cm = Arc::new(ContextManager::with_persistence(
-            Box::new(NoOpCrypto),
+            Arc::new(MlsCryptoProvider::new("did:test:suspend-flush".to_owned())),
             Box::new(scp_core::context::LocalTransportProvider),
             Box::new(NoOpEventLog),
             persistence_for_cm,

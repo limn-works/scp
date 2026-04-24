@@ -89,9 +89,9 @@ fn auto_wire_context_manager(
         ))
     }) {
         Ok(adapter) => {
-            let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
-                did_owned.clone(),
-            ));
+            let crypto = std::sync::Arc::new(
+                scp_core::crypto::mls::provider::MlsCryptoProvider::new(did_owned.clone()),
+            );
             let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
             let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
                 Box::new(crate::runtime::NoOpEventLogProvider);

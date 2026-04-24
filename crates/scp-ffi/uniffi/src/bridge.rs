@@ -3736,7 +3736,8 @@ pub async fn context_close(
             // per-call instance is correct.
             let crypto_provider =
                 scp_core::crypto::mls::provider::MlsCryptoProvider::new(identity_did);
-            let orchestrator = scp_core::context::close::CloseOrchestrator::new(&crypto_provider);
+            let orchestrator =
+                scp_core::context::key_destruction::CloseOrchestrator::new(&crypto_provider);
 
             let close_action = orchestrator
                 .initiate_close(

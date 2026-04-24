@@ -300,7 +300,7 @@ pub fn py_configure_relay_transport(relay_url: &str, local_did: &str) -> PyResul
             ScpPyError::transport(format!("failed to connect to relay '{relay_url}': {e}"))
         })?;
 
-    let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+    let crypto = std::sync::Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
         local_did.to_owned(),
     ));
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));

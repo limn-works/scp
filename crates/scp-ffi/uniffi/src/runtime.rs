@@ -41,9 +41,10 @@ use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
-use scp_core::context::builder::{ContextCryptoProvider, ContextEventLogProvider};
+use scp_core::context::builder::ContextEventLogProvider;
 use scp_core::context::manager::ContextManager;
 use scp_core::context::providers::MerkleEventLogProvider;
+use scp_core::crypto::mls::provider::MlsCryptoProvider;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
@@ -911,7 +912,7 @@ impl scp_core::context::manager::ContextPersistence for ArcContextPersistence {
 /// so the manager and the bridge mirror share the same backend — a
 /// single `SQLite` connection, not two.
 fn build_context_manager(
-    crypto: Box<dyn ContextCryptoProvider>,
+    crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>>,
@@ -1089,7 +1090,7 @@ pub fn init_context_manager_with_did(local_did: &str) {
         return;
     }
     let did = local_did.to_owned();
-    let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
         tracing::error!(
             "init_context_manager_with_did: missing ProtocolRepository after \
@@ -1134,7 +1135,7 @@ pub fn init_context_manager_with_relay_transport(
         return;
     }
     let did = local_did.to_owned();
-    let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
     let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
         tracing::error!(

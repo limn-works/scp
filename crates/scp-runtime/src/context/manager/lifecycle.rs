@@ -1037,6 +1037,10 @@ impl ContextManager {
     /// params. Used by tests to simulate a context whose `min_protocol_version`
     /// was set by a different SDK version or received via sync.
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "ADR-049 commit 12c.9e deleted the trait-based test mocks that called this; retained for 12c.9f rewire when MlsBackend injection lands"
+    )]
     pub(crate) async fn replace_stored_params(&self, context_id: &str, new_params: ContextParams) {
         if let Ok(ctx_arc) = self.get_context_arc(context_id) {
             let mut guard = ctx_arc.lock().await;
@@ -1054,6 +1058,10 @@ impl ContextManager {
     }
 
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "ADR-049 commit 12c.9e deleted the trait-based test mocks that called this; retained for 12c.9f rewire when MlsBackend injection lands"
+    )]
     pub(crate) async fn create_context_bare(
         &self,
         context_id: String,

@@ -76,6 +76,10 @@ use super::{ContextError, ContextGeneration, ContextHandle, ContextManager, DID,
 /// `tests/messaging.rs` continues to witness the bit-identity between this
 /// re-export and the protocol-level implementation.
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "ADR-049 commit 12c.9e deleted the trait-based test mocks that called this; retained for 12c.9f rewire when MlsBackend injection lands"
+)]
 pub(super) fn derive_routing_id(context_id: &str) -> [u8; 32] {
     scp_protocol::context::context_routing_id(context_id)
 }

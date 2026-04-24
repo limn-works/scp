@@ -1836,70 +1836,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper to create a minimal `ContextManager` for testing.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// After ADR-049 commit 12c.9e, the `ContextCryptoProvider` trait is
+    /// deleted and tests bind to a real
+    /// [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider)
+    /// — fail-injection and stub-seal overrides move to
+    /// backend-injection in commit 12c.9f.
     fn test_context_manager() -> Arc<ContextManager> {
         use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
         use crate::context::providers::event_log::EventLogEntry;
-        use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+        use scp_protocol::context::builder::ContextCreationError;
         use scp_protocol::context::{ContextError, ContextParams};
 
-        struct TestCrypto;
-        impl ContextCryptoProvider for TestCrypto {
-            fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-                Ok(())
-            }
-            fn create_mls_group(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-                Ok(())
-            }
-            fn generate_sender_key(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-                Ok(())
-            }
-            fn init_broadcast_key(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-                Ok(())
-            }
-            fn destroy_mls_group(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-                Ok(())
-            }
-            fn destroy_sender_key(&self, _: &[u8; 32]) -> Result<(), ContextCreationError> {
-                Ok(())
-            }
-            fn validate_key_package(&self, _: &str, _: Option<&[u8]>) -> Result<(), ContextError> {
-                Ok(())
-            }
-            fn add_member(
-                &self,
-                _: &[u8; 32],
-                _: &str,
-                _: Option<&[u8]>,
-            ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
-                Ok(scp_protocol::context::builder::AddMemberOutput::default())
-            }
-            fn remove_member(
-                &self,
-                _: &[u8; 32],
-                _: &str,
-            ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError>
-            {
-                Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
-            }
-            fn distribute_sender_key(&self, _: &[u8; 32], _: &str) -> Result<(), ContextError> {
-                Ok(())
-            }
-            fn remove_member_sender_key(&self, _: &[u8; 32], _: &str) -> Result<(), ContextError> {
-                Ok(())
-            }
-            fn seal(
-                &self,
-                _context_id: &[u8; 32],
-                inner: &scp_protocol::envelope::inner::InnerEnvelope,
-                _routing_id: &[u8],
-                _blob_ttl: u32,
-            ) -> Result<Vec<u8>, ContextError> {
-                // Test-only: serialize inner envelope directly (no encryption).
-                rmp_serde::to_vec_named(inner)
-                    .map_err(|e| ContextError::CryptoFailed(format!("test seal: {e}")))
-            }
-        }
+        const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
         struct TestTransport;
         impl ContextTransportProvider for TestTransport {
@@ -1950,7 +1899,9 @@ mod tests {
         // require an attached Supervisor. Wrap with `attach_test_supervisor`
         // so the supervisor-dependent code paths resolve correctly.
         crate::context::attach_test_supervisor(ContextManager::new(
-            Box::new(TestCrypto),
+            Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+                TEST_DID.to_owned(),
+            )),
             Box::new(TestTransport),
             Box::new(TestEventLog),
             Arc::new(|_| None),

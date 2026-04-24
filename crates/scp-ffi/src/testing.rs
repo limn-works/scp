@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use scp_core::context::builder::ContextCryptoProvider;
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams, context_id_bytes};
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};
@@ -420,7 +419,7 @@ pub fn py_fullstack_remove_member(
     // sends via the transport. These are control-plane messages, not
     // application messages, and must not bleed into the buffer that
     // py_fullstack_send_message checks for exactly-one application ciphertext.
-    node.inner.take_sent_ciphertexts();
+    let _ = node.inner.take_sent_ciphertexts();
 
     Ok(())
 }

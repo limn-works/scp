@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
-use scp_core::context::builder::ContextCryptoProvider;
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::{Capability, ContextHandle, ContextMode, ContextParams, context_id_bytes};
 use scp_testing::fullstack::{FullStackNetwork, FullStackNode};

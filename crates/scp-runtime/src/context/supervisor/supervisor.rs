@@ -39,7 +39,6 @@ use dashmap::DashMap;
 use scp_identity::DID;
 use scp_primitives::Clock;
 use scp_protocol::context::ContextError;
-use scp_protocol::context::builder::ContextCryptoProvider;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
 
@@ -272,9 +271,10 @@ pub struct Supervisor {
     /// Shared crypto provider. Populated from
     /// [`ContextManager::crypto_ref`] during
     /// [`Self::attach_context_manager`]. Deleted in 12c.9e with
-    /// `ContextCryptoProvider`.
+    /// `MlsCryptoProvider` concrete type (the old
+    /// `ContextCryptoProvider` trait was deleted in 12c.9e).
     #[allow(dead_code)] // read in 12c.9c when helpers migrate to &Supervisor
-    crypto: OnceLock<Arc<dyn ContextCryptoProvider>>,
+    crypto: OnceLock<Arc<crate::crypto::mls::provider::MlsCryptoProvider>>,
     /// Shared transport provider. Populated from
     /// [`ContextManager::transport_ref`].
     #[allow(dead_code)] // read in 12c.9c when helpers migrate to &Supervisor
@@ -595,13 +595,15 @@ impl Supervisor {
     // -------------------------------------------------------------------
 
     /// Cheap reference to the attached manager's shared
-    /// [`ContextCryptoProvider`]. Returns `None` before
-    /// [`Self::attach_context_manager`] has been called. See
-    /// [`ContextManager::crypto_ref`] for the mirrored underlying
-    /// field.
+    /// [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider).
+    /// Returns `None` before [`Self::attach_context_manager`] has been
+    /// called. See [`ContextManager::crypto_ref`] for the mirrored
+    /// underlying field.
     #[must_use]
     #[allow(dead_code)] // first caller lands in 12c.9c
-    pub(crate) fn crypto_ref(&self) -> Option<&Arc<dyn ContextCryptoProvider>> {
+    pub(crate) fn crypto_ref(
+        &self,
+    ) -> Option<&Arc<crate::crypto::mls::provider::MlsCryptoProvider>> {
         self.crypto.get()
     }
 
@@ -2699,10 +2701,9 @@ mod tests {
         // `MlsCryptoProvider::new` takes a String DID; the stub DID is
         // never used by the spawn tests because no
         // `create_context` call runs.
-        let crypto: Box<dyn scp_protocol::context::builder::ContextCryptoProvider> =
-            Box::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
-                "did:dht:z6MktestDoNotRely".to_owned(),
-            ));
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestDoNotRely".to_owned(),
+        ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =

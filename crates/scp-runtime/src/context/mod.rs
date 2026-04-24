@@ -35,6 +35,7 @@ pub(crate) mod economy_helpers;
 pub mod export_import;
 pub mod governance;
 pub(crate) mod governance_helpers;
+pub mod key_destruction;
 pub(crate) mod lifecycle_helpers;
 pub mod manager;
 pub(crate) mod messaging_helpers;

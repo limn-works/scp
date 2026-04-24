@@ -901,7 +901,7 @@ pub fn init_context_manager(local_did: &str) {
         return;
     }
     let did = local_did.to_owned();
-    let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let transport = Box::new(scp_core::context::NotConfiguredTransportProvider);
     let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
         tracing::error!(
@@ -968,7 +968,7 @@ pub fn init_context_manager_with_local_transport(local_did: &str) {
         return;
     }
     let did = local_did.to_owned();
-    let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let transport = Box::new(scp_core::context::LocalTransportProvider);
     let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
         tracing::error!(
@@ -1030,7 +1030,7 @@ pub fn init_context_manager_with_relay_transport(
         return;
     }
     let did = local_did.to_owned();
-    let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
     let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
         tracing::error!(
@@ -1129,7 +1129,9 @@ pub(crate) fn init_context_manager_for_test() {
         build_event_log_provider().0
     });
     let cm_arc = Arc::new(ContextManager::with_persistence(
-        Box::new(TestNoOpCryptoProvider),
+        Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:test:napi-bridge-test".to_owned(),
+        )),
         Box::new(scp_core::context::LocalTransportProvider),
         event_log,
         Box::new(NapiBridgePersistence::new()),
@@ -1137,89 +1139,6 @@ pub(crate) fn init_context_manager_for_test() {
     ));
 
     bi.core.set_context_manager(cm_arc);
-}
-
-/// No-op crypto provider for Rust unit tests only.
-///
-/// Accepts `None` key packages and `did:key:` DIDs, unlike the production
-/// `MlsCryptoProvider` which requires real MLS key package bytes and
-/// `did:dht:z` DIDs.
-#[cfg(test)]
-struct TestNoOpCryptoProvider;
-
-#[cfg(test)]
-impl scp_core::context::builder::ContextCryptoProvider for TestNoOpCryptoProvider {
-    fn validate_creator_identity(
-        &self,
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn create_mls_group(
-        &self,
-        _context_id: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn generate_sender_key(
-        &self,
-        _context_id: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn init_broadcast_key(
-        &self,
-        _context_id: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_mls_group(
-        &self,
-        _context_id: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_sender_key(
-        &self,
-        _context_id: &[u8; 32],
-    ) -> Result<(), scp_core::context::builder::ContextCreationError> {
-        Ok(())
-    }
-    fn validate_key_package(
-        &self,
-        _owner_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), scp_core::context::ContextError> {
-        Ok(())
-    }
-    fn add_member(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<scp_core::context::AddMemberOutput, scp_core::context::ContextError> {
-        Ok(scp_core::context::AddMemberOutput::default())
-    }
-    fn remove_member(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<scp_core::context::RemoveMemberOutput, scp_core::context::ContextError> {
-        Ok(scp_core::context::RemoveMemberOutput::default())
-    }
-    fn distribute_sender_key(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), scp_core::context::ContextError> {
-        Ok(())
-    }
-    fn remove_member_sender_key(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), scp_core::context::ContextError> {
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------

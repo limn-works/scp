@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use scp_identity::DID;
 use scp_platform::testing::InMemoryStorage;
 use scp_protocol::context::ContextError;
-use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_runtime::context::actor::commands::{
@@ -53,90 +53,12 @@ use scp_runtime::context::manager::{ContextManager, ContextPersistence};
 use scp_runtime::context::supervisor::{
     ProtocolRepositorySagaJournal, SagaJournal, Supervisor, SupervisorConfig,
 };
+use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
 
 // ---------------------------------------------------------------------------
 // Mock providers (same shape as actor_messaging_shim.rs — kept per-file
 // rather than shared to keep each integration test self-contained)
 // ---------------------------------------------------------------------------
-
-#[derive(Default)]
-struct MockCrypto;
-
-impl ContextCryptoProvider for MockCrypto {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn validate_key_package(
-        &self,
-        _owner_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn add_member(
-        &self,
-        _id: &[u8; 32],
-        _member_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
-        Ok(scp_protocol::context::builder::AddMemberOutput::default())
-    }
-    fn remove_member(
-        &self,
-        _id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
-        Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
-    }
-    fn distribute_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn remove_member_sender_key(
-        &self,
-        _id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn seal(
-        &self,
-        _context_id: &[u8; 32],
-        inner: &scp_protocol::envelope::inner::InnerEnvelope,
-        _routing_id: &[u8],
-        _blob_ttl: u32,
-    ) -> Result<Vec<u8>, ContextError> {
-        rmp_serde::to_vec_named(inner)
-            .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
-    }
-    fn open(
-        &self,
-        _context_id: &[u8; 32],
-        outer_bytes: &[u8],
-    ) -> Result<scp_protocol::context::builder::OpenResult, ContextError> {
-        let inner: scp_protocol::envelope::inner::InnerEnvelope =
-            rmp_serde::from_slice(outer_bytes)
-                .map_err(|e| ContextError::CryptoFailed(format!("mock open: {e}")))?;
-        let sender_did = inner.sender_did.clone();
-        Ok(scp_protocol::context::builder::OpenResult::Application(
-            Box::new(scp_protocol::context::builder::OpenedEnvelope { inner, sender_did }),
-        ))
-    }
-}
 
 #[derive(Default)]
 struct TransportCaptures(Mutex<Vec<([u8; 32], Vec<u8>)>>);
@@ -285,7 +207,9 @@ impl Fixture {
     fn new() -> Self {
         let captures = Arc::new(TransportCaptures::default());
         let manager = Arc::new(ContextManager::new(
-            Box::new(MockCrypto),
+            Arc::new(MlsCryptoProvider::new(
+                "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
+            )),
             Box::new(MockTransport::new(Arc::clone(&captures))),
             Box::new(MockEventLog),
             mock_key_resolver(),

@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    and Merkle event log implementations.
     let key_resolver: KeyResolver = Arc::new(|_did| None);
     let manager = ContextManager::new(
-        Box::new(support::MockCrypto),
+        support::example_crypto("did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"),
         Box::new(support::MockTransport),
         Box::new(support::MockEventLog),
         key_resolver,

@@ -55,6 +55,7 @@ pub mod context {
     pub use scp_runtime::context::app_sandbox;
     pub use scp_runtime::context::builder;
     pub use scp_runtime::context::export_import;
+    pub use scp_runtime::context::key_destruction;
     pub use scp_runtime::context::manager;
     pub use scp_runtime::context::policy;
     pub use scp_runtime::context::providers;
@@ -64,8 +65,8 @@ pub mod context {
     };
     // Key runtime types re-exported at this level.
     pub use scp_protocol::context::builder::{
-        AddMemberOutput, AdvanceEpochOutput, ContextCreationError, ContextCryptoProvider,
-        MANAGEMENT_MSG_MAGIC, MAX_MANAGEMENT_PAYLOAD_SIZE, RemoveMemberOutput,
+        AddMemberOutput, AdvanceEpochOutput, ContextCreationError, MANAGEMENT_MSG_MAGIC,
+        MAX_MANAGEMENT_PAYLOAD_SIZE, RemoveMemberOutput,
     };
     pub use scp_runtime::context::ContextHandle;
     /// Actor module — re-exported from `scp-runtime` so the FFI bridges

@@ -81,11 +81,11 @@ use std::sync::Arc;
 use sha2::Digest;
 use subtle::ConstantTimeEq;
 
+use crate::crypto::mls::provider::MlsCryptoProvider;
 use scp_identity::DID;
 use scp_primitives::Clock;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::broadcast::BroadcastContext;
-use scp_protocol::context::builder::ContextCryptoProvider;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::roles::Capability;
@@ -144,7 +144,7 @@ pub type ContextEventSender = tokio::sync::broadcast::Sender<(String, ContextEve
 #[allow(clippy::too_many_arguments)]
 pub fn build_encrypted_envelope(
     clock: &Arc<dyn Clock>,
-    crypto: &Arc<dyn ContextCryptoProvider>,
+    crypto: &Arc<MlsCryptoProvider>,
     context_id: &str,
     sender_did: &DID,
     payload: &[u8],

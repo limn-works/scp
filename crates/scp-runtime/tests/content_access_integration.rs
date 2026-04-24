@@ -26,7 +26,7 @@ use scp_identity::DID;
 use scp_platform::testing::InMemoryKeyCustody;
 use scp_platform::traits::{KeyCustody, KeyType};
 use scp_protocol::context::ContextError;
-use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::{
     AccessScope, GovernanceAction, KeyResolver, ProposalStatus,
 };
@@ -44,6 +44,7 @@ use scp_runtime::crypto::access_keys::lifecycle::{
     handle_block_as_blocked_party, handle_block_as_blocker, restore_access_key, revoke_access_key,
     revoke_read_access, revoke_write_access,
 };
+use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
 use scp_runtime::crypto::sender_keys::key_protocol::send_block_notification;
 use scp_runtime::identity::blocking::{
     BlockInContextParams, GlobalBlockParams, block_did_global, block_did_in_context,
@@ -92,74 +93,6 @@ async fn make_custody_and_key() -> (InMemoryKeyCustody, scp_platform::traits::Ke
 // ---------------------------------------------------------------------------
 // Mock providers (same pattern as content_access_governance_integration.rs)
 // ---------------------------------------------------------------------------
-
-#[derive(Default)]
-struct MockCrypto;
-
-impl ContextCryptoProvider for MockCrypto {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn validate_key_package(
-        &self,
-        _owner_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn add_member(
-        &self,
-        _id: &[u8; 32],
-        _member_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<scp_protocol::context::builder::AddMemberOutput, ContextError> {
-        Ok(scp_protocol::context::builder::AddMemberOutput::default())
-    }
-    fn remove_member(
-        &self,
-        _id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<scp_protocol::context::builder::RemoveMemberOutput, ContextError> {
-        Ok(scp_protocol::context::builder::RemoveMemberOutput::default())
-    }
-    fn distribute_sender_key(&self, _id: &[u8; 32], _member_did: &str) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn remove_member_sender_key(
-        &self,
-        _id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-
-    fn seal(
-        &self,
-        _context_id: &[u8; 32],
-        inner: &scp_protocol::envelope::inner::InnerEnvelope,
-        _routing_id: &[u8],
-        _blob_ttl: u32,
-    ) -> Result<Vec<u8>, ContextError> {
-        // Mock: serialize inner envelope directly (no encryption).
-        rmp_serde::to_vec_named(inner)
-            .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
-    }
-}
 
 #[derive(Default)]
 struct MockTransport {
@@ -246,7 +179,9 @@ fn new_manager() -> std::sync::Arc<ContextManager> {
     // ADR-049 commit 12c.9c — see
     // `tests/content_access_governance_integration.rs::new_manager`.
     scp_runtime::context::attach_test_supervisor(ContextManager::new(
-        Box::new(MockCrypto),
+        Arc::new(MlsCryptoProvider::new(
+            "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
+        )),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog),
         mock_key_resolver(),

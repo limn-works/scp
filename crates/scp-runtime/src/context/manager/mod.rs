@@ -35,9 +35,9 @@ use scp_protocol::context::broadcast::{
 // in commit 12c.4 the `manager/mod.rs` `use` for this type went away (the
 // hoisted helpers import directly from `scp_protocol::context::broadcast`),
 // so the test re-export is the only remaining consumer in this module.
-#[cfg(test)]
-pub(crate) use scp_protocol::context::broadcast::KeyRequestDecision;
-use scp_protocol::context::builder::{ContextCreationError, ContextCryptoProvider};
+use scp_protocol::context::builder::ContextCreationError;
+
+use crate::crypto::mls::provider::MlsCryptoProvider;
 use scp_protocol::context::governance::{
     AccessScope, CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint,
     GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
@@ -2088,7 +2088,7 @@ pub(crate) fn mint_governance_tokens(
 ///
 /// This replaces ~8 lines of manual wiring with a single call.
 pub struct ContextManagerBuilder {
-    crypto: Option<Box<dyn ContextCryptoProvider>>,
+    crypto: Option<Arc<MlsCryptoProvider>>,
     transport: Option<Box<dyn ContextTransportProvider>>,
     event_log: Option<Box<dyn ContextEventLogProvider>>,
     persistence: Option<Box<dyn ContextPersistence>>,
@@ -2114,7 +2114,7 @@ impl ContextManagerBuilder {
 
     /// Sets the crypto provider (required).
     #[must_use]
-    pub fn crypto(mut self, crypto: Box<dyn ContextCryptoProvider>) -> Self {
+    pub fn crypto(mut self, crypto: Arc<MlsCryptoProvider>) -> Self {
         self.crypto = Some(crypto);
         self
     }
@@ -2282,7 +2282,7 @@ pub struct ContextManager {
     /// Stored as `Arc` (not `Box`) so the provider can be shared with
     /// spawned TTL timer tasks that need crypto access for key destruction
     /// on context expiry (SCP-169).
-    crypto: Arc<dyn ContextCryptoProvider>,
+    crypto: Arc<MlsCryptoProvider>,
     /// Provider for relay connectivity and publication.
     transport: Arc<dyn ContextTransportProvider>,
     /// Provider for event log initialisation and append.
@@ -2407,13 +2407,13 @@ impl ContextManager {
     /// * `key_resolver` -- Resolver for DID-to-Ed25519 key mapping (governance vote verification).
     #[must_use]
     pub fn new(
-        crypto: Box<dyn ContextCryptoProvider>,
+        crypto: Arc<MlsCryptoProvider>,
         transport: Box<dyn ContextTransportProvider>,
         event_log: Box<dyn ContextEventLogProvider>,
         key_resolver: KeyResolver,
     ) -> Self {
         Self {
-            crypto: Arc::from(crypto),
+            crypto,
             transport: Arc::from(transport),
             event_log: Arc::from(event_log),
             persistence: None,
@@ -2450,14 +2450,14 @@ impl ContextManager {
     /// * `key_resolver` -- Resolver for DID-to-Ed25519 key mapping (governance vote verification).
     #[must_use]
     pub fn with_persistence(
-        crypto: Box<dyn ContextCryptoProvider>,
+        crypto: Arc<MlsCryptoProvider>,
         transport: Box<dyn ContextTransportProvider>,
         event_log: Box<dyn ContextEventLogProvider>,
         persistence: Box<dyn ContextPersistence>,
         key_resolver: KeyResolver,
     ) -> Self {
         Self {
-            crypto: Arc::from(crypto),
+            crypto,
             transport: Arc::from(transport),
             event_log: Arc::from(event_log),
             persistence: Some(Arc::from(persistence)),
@@ -3060,7 +3060,7 @@ impl ContextManager {
     /// the `testing`-gated `transport_provider_arc` / `clock_arc`
     /// accessors which only feed the actor-deps builder).
     #[must_use]
-    pub(crate) const fn crypto_ref(&self) -> &Arc<dyn ContextCryptoProvider> {
+    pub(crate) const fn crypto_ref(&self) -> &Arc<MlsCryptoProvider> {
         &self.crypto
     }
 

@@ -58,14 +58,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
-use scp_core::context::ContextError;
 use scp_core::context::builder::{
-    ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
+    ContextCreationError, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::manager::{ContextManager, ContextPersistence};
 use scp_core::context::providers::ProtocolRepositoryContextBridge;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
+use scp_core::crypto::mls::provider::MlsCryptoProvider;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
@@ -902,7 +902,7 @@ pub fn init_context_manager(local_did: &str) {
     }
 
     let did = local_did.to_owned();
-    let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
+    let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let persistence = build_persistence_provider();
     let cm_arc = build_context_manager(
         crypto,
@@ -938,7 +938,7 @@ pub fn ensure_bridge_instance() {
 /// from it. Pass `Some(...)` to override with a custom implementation.
 pub fn init_context_manager_with(
     _local_did: &str,
-    crypto: Box<dyn ContextCryptoProvider>,
+    crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
@@ -980,7 +980,9 @@ pub fn init_context_manager_for_test() {
     }
     let persistence = build_persistence_provider();
     let cm_arc = build_context_manager(
-        Box::new(NoOpCryptoProvider),
+        Arc::new(MlsCryptoProvider::new(
+            "did:test:pyo3-bridge-test".to_owned(),
+        )),
         Box::new(scp_core::context::LocalTransportProvider),
         Box::new(NoOpEventLogProvider),
         persistence,
@@ -1099,7 +1101,7 @@ impl ContextPersistence for ArcContextPersistence {
 
 /// Constructs a `ContextManager` with or without persistence.
 fn build_context_manager(
-    crypto: Box<dyn ContextCryptoProvider>,
+    crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
@@ -1178,70 +1180,6 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
 // ---------------------------------------------------------------------------
 // No-op provider implementations for ContextManager initialization
 // ---------------------------------------------------------------------------
-
-/// No-op crypto provider used only by [`init_context_manager_for_test`].
-///
-/// Production code now uses `MlsCryptoProvider` (issue #1324). Tests
-/// continue using this no-op because they pass `did:key:` test DIDs and
-/// `None` key packages which `MlsCryptoProvider` rejects.
-struct NoOpCryptoProvider;
-
-impl ContextCryptoProvider for NoOpCryptoProvider {
-    fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn create_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn generate_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn init_broadcast_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_mls_group(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn destroy_sender_key(&self, _context_id: &[u8; 32]) -> Result<(), ContextCreationError> {
-        Ok(())
-    }
-    fn validate_key_package(
-        &self,
-        _owner_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn add_member(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-        _key_package_bytes: Option<&[u8]>,
-    ) -> Result<scp_core::context::AddMemberOutput, ContextError> {
-        Ok(scp_core::context::AddMemberOutput::default())
-    }
-    fn remove_member(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<scp_core::context::RemoveMemberOutput, ContextError> {
-        Ok(scp_core::context::RemoveMemberOutput::default())
-    }
-    fn distribute_sender_key(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-    fn remove_member_sender_key(
-        &self,
-        _context_id: &[u8; 32],
-        _member_did: &str,
-    ) -> Result<(), ContextError> {
-        Ok(())
-    }
-}
 
 // Use the not-configured transport provider from scp-core (#501).
 // Unlike `LocalTransportProvider` (which silently succeeds), this returns
@@ -2535,7 +2473,9 @@ mod tests {
         // scp_ffi_common::bridge_instance::CoreFields`.
         let persistence = build_persistence_provider();
         let cm = build_context_manager(
-            Box::new(NoOpCryptoProvider),
+            Arc::new(MlsCryptoProvider::new(
+                "did:test:pyo3-bridge-test".to_owned(),
+            )),
             Box::new(scp_core::context::LocalTransportProvider),
             Box::new(NoOpEventLogProvider),
             persistence,

@@ -1046,10 +1046,9 @@ mod tests {
         use scp_platform::testing::InMemoryStorage;
         use std::sync::Arc;
 
-        let crypto: Box<dyn scp_protocol::context::builder::ContextCryptoProvider> =
-            Box::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
-                "did:dht:z6MktestActorNew".to_owned(),
-            ));
+        let crypto = Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
+            "did:dht:z6MktestActorNew".to_owned(),
+        ));
         let transport: Box<dyn crate::context::builder::ContextTransportProvider> =
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
