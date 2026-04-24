@@ -1469,7 +1469,7 @@ pub(super) async fn setup_failing_capture_manager_with_context(
     };
 
     let handle = manager
-        .create_context(context_id.into(), params, creator_did.into(), None)
+        .create_context(context_id.into(), params, creator_did.into(), [0u8; 32])
         .await
         .unwrap();
 
@@ -1513,7 +1513,12 @@ pub(super) async fn setup_active_context() -> (ContextManager, ContextHandle) {
     };
 
     let handle = manager
-        .create_context("test-ctx".into(), params, "did:key:creator".into(), None)
+        .create_context(
+            "test-ctx".into(),
+            params,
+            "did:key:creator".into(),
+            [0u8; 32],
+        )
         .await
         .unwrap();
 
@@ -1545,7 +1550,12 @@ pub(super) async fn setup_active_context_with_key_resolver() -> (ContextManager,
     };
 
     let handle = manager
-        .create_context("test-ctx".into(), params, "did:key:creator".into(), None)
+        .create_context(
+            "test-ctx".into(),
+            params,
+            "did:key:creator".into(),
+            [0u8; 32],
+        )
         .await
         .unwrap();
 
@@ -1662,7 +1672,7 @@ pub(super) async fn setup_broadcast_context_two_authors() -> (ContextManager, Co
             "broadcast-2auth-ctx".into(),
             params,
             "did:key:alice".into(),
-            None,
+            [0u8; 32],
         )
         .await
         .unwrap();
@@ -1717,7 +1727,7 @@ pub(super) async fn setup_broadcast_with_member_ban() -> (ContextManager, String
             "broadcast-ban-ctx".into(),
             params,
             "did:key:alice".into(),
-            None,
+            [0u8; 32],
         )
         .await
         .unwrap();
@@ -1778,7 +1788,12 @@ pub(super) async fn setup_encrypted_with_member_ban() -> (ContextManager, String
     };
 
     let _handle = manager
-        .create_context("enc-ban-ctx".into(), params, "did:key:alice".into(), None)
+        .create_context(
+            "enc-ban-ctx".into(),
+            params,
+            "did:key:alice".into(),
+            [0u8; 32],
+        )
         .await
         .unwrap();
 
@@ -1864,7 +1879,7 @@ pub(super) async fn setup_broadcast_context() -> (ContextManager, ContextHandle,
             "broadcast-ctx".into(),
             params,
             "did:key:author1".into(),
-            None,
+            [0u8; 32],
         )
         .await
         .unwrap();

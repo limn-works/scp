@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let handle = manager
-        .create_context("chat-demo".to_owned(), params, alice.clone(), None)
+        .create_context("chat-demo".to_owned(), params, alice.clone(), [0u8; 32])
         .await?;
     println!("Alice created context: {}", handle.context_id());
 
@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mls_key_package_bytes: None, // mock — no real MLS in this example
     };
     manager
-        .join_context(&handle, bob_key_package, None, None)
+        .join_context(&handle, bob_key_package, None, [0u8; 32])
         .await?;
     println!("Bob joined the context.");
 

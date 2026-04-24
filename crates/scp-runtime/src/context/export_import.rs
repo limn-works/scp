@@ -373,10 +373,24 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         // Generation counter is local runtime state — no meaning to a
         // public observer. Always zero in public scope.
         generation: 0,
-        // §9.10.4: pseudonym state is local-instance routing state —
-        // no meaning to a public observer. Always empty/None in public scope.
-        local_pseudonym: None,
-        pseudonym_registry: HashMap::new(),
+        // §9.10.4: pseudonym state is local-instance routing state and has
+        // no meaning to a public observer. Strip the local pseudonym + peer
+        // registry but keep the variant matching the declared context mode
+        // so a stripped snapshot's shape stays self-consistent. `routing` is
+        // never consulted on `import_context` (which rebuilds it from the
+        // importer's own caller-supplied pseudonym), so the zero pseudonym
+        // inside `Encrypted` is a harmless placeholder.
+        routing: match snapshot.context_params.mode {
+            scp_protocol::context::params::ContextMode::Broadcast => {
+                crate::context::manager::ContextRouting::Broadcast
+            }
+            scp_protocol::context::params::ContextMode::Encrypted => {
+                crate::context::manager::ContextRouting::Encrypted {
+                    local_pseudonym: [0u8; 32],
+                    pseudonym_registry: HashMap::new(),
+                }
+            }
+        },
     }
 }
 
@@ -500,8 +514,8 @@ mod tests {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             generation: 0,
-            local_pseudonym: None,
-            pseudonym_registry: HashMap::new(),
+            // Test fixture — broadcast is the zero-argument variant.
+            routing: crate::context::manager::ContextRouting::Broadcast,
         }
     }
 

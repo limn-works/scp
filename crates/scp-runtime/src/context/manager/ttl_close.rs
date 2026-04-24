@@ -122,11 +122,16 @@ impl ContextManager {
                 // Drop broadcast context state -- keys are zeroed by Zeroize.
                 ctx.broadcast_context = None;
 
-                // §9.10.4: clear pseudonym state on close. The local pseudonym
-                // is derived from secret key material; zeroing it prevents
-                // leaking the routing ID after context teardown.
-                ctx.local_pseudonym = None;
-                ctx.pseudonym_registry.clear();
+                // §9.10.4: drop the peer pseudonym registry on close — it is
+                // learned ephemeral state. The local pseudonym stays in the
+                // Encrypted variant because the variant shape is fixed at
+                // construction; post-close nothing reads it.
+                if let super::ContextRouting::Encrypted {
+                    pseudonym_registry, ..
+                } = &mut ctx.routing
+                {
+                    pseudonym_registry.clear();
+                }
 
                 // Participation decay: clear participation cache and cooldown
                 // state on context close (#1530).

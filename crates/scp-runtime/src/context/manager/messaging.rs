@@ -331,8 +331,22 @@ fn deliver_plaintext_or_announcement(
             return None; // Drop forged announcement, don't deliver as message
         }
         let did = DID(announcement.member_did.clone());
-        ctx.pseudonym_registry
-            .insert(did.clone(), announcement.pseudonym);
+        // §9.10.4: announcements only meaningful for encrypted contexts.
+        // Broadcast contexts should never receive a pseudonym announcement;
+        // if one arrives we drop it without updating state.
+        if let super::ContextRouting::Encrypted {
+            pseudonym_registry, ..
+        } = &mut ctx.routing
+        {
+            pseudonym_registry.insert(did.clone(), announcement.pseudonym);
+        } else {
+            tracing::warn!(
+                context_id,
+                sender_did,
+                "pseudonym announcement received on broadcast context — dropping"
+            );
+            return None;
+        }
         let event = ContextEvent::PseudonymAnnounced {
             member_did: did,
             pseudonym: announcement.pseudonym,
@@ -599,21 +613,27 @@ impl ContextManager {
                     )));
                 };
                 // §9.10.4: collect pseudonym routing IDs for fan-out.
-                // For encrypted contexts with known pseudonyms, send to each
-                // member's pseudonym. Always include the shared routing ID as
-                // fallback for members whose pseudonym is not yet known.
+                // Pattern-match on the routing variant; broadcast is handled
+                // above, so we only reach this branch for encrypted contexts.
                 //
                 // KNOWN LIMITATION (§9.10.4): Fan-out sends the SAME MLS ciphertext to all
                 // routing IDs. A relay can correlate pseudonyms by observing identical blobs.
                 // Per-recipient re-encryption (different nonce per blob) would fix this but
                 // increases bandwidth by O(N). Acceptable until relay-blinding is implemented.
-                let mut routing_ids: Vec<[u8; 32]> =
-                    ctx.pseudonym_registry.values().copied().collect();
+                let mut routing_ids: Vec<[u8; 32]> = match &ctx.routing {
+                    super::ContextRouting::Encrypted {
+                        pseudonym_registry, ..
+                    } => pseudonym_registry.values().copied().collect(),
+                    super::ContextRouting::Broadcast => {
+                        // Unreachable: broadcast_context.is_none() branch is
+                        // taken above. Defensive fallback to empty fan-out.
+                        Vec::new()
+                    }
+                };
                 let shared_rid = scp_protocol::context::context_routing_id(&context_id);
-                // Always include the shared routing ID for backward compat /
-                // members who haven't announced a pseudonym yet. Duplicates
-                // in the fan-out are harmless (same blob to same routing ID
-                // is idempotent at the relay).
+                // Transitional: the shared routing ID is also included during
+                // commit 2's staged migration. Commit 3 removes this push and
+                // asserts the registry is non-empty for multi-member contexts.
                 routing_ids.push(shared_rid);
                 (
                     None,
@@ -1409,8 +1429,19 @@ impl ContextManager {
                 )));
             }
             let announced_did = DID(announcement.member_did.clone());
-            ctx.pseudonym_registry
-                .insert(announced_did.clone(), announcement.pseudonym);
+            // §9.10.4: registry updates are meaningful only for encrypted
+            // contexts. Broadcast contexts should never carry pseudonym
+            // announcements; reject as a spec-level violation.
+            if let super::ContextRouting::Encrypted {
+                pseudonym_registry, ..
+            } = &mut ctx.routing
+            {
+                pseudonym_registry.insert(announced_did.clone(), announcement.pseudonym);
+            } else {
+                return Err(ContextError::PermissionDenied(
+                    "pseudonym announcement received on broadcast context".into(),
+                ));
+            }
             let announce_event = ContextEvent::PseudonymAnnounced {
                 member_did: announced_did,
                 pseudonym: announcement.pseudonym,

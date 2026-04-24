@@ -25,7 +25,12 @@ async fn cac009_tier1_encrypted_block_unblock() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context("cac009-enc".into(), params, "did:key:alice".into(), None)
+        .create_context(
+            "cac009-enc".into(),
+            params,
+            "did:key:alice".into(),
+            [0u8; 32],
+        )
         .await
         .unwrap();
     for did in &["did:key:dave", "did:key:bob"] {
@@ -128,7 +133,7 @@ async fn cac009_tier2_global_block_multiple_contexts() {
             "cac009-g1".into(),
             make_params(),
             "did:key:alice".into(),
-            None,
+            [0u8; 32],
         )
         .await
         .unwrap();
@@ -137,7 +142,7 @@ async fn cac009_tier2_global_block_multiple_contexts() {
             "cac009-g2".into(),
             make_params(),
             "did:key:alice".into(),
-            None,
+            [0u8; 32],
         )
         .await
         .unwrap();
@@ -526,7 +531,7 @@ async fn cac010_threshold_revoke_read_access() {
         signers: vec![creator.clone()],
     };
     let _handle = manager
-        .create_context("cac010-thresh".into(), params, creator.clone(), None)
+        .create_context("cac010-thresh".into(), params, creator.clone(), [0u8; 32])
         .await
         .unwrap();
     {
@@ -796,7 +801,7 @@ async fn test_recovery_advance_epoch_calls_crypto_provider() {
             "recovery-epoch-1".into(),
             ContextParams::default(),
             "did:key:creator".into(),
-            None,
+            [0u8; 32],
         )
         .await
         .unwrap();
@@ -852,7 +857,7 @@ async fn test_recovery_advance_epoch_rollback_on_crypto_failure() {
             "recovery-fail-1".into(),
             ContextParams::default(),
             "did:key:creator".into(),
-            None,
+            [0u8; 32],
         )
         .await
         .unwrap();
@@ -894,7 +899,7 @@ async fn test_recovery_advance_epoch_rejects_inactive_context() {
             "recovery-inactive-1".into(),
             ContextParams::default(),
             "did:key:creator".into(),
-            None,
+            [0u8; 32],
         )
         .await
         .unwrap();

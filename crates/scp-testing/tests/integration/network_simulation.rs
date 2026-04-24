@@ -1133,7 +1133,7 @@ async fn application_layer_demo() {
     println!();
 
     let handle = manager
-        .create_context(ctx_id.to_owned(), params, alice.clone(), None)
+        .create_context(ctx_id.to_owned(), params, alice.clone(), [0u8; 32])
         .await
         .unwrap();
     let state = handle.state().await;
@@ -1155,7 +1155,7 @@ async fn application_layer_demo() {
         mls_key_package_bytes: None,
     };
     manager
-        .join_context(&handle, bob_kp, None, None)
+        .join_context(&handle, bob_kp, None, [0u8; 32])
         .await
         .unwrap();
     println!("  Bob joined context");
@@ -1165,7 +1165,7 @@ async fn application_layer_demo() {
         mls_key_package_bytes: None,
     };
     manager
-        .join_context(&handle, charlie_kp, None, None)
+        .join_context(&handle, charlie_kp, None, [0u8; 32])
         .await
         .unwrap();
     println!("  Charlie joined context");

@@ -15,7 +15,10 @@ async fn member_list_queries() {
     // Add members.
     for name in &["alice", "bob", "charlie"] {
         let kp = KeyPackage::mock(format!("did:key:{name}").into());
-        manager.join_context(&handle, kp, None, None).await.unwrap();
+        manager
+            .join_context(&handle, kp, None, [0u8; 32])
+            .await
+            .unwrap();
     }
 
     assert_eq!(manager.member_count("test-ctx").await, Some(4));
@@ -47,7 +50,10 @@ async fn member_role_assignment() {
 
     // Add a member.
     let kp = KeyPackage::mock("did:key:alice".into());
-    manager.join_context(&handle, kp, None, None).await.unwrap();
+    manager
+        .join_context(&handle, kp, None, [0u8; 32])
+        .await
+        .unwrap();
 
     let role = manager.member_role("test-ctx", "did:key:alice").await;
     assert!(role.is_some());
@@ -414,7 +420,7 @@ async fn get_broadcast_key_for_local_author_returns_key_and_epoch() {
     };
 
     let _handle = manager
-        .create_context("bc-key-test".into(), params, creator_did.clone(), None)
+        .create_context("bc-key-test".into(), params, creator_did.clone(), [0u8; 32])
         .await
         .unwrap();
 
@@ -448,7 +454,12 @@ async fn get_broadcast_key_for_local_author_rejects_non_local_did() {
     };
 
     let _handle = manager
-        .create_context("bc-key-test-2".into(), params, creator_did.clone(), None)
+        .create_context(
+            "bc-key-test-2".into(),
+            params,
+            creator_did.clone(),
+            [0u8; 32],
+        )
         .await
         .unwrap();
 
@@ -502,7 +513,12 @@ async fn get_broadcast_key_for_local_author_rejects_encrypted_context() {
     let params = ContextParams::default();
 
     let _handle = manager
-        .create_context("encrypted-ctx".into(), params, creator_did.clone(), None)
+        .create_context(
+            "encrypted-ctx".into(),
+            params,
+            creator_did.clone(),
+            [0u8; 32],
+        )
         .await
         .unwrap();
 

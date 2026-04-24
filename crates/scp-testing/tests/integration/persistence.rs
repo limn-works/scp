@@ -1188,7 +1188,12 @@ async fn context_manager_broadcast_restore_roundtrip() {
     manager.register_local_did(creator_did.clone()).await;
 
     let _handle = manager
-        .create_context(ctx_id.into(), params.clone(), creator_did.clone(), None)
+        .create_context(
+            ctx_id.into(),
+            params.clone(),
+            creator_did.clone(),
+            [0u8; 32],
+        )
         .await
         .unwrap();
 

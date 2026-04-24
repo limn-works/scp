@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Create the context — returns a handle for all subsequent operations.
     let handle = manager
-        .create_context("demo-context".to_owned(), params, alice.clone(), None)
+        .create_context("demo-context".to_owned(), params, alice.clone(), [0u8; 32])
         .await?;
 
     println!();

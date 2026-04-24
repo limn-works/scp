@@ -211,8 +211,9 @@ mod tests {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             generation: 0,
-            local_pseudonym: None,
-            pseudonym_registry: std::collections::HashMap::new(),
+            // Persistence unit test fixture — broadcast is the zero-argument
+            // variant. Tests that need encrypted routing build their own.
+            routing: crate::context::manager::ContextRouting::Broadcast,
         }
     }
 

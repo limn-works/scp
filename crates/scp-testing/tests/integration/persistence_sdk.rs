@@ -201,7 +201,12 @@ async fn context_create_persists_membership_to_sqlite() {
 
     manager.register_local_did(alice.clone()).await;
     let handle = manager
-        .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
+        .create_context(
+            ctx_id.to_owned(),
+            encrypted_params(),
+            alice.clone(),
+            [0u8; 32],
+        )
         .await
         .expect("context_create must succeed with sqlite-backed persistence");
     assert_eq!(handle.state().await, ContextState::Active);
@@ -284,7 +289,12 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
 
         manager.register_local_did(alice.clone()).await;
         let _handle = manager
-            .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
+            .create_context(
+                ctx_id.to_owned(),
+                encrypted_params(),
+                alice.clone(),
+                [0u8; 32],
+            )
             .await
             .expect("context_create must succeed");
 

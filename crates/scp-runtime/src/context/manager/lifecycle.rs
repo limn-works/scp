@@ -5,8 +5,8 @@ use std::collections::VecDeque;
 use super::{
     AccessControlState, Arc, BroadcastAdmission, BroadcastContext, Capability, CapabilityCeiling,
     CommitOperation, ContextCreationError, ContextError, ContextEvent, ContextHandle,
-    ContextManager, ContextMode, ContextParams, ContextRoleState, ContextSnapshot, ContextState,
-    DID, DeadlockDetectionState, EpochCoordinator, EpochState, GovernanceModel,
+    ContextManager, ContextMode, ContextParams, ContextRoleState, ContextRouting, ContextSnapshot,
+    ContextState, DID, DeadlockDetectionState, EpochCoordinator, EpochState, GovernanceModel,
     GovernanceModelConfig, GovernanceState, GovernanceTimeoutTask, HashMap, HashSet, KeyPackage,
     MemberBudgetTracker, MembershipState, PerContextState, ReceiveBuffer, TemplateId, TtlState,
     TtlTimer, build_governance_engine, builder_create_context, context_id_to_bytes,
@@ -14,6 +14,27 @@ use super::{
     require_active, restore_governance_engine_from_snapshot, restore_grace_store_from_snapshot,
     roles, validate_governance_consistency, validate_governance_model,
 };
+
+/// Builds a [`ContextRouting`] variant from the context mode and caller-
+/// supplied pseudonym. Broadcast contexts ignore the pseudonym; encrypted
+/// contexts embed it verbatim.
+///
+/// Per spec §9.10.4 the pseudonym is pre-derived at the FFI boundary via
+/// `KeyCustody::derive_pseudonym` — threading a real `[u8; 32]` (not an
+/// `Option`) through the runtime constructor makes it impossible to forget
+/// to derive it and silently fall back to the shared routing ID.
+pub(super) fn build_routing_for_mode(
+    mode: ContextMode,
+    local_pseudonym: [u8; 32],
+) -> ContextRouting {
+    match mode {
+        ContextMode::Broadcast => ContextRouting::Broadcast,
+        ContextMode::Encrypted => ContextRouting::Encrypted {
+            local_pseudonym,
+            pseudonym_registry: HashMap::new(),
+        },
+    }
+}
 
 /// Builds an [`IdentityDepthAssessment`] for a member in a context.
 ///
@@ -588,13 +609,9 @@ impl ContextManager {
             // are needed. Deferred to the Welcome delivery plan (#1311)
             // which adds cross-process event log synchronization.
             merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
-            // §9.10.4: restore pseudonym routing state from snapshot.
-            local_pseudonym: ctx_snapshot.local_pseudonym,
-            pseudonym_registry: ctx_snapshot
-                .pseudonym_registry
-                .into_iter()
-                .map(|(did_str, p)| (DID(did_str), p))
-                .collect(),
+            // §9.10.4: restore per-context routing strategy verbatim. The
+            // variant is fixed at creation and never changes across restart.
+            routing: ctx_snapshot.routing,
         };
 
         // Atomic check-and-insert — eliminates TOCTOU race between
@@ -985,6 +1002,7 @@ impl ContextManager {
     pub async fn import_context(
         &self,
         export: crate::context::export_import::ContextExport,
+        local_pseudonym: [u8; 32],
     ) -> Result<ContextHandle, ContextError> {
         // 1. Validate export.
         crate::context::export_import::validate_export_for_import(&export)?;
@@ -1312,10 +1330,11 @@ impl ContextManager {
             // Fresh Merkle tree for imported contexts. Proofs cover
             // post-import events only (same rationale as restore_context).
             merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
-            // §9.10.4: pseudonym state is local-instance — wiped on import.
-            // The importing member must re-derive and re-announce.
-            local_pseudonym: None,
-            pseudonym_registry: HashMap::new(),
+            // §9.10.4: the importer derives their OWN pseudonym — the
+            // exporter's is local-instance state and has no meaning here.
+            // The pseudonym registry starts empty; the importer re-announces
+            // and learns peers' pseudonyms via incoming announcements.
+            routing: build_routing_for_mode(export.snapshot.context_params.mode, local_pseudonym),
         };
 
         // 7. Register the context.
@@ -1405,7 +1424,7 @@ impl ContextManager {
         context_id: String,
         params: ContextParams,
         creator_did: DID,
-        local_pseudonym: Option<[u8; 32]>,
+        local_pseudonym: [u8; 32],
     ) -> Result<ContextHandle, ContextCreationError> {
         // Defense-in-depth: verify creator's SDK version satisfies min_protocol_version.
         params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
@@ -1515,10 +1534,10 @@ impl ContextManager {
             checkpoint_last_time_secs: self.clock.now_secs(),
             checkpoints: Vec::new(),
             merkle_tree: scp_event_log::EventLog::new(context_id.clone()),
-            // §9.10.4: pseudonym routing. Only meaningful for encrypted
-            // contexts; broadcast contexts ignore this field.
-            local_pseudonym,
-            pseudonym_registry: HashMap::new(),
+            // §9.10.4 / §5.14: build routing from context mode. Encrypted
+            // contexts use per-member pseudonyms; broadcast contexts use
+            // `SHA-256(context_id)` and carry no pseudonym state.
+            routing: build_routing_for_mode(params.mode, local_pseudonym),
         };
 
         // Atomic check-and-insert — eliminates TOCTOU race between
@@ -1616,6 +1635,7 @@ impl ContextManager {
         params: ContextParams,
         creator_did: DID,
         governance_config: GovernanceModelConfig,
+        local_pseudonym: [u8; 32],
     ) -> Result<ContextHandle, ContextCreationError> {
         // Defense-in-depth: verify that the creator's SDK version satisfies the
         // min_protocol_version it is setting (same check as create_context).
@@ -1695,6 +1715,7 @@ impl ContextManager {
             role_state,
             broadcast_context,
             governance_config,
+            local_pseudonym,
         )?;
 
         // Atomic check-and-insert — eliminates TOCTOU race between
@@ -1727,6 +1748,7 @@ impl ContextManager {
         role_state: ContextRoleState,
         broadcast_context: Option<BroadcastContext>,
         governance_config: GovernanceModelConfig,
+        local_pseudonym: [u8; 32],
     ) -> Result<PerContextState, ContextCreationError> {
         // Extract threshold signers and value from GovernanceModelConfig before
         // it is consumed by build_governance_engine (ADR-031).
@@ -1850,11 +1872,9 @@ impl ContextManager {
             checkpoint_last_time_secs: self.clock.now_secs(),
             checkpoints: Vec::new(),
             merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
-            // §9.10.4: pseudonym routing — governance-path creation does not
-            // yet support pseudonym injection. The FFI bridge can set this
-            // later via the standard create_context path.
-            local_pseudonym: None,
-            pseudonym_registry: HashMap::new(),
+            // §9.10.4 / §5.14: governance-path creation threads the real
+            // caller-derived pseudonym through. Broadcast mode ignores it.
+            routing: build_routing_for_mode(params.mode, local_pseudonym),
         })
     }
 
@@ -1878,7 +1898,7 @@ impl ContextManager {
         handle: &ContextHandle,
         key_package: KeyPackage,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
-        local_pseudonym: Option<[u8; 32]>,
+        local_pseudonym: [u8; 32],
     ) -> Result<(), ContextError> {
         let context_id = handle.context_id().to_owned();
         let context_id_bytes = context_id_to_bytes(&context_id);
@@ -2101,15 +2121,21 @@ impl ContextManager {
             return Err(e);
         }
 
-        // Phase 4.5: Store local pseudonym after membership mutation succeeds.
-        // The pseudonym was pre-derived by the FFI bridge; storing it here
-        // makes it available for subsequent send_message fan-out (§9.10.4).
-        if let Some(pseudonym) = local_pseudonym
-            && let Ok(ctx_arc) = self.get_context_arc(&context_id)
-        {
+        // Phase 4.5: Store the joiner's local pseudonym after membership
+        // mutation succeeds. The pseudonym was pre-derived by the FFI bridge;
+        // storing it here makes it available for subsequent send_message
+        // fan-out (§9.10.4). Broadcast contexts do not use pseudonyms, so
+        // this is a no-op when routing is `Broadcast`.
+        if let Ok(ctx_arc) = self.get_context_arc(&context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
-            ctx.local_pseudonym = Some(pseudonym);
+            if let ContextRouting::Encrypted {
+                local_pseudonym: stored,
+                ..
+            } = &mut ctx.routing
+            {
+                *stored = local_pseudonym;
+            }
         }
 
         // Phase 5: Capture the escrow hold after all mutations succeeded.
@@ -2170,12 +2196,17 @@ impl ContextManager {
         signing_key: &ed25519_dalek::SigningKey,
     ) {
         let context_id = handle.context_id().to_owned();
-        let pseudonym = {
+        let pseudonym: Option<[u8; 32]> = {
             let Ok(ctx_arc) = self.get_context_arc(&context_id) else {
                 return;
             };
             let guard = ctx_arc.lock().await;
-            guard.local_pseudonym
+            match &guard.routing {
+                ContextRouting::Encrypted {
+                    local_pseudonym, ..
+                } => Some(*local_pseudonym),
+                ContextRouting::Broadcast => None,
+            }
         };
         let Some(pseudonym) = pseudonym else {
             return;
@@ -2462,8 +2493,14 @@ impl ContextManager {
                 .access_key_store
                 .remove(&context_id, member_did.as_ref());
 
-            // §9.10.4: remove the departing member's pseudonym routing ID.
-            ctx.pseudonym_registry.remove(member_did);
+            // §9.10.4: remove the departing member's pseudonym routing ID
+            // from the registry. No-op on broadcast contexts.
+            if let ContextRouting::Encrypted {
+                pseudonym_registry, ..
+            } = &mut ctx.routing
+            {
+                pseudonym_registry.remove(member_did);
+            }
 
             // Emit MemberLeft event to receive buffer.
             let left_event = ContextEvent::MemberLeft {

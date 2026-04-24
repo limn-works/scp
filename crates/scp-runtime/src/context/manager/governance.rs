@@ -2939,8 +2939,14 @@ impl ContextManager {
             ctx.access.access_key_store.remove(context_id, did.as_ref());
 
             // §9.10.4: remove the member's pseudonym routing ID so future
-            // fan-outs do not send messages to a stale routing ID.
-            ctx.pseudonym_registry.remove(did);
+            // fan-outs do not send messages to a stale routing ID. No-op on
+            // broadcast contexts.
+            if let super::ContextRouting::Encrypted {
+                pseudonym_registry, ..
+            } = &mut ctx.routing
+            {
+                pseudonym_registry.remove(did);
+            }
 
             let left_event = ContextEvent::MemberLeft {
                 member_did: did.clone(),
@@ -5043,7 +5049,7 @@ impl ContextManager {
                 destination_context_id.clone(),
                 dest_params,
                 creator_did,
-                None,
+                [0u8; 32],
             )
             .await
         {

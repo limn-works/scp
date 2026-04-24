@@ -1720,32 +1720,32 @@ impl crate::scp::PyScp {
 
         // Delegate context creation to the shared ContextManager for lifecycle tracking.
         // §9.10.4: Derive pseudonym BEFORE context creation so it can be passed
-        // to the ContextManager for per-member routing. The pseudonym derivation
-        // is also reused for the known-contexts registry below.
-        let local_pseudonym: Option<[u8; 32]> =
-            crate::runtime::with_identity(bi, identity_did, |entry| {
-                let rt = crate::runtime().map_err(|e| {
-                    crate::error::ScpPyError::identity(format!("runtime not available: {e}"))
-                })?;
-                let pseudonym = rt.block_on(async {
-                    entry
-                        .custody
-                        .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
-                        .await
-                });
-                let pk = pseudonym
-                    .map_err(|e| {
-                        crate::error::ScpPyError::identity(format!(
-                            "pseudonym derivation failed: {e}"
-                        ))
-                    })?
-                    .public_key;
-                let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
-                    crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
-                })?;
-                Ok(bytes)
-            })
-            .ok();
+        // to the ContextManager for per-member routing. Custody / derivation
+        // failure is a hard error for encrypted contexts — we do NOT silently
+        // fall back to a zero pseudonym or the shared routing ID. Broadcast
+        // contexts don't use per-member pseudonyms (spec §5.14) but we still
+        // derive one here; the runtime ignores it for that mode.
+        let local_pseudonym: [u8; 32] = crate::runtime::with_identity(bi, identity_did, |entry| {
+            let rt = crate::runtime().map_err(|e| {
+                crate::error::ScpPyError::identity(format!("runtime not available: {e}"))
+            })?;
+            let pseudonym = rt.block_on(async {
+                entry
+                    .custody
+                    .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
+                    .await
+            });
+            let pk = pseudonym
+                .map_err(|e| {
+                    crate::error::ScpPyError::identity(format!("pseudonym derivation failed: {e}"))
+                })?
+                .public_key;
+            let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
+                crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
+            })?;
+            Ok(bytes)
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("pseudonym derivation failed: {e}")))?;
 
         // Build scp-core ContextParams from the parsed PyContextParams.
         {
@@ -1776,8 +1776,10 @@ impl crate::scp::PyScp {
         // §9.10.4: Send pseudonym announcement to inform other members of the
         // creator's per-context routing ID. For freshly created single-member
         // contexts this is a no-op (no recipients), but on restored/imported
-        // contexts with existing members the announcement is needed.
-        if local_pseudonym.is_some()
+        // contexts with existing members the announcement is needed. Skipped
+        // for broadcast contexts — spec §5.14 uses a shared routing ID and
+        // no per-member pseudonyms.
+        if handle.params.mode != "broadcast"
             && let Ok(sk) = resolve_signing_key(bi, identity_did)
         {
             let rt = crate::runtime()?;
@@ -1798,19 +1800,15 @@ impl crate::scp::PyScp {
         }
 
         // Register in the known-contexts registry for discovery via
-        // py_mcp_load_contexts. Reuse the pre-derived pseudonym routing ID
-        // (§9.10.4, SCP-214 criterion 4). Falls back to context_routing_id
-        // for encrypted contexts or broadcast_routing_id for broadcast contexts.
-        // Bug fix (#1534): broadcast contexts use broadcast_routing_id (plain
-        // SHA-256) matching the send path, not context_routing_id (domain-separated).
+        // py_mcp_load_contexts. Encrypted contexts use the member's pseudonym
+        // routing ID (§9.10.4); broadcast contexts use SHA-256(context_id) per
+        // spec §5.14 (matching the send path, #1534).
         {
-            let routing_id = local_pseudonym.unwrap_or_else(|| {
-                if handle.params.mode == "broadcast" {
-                    scp_core::context::broadcast_routing_id(&context_id)
-                } else {
-                    scp_core::context::context_routing_id(&context_id)
-                }
-            });
+            let routing_id = if handle.params.mode == "broadcast" {
+                scp_core::context::broadcast_routing_id(&context_id)
+            } else {
+                local_pseudonym
+            };
 
             // Get the relay URL from transport status if a relay is connected.
             let relay_url = match self.transport_status() {
@@ -1920,8 +1918,9 @@ impl crate::scp::PyScp {
             };
 
             // §9.10.4: Derive pseudonym for the joining member so it can be
-            // stored in PerContextState and announced to other members.
-            let local_pseudonym: Option<[u8; 32]> =
+            // stored in PerContextState and announced to other members. Hard
+            // error on custody/derivation failure — no silent fallback.
+            let local_pseudonym: [u8; 32] =
                 crate::runtime::with_identity(bi, identity_did, |entry| {
                     let rt = crate::runtime().map_err(|e| {
                         crate::error::ScpPyError::identity(format!("runtime init failed: {e}"))
@@ -1944,7 +1943,9 @@ impl crate::scp::PyScp {
                     })?;
                     Ok(bytes)
                 })
-                .ok();
+                .map_err(|e| {
+                    PyRuntimeError::new_err(format!("pseudonym derivation failed: {e}"))
+                })?;
 
             // Look up the ContextHandle from a completed create_context call.
             // The ContextManager stores PerContextState keyed by context_id.
@@ -1974,7 +1975,8 @@ impl crate::scp::PyScp {
             })?;
 
             // §9.10.4: Send pseudonym announcement to inform existing members.
-            if local_pseudonym.is_some()
+            // Broadcast contexts have no per-member pseudonyms; skip.
+            if handle.params.mode != "broadcast"
                 && let Ok(sk) = resolve_signing_key(bi, identity_did)
             {
                 let sender_did = scp_identity::DID(member_did.clone());
@@ -2434,7 +2436,7 @@ impl crate::scp::PyScp {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mgr = mgr.clone();
 
-        rt.block_on(mgr.import_context(export))
+        rt.block_on(mgr.import_context(export, [0u8; 32]))
             .map_err(|e| PyRuntimeError::new_err(format!("context import failed: {e}")))?;
 
         Ok(context_id)
@@ -4917,7 +4919,7 @@ mod tests {
             ctx_id.clone(),
             params,
             scp_identity::DID(creator.to_owned()),
-            None,
+            [0u8; 32],
         ))
         .unwrap();
         let new_did = "did:key:z6MkNewMember1";
@@ -4978,7 +4980,7 @@ mod tests {
             ctx_id.clone(),
             params,
             scp_identity::DID(creator.to_owned()),
-            None,
+            [0u8; 32],
         ))
         .unwrap();
         let new_did = "did:key:z6MkAdded1";
@@ -5032,7 +5034,7 @@ mod tests {
             ctx_id.clone(),
             params,
             scp_identity::DID(creator.to_owned()),
-            None,
+            [0u8; 32],
         ))
         .unwrap();
         let add = approved_proposal(

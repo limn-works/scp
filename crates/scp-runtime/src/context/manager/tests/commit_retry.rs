@@ -114,7 +114,7 @@ async fn setup_retry_manager() -> (
 
     let admin_did: DID = "did:key:admin".into();
     let _handle = manager
-        .create_context("retry-ctx".into(), params, admin_did.clone(), None)
+        .create_context("retry-ctx".into(), params, admin_did.clone(), [0u8; 32])
         .await
         .unwrap();
 
@@ -396,8 +396,7 @@ fn test_pending_commits_persist_across_snapshot_roundtrip() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
-        local_pseudonym: None,
-        pseudonym_registry: std::collections::HashMap::new(),
+        routing: crate::context::manager::ContextRouting::Broadcast,
     };
 
     // Round-trip via JSON to ensure serde derive works for both new types.

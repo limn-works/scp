@@ -810,19 +810,17 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub checkpoint_last_time_secs: u64,
     /// Monotonic generation counter for confused-deputy detection (Phase B).
-    /// Assigned on insertion into the contexts map. Legacy snapshots
-    /// deserialize as `0` via `#[serde(default)]`.
-    #[serde(default)]
+    /// Assigned on insertion into the contexts map.
     pub generation: u64,
-    /// This member's pseudonym-derived routing ID for this context (§9.10.4).
-    /// Pre-derived by the FFI bridge. `None` for legacy snapshots and
-    /// broadcast contexts.
-    #[serde(default)]
-    pub local_pseudonym: Option<[u8; 32]>,
-    /// Known members' pseudonym routing IDs (§9.10.4), learned via
-    /// `PseudonymAnnouncement` MLS messages. Keyed by member DID string.
-    #[serde(default)]
-    pub pseudonym_registry: HashMap<String, [u8; 32]>,
+    /// Per-context routing strategy (§9.10.4, §5.14).
+    ///
+    /// [`ContextRouting::Encrypted`] carries the member's pre-derived
+    /// pseudonym and a registry of peer pseudonyms. [`ContextRouting::Broadcast`]
+    /// uses the shared `SHA-256(context_id)` routing ID and carries no
+    /// pseudonym state. Constructors build the correct variant from
+    /// [`ContextMode`] at creation / join / restore time — there is no
+    /// default and no `None`.
+    pub routing: ContextRouting,
 }
 
 /// Serializable snapshot of [`SenderVelocityTracker`](scp_protocol::economy::antispam::SenderVelocityTracker)
@@ -1175,12 +1173,15 @@ pub enum ContextRouting {
     /// FFI boundary. Other members' pseudonyms are learned via
     /// [`PseudonymAnnouncement`] MLS application messages and keyed by DID
     /// so `send_message` can fan out to each member's pseudonym.
+    ///
+    /// `DID` is `#[serde(transparent)]` over `String`, so the serialized wire
+    /// format for `pseudonym_registry` is a plain string-keyed map.
     Encrypted {
         /// This member's pseudonym-derived routing ID.
         #[serde(with = "serde_bytes")]
         local_pseudonym: [u8; 32],
-        /// Known members' pseudonym routing IDs, keyed by DID string.
-        pseudonym_registry: HashMap<String, [u8; 32]>,
+        /// Known members' pseudonym routing IDs, keyed by DID.
+        pseudonym_registry: HashMap<DID, [u8; 32]>,
     },
     /// Broadcast context. Uses `SHA-256(context_id)` as the shared routing ID
     /// per spec §5.14; no pseudonym state is retained.
@@ -1217,15 +1218,13 @@ pub(super) struct PerContextState {
     access: AccessControlState,
     /// TTL timer and extension state (SCP-021).
     ttl: TtlState,
-    /// This member's pseudonym-derived routing ID for this context (§9.10.4).
-    /// Pre-derived by the FFI bridge via `KeyCustody::derive_pseudonym` and
-    /// passed into `create_context` / `join_context`. `None` if the bridge
-    /// did not supply a pseudonym (legacy callers, broadcast contexts).
-    local_pseudonym: Option<[u8; 32]>,
-    /// Known members' pseudonym routing IDs, learned via
-    /// [`PseudonymAnnouncement`] MLS application messages. Keyed by member
-    /// DID so `send_message` can fan-out to each member's pseudonym.
-    pseudonym_registry: HashMap<DID, [u8; 32]>,
+    /// Per-context routing strategy (§9.10.4, §5.14).
+    ///
+    /// Encrypted contexts carry the member's pre-derived pseudonym routing
+    /// ID and a registry of peer pseudonyms keyed by DID. Broadcast contexts
+    /// use a shared routing ID and carry no pseudonym state. The variant
+    /// is fixed at creation/join/restore time based on [`ContextMode`].
+    routing: ContextRouting,
     /// Per-sender sequence tracker for anti-replay protection (§9.8.2).
     /// Validates that per-sender sequence numbers and timestamps are
     /// monotonically increasing within this context.
@@ -2002,7 +2001,7 @@ pub enum ContextManagerBuildError {
 ///
 /// ```ignore
 /// let manager = ContextManager::new(crypto, transport, event_log, key_resolver);
-/// let handle = manager.create_context("ctx-1".into(), params, "did:key:creator".into(), None).await?;
+/// let handle = manager.create_context("ctx-1".into(), params, "did:key:creator".into(), [0u8; 32]).await?;
 /// assert_eq!(handle.state().await, ContextState::Active);
 /// ```
 pub struct ContextManager {
@@ -2503,8 +2502,12 @@ impl ContextManager {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             generation: 0,
-            local_pseudonym: None,
-            pseudonym_registry: std::collections::HashMap::new(),
+            // §9.10.4: the `ContextSnapshot::default()` fixture is used only by
+            // tests that exercise broadcast-only or pseudonym-agnostic paths.
+            // Broadcast is the correct default because it carries no pseudonym
+            // state and is therefore the only zero-argument variant that is
+            // never wrong-shaped for the code path under test.
+            routing: ContextRouting::Broadcast,
         }
     }
 
@@ -2907,12 +2910,9 @@ impl ContextManager {
             checkpoint_events_since: ctx.checkpoint_events_since,
             checkpoint_last_time_secs: ctx.checkpoint_last_time_secs,
             generation: ctx.generation,
-            local_pseudonym: ctx.local_pseudonym,
-            pseudonym_registry: ctx
-                .pseudonym_registry
-                .iter()
-                .map(|(did, p)| (did.to_string(), *p))
-                .collect(),
+            // §9.10.4: the routing variant is fixed at context creation —
+            // snapshotting is a pure clone.
+            routing: ctx.routing.clone(),
         }
     }
 

@@ -255,7 +255,7 @@ async fn ac1_create_single_admin_context() {
         ..ContextParams::default()
     };
     let handle = manager
-        .create_context("ctx-single-admin".into(), params, alice(), None)
+        .create_context("ctx-single-admin".into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
     assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
@@ -273,7 +273,7 @@ async fn ac1_create_threshold_context() {
         ..ContextParams::default()
     };
     let handle = manager
-        .create_context("ctx-threshold".into(), params, alice(), None)
+        .create_context("ctx-threshold".into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
     assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
@@ -290,7 +290,7 @@ async fn ac1_create_majority_context() {
         ..ContextParams::default()
     };
     let handle = manager
-        .create_context("ctx-majority".into(), params, alice(), None)
+        .create_context("ctx-majority".into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
     assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
@@ -307,7 +307,7 @@ async fn ac1_create_unanimity_context() {
         ..ContextParams::default()
     };
     let handle = manager
-        .create_context("ctx-unanimity".into(), params, alice(), None)
+        .create_context("ctx-unanimity".into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
     assert_eq!(handle.try_read_state().unwrap(), ContextState::Active);
@@ -327,7 +327,7 @@ async fn ac2_single_admin_auto_approve_and_execute() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -374,7 +374,7 @@ async fn ac2_single_admin_checked_returns_execution_result() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -417,7 +417,7 @@ async fn ac3_threshold_propose_approve_execute() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -481,7 +481,7 @@ async fn ac4_majority_propose_approve_execute() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -530,7 +530,7 @@ async fn ac5_unanimity_all_approve_execute() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -579,7 +579,7 @@ async fn ac6_rejected_proposal_not_executed_unanimity() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -635,7 +635,7 @@ async fn ac6_rejected_threshold_proposal() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -820,7 +820,7 @@ async fn ac8_vote_withdrawn_event_via_manager() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -861,7 +861,7 @@ async fn ac9_non_admin_cannot_propose_in_single_admin() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -896,7 +896,7 @@ async fn ac9_checked_propose_requires_capability() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -932,7 +932,7 @@ async fn ac10_remove_member_action() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -978,7 +978,7 @@ async fn ac10_change_role_action() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -1008,7 +1008,7 @@ async fn ac10_close_context_action() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -1040,7 +1040,7 @@ async fn ac10_add_signer_action() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -1103,7 +1103,7 @@ async fn ac10_extend_ttl_action() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -1133,7 +1133,7 @@ async fn ac10_revoke_write_access_action() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -1178,7 +1178,7 @@ async fn ac10_restore_write_access_action() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -1244,7 +1244,7 @@ async fn ac11_extend_ttl_requires_unanimity_in_threshold() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -1308,7 +1308,7 @@ async fn ac12_promote_context_requires_unanimity_in_majority() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -1810,7 +1810,7 @@ async fn list_proposals_returns_all_proposals() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -1866,7 +1866,7 @@ async fn full_threshold_lifecycle_add_signer_then_change_role() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -2077,7 +2077,7 @@ async fn multi_party_threshold_propose_approve_verify() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params, alice(), None)
+        .create_context(ctx_id.into(), params, alice(), [0u8; 32])
         .await
         .unwrap();
 

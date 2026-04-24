@@ -795,7 +795,7 @@ async fn tier3_governance_revoke_write_access_broadcast() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params.clone(), alice(), None)
+        .create_context(ctx_id.into(), params.clone(), alice(), [0u8; 32])
         .await
         .unwrap();
 
@@ -1503,7 +1503,7 @@ async fn governance_tier_stacking_via_context_manager() {
         ..ContextParams::default()
     };
     let _handle = manager
-        .create_context(ctx_id.into(), params.clone(), alice(), None)
+        .create_context(ctx_id.into(), params.clone(), alice(), [0u8; 32])
         .await
         .unwrap();
 

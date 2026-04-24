@@ -129,7 +129,7 @@ fn create_test_context(bi: &PyBridgeInstance, creator_did: &str) -> String {
 
     rt.block_on(async move {
         let params = scp_core::context::ContextParams::default();
-        mgr.create_context(ctx_id.clone(), params, creator.clone(), None)
+        mgr.create_context(ctx_id.clone(), params, creator.clone(), [0u8; 32])
             .await
             .unwrap();
         mgr.register_local_did(creator).await;
