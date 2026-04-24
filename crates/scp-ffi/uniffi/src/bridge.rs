@@ -10775,9 +10775,13 @@ impl Scp {
                                 break;
                             }
                         }
-                        if !manager_events.is_empty() {
-                            return Ok(manager_events);
-                        }
+                        // Once the outer `!entries.is_empty()` guard passes we
+                        // return the (possibly filtered-empty) manager result
+                        // instead of falling through to the UCAN-state event
+                        // log. Mirrors PyO3's `query_manager_entries` which
+                        // unconditionally returns `Ok(Some(py_events))` once
+                        // entries is non-empty, regardless of filter outcome.
+                        return Ok(manager_events);
                     }
                 }
 
