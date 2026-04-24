@@ -115,6 +115,10 @@ const PARITY_OPERATIONS: &[(&str, &str, bool)] = &[
     ("outlets", "outlet_register", true),
     ("outlets", "outlet_invoke", true),
     ("outlets", "outlet_verify", true),
+    ("outlets", "outlet_update", true),
+    ("outlets", "outlet_deregister", true),
+    ("outlets", "outlet_list", true),
+    ("outlets", "outlet_get", true),
     ("outlets", "outlet_invoke_cross_context", false),
     ("outlets", "outlet_session_open", false),
     ("outlets", "outlet_session_invoke", false),
@@ -1032,6 +1036,13 @@ fn discovery_and_provenance_coverage() {
 // Any decrease requires human approval
 // =========================================================================
 
+// Ratchet raised from 97 -> 101 by SCP-OUT-005 (outlet FFI expansion):
+// four new operations added to the outlet surface — `outlet_update`,
+// `outlet_deregister`, `outlet_list`, `outlet_get` — are exported from
+// every bridge (PyO3, UniFFI, NAPI, WASM) and are required on every bridge
+// per the PRD's AC4/AC7/AC11/AC15.
+//
+// Prior ratchet note retained for provenance:
 // Ratchet lowered from 98 -> 97 by the spec §19.7 anti-spam wiring plan:
 // the non-spec EIP-1559-style relay base-price adjustment operation
 // (`economy_adjust_relay_price` / `py_economy_adjust_relay_price` /
@@ -1044,7 +1055,7 @@ fn discovery_and_provenance_coverage() {
 // paths, so no new parity operation was added in its place. This is a
 // legitimate removal; the ratchet is reset to the new floor. See commit
 // 2291102.
-const MIN_PARITY_OPERATIONS: usize = 97;
+const MIN_PARITY_OPERATIONS: usize = 101;
 
 /// Named set of operations that must have `wasm_required=true`.
 /// This is a named set, not a count — swapping one operation for another is
@@ -1075,10 +1086,14 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "context_drain_events",
     // Governance
     "governance_execute",
-    // Outlets (core only — sessions and cross-context are optional)
+    // Outlets (core — sessions/cross-context remain optional per ADR-034)
     "outlet_register",
     "outlet_invoke",
     "outlet_verify",
+    "outlet_update",
+    "outlet_deregister",
+    "outlet_list",
+    "outlet_get",
     // UCAN
     "ucan_validate",
     "ucan_mint",

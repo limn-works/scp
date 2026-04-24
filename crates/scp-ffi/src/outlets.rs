@@ -130,6 +130,131 @@ impl PyOutletVerificationResult {
 }
 
 // ---------------------------------------------------------------------------
+// PyOutletCost
+// ---------------------------------------------------------------------------
+
+/// Per-invocation cost metadata for a tool (spec §5.4.1, §19.3).
+///
+/// Mirrors [`scp_core::context::tools::OutletCost`]. Exposed as a typed Python
+/// class so callers can construct cost metadata without JSON round-trips.
+#[pyclass(name = "OutletCost")]
+#[derive(Debug, Clone)]
+pub struct PyOutletCost {
+    /// Cost per invocation in the smallest currency unit.
+    #[pyo3(get, set)]
+    pub amount: u64,
+    /// ISO 4217 or protocol-defined currency code.
+    #[pyo3(get, set)]
+    pub currency: String,
+    /// DID that receives tool invocation payments. May differ from the
+    /// context payee.
+    #[pyo3(get, set)]
+    pub payee: String,
+    /// Optional pricing formula identifier for dynamic pricing (§19.4).
+    #[pyo3(get, set)]
+    pub cost_formula: Option<String>,
+}
+
+#[pymethods]
+impl PyOutletCost {
+    /// Creates a new `OutletCost`.
+    #[new]
+    #[pyo3(signature = (amount, currency, payee, cost_formula=None))]
+    #[allow(clippy::missing_const_for_fn)] // PyO3 #[new] cannot be const.
+    fn new(amount: u64, currency: String, payee: String, cost_formula: Option<String>) -> Self {
+        Self {
+            amount,
+            currency,
+            payee,
+            cost_formula,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "OutletCost(amount={}, currency={:?}, payee={:?}, cost_formula={:?})",
+            self.amount, self.currency, self.payee, self.cost_formula
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PyOutletSchema
+// ---------------------------------------------------------------------------
+
+/// MCP-compatible JSON Schema for a tool's input and output.
+///
+/// Mirrors [`scp_core::context::tools::OutletSchema`]. Both fields must be
+/// valid JSON Schema objects.
+#[pyclass(name = "OutletSchema")]
+#[derive(Debug)]
+pub struct PyOutletSchema {
+    /// JSON Schema for the tool's input as a Python dict.
+    #[pyo3(get)]
+    pub input_schema: PyObject,
+    /// JSON Schema for the tool's output as a Python dict.
+    #[pyo3(get)]
+    pub output_schema: PyObject,
+}
+
+#[pymethods]
+impl PyOutletSchema {
+    /// Creates a new `OutletSchema` from input and output JSON Schema dicts.
+    #[new]
+    #[allow(clippy::missing_const_for_fn)] // PyO3 #[new] cannot be const.
+    fn new(input_schema: PyObject, output_schema: PyObject) -> Self {
+        Self {
+            input_schema,
+            output_schema,
+        }
+    }
+
+    #[allow(clippy::unused_self)] // PyO3 dunder methods require &self.
+    fn __repr__(&self) -> String {
+        "OutletSchema(input_schema=..., output_schema=...)".to_owned()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PyOutletTestVector
+// ---------------------------------------------------------------------------
+
+/// A known input-output pair for tool verification.
+///
+/// Mirrors [`scp_core::context::tools::OutletTestVector`].
+#[pyclass(name = "OutletTestVector")]
+#[derive(Debug)]
+pub struct PyOutletTestVector {
+    /// The test input to provide to the tool (as a Python value).
+    #[pyo3(get)]
+    pub input: PyObject,
+    /// The expected output from the tool (as a Python value).
+    #[pyo3(get)]
+    pub expected_output: PyObject,
+    /// Human-readable description of what this test vector validates.
+    #[pyo3(get, set)]
+    pub description: String,
+}
+
+#[pymethods]
+impl PyOutletTestVector {
+    /// Creates a new `OutletTestVector`.
+    #[new]
+    #[allow(clippy::missing_const_for_fn)] // PyO3 #[new] cannot be const.
+    fn new(input: PyObject, expected_output: PyObject, description: String) -> Self {
+        Self {
+            input,
+            expected_output,
+            description,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("OutletTestVector(description={:?})", self.description)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
 
@@ -152,7 +277,7 @@ impl PyOutletVerificationResult {
 ///
 /// See ADR-013 §4: `py_outlet_register(handle, registration) -> str`.
 #[pyfunction]
-#[pyo3(name = "outlet_register")]
+#[pyo3(name = "context_outlet_register")]
 pub fn py_outlet_register(context_id: &str, registration: &Bound<'_, PyDict>) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
 
@@ -375,7 +500,7 @@ fn validate_outlet_ucan(
 /// See SCP-212 for the handler registration and dispatch design.
 /// See spec §6.2, §8, §19.5, §19.7, ADR-016, and issue #319.
 #[pyfunction]
-#[pyo3(name = "outlet_invoke")]
+#[pyo3(name = "context_outlet_invoke")]
 #[pyo3(signature = (context_id, outlet_id, input, identity_did, ucan_token, proof_tokens=None, spending_ucan=None))]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 #[allow(clippy::too_many_arguments)] // Bridge mirrors the runtime's economy entry point.
@@ -534,7 +659,7 @@ pub fn py_outlet_invoke(
 ///
 /// See ADR-013 §4: `py_outlet_verify(handle, outlet_id) -> PyOutletVerificationResult`.
 #[pyfunction]
-#[pyo3(name = "outlet_verify")]
+#[pyo3(name = "context_outlet_verify")]
 pub fn py_outlet_verify(context_id: &str, outlet_id: &str) -> PyResult<PyOutletVerificationResult> {
     validate::validate_context_id(context_id)?;
     validate::validate_outlet_id(outlet_id)?;
@@ -768,7 +893,7 @@ fn extract_test_vectors(
 /// Raises `ContextError` if either context is not connected, the tool is
 /// not found, chain depth is exceeded, or the interface is not approved.
 #[pyfunction]
-#[pyo3(name = "outlet_invoke_cross_context")]
+#[pyo3(name = "context_outlet_invoke_cross_context")]
 #[pyo3(signature = (source_context_id, target_context_id, outlet_id, input, invoker_did, ucan_token, chain_depth, proof_tokens=None))]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 #[allow(clippy::too_many_arguments)] // FFI boundary: PyO3 requires explicit params
@@ -924,7 +1049,7 @@ pub fn py_outlet_invoke_cross_context(
 /// Raises `ContextError` if the context is not connected, the tool is
 /// not found, or the per-caller session cap is exceeded.
 #[pyfunction]
-#[pyo3(name = "outlet_session_open", signature = (context_id, outlet_id, source_context_id, ttl_seconds=None))]
+#[pyo3(name = "context_outlet_session_open", signature = (context_id, outlet_id, source_context_id, ttl_seconds=None))]
 pub fn py_outlet_session_open(
     context_id: &str,
     outlet_id: &str,
@@ -1008,7 +1133,7 @@ pub fn py_outlet_session_open(
 /// Raises `ContextError` if the session is not found, has expired, or
 /// the invoker lacks capability.
 #[pyfunction]
-#[pyo3(name = "outlet_session_invoke")]
+#[pyo3(name = "context_outlet_session_invoke")]
 #[pyo3(signature = (context_id, session_id, input, invoker_did, ucan_token, proof_tokens=None))]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 pub fn py_outlet_session_invoke(
@@ -1136,7 +1261,7 @@ pub fn py_outlet_session_invoke(
 /// Raises `ContextError` if the context is not connected or the session
 /// is not found.
 #[pyfunction]
-#[pyo3(name = "outlet_session_close")]
+#[pyo3(name = "context_outlet_session_close")]
 pub fn py_outlet_session_close(context_id: &str, session_id: &str) -> PyResult<()> {
     validate::validate_context_id(context_id)?;
 
@@ -1180,7 +1305,7 @@ pub fn py_outlet_session_close(context_id: &str, session_id: &str) -> PyResult<(
 ///
 /// Raises `OutletError` if the caller is not an admin or the tool is not found.
 #[pyfunction]
-#[pyo3(name = "outlet_interface_offer", signature = (context_id, outlet_id, target_context_id, rate_limit_json=None))]
+#[pyo3(name = "context_outlet_interface_offer", signature = (context_id, outlet_id, target_context_id, rate_limit_json=None))]
 pub fn py_outlet_interface_offer(
     context_id: &str,
     outlet_id: &str,
@@ -1251,7 +1376,7 @@ pub fn py_outlet_interface_offer(
 /// Raises `OutletError` if the caller is not an admin or the interface's target
 /// context does not match `context_id`.
 #[pyfunction]
-#[pyo3(name = "outlet_interface_accept")]
+#[pyo3(name = "context_outlet_interface_accept")]
 pub fn py_outlet_interface_accept(context_id: &str, interface_json: &str) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
 
@@ -1304,7 +1429,7 @@ pub fn py_outlet_interface_accept(context_id: &str, interface_json: &str) -> PyR
 ///
 /// Raises `ValidationError` if `interface_id` is not valid hex or not 32 bytes.
 #[pyfunction]
-#[pyo3(name = "outlet_interface_revoke")]
+#[pyo3(name = "context_outlet_interface_revoke")]
 pub fn py_outlet_interface_revoke(context_id: &str, interface_id_hex: &str) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
 
@@ -1341,6 +1466,306 @@ pub fn py_outlet_interface_revoke(context_id: &str, interface_id_hex: &str) -> P
 }
 
 // ---------------------------------------------------------------------------
+// Registry lookup / management (SCP-OUT-005)
+// ---------------------------------------------------------------------------
+
+/// Converts a core `OutletRegistration` into a Python dict for cross-FFI
+/// consumption. Used by `context_outlet_get` and `context_outlet_list`.
+fn outlet_registration_to_dict<'py>(
+    py: Python<'py>,
+    reg: &scp_core::context::tools::OutletRegistration,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("outlet_id", &reg.outlet_id)?;
+    dict.set_item("name", &reg.name)?;
+    dict.set_item("description", &reg.description)?;
+
+    let schema = PyDict::new(py);
+    schema.set_item("input_schema", json_to_py_dict(py, &reg.schema.input_schema)?)?;
+    schema.set_item(
+        "output_schema",
+        json_to_py_dict(py, &reg.schema.output_schema)?,
+    )?;
+    dict.set_item("schema", schema)?;
+
+    dict.set_item("operator_did", reg.operator_did.to_string())?;
+    dict.set_item("implementation_hash", hex::encode(reg.implementation_hash))?;
+    dict.set_item("registered_at", reg.registered_at)?;
+    dict.set_item("signature", reg.signature.clone())?;
+
+    if let Some(cost) = &reg.cost {
+        let cd = PyDict::new(py);
+        cd.set_item("amount", cost.amount)?;
+        cd.set_item("currency", &cost.currency)?;
+        cd.set_item("payee", cost.payee.to_string())?;
+        cd.set_item("cost_formula", cost.cost_formula.clone())?;
+        dict.set_item("cost", cd)?;
+    } else {
+        dict.set_item("cost", py.None())?;
+    }
+
+    let vectors = pyo3::types::PyList::empty(py);
+    for v in &reg.test_vectors {
+        let vd = PyDict::new(py);
+        vd.set_item("input", json_to_py_dict(py, &v.input)?)?;
+        vd.set_item("expected_output", json_to_py_dict(py, &v.expected_output)?)?;
+        vd.set_item("description", &v.description)?;
+        vectors.append(vd)?;
+    }
+    dict.set_item("test_vectors", vectors)?;
+
+    Ok(dict)
+}
+
+/// Builds an `OutletRegistration` from a Python dict. Shared by register and
+/// update paths. The `outlet_id` is determined by the caller (derived from
+/// name on register, provided explicitly on update).
+fn build_outlet_registration_from_py(
+    registration: &Bound<'_, PyDict>,
+    outlet_id: String,
+) -> PyResult<scp_core::context::tools::OutletRegistration> {
+    let name: String = registration
+        .get_item("name")?
+        .ok_or_else(|| ScpPyError::validation("missing 'name' field".to_owned()))?
+        .extract()?;
+    let description: String = registration
+        .get_item("description")?
+        .ok_or_else(|| ScpPyError::validation("missing 'description' field".to_owned()))?
+        .extract()?;
+    let operator_did: String = registration
+        .get_item("operator_did")?
+        .ok_or_else(|| ScpPyError::validation("missing 'operator_did' field".to_owned()))?
+        .extract()?;
+
+    validate::validate_outlet_name(&name)?;
+    validate::validate_did(&operator_did)?;
+
+    let schema_obj = registration
+        .get_item("schema")?
+        .ok_or_else(|| ScpPyError::validation("missing 'schema' field".to_owned()))?;
+    let schema_dict = schema_obj
+        .downcast::<PyDict>()
+        .map_err(|_| ScpPyError::validation("'schema' must be a dict".to_owned()))?;
+    let schema_json = py_dict_to_json(schema_dict)?;
+    let input_schema = schema_json.get("input_schema").cloned().ok_or_else(|| {
+        ScpPyError::ValidationError {
+            message:
+                "missing 'input_schema' in schema dict — both 'input_schema' and 'output_schema' are required"
+                    .to_owned(),
+            code: codes::VALID_7035.to_owned(),
+        }
+    })?;
+    if !input_schema.is_object() {
+        return Err(ScpPyError::ValidationError {
+            message: format!(
+                "invalid 'input_schema': expected a JSON object, got {}",
+                scp_ffi_common::validate::json_value_type_name(&input_schema)
+            ),
+            code: codes::VALID_7035.to_owned(),
+        }
+        .into());
+    }
+    let output_schema = schema_json.get("output_schema").cloned().ok_or_else(|| {
+        ScpPyError::ValidationError {
+            message:
+                "missing 'output_schema' in schema dict — both 'input_schema' and 'output_schema' are required"
+                    .to_owned(),
+            code: codes::VALID_7036.to_owned(),
+        }
+    })?;
+    if !output_schema.is_object() {
+        return Err(ScpPyError::ValidationError {
+            message: format!(
+                "invalid 'output_schema': expected a JSON object, got {}",
+                scp_ffi_common::validate::json_value_type_name(&output_schema)
+            ),
+            code: codes::VALID_7036.to_owned(),
+        }
+        .into());
+    }
+
+    let test_vectors = extract_test_vectors(registration)?;
+    let implementation_hash = extract_implementation_hash(registration)?;
+    let cost = extract_cost(registration)?;
+
+    Ok(scp_core::context::tools::OutletRegistration {
+        outlet_id,
+        name,
+        description,
+        schema: scp_core::context::tools::OutletSchema {
+            input_schema,
+            output_schema,
+        },
+        implementation_hash,
+        test_vectors,
+        operator_did: operator_did.into(),
+        cost,
+        registered_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        signature: vec![],
+    })
+}
+
+/// Updates an existing outlet registration in an SCP context.
+///
+/// Wraps [`scp_core::context::tools::update_outlet`]. The `outlet_id` must
+/// match an existing registration; the caller must be either the registered
+/// operator or an admin of the context. Validates schemas and test vectors
+/// on the new registration.
+///
+/// # Arguments
+///
+/// * `context_id` — The context containing the outlet.
+/// * `outlet_id` — The ID of the outlet to update.
+/// * `registration` — Python dict with the new registration fields.
+/// * `updater_did` — The DID of the caller performing the update.
+///
+/// # Returns
+///
+/// The `outlet_id` of the updated outlet.
+#[pyfunction]
+#[pyo3(name = "context_outlet_update")]
+pub fn py_outlet_update(
+    context_id: &str,
+    outlet_id: &str,
+    registration: &Bound<'_, PyDict>,
+    updater_did: &str,
+) -> PyResult<String> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_outlet_id(outlet_id)?;
+    validate::validate_did(updater_did)?;
+
+    let new_registration = build_outlet_registration_from_py(registration, outlet_id.to_owned())?;
+
+    crate::runtime::with_context(context_id, |rt| {
+        let _event = scp_core::context::tools::update_outlet(
+            &mut rt.outlet_registry,
+            &rt.role_state,
+            outlet_id,
+            new_registration,
+            updater_did,
+        )
+        .map_err(|e| ScpPyError::context(format!("outlet update failed: {e}")))?;
+        Ok(())
+    })?;
+
+    Ok(outlet_id.to_owned())
+}
+
+/// Deregisters (removes) an outlet from an SCP context.
+///
+/// The caller must be either the registered operator of the outlet or an
+/// admin of the context.
+///
+/// # Arguments
+///
+/// * `context_id` — The context containing the outlet.
+/// * `outlet_id` — The ID of the outlet to remove.
+/// * `actor_did` — The DID of the caller requesting deregistration.
+///
+/// # Errors
+///
+/// Raises `ContextError` if the outlet is not found or the caller is not
+/// authorized.
+#[pyfunction]
+#[pyo3(name = "context_outlet_deregister")]
+pub fn py_outlet_deregister(
+    context_id: &str,
+    outlet_id: &str,
+    actor_did: &str,
+) -> PyResult<()> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_outlet_id(outlet_id)?;
+    validate::validate_did(actor_did)?;
+
+    crate::runtime::with_context(context_id, |rt| {
+        let existing = rt
+            .outlet_registry
+            .get(outlet_id)
+            .ok_or_else(|| {
+                ScpPyError::context(format!(
+                    "outlet '{outlet_id}' not found in context '{context_id}'"
+                ))
+            })?
+            .clone();
+
+        // Authorization mirrors `update_outlet`: operator or admin.
+        let is_operator = existing.operator_did == actor_did;
+        let is_admin = scp_core::context::tools::has_admin_role(&rt.role_state, actor_did);
+        if !is_operator && !is_admin {
+            return Err(ScpPyError::ucan(format!(
+                "actor '{actor_did}' is not authorized to deregister outlet '{outlet_id}'"
+            )));
+        }
+
+        rt.outlet_registry.remove(outlet_id);
+        // Drop any registered handler for the outlet — otherwise the runtime
+        // would invoke a dangling closure on a missing registration.
+        rt.outlet_handlers.remove(outlet_id);
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+/// Lists all outlet IDs registered in an SCP context.
+///
+/// # Arguments
+///
+/// * `context_id` — The context to list outlets from.
+///
+/// # Returns
+///
+/// A Python list of outlet ID strings.
+#[pyfunction]
+#[pyo3(name = "context_outlet_list")]
+pub fn py_outlet_list(context_id: &str) -> PyResult<Vec<String>> {
+    validate::validate_context_id(context_id)?;
+
+    let ids = crate::runtime::with_context(context_id, |rt| {
+        let mut ids: Vec<String> = rt
+            .outlet_registry
+            .tool_ids()
+            .map(ToOwned::to_owned)
+            .collect();
+        ids.sort();
+        Ok(ids)
+    })?;
+
+    Ok(ids)
+}
+
+/// Returns the registration for a specific outlet.
+///
+/// # Arguments
+///
+/// * `context_id` — The context containing the outlet.
+/// * `outlet_id` — The ID of the outlet to look up.
+///
+/// # Returns
+///
+/// A Python dict of the outlet's registration fields. Raises `ContextError`
+/// if the outlet is not found.
+#[pyfunction]
+#[pyo3(name = "context_outlet_get")]
+pub fn py_outlet_get(py: Python<'_>, context_id: &str, outlet_id: &str) -> PyResult<PyObject> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_outlet_id(outlet_id)?;
+
+    let registration = crate::runtime::with_context(context_id, |rt| {
+        rt.outlet_registry.get(outlet_id).cloned().ok_or_else(|| {
+            ScpPyError::context(format!(
+                "outlet '{outlet_id}' not found in context '{context_id}'"
+            ))
+        })
+    })?;
+
+    let dict = outlet_registration_to_dict(py, &registration)?;
+    Ok(dict.into())
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -1354,6 +1779,9 @@ pub fn py_outlet_interface_revoke(context_id: &str, interface_id_hex: &str) -> P
 pub fn register_outlets(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyOutletRegistration>()?;
     m.add_class::<PyOutletVerificationResult>()?;
+    m.add_class::<PyOutletCost>()?;
+    m.add_class::<PyOutletSchema>()?;
+    m.add_class::<PyOutletTestVector>()?;
     m.add_function(wrap_pyfunction!(py_outlet_register, m)?)?;
     m.add_function(wrap_pyfunction!(py_outlet_invoke, m)?)?;
     m.add_function(wrap_pyfunction!(py_outlet_verify, m)?)?;
@@ -1364,6 +1792,10 @@ pub fn register_outlets(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_outlet_interface_offer, m)?)?;
     m.add_function(wrap_pyfunction!(py_outlet_interface_accept, m)?)?;
     m.add_function(wrap_pyfunction!(py_outlet_interface_revoke, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_update, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_deregister, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_list, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_get, m)?)?;
     Ok(())
 }
 
@@ -1815,6 +2247,194 @@ mod tests {
         });
 
         // Clean up global state.
+        crate::runtime::remove_ffi_state(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // list / get / deregister / update (SCP-OUT-005 expansion)
+    // -----------------------------------------------------------------------
+
+    fn register_probe_outlet(ctx_id: &str, creator_did: &str, name: &str) -> String {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("name", name).unwrap();
+            dict.set_item("description", "probe").unwrap();
+            dict.set_item("operator_did", creator_did).unwrap();
+            let schema = PyDict::new(py);
+            let input = PyDict::new(py);
+            input.set_item("type", "object").unwrap();
+            let props = PyDict::new(py);
+            let str_type = PyDict::new(py);
+            str_type.set_item("type", "string").unwrap();
+            props.set_item("a", str_type).unwrap();
+            let num_type = PyDict::new(py);
+            num_type.set_item("type", "number").unwrap();
+            props.set_item("b", num_type).unwrap();
+            input.set_item("properties", props).unwrap();
+            schema.set_item("input_schema", input).unwrap();
+            let output = PyDict::new(py);
+            output.set_item("type", "object").unwrap();
+            schema.set_item("output_schema", output).unwrap();
+            dict.set_item("schema", schema).unwrap();
+            py_outlet_register(ctx_id, &dict.as_borrowed())
+                .expect("py_outlet_register should succeed")
+        })
+    }
+
+    /// `context_outlet_list` returns all registered outlet IDs, sorted.
+    #[test]
+    fn list_returns_registered_outlets_sorted() {
+        let ctx_id = format!("ctx-list-{}", std::process::id());
+        let creator_did = "did:dht:z6MkListTest";
+        crate::runtime::register_ffi_state(&ctx_id, creator_did, &[]).unwrap();
+
+        register_probe_outlet(&ctx_id, creator_did, "zeta");
+        register_probe_outlet(&ctx_id, creator_did, "alpha");
+        register_probe_outlet(&ctx_id, creator_did, "beta");
+
+        let ids = py_outlet_list(&ctx_id).expect("list should succeed");
+        assert_eq!(ids, vec!["tool-alpha", "tool-beta", "tool-zeta"]);
+
+        crate::runtime::remove_ffi_state(&ctx_id);
+    }
+
+    /// `context_outlet_get` returns a dict with the registered outlet's fields.
+    #[test]
+    fn get_returns_registration_dict() {
+        let ctx_id = format!("ctx-get-{}", std::process::id());
+        let creator_did = "did:dht:z6MkGetTest";
+        crate::runtime::register_ffi_state(&ctx_id, creator_did, &[]).unwrap();
+
+        let outlet_id = register_probe_outlet(&ctx_id, creator_did, "gamma");
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict_obj =
+                py_outlet_get(py, &ctx_id, &outlet_id).expect("get should succeed");
+            let dict: &Bound<'_, PyDict> = dict_obj.bind(py).downcast::<PyDict>().unwrap();
+            let id: String = dict
+                .get_item("outlet_id")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(id, outlet_id);
+            let name: String = dict.get_item("name").unwrap().unwrap().extract().unwrap();
+            assert_eq!(name, "gamma");
+        });
+
+        crate::runtime::remove_ffi_state(&ctx_id);
+    }
+
+    /// `context_outlet_get` returns an error when the outlet is not found.
+    #[test]
+    fn get_rejects_missing_outlet() {
+        let ctx_id = format!("ctx-get-miss-{}", std::process::id());
+        let creator_did = "did:dht:z6MkGetMissTest";
+        crate::runtime::register_ffi_state(&ctx_id, creator_did, &[]).unwrap();
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let result = py_outlet_get(py, &ctx_id, "tool-does-not-exist");
+            assert!(result.is_err(), "missing outlet should error");
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("not found"),
+                "error should mention not-found, got: {err_str}"
+            );
+        });
+
+        crate::runtime::remove_ffi_state(&ctx_id);
+    }
+
+    /// `context_outlet_deregister` removes the outlet from the registry.
+    #[test]
+    fn deregister_removes_outlet() {
+        let ctx_id = format!("ctx-dereg-{}", std::process::id());
+        let creator_did = "did:dht:z6MkDeregTest";
+        crate::runtime::register_ffi_state(&ctx_id, creator_did, &[]).unwrap();
+
+        let outlet_id = register_probe_outlet(&ctx_id, creator_did, "delta");
+
+        py_outlet_deregister(&ctx_id, &outlet_id, creator_did)
+            .expect("deregister by operator should succeed");
+
+        let ids = py_outlet_list(&ctx_id).expect("list should succeed");
+        assert!(
+            !ids.contains(&outlet_id),
+            "outlet should be absent after deregister; got {ids:?}"
+        );
+
+        crate::runtime::remove_ffi_state(&ctx_id);
+    }
+
+    /// `context_outlet_deregister` rejects callers who are not operator/admin.
+    #[test]
+    fn deregister_rejects_unauthorized() {
+        let ctx_id = format!("ctx-dereg-unauth-{}", std::process::id());
+        let creator_did = "did:dht:z6MkDeregUnauthTest";
+        crate::runtime::register_ffi_state(&ctx_id, creator_did, &[]).unwrap();
+
+        let outlet_id = register_probe_outlet(&ctx_id, creator_did, "epsilon");
+
+        let result = py_outlet_deregister(
+            &ctx_id,
+            &outlet_id,
+            "did:dht:z6MkStranger00000000000",
+        );
+        assert!(result.is_err(), "stranger cannot deregister");
+
+        crate::runtime::remove_ffi_state(&ctx_id);
+    }
+
+    /// `context_outlet_update` mutates the existing registration.
+    #[test]
+    fn update_mutates_registration() {
+        let ctx_id = format!("ctx-upd-{}", std::process::id());
+        let creator_did = "did:dht:z6MkUpdateTest";
+        crate::runtime::register_ffi_state(&ctx_id, creator_did, &[]).unwrap();
+
+        let outlet_id = register_probe_outlet(&ctx_id, creator_did, "omega");
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("name", "omega").unwrap();
+            dict.set_item("description", "updated description").unwrap();
+            dict.set_item("operator_did", creator_did).unwrap();
+            let schema = PyDict::new(py);
+            let input = PyDict::new(py);
+            input.set_item("type", "object").unwrap();
+            let props = PyDict::new(py);
+            let str_type = PyDict::new(py);
+            str_type.set_item("type", "string").unwrap();
+            props.set_item("a", str_type).unwrap();
+            let num_type = PyDict::new(py);
+            num_type.set_item("type", "number").unwrap();
+            props.set_item("b", num_type).unwrap();
+            input.set_item("properties", props).unwrap();
+            schema.set_item("input_schema", input).unwrap();
+            let output = PyDict::new(py);
+            output.set_item("type", "object").unwrap();
+            schema.set_item("output_schema", output).unwrap();
+            dict.set_item("schema", schema).unwrap();
+
+            py_outlet_update(&ctx_id, &outlet_id, &dict.as_borrowed(), creator_did)
+                .expect("update by operator should succeed");
+        });
+
+        let new_desc = crate::runtime::with_ffi_state(&ctx_id, |state| {
+            Ok(state
+                .outlet_registry
+                .get(&outlet_id)
+                .expect("outlet present")
+                .description
+                .clone())
+        })
+        .unwrap();
+        assert_eq!(new_desc, "updated description");
+
         crate::runtime::remove_ffi_state(&ctx_id);
     }
 }

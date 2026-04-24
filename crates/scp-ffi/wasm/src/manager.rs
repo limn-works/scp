@@ -2034,6 +2034,161 @@ impl WasmContextManager {
         Ok((failures.is_empty(), failures))
     }
 
+    /// Updates an existing outlet registration.
+    ///
+    /// The caller (`updater_did`) must be either the outlet's operator or
+    /// the context creator (WASM tracks roles at the member level only;
+    /// creator plays the admin role for registry operations, matching the
+    /// pattern used by `outlet_interface_offer`/`accept`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not active, the outlet is not
+    /// found, the caller is not authorized, or the new registration is
+    /// invalid (schema, test vectors, id mismatch).
+    pub fn update_outlet(
+        &mut self,
+        context_id: &str,
+        outlet_id: &str,
+        new_registration: OutletRegistration,
+        updater_did: &str,
+    ) -> Result<(), ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+
+        let existing =
+            ctx.outlet_registry
+                .get(outlet_id)
+                .ok_or_else(|| ScpWasmError::Tool {
+                    message: format!("outlet '{outlet_id}' not found in context '{context_id}'"),
+                    code: codes::TOOL_6002.to_owned(),
+                })?
+                .clone();
+
+        let is_operator = existing.operator_did.as_ref() == updater_did;
+        let is_admin = ctx.creator_did == updater_did;
+        if !is_operator && !is_admin {
+            return Err(ScpWasmError::Permission {
+                message: format!(
+                    "updater '{updater_did}' is not authorized to update outlet '{outlet_id}'"
+                ),
+                code: codes::PERM_3001.to_owned(),
+            });
+        }
+
+        if new_registration.outlet_id != outlet_id {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "outlet_id mismatch: expected '{outlet_id}', got '{}'",
+                    new_registration.outlet_id
+                ),
+                code: codes::VALID_7000.to_owned(),
+            });
+        }
+
+        // Validate schemas on the new registration (defense-in-depth — the
+        // bridge caller validated them too, but this keeps parity with the
+        // scp-protocol update path).
+        crate::runtime::validate_schema(&new_registration.schema.input_schema).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("invalid input schema in update: {e}"),
+                code: codes::VALID_7035.to_owned(),
+            }
+        })?;
+        crate::runtime::validate_schema(&new_registration.schema.output_schema).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("invalid output schema in update: {e}"),
+                code: codes::VALID_7036.to_owned(),
+            }
+        })?;
+
+        ctx.outlet_registry.insert(new_registration);
+
+        let actor = ctx.creator_did.clone();
+        ctx.append_log_event(EventType::OutletUpdated, &actor, outlet_id.as_bytes());
+
+        Ok(())
+    }
+
+    /// Deregisters (removes) an outlet from the context.
+    ///
+    /// The caller must be the outlet's operator or the context creator
+    /// (admin on WASM). Drops any registered handler for the outlet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not active, the outlet is not
+    /// found, or the caller is not authorized.
+    pub fn deregister_outlet(
+        &mut self,
+        context_id: &str,
+        outlet_id: &str,
+        actor_did: &str,
+    ) -> Result<(), ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+
+        let existing =
+            ctx.outlet_registry
+                .get(outlet_id)
+                .ok_or_else(|| ScpWasmError::Tool {
+                    message: format!("outlet '{outlet_id}' not found in context '{context_id}'"),
+                    code: codes::TOOL_6002.to_owned(),
+                })?
+                .clone();
+
+        let is_operator = existing.operator_did.as_ref() == actor_did;
+        let is_admin = ctx.creator_did == actor_did;
+        if !is_operator && !is_admin {
+            return Err(ScpWasmError::Permission {
+                message: format!(
+                    "actor '{actor_did}' is not authorized to deregister outlet '{outlet_id}'"
+                ),
+                code: codes::PERM_3001.to_owned(),
+            });
+        }
+
+        ctx.outlet_registry.remove(outlet_id);
+        ctx.outlet_handlers.remove(outlet_id);
+
+        let actor = ctx.creator_did.clone();
+        ctx.append_log_event(EventType::OutletDeregistered, &actor, outlet_id.as_bytes());
+
+        Ok(())
+    }
+
+    /// Lists all outlet IDs registered in a context. Sorted for deterministic
+    /// ordering across callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not found.
+    pub fn list_outlets(&self, context_id: &str) -> Result<Vec<String>, ScpWasmError> {
+        let ctx = self.require_context(context_id)?;
+        let mut ids: Vec<String> = ctx.outlet_registry.tool_ids().map(ToOwned::to_owned).collect();
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// Retrieves the full registration for an outlet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not found or the outlet is not
+    /// registered.
+    pub fn get_outlet(
+        &self,
+        context_id: &str,
+        outlet_id: &str,
+    ) -> Result<OutletRegistration, ScpWasmError> {
+        let ctx = self.require_context(context_id)?;
+        ctx.outlet_registry
+            .get(outlet_id)
+            .cloned()
+            .ok_or_else(|| ScpWasmError::Tool {
+                message: format!("outlet '{outlet_id}' not found in context '{context_id}'"),
+                code: codes::TOOL_6002.to_owned(),
+            })
+    }
+
     // -----------------------------------------------------------------------
     // Cross-context tool invocation (spec section 6.2)
     // -----------------------------------------------------------------------

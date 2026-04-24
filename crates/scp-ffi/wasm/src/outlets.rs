@@ -583,6 +583,184 @@ pub fn outlet_verify(context: &WasmContextHandle, outlet_id: String) -> Promise 
 }
 
 // ---------------------------------------------------------------------------
+// Registry lookup / management (SCP-OUT-005)
+// ---------------------------------------------------------------------------
+
+/// Builds a core `OutletRegistration` from the shared JSON definition shape
+/// used by `outlet_register`/`outlet_update`. Factored out so update reuses
+/// the same validation pipeline as register.
+fn build_outlet_registration_from_json(
+    def: &serde_json::Value,
+    outlet_id: String,
+) -> Result<runtime::OutletRegistration, JsValue> {
+    let name = def["name"]
+        .as_str()
+        .ok_or_else(|| {
+            ScpWasmError::Validation {
+                message: "definition_json missing required 'name' field".to_owned(),
+                code: codes::VALID_7000.to_owned(),
+            }
+            .into_js()
+        })?
+        .to_owned();
+    validate_outlet_name(&name).map_err(|e| ScpWasmError::from(e).into_js())?;
+
+    let description = match def.get("description") {
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| {
+                ScpWasmError::Validation {
+                    message: format!(
+                        "invalid 'description': expected a string, got {}",
+                        json_value_type_name(v)
+                    ),
+                    code: codes::VALID_7000.to_owned(),
+                }
+                .into_js()
+            })?
+            .to_owned(),
+        None => String::new(),
+    };
+
+    let input_schema = validate_schema_field(def, "schema").map_err(ScpWasmError::into_js)?;
+    let output_schema = validate_schema_field(def, "outputSchema").map_err(ScpWasmError::into_js)?;
+    let operator_did = def["operatorDid"].as_str().unwrap_or("").to_owned();
+    let test_vectors = validate_test_vectors(def).map_err(ScpWasmError::into_js)?;
+    let (implementation_hash, signature, cost, registered_at) = parse_provenance_fields(def)?;
+
+    Ok(runtime::OutletRegistration {
+        outlet_id,
+        name,
+        description,
+        schema: runtime::OutletSchema {
+            input_schema,
+            output_schema,
+        },
+        implementation_hash,
+        test_vectors,
+        operator_did: scp_event_log::DID::from(operator_did),
+        cost,
+        registered_at,
+        signature,
+    })
+}
+
+/// Updates an existing outlet registration.
+///
+/// The caller (`updater_did`) must be the outlet's operator or the context
+/// creator. Validates schemas and that the outlet ID on the new
+/// registration matches the existing one.
+///
+/// # Returns
+///
+/// `Promise<string>` — resolves to the outlet ID of the updated outlet.
+#[wasm_bindgen(js_name = outletUpdate)]
+pub fn outlet_update(
+    context: &WasmContextHandle,
+    outlet_id: String,
+    definition_json: String,
+    updater_did: String,
+) -> Promise {
+    let context_id = context.context_id();
+    future_to_promise(async move {
+        validate_outlet_id(&outlet_id).map_err(|e| ScpWasmError::from(e).into_js())?;
+        validate_did(&updater_did).map_err(|e| ScpWasmError::from(e).into_js())?;
+
+        let def: serde_json::Value = serde_json::from_str(&definition_json).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("definition_json is not valid JSON: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            }
+            .into_js()
+        })?;
+
+        let new_registration = build_outlet_registration_from_json(&def, outlet_id.clone())?;
+
+        with_manager(|mgr| mgr.update_outlet(&context_id, &outlet_id, new_registration, &updater_did))
+            .map_err(ScpWasmError::into_js)?;
+
+        Ok(JsValue::from_str(&outlet_id))
+    })
+}
+
+/// Deregisters (removes) an outlet from the context.
+///
+/// The caller must be the outlet's operator or the context creator.
+///
+/// # Returns
+///
+/// `Promise<void>` — resolves when the outlet has been removed.
+#[wasm_bindgen(js_name = outletDeregister)]
+pub fn outlet_deregister(
+    context: &WasmContextHandle,
+    outlet_id: String,
+    actor_did: String,
+) -> Promise {
+    let context_id = context.context_id();
+    future_to_promise(async move {
+        validate_outlet_id(&outlet_id).map_err(|e| ScpWasmError::from(e).into_js())?;
+        validate_did(&actor_did).map_err(|e| ScpWasmError::from(e).into_js())?;
+
+        with_manager(|mgr| mgr.deregister_outlet(&context_id, &outlet_id, &actor_did))
+            .map_err(ScpWasmError::into_js)?;
+
+        Ok(JsValue::UNDEFINED)
+    })
+}
+
+/// Lists all outlet IDs registered in a context.
+///
+/// # Returns
+///
+/// `Promise<string[]>` — resolves to the sorted list of outlet IDs as a JSON
+/// string array serialized via `JsValue::from_serde`.
+#[wasm_bindgen(js_name = outletList)]
+pub fn outlet_list(context: &WasmContextHandle) -> Promise {
+    let context_id = context.context_id();
+    future_to_promise(async move {
+        let ids = with_manager(|mgr| mgr.list_outlets(&context_id))
+            .map_err(ScpWasmError::into_js)?;
+
+        let json_str = serde_json::to_string(&ids).map_err(|e| {
+            ScpWasmError::Tool {
+                message: format!("failed to serialize outlet list: {e}"),
+                code: codes::TOOL_6002.to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+/// Retrieves an outlet registration as a JSON string.
+///
+/// # Returns
+///
+/// `Promise<string>` — resolves to the `OutletRegistration` as JSON.
+/// Rejects with `SCP-TOOL-6002` if the outlet is not found.
+#[wasm_bindgen(js_name = outletGet)]
+pub fn outlet_get(context: &WasmContextHandle, outlet_id: String) -> Promise {
+    let context_id = context.context_id();
+    future_to_promise(async move {
+        validate_outlet_id(&outlet_id).map_err(|e| ScpWasmError::from(e).into_js())?;
+
+        let registration = with_manager(|mgr| mgr.get_outlet(&context_id, &outlet_id))
+            .map_err(ScpWasmError::into_js)?;
+
+        let json_str = serde_json::to_string(&registration).map_err(|e| {
+            ScpWasmError::Tool {
+                message: format!("failed to serialize outlet registration: {e}"),
+                code: codes::TOOL_6002.to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json_str))
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Cross-context tool invocation (spec section 6.2)
 // ---------------------------------------------------------------------------
 

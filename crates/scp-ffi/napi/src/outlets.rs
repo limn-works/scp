@@ -103,6 +103,29 @@ pub struct NapiOutletCost {
     pub cost_formula: Option<String>,
 }
 
+/// MCP-compatible JSON Schema for an outlet's input and output (spec §5.4.1).
+///
+/// Both fields carry serialized JSON Schema strings. JS callers typically
+/// `JSON.stringify` a schema object and pass the result here.
+#[napi(object)]
+pub struct NapiOutletSchema {
+    /// JSON Schema for the outlet's input (as a JSON string).
+    pub input_schema_json: String,
+    /// JSON Schema for the outlet's output (as a JSON string).
+    pub output_schema_json: String,
+}
+
+/// A known input/output pair used for outlet verification (spec §7.3.3).
+#[napi(object)]
+pub struct NapiOutletTestVector {
+    /// The test input to pass to the outlet (as a JSON string).
+    pub input_json: String,
+    /// The expected output from the outlet (as a JSON string).
+    pub expected_output_json: String,
+    /// Human-readable description of what this test vector validates.
+    pub description: String,
+}
+
 // ---------------------------------------------------------------------------
 // NapiOutletVerificationResult — result of tool verification
 // ---------------------------------------------------------------------------
@@ -205,7 +228,7 @@ fn validate_implementation_hash(bytes: Option<&[u8]>) -> napi::Result<[u8; 32]> 
 /// - Rejects with `SCP-VALID-7038` if `implementation_hash` is provided but not exactly 32 bytes.
 /// - Rejects with `SCP-TOOL-6001` if registration fails (permission denied,
 ///   schema invalid, duplicate name, etc.) in the full runtime.
-#[napi]
+#[napi(js_name = "contextOutletRegister")]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 pub async fn outlet_register(
     handle: &NapiContextHandle,
@@ -333,7 +356,7 @@ pub async fn outlet_register(
 ///   schema mismatch, etc.).
 ///
 /// See spec §6.2, §8, §19.5, §19.7, ADR-016, and issue #319.
-#[napi]
+#[napi(js_name = "contextOutletInvoke")]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 #[allow(clippy::too_many_arguments)] // mirrors the runtime's economy entry point
 pub async fn outlet_invoke(
@@ -495,7 +518,7 @@ pub async fn outlet_invoke(
 ///
 /// - Rejects with `SCP-TOOL-6007` if the context is not `"active"`.
 /// - Rejects with `SCP-TOOL-6001` if the tool is not found in the context.
-#[napi]
+#[napi(js_name = "contextOutletVerify")]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 pub async fn outlet_verify(
@@ -572,7 +595,7 @@ pub async fn outlet_verify(
 /// # Returns
 ///
 /// A `Promise<string>` resolving to the tool output as a JSON string.
-#[napi]
+#[napi(js_name = "contextOutletInvokeCrossContext")]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 #[allow(clippy::too_many_arguments)] // FFI boundary: napi-rs requires explicit params
@@ -733,7 +756,7 @@ pub async fn outlet_invoke_cross_context(
 /// # Returns
 ///
 /// A `Promise<string>` resolving to the session ID (UUID).
-#[napi]
+#[napi(js_name = "contextOutletSessionOpen")]
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn outlet_session_open(
@@ -805,7 +828,7 @@ pub async fn outlet_session_open(
 /// # Returns
 ///
 /// A `Promise<string>` resolving to the tool output as a JSON string.
-#[napi]
+#[napi(js_name = "contextOutletSessionInvoke")]
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn outlet_session_invoke(
@@ -947,7 +970,7 @@ pub async fn outlet_session_invoke(
 /// # Returns
 ///
 /// A `Promise<void>` that resolves when the session is closed.
-#[napi]
+#[napi(js_name = "contextOutletSessionClose")]
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn outlet_session_close(
@@ -983,7 +1006,7 @@ pub async fn outlet_session_close(
 /// # Returns
 ///
 /// A `Promise<string>` resolving to the `OutletInterface` as JSON.
-#[napi]
+#[napi(js_name = "contextOutletInterfaceOffer")]
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn outlet_interface_offer(
@@ -1062,7 +1085,7 @@ pub async fn outlet_interface_offer(
 /// # Returns
 ///
 /// A `Promise<string>` resolving to the updated `OutletInterface` as JSON.
-#[napi]
+#[napi(js_name = "contextOutletInterfaceAccept")]
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn outlet_interface_accept(
@@ -1125,7 +1148,7 @@ pub async fn outlet_interface_accept(
 /// # Returns
 ///
 /// A `Promise<string>` resolving to the `InterfaceRevoked` event as JSON.
-#[napi]
+#[napi(js_name = "contextOutletInterfaceRevoke")]
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn outlet_interface_revoke(
@@ -1166,6 +1189,233 @@ pub async fn outlet_interface_revoke(
             code: codes::TOOL_6035.to_owned(),
         })
     })
+}
+
+// ---------------------------------------------------------------------------
+// Registry lookup / management (SCP-OUT-005)
+// ---------------------------------------------------------------------------
+
+/// Serializes a core `OutletRegistration` to a JSON string for JS consumers.
+fn serialize_outlet_registration(
+    reg: &scp_core::context::tools::OutletRegistration,
+) -> Result<String, ScpNapiError> {
+    serde_json::to_string(reg).map_err(|e| ScpNapiError::Tool {
+        message: format!("failed to serialize outlet registration: {e}"),
+        code: codes::TOOL_6006.to_owned(),
+    })
+}
+
+/// Builds a core `OutletRegistration` from a `NapiOutletDefinition`.
+///
+/// Shared by `outlet_register` and `outlet_update`. The outlet ID is supplied
+/// by the caller (derived from name on register, supplied explicitly on
+/// update).
+fn build_outlet_registration_from_napi(
+    definition: NapiOutletDefinition,
+    outlet_id: String,
+) -> napi::Result<scp_core::context::tools::OutletRegistration> {
+    let input_schema = validate_schema_json(&definition.input_schema_json, "input_schema_json")?;
+    let output_schema = validate_schema_json(&definition.output_schema_json, "output_schema_json")?;
+    let test_vectors = validate_test_vectors_json(definition.test_vectors_json.as_deref())?;
+    let implementation_hash =
+        validate_implementation_hash(definition.implementation_hash.as_deref())?;
+
+    let cost = definition
+        .cost
+        .map(|c| scp_core::context::tools::OutletCost {
+            amount: c.amount.max(0).cast_unsigned(),
+            currency: c.currency,
+            payee: c.payee.into(),
+            cost_formula: c.cost_formula,
+        });
+
+    Ok(scp_core::context::tools::OutletRegistration {
+        outlet_id,
+        name: definition.name,
+        description: definition.description,
+        schema: scp_core::context::tools::OutletSchema {
+            input_schema,
+            output_schema,
+        },
+        implementation_hash,
+        test_vectors,
+        operator_did: definition.operator_did.into(),
+        cost,
+        registered_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        signature: Vec::new(),
+    })
+}
+
+/// Updates an existing outlet registration.
+///
+/// Wraps [`scp_core::context::tools::update_outlet`]. The caller's DID is the
+/// `updater_did`, and must match the outlet's operator DID or hold the admin
+/// role on the context.
+///
+/// # Arguments
+///
+/// * `handle` — The context containing the outlet.
+/// * `outlet_id` — The ID of the outlet to update.
+/// * `definition` — The new outlet definition.
+/// * `updater_did` — The DID of the caller performing the update.
+#[napi(js_name = "contextOutletUpdate")]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return.
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned values.
+pub async fn outlet_update(
+    handle: &NapiContextHandle,
+    outlet_id: String,
+    definition: NapiOutletDefinition,
+    updater_did: String,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
+    validate_outlet_id(&outlet_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_outlet_name(&definition.name).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_did(&updater_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    let state_str = handle.state()?;
+    if state_str != "active" {
+        return Err(ScpNapiError::Tool {
+            message: format!(
+                "cannot update outlet in context in {state_str:?} state — context must be active"
+            ),
+            code: codes::TOOL_6003.to_owned(),
+        }
+        .into());
+    }
+
+    crate::runtime::ensure_registered(handle)?;
+    let context_id = handle.context_id();
+
+    let core_registration = build_outlet_registration_from_napi(definition, outlet_id.clone())?;
+
+    crate::runtime::with_context(&context_id, |rt| {
+        let _event = scp_core::context::tools::update_outlet(
+            &mut rt.outlet_registry,
+            &rt.role_state,
+            &outlet_id,
+            core_registration,
+            &updater_did,
+        )
+        .map_err(|e| ScpNapiError::Tool {
+            message: format!("outlet update failed: {e}"),
+            code: codes::TOOL_6001.to_owned(),
+        })?;
+        Ok(())
+    })
+    .map_err(napi::Error::from)?;
+
+    Ok(outlet_id)
+}
+
+/// Deregisters (removes) an outlet from the context.
+///
+/// The caller must be the outlet's operator or an admin on the context.
+#[napi(js_name = "contextOutletDeregister")]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return.
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned values.
+pub async fn outlet_deregister(
+    handle: &NapiContextHandle,
+    outlet_id: String,
+    actor_did: String,
+) -> napi::Result<()> {
+    crate::napi_check_handle!(handle);
+    validate_outlet_id(&outlet_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_did(&actor_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    let state_str = handle.state()?;
+    if state_str != "active" {
+        return Err(ScpNapiError::Tool {
+            message: format!(
+                "cannot deregister outlet in context in {state_str:?} state — context must be active"
+            ),
+            code: codes::TOOL_6003.to_owned(),
+        }
+        .into());
+    }
+
+    crate::runtime::ensure_registered(handle)?;
+    let context_id = handle.context_id();
+
+    crate::runtime::with_context(&context_id, |rt| {
+        let existing = rt
+            .outlet_registry
+            .get(&outlet_id)
+            .ok_or_else(|| ScpNapiError::Tool {
+                message: format!("outlet '{outlet_id}' not found in context '{context_id}'"),
+                code: codes::TOOL_6002.to_owned(),
+            })?
+            .clone();
+
+        let is_operator = existing.operator_did == actor_did;
+        let is_admin = scp_core::context::tools::has_admin_role(&rt.role_state, &actor_did);
+        if !is_operator && !is_admin {
+            return Err(ScpNapiError::Permission {
+                message: format!(
+                    "actor '{actor_did}' is not authorized to deregister outlet '{outlet_id}'"
+                ),
+                code: codes::PERM_3001.to_owned(),
+            });
+        }
+
+        rt.outlet_registry.remove(&outlet_id);
+        rt.outlet_handlers.remove(&outlet_id);
+        Ok(())
+    })
+    .map_err(napi::Error::from)?;
+
+    Ok(())
+}
+
+/// Lists all outlet IDs registered in a context.
+#[napi(js_name = "contextOutletList")]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return.
+pub async fn outlet_list(handle: &NapiContextHandle) -> napi::Result<Vec<String>> {
+    crate::napi_check_handle!(handle);
+    crate::runtime::ensure_registered(handle)?;
+    let context_id = handle.context_id();
+
+    crate::runtime::with_context(&context_id, |rt| {
+        let mut ids: Vec<String> = rt
+            .outlet_registry
+            .tool_ids()
+            .map(ToOwned::to_owned)
+            .collect();
+        ids.sort();
+        Ok(ids)
+    })
+    .map_err(napi::Error::from)
+}
+
+/// Retrieves a full outlet registration as a JSON string.
+///
+/// Returns `SCP-TOOL-6002` if the outlet is not found.
+#[napi(js_name = "contextOutletGet")]
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return.
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned values.
+pub async fn outlet_get(
+    handle: &NapiContextHandle,
+    outlet_id: String,
+) -> napi::Result<String> {
+    crate::napi_check_handle!(handle);
+    validate_outlet_id(&outlet_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    crate::runtime::ensure_registered(handle)?;
+    let context_id = handle.context_id();
+
+    let registration = crate::runtime::with_context(&context_id, |rt| {
+        rt.outlet_registry
+            .get(&outlet_id)
+            .cloned()
+            .ok_or_else(|| ScpNapiError::Tool {
+                message: format!("outlet '{outlet_id}' not found in context '{context_id}'"),
+                code: codes::TOOL_6002.to_owned(),
+            })
+    })
+    .map_err(napi::Error::from)?;
+
+    serialize_outlet_registration(&registration).map_err(napi::Error::from)
 }
 
 // ---------------------------------------------------------------------------

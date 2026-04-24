@@ -5032,6 +5032,312 @@ pub async fn outlet_interface_revoke(
 }
 
 // ---------------------------------------------------------------------------
+// Free functions — outlet registry lookup / management (SCP-OUT-005)
+// ---------------------------------------------------------------------------
+
+/// Builds a core `OutletRegistration` from a `UniFFI` `OutletDefinition`.
+///
+/// Shared by `outlet_register` and `outlet_update`. The `outlet_id` is the
+/// caller-supplied identifier (name-derived on register, explicit on update).
+fn build_outlet_registration_from_uniffi(
+    definition: OutletDefinition,
+    outlet_id: String,
+) -> Result<scp_core::context::tools::OutletRegistration, ScpError> {
+    let input_schema: serde_json::Value = serde_json::from_str(&definition.input_schema_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("invalid input_schema_json: {e}"),
+            code: codes::VALID_7035.to_owned(),
+        })?;
+    if !input_schema.is_object() {
+        return Err(ScpError::Validation {
+            msg: format!(
+                "invalid input_schema_json: expected a JSON object, got {}",
+                json_value_type_name(&input_schema)
+            ),
+            code: codes::VALID_7035.to_owned(),
+        });
+    }
+
+    let output_schema: serde_json::Value = serde_json::from_str(&definition.output_schema_json)
+        .map_err(|e| ScpError::Validation {
+            msg: format!("invalid output_schema_json: {e}"),
+            code: codes::VALID_7036.to_owned(),
+        })?;
+    if !output_schema.is_object() {
+        return Err(ScpError::Validation {
+            msg: format!(
+                "invalid output_schema_json: expected a JSON object, got {}",
+                json_value_type_name(&output_schema)
+            ),
+            code: codes::VALID_7036.to_owned(),
+        });
+    }
+
+    let test_vectors: Vec<scp_core::context::tools::OutletTestVector> =
+        match definition.test_vectors_json.as_deref() {
+            None => Vec::new(),
+            Some(json) => serde_json::from_str(json).map_err(|e| ScpError::Validation {
+                msg: format!("invalid test_vectors_json: {e}"),
+                code: codes::VALID_7037.to_owned(),
+            })?,
+        };
+
+    let implementation_hash: [u8; 32] = match definition.implementation_hash.as_deref() {
+        None => [0u8; 32],
+        Some(bytes) => <[u8; 32]>::try_from(bytes).map_err(|_| ScpError::Validation {
+            msg: format!(
+                "implementation_hash must be exactly 32 bytes, got {}",
+                bytes.len()
+            ),
+            code: codes::VALID_7038.to_owned(),
+        })?,
+    };
+
+    let cost = definition
+        .cost
+        .map(|c| scp_core::context::tools::OutletCost {
+            amount: c.amount,
+            currency: c.currency,
+            payee: c.payee.into(),
+            cost_formula: c.cost_formula,
+        });
+
+    Ok(scp_core::context::tools::OutletRegistration {
+        outlet_id,
+        name: definition.name,
+        description: definition.description,
+        schema: scp_core::context::tools::OutletSchema {
+            input_schema,
+            output_schema,
+        },
+        implementation_hash,
+        test_vectors,
+        operator_did: definition.operator_did.into(),
+        cost,
+        registered_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        signature: Vec::new(),
+    })
+}
+
+/// Updates an existing outlet registration.
+///
+/// Wraps [`scp_core::context::tools::update_outlet`]. The caller must be
+/// either the registered operator of the outlet or an admin of the context.
+///
+/// # Arguments
+///
+/// * `handle` — The context containing the outlet.
+/// * `outlet_id` — The ID of the outlet to update.
+/// * `definition` — The new outlet definition.
+/// * `updater_did` — The DID of the caller performing the update.
+#[uniffi::export]
+pub async fn outlet_update(
+    handle: Arc<ContextHandle>,
+    outlet_id: String,
+    definition: OutletDefinition,
+    updater_did: String,
+) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    runtime()
+        .spawn(async move {
+            validate_outlet_id(&outlet_id)?;
+            validate_outlet_name(&definition.name)?;
+            validate_did(&updater_did)?;
+
+            let state = handle.state.lock().await;
+            if !matches!(*state, ContextState::Active) {
+                return Err(ScpError::Tool {
+                    msg: format!(
+                        "cannot update outlet in context in {:?} state — context must be active",
+                        *state
+                    ),
+                    code: codes::TOOL_6003.to_owned(),
+                });
+            }
+            drop(state);
+
+            let new_registration =
+                build_outlet_registration_from_uniffi(definition, outlet_id.clone())?;
+
+            // Build the role state for capability checking (mirrors outlet_register).
+            let ceiling = scp_core::context::roles::default_ceiling();
+            let role_state = scp_core::context::roles::ContextRoleState::new(
+                &handle.context_id,
+                &handle.creator_did,
+                ceiling,
+                vec![],
+                &scp_primitives::SystemClock,
+            )
+            .map_err(|e| ScpError::Tool {
+                msg: format!("failed to create role state: {e}"),
+                code: codes::TOOL_6003.to_owned(),
+            })?;
+
+            let mut registry = handle.outlet_registry.lock().await;
+            let _event = scp_core::context::tools::update_outlet(
+                &mut registry,
+                &role_state,
+                &outlet_id,
+                new_registration,
+                &updater_did,
+            )
+            .map_err(|e| ScpError::Tool {
+                msg: format!("outlet update failed: {e}"),
+                code: codes::TOOL_6001.to_owned(),
+            })?;
+
+            Ok(outlet_id)
+        })
+        .await
+        .map_err(|e| ScpError::Tool {
+            msg: format!("tokio task join error during outlet_update: {e}"),
+            code: codes::TOOL_6004.to_owned(),
+        })?
+}
+
+/// Deregisters (removes) an outlet from the context.
+///
+/// The caller must be either the registered operator of the outlet or an
+/// admin of the context.
+#[uniffi::export]
+pub async fn outlet_deregister(
+    handle: Arc<ContextHandle>,
+    outlet_id: String,
+    actor_did: String,
+) -> Result<(), ScpError> {
+    crate::uniffi_check_handle!(handle);
+    runtime()
+        .spawn(async move {
+            validate_outlet_id(&outlet_id)?;
+            validate_did(&actor_did)?;
+
+            let state = handle.state.lock().await;
+            if !matches!(*state, ContextState::Active) {
+                return Err(ScpError::Tool {
+                    msg: format!(
+                        "cannot deregister outlet in context in {:?} state — context must be active",
+                        *state
+                    ),
+                    code: codes::TOOL_6003.to_owned(),
+                });
+            }
+            drop(state);
+
+            // Build the role state for capability checking.
+            let ceiling = scp_core::context::roles::default_ceiling();
+            let role_state = scp_core::context::roles::ContextRoleState::new(
+                &handle.context_id,
+                &handle.creator_did,
+                ceiling,
+                vec![],
+                &scp_primitives::SystemClock,
+            )
+            .map_err(|e| ScpError::Tool {
+                msg: format!("failed to create role state: {e}"),
+                code: codes::TOOL_6003.to_owned(),
+            })?;
+
+            let mut registry = handle.outlet_registry.lock().await;
+            let existing = registry
+                .get(&outlet_id)
+                .ok_or_else(|| ScpError::Tool {
+                    msg: format!(
+                        "outlet '{}' not found in context '{}'",
+                        outlet_id, handle.context_id
+                    ),
+                    code: codes::TOOL_6002.to_owned(),
+                })?
+                .clone();
+
+            let is_operator = existing.operator_did == actor_did;
+            let is_admin = scp_core::context::tools::has_admin_role(&role_state, &actor_did);
+            if !is_operator && !is_admin {
+                return Err(ScpError::Permission {
+                    msg: format!(
+                        "actor '{actor_did}' is not authorized to deregister outlet '{outlet_id}'"
+                    ),
+                    code: codes::PERM_3001.to_owned(),
+                });
+            }
+
+            registry.remove(&outlet_id);
+            drop(registry);
+
+            // Drop any registered handler for this outlet — otherwise invoke
+            // would dispatch to a dangling closure against a missing
+            // registration.
+            let mut handlers = handle.outlet_handlers.lock().await;
+            handlers.remove(&outlet_id);
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| ScpError::Tool {
+            msg: format!("tokio task join error during outlet_deregister: {e}"),
+            code: codes::TOOL_6004.to_owned(),
+        })?
+}
+
+/// Lists all outlet IDs registered in a context.
+#[uniffi::export]
+pub async fn outlet_list(handle: Arc<ContextHandle>) -> Result<Vec<String>, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    runtime()
+        .spawn(async move {
+            let registry = handle.outlet_registry.lock().await;
+            let mut ids: Vec<String> = registry.tool_ids().map(|id| (*id).clone()).collect();
+            ids.sort();
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| ScpError::Tool {
+            msg: format!("tokio task join error during outlet_list: {e}"),
+            code: codes::TOOL_6004.to_owned(),
+        })?
+}
+
+/// Retrieves an outlet registration as a JSON string.
+///
+/// Returns `ScpError::Tool` (`SCP-TOOL-6002`) if the outlet is not found.
+#[uniffi::export]
+pub async fn outlet_get(
+    handle: Arc<ContextHandle>,
+    outlet_id: String,
+) -> Result<String, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    runtime()
+        .spawn(async move {
+            validate_outlet_id(&outlet_id)?;
+
+            let registry = handle.outlet_registry.lock().await;
+            let registration =
+                registry
+                    .get(&outlet_id)
+                    .cloned()
+                    .ok_or_else(|| ScpError::Tool {
+                        msg: format!(
+                            "outlet '{}' not found in context '{}'",
+                            outlet_id, handle.context_id
+                        ),
+                        code: codes::TOOL_6002.to_owned(),
+                    })?;
+            drop(registry);
+
+            serde_json::to_string(&registration).map_err(|e| ScpError::Tool {
+                msg: format!("failed to serialize outlet registration: {e}"),
+                code: codes::TOOL_6006.to_owned(),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Tool {
+            msg: format!("tokio task join error during outlet_get: {e}"),
+            code: codes::TOOL_6004.to_owned(),
+        })?
+}
+
+// ---------------------------------------------------------------------------
 // Free functions — transport operations
 //
 // See ADR-021 acceptance criterion 5.
