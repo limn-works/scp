@@ -164,12 +164,13 @@ pub fn bridge_register(
 
     let parsed_platform_key = platform_key
         .map(|k| {
-            <[u8; 32]>::try_from(k.as_slice()).map_err(|_| {
-                napi::Error::from(ScpNapiError::Validation {
-                    message: format!("platform_key must be exactly 32 bytes, got {}", k.len()),
-                    code: codes::VALID_7052.to_owned(),
+            scp_ffi_common::validate::expect_fixed_bytes::<32>(k.as_slice(), "platform_key")
+                .map_err(|msg| {
+                    napi::Error::from(ScpNapiError::Validation {
+                        message: msg,
+                        code: codes::VALID_7052.to_owned(),
+                    })
                 })
-            })
         })
         .transpose()?;
 

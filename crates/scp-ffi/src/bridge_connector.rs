@@ -167,10 +167,11 @@ pub fn py_bridge_register(
 
     let parsed_platform_key = platform_key
         .map(|k| {
-            <[u8; 32]>::try_from(k.as_slice()).map_err(|_| ScpPyError::ValidationError {
-                message: format!("platform_key must be exactly 32 bytes, got {}", k.len()),
-                code: codes::VALID_7052.to_string(),
-            })
+            scp_ffi_common::validate::expect_fixed_bytes::<32>(k.as_slice(), "platform_key")
+                .map_err(|msg| ScpPyError::ValidationError {
+                    message: msg,
+                    code: codes::VALID_7052.to_string(),
+                })
         })
         .transpose()?;
 
@@ -564,20 +565,18 @@ pub fn py_bridge_seal_shadow_envelope(
 
     let mode = parse_bridge_mode(bridge_mode)?;
 
-    // Wrap raw key material in Zeroizing to prevent lingering in freed heap
-    // memory after the Vec is dropped (defense-in-depth for FFI boundary).
+    // Narrow-and-zeroize the raw key material via the shared helper. The
+    // returned `Zeroizing<[u8; 32]>` is overwritten on drop (zeroize
+    // defense-in-depth for FFI boundary — ADR-006 / §5.12.3.1).
     let sender_key_bytes = Zeroizing::new(sender_key_bytes);
-    let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-        <[u8; 32]>::try_from(sender_key_bytes.as_slice()).map_err(|_| {
-            ScpPyError::ValidationError {
-                message: format!(
-                    "sender_key_bytes must be exactly 32 bytes, got {}",
-                    sender_key_bytes.len()
-                ),
-                code: codes::VALID_7054.to_string(),
-            }
-        })?,
-    );
+    let key_bytes = scp_ffi_common::validate::expect_fixed_bytes_zeroized::<32>(
+        sender_key_bytes.as_slice(),
+        "sender_key_bytes",
+    )
+    .map_err(|msg| ScpPyError::ValidationError {
+        message: msg,
+        code: codes::VALID_7054.to_string(),
+    })?;
     let sender_key = SenderKey::from_bytes(*key_bytes);
 
     let status = match provenance_status.as_deref() {
@@ -685,20 +684,18 @@ pub fn py_bridge_open_shadow_envelope(
             code: codes::VALID_7056.to_string(),
         })?;
 
-    // Wrap raw key material in Zeroizing to prevent lingering in freed heap
-    // memory after the Vec is dropped (defense-in-depth for FFI boundary).
+    // Narrow-and-zeroize the raw key material via the shared helper. The
+    // returned `Zeroizing<[u8; 32]>` is overwritten on drop (zeroize
+    // defense-in-depth for FFI boundary — ADR-006 / §5.12.3.1).
     let sender_key_bytes = Zeroizing::new(sender_key_bytes);
-    let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-        <[u8; 32]>::try_from(sender_key_bytes.as_slice()).map_err(|_| {
-            ScpPyError::ValidationError {
-                message: format!(
-                    "sender_key_bytes must be exactly 32 bytes, got {}",
-                    sender_key_bytes.len()
-                ),
-                code: codes::VALID_7054.to_string(),
-            }
-        })?,
-    );
+    let key_bytes = scp_ffi_common::validate::expect_fixed_bytes_zeroized::<32>(
+        sender_key_bytes.as_slice(),
+        "sender_key_bytes",
+    )
+    .map_err(|msg| ScpPyError::ValidationError {
+        message: msg,
+        code: codes::VALID_7054.to_string(),
+    })?;
     let sender_key = SenderKey::from_bytes(*key_bytes);
 
     // Evaluate bridge provenance trust level before decryption (§12.5).
@@ -754,17 +751,14 @@ pub fn py_bridge_derive_credential_key(
     bridge_id: &str,
 ) -> PyResult<Vec<u8>> {
     let bridge_credential_key = Zeroizing::new(bridge_credential_key);
-    let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-        <[u8; 32]>::try_from(bridge_credential_key.as_slice()).map_err(|_| {
-            ScpPyError::ValidationError {
-                message: format!(
-                    "bridge_credential_key must be exactly 32 bytes, got {}",
-                    bridge_credential_key.len()
-                ),
-                code: codes::VALID_7057.to_string(),
-            }
-        })?,
-    );
+    let key_bytes = scp_ffi_common::validate::expect_fixed_bytes_zeroized::<32>(
+        bridge_credential_key.as_slice(),
+        "bridge_credential_key",
+    )
+    .map_err(|msg| ScpPyError::ValidationError {
+        message: msg,
+        code: codes::VALID_7057.to_string(),
+    })?;
 
     let derived =
         derive_credential_key(&key_bytes, bridge_id).map_err(|e| ScpPyError::CryptoError {
@@ -1026,7 +1020,7 @@ fn bridge_credential_store_key_impl(
     let rt = crate::runtime()?;
     let store = credential_store_for(bi);
 
-    rt.block_on(store.store_bridge_credential_key(bridge_id, Zeroizing::new(key_bytes)))
+    rt.block_on(store.store_bridge_credential_key(bridge_id, key_bytes))
         .map_err(|e| ScpPyError::ContextError {
             message: format!("credential key store failed: {e}"),
             code: codes::CTX_2111.to_string(),
@@ -1232,17 +1226,15 @@ fn parse_credential_type(s: &str) -> PyResult<CredentialType> {
     }
 }
 
-fn parse_credential_key_bytes(key: &[u8]) -> PyResult<[u8; 32]> {
-    <[u8; 32]>::try_from(key).map_err(|_| {
-        ScpPyError::ValidationError {
-            message: format!(
-                "bridge_credential_key must be exactly 32 bytes, got {}",
-                key.len()
-            ),
-            code: codes::VALID_7057.to_string(),
-        }
-        .into()
-    })
+fn parse_credential_key_bytes(key: &[u8]) -> PyResult<Zeroizing<[u8; 32]>> {
+    scp_ffi_common::validate::expect_fixed_bytes_zeroized::<32>(key, "bridge_credential_key")
+        .map_err(|msg| {
+            ScpPyError::ValidationError {
+                message: msg,
+                code: codes::VALID_7057.to_string(),
+            }
+            .into()
+        })
 }
 
 fn parse_shadow_status(s: &str) -> PyResult<ShadowProvenanceStatus> {
@@ -1649,7 +1641,8 @@ mod tests {
         let key = [42u8; 32];
         let result = parse_credential_key_bytes(&key);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), key);
+        // Deref through Zeroizing to compare against the plain array.
+        assert_eq!(*result.unwrap(), key);
     }
 
     #[test]

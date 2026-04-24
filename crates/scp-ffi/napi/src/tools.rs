@@ -168,15 +168,14 @@ fn validate_implementation_hash(bytes: Option<&[u8]>) -> napi::Result<[u8; 32]> 
     bytes.map_or_else(
         || Ok([0u8; 32]),
         |b| {
-            <[u8; 32]>::try_from(b).map_err(|_| {
-                napi::Error::from(ScpNapiError::Validation {
-                    message: format!(
-                        "implementation_hash must be exactly 32 bytes, got {}",
-                        b.len()
-                    ),
-                    code: codes::VALID_7038.to_owned(),
-                })
-            })
+            scp_ffi_common::validate::expect_fixed_bytes::<32>(b, "implementation_hash").map_err(
+                |msg| {
+                    napi::Error::from(ScpNapiError::Validation {
+                        message: msg,
+                        code: codes::VALID_7038.to_owned(),
+                    })
+                },
+            )
         },
     )
 }
@@ -1011,16 +1010,16 @@ pub(crate) async fn tool_interface_revoke_on(
             code: codes::VALID_7042.to_owned(),
         })
     })?;
-    let interface_id: [u8; 32] =
-        <[u8; 32]>::try_from(interface_id_bytes.as_slice()).map_err(|_| {
-            napi::Error::from(ScpNapiError::Validation {
-                message: format!(
-                    "interface_id_hex must be exactly 32 bytes (64 hex chars), got {}",
-                    interface_id_bytes.len()
-                ),
-                code: codes::VALID_7042.to_owned(),
-            })
-        })?;
+    let interface_id: [u8; 32] = scp_ffi_common::validate::expect_fixed_bytes::<32>(
+        interface_id_bytes.as_slice(),
+        "interface_id_hex",
+    )
+    .map_err(|msg| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: msg,
+            code: codes::VALID_7042.to_owned(),
+        })
+    })?;
 
     let now_ms = scp_primitives::SystemClock.now_millis();
 

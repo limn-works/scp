@@ -1317,16 +1317,14 @@ fn tool_interface_revoke_impl(
             message: format!("invalid interface_id_hex: not valid hex: {e}"),
             code: codes::VALID_7042.to_owned(),
         })?;
-    let interface_id: [u8; 32] =
-        <[u8; 32]>::try_from(interface_id_bytes.as_slice()).map_err(|_| {
-            ScpPyError::ValidationError {
-                message: format!(
-                    "interface_id_hex must be exactly 32 bytes (64 hex chars), got {}",
-                    interface_id_bytes.len()
-                ),
-                code: codes::VALID_7042.to_owned(),
-            }
-        })?;
+    let interface_id: [u8; 32] = scp_ffi_common::validate::expect_fixed_bytes::<32>(
+        interface_id_bytes.as_slice(),
+        "interface_id_hex",
+    )
+    .map_err(|msg| ScpPyError::ValidationError {
+        message: msg,
+        code: codes::VALID_7042.to_owned(),
+    })?;
 
     let now_ms = scp_primitives::SystemClock.now_millis();
 
