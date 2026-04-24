@@ -1423,19 +1423,46 @@ impl CoreFields {
         // installing an empty manager would make later relay operations fail
         // with a confusing "no adapters" error instead of the clearer
         // "reconnect failed" we surface below.
-        if connected_count > 0
-            && let Err(e) = self.set_transport(Arc::new(manager))
-        {
-            tracing::warn!(
-                error = %e,
-                "reconnect_transport_if_pending: set_transport failed after successful reconnects"
-            );
-            if first_failure.is_none() {
-                first_failure = Some(LifecycleError::ReconnectFailed {
-                    url: String::new(),
-                    reason: e.to_string(),
-                });
+        let install_failed = if connected_count > 0 {
+            if let Err(e) = self.set_transport(Arc::new(manager)) {
+                tracing::warn!(
+                    error = %e,
+                    "reconnect_transport_if_pending: set_transport failed after successful reconnects"
+                );
+                if first_failure.is_none() {
+                    first_failure = Some(LifecycleError::ReconnectFailed {
+                        url: String::new(),
+                        reason: e.to_string(),
+                    });
+                }
+                true
+            } else {
+                false
             }
+        } else {
+            // No adapters connected — nothing installed, no install failure
+            // to distinguish from dial/panic failures.
+            false
+        };
+        // If at least one adapter actually landed in the transport manager,
+        // report success: the caller would otherwise see `Err` but observe
+        // a working transport, and a retry would duplicate the already-open
+        // sockets. Panics and per-URL dial failures are demoted to
+        // `tracing::warn!` in this case (the per-site warnings were already
+        // emitted above). If `set_transport` itself failed, we keep the
+        // error so the caller can distinguish "nothing landed" from
+        // "transport live with some losses".
+        if connected_count > 0 && !install_failed {
+            if let Some(err) = first_failure.as_ref() {
+                tracing::warn!(
+                    error = %err,
+                    connected_count,
+                    "reconnect_transport_if_pending: partial success — transport installed \
+                     with {connected_count} adapter(s); some dials failed or panicked but the \
+                     bridge is usable"
+                );
+            }
+            return Ok(());
         }
         first_failure.map_or(Ok(()), Err)
     }
