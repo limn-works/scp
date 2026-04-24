@@ -335,14 +335,17 @@ pub(crate) async fn transport_status_on(
         }
         return Ok(status);
     }
-    // Handleless probe — mirrors PyO3/WASM `transport_status()`. Reports
-    // whether a `TransportManager` is wired on this bridge; the relay URL /
-    // latency fields are null because those live on the handle, not in
-    // the bridge instance.
+    // Handleless probe — mirrors UniFFI `Scp::transport_manager_status`
+    // (PyO3 and WASM have their own per-bridge-state probes with different
+    // contracts). Reports whether a `TransportManager` is wired on this
+    // bridge; the relay URL / latency fields are null because those live
+    // on the handle, not in the bridge instance.
+    let (connected, relay_url, latency_ms) =
+        scp_ffi_common::handleless_transport_status(has_transport_manager_on(bi));
     Ok(NapiTransportStatus {
-        connected: has_transport_manager_on(bi),
-        relay_url: None,
-        latency_ms: None,
+        connected,
+        relay_url,
+        latency_ms,
     })
 }
 

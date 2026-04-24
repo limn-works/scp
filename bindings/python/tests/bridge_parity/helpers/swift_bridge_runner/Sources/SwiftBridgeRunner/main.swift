@@ -499,7 +499,7 @@ func opTransportStatus(_ req: BridgeRequest) async throws -> [String: JSONValue]
     return [
         "connected": .bool(status.connected),
         "relay_url": status.relayUrl.map(JSONValue.string) ?? .null,
-        "latency_ms": status.latencyMs.map { .number($0) } ?? .null,
+        "latency_ms": status.latencyMs.map { JSONValue.number(Double($0)) } ?? .null,
     ]
 }
 

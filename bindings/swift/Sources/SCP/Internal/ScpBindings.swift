@@ -3012,6 +3012,33 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func transportDisconnect(manager: TransportManager) async throws 
     
     /**
+     * Handleless transport-status probe — reports whether a
+     * `TransportManager` is currently installed on this `SCP`
+     * instance without requiring the caller to construct a
+     * [`TransportManager`] handle first.
+     *
+     * Mirrors `PyO3`'s `Scp::transport_status()`, NAPI's
+     * `Scp::transportStatus(undefined)`, and WASM's
+     * `transport_status()` so the cross-bridge parity harness
+     * (ADR-046) can compare the disconnected-state shape across all
+     * four bridges without needing a relay fixture for the `UniFFI`
+     * runners (ADR-048 §7a).
+     *
+     * Returns `connected = has_transport()`, and always `None` for
+     * both `relay_url` and `latency_ms` — matching the NAPI
+     * handleless probe's contract (the relay URL lives on the
+     * `TransportManager` handle, not on the bridge instance, so it
+     * is only observable via [`Self::transport_status`]). The
+     * disconnected shape — the only shape the parity harness
+     * exercises — is `(false, None, None)` across all four bridges.
+     *
+     * Since the result is stateless as far as the bridge is
+     * concerned (no cross-instance handle is passed in), there is no
+     * handle-affinity check to perform.
+     */
+    func transportManagerStatus() async throws  -> TransportStatus
+    
+    /**
      * Per-instance equivalent of the free-function `transport_status`.
      *
      * Routes through `&*self.inner`. Rejects any `TransportManager`
@@ -5890,6 +5917,48 @@ open func transportDisconnect(manager: TransportManager)async throws   {
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
             liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Handleless transport-status probe — reports whether a
+     * `TransportManager` is currently installed on this `SCP`
+     * instance without requiring the caller to construct a
+     * [`TransportManager`] handle first.
+     *
+     * Mirrors `PyO3`'s `Scp::transport_status()`, NAPI's
+     * `Scp::transportStatus(undefined)`, and WASM's
+     * `transport_status()` so the cross-bridge parity harness
+     * (ADR-046) can compare the disconnected-state shape across all
+     * four bridges without needing a relay fixture for the `UniFFI`
+     * runners (ADR-048 §7a).
+     *
+     * Returns `connected = has_transport()`, and always `None` for
+     * both `relay_url` and `latency_ms` — matching the NAPI
+     * handleless probe's contract (the relay URL lives on the
+     * `TransportManager` handle, not on the bridge instance, so it
+     * is only observable via [`Self::transport_status`]). The
+     * disconnected shape — the only shape the parity harness
+     * exercises — is `(false, None, None)` across all four bridges.
+     *
+     * Since the result is stateless as far as the bridge is
+     * concerned (no cross-instance handle is passed in), there is no
+     * handle-affinity check to perform.
+     */
+open func transportManagerStatus()async throws  -> TransportStatus  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_transport_manager_status(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeTransportStatus_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -14843,6 +14912,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_disconnect() != 45973) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_manager_status() != 45644) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_status() != 20055) {
