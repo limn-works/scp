@@ -594,7 +594,7 @@
       "gate": "gate-rename",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-mcp/src/lib.rs",
         "crates/scp-mcp/src/namespace.rs",
