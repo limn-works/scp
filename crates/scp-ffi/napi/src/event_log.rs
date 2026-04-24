@@ -92,6 +92,19 @@ pub(crate) async fn event_log_query_on(
         .and_then(|f| f.get("event_type").or_else(|| f.get("eventType")))
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
+    let actor_did_filter = filter
+        .as_ref()
+        .and_then(|f| f.get("actor_did").or_else(|| f.get("actorDid")))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let after_sequence_filter = filter
+        .as_ref()
+        .and_then(|f| f.get("after_sequence").or_else(|| f.get("afterSequence")))
+        .and_then(serde_json::Value::as_u64);
+    let before_sequence_filter = filter
+        .as_ref()
+        .and_then(|f| f.get("before_sequence").or_else(|| f.get("beforeSequence")))
+        .and_then(serde_json::Value::as_u64);
 
     // Query the ContextManager's event log provider for real Merkle entries.
     // The UCAN state event log is a separate per-context instance; the
@@ -107,30 +120,53 @@ pub(crate) async fn event_log_query_on(
         && !entries.is_empty()
     {
         // Build NapiEvent list from the ContextManager's Merkle entries.
-        // EventLogEntry has: event (name), timestamp, prev_hash, hash.
-        // Map event → event_type, no actor_did (unknown), index → sequence.
+        // EventLogEntry carries `event`, `actor_did`, `timestamp`, `hash`; index
+        // within the entries slice becomes `sequence`. Filter semantics mirror
+        // UniFFI's `event_log_query`: `after_sequence` / `before_sequence` are
+        // exclusive on both ends.
         #[allow(clippy::cast_precision_loss)]
-        let events: Vec<NapiEvent> = entries
-            .iter()
-            .enumerate()
-            .filter(|(_idx, entry)| event_type_filter.as_ref().is_none_or(|f| entry.event == *f))
-            .map(|(idx, entry)| NapiEvent {
+        let mut events: Vec<NapiEvent> = Vec::new();
+        for (idx, entry) in entries.iter().enumerate() {
+            let seq = idx as u64;
+            if let Some(after) = after_sequence_filter
+                && seq <= after
+            {
+                continue;
+            }
+            if let Some(before) = before_sequence_filter
+                && seq >= before
+            {
+                continue;
+            }
+            if let Some(ref et) = event_type_filter
+                && entry.event != *et
+            {
+                continue;
+            }
+            if let Some(ref actor) = actor_did_filter
+                && entry.actor_did != *actor
+            {
+                continue;
+            }
+            #[allow(clippy::cast_precision_loss)]
+            events.push(NapiEvent {
                 event_type: entry.event.clone(),
-                actor_did: String::new(), // EventLogEntry does not carry actor DID
+                actor_did: entry.actor_did.clone(),
                 timestamp: entry.timestamp as f64,
                 payload_json: serde_json::json!({
                     "hash": hex::encode(entry.hash),
                 })
                 .to_string(),
-                sequence: idx as f64,
-            })
-            .collect();
+                sequence: seq as f64,
+            });
+            if let Some(lim) = limit
+                && events.len() >= lim
+            {
+                break;
+            }
+        }
 
-        return if let Some(lim) = limit {
-            Ok(events.into_iter().take(lim).collect())
-        } else {
-            Ok(events)
-        };
+        return Ok(events);
     }
 
     // Fallback: read from the per-context UCAN state event log.

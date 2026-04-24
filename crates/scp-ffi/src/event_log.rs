@@ -238,8 +238,26 @@ fn query_manager_entries(
 
     let mut py_events = Vec::new();
     for (idx, entry) in entries.iter().enumerate() {
+        let seq = idx as u64;
+        // Apply sequence range filters (exclusive on both ends to match
+        // UniFFI's `after_sequence` / `before_sequence` semantics).
+        if let Some(after) = query_filter.sequence_start
+            && seq <= after
+        {
+            continue;
+        }
+        if let Some(before) = query_filter.sequence_end
+            && seq >= before
+        {
+            continue;
+        }
         if let Some(ref et) = query_filter.event_type
             && entry.event != *et
+        {
+            continue;
+        }
+        if let Some(ref actor) = query_filter.actor_did
+            && entry.actor_did != *actor
         {
             continue;
         }
@@ -251,11 +269,10 @@ fn query_manager_entries(
         let payload = json_to_py_dict(py, &payload_json)?;
         py_events.push(PyEvent {
             event_type: entry.event.clone(),
-            // `EventLogEntry` does not carry actor DID.
-            actor_did: String::new(),
+            actor_did: entry.actor_did.clone(),
             timestamp,
             payload,
-            sequence: idx as u64,
+            sequence: seq,
         });
         if let Some(limit) = query_filter.limit
             && py_events.len() >= limit
