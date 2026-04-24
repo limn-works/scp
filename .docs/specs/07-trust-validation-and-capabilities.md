@@ -137,7 +137,7 @@ This transforms claims about the past from trust-dependent to validation-depende
 The protocol defines a standard participation record format derivable from context event logs. A participation record is not a reputation score (opaque, gameable, subjective). It is a set of verifiable facts:
 
 - Number of contexts participated in, with duration
-- Tool invocations by type and frequency
+- Outlet invocations by type and frequency
 - Governance actions taken against this identity (warnings, role demotions, ejections)
 - Governance actions taken by this identity (if in a governance role)
 - Role progression history (promotions, demotions)
@@ -153,7 +153,7 @@ Each fact is verifiable against the relevant context's Merkle root. The particip
    - `participation_duration_secs`: `(latest_event_timestamp - MemberJoined_timestamp)` for the target DID. If the member has left and rejoined, sum all intervals.
    - `governance_actions_against`: Count of events with type `GovernanceActionExecuted` where `subject_did == target_did`.
    - `governance_actions_by`: Count of events with type `GovernanceActionExecuted` where `actor_did == target_did`.
-   - `tool_invocation_count`: Count of events with type `ToolInvoked` where `actor_did == target_did`.
+   - `outlet_invocation_count`: Count of events with type `OutletInvoked` where `actor_did == target_did`.
    - `context_creation_count`: Count of events with type `ChildContextCreated` where `actor_did == target_did`. This is per-context (counts child contexts created within this context only, not globally).
    - `role_progression_count`: Count of events with type `RoleAssigned` where `subject_did == target_did`.
    - `attestation_count`: Count of events with type `AttestationPublished` where `actor_did == target_did`.
@@ -161,7 +161,7 @@ Each fact is verifiable against the relevant context's Merkle root. The particip
 4. **Aggregation.** Sum each fact across all contexts to produce the aggregate participation record. The aggregate is NOT signed — it is a local computation. Only per-context `ParticipationProfile` attestations (§7.3.2.1) are signed.
 5. **Freshness.** Each fact carries the `updated_at` timestamp from its source context. Stale facts (older than the consumer's `max_age_secs` requirement) are excluded from the aggregate.
 
-Participation records replace endorsements as the primary input to evaluation for established identities. Instead of "Bob says Carol is trustworthy for scheduling," the evaluating agent can see: "Carol has invoked scheduling tools 203 times across 14 contexts over 8 months. Zero governance actions. Three contexts promoted her to admin." These are facts, not opinions. Validated, not trusted.
+Participation records replace endorsements as the primary input to evaluation for established identities. Instead of "Bob says Carol is trustworthy for scheduling," the evaluating agent can see: "Carol has invoked scheduling outlets 203 times across 14 contexts over 8 months. Zero governance actions. Three contexts promoted her to admin." These are facts, not opinions. Validated, not trusted.
 
 #### 7.3.2.1 Participation Admission Requirements
 

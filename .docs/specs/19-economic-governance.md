@@ -479,7 +479,7 @@ Economic governance introduces new event types for the verifiable event log (ADR
 | `SpendingUcanGranted` | Human grants spending UCAN to agent | Agent key `#agent` on human's DID, `SpendingCapability` summary (amounts, window), UCAN token ID |
 | `SpendingUcanRevoked` | Human revokes spending UCAN | UCAN token ID, revocation reason |
 
-These extend the existing event type enum alongside `MessageSent`, `MemberJoined`, `RoleAssigned`, `ToolInvoked`, etc. All economic events carry the same Merkle-tree inclusion guarantees as other event types.
+These extend the existing event type enum alongside `MessageSent`, `MemberJoined`, `RoleAssigned`, `OutletInvoked`, etc. All economic events carry the same Merkle-tree inclusion guarantees as other event types.
 
 ## 19.7 Anti-Spam via Cost Escalation
 

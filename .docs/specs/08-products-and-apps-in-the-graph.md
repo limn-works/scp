@@ -197,8 +197,8 @@ tool.description      →  description
 tool.inputSchema      →  schema.input
 tool.outputSchema     →  schema.output
 tools/list_changed    →  OutletUpdated / OutletRegistered / OutletDeregistered
-CallToolRequest       →  OutletStreamOpen (non-streaming: single-chunk collapse)
-CallToolResult        →  collected stream  (Data + End chunks flattened)
+tools/call request    →  OutletStreamOpen (non-streaming: single-chunk collapse)
+tools/call result     →  collected stream  (Data + End chunks flattened)
 isError               →  OutletError envelope (§5.4.4)
 ```
 

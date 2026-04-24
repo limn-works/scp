@@ -580,11 +580,11 @@ Canonical hash input:
 
 Total: 23 + 17 + 17 + 17 + 8 = 82 bytes
 
-Expected SHA-256 (implementations MUST recompute and publish the digest when this vector is regenerated under the SCP-OUTLET-OFFER-ID-V1 domain; the pre-rename 0xb9f0cd... digest was computed against the now-deleted SCP-OFFER-ID-V1 preimage and is no longer valid):
+Expected SHA-256 (implementations MUST recompute and publish the digest when this vector is regenerated under the SCP-OUTLET-OFFER-ID-V1 domain; the pre-rename 0xb9f0cd... digest was computed against the now-deleted pre-rename preimage and is no longer valid):
   <RECOMPUTE>
 ```
 
-The pre-rename domain `SCP-OFFER-ID-V1:` is deleted. The new domain `SCP-OUTLET-OFFER-ID-V1:` is registered in §9.18.2. Pre-rename fixtures and vectors under the old domain are rejected by validators post-merge per the ADR-049 hard-break policy.
+The pre-rename offer-id domain is deleted. The new domain `SCP-OUTLET-OFFER-ID-V1:` is registered in §9.18.2. Pre-rename fixtures and vectors under the old domain are rejected by validators post-merge per the ADR-049 hard-break policy.
 
 ## 25.16 Attestation ID Vectors (§3.5.2)
 
