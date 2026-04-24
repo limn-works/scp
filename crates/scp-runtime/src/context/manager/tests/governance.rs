@@ -14991,6 +14991,13 @@ async fn h17_setup_alice_and_bob(
         ctx.access
             .access_key_store
             .set(context_id, bob_did_str, bob_access_key.clone());
+        // §9.10.4: inject Bob's pseudonym so Alice's fan-out targets it.
+        if let super::super::ContextRouting::Encrypted {
+            pseudonym_registry, ..
+        } = &mut ctx.routing
+        {
+            pseudonym_registry.insert(bob_did_str.into(), [0xBBu8; 32]);
+        }
     }
 
     // -- Bob's manager --

@@ -159,6 +159,29 @@ async fn send_message_transport_failure_no_phantom_event() {
         .await
         .unwrap();
 
+    // §9.10.4: add a second member + their pseudonym so the encrypted
+    // fan-out has a routing ID to drive. A single-member encrypted send
+    // is a vacuous no-op (no peers to route to) — a multi-member send is
+    // what exercises the transport-failure path this test cares about.
+    {
+        let arc = manager.get_context_arc("test-ctx-fail").unwrap();
+        let mut ctx = arc.lock().await;
+        ctx.membership
+            .add_member("did:key:peer".into(), "member".into(), vec![]);
+        ctx.role_state.members.insert("did:key:peer".to_owned());
+        let peer_key =
+            scp_protocol::crypto::access_keys::generate_access_key("test-ctx-fail", "did:key:peer");
+        ctx.access
+            .access_key_store
+            .set("test-ctx-fail", "did:key:peer", peer_key);
+        if let super::super::ContextRouting::Encrypted {
+            pseudonym_registry, ..
+        } = &mut ctx.routing
+        {
+            pseudonym_registry.insert("did:key:peer".into(), [0xAAu8; 32]);
+        }
+    }
+
     let sk = signing_key_for_did(&"did:key:creator".into());
 
     // send_message should fail because FailingTransport.send_message
@@ -406,6 +429,17 @@ async fn setup_two_member_verified_context() -> (
         ctx.access
             .access_key_store
             .set("test-ctx", "did:key:bob", bob_access_key);
+
+        // §9.10.4: inject Bob's pseudonym into the registry so send_message's
+        // fan-out has a routing ID to target. In production this is populated
+        // via PseudonymAnnouncement MLS messages; here we short-circuit the
+        // round-trip.
+        if let super::super::ContextRouting::Encrypted {
+            pseudonym_registry, ..
+        } = &mut ctx.routing
+        {
+            pseudonym_registry.insert("did:key:bob".into(), [0xBBu8; 32]);
+        }
     }
 
     (manager, handle, sent)
@@ -1314,8 +1348,9 @@ async fn send_message_produces_non_empty_encrypted_blob() {
 // -----------------------------------------------------------------------
 
 /// Verifies that `send_message` produces bytes that can be deserialized as
-/// an `InnerEnvelope` (mock format) and that the routing ID passed to
-/// transport matches the domain-separated `context_routing_id`.
+/// an `InnerEnvelope` (mock format) and that the routing ID passed to the
+/// transport is a peer member's pseudonym (§9.10.4), NOT the shared
+/// `context_routing_id` (which was removed from the encrypted fan-out).
 #[tokio::test]
 async fn send_message_produces_valid_outer_envelope() {
     let transport = MockTransport::connected();
@@ -1347,6 +1382,29 @@ async fn send_message_produces_valid_outer_envelope() {
         .await
         .unwrap();
 
+    // Add a peer + their pseudonym so fan-out targets something.
+    const PEER_PSEUDONYM: [u8; 32] = [0xCCu8; 32];
+    {
+        let arc = manager.get_context_arc("envelope-test-ctx").unwrap();
+        let mut ctx = arc.lock().await;
+        ctx.membership
+            .add_member("did:key:peer".into(), "member".into(), vec![]);
+        ctx.role_state.members.insert("did:key:peer".to_owned());
+        let peer_key = scp_protocol::crypto::access_keys::generate_access_key(
+            "envelope-test-ctx",
+            "did:key:peer",
+        );
+        ctx.access
+            .access_key_store
+            .set("envelope-test-ctx", "did:key:peer", peer_key);
+        if let super::super::ContextRouting::Encrypted {
+            pseudonym_registry, ..
+        } = &mut ctx.routing
+        {
+            pseudonym_registry.insert("did:key:peer".into(), PEER_PSEUDONYM);
+        }
+    }
+
     let sk = signing_key_for_did(&"did:key:creator".into());
 
     manager
@@ -1361,7 +1419,7 @@ async fn send_message_produces_valid_outer_envelope() {
         .await
         .unwrap();
 
-    // 1. Verify transport received exactly one message.
+    // 1. Verify transport received exactly one message (one peer → one send).
     let sent = sent_handle.lock().unwrap();
     assert_eq!(sent.len(), 1, "exactly one message should be sent");
 
@@ -1378,21 +1436,20 @@ async fn send_message_produces_valid_outer_envelope() {
         "InnerEnvelope context_id must match"
     );
 
-    // 3. Verify routing ID uses domain-separated derivation.
+    // 3. Verify routing ID is the peer's pseudonym — per-member routing
+    //    per §9.10.4. The shared context_routing_id is no longer used for
+    //    encrypted contexts.
     let routing_ids = routing_handle.lock().unwrap();
     assert_eq!(routing_ids.len(), 1, "exactly one routing ID");
-    let expected_routing_id = scp_protocol::context::context_routing_id("envelope-test-ctx");
     assert_eq!(
-        routing_ids[0], expected_routing_id,
-        "routing ID must use domain-separated context_routing_id, \
-         not raw context_id_bytes"
+        routing_ids[0], PEER_PSEUDONYM,
+        "routing ID must be the peer's pseudonym (§9.10.4)"
     );
-
-    // 4. Verify routing ID is NOT the raw context_id_bytes.
-    let raw_bytes = scp_protocol::context::context_id_bytes("envelope-test-ctx");
     assert_ne!(
-        routing_ids[0], raw_bytes,
-        "routing ID must differ from raw context_id_bytes"
+        routing_ids[0],
+        scp_protocol::context::context_routing_id("envelope-test-ctx"),
+        "routing ID must NOT be the shared context_routing_id — \
+         encrypted fan-out is pseudonym-only"
     );
 }
 
@@ -3724,6 +3781,16 @@ async fn setup_two_member_context_with(
         ctx.access
             .access_key_store
             .set("test-ctx", "did:key:bob", bob_access_key);
+
+        // §9.10.4: inject Bob's pseudonym into the registry so send_message's
+        // fan-out has a routing ID to target. In production this is populated
+        // via PseudonymAnnouncement MLS messages.
+        if let super::super::ContextRouting::Encrypted {
+            pseudonym_registry, ..
+        } = &mut ctx.routing
+        {
+            pseudonym_registry.insert("did:key:bob".into(), [0xBBu8; 32]);
+        }
     }
 
     (manager, handle, sent)
@@ -4485,6 +4552,7 @@ async fn local_pseudonym_errors_on_broadcast_context() {
 
     let params = ContextParams {
         mode: scp_protocol::context::params::ContextMode::Broadcast,
+        memory_scope: scp_protocol::context::params::MemoryScope::Full,
         ..ContextParams::default()
     };
 
