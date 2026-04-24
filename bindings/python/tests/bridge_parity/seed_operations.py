@@ -731,33 +731,29 @@ OP_UCAN_VALIDATE_MALFORMED = OpSpec(
 # ---------------------------------------------------------------------------
 # op 9: transport_status_disconnected
 #
-# Query the transport status with no relay connected. All four bridges
-# expose a handleless stateless-probe path:
-#
-#   - PyO3: `transport_status()` with no argument.
-#   - WASM: `transport_status()` with no argument.
-#   - NAPI: `transport_status(manager: Option<&NapiTransportManager>)` —
-#     pass `null` for the stateless probe.
-#   - UniFFI: `transport_status(manager: Option<Arc<TransportManager>>)`
-#     — pass `None`/`nil` for the stateless probe.
+# Query the transport status with no relay connected.
 #
 # **Bridge semantics differ for this op**:
-#   - **PyO3, NAPI, UniFFI**: `transport_status()` is a REAL probe —
-#     returns the current relay connection state. With no connect, that
-#     state is `{connected: false, relay_url: None, latency_ms: None}`
-#     (spec-committed).
-#   - **WASM**: `transport_status()` is a SHAPE ASSERTION — WASM has no
-#     network-capable transport on the `wasm32-unknown-unknown` target
+#   - **PyO3**: `SCP.transport_status()` — handleless instance method,
+#     returns the per-instance BridgeInstance snapshot. With no connect,
+#     that state is `{connected: false, relay_url: None, latency_ms: None}`.
+#   - **NAPI**: `SCP.transportStatus(manager: Option<&NapiTransportManager>)`
+#     — pass `null` for the stateless probe path on the same instance.
+#   - **WASM**: `transport_status()` — free function, SHAPE ASSERTION only.
+#     WASM has no network-capable transport on `wasm32-unknown-unknown`
 #     (ADR-034), so the bridge hardcodes the disconnected triple. The
-#     parity gate exercises the SHAPE — that WASM's return value matches
-#     the other bridges' disconnected shape exactly. Comparing WASM's
-#     "connected state" to a real probe is meaningless; comparing its
-#     shape IS meaningful, and this op pins that.
+#     parity gate pins the cross-bridge shape commitment.
+#   - **UniFFI (Kotlin/Swift)**: `Scp.transportStatus(manager:
+#     TransportManager)` — REQUIRES a non-optional TransportManager handle
+#     after ADR-048 Phase D / #1549 PR 4. The prior handleless probe was
+#     deleted when the process-wide default bridge was removed; without a
+#     relay fixture to wire up a real `transport_connect` first, the
+#     runners cannot produce a TransportManager.
 #
-# Changing WASM to probe real transport state would require wiring a JS
-# callback injection point (see `custody.rs` / `storage.rs` for the
-# pattern), which is out of scope for ADR-046 — this gate locks in the
-# cross-bridge shape commitment until that happens.
+# UniFFI is xfailed below on that basis. Aligning UniFFI with the other
+# bridges requires either exposing a handleless instance-level probe on
+# `Scp` or teaching the parity harness to spin up a relay fixture — both
+# are cross-cutting enough to track outside this gate.
 # ---------------------------------------------------------------------------
 
 
@@ -789,6 +785,13 @@ OP_TRANSPORT_STATUS = OpSpec(
         ("connected", False),
         ("relay_url", None),
         ("latency_ms", None),
+    ),
+    xfail_bridges=("uniffi-kotlin", "uniffi-swift"),
+    xfail_reason=(
+        "UniFFI `Scp.transportStatus(manager)` requires a non-optional "
+        "TransportManager after ADR-048 Phase D; parity harness has no "
+        "relay fixture to produce one. PyO3/NAPI/WASM keep a handleless "
+        "path and match exactly."
     ),
 )
 
