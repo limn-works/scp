@@ -413,7 +413,7 @@
       "gate": "gate-rename",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/tools.rs",
         "crates/scp-ffi/src/lib.rs",
