@@ -10,15 +10,65 @@
 //! - [`namespace`] -- Context namespace parsing (`context_id/tool_name`
 //!   splitting) and built-in tool definitions (`send_message`, `read_messages`,
 //!   `list_members`).
-//! - [`server`] -- MCP server: tool listing with capability filtering, tool
-//!   invocation routing, resource listing/reading/subscriptions, and MCP
-//!   lifecycle handling.
+//! - [`translator`] -- Purely lexical `outlet` ↔ `tool` boundary translation
+//!   per §8.5.1 / ADR-049. MCP messages inbound are rewritten to SCP outlet
+//!   vocabulary; SCP messages outbound are rewritten to MCP tool vocabulary.
+//!   Wire shape is preserved in both directions; each message is translated
+//!   in isolation (no state is kept across translations).
+//! - [`server`] -- MCP server: tool listing with capability filtering,
+//!   outlet invocation routing, resource listing/reading/subscriptions, and
+//!   MCP lifecycle handling. Uses SCP outlet vocabulary internally; the MCP
+//!   wire boundary goes through [`translator`].
+//! - [`client`] -- MCP client used by an SCP agent to consume tools from
+//!   external MCP servers. Outbound requests are rewritten via
+//!   [`translator::scp_to_mcp`] so the external server receives MCP-shaped
+//!   JSON; inbound responses are rewritten via [`translator::mcp_to_scp`].
 //!
 //! Any MCP-compatible model (Claude, GPT, Gemini, open-source models) can
-//! participate in SCP contexts without knowing SCP exists -- it sees MCP tools
+//! participate in SCP contexts without knowing SCP exists — it sees MCP tools
 //! namespaced by context, calls them, and gets results.
 //!
-//! See ADR-015 in `.docs/adrs/phase-3.md` for the full design.
+//! # Example: outbound tools/list round-trip
+//!
+//! ```
+//! use scp_mcp::translator::{mcp_to_scp, scp_to_mcp};
+//! use serde_json::json;
+//!
+//! // An MCP client sends tools/list; the SCP agent translates it to
+//! // outlet list before routing.
+//! let mcp = json!({
+//!     "jsonrpc": "2.0",
+//!     "method": "tools/list",
+//!     "id": 1
+//! });
+//! let scp = mcp_to_scp(mcp.clone());
+//! assert_eq!(scp["method"], "outlet list");
+//!
+//! // The reverse converts an SCP message back to MCP wire format.
+//! let mcp_again = scp_to_mcp(scp);
+//! assert_eq!(mcp_again["method"], "tools/list");
+//! ```
+//!
+//! # Example: kind-aware tools/call round-trip
+//!
+//! ```
+//! use scp_mcp::translator::{mcp_to_scp, OutletKind};
+//! use serde_json::json;
+//!
+//! let mcp = json!({
+//!     "jsonrpc": "2.0",
+//!     "method": "tools/call",
+//!     "params": { "name": "query.lookup_users", "arguments": { "q": "alice" } },
+//!     "id": 42
+//! });
+//! let scp = mcp_to_scp(mcp);
+//! assert_eq!(scp["params"]["outlet_id"], "lookup_users");
+//! assert_eq!(scp["params"]["kind"], "Query");
+//! # let _ = OutletKind::Query;
+//! ```
+//!
+//! See ADR-015 in `.docs/adrs/phase-3.md` and ADR-049 §8.5.1 for the full
+//! design.
 
 #![forbid(unsafe_code)]
 
@@ -29,3 +79,4 @@ pub mod protocol;
 pub mod server;
 pub mod sse;
 pub mod stdio;
+pub mod translator;

@@ -6005,7 +6005,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         &self.agent_did
     }
 
-    fn context_tools(&self, context_id: &str) -> Vec<scp_mcp::server::ContextToolInfo> {
+    fn context_tools(&self, context_id: &str) -> Vec<scp_mcp::server::ContextOutletInfo> {
         // Look up the ContextHandle from the global registry and read its
         // outlet_registry.
         let registry = context_handle_registry();
@@ -6015,12 +6015,15 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         let outlet_registry = handle.outlet_registry.blocking_lock();
         outlet_registry
             .registrations()
-            .map(|t| scp_mcp::server::ContextToolInfo {
+            .map(|t| scp_mcp::server::ContextOutletInfo {
                 name: t.name.clone(),
                 description: Some(t.description.clone()),
                 input_schema: t.schema.input_schema.clone(),
                 output_schema: Some(t.schema.output_schema.clone()),
                 admin_only: false,
+                // Default to Action per the SCP-OUT-007 sentinel; real
+                // classification lands in SCP-OUT-017.
+                kind: scp_mcp::translator::OutletKind::Action,
             })
             .collect()
     }
@@ -6136,16 +6139,14 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn invoke_tool(
+    fn invoke_outlet(
         &self,
         context_id: &str,
-        tool_name: &str,
+        outlet_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        // MCP trait uses canonical `tool` / `invoke_tool` vocabulary; the
-        // SCP runtime below uses outlet vocabulary (see OUT-007 for the
-        // scp-mcp lexical translator story).
-        let outlet_name = tool_name;
+        // MCP trait uses SCP outlet vocabulary per SCP-OUT-007; boundary
+        // translation to MCP `tool` naming happens in the translator module.
         let start = std::time::Instant::now();
         let agent_did = self.agent_did.clone();
         let timeout = std::time::Duration::from_millis(self.tool_timeout_ms);

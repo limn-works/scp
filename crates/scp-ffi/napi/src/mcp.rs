@@ -391,7 +391,7 @@ impl ContextProvider for McpNapiBridgeProvider {
         &self.agent_did
     }
 
-    fn context_tools(&self, _context_id: &str) -> Vec<scp_mcp::server::ContextToolInfo> {
+    fn context_tools(&self, _context_id: &str) -> Vec<scp_mcp::server::ContextOutletInfo> {
         Vec::new()
     }
 
@@ -407,16 +407,16 @@ impl ContextProvider for McpNapiBridgeProvider {
         Err("capability validation not implemented — wire a production ContextProvider".to_owned())
     }
 
-    fn invoke_tool(
+    fn invoke_outlet(
         &self,
         _context_id: &str,
-        _tool_name: &str,
+        _outlet_name: &str,
         _arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        // MCP trait uses canonical `tool` vocabulary; bridge still uses
-        // outlet-era naming internally (see OUT-007 lexical translator).
+        // MCP trait uses SCP outlet vocabulary (SCP-OUT-007); boundary
+        // translation to MCP `tool` naming happens in the translator module.
         Err(
-            "tool invocation through MCP server requires ContextManager outlet registry integration"
+            "outlet invocation through MCP server requires ContextManager outlet registry integration"
                 .to_owned(),
         )
     }

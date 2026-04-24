@@ -48,7 +48,7 @@ use pyo3::types::PyDict;
 use scp_mcp::allowlist;
 use scp_mcp::client::{McpClient, McpTransport, SystemTimestamp};
 use scp_mcp::protocol::{JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
-use scp_mcp::server::{ContextProvider, ContextToolInfo, McpServer, MemberInfo};
+use scp_mcp::server::{ContextOutletInfo, ContextProvider, McpServer, MemberInfo};
 use scp_platform::traits::Storage;
 
 use crate::error::ScpPyError;
@@ -631,17 +631,20 @@ impl ContextProvider for FfiBridgeProvider {
         &self.agent_did
     }
 
-    fn context_tools(&self, context_id: &str) -> Vec<ContextToolInfo> {
+    fn context_tools(&self, context_id: &str) -> Vec<ContextOutletInfo> {
         crate::runtime::with_context(context_id, |rt| {
             let tools = rt
                 .outlet_registry
                 .registrations()
-                .map(|t| ContextToolInfo {
+                .map(|t| ContextOutletInfo {
                     name: t.name.clone(),
                     description: Some(t.description.clone()),
                     input_schema: t.schema.input_schema.clone(),
                     output_schema: Some(t.schema.output_schema.clone()),
                     admin_only: false,
+                    // Default to Action per the SCP-OUT-007 sentinel; real
+                    // classification lands in SCP-OUT-017.
+                    kind: scp_mcp::translator::OutletKind::Action,
                 })
                 .collect();
             Ok(tools)
@@ -738,16 +741,15 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     #[allow(clippy::too_many_lines)] // Three-phase dispatch: validate + execute + emit event.
-    fn invoke_tool(
+    fn invoke_outlet(
         &self,
         context_id: &str,
-        tool_name: &str,
+        outlet_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        // Shim: the MCP ContextProvider trait uses MCP-canonical `tool` /
-        // `invoke_tool` vocabulary; the SCP runtime below is on outlet
-        // vocabulary. Rename local bindings to match what the body expects.
-        let outlet_name = tool_name;
+        // The MCP ContextProvider trait uses SCP outlet vocabulary (SCP-OUT-007);
+        // boundary translation to MCP `tool` naming happens in the translator
+        // module. See §8.5.1.
         // Validates tool existence and input schema, then dispatches to a
         // registered handler if one exists. If no handler is registered, falls
         // back to echoing the validated input with metadata (schema-only mode).
@@ -2529,7 +2531,7 @@ mod tests {
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
-        let result = provider.invoke_tool(&ctx_id, "calculator", input.clone());
+        let result = provider.invoke_outlet(&ctx_id, "calculator", input.clone());
         assert!(result.is_ok(), "invoke_outlet should succeed: {result:?}");
 
         let output = result.unwrap();
@@ -2573,7 +2575,7 @@ mod tests {
 
         // Invoke in echo mode (no handler registered).
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
         assert!(result.is_ok(), "invoke_outlet should succeed: {result:?}");
 
         // Verify the event log now has one event.
@@ -2588,7 +2590,7 @@ mod tests {
 
         // Invoke again to verify sequential appending.
         let result2 =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 5, "b": 6}));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 5, "b": 6}));
         assert!(result2.is_ok());
 
         let final_count = crate::runtime::with_context(&ctx_id, |rt| {
@@ -2627,7 +2629,7 @@ mod tests {
         };
 
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 10, "b": 20}));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 10, "b": 20}));
         assert!(result.is_ok(), "invoke_outlet should succeed: {result:?}");
         assert_eq!(result.unwrap(), serde_json::json!({"result": 30.0}));
 
@@ -2667,7 +2669,7 @@ mod tests {
 
         // Invoke with invalid input (schema validation fails).
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!("not an object"));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!("not an object"));
         assert!(result.is_err(), "invalid input should be rejected");
 
         // Event log should still be empty (no event appended on error).
@@ -2704,7 +2706,7 @@ mod tests {
         // Input schema requires an object with "a" and "b" as required fields.
         // Pass a string instead.
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!("not an object"));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!("not an object"));
         assert!(result.is_err(), "invalid input should be rejected");
         let err = result.unwrap_err();
         assert!(
@@ -2713,7 +2715,7 @@ mod tests {
         );
 
         // Pass an object missing required fields.
-        let result = provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1}));
+        let result = provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1}));
         assert!(
             result.is_err(),
             "input missing required field 'b' should be rejected"
@@ -2721,7 +2723,7 @@ mod tests {
 
         // Pass valid input — should succeed.
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
         assert!(result.is_ok(), "valid input should succeed: {result:?}");
 
         crate::runtime::remove_context(&ctx_id);
@@ -2745,7 +2747,7 @@ mod tests {
             agent_proof_tokens: None,
         };
 
-        let result = provider.invoke_tool(&ctx_id, "nonexistent", serde_json::json!({}));
+        let result = provider.invoke_outlet(&ctx_id, "nonexistent", serde_json::json!({}));
         assert!(result.is_err(), "unknown tool should be rejected");
         let err = result.unwrap_err();
         assert!(
@@ -2903,7 +2905,7 @@ mod tests {
         };
 
         let input = serde_json::json!({"a": 3, "b": 4});
-        let result = provider.invoke_tool(&ctx_id, "calculator", input);
+        let result = provider.invoke_outlet(&ctx_id, "calculator", input);
         assert!(result.is_ok(), "invoke_outlet should succeed: {result:?}");
 
         let output = result.unwrap();
@@ -2966,7 +2968,7 @@ mod tests {
         };
 
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
         assert!(
             result.is_err(),
             "handler returning invalid output should be rejected"
@@ -3001,7 +3003,7 @@ mod tests {
         };
 
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
         assert!(result.is_err(), "failing handler should propagate error");
         let err = result.unwrap_err();
         assert!(
@@ -3039,7 +3041,7 @@ mod tests {
         };
 
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
         assert!(result.is_err(), "blocking handler should be timed out");
         let err = result.unwrap_err();
         assert!(
@@ -3085,7 +3087,7 @@ mod tests {
         };
 
         let result =
-            provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 3, "b": 4}));
+            provider.invoke_outlet(&ctx_id, "calculator", serde_json::json!({"a": 3, "b": 4}));
         assert!(
             result.is_ok(),
             "fast handler should complete within timeout: {result:?}"
