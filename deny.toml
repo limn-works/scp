@@ -49,6 +49,14 @@ ignore = [
     # libcrux-sha3: incorrect incremental SHAKE XOF output. Transitive via
     # openmls -> openmls_libcrux_crypto. Awaiting openmls upgrade.
     "RUSTSEC-2026-0074",
+    # rand 0.8.5 unsound: aliased mutable reference when a custom logger
+    # calls `rand::rng()` during ThreadRng reseed. Transitive via
+    # hpke-rs-rust-crypto -> openmls_rust_crypto. Cannot upgrade: hpke-rs
+    # pins rand ^0.8; fix requires rand >= 0.9.3. SCP uses tracing (not
+    # log) and no logging callback generates random data, so the specific
+    # soundness violation is unreachable in our code path. Awaiting
+    # hpke-rs upstream upgrade.
+    "RUSTSEC-2026-0097",
     # rustls-webpki: URI name constraints incorrectly accepted + wildcard
     # name constraints accepted. Transitive via rustls -> webpki. Awaiting
     # upstream rustls-webpki patch.
