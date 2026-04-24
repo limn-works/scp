@@ -1138,10 +1138,10 @@ pub(crate) async fn context_subscribe_on(
         let _active_flag_guard = ActiveFlagGuard(Some(active_flag));
 
         // Collect the member's pseudonym from the ContextManager state.
-        // Done inside the async block because local_pseudonym is async.
-        // Broadcast contexts have no per-member pseudonyms (spec §5.14) —
-        // `local_pseudonym` errors for them, which we map back to `None`.
-        let local_pseudonym: Option<[u8; 32]> = if is_broadcast {
+        // Broadcast contexts have no per-member pseudonyms (spec §5.14); the
+        // runtime's `local_pseudonym` call returns an error for broadcast
+        // contexts, which we map back to the "no pseudonym stream" branch.
+        let pseudonym_for_subscribe = if is_broadcast {
             None
         } else {
             match manager_for_task.as_ref() {
@@ -1180,7 +1180,7 @@ pub(crate) async fn context_subscribe_on(
         let mut stream: std::pin::Pin<
             Box<dyn futures::Stream<Item = scp_transport::TransportEvent> + Send>,
         > = stream;
-        if let Some(pseudonym_bytes) = local_pseudonym {
+        if let Some(pseudonym_bytes) = pseudonym_for_subscribe {
             let pseudonym_rid = scp_transport::RoutingId::new(pseudonym_bytes);
             if let Ok(pseudonym_stream) = transport_mgr.subscribe(&pseudonym_rid, None).await {
                 // Merge the pseudonym stream into the main stream using
