@@ -299,40 +299,41 @@ impl Scp {
     /// `&*self.inner`. Key material, registry writes, and the DID
     /// resolver are all scoped to this `SCP`.
     ///
-    /// When `seed` is supplied (32 bytes), the in-memory custody is backed
-    /// by a deterministic RNG so subsequent `generate_keypair` calls
-    /// produce byte-identical Ed25519 keys across bridges — the basis of
-    /// the cross-bridge parity test (ADR-046). `seed` is only valid for
-    /// `"in_memory"` custody; other custody types reject it with
-    /// `SCP-VALID-7007`.
+    /// When `testing_seed` is supplied (32 bytes), the in-memory custody
+    /// is backed by a deterministic RNG so subsequent `generate_keypair`
+    /// calls produce byte-identical Ed25519 keys across bridges — the
+    /// basis of the cross-bridge parity test (ADR-046). `testing_seed` is
+    /// only valid for `"in_memory"` custody; other custody types reject
+    /// it with `SCP-VALID-7009`.
     #[napi(js_name = "identityCreate")]
     pub async fn identity_create(
         &self,
         custody: String,
-        seed: Option<napi::bindgen_prelude::Buffer>,
+        testing_seed: Option<napi::bindgen_prelude::Buffer>,
     ) -> napi::Result<crate::identity::NapiIdentity> {
         use crate::identity::{NapiIdentityInner, ensure_did_resolver_initialized_on};
 
         validate_custody_type(&custody).map_err(NapiError::from)?;
 
-        // Validate the optional 32-byte seed at the FFI boundary so we fail
-        // early rather than panicking in `InMemoryKeyCustody::from_seed_bytes`.
-        let seed_bytes: Option<[u8; 32]> = match seed {
+        // Validate the optional 32-byte `testing_seed` at the FFI boundary
+        // so we fail early rather than panicking in
+        // `InMemoryKeyCustody::from_seed_bytes`. A length mismatch is
+        // `SCP-VALID-7007`; a seed paired with a non-InMemory custody
+        // surfaces later as `SCP-VALID-7009`.
+        let testing_seed_bytes: Option<[u8; 32]> = match testing_seed {
             None => None,
             Some(buf) => {
                 let slice: &[u8] = buf.as_ref();
-                if slice.len() != 32 {
-                    return Err(NapiError::from(ScpNapiError::Validation {
+                let arr: [u8; 32] = slice.try_into().map_err(|_| {
+                    NapiError::from(ScpNapiError::Validation {
                         message: format!(
-                            "`seed` must be exactly 32 bytes, got {}",
+                            "`testing_seed` must be exactly 32 bytes, got {}",
                             slice.len()
                         ),
                         code: codes::VALID_7007.to_owned(),
-                    }));
-                }
-                let mut out = [0u8; 32];
-                out.copy_from_slice(slice);
-                Some(out)
+                    })
+                })?;
+                Some(arr)
             }
         };
 
@@ -345,7 +346,7 @@ impl Scp {
                 use scp_platform::testing::InMemoryKeyCustody;
                 use scp_identity::DidDht;
 
-                let in_memory = seed_bytes
+                let in_memory = testing_seed_bytes
                     .map_or_else(InMemoryKeyCustody::new, InMemoryKeyCustody::from_seed_bytes);
                 let key_custody = Arc::new(crate::identity::OpaqueInMemoryKeyCustody(in_memory));
                 let dht = DidDht::new();
@@ -398,11 +399,12 @@ impl Scp {
             }
             .into()),
             "platform" | "software" => {
-                if seed_bytes.is_some() {
+                if testing_seed_bytes.is_some() {
                     return Err(NapiError::from(ScpNapiError::Validation {
-                        message: "`seed` parameter is only valid for custody=\"in_memory\""
-                            .to_owned(),
-                        code: codes::VALID_7007.to_owned(),
+                        message:
+                            "`testing_seed` parameter is only valid for custody=\"in_memory\""
+                                .to_owned(),
+                        code: codes::VALID_7009.to_owned(),
                     }));
                 }
                 Err(ScpNapiError::Identity {
@@ -3741,7 +3743,7 @@ impl Scp {
     /// `signed_at_override` is a testing-only parameter for the ADR-046
     /// cross-bridge parity harness. Only accepted when scp-core is built
     /// with the `testing` feature; production builds reject any non-`null`
-    /// value via `SCP-VALID-7007`.
+    /// value via `SCP-VALID-7008`.
     #[cfg(feature = "allow_in_memory_custody")]
     #[napi(js_name = "scpidSign")]
     pub fn scpid_sign(

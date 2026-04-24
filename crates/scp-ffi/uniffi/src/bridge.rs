@@ -168,10 +168,7 @@ impl fmt::Debug for OpaqueInMemoryKeyCustody {
 /// `remove_agent_key`, `identity_migrate` in-memory arm,
 /// `identity_migrate` callback arm, `identity_create_with_custody`,
 /// `identity_create_with_agent_key`) delegate here.
-async fn snapshot_verifying_key_hex<C: KeyCustody>(
-    custody: &C,
-    key: &KeyHandle,
-) -> Option<String> {
+async fn snapshot_verifying_key_hex<C: KeyCustody>(custody: &C, key: &KeyHandle) -> Option<String> {
     custody
         .public_key(key)
         .await
@@ -1691,7 +1688,8 @@ impl Identity {
                         .map_err(ScpError::from)?;
 
                     let verifying_key_hex =
-                        snapshot_verifying_key_hex(&custody.0, &updated_identity.identity_key).await;
+                        snapshot_verifying_key_hex(&custody.0, &updated_identity.identity_key)
+                            .await;
 
                     let handle = Arc::new(Self {
                         did,
@@ -1787,8 +1785,11 @@ impl Identity {
                         .await
                         .map_err(ScpError::from)?;
 
-                    let verifying_key_hex =
-                        snapshot_verifying_key_hex(&custody_for_key.0, &updated_identity.identity_key).await;
+                    let verifying_key_hex = snapshot_verifying_key_hex(
+                        &custody_for_key.0,
+                        &updated_identity.identity_key,
+                    )
+                    .await;
 
                     let handle = Arc::new(Self {
                         did,
@@ -1882,7 +1883,8 @@ impl Identity {
                         .map_err(ScpError::from)?;
 
                     let verifying_key_hex =
-                        snapshot_verifying_key_hex(&custody.0, &updated_identity.identity_key).await;
+                        snapshot_verifying_key_hex(&custody.0, &updated_identity.identity_key)
+                            .await;
 
                     let handle = Arc::new(Self {
                         did,
@@ -6229,7 +6231,7 @@ pub(crate) fn scpid_sign_impl(
             msg:
                 "signed_at_override requires the scp-core `testing` feature — not available in production builds"
                     .to_owned(),
-            code: codes::VALID_7007.to_owned(),
+            code: codes::VALID_7008.to_owned(),
         });
     }
 
@@ -6820,34 +6822,37 @@ impl Scp {
     /// initialization, handle `instance_id` stamping) is scoped to this
     /// `SCP`.
     ///
-    /// When `seed` is supplied (32 bytes), the in-memory custody is backed
-    /// by a deterministic RNG so subsequent `generate_keypair` calls produce
-    /// byte-identical Ed25519 keys across bridges — the basis of the
-    /// cross-bridge parity test (ADR-046). `seed` is only valid for
-    /// `"in_memory"` custody; other custody types reject it with
-    /// `SCP-VALID-7007`.
+    /// When `testing_seed` is supplied (32 bytes), the in-memory custody
+    /// is backed by a deterministic RNG so subsequent `generate_keypair`
+    /// calls produce byte-identical Ed25519 keys across bridges — the
+    /// basis of the cross-bridge parity test (ADR-046). `testing_seed`
+    /// is only valid for `"in_memory"` custody; other custody types
+    /// reject it with `SCP-VALID-7009`.
     pub async fn identity_create(
         &self,
         custody: String,
-        seed: Option<Vec<u8>>,
+        testing_seed: Option<Vec<u8>>,
     ) -> Result<Arc<Identity>, ScpError> {
         let custody_method = parse_custody_method(&custody)?;
         let bi = Arc::clone(&self.inner);
 
-        // Validate the optional 32-byte seed at the FFI boundary so we fail
-        // early rather than panicking in `InMemoryKeyCustody::from_seed_bytes`.
-        let seed_bytes: Option<[u8; 32]> = match seed {
+        // Validate the optional 32-byte `testing_seed` at the FFI
+        // boundary so we fail early rather than panicking inside
+        // `InMemoryKeyCustody::from_seed_bytes`. UniFFI's FFI scalar set
+        // forbids fixed-size arrays, so the wire type stays
+        // `Option<Vec<u8>>`; we immediately narrow to `[u8; 32]` via
+        // `TryFrom` and surface a length mismatch as `SCP-VALID-7007`.
+        // A seed paired with a non-InMemory custody type is caught
+        // below as `SCP-VALID-7009`.
+        let testing_seed_bytes: Option<[u8; 32]> = match testing_seed {
             None => None,
             Some(bytes) => {
-                if bytes.len() != 32 {
-                    return Err(ScpError::Validation {
-                        msg: format!("seed must be exactly 32 bytes, got {}", bytes.len()),
+                let arr: [u8; 32] =
+                    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| ScpError::Validation {
+                        msg: format!("testing_seed must be exactly 32 bytes, got {}", bytes.len()),
                         code: codes::VALID_7007.to_owned(),
-                    });
-                }
-                let mut out = [0u8; 32];
-                out.copy_from_slice(&bytes);
-                Some(out)
+                    })?;
+                Some(arr)
             }
         };
 
@@ -6861,7 +6866,7 @@ impl Scp {
                         #[cfg(not(feature = "allow_in_memory_custody"))]
                         {
                             let _ = &bi;
-                            let _ = seed_bytes;
+                            let _ = testing_seed_bytes;
                             Err(ScpError::Identity {
                                 msg: "\"in_memory\" custody is not available in this build \
                                       — enable the \"allow_in_memory_custody\" feature for \
@@ -6885,9 +6890,9 @@ impl Scp {
                             // Dropping `key_custody` destroys all private key material
                             // and renders those handles dangling.
                             //
-                            // When `seed` is supplied, the custody is backed by a
-                            // deterministic RNG (ADR-046 parity).
-                            let in_memory = seed_bytes.map_or_else(
+                            // When `testing_seed` is supplied, the custody is
+                            // backed by a deterministic RNG (ADR-046 parity).
+                            let in_memory = testing_seed_bytes.map_or_else(
                                 InMemoryKeyCustody::new,
                                 InMemoryKeyCustody::from_seed_bytes,
                             );
@@ -6923,11 +6928,12 @@ impl Scp {
                         }
                     }
                     CustodyMethod::Platform | CustodyMethod::Software => {
-                        if seed_bytes.is_some() {
+                        if testing_seed_bytes.is_some() {
                             return Err(ScpError::Validation {
-                                msg: "`seed` parameter is only valid for custody=\"in_memory\""
-                                    .to_owned(),
-                                code: codes::VALID_7007.to_owned(),
+                                msg:
+                                    "`testing_seed` parameter is only valid for custody=\"in_memory\""
+                                        .to_owned(),
+                                code: codes::VALID_7009.to_owned(),
                             });
                         }
                         // Platform and software custody require a wired
@@ -6992,7 +6998,8 @@ impl Scp {
 
                 // Snapshot the #0 (identity) verifying key for ADR-046 parity.
                 let verifying_key_hex =
-                    snapshot_verifying_key_hex(callback_custody.as_ref(), &identity.identity_key).await;
+                    snapshot_verifying_key_hex(callback_custody.as_ref(), &identity.identity_key)
+                        .await;
 
                 // Initialize the production DID resolver for UCAN validation
                 // on this instance.
@@ -11941,7 +11948,7 @@ impl Scp {
     /// `signed_at_override` is a testing-only parameter for the ADR-046
     /// cross-bridge parity harness. Only accepted when scp-core is built
     /// with the `testing` feature; production builds reject any non-`None`
-    /// value via `SCP-VALID-7007`.
+    /// value via `SCP-VALID-7008`.
     #[cfg(feature = "allow_in_memory_custody")]
     pub fn scpid_sign(
         &self,
@@ -12744,7 +12751,8 @@ impl Scp {
 
                             // Snapshot the #0 verifying key for ADR-046 parity.
                             let verifying_key_hex =
-                                snapshot_verifying_key_hex(&key_custody.0, &identity.identity_key).await;
+                                snapshot_verifying_key_hex(&key_custody.0, &identity.identity_key)
+                                    .await;
 
                             // Initialize the production DID resolver for UCAN
                             // validation on this instance.

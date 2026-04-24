@@ -454,42 +454,30 @@ fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyErr
     parse_custody_with_seed(custody, None)
 }
 
-/// Validates that an optional `seed` byte slice is either `None` or exactly
-/// 32 bytes long. Keeps seed-length validation on the FFI boundary so the
-/// runtime never has to reject malformed bytes.
-fn parse_optional_seed(seed: Option<&[u8]>) -> Result<Option<[u8; 32]>, ScpPyError> {
-    seed.map_or(Ok(None), |bytes| {
-        <[u8; 32]>::try_from(bytes).map(Some).map_err(|_| {
-            ScpPyError::validation(format!(
-                "seed must be exactly 32 bytes, got {}",
-                bytes.len()
-            ))
-        })
-    })
-}
-
-/// Variant of [`parse_custody`] that optionally accepts a 32-byte seed for the
-/// `"in_memory"` custody path, used by the cross-bridge parity harness
-/// (ADR-046). The seed is fed directly into
+/// Variant of [`parse_custody`] that optionally accepts a 32-byte
+/// `testing_seed` for the `"in_memory"` custody path, used by the
+/// cross-bridge parity harness (ADR-046). The seed is fed directly into
 /// [`InMemoryKeyCustody::from_seed_bytes`], making every subsequent
 /// `generate_keypair` call deterministic.
 ///
 /// A non-`None` seed on any custody type other than `"in_memory"` is a
-/// validation error — seeded determinism is only meaningful for the
-/// in-process testing custody.
+/// validation error (`SCP-VALID-7009`) — seeded determinism is only
+/// meaningful for the in-process testing custody.
 #[cfg(feature = "allow_in_memory_custody")]
 fn parse_custody_with_seed(
     custody: &str,
-    seed: Option<[u8; 32]>,
+    testing_seed: Option<[u8; 32]>,
 ) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
     match custody {
         "in_memory" => {
-            let kc = seed.map_or_else(InMemoryKeyCustody::new, InMemoryKeyCustody::from_seed_bytes);
+            let kc = testing_seed
+                .map_or_else(InMemoryKeyCustody::new, InMemoryKeyCustody::from_seed_bytes);
             Ok((Arc::new(FfiKeyCustody::InMemory(kc)), custody.to_owned()))
         }
-        _ if seed.is_some() => Err(ScpPyError::validation(
-            "`seed` parameter is only valid for custody=\"in_memory\"",
-        )),
+        _ if testing_seed.is_some() => Err(ScpPyError::ValidationError {
+            message: "`testing_seed` parameter is only valid for custody=\"in_memory\"".to_owned(),
+            code: scp_ffi_common::error_codes::VALID_7009.to_owned(),
+        }),
         other => parse_custody_inner(other),
     }
 }
@@ -497,12 +485,14 @@ fn parse_custody_with_seed(
 #[cfg(not(feature = "allow_in_memory_custody"))]
 fn parse_custody_with_seed(
     custody: &str,
-    seed: Option<[u8; 32]>,
+    testing_seed: Option<[u8; 32]>,
 ) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
-    if seed.is_some() {
-        return Err(ScpPyError::validation(
-            "`seed` parameter requires the allow_in_memory_custody feature",
-        ));
+    if testing_seed.is_some() {
+        return Err(ScpPyError::ValidationError {
+            message: "`testing_seed` parameter requires the allow_in_memory_custody feature"
+                .to_owned(),
+            code: scp_ffi_common::error_codes::VALID_7008.to_owned(),
+        });
     }
     parse_custody_inner(custody)
 }
@@ -664,16 +654,35 @@ impl crate::scp::PyScp {
     /// creation (SCP-217).
     ///
     /// See ADR-013 acceptance criterion 2.
-    #[pyo3(signature = (custody, seed=None))]
+    #[pyo3(signature = (custody, testing_seed=None))]
     pub fn identity_create(
         &self,
         py: Python<'_>,
         custody: &str,
-        seed: Option<&[u8]>,
+        testing_seed: Option<&[u8]>,
     ) -> PyResult<PyIdentity> {
         let bi_arc = Arc::clone(&self.inner);
-        let seed_array = parse_optional_seed(seed)?;
-        let (key_custody, custody_str) = parse_custody_with_seed(custody, seed_array)?;
+        // Validate that an optional `testing_seed` byte slice is either
+        // `None` or exactly 32 bytes long. Keeping seed-length validation
+        // on the FFI boundary means the runtime never sees malformed
+        // bytes. Mismatched length is `SCP-VALID-7007` (format error);
+        // seed-plus-wrong-custody is `SCP-VALID-7009` and is raised by
+        // `parse_custody_with_seed` below.
+        let testing_seed_array: Option<[u8; 32]> = match testing_seed {
+            None => None,
+            Some(bytes) => {
+                Some(
+                    <[u8; 32]>::try_from(bytes).map_err(|_| ScpPyError::ValidationError {
+                        message: format!(
+                            "testing_seed must be exactly 32 bytes, got {}",
+                            bytes.len()
+                        ),
+                        code: scp_ffi_common::error_codes::VALID_7007.to_owned(),
+                    })?,
+                )
+            }
+        };
+        let (key_custody, custody_str) = parse_custody_with_seed(custody, testing_seed_array)?;
         let rt = crate::runtime()?;
 
         // Ensure the production DID resolver is initialized on this bridge
@@ -923,22 +932,16 @@ impl crate::scp::PyScp {
                         // live registry entry so loaded identities also
                         // populate the ADR-046 parity field. Failures are
                         // non-fatal.
-                        let verifying_key_hex = crate::runtime::with_identity(
-                            &bi_arc,
-                            &did_owned,
-                            |entry| {
-                                Ok((
-                                    Arc::clone(&entry.custody),
-                                    entry.identity.identity_key,
-                                ))
-                            },
-                        )
-                        .ok()
-                        .and_then(|(custody, handle)| {
-                            rt.block_on(custody.public_key(&handle))
-                                .ok()
-                                .map(|pk| hex::encode(pk.as_bytes()))
-                        });
+                        let verifying_key_hex =
+                            crate::runtime::with_identity(&bi_arc, &did_owned, |entry| {
+                                Ok((Arc::clone(&entry.custody), entry.identity.identity_key))
+                            })
+                            .ok()
+                            .and_then(|(custody, handle)| {
+                                rt.block_on(custody.public_key(&handle))
+                                    .ok()
+                                    .map(|pk| hex::encode(pk.as_bytes()))
+                            });
                         return Ok(PyIdentity::from_document(
                             &bi_arc,
                             stored_did,

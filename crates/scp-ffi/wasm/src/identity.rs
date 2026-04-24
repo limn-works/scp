@@ -1016,7 +1016,7 @@ impl WasmDIDDocument {
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
-pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
+pub fn identity_create(custody: String, testing_seed: Option<Vec<u8>>) -> Promise {
     future_to_promise(async move {
         if custody != "js_custody" && custody != "in_memory" {
             return Err(ScpWasmError::Identity {
@@ -1030,21 +1030,22 @@ pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
             .into());
         }
 
-        // The caller-supplied `seed` parameter is a parity-harness
+        // The caller-supplied `testing_seed` parameter is a parity-harness
         // affordance (ADR-046), not a production API — mirrors how the
         // other three bridges gate `signed_at_override` behind
         // `testing`. Production WASM bundles reject any non-None seed
-        // with SCP-VALID-7007; the testing build consumes the 32 bytes
-        // to drive `StdRng::from_seed` below. Note this is independent
-        // of the spec §3.2.1 two-key model, which stays unconditional:
-        // the no-seed path still derives a distinct `#active` key from
+        // with SCP-VALID-7008; the testing build consumes the 32 bytes
+        // to drive `StdRng::from_seed` below (a length mismatch there
+        // surfaces as SCP-VALID-7007). Note this is independent of the
+        // spec §3.2.1 two-key model, which stays unconditional: the
+        // no-seed path still derives a distinct `#active` key from
         // `OsRng` in every build.
-        let seed_bytes: Option<[u8; 32]> = match seed.as_deref() {
+        let testing_seed_bytes: Option<[u8; 32]> = match testing_seed.as_deref() {
             None => None,
             #[cfg(feature = "testing")]
             Some(bytes) => Some(<[u8; 32]>::try_from(bytes).map_err(|_| {
                 ScpWasmError::Validation {
-                    message: format!("seed must be exactly 32 bytes, got {}", bytes.len()),
+                    message: format!("testing_seed must be exactly 32 bytes, got {}", bytes.len()),
                     code: codes::VALID_7007.to_owned(),
                 }
                 .into_js()
@@ -1052,10 +1053,11 @@ pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
             #[cfg(not(feature = "testing"))]
             Some(_) => {
                 return Err(ScpWasmError::Validation {
-                    message: "`seed` parameter requires the `testing` feature — not available \
+                    message:
+                        "`testing_seed` parameter requires the `testing` feature — not available \
                               in production WASM builds"
-                        .to_owned(),
-                    code: codes::VALID_7007.to_owned(),
+                            .to_owned(),
+                    code: codes::VALID_7008.to_owned(),
                 }
                 .into_js()
                 .into());
@@ -1086,7 +1088,7 @@ pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
         let (signing_key, active_signing_key_bytes): (
             ed25519_dalek::SigningKey,
             zeroize::Zeroizing<[u8; 32]>,
-        ) = seed_bytes.map_or_else(random_two_key, |s| {
+        ) = testing_seed_bytes.map_or_else(random_two_key, |s| {
             use rand::{RngCore, SeedableRng};
             let mut rng = rand::rngs::StdRng::from_seed(s);
             let mut identity_key_bytes = zeroize::Zeroizing::new([0u8; 32]);
@@ -1102,11 +1104,11 @@ pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
             ed25519_dalek::SigningKey,
             zeroize::Zeroizing<[u8; 32]>,
         ) = {
-            // `seed_bytes` is guaranteed `None` here — the testing-gate
-            // match above returns early for any `Some(_)` on non-testing
-            // builds. Silence the unused binding without disturbing the
-            // shared control flow.
-            let _ = seed_bytes;
+            // `testing_seed_bytes` is guaranteed `None` here — the
+            // testing-gate match above returns early for any `Some(_)` on
+            // non-testing builds. Silence the unused binding without
+            // disturbing the shared control flow.
+            let _ = testing_seed_bytes;
             random_two_key()
         };
         let verifying_key = signing_key.verifying_key();

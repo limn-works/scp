@@ -11,10 +11,11 @@ publish = false
 crate-type = ["cdylib"]
 
 [features]
-# Enables the caller-supplied `seed: Option<Vec<u8>>` parameter on
-# `identity_create` AND the `signed_at_override: Option<u64>` parameter
-# on `scpid_sign` for the cross-bridge parity harness (ADR-046).
-# Production WASM bundles reject any non-`undefined` value for both.
+# Enables the caller-supplied `testing_seed: Option<Vec<u8>>` parameter
+# on `identity_create` AND the `signed_at_override: Option<u64>`
+# parameter on `scpid_sign` for the cross-bridge parity harness
+# (ADR-046). Production WASM bundles reject any non-`undefined` value
+# for both.
 #
 # The spec §3.2.1 two-key model (#0 identity key + #active signing key)
 # is independently always-on — the no-seed path still derives a distinct
