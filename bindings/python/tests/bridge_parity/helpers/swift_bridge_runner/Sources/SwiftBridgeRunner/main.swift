@@ -18,6 +18,12 @@
 //
 // Bridge selection is explicit — the runner rejects any bridgeMode other
 // than "uniffi-swift" per the no-auto-fallback principle in ADR-046.
+//
+// ADR-048 / #1549 Phase 4 PR 4: every UniFFI bridge operation is now a
+// per-instance method on the `Scp` opaque class. Each op constructs a
+// fresh `Scp()` so handles stay scoped to the call. The pre-PR-4
+// free-function façade and the DEFAULT_BRIDGE_INSTANCE it delegated
+// to were both deleted.
 
 import Foundation
 import SCP
@@ -52,9 +58,6 @@ func readExact(_ n: Int) -> Data? {
             // availableData returned more than we asked for — not expected
             // with the way it's documented, but handle defensively.
             buf.append(chunk.prefix(remaining))
-            // We cannot un-consume the overflow from FileHandle; guard
-            // against this path by always requesting one byte at a time in
-            // readHeader (see below). This branch should be unreachable.
             eprint("swift_bridge_runner: unexpected over-read from stdin")
         }
     }
@@ -71,7 +74,6 @@ func readHeader() -> String? {
     while true {
         let chunk = stdin.readData(ofLength: 1)
         if chunk.isEmpty {
-            // EOF before header complete — clean shutdown only if buffer empty.
             return header.isEmpty ? nil : nil
         }
         header.append(chunk)
@@ -171,7 +173,6 @@ enum JSONValue: Codable {
 
 func writeFrame<T: Encodable>(_ payload: T) {
     let encoder = JSONEncoder()
-    // Stable ordering keeps diffs clean on the Python side.
     encoder.outputFormatting = [.sortedKeys]
     do {
         let body = try encoder.encode(payload)
@@ -187,16 +188,13 @@ func writeFrame<T: Encodable>(_ payload: T) {
 
 func readFrame() -> BridgeRequest? {
     guard let header = readHeader() else { return nil }
-    // Header looks like "Content-Length: N\r\n\r\n"
     let lower = header.lowercased()
     guard let range = lower.range(of: "content-length:") else {
         eprint("swift_bridge_runner: missing Content-Length header: \(header)")
         return nil
     }
     let tail = header[range.upperBound...]
-    // Find the first digit run.
     let digits = tail.prefix { !$0.isNumber && !$0.isWhitespace ? false : true }
-    // Strip whitespace and read the integer.
     let numStr = digits.trimmingCharacters(in: .whitespacesAndNewlines)
         .split(whereSeparator: { !$0.isNumber })
         .first
@@ -222,28 +220,15 @@ func readFrame() -> BridgeRequest? {
 }
 
 // ---------------------------------------------------------------------------
-// Runner state (module-global caches, cleared on `reset`)
-// ---------------------------------------------------------------------------
-
-// UniFFI Swift bindings maintain their own module-global state (identity
-// registry, context manager). We don't cache anything here — each op
-// creates fresh identities/contexts and does not rely on handoff between
-// RPCs. `reset` is still handled (returns success) because the Python
-// harness sends one before every parity test.
-
-// ---------------------------------------------------------------------------
 // Op dispatch
 // ---------------------------------------------------------------------------
 
 func extractScpCode(_ message: String) -> String {
-    // Match SCP-{CATEGORY}-{NNNN} — same regex used by the Bun runner.
-    // Bounded fixed-string scan to avoid NSRegularExpression overhead.
     let chars = Array(message)
     let n = chars.count
     var i = 0
     while i + 4 <= n {
         if chars[i] == "S", chars[i + 1] == "C", chars[i + 2] == "P", chars[i + 3] == "-" {
-            // Scan category (uppercase letters), optional more hyphens.
             var j = i + 4
             while j < n, chars[j].isLetter, chars[j].isUppercase { j += 1 }
             if j < n, chars[j] == "-" {
@@ -274,10 +259,6 @@ func toErrResponse(_ id: Int, _ error: Error) -> ErrResponse {
 func buildContextParams(
     ceiling: [String] = ["messages:read", "messages:write"]
 ) -> ContextParams {
-    // Matches the other runners' defaults: single-admin, ephemeral,
-    // no TTL, encrypted mode. Ceiling is the minimum set needed for
-    // parity-test send/receive. Callers override ceiling for ops that
-    // need additional capabilities (tool:register, etc.).
     return ContextParams(
         mode: .encrypted,
         ceiling: ceiling,
@@ -307,16 +288,8 @@ func ceilingFromArgs(
 // MARK: - Op implementations
 
 /// Decode a 64-char hex string into a 32-byte `Data` seed for the
-/// `identityCreate(custody:seed:)` bridge call. Matches
-/// `node_bridge_runner.ts::seedFromHex` — the parity harness passes a
-/// `seed_hex` arg so every bridge derives byte-identical key material
-/// from the same 32 bytes (ADR-046 /
-/// `seed_operations.py::PARITY_SEED_HEX`).
-///
-/// Returns `nil` on malformed input (wrong length, odd digit count,
-/// non-hex chars). Callers treat `nil` as "no seed" rather than
-/// surfacing an error — the harness always sends valid hex when the
-/// parameter is present, so malformed input is already a harness bug.
+/// `scp.identityCreate(custody:testingSeed:)` per-instance call. Matches
+/// `node_bridge_runner.ts::seedFromHex`.
 func seedFromHex(_ hex: String) -> Data? {
     guard hex.count == 64 else { return nil }
     var bytes = Data(capacity: 32)
@@ -333,18 +306,14 @@ func seedFromHex(_ hex: String) -> Data? {
 }
 
 func opIdentityCreate(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    let scp = Scp()
     let custody = req.args["custody"]?.stringValue ?? "in_memory"
-    // Plumb the optional `seed_hex` so UniFFI produces byte-identical
-    // DIDs under the shared `PARITY_SEED_HEX`. When absent, pass `nil`
-    // — the bridge falls back to OS entropy.
     let seed = req.args["seed_hex"]?.stringValue.flatMap { seedFromHex($0) }
-    let identity = try await identityCreate(custody: custody, seed: seed)
+    let identity = try await scp.identityCreate(custody: custody, testingSeed: seed)
     var out: [String: JSONValue] = [
         "did": .string(identity.did()),
         "custody": .string(custody)
     ]
-    // The harness's `bytes_from_hex` FieldSpec normalises hex → base64
-    // before comparison; emit raw hex to match PyO3 / NAPI / WASM.
     if let hex = identity.verifyingKey() {
         out["verifying_key"] = .string(hex)
     }
@@ -352,10 +321,11 @@ func opIdentityCreate(_ req: BridgeRequest) async throws -> [String: JSONValue] 
 }
 
 func opContextCreate(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    let scp = Scp()
     let paramsArg = req.args["params"]?.objectValue ?? [:]
     let mode = paramsArg["mode"]?.stringValue ?? "encrypted"
-    let identity = try await identityCreate(custody: "in_memory", seed: nil)
-    let handle = try await contextCreate(identity: identity, params: buildContextParams())
+    let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
+    let handle = try await scp.contextCreate(identity: identity, params: buildContextParams())
     return [
         "context_id": .string(handle.contextId()),
         "creator_did": .string(identity.did()),
@@ -365,17 +335,14 @@ func opContextCreate(_ req: BridgeRequest) async throws -> [String: JSONValue] {
 
 func opInvalidCapability(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     _ = req
-    // UniFFI Swift's `scpidSign` takes an `Identity` opaque handle
-    // rather than a DID string, so we cannot directly exercise the
-    // unregistered-DID lookup path that the PyO3 bridge tests. Instead,
-    // we create a real identity and pass a malformed challenge — that
-    // hits SCP-IDENT-1038 (shape validation) before any DID lookup.
-    // This is the exact path `seed_operations.py` documents as the MVP
-    // shared failure mode across all bridges.
+    // UniFFI `scpidSign` takes an `Identity` opaque handle; feed it a
+    // malformed challenge to hit SCP-IDENT-1038 (shape validation) before
+    // any DID lookup. Matches the other runners.
+    let scp = Scp()
     let badChallenge = "{\"protocol\":\"scpid/1\",\"nonce\":\"00\",\"audience\":\"x\",\"issued_at\":0,\"expires_at\":0}"
     do {
-        let identity = try await identityCreate(custody: "in_memory", seed: nil)
-        _ = try scpidSign(
+        let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
+        _ = try scp.scpidSign(
             identity: identity,
             signingKeyId: "#active",
             challengeJson: badChallenge,
@@ -404,9 +371,10 @@ func opInvalidCapability(_ req: BridgeRequest) async throws -> [String: JSONValu
 
 func opEventLogAppend(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     _ = req
-    let identity = try await identityCreate(custody: "in_memory", seed: nil)
-    let handle = try await contextCreate(identity: identity, params: buildContextParams())
-    let events = try await eventLogQuery(handle: handle, filterJson: nil)
+    let scp = Scp()
+    let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
+    let handle = try await scp.contextCreate(identity: identity, params: buildContextParams())
+    let events = try await scp.eventLogQuery(handle: handle, filterJson: nil)
     guard let first = events.first else {
         return [
             "event_count": .integer(0),
@@ -432,17 +400,15 @@ let parityToolCeiling = [
 ]
 
 func opToolRegister(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    let scp = Scp()
     let ceiling = ceilingFromArgs(req.args, default: parityToolCeiling)
-    let identity = try await identityCreate(custody: "in_memory", seed: nil)
-    let handle = try await contextCreate(
+    let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
+    let handle = try await scp.contextCreate(
         identity: identity, params: buildContextParams(ceiling: ceiling)
     )
-    // Two-field schemas to satisfy `validate_specificity_floor`
-    // (MIN_SCHEMA_FIELDS = 2). Kept aligned with the PyO3/Node/Kotlin
-    // fixtures so tool_id parity holds across every bridge.
     let inputSchema = "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"},\"label\":{\"type\":\"string\"}}}"
     let outputSchema = "{\"type\":\"object\",\"properties\":{\"y\":{\"type\":\"integer\"},\"status\":{\"type\":\"string\"}}}"
-    let toolId = try await toolRegister(
+    let toolId = try await scp.toolRegister(
         handle: handle,
         definition: ToolDefinition(
             name: parityToolName,
@@ -459,6 +425,7 @@ func opToolRegister(_ req: BridgeRequest) async throws -> [String: JSONValue] {
 }
 
 func opUcanMint(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    let scp = Scp()
     let memberDid = req.args["member_did"]?.stringValue
         ?? "did:dht:zparitymemberparitymemberparitymemberparitymember"
     let capabilities: [String]
@@ -468,11 +435,11 @@ func opUcanMint(_ req: BridgeRequest) async throws -> [String: JSONValue] {
         capabilities = ["messages:read"]
     }
     let ceiling = ceilingFromArgs(req.args, default: ["messages:read", "messages:write"])
-    let identity = try await identityCreate(custody: "in_memory", seed: nil)
-    let handle = try await contextCreate(
+    let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
+    let handle = try await scp.contextCreate(
         identity: identity, params: buildContextParams(ceiling: ceiling)
     )
-    let token = try await ucanMint(
+    let token = try await scp.ucanMint(
         handle: handle,
         memberDid: memberDid,
         capabilities: capabilities,
@@ -488,13 +455,14 @@ func opUcanMint(_ req: BridgeRequest) async throws -> [String: JSONValue] {
 func opUcanValidateMalformed(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     // UniFFI wraps parse_ucan with SCP-PERM-3002. Xfail'd in
     // seed_operations.py against uniffi-swift.
+    let scp = Scp()
     let ceiling = ceilingFromArgs(req.args, default: ["messages:read", "messages:write"])
-    let identity = try await identityCreate(custody: "in_memory", seed: nil)
-    let handle = try await contextCreate(
+    let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
+    let handle = try await scp.contextCreate(
         identity: identity, params: buildContextParams(ceiling: ceiling)
     )
     do {
-        try await ucanValidate(
+        try await scp.ucanValidate(
             handle: handle,
             token: "not.a.jwt",
             capability: "scp:ctx:any/messages:read",
@@ -522,56 +490,43 @@ func opUcanValidateMalformed(_ req: BridgeRequest) async throws -> [String: JSON
 
 func opTransportStatus(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     _ = req
-    // UniFFI's `transport_status` now accepts an optional manager; when
-    // `nil`, it returns the stateless BridgeInstance-level snapshot —
-    // the same shape PyO3 and WASM expose. The parity harness always
-    // exercises the handleless probe (no transport_connect, no relay
-    // fixture), so every bridge reports `connected: false` here.
-    let status = try await transportStatus(manager: nil)
-    let connected: JSONValue = .bool(status.connected)
-    let relayUrl: JSONValue
-    if let url = status.relayUrl {
-        relayUrl = .string(url)
-    } else {
-        relayUrl = .null
-    }
-    let latencyMs: JSONValue
-    if let latency = status.latencyMs {
-        latencyMs = .number(latency)
-    } else {
-        latencyMs = .null
-    }
+    // UniFFI `Scp.transportStatus(manager:)` now requires a non-optional
+    // TransportManager after ADR-048 Phase D (#1549 PR 4) — the prior
+    // handleless probe was deleted along with the default bridge
+    // instance. The parity harness has no relay fixture to produce a
+    // manager. Xfailed against uniffi-kotlin/uniffi-swift in
+    // seed_operations.py; surface a structured runner error so the
+    // strict-xfail still fires loudly if the divergence gets silently
+    // closed.
     return [
-        "connected": connected,
-        "relay_url": relayUrl,
-        "latency_ms": latencyMs
+        "error": .object([
+            "type": .string("UnsupportedOnUniFFI"),
+            "code": .string("TEST-PARITY-1004"),
+            "message": .string(
+                "uniffi-swift: Scp.transportStatus requires a TransportManager; no handleless probe exposed"
+            )
+        ])
     ]
 }
 
 // Shape-valid `did:dht:z…` DID guaranteed NOT to be in any bridge's
-// identity registry. Mirrors
-// `seed_operations.py::FAKE_UNREGISTERED_DID` and
-// `node_bridge_runner.ts::FAKE_UNREGISTERED_DID` — MUST match byte-for-byte
-// so the parity harness lines every bridge up against the same input.
+// identity registry. Mirrors `seed_operations.py::FAKE_UNREGISTERED_DID`.
 let fakeUnregisteredDid =
     "did:dht:znever1never1never1never1never1never1never1never1never1never1neva"
 
 func opUnregisteredDidRejected(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     _ = req
-    // UniFFI `scpidSign` takes an opaque `Identity` handle, not a DID
-    // string, so it never performs the bridge-local registry lookup
-    // the PyO3/NAPI/WASM bridges use to detect an unregistered DID.
-    // Instead, we exercise the SAME error code via `identityResolve`:
-    // the fake DID's 64-char zbase32 suffix decodes to 40 bytes, which
-    // fails `DidDht::extract_public_key`'s 32-byte check locally (no
-    // DHT round-trip). That `IdentityError::InvalidDidFormat` is
-    // surfaced by the bridge's blanket `From<IdentityError>` mapping
-    // (crates/scp-ffi/uniffi/src/bridge.rs) as SCP-IDENT-1001 — the
-    // same code the other bridges emit on registry miss. See the
-    // docstring block on `OP_UNREGISTERED_DID_REJECTED` in
-    // `seed_operations.py` for the full rationale.
+    // UniFFI `scpidSign` takes an opaque `Identity` handle rather than
+    // a DID string, so we cannot reach the bridge-local registry-lookup
+    // path the PyO3/NAPI/WASM bridges expose. Instead we exercise the
+    // SAME error code via `identityResolve` on the fake DID: its 64-char
+    // zbase32 suffix decodes to 40 bytes (not the 32 required by
+    // did:dht), so `DidDht::extract_public_key` returns
+    // `IdentityError::InvalidDidFormat` locally — and the bridge's
+    // blanket `From<IdentityError>` maps that to SCP-IDENT-1001.
+    let scp = Scp()
     do {
-        _ = try await identityResolve(did: fakeUnregisteredDid)
+        _ = try await scp.identityResolve(did: fakeUnregisteredDid)
         return [
             "error": .object([
                 "type": .string("none"),
@@ -592,13 +547,13 @@ func opUnregisteredDidRejected(_ req: BridgeRequest) async throws -> [String: JS
 }
 
 func opEventLogQueryFiltered(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    let scp = Scp()
     let filter: [String: JSONValue]
     if let obj = req.args["filter"]?.objectValue {
         filter = obj
     } else {
         filter = ["event_type": .string("ContextCreated")]
     }
-    // Serialize the filter to a JSON string for the UniFFI API.
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
     let filterJson: String
@@ -608,11 +563,11 @@ func opEventLogQueryFiltered(_ req: BridgeRequest) async throws -> [String: JSON
     } else {
         filterJson = "{\"event_type\":\"ContextCreated\"}"
     }
-    let identity = try await identityCreate(custody: "in_memory", seed: nil)
-    let handle = try await contextCreate(
+    let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: nil)
+    let handle = try await scp.contextCreate(
         identity: identity, params: buildContextParams()
     )
-    let events = try await eventLogQuery(handle: handle, filterJson: filterJson)
+    let events = try await scp.eventLogQuery(handle: handle, filterJson: filterJson)
     let first = events.first
     return [
         "event_count": .integer(Int64(events.count)),
@@ -622,21 +577,16 @@ func opEventLogQueryFiltered(_ req: BridgeRequest) async throws -> [String: JSON
 
 // Fixed 32-byte nonce used when `signed_at_override` pins the SCPID
 // response. Must match
-// `bindings/python/tests/bridge_parity/seed_operations.py::PARITY_NONCE_HEX`
-// and `node_bridge_runner.ts::PARITY_NONCE_HEX`.
+// `bindings/python/tests/bridge_parity/seed_operations.py::PARITY_NONCE_HEX`.
 let parityNonceHex = String(repeating: "aa", count: 32)
 
 // Year-2286 timestamp — far enough in the future that wall-clock expiry
-// cannot trip the SCPID expiry check. Must match the Python harness's
-// `PARITY_CHALLENGE_EXPIRES_AT_MS`.
+// cannot trip the SCPID expiry check.
 let parityChallengeExpiresAtMs: Int64 = 9_999_999_999_000
 
-/// When `signed_at_override` is supplied, the challenge must match the
-/// pinned fixture used by the Python harness and the scp-runtime
-/// golden-value test. REPLACE the bridge-issued challenge with the
-/// pinned one so every bridge feeds `scpid_sign` the same canonical
-/// hash inputs. `expires_at` is set far in the future so wall-clock
-/// expiry can't trip the bridge-side expiry check. Mirrors
+/// When `signed_at_override` is supplied, REPLACE the bridge-issued
+/// challenge with a pinned fixture so every bridge feeds `scpidSign`
+/// the same canonical hash inputs. Mirrors
 /// `node_bridge_runner.ts::patchChallengeForOverride`.
 func patchChallengeForOverride(_ challengeJson: String, override: Int64?) -> String {
     guard let override = override else { return challengeJson }
@@ -647,9 +597,6 @@ func patchChallengeForOverride(_ challengeJson: String, override: Int64?) -> Str
         "issued_at": override,
         "expires_at": parityChallengeExpiresAtMs
     ]
-    // sortedKeys keeps the canonical-hash input deterministic across
-    // bridges; the Rust canonicalizer re-sorts on its end anyway, but
-    // emitting stable output here keeps stderr diffs clean.
     guard let data = try? JSONSerialization.data(
         withJSONObject: obj, options: [.sortedKeys]
     ), let str = String(data: data, encoding: .utf8) else {
@@ -659,23 +606,18 @@ func patchChallengeForOverride(_ challengeJson: String, override: Int64?) -> Str
 }
 
 func opSignMessage(_ req: BridgeRequest) async throws -> [String: JSONValue] {
+    let scp = Scp()
     let audience = req.args["audience"]?.stringValue
         ?? "https://parity-test.example.com"
     let ttl = UInt64(req.args["ttl_seconds"]?.intValue ?? 60)
-    // Seed the identity so `#active` derives from the same bytes used
-    // by PyO3/NAPI/WASM, giving byte-identical Ed25519 signatures when
-    // combined with `signed_at_override`. Mirrors `opSignMessage` in
-    // `node_bridge_runner.ts`.
     let seed = req.args["seed_hex"]?.stringValue.flatMap { seedFromHex($0) }
-    // Optional `signed_at_override` (ms since epoch). When present,
-    // UniFFI's `scpidSign(..., signedAtOverride: UInt64?)` pins the
-    // `signed_at` field in the canonical hash so signatures match
-    // across bridges.
     let signedAtOverride = req.args["signed_at_override"]?.intValue
-    let identity = try await identityCreate(custody: "in_memory", seed: seed)
+    let identity = try await scp.identityCreate(custody: "in_memory", testingSeed: seed)
+    // `scpidChallenge` is a stateless helper; remains a free function
+    // in the UniFFI Swift module.
     let challenge = try scpidChallenge(audience: audience, ttlSeconds: ttl)
     let patched = patchChallengeForOverride(challenge, override: signedAtOverride)
-    let responseJson = try scpidSign(
+    let responseJson = try scp.scpidSign(
         identity: identity,
         signingKeyId: "#active",
         challengeJson: patched,
@@ -744,9 +686,6 @@ func dispatch(_ req: BridgeRequest) async -> Any {
 // Main loop
 // ---------------------------------------------------------------------------
 
-// Non-generic wrapper — Swift's existential Encodable can't be used as a
-// direct type argument to writeFrame<T>, so we branch on the concrete
-// response type before calling the generic function.
 func writeResponse(_ payload: Any) {
     if let ok = payload as? OkResponse {
         writeFrame(ok)
@@ -757,15 +696,9 @@ func writeResponse(_ payload: Any) {
     }
 }
 
-// Run the async dispatch loop on a detached task and block main until
-// it exits. `Swift` scripts do not have an automatic event loop, so we
-// drive one explicitly.
 let sem = DispatchSemaphore(value: 0)
 
 Task.detached {
-    // Emit a startup diagnostic (stderr, JSON) so the harness operator
-    // can confirm which binding surface resolved. Parallel to the Bun
-    // runner's bridge_parity_runner_loaded event.
     eprint("{\"event\":\"bridge_parity_runner_loaded\",\"runner\":\"swift\",\"bridge\":\"uniffi-swift\"}")
 
     while true {
@@ -777,8 +710,8 @@ Task.detached {
             break
         }
         if req.op == "reset" {
-            // UniFFI Swift bindings hold their own module-globals — no
-            // per-runner caches to clear. Respond ok.
+            // Per-op `Scp()` instances mean there are no module-level
+            // runner caches to clear. Respond ok for harness parity.
             writeFrame(OkResponse(id: req.id, ok: true, result: [:]))
             continue
         }
