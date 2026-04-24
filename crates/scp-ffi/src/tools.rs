@@ -1322,7 +1322,7 @@ fn tool_interface_revoke_impl(
         "interface_id_hex",
     )
     .map_err(|msg| ScpPyError::ValidationError {
-        message: msg,
+        message: format!("{msg} (64 hex chars)"),
         code: codes::VALID_7042.to_owned(),
     })?;
 

@@ -692,7 +692,7 @@ impl crate::scp::PyScp {
         //
         // Unlike the UniFFI / NAPI / WASM bridges, PyO3 hands us a
         // `&[u8]` borrow straight from the caller's `PyBytes` — the
-        // narrowing below copies through `<[u8; 32]>::try_from(&[u8])`
+        // narrowing below copies through `expect_fixed_bytes::<32>`
         // with no intermediate `Vec` on the Rust side, so there is no
         // bridge-owned heap buffer to wipe. The caller's `PyBytes` is
         // owned by the Python interpreter and is not ours to mutate:

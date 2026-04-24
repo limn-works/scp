@@ -1016,7 +1016,7 @@ pub(crate) async fn tool_interface_revoke_on(
     )
     .map_err(|msg| {
         napi::Error::from(ScpNapiError::Validation {
-            message: msg,
+            message: format!("{msg} (64 hex chars)"),
             code: codes::VALID_7042.to_owned(),
         })
     })?;
