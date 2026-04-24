@@ -32,6 +32,13 @@ pub use bridge_id::generate_bridge_id;
 mod context_id;
 pub use context_id::generate_context_id;
 
+// Canonical handleless transport-status triple — shared across all
+// four bridges so the no-handle-supplied `transport_status()` probe
+// cannot diverge across `PyO3`, napi-rs, `UniFFI`, and wasm-bindgen
+// (see ADR-048 §7a).
+mod transport_status;
+pub use transport_status::handleless_transport_status;
+
 // ---------------------------------------------------------------------------
 // HTML escaping for event output (XSS prevention)
 // ---------------------------------------------------------------------------
@@ -116,6 +123,13 @@ pub mod bridge_runtime;
 // Requires scp-core (behind `resolvers` feature). Not available for WASM.
 #[cfg(feature = "resolvers")]
 pub mod context_params;
+
+// Canonical event-log filter shared across PyO3, napi-rs, and UniFFI.
+// Pins `after_sequence` / `before_sequence` / `event_type` / `actor_did` /
+// `limit` semantics so the three bridges cannot drift. Requires scp-core
+// for `EventLogEntry` (behind `resolvers` feature). Not available for WASM.
+#[cfg(feature = "resolvers")]
+pub mod event_log;
 
 // Trust store shared across PyO3, napi-rs, and UniFFI bridges.
 // Requires scp-core (behind `resolvers` feature). Not available for WASM.
