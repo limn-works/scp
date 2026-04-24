@@ -4581,11 +4581,18 @@ pub(crate) fn parse_custody_method(custody: &str) -> Result<CustodyMethod, ScpEr
         "in_memory" => Ok(CustodyMethod::InMemory),
         "platform" => Ok(CustodyMethod::Platform),
         "software" => Ok(CustodyMethod::Software),
+        // VALID_7005 ("invalid field value") matches the semantic: an
+        // unrecognized enum string is a wrong-value error, not the
+        // malformed/wrong-shape byte input that VALID_7007 is reserved
+        // for (api-design J2, M1). PyO3's `parse_custody_inner` emits
+        // the same class of error (VALID_7001 via
+        // `ScpPyError::validation`), both distinct from the narrower
+        // 7007.
         other => Err(ScpError::Validation {
             msg: format!(
                 "unknown custody type: {other:?} — expected \"in_memory\", \"platform\", or \"software\""
             ),
-            code: codes::VALID_7007.to_owned(),
+            code: codes::VALID_7005.to_owned(),
         }),
     }
 }

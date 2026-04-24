@@ -477,11 +477,17 @@ impl From<scp_ffi_common::bridge_instance::HandleAffinityError> for ScpNapiError
 pub(crate) fn validate_custody_type(custody: &str) -> Result<&str, ScpNapiError> {
     match custody {
         "in_memory" | "platform" | "software" => Ok(custody),
+        // VALID_7005 ("invalid field value") matches the semantic: an
+        // unrecognized enum string is a wrong-value error, not the
+        // malformed/wrong-shape byte input that VALID_7007 is reserved for
+        // (api-design J2, M1). PyO3's `parse_custody_inner` emits the
+        // same class of error (VALID_7001 via `ScpPyError::validation`),
+        // both distinct from the narrower 7007.
         other => Err(ScpNapiError::Validation {
             message: format!(
                 "unknown custody type: {other:?} — expected \"in_memory\", \"platform\", or \"software\""
             ),
-            code: codes::VALID_7007.to_owned(),
+            code: codes::VALID_7005.to_owned(),
         }),
     }
 }
