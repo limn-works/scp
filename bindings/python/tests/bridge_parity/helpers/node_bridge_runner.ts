@@ -642,12 +642,20 @@ async function opToolRegister(
     const scp = await newNapiScp();
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, JSON.stringify(params));
+    // NapiToolDefinition fields are camelCase on the JS side (napi-rs
+    // renames `input_schema_json` → `inputSchemaJson`) and expect JSON
+    // STRINGS, not nested objects. Matches
+    // `crates/scp-ffi/napi/src/tools.rs::NapiToolDefinition`.
+    // napi-rs `Option<T>` fields are serialized from JS `undefined`, not
+    // `null` — passing `null` hits the non-null `FromNapiValue<String>`
+    // path and errors with "Failed to convert JavaScript value `Null`".
+    // Omit optional fields entirely; napi-rs reads them as `None`.
     const toolId = await scp.toolRegister(handle, {
       name: PARITY_TOOL_NAME,
       description: "parity harness probe tool",
-      inputSchema: PARITY_TOOL_SCHEMA.input,
-      outputSchema: PARITY_TOOL_SCHEMA.output,
-      operator: identity.did,
+      inputSchemaJson: JSON.stringify(PARITY_TOOL_SCHEMA.input),
+      outputSchemaJson: JSON.stringify(PARITY_TOOL_SCHEMA.output),
+      operatorDid: identity.did,
     });
     return { tool_id: toolId };
   }
@@ -777,7 +785,9 @@ async function opEventLogQueryFiltered(
     const scp = await newNapiScp();
     const identity = await scp.identityCreate("in_memory");
     const handle = await scp.contextCreate(identity, JSON.stringify(params));
-    const events = await scp.eventLogQuery(handle, filter);
+    // Raw NAPI `eventLogQuery` takes `filter_json: Option<String>`, not
+    // an Object. Pass a JSON-encoded filter.
+    const events = await scp.eventLogQuery(handle, JSON.stringify(filter));
     const first = events[0];
     return {
       event_count: events.length,
@@ -819,12 +829,11 @@ async function opSignMessage(req: BridgeRequest): Promise<Record<string, unknown
     const scp = await newNapiScp();
     const testingSeed = seedFromHex(seedHex, false);
     const identity = await scp.identityCreate("in_memory", testingSeed);
-    // `scpidChallenge` is a stateless helper: on NAPI it remains an addon
-    // top-level export since it does not touch registry state. On the
-    // SCP class side it also exists, but either path yields the same
-    // bytes.
-    const addon = await loadNapiAddon();
-    const challenge = addon.scpidChallenge(audience, ttl);
+    // `scpidChallenge` on the NAPI bridge is an `Scp` method after
+    // ADR-048 Phase D — every entry point routes through the instance
+    // for handle affinity. It is stateless (no registry lookup), but
+    // still hangs off `scp` so the API surface is uniform.
+    const challenge = scp.scpidChallenge(audience, ttl);
     const patched = patchChallengeForOverride(challenge, signedAtOverride);
     const overrideArg =
       signedAtOverride === undefined ? null : BigInt(signedAtOverride);
